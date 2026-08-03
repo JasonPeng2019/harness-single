@@ -404,6 +404,57 @@ def _thread_id(line: bytes) -> str | None:
     return None
 
 
+def _shutdown_exact_child(
+    process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
+) -> tuple[bool, dict[str, Any]]:
+    """Bound shutdown to the captured Popen handle and prove that it was reaped."""
+    evidence: dict[str, Any] = {
+        "codex_pid": process.pid,
+        "cleanup_confirmed": False,
+        "terminate_attempted": False,
+        "kill_attempted": False,
+    }
+
+    def reap(stage: str, timeout: float) -> bool:
+        try:
+            evidence["exit_code"] = process.wait(timeout=timeout)
+            evidence["reaped_after"] = stage
+            evidence["cleanup_confirmed"] = True
+            return True
+        except subprocess.TimeoutExpired:
+            evidence[f"{stage}_wait_timed_out"] = True
+        except BaseException as exc:
+            evidence[f"{stage}_wait_error"] = f"{type(exc).__name__}: {exc}"
+        return False
+
+    try:
+        already_exited = process.poll()
+    except BaseException as exc:
+        evidence["initial_poll_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        if already_exited is not None and reap("observed_exit", 0):
+            return True, evidence
+
+    evidence["terminate_attempted"] = True
+    try:
+        process.terminate()
+    except BaseException as exc:
+        evidence["terminate_error"] = f"{type(exc).__name__}: {exc}"
+    if reap("terminate", timeout_seconds):
+        return True, evidence
+
+    evidence["kill_attempted"] = True
+    try:
+        process.kill()
+    except BaseException as exc:
+        evidence["kill_error"] = f"{type(exc).__name__}: {exc}"
+    if reap("kill", timeout_seconds):
+        return True, evidence
+
+    evidence["error"] = "exact Codex child exit and reap could not be proven"
+    return False, evidence
+
+
 def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
     if not invocation.status_path.is_file():
         return None
@@ -594,6 +645,7 @@ def run(invocation: Invocation) -> int:
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     resource_claims: ResourceClaims | None = None
+    child_exit_confirmed = True
     try:
         if invocation.worker_invocation_id is not None and invocation.resources:
             assert invocation.resource_lock_root is not None
@@ -623,6 +675,7 @@ def run(invocation: Invocation) -> int:
             _atomic_json(invocation.status_path, state)
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
             state.update({"state": "RUNNING_CODEX", "codex_pid": child.pid, "codex_started_utc": iso_utc(child.created_utc), "codex_created_utc": iso_utc(child.created_utc)})
             _atomic_json(invocation.status_path, state)
@@ -650,7 +703,9 @@ def run(invocation: Invocation) -> int:
             out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
             err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
             out_thread.start(); err_thread.start()
-            exit_code = process.wait(); out_thread.join(); err_thread.join()
+            exit_code = process.wait()
+            child_exit_confirmed = True
+            out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
         thread_identity_error = state.get("thread_identity_error")
         if isinstance(thread_identity_error, str):
@@ -682,9 +737,30 @@ def run(invocation: Invocation) -> int:
         ))
         return exit_code if result_valid else 1
     except KeyboardInterrupt:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=5)
+        cleanup_evidence: dict[str, Any] | None = None
+        if process is not None and not child_exit_confirmed:
+            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+        if not child_exit_confirmed:
+            retained_claims = resource_claims.held if resource_claims is not None else []
+            error = "controller interrupted; exact Codex child shutdown could not be proven"
+            state.update({
+                "state": "COORDINATION_FAILED",
+                "ended_utc": _utc(),
+                "error": error,
+                "coordination_failure": {
+                    "error": error,
+                    "trigger": "KeyboardInterrupt",
+                    "child_shutdown": cleanup_evidence,
+                    "retained_claims": retained_claims,
+                },
+                "held_resource_claims": retained_claims,
+            })
+            _atomic_json(invocation.status_path, state)
+            _append_event(invocation.event_log, _event(
+                invocation, "COORDINATION_FAILED", error=error,
+                child_shutdown=cleanup_evidence, retained_claims=retained_claims,
+            ))
+            return 130
         state.update({"state": "CONTROLLER_INTERRUPTED", "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
@@ -705,15 +781,37 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
         return 1
     except Exception as exc:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=5)
+        cleanup_evidence = None
+        if process is not None and not child_exit_confirmed:
+            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+        if not child_exit_confirmed:
+            retained_claims = resource_claims.held if resource_claims is not None else []
+            error = f"{exc}; exact Codex child shutdown could not be proven"
+            state.update({
+                "state": "COORDINATION_FAILED",
+                "ended_utc": _utc(),
+                "error": error,
+                "coordination_failure": {
+                    "error": error,
+                    "trigger": type(exc).__name__,
+                    "trigger_error": str(exc),
+                    "child_shutdown": cleanup_evidence,
+                    "retained_claims": retained_claims,
+                },
+                "held_resource_claims": retained_claims,
+            })
+            _atomic_json(invocation.status_path, state)
+            _append_event(invocation.event_log, _event(
+                invocation, "COORDINATION_FAILED", error=error,
+                child_shutdown=cleanup_evidence, retained_claims=retained_claims,
+            ))
+            return 1
         state.update({"state": "CONTROLLER_FAILED" if state.get("codex_pid") else "LAUNCH_FAILED", "ended_utc": _utc(), "error": str(exc)})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
     finally:
-        if resource_claims is not None:
+        if resource_claims is not None and child_exit_confirmed:
             release_failures = resource_claims.release_all()
             state["held_resource_claims"] = resource_claims.held
             state["waiting_resource_claim"] = None
