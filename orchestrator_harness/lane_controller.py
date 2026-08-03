@@ -588,10 +588,7 @@ def run(invocation: Invocation) -> int:
     argv = [*invocation.codex_command, "exec"]
     if invocation.action == "resume":
         argv.extend(["resume", thread])  # type: ignore[arg-type]
-    if invocation.worker_invocation_id is None:
-        argv.append("--dangerously-bypass-approvals-and-sandbox")
-    else:
-        argv.extend(["--sandbox", invocation.sandbox])
+    argv.append("--dangerously-bypass-approvals-and-sandbox")
     argv.extend([
         "--ignore-user-config", "--skip-git-repo-check",
         "-c", f'approval_policy="{invocation.approval_policy}"', "-m", invocation.model,

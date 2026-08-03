@@ -130,10 +130,11 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual(controller.CODING_INVOCATION_SCHEMA, status["invocation_schema"])
         self.assertEqual("coding-thread", status["thread_id"])
         argv = json.loads(self.capture.read_text(encoding="utf-8"))
-        self.assertIn("--sandbox", argv); self.assertIn("workspace-write", argv)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--sandbox", argv)
         self.assertIn('approval_policy="never"', argv); self.assertIn("gpt-5.6-codex", argv)
         self.assertIn('model_reasoning_effort="high"', argv); self.assertIn('service_tier="priority"', argv)
-        self.assertIn("feature_flag=true", argv); self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("feature_flag=true", argv)
         events = [json.loads(line) for line in (self.runtime_root / "events" / "controller.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(["CODEX_STARTED", "CODEX_EXITED"], [event["event"] for event in events])
         self.assertTrue(all(event["worker_invocation_id"] == "worker-1" for event in events))
