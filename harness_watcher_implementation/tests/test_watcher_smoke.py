@@ -58,6 +58,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             poll_interval_seconds=300,
             no_progress_seconds=900,
             max_tail_bytes=1024,
+            evaluator_enabled=True,
         )
         self.original_active = settings.harness_watcher_active
 
@@ -69,6 +70,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         root=Path(__file__).resolve().parents[2]; token="diagnostic-owner-path-test"; runtime=root/"multi-agent-logs"/token; source=self.root/"changed.jsonl"; sentinel=self.root/"sentinel"; source.write_text('{"changed":true}\n')
         config=root/"multi-agent-logs"/(token+".json")
         try:
+            config.parent.mkdir(parents=True, exist_ok=True)
             config.write_text(json.dumps({"runtime_root":str(runtime.relative_to(root)),"observed_sources":[{"path":str(source),"role":"orchestrator","source_id":"root"}],"evaluator_enabled":False,"poll_interval_seconds":1,"evaluator_command":[sys.executable,"-c",f"open(r'{sentinel}','w').write('called')"]}))
             started=subprocess.run([sys.executable,"-m","harness_watcher_implementation","--config",str(config),"start","--owner-pid",str(os.getpid())],cwd=root,capture_output=True,text=True,timeout=10); self.assertEqual(0,started.returncode,started.stderr)
             service=runtime/"watcher"/"service.json"; state=json.loads(service.read_text()); pid=state["watcher"]["pid"]; self.assertFalse(state["evaluator_enabled"])
@@ -132,6 +134,18 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertFalse(sentinel.exists()); self.assertTrue((self.config.runtime_root / "watcher" / "cursor.json").exists())
         events=(self.config.runtime_root / "watcher" / "events.jsonl").read_text(encoding="utf-8")
         self.assertIn('"event_type":"EVALUATOR_SKIPPED"', events); self.assertIn('"evaluator_enabled":false', events)
+
+    def test_evaluator_enabled_config_defaults_false_and_rejects_non_boolean(self) -> None:
+        config = self.root / "watcher.json"
+        config.write_text(json.dumps({"runtime_root": "runtime"}), encoding="utf-8")
+        self.assertFalse(load_config(config).evaluator_enabled)
+        config.write_text(json.dumps({"runtime_root": "runtime", "evaluator_enabled": False}), encoding="utf-8")
+        self.assertFalse(load_config(config).evaluator_enabled)
+        config.write_text(json.dumps({"runtime_root": "runtime", "evaluator_enabled": True}), encoding="utf-8")
+        self.assertTrue(load_config(config).evaluator_enabled)
+        config.write_text(json.dumps({"runtime_root": "runtime", "evaluator_enabled": "true"}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "evaluator_enabled must be boolean"):
+            load_config(config)
 
     def test_enabled_healthy_poll_is_passive_and_logs_only_watcher_activity(self) -> None:
         result = poll(self.config, FakeEvaluator())
@@ -197,6 +211,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertTrue((self.config.runtime_root / "watcher" / "attention-timeline.jsonl").is_file())
 
     def test_default_off_does_not_create_attention_outputs(self) -> None:
+        self.config = WatcherConfig(self.root, self.root / "harness_watcher", (self.log_file,), 300, 900, 1024, evaluator_enabled=False)
         result = poll(self.config, FakeEvaluator())
         self.assertFalse(result["packet"]["attention_findings"])
         self.assertFalse((self.config.runtime_root / "watcher" / "attention-timeline.jsonl").exists())
@@ -370,7 +385,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
     def test_source_created_after_service_baseline_is_evaluated_normally(self) -> None:
         late = self.root / "late.jsonl"
-        config = WatcherConfig(self.root, self.config.runtime_root, (late,), max_tail_bytes=1024)
+        config = WatcherConfig(self.root, self.config.runtime_root, (late,), max_tail_bytes=1024, evaluator_enabled=True)
         class CapturingEvaluator:
             def __init__(self): self.packets = []
             def evaluate(self, packet):
