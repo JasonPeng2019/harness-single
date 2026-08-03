@@ -134,6 +134,7 @@ class CodingCoordinationEventTests(unittest.TestCase):
             conditions, current, observed_at=NOW, acknowledged_event_ids=set()
         )
         self.assertIsNotNone(selected)
+        assert selected is not None
         self.assertEqual("DUPLICATE_CODING_BRANCH", selected["type"])
         self.assertEqual(2, selected["admitted_priority"])
 
@@ -298,15 +299,14 @@ class CodingCoordinationEventTests(unittest.TestCase):
         harness_conditions = conditions_from_snapshot(harness)
         self.assertNotIn("lane:coding:one:coordination-failure", application_conditions)
         self.assertIn("lane:coding:one:coordination-failure", harness_conditions)
-        self.assertEqual(
-            "COORDINATION_FAILED",
-            select_actionable(
-                harness_conditions,
-                harness,
-                observed_at=NOW,
-                acknowledged_event_ids=set(),
-            )["type"],
+        selected = select_actionable(
+            harness_conditions,
+            harness,
+            observed_at=NOW,
+            acknowledged_event_ids=set(),
         )
+        assert selected is not None
+        self.assertEqual("COORDINATION_FAILED", selected["type"])
 
     def test_firmware_lane_does_not_receive_coding_conditions(self) -> None:
         firmware = coding_lane(
