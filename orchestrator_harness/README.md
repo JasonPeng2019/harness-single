@@ -205,14 +205,54 @@ and has no scheduling, acknowledgement, lease, hardware, or process-kill authori
 `orchestrator-coding-invocation/v1` schema for one coding worker turn. The schema requires a
 `runtime_root`, confines the event log beneath that root, confines the prompt to `run_root`, and
 confines all output paths to `run_root/.agent-workspace`. Prompt bytes must match
-`prompt_sha256`. See `examples/coding.invocation.example.json` for the complete start shape.
+`prompt_sha256`. It also requires a `repository` object declaring the actual Git `common_dir`,
+`worktree_root` (which must equal `run_root`), attached short `branch`, and full `base_commit`.
+The controller obtains all Git facts with bounded `subprocess` argv calls and never invokes a
+shell. See `examples/coding.invocation.example.json` for the complete start shape.
 
 Coding invocations carry generic `resources` and Codex launch settings; they do not require the
 firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
 schema-less legacy firmware shape remains policy-bound. Any other explicit schema is rejected.
 
+Before a coding launch, the controller proves the declared common directory and worktree root,
+requires the exact attached branch, resolves the base commit, and records the canonical common
+directory, worktree, branch, base commit, and starting commit in controller status. It rejects a
+duplicate worktree or branch claimed by another coding status only when that status says
+`RUNNING_CODEX` and both recorded PID/creation identities and parentage are currently live. Git
+worktree paths use Windows case-normalized comparisons. Historical exited or stale status does not
+reserve a worktree or branch.
+
 For `resume`, reuse the same output paths and `worker_invocation_id`, and provide the prior thread as
 either `resume_thread_id` or `resume_identity.thread_id`. If `resume_identity` also includes
 `worker_invocation_id`, it must match the top-level value. The controller rejects requested worker
 or thread identities that differ from persisted status. Status and lane events record both
-`invocation_schema` and `worker_invocation_id`.
+`invocation_schema` and `worker_invocation_id`. Resume also requires the persisted repository,
+worktree, branch, base, and original starting-commit identity; the real worktree and branch are
+revalidated immediately before launch.
+
+A coding lane completes only with `.agent-workspace/RESULT.json` using
+`orchestrator-lane-result/v1` and these fields:
+
+```json
+{
+  "schema": "orchestrator-lane-result/v1",
+  "lane_id": "S1.P",
+  "worker_invocation_id": "s1-product-001",
+  "branch": "work/s1-product",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "outcome": "PASS",
+  "summary": "Implemented and verified the focused change.",
+  "checks": [
+    {"name": "focused tests", "command": "python -m unittest ...", "outcome": "PASS"}
+  ]
+}
+```
+
+`outcome` is `PASS`, `FAIL`, or `BLOCKED`; checks are bounded and use `PASS`, `FAIL`, `SKIP`, or
+`NOT_RUN`. Reported command strings are evidence only and are never executed. The result lane,
+worker, and branch must match current controller status, its commit must equal the real current
+branch tip, and the project worktree must be clean. Ordinary ignored runtime state is excluded by
+Git. Invalid coding result evidence is bounded in controller status and the reconciled snapshot;
+it disappears from the current snapshot when a corrected valid result replaces it. A firmware
+shaped result is never accepted for a coding controller. Schema-less firmware lanes retain their
+legacy result route.

@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import HarnessConfig
+from .git_safety import (
+    GitSafetyError,
+    declaration_from_status,
+    invalid_result_evidence,
+    validate_coding_result,
+)
 from .models import ObservationError, StableBytes
 from .models import parse_utc
 from .stable_io import read_stable, read_tail_stable
@@ -51,6 +57,7 @@ class RunRecords:
     mcp_records: tuple[JsonRecord, ...]
     checkpoint: StableBytes | None
     result: JsonRecord | None
+    invalid_result: dict[str, Any] | None
     manager_signals: tuple[ManagerSignalRecord, ...]
     errors: tuple[ObservationError, ...]
 
@@ -333,14 +340,58 @@ def discover_run(
             )
 
     result = None
+    invalid_result = None
     result_path = workspace / "RESULT.json"
+    latest_controller = max(
+        controllers,
+        key=lambda item: item.status.stable.mtime_ns,
+        default=None,
+    )
+    coding_status = (
+        latest_controller.status.value
+        if latest_controller is not None
+        and latest_controller.status.value.get("invocation_schema")
+        == "orchestrator-coding-invocation/v1"
+        else None
+    )
     if result_path.exists():
         try:
-            result = _json_record(result_path, config)
+            candidate = _json_record(result_path, config)
+            if coding_status is None:
+                result = candidate
+            else:
+                lane_id = coding_status.get("declared_lane_id")
+                worker_id = coding_status.get("worker_invocation_id")
+                if not isinstance(lane_id, str) or not lane_id:
+                    raise GitSafetyError("coding controller status has no current lane_id")
+                if not isinstance(worker_id, str) or not worker_id:
+                    raise GitSafetyError("coding controller status has no current worker_invocation_id")
+                declaration = declaration_from_status(coding_status, run_root)
+                validate_coding_result(
+                    candidate.value,
+                    lane_id=lane_id,
+                    worker_invocation_id=worker_id,
+                    declaration=declaration,
+                )
+                result = candidate
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            code = "CODING_RESULT_INVALID" if coding_status is not None else "RESULT_READ_ERROR"
             errors.append(
-                ObservationError(str(result_path), "RESULT_READ_ERROR", str(exc))
+                ObservationError(str(result_path), code, str(exc)[:500])
             )
+            if coding_status is not None:
+                sha256 = None
+                try:
+                    stable = read_stable(
+                        result_path,
+                        max_bytes=config.max_json_bytes,
+                        retries=config.stable_read_retries,
+                        delay_seconds=config.stable_read_delay_seconds,
+                    )
+                    sha256 = stable.sha256
+                except OSError:
+                    pass
+                invalid_result = invalid_result_evidence(result_path, str(exc), sha256=sha256)
 
     signals_root = workspace / "manager-signals"
     signal_ids: dict[str, list[ManagerSignalRecord]] = {}
@@ -381,6 +432,7 @@ def discover_run(
         mcp_records=tuple(mcp_records),
         checkpoint=checkpoint,
         result=result,
+        invalid_result=invalid_result,
         manager_signals=tuple(manager_signals),
         errors=tuple(errors),
     )

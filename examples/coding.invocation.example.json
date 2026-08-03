@@ -3,6 +3,12 @@
   "action": "start",
   "runtime_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch",
   "run_root": "C:/absolute/path/to/target-checkout",
+  "repository": {
+    "common_dir": "C:/absolute/path/to/repository/.git",
+    "worktree_root": "C:/absolute/path/to/target-checkout",
+    "branch": "work/s1-product",
+    "base_commit": "0123456789abcdef0123456789abcdef01234567"
+  },
   "prompt_path": "C:/absolute/path/to/target-checkout/.agent-workspace/worker-prompt.md",
   "prompt_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "output_paths": {

@@ -17,8 +17,18 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from .git_safety import (
+    GitDeclaration,
+    GitSafetyError,
+    active_declaration_conflicts,
+    declaration_from_invocation,
+    inspect_repository,
+    invalid_result_evidence,
+    repository_status,
+    validate_coding_result,
+)
 from .models import ProcessInfo, iso_utc
 from .processes import process_snapshot
 
@@ -118,6 +128,7 @@ class Invocation:
     sandbox: str
     approval_policy: str
     requested_thread_id: str | None
+    repository: GitDeclaration | None
     status_path: Path
     jsonl_path: Path
     stderr_path: Path
@@ -235,7 +246,7 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
         _string(raw, "phase"), _string(raw, "declared_lane_id"), _string_list(raw.get("leases", []), "leases"),
         _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"),
         server_snapshot, [], _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
-        _string(model_settings, "service_tier"), command, overrides, "danger-full-access", "never", requested_thread,
+        _string(model_settings, "service_tier"), command, overrides, "danger-full-access", "never", requested_thread, None,
         outputs["status"], outputs["jsonl"], outputs["stderr"], outputs["last_message"], event_log,
     )
 
@@ -283,6 +294,10 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         raise InvocationError("lane_id must be a non-empty string")
     lane_id = lane_id_value.strip()
     resources = _string_list(raw.get("resources", []), "resources")
+    try:
+        repository = declaration_from_invocation(raw, run_root)
+    except GitSafetyError as exc:
+        raise InvocationError(str(exc)) from exc
     model, reasoning, tier, command, overrides, sandbox, approval = _coding_settings(raw)
     requested_thread = _resume_thread(raw)
     resume_identity = raw.get("resume_identity", raw.get("resume"))
@@ -309,7 +324,7 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
         prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
         _string(raw, "phase"), lane_id, [], [], [], {}, resources, model, reasoning, tier, command,
-        overrides, sandbox, approval, requested_thread, outputs["status"], outputs["jsonl"],
+        overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
         outputs["stderr"], outputs["last_message"], event_log,
     )
 
@@ -379,6 +394,64 @@ def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
     return value
 
 
+def _persisted_repository(invocation: Invocation, prior_status: Mapping[str, Any]) -> str:
+    assert invocation.repository is not None
+    nested = prior_status.get("repository")
+    if not isinstance(nested, Mapping):
+        raise InvocationError("coding resume requires persisted repository identity")
+    expected = {
+        "common_dir": str(invocation.repository.common_dir),
+        "worktree_root": str(invocation.repository.worktree_root),
+        "branch": invocation.repository.branch,
+    }
+    for key, value in expected.items():
+        persisted = nested.get(key)
+        if key.endswith("dir") or key.endswith("root"):
+            try:
+                if not isinstance(persisted, str) or Path(persisted).resolve(strict=False) != Path(value).resolve(strict=False):
+                    raise InvocationError(f"resume repository {key} does not match persisted status")
+            except OSError as exc:
+                raise InvocationError(f"cannot compare persisted repository {key}: {exc}") from exc
+        elif persisted != value:
+            raise InvocationError(f"resume repository {key} does not match persisted status")
+    if nested.get("base_commit") != invocation.repository.base_commit:
+        raise InvocationError("resume base_commit does not match persisted status")
+    starting_commit = nested.get("starting_commit")
+    if not isinstance(starting_commit, str) or not starting_commit:
+        raise InvocationError("coding resume requires persisted starting_commit")
+    return starting_commit
+
+
+def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool]:
+    assert invocation.repository is not None and invocation.worker_invocation_id is not None
+    path = invocation.workspace / "RESULT.json"
+    if not path.exists():
+        return {"state": "MISSING", "path": str(path)}, True
+    sha256 = None
+    try:
+        data = path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        if len(data) > 1024 * 1024:
+            raise GitSafetyError("coding result exceeds the 1 MiB controller limit")
+        value = json.loads(data.decode("utf-8-sig"))
+        if not isinstance(value, Mapping):
+            raise GitSafetyError("coding result root must be an object")
+        identity = validate_coding_result(
+            value,
+            lane_id=invocation.lane_id,
+            worker_invocation_id=invocation.worker_invocation_id,
+            declaration=invocation.repository,
+        )
+        return {
+            "state": "VALID",
+            "path": str(path),
+            "sha256": sha256,
+            "commit": identity.head_commit,
+        }, True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, GitSafetyError) as exc:
+        return invalid_result_evidence(path, str(exc), sha256=sha256), False
+
+
 def run(invocation: Invocation) -> int:
     prompt = invocation.prompt_bytes
     if not prompt:
@@ -386,6 +459,13 @@ def run(invocation: Invocation) -> int:
     prior_status = _read_prior_status(invocation)
     prior_thread_value = prior_status.get("thread_id") if prior_status else None
     prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
+    starting_commit = None
+    git_identity = None
+    if invocation.repository is not None:
+        try:
+            git_identity = inspect_repository(invocation.repository)
+        except GitSafetyError as exc:
+            raise InvocationError(str(exc)) from exc
     if invocation.action == "resume":
         if invocation.worker_invocation_id is not None:
             if prior_status is None:
@@ -396,11 +476,30 @@ def run(invocation: Invocation) -> int:
                 raise InvocationError("resume invocation schema does not match persisted status")
             if prior_thread is None:
                 raise InvocationError("coding resume requires a persisted lane thread ID")
+            starting_commit = _persisted_repository(invocation, prior_status)
         thread = invocation.requested_thread_id or prior_thread
         if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
             raise InvocationError("resume requires the persisted lane thread ID")
     else:
         thread = None
+        if git_identity is not None:
+            starting_commit = git_identity.head_commit
+    if invocation.repository is not None:
+        try:
+            conflicts = active_declaration_conflicts(
+                invocation.repository,
+                current_status_path=invocation.status_path,
+            )
+        except GitSafetyError as exc:
+            raise InvocationError(str(exc)) from exc
+        if conflicts:
+            raise InvocationError("duplicate ACTIVE coding declaration: " + "; ".join(conflicts))
+        try:
+            launch_identity = inspect_repository(invocation.repository)
+        except GitSafetyError as exc:
+            raise InvocationError(str(exc)) from exc
+        if git_identity is None or launch_identity.head_commit != git_identity.head_commit:
+            raise InvocationError("coding worktree HEAD changed during pre-launch validation")
     controller = _identity(os.getpid())
     argv = [*invocation.codex_command, "exec"]
     if invocation.action == "resume":
@@ -445,6 +544,16 @@ def run(invocation: Invocation) -> int:
             "config_overrides": invocation.config_overrides,
             "jsonl": True, "ephemeral": False, "action": invocation.action, "argv": argv[:-1]},
     }
+    if git_identity is not None:
+        repository = repository_status(git_identity, starting_commit=starting_commit)
+        state.update({
+            "repository": repository,
+            "repository_common_dir": repository["common_dir"],
+            "worktree_root": repository["worktree_root"],
+            "branch": repository["branch"],
+            "base_commit": repository["base_commit"],
+            "starting_commit": repository["starting_commit"],
+        })
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -496,12 +605,17 @@ def run(invocation: Invocation) -> int:
             _atomic_json(invocation.status_path, state)
             _append_event(invocation.event_log, _event(invocation, "LAUNCH_FAILED", exit_code=exit_code))
             return 1
+        result_valid = True
+        if invocation.repository is not None:
+            result_validation, result_valid = _coding_result_validation(invocation)
+            state["result_validation"] = result_validation
         state.update({"state": "CODEX_EXITED", "exit_code": exit_code, "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(
             invocation, "CODEX_EXITED", exit_code=exit_code, thread_id=state.get("thread_id"),
+            result_validation=state.get("result_validation"),
         ))
-        return exit_code
+        return exit_code if result_valid else 1
     except KeyboardInterrupt:
         if process is not None and process.poll() is None:
             process.terminate()

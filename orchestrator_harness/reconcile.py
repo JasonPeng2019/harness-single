@@ -1093,6 +1093,8 @@ def reconcile(
                     "backend unavailable",
                 )
             )
+            if run.invalid_result is not None:
+                lane["invalid_result"] = dict(run.invalid_result)
             if run.result is not None:
                 lane["operational_state"] = "TERMINAL_RESULT"
                 lane["result_path"] = str(run.result.path)
