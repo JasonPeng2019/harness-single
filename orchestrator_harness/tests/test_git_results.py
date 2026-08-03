@@ -4,7 +4,6 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
