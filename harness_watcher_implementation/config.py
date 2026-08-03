@@ -10,7 +10,7 @@ class ObservedSource:
  path: Path; role: str; source_id: str
 @dataclass(frozen=True)
 class WatcherConfig:
- repository_root: Path; runtime_root: Path; observed_log_roots: tuple[Path,...]; poll_interval_seconds: int=300; no_progress_seconds: int=900; max_tail_bytes: int=65536; evaluator_command: tuple[str,...]=(); observed_sources: tuple[ObservedSource,...]=(); attention_logging_enabled: bool=False; attention_producers: tuple[tuple[str,str],...]=(); attention_lock_timeout_seconds: float=5.0; primary_owner_identity_path: Path|None=None; attention_epoch_id: str|None=None; evaluator_enabled: bool=True
+ repository_root: Path; runtime_root: Path; observed_log_roots: tuple[Path,...]; poll_interval_seconds: int=300; no_progress_seconds: int=900; max_tail_bytes: int=65536; evaluator_command: tuple[str,...]=(); observed_sources: tuple[ObservedSource,...]=(); attention_logging_enabled: bool=False; attention_producers: tuple[tuple[str,str],...]=(); attention_lock_timeout_seconds: float=5.0; primary_owner_identity_path: Path|None=None; attention_epoch_id: str|None=None; evaluator_enabled: bool=False
 def _command(raw: Any)->tuple[str,...]:
  default=("codex","exec","--model","gpt-5.6-terra","-c",'model_reasoning_effort="high"',"--output-schema",str(SCHEMA_PATH),"-")
  command=raw if raw is not None else list(default)
@@ -56,7 +56,7 @@ def load_config(path: str|Path|None=None)->WatcherConfig:
  if identity_path is not None:
   try: identity_path.relative_to(repo)
   except ValueError as exc: raise ValueError("primary_owner_identity_path must stay in repository") from exc
- enabled=raw.get("evaluator_enabled",True)
+ enabled=raw.get("evaluator_enabled",False)
  if not isinstance(enabled,bool): raise ValueError("evaluator_enabled must be boolean")
  epoch=raw.get("attention_epoch_id")
  if epoch is not None and (not isinstance(epoch,str) or not epoch): raise ValueError("attention_epoch_id must be a non-empty string")

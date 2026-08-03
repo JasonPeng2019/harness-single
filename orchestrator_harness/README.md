@@ -198,3 +198,21 @@ python -m orchestrator_harness.operator_launch --receipt <absolute-receipt.json>
 It launches without a shell, writes an atomic receipt with PID plus provider creation identity,
 and fails closed if that identity cannot be proved. It is not imported or invoked by watcher paths
 and has no scheduling, acknowledgement, lease, hardware, or process-kill authority.
+
+### General coding lane invocation
+
+`python -m orchestrator_harness.lane_controller <invocation.json>` accepts the explicit
+`orchestrator-coding-invocation/v1` schema for one coding worker turn. The schema requires a
+`runtime_root`, confines the event log beneath that root, confines the prompt to `run_root`, and
+confines all output paths to `run_root/.agent-workspace`. Prompt bytes must match
+`prompt_sha256`. See `examples/coding.invocation.example.json` for the complete start shape.
+
+Coding invocations carry generic `resources` and Codex launch settings; they do not require the
+firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
+schema-less legacy firmware shape remains policy-bound. Any other explicit schema is rejected.
+
+For `resume`, reuse the same output paths and `worker_invocation_id`, and provide the prior thread as
+either `resume_thread_id` or `resume_identity.thread_id`. If `resume_identity` also includes
+`worker_invocation_id`, it must match the top-level value. The controller rejects requested worker
+or thread identities that differ from persisted status. Status and lane events record both
+`invocation_schema` and `worker_invocation_id`.

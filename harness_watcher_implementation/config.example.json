@@ -37,7 +37,7 @@
     "-"
   ],
   "attention_logging_enabled": false,
-  "evaluator_enabled": true,
+  "evaluator_enabled": false,
   "attention_producers": [
     {
       "role": "orchestrator",

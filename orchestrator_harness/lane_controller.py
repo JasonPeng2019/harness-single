@@ -1,8 +1,8 @@
 """Small, externally invoked controller for one persistent Codex lane turn.
 
-This module deliberately does not schedule lanes or inspect the firmware server.  It validates a
-manager-written invocation, launches one child, and leaves factual process/output records for the
-read-only harness to observe.
+The controller accepts either the original firmware/policy-bound invocation or the explicit
+general-coding schema. It does not schedule lanes: it validates one manager-written invocation,
+launches one child, and leaves factual process/output records for the read-only harness to observe.
 """
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ from .processes import process_snapshot
 
 class InvocationError(ValueError):
     pass
+
+
+CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 
 
 def _utc() -> str:
@@ -87,13 +90,15 @@ def _string_list(value: object, name: str) -> list[str]:
 
 @dataclass(frozen=True)
 class Invocation:
+    invocation_schema: str | None
+    worker_invocation_id: str | None
     action: str
     run_root: Path
     workspace: Path
     prompt_path: Path
     prompt_sha256: str
-    policy_path: Path
-    policy_sha256: str
+    policy_path: Path | None
+    policy_sha256: str | None
     label: str
     doer: str
     task: str
@@ -103,11 +108,14 @@ class Invocation:
     board_tokens: list[str]
     mcp_servers: list[str]
     server_snapshot: dict[str, Any]
+    resources: list[str]
     model: str
     reasoning_effort: str
     service_tier: str
     codex_command: list[str]
     config_overrides: list[str]
+    sandbox: str
+    approval_policy: str
     requested_thread_id: str | None
     status_path: Path
     jsonl_path: Path
@@ -116,24 +124,26 @@ class Invocation:
     event_log: Path
 
 
-def load_invocation(path: Path) -> Invocation:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise InvocationError(f"cannot read invocation: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise InvocationError("invocation root must be an object")
+def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, dict[str, Path]]:
     action = _string(raw, "action").lower()
     if action not in {"start", "resume"}:
         raise InvocationError("action must be start or resume")
     run_root_value = raw.get("run_root")
     if not isinstance(run_root_value, str) or not run_root_value:
         raise InvocationError("run_root must be a path")
-    run_root = Path(run_root_value).resolve(strict=True)
+    try:
+        run_root = Path(run_root_value).resolve(strict=True)
+    except OSError as exc:
+        raise InvocationError(f"run_root cannot be resolved: {exc}") from exc
+    if not run_root.is_dir():
+        raise InvocationError("run_root must be an existing directory")
     workspace = (run_root / ".agent-workspace").resolve(strict=False)
     if workspace.parent != run_root:
         raise InvocationError("invalid run workspace")
-    workspace.mkdir(exist_ok=True)
+    try:
+        workspace.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise InvocationError(f"cannot create run workspace: {exc}") from exc
     prompt_path = _safe_path(raw.get("prompt_path"), root=run_root, name="prompt_path", must_exist=True)
     outputs = raw.get("output_paths")
     if not isinstance(outputs, dict):
@@ -142,12 +152,38 @@ def load_invocation(path: Path) -> Invocation:
     jsonl_path = _safe_path(outputs.get("jsonl"), root=workspace, name="jsonl")
     stderr_path = _safe_path(outputs.get("stderr"), root=workspace, name="stderr")
     last_message_path = _safe_path(outputs.get("last_message"), root=workspace, name="last_message")
+    prompt_sha256 = _string(raw, "prompt_sha256").lower()
+    if len(prompt_sha256) != 64 or any(char not in "0123456789abcdef" for char in prompt_sha256):
+        raise InvocationError("prompt_sha256 must be a SHA-256 hex digest")
+    try:
+        prompt_bytes = prompt_path.read_bytes()
+    except OSError as exc:
+        raise InvocationError(f"cannot verify prompt: {exc}") from exc
+    if hashlib.sha256(prompt_bytes).hexdigest() != prompt_sha256:
+        raise InvocationError("prompt bytes do not match prompt_sha256")
+    return action, run_root, workspace, prompt_path, prompt_sha256, {
+        "status": status_path,
+        "jsonl": jsonl_path,
+        "stderr": stderr_path,
+        "last_message": last_message_path,
+    }
+
+
+def _resume_thread(raw: dict[str, Any]) -> str | None:
+    requested_thread = raw.get("resume_thread_id")
+    if requested_thread is not None and (not isinstance(requested_thread, str) or not requested_thread.strip()):
+        raise InvocationError("resume_thread_id must be a non-empty string when supplied")
+    return requested_thread.strip() if isinstance(requested_thread, str) else None
+
+
+def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
+    action, run_root, workspace, prompt_path, prompt_sha256, outputs = _common_paths(raw)
     label = _string(raw, "label")
     expected = {
         "status": f"{label}_controller.status.json",
         "jsonl": f"{label}_codex.jsonl",
     }
-    if status_path.name != expected["status"] or jsonl_path.name != expected["jsonl"]:
+    if outputs["status"].name != expected["status"] or outputs["jsonl"].name != expected["jsonl"]:
         raise InvocationError("controller status/JSONL names must match the lane label")
     server_snapshot = raw.get("server_snapshot")
     if not isinstance(server_snapshot, dict):
@@ -158,26 +194,21 @@ def load_invocation(path: Path) -> Invocation:
     command = raw.get("codex_command", ["codex"])
     command = _string_list(command, "codex_command")
     overrides = _string_list(raw.get("config_overrides", []), "config_overrides")
-    requested_thread = raw.get("resume_thread_id")
-    if requested_thread is not None and (not isinstance(requested_thread, str) or not requested_thread.strip()):
-        raise InvocationError("resume_thread_id must be a non-empty string when supplied")
+    requested_thread = _resume_thread(raw)
     suite_root = Path(__file__).resolve().parent.parent
     policy_path = suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.md"
     sidecar_path = suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.sha256"
     policy_sha256 = _string(raw, "policy_sha256").lower()
-    prompt_sha256 = _string(raw, "prompt_sha256").lower()
-    if any(len(value) != 64 or any(char not in "0123456789abcdef" for char in value) for value in (policy_sha256, prompt_sha256)):
-        raise InvocationError("policy_sha256 and prompt_sha256 must be SHA-256 hex digests")
+    if len(policy_sha256) != 64 or any(char not in "0123456789abcdef" for char in policy_sha256):
+        raise InvocationError("policy_sha256 must be a SHA-256 hex digest")
     try:
         policy_bytes = policy_path.read_bytes()
         sidecar = sidecar_path.read_text(encoding="utf-8").split()[0].lower()
-        prompt_bytes = prompt_path.read_bytes()
     except (OSError, IndexError) as exc:
         raise InvocationError(f"cannot verify policy-bound prompt: {exc}") from exc
     if hashlib.sha256(policy_bytes).hexdigest() != policy_sha256 or sidecar != policy_sha256:
         raise InvocationError("canonical policy file or sidecar does not match policy_sha256")
-    if hashlib.sha256(prompt_bytes).hexdigest() != prompt_sha256:
-        raise InvocationError("prompt bytes do not match prompt_sha256")
+    prompt_bytes = prompt_path.read_bytes()
     try:
         prompt_text = prompt_bytes.decode("utf-8-sig")
         policy_text = policy_bytes.decode("utf-8-sig")
@@ -198,12 +229,105 @@ def load_invocation(path: Path) -> Invocation:
         raise InvocationError("lane_event_log must be named LANE_EVENTS.jsonl")
     event_log.parent.mkdir(parents=True, exist_ok=True)
     return Invocation(
-        action, run_root, workspace, prompt_path, prompt_sha256, policy_path, policy_sha256, label, _string(raw, "doer"), _string(raw, "task"),
+        None, None, action, run_root, workspace, prompt_path,
+        prompt_sha256, policy_path, policy_sha256, label, _string(raw, "doer"), _string(raw, "task"),
         _string(raw, "phase"), _string(raw, "declared_lane_id"), _string_list(raw.get("leases", []), "leases"),
-        _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"), server_snapshot, _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
-        _string(model_settings, "service_tier"), command, overrides, requested_thread.strip() if requested_thread else None,
-        status_path, jsonl_path, stderr_path, last_message_path, event_log,
+        _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"),
+        server_snapshot, [], _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
+        _string(model_settings, "service_tier"), command, overrides, "danger-full-access", "never", requested_thread,
+        outputs["status"], outputs["jsonl"], outputs["stderr"], outputs["last_message"], event_log,
     )
+
+
+def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], list[str], str, str]:
+    codex = raw.get("codex", raw.get("codex_settings"))
+    if codex is not None and not isinstance(codex, dict):
+        raise InvocationError("codex must be an object")
+    settings = codex if isinstance(codex, dict) else raw.get("model_settings")
+    if not isinstance(settings, dict):
+        raise InvocationError("codex or model_settings must be an object")
+    command_value = settings.get("command", raw.get("codex_command", ["codex"]))
+    overrides_value = settings.get("config_overrides", raw.get("config_overrides", []))
+    sandbox = _string(settings, "sandbox")
+    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise InvocationError("sandbox must be read-only, workspace-write, or danger-full-access")
+    approval_policy = _string(settings, "approval_policy")
+    if approval_policy not in {"untrusted", "on-failure", "on-request", "never"}:
+        raise InvocationError("approval_policy is not a supported Codex approval policy")
+    return (
+        _string(settings, "model"),
+        _string(settings, "reasoning_effort"),
+        _string(settings, "service_tier"),
+        _string_list(command_value, "codex command"),
+        _string_list(overrides_value, "Codex config_overrides"),
+        sandbox,
+        approval_policy,
+    )
+
+
+def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
+    action, run_root, workspace, prompt_path, prompt_sha256, outputs = _common_paths(raw)
+    runtime_value = raw.get("runtime_root")
+    if not isinstance(runtime_value, str) or not runtime_value:
+        raise InvocationError("runtime_root must be a non-empty path string")
+    runtime_root = Path(runtime_value).expanduser().resolve(strict=False)
+    if not runtime_root.is_dir():
+        raise InvocationError("runtime_root must be an existing directory")
+    event_value = raw.get("event_log_path", raw.get("event_log", raw.get("lane_event_log")))
+    event_log = _safe_path(event_value, root=runtime_root, name="event_log_path")
+    event_log.parent.mkdir(parents=True, exist_ok=True)
+    worker_invocation_id = _string(raw, "worker_invocation_id")
+    lane_id_value = raw.get("lane_id", raw.get("declared_lane_id"))
+    if not isinstance(lane_id_value, str) or not lane_id_value.strip():
+        raise InvocationError("lane_id must be a non-empty string")
+    lane_id = lane_id_value.strip()
+    resources = _string_list(raw.get("resources", []), "resources")
+    model, reasoning, tier, command, overrides, sandbox, approval = _coding_settings(raw)
+    requested_thread = _resume_thread(raw)
+    resume_identity = raw.get("resume_identity", raw.get("resume"))
+    if resume_identity is not None:
+        if not isinstance(resume_identity, dict):
+            raise InvocationError("resume_identity must be an object")
+        identity_worker = resume_identity.get("worker_invocation_id")
+        identity_thread = resume_identity.get("thread_id")
+        if identity_worker is not None and identity_worker != worker_invocation_id:
+            raise InvocationError("resume identity worker_invocation_id mismatch")
+        if identity_thread is not None and (not isinstance(identity_thread, str) or not identity_thread.strip()):
+            raise InvocationError("resume identity thread_id must be a non-empty string")
+        normalized_identity_thread = identity_thread.strip() if isinstance(identity_thread, str) else None
+        if requested_thread and normalized_identity_thread and requested_thread != normalized_identity_thread:
+            raise InvocationError("conflicting requested resume thread IDs")
+        requested_thread = requested_thread or normalized_identity_thread
+    label_value = raw.get("label", worker_invocation_id)
+    if not isinstance(label_value, str) or not label_value.strip():
+        raise InvocationError("label must be a non-empty string when supplied")
+    doer_value = raw.get("doer", lane_id)
+    if not isinstance(doer_value, str) or not doer_value.strip():
+        raise InvocationError("doer must be a non-empty string when supplied")
+    return Invocation(
+        CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
+        prompt_sha256, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
+        _string(raw, "phase"), lane_id, [], [], [], {}, resources, model, reasoning, tier, command,
+        overrides, sandbox, approval, requested_thread, outputs["status"], outputs["jsonl"],
+        outputs["stderr"], outputs["last_message"], event_log,
+    )
+
+
+def load_invocation(path: Path) -> Invocation:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InvocationError(f"cannot read invocation: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise InvocationError("invocation root must be an object")
+    schema = raw.get("schema")
+    if schema is not None and (not isinstance(schema, str) or not schema):
+        raise InvocationError("schema must be a non-empty string when supplied")
+    if schema == CODING_INVOCATION_SCHEMA:
+        return _load_coding_invocation(raw)
+    if schema is None:
+        return _load_firmware_invocation(raw)
+    raise InvocationError(f"unsupported invocation schema: {schema}")
 
 
 def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> ProcessInfo:
@@ -231,23 +355,46 @@ def _thread_id(line: bytes) -> str | None:
     return None
 
 
-def _read_prior_thread(invocation: Invocation) -> str | None:
+def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
     if not invocation.status_path.is_file():
         return None
     try:
         value = json.loads(invocation.status_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    thread = value.get("thread_id") if isinstance(value, dict) else None
-    return thread if isinstance(thread, str) and thread else None
+    return value if isinstance(value, dict) else None
+
+
+def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "utc": _utc(),
+        "event": event,
+        "label": invocation.label,
+        "declared_lane_id": invocation.lane_id,
+        "invocation_schema": invocation.invocation_schema,
+        "worker_invocation_id": invocation.worker_invocation_id,
+    }
+    value.update(fields)
+    return value
 
 
 def run(invocation: Invocation) -> int:
     prompt = invocation.prompt_path.read_bytes()
     if not prompt:
-        raise InvocationError("policy-bound prompt is empty")
-    prior_thread = _read_prior_thread(invocation)
+        raise InvocationError("prompt is empty")
+    prior_status = _read_prior_status(invocation)
+    prior_thread_value = prior_status.get("thread_id") if prior_status else None
+    prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
     if invocation.action == "resume":
+        if invocation.worker_invocation_id is not None:
+            if prior_status is None:
+                raise InvocationError("coding resume requires persisted controller status")
+            if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
+                raise InvocationError("resume worker_invocation_id does not match persisted status")
+            if prior_status.get("invocation_schema") != invocation.invocation_schema:
+                raise InvocationError("resume invocation schema does not match persisted status")
+            if prior_thread is None:
+                raise InvocationError("coding resume requires a persisted lane thread ID")
         thread = invocation.requested_thread_id or prior_thread
         if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
             raise InvocationError("resume requires the persisted lane thread ID")
@@ -257,11 +404,18 @@ def run(invocation: Invocation) -> int:
     argv = [*invocation.codex_command, "exec"]
     if invocation.action == "resume":
         argv.extend(["resume", thread])  # type: ignore[arg-type]
+    if invocation.worker_invocation_id is None:
+        argv.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        argv.extend(["--sandbox", invocation.sandbox])
     argv.extend([
-        "--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "--skip-git-repo-check",
-        "-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"', "-m", invocation.model,
-        "-c", f'model_reasoning_effort="{invocation.reasoning_effort}"', "-c", f'service_tier="{invocation.service_tier}"',
+        "--ignore-user-config", "--skip-git-repo-check",
+        "-c", f'approval_policy="{invocation.approval_policy}"', "-m", invocation.model,
+        "-c", f'model_reasoning_effort="{invocation.reasoning_effort}"',
+        "-c", f'service_tier="{invocation.service_tier}"',
     ])
+    if invocation.worker_invocation_id is None:
+        argv.extend(["-c", 'approvals_reviewer="user"'])
     for override in invocation.config_overrides:
         argv.extend(["-c", override])
     argv.extend(["--json", "--output-last-message", str(invocation.last_message_path)])
@@ -270,18 +424,25 @@ def run(invocation: Invocation) -> int:
     argv.append("-")
     state: dict[str, Any] = {
         "schema": "orchestrator-lane-controller/v1", "state": "LAUNCH_FAILED", "started_utc": _utc(),
+        "invocation_schema": invocation.invocation_schema,
+        "worker_invocation_id": invocation.worker_invocation_id,
         "controller_pid": controller.pid, "controller_started_utc": iso_utc(controller.created_utc),
         "controller_created_utc": iso_utc(controller.created_utc), "codex_pid": None, "codex_started_utc": None,
         "doer": invocation.doer, "task": invocation.task, "phase": invocation.phase,
         "declared_lane_id": invocation.lane_id, "thread_id": thread, "leases": invocation.leases,
         "board_tokens": invocation.board_tokens, "mcp_servers": invocation.mcp_servers,
-        "server_snapshot": invocation.server_snapshot, "jsonl_path": str(invocation.jsonl_path),
+        "server_snapshot": invocation.server_snapshot, "resources": invocation.resources,
+        "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path), "last_message_path": str(invocation.last_message_path),
         "prompt_path": str(invocation.prompt_path), "prompt_sha256": invocation.prompt_sha256,
-        "policy_path": str(invocation.policy_path), "policy_sha256": invocation.policy_sha256,
+        "policy_path": str(invocation.policy_path) if invocation.policy_path is not None else None,
+        "policy_sha256": invocation.policy_sha256,
         "launcher_settings": {"model": invocation.model, "model_reasoning_effort": invocation.reasoning_effort,
-            "service_tier": invocation.service_tier, "sandbox": "danger-full-access", "approval_policy": "never",
-            "approvals_reviewer": "user", "jsonl": True, "ephemeral": False, "action": invocation.action, "argv": argv[:-1]},
+            "service_tier": invocation.service_tier, "sandbox": invocation.sandbox,
+            "approval_policy": invocation.approval_policy,
+            "approvals_reviewer": "user" if invocation.worker_invocation_id is None else None,
+            "config_overrides": invocation.config_overrides,
+            "jsonl": True, "ephemeral": False, "action": invocation.action, "argv": argv[:-1]},
     }
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
@@ -291,7 +452,9 @@ def run(invocation: Invocation) -> int:
             child = _identity(process.pid, parent=controller.pid)
             state.update({"state": "RUNNING_CODEX", "codex_pid": child.pid, "codex_started_utc": iso_utc(child.created_utc), "codex_created_utc": iso_utc(child.created_utc)})
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, {"utc": _utc(), "event": "CODEX_STARTED", "label": invocation.label, "declared_lane_id": invocation.lane_id, "controller_pid": controller.pid, "codex_pid": child.pid})
+            _append_event(invocation.event_log, _event(
+                invocation, "CODEX_STARTED", controller_pid=controller.pid, codex_pid=child.pid,
+            ))
             assert process.stdin is not None and process.stdout is not None and process.stderr is not None
             process.stdin.write(prompt); process.stdin.close()
             def drain(source: Any, destination: Any, parse: bool) -> None:
@@ -312,11 +475,13 @@ def run(invocation: Invocation) -> int:
         if invocation.action == "start" and not state.get("thread_id"):
             state.update({"state": "LAUNCH_FAILED", "exit_code": exit_code, "ended_utc": _utc(), "error": "Codex exited without thread.started/thread_id; inspect stderr_path"})
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, {"utc": _utc(), "event": "LAUNCH_FAILED", "label": invocation.label, "declared_lane_id": invocation.lane_id, "exit_code": exit_code})
+            _append_event(invocation.event_log, _event(invocation, "LAUNCH_FAILED", exit_code=exit_code))
             return 1
         state.update({"state": "CODEX_EXITED", "exit_code": exit_code, "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, {"utc": _utc(), "event": "CODEX_EXITED", "label": invocation.label, "declared_lane_id": invocation.lane_id, "exit_code": exit_code, "thread_id": state.get("thread_id")})
+        _append_event(invocation.event_log, _event(
+            invocation, "CODEX_EXITED", exit_code=exit_code, thread_id=state.get("thread_id"),
+        ))
         return exit_code
     except KeyboardInterrupt:
         if process is not None and process.poll() is None:
@@ -324,7 +489,7 @@ def run(invocation: Invocation) -> int:
             process.wait(timeout=5)
         state.update({"state": "CONTROLLER_INTERRUPTED", "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, {"utc": _utc(), "event": "CONTROLLER_INTERRUPTED", "label": invocation.label, "declared_lane_id": invocation.lane_id})
+        _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
         return 130
     except Exception as exc:
         if process is not None and process.poll() is None:
@@ -332,7 +497,7 @@ def run(invocation: Invocation) -> int:
             process.wait(timeout=5)
         state.update({"state": "CONTROLLER_FAILED" if state.get("codex_pid") else "LAUNCH_FAILED", "ended_utc": _utc(), "error": str(exc)})
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, {"utc": _utc(), "event": state["state"], "label": invocation.label, "declared_lane_id": invocation.lane_id, "error": str(exc)})
+        _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
 
 

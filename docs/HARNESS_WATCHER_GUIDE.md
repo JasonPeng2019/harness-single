@@ -110,11 +110,11 @@ failed.
 ## Evaluator modes and M5 diagnostic-only operation
 
 `evaluator_enabled` is independent of the global watcher feature flag. The normal default is
-`true`: the watcher may construct the configured Terra evaluator and create evaluator-derived
-alerts. For an M5 **counted sprint**, set it to `false`; this is the required diagnostic-only
-mode. It still reads sources, advances cursors, ingests attention, writes reports and health/POLL
-evidence, and detects owner loss, but it never launches or invokes an evaluator and emits no
-evaluator-derived alert. A post-sprint reviewer examines retained evidence only after cleanup.
+`false`: the watcher remains deterministic and diagnostic-only unless a configuration explicitly
+sets the field to `true`. In passive mode it still reads sources, advances cursors, ingests
+attention, writes reports and health/POLL evidence, and detects owner loss, but it never launches
+or invokes an evaluator and emits no evaluator-derived alert. A post-sprint reviewer examines
+retained evidence only after cleanup.
 
 Diagnostic attention analysis also consumes passive `HARNESS_EVENT_INELIGIBLE` records for
 `ALREADY_ANSWERED`, `INVALID_LANE_ID`, and `LANE_NOT_LIVE`. These records explain why a signal was
