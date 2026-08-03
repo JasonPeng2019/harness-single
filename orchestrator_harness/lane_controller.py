@@ -97,6 +97,7 @@ class Invocation:
     workspace: Path
     prompt_path: Path
     prompt_sha256: str
+    prompt_bytes: bytes
     policy_path: Path | None
     policy_sha256: str | None
     label: str
@@ -124,7 +125,7 @@ class Invocation:
     event_log: Path
 
 
-def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, dict[str, Path]]:
+def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
     action = _string(raw, "action").lower()
     if action not in {"start", "resume"}:
         raise InvocationError("action must be start or resume")
@@ -161,7 +162,7 @@ def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, dict
         raise InvocationError(f"cannot verify prompt: {exc}") from exc
     if hashlib.sha256(prompt_bytes).hexdigest() != prompt_sha256:
         raise InvocationError("prompt bytes do not match prompt_sha256")
-    return action, run_root, workspace, prompt_path, prompt_sha256, {
+    return action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, {
         "status": status_path,
         "jsonl": jsonl_path,
         "stderr": stderr_path,
@@ -177,7 +178,7 @@ def _resume_thread(raw: dict[str, Any]) -> str | None:
 
 
 def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
-    action, run_root, workspace, prompt_path, prompt_sha256, outputs = _common_paths(raw)
+    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     label = _string(raw, "label")
     expected = {
         "status": f"{label}_controller.status.json",
@@ -208,7 +209,6 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
         raise InvocationError(f"cannot verify policy-bound prompt: {exc}") from exc
     if hashlib.sha256(policy_bytes).hexdigest() != policy_sha256 or sidecar != policy_sha256:
         raise InvocationError("canonical policy file or sidecar does not match policy_sha256")
-    prompt_bytes = prompt_path.read_bytes()
     try:
         prompt_text = prompt_bytes.decode("utf-8-sig")
         policy_text = policy_bytes.decode("utf-8-sig")
@@ -230,7 +230,8 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
     event_log.parent.mkdir(parents=True, exist_ok=True)
     return Invocation(
         None, None, action, run_root, workspace, prompt_path,
-        prompt_sha256, policy_path, policy_sha256, label, _string(raw, "doer"), _string(raw, "task"),
+        prompt_sha256, prompt_bytes, policy_path, policy_sha256, label, _string(raw, "doer"),
+        _string(raw, "task"),
         _string(raw, "phase"), _string(raw, "declared_lane_id"), _string_list(raw.get("leases", []), "leases"),
         _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"),
         server_snapshot, [], _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
@@ -266,7 +267,7 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
 
 
 def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
-    action, run_root, workspace, prompt_path, prompt_sha256, outputs = _common_paths(raw)
+    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     runtime_value = raw.get("runtime_root")
     if not isinstance(runtime_value, str) or not runtime_value:
         raise InvocationError("runtime_root must be a non-empty path string")
@@ -306,7 +307,7 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         raise InvocationError("doer must be a non-empty string when supplied")
     return Invocation(
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
-        prompt_sha256, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
+        prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
         _string(raw, "phase"), lane_id, [], [], [], {}, resources, model, reasoning, tier, command,
         overrides, sandbox, approval, requested_thread, outputs["status"], outputs["jsonl"],
         outputs["stderr"], outputs["last_message"], event_log,
@@ -379,7 +380,7 @@ def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
 
 
 def run(invocation: Invocation) -> int:
-    prompt = invocation.prompt_path.read_bytes()
+    prompt = invocation.prompt_bytes
     if not prompt:
         raise InvocationError("prompt is empty")
     prior_status = _read_prior_status(invocation)
@@ -465,13 +466,31 @@ def run(invocation: Invocation) -> int:
                         found = _thread_id(line)
                         if found:
                             with lock:
-                                state["thread_id"] = found
+                                if invocation.action == "resume" and found != thread:
+                                    state["thread_identity_error"] = (
+                                        f"child thread.started identity {found!r} does not match "
+                                        f"validated resume thread {thread!r}"
+                                    )
+                                else:
+                                    state["thread_id"] = found
                                 _atomic_json(invocation.status_path, state)
             out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
             err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
             out_thread.start(); err_thread.start()
             exit_code = process.wait(); out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
+        thread_identity_error = state.get("thread_identity_error")
+        if isinstance(thread_identity_error, str):
+            state.update({
+                "state": "CONTROLLER_FAILED", "exit_code": exit_code, "ended_utc": _utc(),
+                "error": thread_identity_error,
+            })
+            _atomic_json(invocation.status_path, state)
+            _append_event(invocation.event_log, _event(
+                invocation, "CONTROLLER_FAILED", exit_code=exit_code, error=thread_identity_error,
+                thread_id=state.get("thread_id"),
+            ))
+            return 1
         if invocation.action == "start" and not state.get("thread_id"):
             state.update({"state": "LAUNCH_FAILED", "exit_code": exit_code, "ended_utc": _utc(), "error": "Codex exited without thread.started/thread_id; inspect stderr_path"})
             _atomic_json(invocation.status_path, state)
