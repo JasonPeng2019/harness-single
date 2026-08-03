@@ -1,0 +1,30 @@
+{
+  "suite_root": "..",
+  "run_globs": [
+    "fresh-experiments/A21_20260726-052146",
+    "fresh-experiments/A22_20260726-062324",
+    "fresh-experiments/A24_20260726-052146",
+    "fresh-experiments/A25_20260726-052147",
+    "fresh-experiments/A26_20260726-062325",
+    "fresh-experiments/D30_20260726-082524",
+    "fresh-experiments/D31_20260726-062325",
+    "fresh-experiments/D32_20260726-082524",
+    "fresh-experiments/D34_20260726-072852",
+    "fresh-experiments/Q40_20260730-000000",
+    "fresh-experiments/Q41_20260726-111328"
+  ],
+  "workspace_relpath": ".agent-workspace",
+  "output_dir": "canary-20260731-s1-state",
+  "poll_interval_seconds": 1.0,
+  "watch_timeout_seconds": 60.0,
+  "manager_review_interval_seconds": 180,
+  "lane_no_progress_seconds": 600,
+  "manager_heartbeat_timeout_seconds": 420,
+  "request_warning_seconds": 120,
+  "request_critical_seconds": 30,
+  "process_start_tolerance_seconds": 2,
+  "max_json_bytes": 4000000,
+  "max_jsonl_tail_bytes": 512000,
+  "stable_read_retries": 4,
+  "stable_read_delay_seconds": 0.03
+}

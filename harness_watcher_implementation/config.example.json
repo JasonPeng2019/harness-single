@@ -1,0 +1,52 @@
+{
+  "poll_interval_seconds": 300,
+  "observed_sources": [
+    {
+      "path": "multi-agent-logs/orchestrator-harness/example-epoch/MANAGER_LOG.jsonl",
+      "role": "orchestrator",
+      "source_id": "main-orchestrator"
+    },
+    {
+      "path": "multi-agent-logs/orchestrator-harness/example-epoch/events.jsonl",
+      "role": "harness",
+      "source_id": "managed-harness"
+    },
+    {
+      "path": "multi-agent-logs/orchestrator-harness/example-epoch/LANE_EVENTS.jsonl",
+      "role": "subagent",
+      "source_id": "lane-events"
+    },
+    {
+      "path": "multi-agent-logs/orchestrator-harness/example-epoch/attention-events.jsonl",
+      "role": "harness",
+      "source_id": "managed-harness"
+    }
+  ],
+  "runtime_root": "harness_watcher",
+  "no_progress_seconds": 900,
+  "max_tail_bytes": 65536,
+  "evaluator_command": [
+    "codex",
+    "exec",
+    "--model",
+    "gpt-5.6-terra",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "--output-schema",
+    "REPLACED_BY_LOADER",
+    "-"
+  ],
+  "attention_logging_enabled": false,
+  "evaluator_enabled": true,
+  "attention_producers": [
+    {
+      "role": "orchestrator",
+      "source_id": "main-orchestrator"
+    },
+    {
+      "role": "subagent",
+      "source_id": "lane-events"
+    }
+  ],
+  "attention_lock_timeout_seconds": 5.0
+}

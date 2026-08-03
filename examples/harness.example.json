@@ -1,0 +1,23 @@
+{
+  "suite_root": "../../TARGET_SUITE",
+  "run_globs": [
+    "fresh-experiments/*"
+  ],
+  "workspace_relpath": ".agent-workspace",
+  "output_dir": "../runtime/orchestrator-harness/example-epoch",
+  "poll_interval_seconds": 1.0,
+  "watch_timeout_seconds": 60.0,
+  "manager_review_interval_seconds": 300,
+  "lane_no_progress_seconds": 600,
+  "manager_heartbeat_timeout_seconds": 420,
+  "request_warning_seconds": 120,
+  "request_critical_seconds": 30,
+  "process_start_tolerance_seconds": 2,
+  "max_json_bytes": 4000000,
+  "max_jsonl_tail_bytes": 512000,
+  "stable_read_retries": 4,
+  "stable_read_delay_seconds": 0.03,
+  "attention_logging_enabled": false,
+  "attention_epoch_id": "replace-with-fresh-epoch-id"
+}
+
