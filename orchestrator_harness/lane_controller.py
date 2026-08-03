@@ -279,6 +279,15 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
 
 def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
+    if (
+        outputs["status"].parent != workspace
+        or outputs["status"].suffix != ".json"
+        or outputs["status"].name.startswith(".")
+        or outputs["status"].name == "RESULT.json"
+    ):
+        raise InvocationError(
+            "coding controller status must be a direct, non-hidden *.json file under .agent-workspace"
+        )
     runtime_value = raw.get("runtime_root")
     if not isinstance(runtime_value, str) or not runtime_value:
         raise InvocationError("runtime_root must be a non-empty path string")

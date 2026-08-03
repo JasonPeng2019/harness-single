@@ -57,7 +57,9 @@ class RunRecords:
     mcp_records: tuple[JsonRecord, ...]
     checkpoint: StableBytes | None
     result: JsonRecord | None
+    result_status_path: Path | None
     invalid_result: dict[str, Any] | None
+    invalid_result_status_path: Path | None
     manager_signals: tuple[ManagerSignalRecord, ...]
     errors: tuple[ObservationError, ...]
 
@@ -234,10 +236,27 @@ def discover_run(
 ) -> RunRecords:
     errors: list[ObservationError] = []
     controllers: list[ControllerRecord] = []
-    for path in sorted(workspace.glob("*_controller.status.json")):
+    conventional_statuses = set(workspace.glob("*_controller.status.json"))
+    coding_candidates = set(workspace.glob("*.json")) - conventional_statuses
+    for path in sorted(conventional_statuses | coding_candidates):
         try:
             status = _json_record(path, config)
-            label = path.name[: -len("_controller.status.json")]
+            conventional = path in conventional_statuses
+            if not conventional and not (
+                status.value.get("schema") == "orchestrator-lane-controller/v1"
+                and status.value.get("invocation_schema")
+                == "orchestrator-coding-invocation/v1"
+            ):
+                continue
+            label = (
+                path.name[: -len("_controller.status.json")]
+                if conventional
+                else str(
+                    status.value.get("label")
+                    or status.value.get("worker_invocation_id")
+                    or path.stem
+                )
+            )
             candidates = [
                 workspace / f"{label}_codex.jsonl",
                 workspace / "test_agent_codex.jsonl",
@@ -259,6 +278,8 @@ def discover_run(
                 )
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if path not in conventional_statuses:
+                continue
             errors.append(
                 ObservationError(str(path), "CONTROLLER_READ_ERROR", str(exc))
             )
@@ -340,46 +361,79 @@ def discover_run(
             )
 
     result = None
+    result_status_path = None
     invalid_result = None
+    invalid_result_status_path = None
     result_path = workspace / "RESULT.json"
-    latest_controller = max(
-        controllers,
-        key=lambda item: item.status.stable.mtime_ns,
-        default=None,
-    )
-    coding_status = (
-        latest_controller.status.value
-        if latest_controller is not None
-        and latest_controller.status.value.get("invocation_schema")
+    coding_controllers = [
+        item
+        for item in controllers
+        if item.status.value.get("invocation_schema")
         == "orchestrator-coding-invocation/v1"
-        else None
-    )
+    ]
+    firmware_controllers = [
+        item
+        for item in controllers
+        if item.status.value.get("invocation_schema") is None
+    ]
+    coding_route = bool(coding_controllers) and not firmware_controllers
+    coding_owner: ControllerRecord | None = None
     if result_path.exists():
         try:
             candidate = _json_record(result_path, config)
-            if coding_status is None:
-                result = candidate
-            else:
-                lane_id = coding_status.get("declared_lane_id")
-                worker_id = coding_status.get("worker_invocation_id")
-                if not isinstance(lane_id, str) or not lane_id:
-                    raise GitSafetyError("coding controller status has no current lane_id")
-                if not isinstance(worker_id, str) or not worker_id:
-                    raise GitSafetyError("coding controller status has no current worker_invocation_id")
+            coding_route = (
+                candidate.value.get("schema") is not None
+                or "worker_invocation_id" in candidate.value
+            )
+            if coding_route:
+                lane_id = candidate.value.get("lane_id")
+                worker_id = candidate.value.get("worker_invocation_id")
+                lane_matches = [
+                    item
+                    for item in coding_controllers
+                    if item.status.value.get("declared_lane_id") == lane_id
+                ]
+                if lane_matches:
+                    coding_owner = max(
+                        lane_matches,
+                        key=lambda item: item.status.stable.mtime_ns,
+                    )
+                if (
+                    coding_owner is None
+                    or coding_owner.status.value.get("worker_invocation_id") != worker_id
+                ):
+                    raise GitSafetyError(
+                        "coding result does not match a current coding lane and worker invocation"
+                    )
+                coding_status = coding_owner.status.value
                 declaration = declaration_from_status(coding_status, run_root)
                 validate_coding_result(
                     candidate.value,
-                    lane_id=lane_id,
-                    worker_invocation_id=worker_id,
+                    lane_id=str(coding_status["declared_lane_id"]),
+                    worker_invocation_id=str(coding_status["worker_invocation_id"]),
                     declaration=declaration,
                 )
                 result = candidate
+                result_status_path = coding_owner.status.path
+            else:
+                if len(firmware_controllers) > 1:
+                    raise ValueError("legacy firmware result has ambiguous controller ownership")
+                if not firmware_controllers and coding_controllers:
+                    coding_route = True
+                    if len(coding_controllers) == 1:
+                        coding_owner = coding_controllers[0]
+                    raise GitSafetyError(
+                        "firmware-shaped result is not valid for a coding lane"
+                    )
+                result = candidate
+                if firmware_controllers:
+                    result_status_path = firmware_controllers[0].status.path
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            code = "CODING_RESULT_INVALID" if coding_status is not None else "RESULT_READ_ERROR"
+            code = "CODING_RESULT_INVALID" if coding_route else "RESULT_READ_ERROR"
             errors.append(
                 ObservationError(str(result_path), code, str(exc)[:500])
             )
-            if coding_status is not None:
+            if coding_route:
                 sha256 = None
                 try:
                     stable = read_stable(
@@ -392,6 +446,9 @@ def discover_run(
                 except OSError:
                     pass
                 invalid_result = invalid_result_evidence(result_path, str(exc), sha256=sha256)
+                invalid_result_status_path = (
+                    coding_owner.status.path if coding_owner is not None else None
+                )
 
     signals_root = workspace / "manager-signals"
     signal_ids: dict[str, list[ManagerSignalRecord]] = {}
@@ -432,7 +489,9 @@ def discover_run(
         mcp_records=tuple(mcp_records),
         checkpoint=checkpoint,
         result=result,
+        result_status_path=result_status_path,
         invalid_result=invalid_result,
+        invalid_result_status_path=invalid_result_status_path,
         manager_signals=tuple(manager_signals),
         errors=tuple(errors),
     )

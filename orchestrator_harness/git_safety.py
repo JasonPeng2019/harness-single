@@ -39,7 +39,7 @@ _RESULT_OUTCOMES = {"PASS", "FAIL", "BLOCKED"}
 _CHECK_OUTCOMES = {"PASS", "FAIL", "SKIP", "NOT_RUN"}
 _MAX_STATUS_BYTES = 256 * 1024
 _MAX_WORKTREES = 256
-_MAX_STATUSES_PER_WORKTREE = 128
+_MAX_JSON_CANDIDATES_PER_WORKTREE = 256
 
 
 def _normalized_path(path: Path) -> str:
@@ -96,7 +96,18 @@ def declaration_from_status(raw: Mapping[str, Any], run_root: Path) -> GitDeclar
 
 
 def _git(cwd: Path, *args: str, allow_failure: bool = False) -> str | None:
-    env = os.environ.copy()
+    preserved = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "SYSTEMDRIVE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    )
+    env = {key: os.environ[key] for key in preserved if key in os.environ}
     env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
     try:
         completed = subprocess.run(
@@ -213,9 +224,9 @@ def active_declaration_conflicts(
         workspace = root / ".agent-workspace"
         if not workspace.is_dir():
             continue
-        paths = sorted(workspace.glob("*.status.json"))
-        if len(paths) > _MAX_STATUSES_PER_WORKTREE:
-            raise GitSafetyError(f"too many controller status records under {workspace}")
+        paths = sorted(workspace.glob("*.json"))
+        if len(paths) > _MAX_JSON_CANDIDATES_PER_WORKTREE:
+            raise GitSafetyError(f"too many JSON candidates under {workspace}")
         for path in paths:
             if _normalized_path(path) == current or path.is_symlink() or not path.is_file():
                 continue

@@ -1093,9 +1093,21 @@ def reconcile(
                     "backend unavailable",
                 )
             )
-            if run.invalid_result is not None:
+            owns_invalid_result = (
+                run.invalid_result is not None
+                and run.invalid_result_status_path is not None
+                and lane["status_path"] == str(run.invalid_result_status_path)
+            )
+            owns_result = (
+                run.result is not None
+                and run.result_status_path is not None
+                and lane["status_path"] == str(run.result_status_path)
+            )
+            if owns_invalid_result:
+                assert run.invalid_result is not None
                 lane["invalid_result"] = dict(run.invalid_result)
-            if run.result is not None:
+            if owns_result:
+                assert run.result is not None
                 lane["operational_state"] = "TERMINAL_RESULT"
                 lane["result_path"] = str(run.result.path)
                 lane["result_sha256"] = run.result.stable.sha256

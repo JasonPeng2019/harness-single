@@ -207,8 +207,13 @@ and has no scheduling, acknowledgement, lease, hardware, or process-kill authori
 confines all output paths to `run_root/.agent-workspace`. Prompt bytes must match
 `prompt_sha256`. It also requires a `repository` object declaring the actual Git `common_dir`,
 `worktree_root` (which must equal `run_root`), attached short `branch`, and full `base_commit`.
+The coding controller status path must be a direct, non-hidden lowercase `*.json` file under
+`.agent-workspace` and cannot be the reserved `RESULT.json`. This lets duplicate detection inspect
+every permitted status path while ignoring JSON files without the coding controller schemas.
 The controller obtains all Git facts with bounded `subprocess` argv calls and never invokes a
-shell. See `examples/coding.invocation.example.json` for the complete start shape.
+shell. Git inspection uses a minimal execution environment and does not inherit repository,
+worktree, object, index, or Git configuration redirection variables. See
+`examples/coding.invocation.example.json` for the complete start shape.
 
 Coding invocations carry generic `resources` and Codex launch settings; they do not require the
 firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
@@ -255,4 +260,6 @@ branch tip, and the project worktree must be clean. Ordinary ignored runtime sta
 Git. Invalid coding result evidence is bounded in controller status and the reconciled snapshot;
 it disappears from the current snapshot when a corrected valid result replaces it. A firmware
 shaped result is never accepted for a coding controller. Schema-less firmware lanes retain their
-legacy result route.
+legacy result route. Discovery binds a coding result to the exact controller status matching both
+its lane and worker invocation, so controller recency in another lane cannot reroute the result.
+A schema-less legacy result binds only when one firmware controller owns that run workspace.
