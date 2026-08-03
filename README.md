@@ -134,5 +134,6 @@ authorization, lease, relay, and physical cleanup rules.
 - `QUICK_RULES.md`: authority and safety rules.
 - `orchestrator_harness/README.md`: command and contract reference.
 - `orchestrator_harness/SPEC.md`: observer requirements, including the legacy firmware path.
-- `docs/HARNESS_WATCHER_GUIDE.md`: optional diagnostic watcher.
+- `docs/HARNESS_WATCHER_GUIDE.md`: optional diagnostic watcher; its M5 and named-experiment
+  procedures are retained legacy firmware compatibility guidance.
 - `PORTABLE_CONTENTS.md`: packaged contents and exclusions.

@@ -1,5 +1,10 @@
 # Harness Watcher operating guide
 
+> **Legacy firmware compatibility:** The M5 counted-sprint workflow, named experiment roles, MCP,
+> hardware, lease, relay, and server-repair procedures below describe the supported legacy firmware
+> path. They are not the current ordinary coding workflow. For general coding operation, start with
+> `QUICK_START.md` and keep the optional watcher deterministic with evaluation disabled.
+
 The Harness Watcher is an **optional deterministic, read-only diagnostic service** around the
 required `orchestrator_harness`. It is not an AI subagent, suite manager, wake bridge, or replacement
 for the managed harness event loop. It tails configured logs, records health and attention evidence,

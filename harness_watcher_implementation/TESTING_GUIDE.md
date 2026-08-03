@@ -1,4 +1,8 @@
-# Harness Watcher testing guide — final
+# Harness Watcher testing guide - legacy firmware compatibility
+
+The MCP-Trial-3, counted-sprint, canary, and production-source-routing instructions in this guide
+are retained for the supported legacy firmware path. They are not required for current ordinary
+coding operation or its disposable fixture; use `QUICK_START.md` for the general coding path.
 
 Run from `MCP-Trial-3`:
 
