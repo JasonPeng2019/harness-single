@@ -31,6 +31,7 @@ from .git_safety import (
 )
 from .models import ProcessInfo, iso_utc
 from .processes import process_snapshot
+from .resource_locks import ResourceClaims, ResourceLockError
 
 
 class InvocationError(ValueError):
@@ -93,7 +94,9 @@ def _string(raw: dict[str, Any], key: str) -> str:
 
 
 def _string_list(value: object, name: str) -> list[str]:
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
         raise InvocationError(f"{name} must be a list of non-empty strings")
     return list(value)
 
@@ -120,6 +123,7 @@ class Invocation:
     mcp_servers: list[str]
     server_snapshot: dict[str, Any]
     resources: list[str]
+    resource_lock_root: Path | None
     model: str
     reasoning_effort: str
     service_tier: str
@@ -245,7 +249,7 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
         _string(raw, "task"),
         _string(raw, "phase"), _string(raw, "declared_lane_id"), _string_list(raw.get("leases", []), "leases"),
         _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"),
-        server_snapshot, [], _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
+        server_snapshot, [], None, _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
         _string(model_settings, "service_tier"), command, overrides, "danger-full-access", "never", requested_thread, None,
         outputs["status"], outputs["jsonl"], outputs["stderr"], outputs["last_message"], event_log,
     )
@@ -294,6 +298,12 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     runtime_root = Path(runtime_value).expanduser().resolve(strict=False)
     if not runtime_root.is_dir():
         raise InvocationError("runtime_root must be an existing directory")
+    lock_value = raw.get("resource_lock_root", str(runtime_root / "coding-resource-locks"))
+    resource_lock_root = _safe_path(
+        lock_value, root=runtime_root, name="resource_lock_root"
+    )
+    if resource_lock_root == runtime_root:
+        raise InvocationError("resource_lock_root must be below runtime_root")
     event_value = raw.get("event_log_path", raw.get("event_log", raw.get("lane_event_log")))
     event_log = _safe_path(event_value, root=runtime_root, name="event_log_path")
     event_log.parent.mkdir(parents=True, exist_ok=True)
@@ -332,7 +342,8 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     return Invocation(
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
         prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
-        _string(raw, "phase"), lane_id, [], [], [], {}, resources, model, reasoning, tier, command,
+        _string(raw, "phase"), lane_id, [], [], [], {}, resources, resource_lock_root,
+        model, reasoning, tier, command,
         overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
         outputs["stderr"], outputs["last_message"], event_log,
     )
@@ -541,6 +552,9 @@ def run(invocation: Invocation) -> int:
         "declared_lane_id": invocation.lane_id, "thread_id": thread, "leases": invocation.leases,
         "board_tokens": invocation.board_tokens, "mcp_servers": invocation.mcp_servers,
         "server_snapshot": invocation.server_snapshot, "resources": invocation.resources,
+        "resource_lock_root": str(invocation.resource_lock_root) if invocation.resource_lock_root else None,
+        "held_resource_claims": [], "waiting_resource_claim": None,
+        "resource_claim_findings": [],
         "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path), "last_message_path": str(invocation.last_message_path),
         "prompt_path": str(invocation.prompt_path), "prompt_sha256": invocation.prompt_sha256,
@@ -565,7 +579,34 @@ def run(invocation: Invocation) -> int:
         })
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
+    resource_claims: ResourceClaims | None = None
     try:
+        if invocation.worker_invocation_id is not None and invocation.resources:
+            assert invocation.resource_lock_root is not None
+            resource_claims = ResourceClaims(
+                invocation.resource_lock_root,
+                invocation.lane_id,
+                invocation.worker_invocation_id,
+                controller,
+            )
+
+            def record_wait(wait: dict[str, Any]) -> None:
+                state.update({
+                    "state": "WAITING_RESOURCE",
+                    "held_resource_claims": resource_claims.held,
+                    "waiting_resource_claim": wait,
+                    "resource_claim_findings": list(resource_claims.findings),
+                })
+                _atomic_json(invocation.status_path, state)
+
+            resource_claims.acquire_all(invocation.resources, on_wait=record_wait)
+            state.update({
+                "state": "LAUNCH_FAILED",
+                "held_resource_claims": resource_claims.held,
+                "waiting_resource_claim": None,
+                "resource_claim_findings": list(resource_claims.findings),
+            })
+            _atomic_json(invocation.status_path, state)
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             child = _identity(process.pid, parent=controller.pid)
@@ -618,6 +659,7 @@ def run(invocation: Invocation) -> int:
         if invocation.repository is not None:
             result_validation, result_valid = _coding_result_validation(invocation)
             state["result_validation"] = result_validation
+            state["result_valid"] = result_valid
         state.update({"state": "CODEX_EXITED", "exit_code": exit_code, "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(
@@ -633,6 +675,11 @@ def run(invocation: Invocation) -> int:
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
         return 130
+    except ResourceLockError as exc:
+        state.update({"state": "COORDINATION_FAILED", "ended_utc": _utc(), "error": str(exc)})
+        _atomic_json(invocation.status_path, state)
+        _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
+        return 1
     except Exception as exc:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -641,6 +688,17 @@ def run(invocation: Invocation) -> int:
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
+    finally:
+        if resource_claims is not None:
+            release_failures = resource_claims.release_all()
+            state["held_resource_claims"] = resource_claims.held
+            state["waiting_resource_claim"] = None
+            if release_failures:
+                state["resource_release_errors"] = release_failures
+            try:
+                _atomic_json(invocation.status_path, state)
+            except OSError:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

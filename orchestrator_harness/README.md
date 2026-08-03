@@ -203,7 +203,7 @@ and has no scheduling, acknowledgement, lease, hardware, or process-kill authori
 
 `python -m orchestrator_harness.lane_controller <invocation.json>` accepts the explicit
 `orchestrator-coding-invocation/v1` schema for one coding worker turn. The schema requires a
-`runtime_root`, confines the event log beneath that root, confines the prompt to `run_root`, and
+`runtime_root`, confines the event log and `resource_lock_root` beneath that root, confines the prompt to `run_root`, and
 confines all output paths to `run_root/.agent-workspace`. Prompt bytes must match
 `prompt_sha256`. It also requires a `repository` object declaring the actual Git `common_dir`,
 `worktree_root` (which must equal `run_root`), attached short `branch`, and full `base_commit`.
@@ -218,6 +218,15 @@ worktree, object, index, or Git configuration redirection variables. See
 Coding invocations carry generic `resources` and Codex launch settings; they do not require the
 firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
 schema-less legacy firmware shape remains policy-bound. Any other explicit schema is rejected.
+
+Coding resource names are opaque, non-empty strings. The controller sorts exact names, maps each
+to a SHA-256 filename under `resource_lock_root`, and atomically creates every claim before Codex
+is launched. A claim retains the original name, lane, worker invocation, and exact controller PID
+plus creation identity. On contention, the controller releases any partial set before waiting and
+persists `WAITING_RESOURCE`; an ordinary short wait does not wake management. Malformed claims,
+proved stale owners, reused or missing owner identity, and waits beyond 30 seconds remain locked
+and are exposed as actionable conditions. A stale claim is reclaimed only when a complete process
+inventory proves its PID absent. Exact claims are released on every cooperative terminal path.
 
 Before a coding launch, the controller proves the declared common directory and worktree root,
 requires the exact attached branch, resolves the base commit, and records the canonical common

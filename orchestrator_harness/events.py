@@ -10,6 +10,7 @@ from .stable_io import canonical_json
 
 LANE_EVENT_TYPES = {
     "RUNNING_CODEX": "CONTROLLER_ACTIVE",
+    "WAITING_RESOURCE": "LANE_WAITING_RESOURCE",
     "WAITING_RELAY": "LANE_WAITING_RELAY",
     "HELPER_RUNNING": "HELPER_ACTIVE",
     "STALE_STATUS": "STALE_STATUS",
@@ -22,6 +23,7 @@ LANE_EVENT_TYPES = {
 
 PROCESS_EVENT_TYPES = {
     "RUNNING_CODEX": "CONTROLLER_ACTIVE",
+    "WAITING_RESOURCE": "LANE_WAITING_RESOURCE",
     "STALE_STATUS": "STALE_STATUS",
     "PROCESS_STATE_UNKNOWN": "PROCESS_STATE_UNKNOWN",
     "EXITED": "CONTROLLER_EXITED",
@@ -30,7 +32,7 @@ PROCESS_EVENT_TYPES = {
 
 
 def _stable_data(data: dict[str, Any]) -> dict[str, Any]:
-    ignored = {"remaining_seconds", "observed_utc"}
+    ignored = {"remaining_seconds", "wait_seconds", "observed_utc"}
     return {key: value for key, value in data.items() if key not in ignored}
 
 
@@ -89,9 +91,49 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             "codex_pid": lane.get("codex_pid"),
             "controller_started_utc": lane.get("controller_started_utc"),
             "codex_started_utc": lane.get("codex_started_utc"),
+            "invocation_schema": lane.get("invocation_schema"),
+            "worker_invocation_id": lane.get("worker_invocation_id"),
+            "repository": lane.get("repository"),
+            "resources": lane.get("declared_resources", []),
+            "held_resource_claims": lane.get("held_resource_claims", []),
+            "result_validation": lane.get("result_validation"),
+            "result_valid": lane.get("result_valid"),
         }
         identity = f"lane:{lane_id}:process"
         conditions[identity] = _condition(identity, kind, severity, data)
+        wait = lane.get("waiting_resource_claim")
+        if isinstance(wait, dict):
+            identity = f"lane:{lane_id}:resource-wait"
+            conditions[identity] = _condition(
+                identity,
+                "RESOURCE_WAIT",
+                "warning" if wait.get("actionable") is True else "info",
+                {
+                    "lane_id": lane_id,
+                    "worker_invocation_id": lane.get("worker_invocation_id"),
+                    **wait,
+                },
+            )
+        for finding in lane.get("resource_claim_findings", []):
+            if not isinstance(finding, dict):
+                continue
+            resource = finding.get("resource")
+            identity = f"lane:{lane_id}:resource-claim:{resource}"
+            conditions[identity] = _condition(
+                identity, "RESOURCE_CLAIM_STALE", "warning",
+                {"lane_id": lane_id, **finding},
+            )
+        invalid_result = lane.get("invalid_result")
+        if isinstance(invalid_result, dict):
+            identity = f"lane:{lane_id}:invalid-result"
+            conditions[identity] = _condition(
+                identity, "CODING_RESULT_INVALID", "error",
+                {
+                    "lane_id": lane_id,
+                    "worker_invocation_id": lane.get("worker_invocation_id"),
+                    **invalid_result,
+                },
+            )
         if lane.get("operational_state") == "WAITING_RELAY":
             identity = f"lane:{lane_id}:relay-wait"
             conditions[identity] = _condition(
@@ -279,6 +321,12 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             "RESOURCE_CONFLICT",
             "error",
             conflict,
+        )
+
+    for conflict in snapshot.get("coding_conflicts", []):
+        identity = f"coding:{conflict['type']}:{conflict['identity']}"
+        conditions[identity] = _condition(
+            identity, conflict["type"], "error", conflict,
         )
 
     for signal in snapshot.get("manager_signals", []):

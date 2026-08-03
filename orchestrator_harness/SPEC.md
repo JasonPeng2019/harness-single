@@ -51,7 +51,7 @@ remain serialized by the main orchestrator.
    liveness, expected parent identity, and terminal JSONL events.
 4. Never treat a raw `state="running"` declaration as authoritative.
 5. Derive explicit operational states:
-   `RUNNING_CODEX`, `WAITING_RELAY`, `HELPER_RUNNING`, `STALE_STATUS`, `CHECKPOINTED`,
+   `RUNNING_CODEX`, `WAITING_RESOURCE`, `WAITING_RELAY`, `HELPER_RUNNING`, `STALE_STATUS`, `CHECKPOINTED`,
    `TERMINAL_RESULT`, `EXITED`, or `UNKNOWN`.
 6. Detect multiple live controller attempts for the same doer/run.
 7. Support dependency injection of a fake process provider for deterministic tests.

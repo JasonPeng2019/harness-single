@@ -131,7 +131,20 @@ def _controller_observation(
 
     declared = str(raw.get("state") or "unknown").lower()
     terminal = controller.terminal_event
-    if not snapshot.complete:
+    if declared == "waiting_resource":
+        if not snapshot.complete:
+            operational = "PROCESS_STATE_UNKNOWN"
+            reason = "resource wait cannot be reconciled without complete process inventory"
+        elif controller_identity == "live":
+            operational = "WAITING_RESOURCE"
+            reason = "controller is waiting before Codex launch"
+        elif controller_identity == "unknown":
+            operational = "PROCESS_STATE_UNKNOWN"
+            reason = "resource-wait controller identity cannot be proved"
+        else:
+            operational = "STALE_STATUS"
+            reason = "resource-wait declaration contradicts controller identity"
+    elif not snapshot.complete:
         operational = "PROCESS_STATE_UNKNOWN"
         reason = "process provider is incomplete"
     elif declared in {"running", "running_codex"}:
@@ -164,6 +177,7 @@ def _controller_observation(
         "codex_exited",
         "controller_interrupted",
         "controller_failed",
+        "coordination_failed",
         "launch_failed",
         "completed",
         "done",
@@ -240,6 +254,28 @@ def _controller_observation(
         "parent_state": parent_state,
         "parent_reason": parent_reason,
         "terminal_event": terminal,
+        "invocation_schema": raw.get("invocation_schema"),
+        "worker_invocation_id": raw.get("worker_invocation_id"),
+        "repository": raw.get("repository"),
+        "declared_resources": list(raw.get("resources", []))
+        if isinstance(raw.get("resources"), list)
+        else [],
+        "resource_lock_root": raw.get("resource_lock_root"),
+        "held_resource_claims": list(raw.get("held_resource_claims", []))
+        if isinstance(raw.get("held_resource_claims"), list)
+        else [],
+        "waiting_resource_claim": raw.get("waiting_resource_claim")
+        if isinstance(raw.get("waiting_resource_claim"), dict)
+        else None,
+        "resource_claim_findings": list(raw.get("resource_claim_findings", []))
+        if isinstance(raw.get("resource_claim_findings"), list)
+        else [],
+        "result_validation": raw.get("result_validation")
+        if isinstance(raw.get("result_validation"), dict)
+        else None,
+        "result_valid": raw.get("result_valid")
+        if isinstance(raw.get("result_valid"), bool)
+        else None,
         "jsonl_path": str(controller.jsonl_path) if controller.jsonl_path else None,
         "board_tokens": sorted(
             str(item) for item in raw.get("board_tokens", []) if item is not None
@@ -925,6 +961,11 @@ def _resource_set(
     resources: set[str] = set()
     ambiguity: list[str] = []
     active_lane = _lane_is_active_or_unknown(lane)
+    if active_lane and lane.get("invocation_schema") == "orchestrator-coding-invocation/v1":
+        resources.update(
+            item for item in lane.get("declared_resources", [])
+            if isinstance(item, str) and item
+        )
     if active_lane:
         for board in lane.get("board_tokens", []):
             resources.add(f"board:{_token(str(board))}")
@@ -954,6 +995,7 @@ def _resource_set(
 def _lane_is_active_or_unknown(lane: dict[str, Any]) -> bool:
     return lane.get("operational_state", lane.get("process_state")) in {
         "RUNNING_CODEX",
+        "WAITING_RESOURCE",
         "WAITING_RELAY",
         "HELPER_RUNNING",
         "PROCESS_STATE_UNKNOWN",
@@ -1239,6 +1281,33 @@ def reconcile(
         if len(set(lane_ids)) > 1
     ]
 
+    coding_conflicts: list[dict[str, Any]] = []
+    active_coding = [
+        lane for lane in lanes
+        if _lane_is_active_or_unknown(lane)
+        and lane.get("invocation_schema") == "orchestrator-coding-invocation/v1"
+        and isinstance(lane.get("repository"), dict)
+    ]
+    for field, kind in (("worktree_root", "DUPLICATE_CODING_WORKTREE"), ("branch", "DUPLICATE_CODING_BRANCH")):
+        groups: dict[str, list[str]] = defaultdict(list)
+        for lane in active_coding:
+            repository = lane["repository"]
+            value = repository.get(field)
+            if field == "branch":
+                common = repository.get("common_dir")
+                key = f"{common}::{value}" if isinstance(common, str) and isinstance(value, str) else ""
+            else:
+                key = str(Path(value).resolve(strict=False)).casefold() if isinstance(value, str) and value else ""
+            if key:
+                groups[key].append(lane["lane_id"])
+        for key, lane_ids in groups.items():
+            if len(set(lane_ids)) > 1:
+                coding_conflicts.append({
+                    "type": kind,
+                    "identity": key,
+                    "lanes": sorted(set(lane_ids)),
+                })
+
     return {
         "schema": "orchestrator-watcher-snapshot/v1",
         "observed_utc": iso_utc(now),
@@ -1252,6 +1321,9 @@ def reconcile(
         "mcps": sorted(mcps, key=lambda item: item["path"]),
         "manager_signals": sorted(manager_signals, key=lambda item: (item["signal_id"], item["path"])),
         "resource_conflicts": sorted(conflicts, key=lambda item: item["resource"]),
+        "coding_conflicts": sorted(
+            coding_conflicts, key=lambda item: (item["type"], item["identity"])
+        ),
         "observation_errors": sorted(
             errors, key=lambda item: (item["path"], item["code"])
         ),

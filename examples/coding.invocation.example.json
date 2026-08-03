@@ -2,6 +2,7 @@
   "schema": "orchestrator-coding-invocation/v1",
   "action": "start",
   "runtime_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch",
+  "resource_lock_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/coding-resource-locks",
   "run_root": "C:/absolute/path/to/target-checkout",
   "repository": {
     "common_dir": "C:/absolute/path/to/repository/.git",

@@ -26,7 +26,7 @@ _MUTABLE_HANDOFF_TYPES = {"CHECKPOINT_UPDATED", "RESULT_AVAILABLE"}
 def _active_lanes(snapshot: dict[str, Any]) -> bool:
     return any(
         lane.get("process_state", lane.get("operational_state"))
-        in {"RUNNING_CODEX", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+        in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
         for lane in snapshot.get("lanes", [])
     )
 
@@ -78,7 +78,7 @@ def _manager_signal_ineligibility_reason(
     lane_current = any(
         lane.get("lane_id") == lane_id
         and lane.get("process_state", lane.get("operational_state"))
-        in {"RUNNING_CODEX", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+        in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
         for lane in snapshot.get("lanes", [])
     )
     if lane_current:
@@ -117,6 +117,7 @@ def _resource_ambiguity_is_current(
         and lane.get("operational_state", lane.get("process_state"))
         in {
             "RUNNING_CODEX",
+            "WAITING_RESOURCE",
             "WAITING_RELAY",
             "HELPER_RUNNING",
             "PROCESS_STATE_UNKNOWN",
@@ -164,10 +165,16 @@ def _priority(
         return 1 if _event_manager_actionable(data) and data.get("expiry_bucket") in {"WARNING", "CRITICAL"} else None
     if kind in {
         "DUPLICATE_CONTROLLER",
+        "DUPLICATE_CODING_BRANCH",
+        "DUPLICATE_CODING_WORKTREE",
+        "CODING_RESULT_INVALID",
+        "RESOURCE_CLAIM_STALE",
         "RESOURCE_CONFLICT",
         "LANE_STATE_UNKNOWN",
     }:
         return 2
+    if kind == "RESOURCE_WAIT":
+        return 2 if data.get("actionable") is True else None
     if kind == "RESOURCE_AMBIGUOUS":
         return 2 if _resource_ambiguity_is_current(data, snapshot, observed_at) else None
     if kind == "STALE_STATUS":
@@ -203,14 +210,14 @@ def _priority(
             return 4 if any(
                 lane.get("lane_id") == lane_id
                 and lane.get("process_state", lane.get("operational_state"))
-                in {"RUNNING_CODEX", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+                in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
                 for lane in snapshot.get("lanes", [])
             ) else None
         if isinstance(session_id, str) and session_id:
             return 4 if any(
                 lane.get("thread_id") == session_id
                 and lane.get("process_state", lane.get("operational_state"))
-                in {"RUNNING_CODEX", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+                in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
                 for lane in snapshot.get("lanes", [])
             ) else None
         return 4 if _active_lanes(snapshot) else None
