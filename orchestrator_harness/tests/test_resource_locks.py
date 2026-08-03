@@ -180,7 +180,7 @@ class ResourceLockTests(unittest.TestCase):
             202, inventory=snapshot(process(202)), identities={202: "identity:202"}
         )
         self.acquire(rescuer, ["board:a"])
-        evidence, _ = _read_claim_evidence(path)
+        evidence, _, _ = _read_claim_evidence(path)
         assert evidence is not None
         self.assertEqual("lane-202", evidence["lane_id"])
         self.assertEqual([], rescuer.release_all())
