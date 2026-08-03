@@ -1,124 +1,138 @@
-# Portable Harness + Deterministic Watcher
+# Portable Coding Orchestrator Harness
 
-This folder is a clean, standalone copy of the native orchestration harness and deterministic
-watcher. It contains no historical run logs, M5 evidence, worker outputs, or watcher runtime state.
+This repository coordinates ordinary software work across Git branches and worktrees. A persistent
+manager plans lanes and integration; externally launched lane controllers validate identity,
+launch one coding worker, and serialize opaque named resources; the native observer reconciles
+durable state and delivers events. The optional deterministic watcher records diagnostics only.
 
-**New agent:** read `QUICK_RULES.md`, then follow `QUICK_START.md`.
+The harness is not a scheduler, task database, dependency engine, project checker, or file
+ownership system. Git worktrees isolate code. The manager remains responsible for planning,
+launching, decisions, merges, checks, acceptance, and promotion.
 
-## Intended minimal topology
+## Coding topology
 
 ```text
-external workers -> native orchestrator harness -> persistent orchestrator
-                              |
-                              v
-                    deterministic watcher
-                    (diagnostics only)
+frozen baseline -> lane branches/worktrees -> integration branch/worktree
+                       |                              |
+                 coding controllers             merge worker
+                       |                              |
+                       +------ native observer -------+
+                                      |
+                              persistent manager
 ```
 
-- There is **no AI watcher subagent or collaboration relay**.
-- The orchestrator calls the harness's native blocking wait directly.
-- The deterministic watcher records diagnostics; it does not wake the orchestrator, manage workers,
-  repair code, or make decisions.
-- The orchestrator remains responsible for launching workers, responding to them, managing
-  resources, and acknowledging exact harness events.
+- Create one branch and worktree per concurrently active lane.
+- Branch child lanes from an exact stable parent commit.
+- Use a manager-assigned merge lane to combine completed lane branches.
+- Keep a known-good frozen revision unchanged during execution.
+- Treat the integrated commit as a candidate until acceptance checks pass.
+- Promote only the accepted candidate; never promote a dirty worktree or an unvalidated result.
 
-## Requirements
+## Start here
 
-- Python 3.11 or newer.
-- No third-party Python runtime dependencies.
-- A target suite whose worker/run state follows the contracts in
-  `orchestrator_harness/SPEC.md`.
-- A persistent orchestrator that repeatedly returns to the native blocking wait. This package
-  cannot wake a closed or terminated agent conversation.
-
-Run commands from this folder so Python can import `orchestrator_harness`,
-`harness_watcher_implementation`, and `harness_common`.
-
-## First-time setup
-
-1. Copy `examples/harness.example.json` to `local-config/harness.json`.
-2. Set `suite_root` to the target repository and set `run_globs` to its run directories.
-3. Give every live epoch a fresh `output_dir` under `runtime/orchestrator-harness/<epoch>`.
-4. Copy `examples/watcher.diagnostic.example.json` to `local-config/watcher.json`.
-5. Update its `observed_sources` to the harness, orchestrator, and worker JSONL files for that epoch.
-6. Give it a fresh `runtime_root` under `runtime/harness-watcher/<epoch>`.
-
-The supplied watcher example has `evaluator_enabled: false`. Keep it false for the minimal,
-deterministic-only system. Enabling it launches an AI evaluator and is a different runtime topology.
-
-## Validate configuration
+1. Read `QUICK_RULES.md` and `QUICK_START.md`.
+2. Copy `examples/harness.example.json` to ignored `local-config/harness.json`.
+3. Set `suite_root` to the parent that contains `worktrees/` and use `worktrees/*` as `run_globs`.
+4. Give each manager epoch a fresh `runtime/orchestrator-harness/<epoch>` output directory.
+5. Run a read-only discovery scan before launching workers:
 
 ```powershell
 python -m orchestrator_harness --config local-config/harness.json scan --no-write
-python -m harness_watcher_implementation --config local-config/watcher.json poll
 ```
 
-`scan --no-write` must accurately discover the intended lanes before live operation. If it does
-not, fix the configuration or target-suite records; do not surround the harness with a relay,
-runner, or wrapper.
+The complete coding invocation, result, and lock-record shapes are in `examples/`. Paths and Git
+IDs in those static examples are placeholders and must be replaced with facts from the active lane.
 
-## Normal manager loop
+## Manager loop
 
-Start the deterministic watcher with the exact PID of a durable owner process:
+The persistent manager launches controllers explicitly:
 
 ```powershell
-python -m harness_watcher_implementation --config local-config/watcher.json start --owner-pid <durable-owner-pid>
+python -m orchestrator_harness.lane_controller <absolute-invocation.json>
 ```
 
-Then the persistent orchestrator repeatedly performs a bounded native wait:
+It then repeatedly uses the native blocking wait:
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60 --manager-session-id <session-id> --manager-invocation-id <invocation-id>
+python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60
 ```
 
-- Exit `0`: one actionable event was returned as JSON.
-- Exit `3`: quiet timeout; no event was delivered.
-- Exit `1`: configuration, observation, or safety failure.
-
-For a returned event:
-
-1. Log `MANAGER_WAKE_RECEIVED` first when attention logging is enabled.
-2. Record the matching `MANAGER_WAIT_FINISHED`.
-3. Inspect and handle the request.
-4. Validate the response's exact non-empty epoch, source event, lane, session, and invocation IDs.
-5. Publish the response atomically.
-6. Acknowledge using the envelope's top-level native `event_id`:
+Exit `0` returns one JSON event. Exit `3` is a quiet timeout. Exit `1` is a configuration,
+observation, or safety failure. Handle the event, verify the durable action, and acknowledge only
+its top-level native `event_id`:
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json ack --event-id <native-event-id>
+python -m orchestrator_harness --config local-config/harness.json ack --event-id <event-id>
 ```
 
-Do not use `data.signal_id` for acknowledgement. That is the worker/source event identity.
+`data.signal_id` identifies a source signal and is not an acknowledgement ID. Delivery is
+at-least-once, so consumers deduplicate by `event_id`. An event remains pending until exact
+acknowledgement succeeds.
 
-## Status and shutdown
+## Lane records
+
+Every coding invocation uses `orchestrator-coding-invocation/v1` and records:
+
+- lane and worker invocation IDs;
+- worktree, attached branch, Git common directory, and base commit;
+- prompt path and SHA-256;
+- controller output paths under `.agent-workspace`;
+- manager-epoch event and resource-lock roots; and
+- zero or more exact opaque `exclusive_resources` names.
+
+`PARALLEL_CHECKPOINT.md` is resumable progress, not completion. A merge-ready
+`.agent-workspace/RESULT.json` uses `orchestrator-lane-result/v1` and must match the current lane,
+worker invocation, branch, and real branch-tip commit. The project worktree must be clean. Reported
+checks are evidence; the harness does not execute them. The merge worker runs integration checks.
+
+Named locks use exact string matching and atomic claims. Normal contention stays in
+`WAITING_RESOURCE` and does not require manager action. Malformed, unknown, stale, or excessive
+wait evidence fails safe. A controller releases only claims matching its exact invocation and
+PID-plus-creation identity.
+
+## Split, merge, accept
+
+1. Commit the stable parent before splitting.
+2. Create child branches at that exact commit and add separate worktrees.
+3. Write one bounded invocation per lane and launch one controller per worktree.
+4. Wait for native events; review checkpoints and exact validated results.
+5. Create a dedicated integration branch/worktree from the declared base.
+6. Merge the completed input branches and resolve conflicts in that merge lane.
+7. Run the target project's tests in the merge worktree.
+8. Publish the merge lane result, select the candidate commit, and run acceptance.
+9. Promote the candidate only after acceptance; retain or restore the frozen revision on failure.
+
+## Cleanup
+
+Stop managed observation cooperatively with `watch stop` when used. Confirm controller, worker, and
+watcher PID-plus-creation identities are absent; named claims are released; worktrees are clean;
+and no pending event is silently discarded. Remove disposable worktrees with Git only after their
+commits and results have been preserved. Runtime data belongs under ignored `runtime/`.
+
+## Disposable integration fixture
+
+This local smoke creates a temporary Python repository, two contending coding lanes, a merge lane,
+stale and valid results, durable event delivery and exact acknowledgement, then removes everything:
 
 ```powershell
-python -m harness_watcher_implementation --config local-config/watcher.json status
-python -m harness_watcher_implementation --config local-config/watcher.json stop
-python -m orchestrator_harness --config local-config/harness.json watch stop
+python examples/disposable_coding_fixture.py
 ```
 
-Stops are cooperative. Confirm exact PID plus creation identity rather than killing processes by
-name or broad command matching.
+Use `--keep <new-directory>` only when inspecting failed evidence. No network, Codex service,
+firmware record, or physical resource is used.
 
-## Tests
+## Supported firmware compatibility path
 
-```powershell
-python -m compileall -q orchestrator_harness harness_common harness_watcher_implementation
-python -m unittest discover -s orchestrator_harness/tests -t . -v
-python -m unittest discover -s harness_watcher_implementation/tests -t . -v
-python harness_watcher_implementation/tests/run_attention_practical.py
-```
+The schema-less policy-bound firmware invocation and passive board, relay, lease, MCP, and hardware
+observation remain supported. They are a separate compatibility path and are not required by
+`orchestrator-coding-invocation/v1`. Firmware work must continue to follow its existing policy,
+authorization, lease, relay, and physical cleanup rules.
 
-The optional WSL real-agent test has additional isolation requirements documented in
-`orchestrator_harness/README.md`. Ordinary operation does not require WSL or Codex CLI access.
+## Documentation
 
-## Documentation map
-
-- `orchestrator_harness/README.md` - harness commands and operating behavior.
-- `orchestrator_harness/SPEC.md` - authoritative harness contracts and non-goals.
-- `docs/HARNESS_WATCHER_GUIDE.md` - detailed deterministic-watcher operating guide.
-- `harness_watcher_implementation/SPEC.md` - watcher interfaces and authority.
-- `harness_watcher_implementation/ATTENTION_LOGGING.md` - optional six-stage attention evidence.
-- `harness_watcher_implementation/TESTING_GUIDE.md` - focused watcher verification.
-- `PORTABLE_CONTENTS.md` - exactly what was copied and excluded.
+- `QUICK_START.md`: shortest ordinary coding run.
+- `QUICK_RULES.md`: authority and safety rules.
+- `orchestrator_harness/README.md`: command and contract reference.
+- `orchestrator_harness/SPEC.md`: observer requirements, including the legacy firmware path.
+- `docs/HARNESS_WATCHER_GUIDE.md`: optional diagnostic watcher.
+- `PORTABLE_CONTENTS.md`: packaged contents and exclusions.

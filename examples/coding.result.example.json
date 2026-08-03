@@ -1,0 +1,16 @@
+{
+  "schema": "orchestrator-lane-result/v1",
+  "lane_id": "parser",
+  "worker_invocation_id": "parser-001",
+  "branch": "lane/parser",
+  "commit": "fedcba9876543210fedcba9876543210fedcba98",
+  "outcome": "PASS",
+  "summary": "Implemented the parser and focused tests.",
+  "checks": [
+    {
+      "name": "parser unit tests",
+      "command": "python -m unittest tests.test_parser -v",
+      "outcome": "PASS"
+    }
+  ]
+}

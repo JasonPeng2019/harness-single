@@ -1,8 +1,19 @@
-# MCP-Trial-3 Orchestrator Harness
+# Coding Orchestrator Harness
 
-This package is a read-only watcher for the parallel firmware-test lanes. It does not schedule
-agents, operate hardware, write permission relays, change leases, edit evidence, or repair the
-server. The active main orchestrator consumes its events and remains the only authority.
+This package supports ordinary coding lanes on separate Git branches and worktrees. The lane
+controller validates each declared Git identity, launches one worker, records checkpoints/results,
+and enforces exact opaque named locks. The observer reconciles durable lane state and delivers
+at-least-once events to one persistent manager. It does not schedule lanes or make integration,
+acceptance, or promotion decisions.
+
+Use `orchestrator-coding-invocation/v1` for normal coding. Create child lanes only from a stable
+committed parent, use a dedicated integration worktree to merge completed branches, validate each
+`RESULT.json` against the current invocation and branch tip, and run final project checks in the
+merge lane. `examples/coding.invocation.example.json`, `examples/coding.result.example.json`, and
+`examples/coding.named-lock.example.json` show the supported records.
+
+The schema-less policy-bound firmware controller and passive firmware observations remain a
+separate supported compatibility path. They do not impose firmware fields on coding invocations.
 
 ## Commands
 
@@ -104,7 +115,7 @@ remain harness-delay evidence.
 - `1`: configuration, safety, or observation failure
 - `3`: bounded watch timeout
 
-## Required suite use
+## Legacy firmware suite use
 
 For an overlapping or HIL/server-consuming suite epoch, the active main orchestrator **must**
 create a fresh config from `config.example.json` whose `run_globs` cover every run the epoch may
@@ -199,7 +210,7 @@ It launches without a shell, writes an atomic receipt with PID plus provider cre
 and fails closed if that identity cannot be proved. It is not imported or invoked by watcher paths
 and has no scheduling, acknowledgement, lease, hardware, or process-kill authority.
 
-### General coding lane invocation
+## General coding lane invocation
 
 `python -m orchestrator_harness.lane_controller <invocation.json>` accepts the explicit
 `orchestrator-coding-invocation/v1` schema for one coding worker turn. The schema requires a
@@ -215,7 +226,8 @@ shell. Git inspection uses a minimal execution environment and does not inherit 
 worktree, object, index, or Git configuration redirection variables. See
 `examples/coding.invocation.example.json` for the complete start shape.
 
-Coding invocations carry generic `resources` and Codex launch settings; they do not require the
+Coding invocations carry generic `exclusive_resources` and Codex launch settings; `resources`
+remains a compatibility alias. They do not require the
 firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
 schema-less legacy firmware shape remains policy-bound. Any other explicit schema is rejected.
 

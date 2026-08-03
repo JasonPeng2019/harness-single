@@ -1,7 +1,7 @@
 [project]
-name = "mcp-trial-orchestrator-harness"
+name = "portable-orchestrator-harness"
 version = "0.1.0"
-description = "Read-only event watcher for MCP-Trial-3 parallel firmware lanes"
+description = "Durable event observation and lane control for parallel coding work"
 requires-python = ">=3.11"
 dependencies = []
 

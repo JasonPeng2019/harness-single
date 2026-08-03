@@ -312,7 +312,20 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     if not isinstance(lane_id_value, str) or not lane_id_value.strip():
         raise InvocationError("lane_id must be a non-empty string")
     lane_id = lane_id_value.strip()
-    resources = _string_list(raw.get("resources", []), "resources")
+    legacy_resources = raw.get("resources")
+    exclusive_resources = raw.get("exclusive_resources")
+    if (
+        legacy_resources is not None
+        and exclusive_resources is not None
+        and legacy_resources != exclusive_resources
+    ):
+        raise InvocationError(
+            "resources and exclusive_resources must match when both are supplied"
+        )
+    resources = _string_list(
+        exclusive_resources if exclusive_resources is not None else legacy_resources or [],
+        "exclusive_resources",
+    )
     try:
         repository = declaration_from_invocation(raw, run_root)
     except GitSafetyError as exc:
@@ -552,6 +565,7 @@ def run(invocation: Invocation) -> int:
         "declared_lane_id": invocation.lane_id, "thread_id": thread, "leases": invocation.leases,
         "board_tokens": invocation.board_tokens, "mcp_servers": invocation.mcp_servers,
         "server_snapshot": invocation.server_snapshot, "resources": invocation.resources,
+        "exclusive_resources": invocation.resources,
         "resource_lock_root": str(invocation.resource_lock_root) if invocation.resource_lock_root else None,
         "held_resource_claims": [], "waiting_resource_claim": None,
         "resource_claim_findings": [],

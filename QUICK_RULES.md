@@ -1,88 +1,62 @@
-# Quick Rules for Any Agent
+# Quick Rules
 
-These rules preserve the minimal working system and prevent helpers from silently replacing the
-capability being used.
+## Authority
 
-## Runtime roles
+1. One persistent manager owns planning, lane assignment, launches, decisions, integration,
+   acceptance, promotion, and final cleanup.
+2. One coding worker runs in each active branch/worktree lane.
+3. A merge worker integrates only the branches assigned by the manager.
+4. The native observer reports facts and delivers durable events; it does not schedule or decide.
+5. The deterministic watcher is optional and diagnostic-only with `evaluator_enabled: false`.
 
-1. **One persistent orchestrator is the only manager.** It launches workers, makes decisions,
-   manages resources, and responds to requests.
-2. **Workers perform the real task.** They do not manage other workers or control the harness.
-3. **The native harness only observes and delivers durable events.** Use its blocking wait directly.
-4. **The deterministic watcher is diagnostic-only.** Keep `evaluator_enabled: false`. It does not
-   wake the orchestrator, notify through collaboration, repair code, acknowledge events, or act.
-5. **No AI watcher subagent.** Do not spend a subagent slot or model compute on notification relay.
+## Git lanes
 
-## Forbidden assistance
+- Commit before splitting a lane; branch every child from the recorded stable commit.
+- Use a separate worktree for every concurrently active lane.
+- Never switch or reuse another live lane's branch or worktree.
+- Integrate on a dedicated branch/worktree, not in a worker lane.
+- Keep the frozen known-good revision unchanged. Candidate, acceptance, and promotion are distinct.
+- Git is the source ownership boundary; do not add a file-ownership database.
 
-Do not create or use:
+## Durable identity
 
-- a runner around the harness;
-- watcher or harness wrappers;
-- notification relays or collaboration-message wakeups;
-- custom polling loops, schedulers, retry controllers, or event mirrors;
-- a second queue or alternate request-discovery path;
-- transcript inspection, direct worker-message inspection, or user messages to discover requests;
-- a helper subagent that monitors, prompts, or compensates for the orchestrator; or
-- mid-run code repair or automatic repair machinery.
+- Bind every coding invocation to lane ID, worker invocation ID, worktree, branch, common Git
+  directory, and full base commit.
+- Treat `PARALLEL_CHECKPOINT.md` as resumable progress only.
+- Treat `RESULT.json` as merge-ready only after schema, invocation, branch-tip, and cleanliness
+  validation succeeds.
+- A stale, malformed, mismatched, non-tip, or dirty result is not completion.
 
-If the native harness is difficult or fails, preserve that as evidence. Do not hide it with another
-layer.
+## Events
 
-## Required event discipline
+- Discover manager work through native `watch --until-actionable`, not transcript inspection,
+  custom polling, a second queue, or a notification relay.
+- Delivery is at-least-once. Deduplicate with the top-level `event_id`.
+- Acknowledge only after handling and verifying the event.
+- Acknowledge the top-level `event_id`, never `data.signal_id`.
+- Leave an unhandled event pending.
 
-- Discover actionable work only through the native blocking wait.
-- Preserve the returned `wake_id`.
-- `data.signal_id` is the worker/source event identity.
-- The top-level `event_id` is the native harness identity used for acknowledgement.
-- Validate every required response identity before atomic publication.
-- Acknowledge only after the response or management action is complete and verified.
-- Never repair malformed published data in place and then pretend the original publication passed.
-- An unhandled event remains pending; do not discard or silently skip it.
+## Resources and processes
 
-## Run discipline
+- Declare external exclusivity with exact opaque `exclusive_resources` names.
+- Ordinary contention waits without manager intervention.
+- Unknown identity is never safe absence. Reclaim only when exact PID-plus-creation evidence proves
+  the prior owner absent.
+- A controller releases only claims owned by its exact invocation.
+- Stop cooperatively and never kill by broad process name or command matching.
 
-- Use a fresh epoch, config, output directory, watcher runtime, and cursor for every run.
-- Confirm configuration and discovery with `scan --no-write` before launching workers.
-- Freeze code and configuration during live work.
-- Let a safe live run reach its natural boundary even when an agent makes a mistake. Stop early only
-  for a real safety, authorization, resource-ownership, or evidence-path failure.
-- Make changes only after workers are safe, the harness and watcher are stopped, evidence is
-  preserved, and exact cleanup is proven.
-- Do not treat an orchestrator or worker mistake as a harness/watcher bug without evidence.
-- Do not treat watcher analysis as execution truth; it is diagnostic evidence for the orchestrator
-  to audit.
+## Runtime hygiene
 
-## Process, resource, and hardware safety
+- Use fresh manager-epoch configuration and ignored `runtime/` directories.
+- Run `scan --no-write` before launch.
+- Keep generated state out of source packages and observed `.agent-workspace` trees except for the
+  lane records intentionally written there.
+- Freeze product code and live configuration during an acceptance run.
+- Preserve failures as evidence; do not hide them with wrappers, schedulers, retry controllers, or
+  mid-run automatic repair.
 
-- Use exact PID plus provider creation identity. Never kill by process name or broad command match.
-- Stop services cooperatively before considering exact targeted termination.
-- The harness and watcher grant no hardware, flashing, deployment, lease, or repair authority.
-- Follow the target project's existing authorization, lease, checkpoint, and hardware rules.
-- Never commit, push, deploy, or flash merely because the harness returned an event.
+## Firmware compatibility
 
-## Files and logs
-
-- Keep code under `orchestrator_harness/`, `harness_common/`, and
-  `harness_watcher_implementation/`.
-- Keep local configs under ignored `local-config/`.
-- Keep all portable runtime output under ignored `runtime/`.
-- Never write logs, generated evidence, caches, pending state, or canary output into source folders.
-- Do not reuse runtime data from a previous epoch.
-
-## Important limitation
-
-The no-relay system works while the persistent orchestrator remains active and repeatedly returns to
-the blocking wait. The deterministic watcher cannot wake or restart a closed, crashed, or terminated
-agent conversation. Do not claim otherwise.
-
-## Before starting checklist
-
-- [ ] I read this file and `QUICK_START.md`.
-- [ ] I am the one persistent orchestrator and understand I remain the decision-maker.
-- [ ] The watcher is deterministic-only with `evaluator_enabled: false`.
-- [ ] No relay, wrapper, runner, helper watcher, scheduler, or alternate discovery path exists.
-- [ ] The epoch and all runtime directories are fresh.
-- [ ] `scan --no-write` shows exactly the intended runs and lanes.
-- [ ] Worker controllers, resources, authorization, and cleanup responsibilities are known.
-- [ ] I will validate response identity before publication and acknowledge only the native event ID.
+Schema-less policy-bound firmware invocations remain supported separately. Their board, relay,
+lease, MCP, hardware authorization, and physical cleanup rules still apply to firmware work. None
+of those records is required for an `orchestrator-coding-invocation/v1` lane.

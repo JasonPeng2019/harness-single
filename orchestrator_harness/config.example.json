@@ -1,10 +1,10 @@
 {
-  "suite_root": "..",
+  "suite_root": "../../TARGET_PROJECT",
   "run_globs": [
-    "fresh-experiments/*"
+    "worktrees/*"
   ],
   "workspace_relpath": ".agent-workspace",
-  "output_dir": "../multi-agent-logs/orchestrator-harness/example-epoch",
+  "output_dir": "../runtime/orchestrator-harness/example-epoch",
   "poll_interval_seconds": 1.0,
   "watch_timeout_seconds": 60.0,
   "manager_review_interval_seconds": 300,

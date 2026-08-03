@@ -1,7 +1,7 @@
 {
-  "suite_root": "../../TARGET_SUITE",
+  "suite_root": "../../TARGET_PROJECT",
   "run_globs": [
-    "fresh-experiments/*"
+    "worktrees/*"
   ],
   "workspace_relpath": ".agent-workspace",
   "output_dir": "../runtime/orchestrator-harness/example-epoch",

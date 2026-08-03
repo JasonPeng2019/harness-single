@@ -73,7 +73,7 @@ def load_config(
         raise ConfigError("suite_root must be a non-empty path string")
     suite_root = (base / suite_value).resolve()
 
-    globs = raw.get("run_globs", ["fresh-experiments/*"])
+    globs = raw.get("run_globs", ["worktrees/*"])
     if (
         not isinstance(globs, list)
         or not globs

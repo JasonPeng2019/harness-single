@@ -1,0 +1,12 @@
+{
+  "schema": "orchestrator-coding-resource-claim/v1",
+  "resource": "service:integration-database",
+  "lane_id": "parser",
+  "worker_invocation_id": "parser-001",
+  "owner": {
+    "pid": 12345,
+    "created_utc": "2026-08-03T10:00:00Z",
+    "creation_identity": "2026-08-03T10:00:00Z"
+  },
+  "created_utc": "2026-08-03T10:00:00Z"
+}

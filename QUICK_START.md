@@ -1,119 +1,92 @@
-# Quick Start
+# Quick Start: Ordinary Coding
 
-This is the shortest safe path for an agent to use the native harness and deterministic watcher
-without an AI watcher subagent, relay, runner, or wrapper.
+## 1. Prepare lanes
 
-## 1. Read the rules
+Start from a stable committed base. Create one branch and worktree for each concurrent task:
 
-Read `QUICK_RULES.md`. The important boundary is simple: the harness delivers events, the watcher
-records diagnostics, and the persistent orchestrator makes every decision.
+```powershell
+git worktree add -b lane/parser ..\project-worktrees\parser <base-commit>
+git worktree add -b lane/api ..\project-worktrees\api <base-commit>
+```
 
-## 2. Prepare local configuration
+Do not switch branches in an active lane worktree. A later split starts only after the parent lane
+commits; every child branches from that exact commit.
 
-From this folder:
+## 2. Configure discovery
 
 ```powershell
 New-Item -ItemType Directory -Force local-config | Out-Null
 Copy-Item examples/harness.example.json local-config/harness.json
-Copy-Item examples/watcher.diagnostic.example.json local-config/watcher.json
 ```
 
-Edit `local-config/harness.json`:
-
-- `suite_root`: target repository containing the worker runs;
-- `run_globs`: every run the harness should observe;
-- `output_dir`: a fresh `runtime/orchestrator-harness/<epoch>` directory; and
-- `attention_epoch_id`: a new unique epoch ID.
-
-Edit `local-config/watcher.json`:
-
-- point `observed_sources` at that epoch's manager, harness, and worker JSONL files;
-- use a fresh `runtime/harness-watcher/<epoch>` directory; and
-- keep `evaluator_enabled: false`.
-
-Never reuse another run's config, state directory, pending notification, or watcher cursor.
-
-## 3. Confirm the target is discoverable
+Set `suite_root` to the directory containing `worktrees/`, keep `run_globs` as `worktrees/*`, and
+choose a fresh ignored `runtime/orchestrator-harness/<epoch>` output. Validate before launch:
 
 ```powershell
 python -m orchestrator_harness --config local-config/harness.json scan --no-write
-python -m harness_watcher_implementation --config local-config/watcher.json poll
 ```
 
-Inspect the output. Do not start live workers until the intended runs and lanes are present and no
-unexpected run is included.
+## 3. Launch lane controllers
 
-## 4. Start the diagnostic watcher
-
-Use the exact PID of a durable owner that will remain alive for the run—not a temporary shell:
+For each lane, copy the shape in `examples/coding.invocation.example.json`, replace every path and
+Git identity, write the prompt beneath that lane's `.agent-workspace`, and calculate its SHA-256.
+Use `exclusive_resources` only for non-Git resources that cannot be shared concurrently.
 
 ```powershell
-python -m harness_watcher_implementation --config local-config/watcher.json start --owner-pid <durable-owner-pid>
-python -m harness_watcher_implementation --config local-config/watcher.json status
+python -m orchestrator_harness.lane_controller <lane-invocation.json>
 ```
 
-Confirm the watcher reports ready and `evaluator_enabled: false`.
+The manager may use `orchestrator_harness.operator_launch` for a detached, identity-recorded
+controller. The harness does not schedule controllers automatically.
 
-## 5. Launch real task workers
-
-The persistent orchestrator launches the external workers using the target project's normal worker
-controller and authorization rules. The harness and watcher do not launch or manage workers.
-
-Do not launch an AI watcher, notification relay, harness helper, scheduler, or retry process.
-
-## 6. Run the manager loop
-
-The orchestrator directly performs this bounded wait whenever it is ready for the next event:
+## 4. Wait and acknowledge
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60 --manager-session-id <session-id> --manager-invocation-id <invocation-id>
+python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60
 ```
 
-- Exit `0`: handle the returned JSON event.
-- Exit `3`: quiet timeout; call the native wait again when appropriate.
-- Exit `1`: preserve the error and diagnose it. Do not build a workaround around the harness.
-
-The agent must stay active and keep returning to this wait. This system cannot restart or wake a
-closed agent conversation.
-
-## 7. Handle one returned event correctly
-
-1. Preserve the returned `wake_id`.
-2. If attention logging is enabled, make `MANAGER_WAKE_RECEIVED` the first manager record after
-   delivery, then record the matching `MANAGER_WAIT_FINISHED`.
-3. Use `data.signal_id` as the worker/source event ID.
-4. Inspect the durable worker request and make the management decision.
-5. Validate non-empty exact epoch, source-event, lane, session, and invocation IDs before publishing
-   a response.
-6. Publish the response atomically and confirm the intended bytes exist.
-7. Acknowledge only after successful handling, using the envelope's top-level native `event_id`:
+Handle one returned event, verify the corresponding action or durable record, then acknowledge the
+top-level `event_id` exactly:
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json ack --event-id <native-event-id>
+python -m orchestrator_harness --config local-config/harness.json ack --event-id <event-id>
 ```
 
-Never acknowledge with `data.signal_id`.
+Repeat after timeouts. Never poll worker transcripts or add a relay as an alternate discovery path.
 
-## 8. Stop and clean up
+## 5. Finish each lane
 
-Let active task work reach a safe natural boundary, then stop cooperatively:
+Workers may update `.agent-workspace/PARALLEL_CHECKPOINT.md` during progress. Completion requires a
+clean committed branch plus `.agent-workspace/RESULT.json` matching
+`examples/coding.result.example.json`. The commit must be the current branch tip.
+
+Normal named-lock contention waits automatically. Investigate only malformed, stale, unknown, or
+excessive-wait evidence. Never delete another invocation's claim.
+
+## 6. Merge and accept
 
 ```powershell
-python -m harness_watcher_implementation --config local-config/watcher.json stop
-python -m orchestrator_harness --config local-config/harness.json watch stop
+git worktree add -b integration/candidate ..\project-worktrees\candidate <base-commit>
+git -C ..\project-worktrees\candidate merge --no-edit lane/parser
+git -C ..\project-worktrees\candidate merge --no-edit lane/api
+python -m unittest discover -s ..\project-worktrees\candidate -v
 ```
 
-Confirm the watcher and harness stopped, their exact PID-plus-creation identities are absent, and no
-worker, controller, lease, debugger, provider, or hardware process remains unintentionally active.
+Use a manager-assigned merge worker when conflict resolution or integration work is needed. Its
+invocation identifies the integration branch and merge inputs. Publish and validate its result,
+then treat that commit as the candidate. Run acceptance before promoting it over the frozen
+known-good revision.
 
-Runtime data belongs under `runtime/`; never move it into a source package.
+## 7. Clean up
 
-## If something fails
+Stop managed observation cooperatively if active, prove exact process identities absent, confirm
+all named claims released, preserve results, then remove disposable worktrees with `git worktree
+remove`. Never remove a dirty or unmerged lane without an explicit manager decision.
 
-- Preserve the event, error, watcher diagnostics, and current state.
-- Do not add support machinery or edit code during live work.
-- Finish or stop at the next safe boundary.
-- Decide whether the problem is configuration, operator procedure, worker behavior, harness code,
-  or watcher diagnostics.
-- Repair only a verified defect, then run the tests in `README.md` before the next fresh epoch.
+Run the complete local example at any time:
 
+```powershell
+python examples/disposable_coding_fixture.py
+```
+
+The legacy policy-bound firmware path remains supported but is not part of this quick start.

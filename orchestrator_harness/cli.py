@@ -147,7 +147,10 @@ def _store(config: HarnessConfig) -> SafeOutput:
         harness_root=config.harness_root,
         output_root=config.output_dir,
         forbidden_roots=config.forbidden_output_roots,
-        allowed_output_roots=(config.suite_root / "multi-agent-logs",),
+        allowed_output_roots=(
+            config.suite_root / "runtime",
+            config.suite_root / "multi-agent-logs",
+        ),
         attention_logging_enabled=config.attention_logging_enabled,
         attention_epoch_id=config.attention_epoch_id,
     )
@@ -657,7 +660,7 @@ def stop_command(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m orchestrator_harness",
-        description="Read-only MCP-Trial-3 parallel-lane watcher",
+        description="Durable event observer for parallel coding lanes",
     )
     parser.add_argument(
         "--config",

@@ -3,28 +3,29 @@
   "action": "start",
   "runtime_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch",
   "resource_lock_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/coding-resource-locks",
-  "run_root": "C:/absolute/path/to/target-checkout",
+  "run_root": "C:/absolute/path/to/project-worktrees/parser",
   "repository": {
     "common_dir": "C:/absolute/path/to/repository/.git",
-    "worktree_root": "C:/absolute/path/to/target-checkout",
-    "branch": "work/s1-product",
-    "base_commit": "0123456789abcdef0123456789abcdef01234567"
+    "worktree_root": "C:/absolute/path/to/project-worktrees/parser",
+    "branch": "lane/parser",
+    "base_commit": "0123456789abcdef0123456789abcdef01234567",
+    "merge_inputs": []
   },
-  "prompt_path": "C:/absolute/path/to/target-checkout/.agent-workspace/worker-prompt.md",
+  "prompt_path": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker-prompt.md",
   "prompt_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "output_paths": {
-    "status": "C:/absolute/path/to/target-checkout/.agent-workspace/worker_controller.status.json",
-    "jsonl": "C:/absolute/path/to/target-checkout/.agent-workspace/worker_codex.jsonl",
-    "stderr": "C:/absolute/path/to/target-checkout/.agent-workspace/worker_codex.stderr.log",
-    "last_message": "C:/absolute/path/to/target-checkout/.agent-workspace/worker_last_message.txt"
+    "status": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_controller.status.json",
+    "jsonl": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_codex.jsonl",
+    "stderr": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_codex.stderr.log",
+    "last_message": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_last_message.txt"
   },
   "event_log_path": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/LANE_EVENTS.jsonl",
-  "lane_id": "S1.P",
-  "worker_invocation_id": "s1-product-001",
-  "task": "S1",
+  "lane_id": "parser",
+  "worker_invocation_id": "parser-001",
+  "task": "Implement the parser and focused tests",
   "phase": "implementation",
-  "resources": [
-    "worktree:01-general-worker"
+  "exclusive_resources": [
+    "service:integration-database"
   ],
   "codex": {
     "command": [

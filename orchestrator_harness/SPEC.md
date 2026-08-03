@@ -2,26 +2,35 @@
 
 ## Purpose
 
-Build a small, suite-specific, read-only watcher that gives the active MCP-Trial-3 main
-orchestrator a truthful, event-driven view of every parallel firmware-test lane.
+Provide a durable event-driven view of parallel coding lanes while preserving the supported legacy
+firmware observation contract. Ordinary coding lanes use separate Git branches/worktrees, explicit
+`orchestrator-coding-invocation/v1` identity, validated branch-tip results, and opaque exclusive
+named resources. The persistent manager owns planning, split/merge ordering, launches, decisions,
+acceptance, promotion, and cleanup.
 
 The watcher is a monitor, not another manager. It must make crashes, stale state, permission
 requests, helper expiry, checkpoints, provider waits, results, duplicated controllers, and resource
 conflicts visible promptly. The main orchestrator remains the only authority that schedules work,
 changes leases, reviews hardware plans, publishes relays, recovers lanes, classifies failures, or
-serializes production-server repairs.
+serializes production-server repairs on the legacy firmware path.
 
-## Desired operating loop
+## Coding operating loop
 
 ```text
-main orchestrator reconciles
-  -> launches all dependency-ready, resource-compatible lanes
+main orchestrator freezes a stable base and plans branch/worktree lanes
+  -> launches manager-selected lanes and lets exact named locks serialize contention
   -> waits in a bounded watcher exit-on-event call
   -> reviews and handles the event
-  -> reconciles every lane and lease
+  -> acknowledges the exact native event ID and reconciles every lane
   -> repeats
-  -> writes a durable checkpoint before the scheduling epoch ends
+  -> launches a merge lane, runs project checks, accepts and promotes the candidate
 ```
+
+`PARALLEL_CHECKPOINT.md` records resumable progress. `RESULT.json` is merge-ready only when its
+lane, invocation, branch, full current tip, checks shape, and clean-worktree evidence validate.
+The harness does not execute reported checks or infer a dependency graph.
+
+### Legacy firmware compatibility
 
 Parallel firmware and host work may run in isolated workspaces. Parallel hardware work is valid
 only under nonconflicting exclusive leases. Exact hardware relays and all production-server edits

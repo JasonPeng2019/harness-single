@@ -1,4 +1,4 @@
-"""Read-only orchestration watcher for the MCP-Trial-3 firmware suite."""
+"""Durable observation and lane-control primitives for parallel coding work."""
 
 from .models import ProcessInfo, ProcessSnapshot
 
