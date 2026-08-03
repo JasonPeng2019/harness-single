@@ -158,6 +158,60 @@ class SuiteFixture:
         )
 
 
+@dataclass
+class TemporaryGitRepository:
+    """Small argv-only Git fixture for coding-lane tests."""
+
+    root: Path
+    branch: str
+
+    @classmethod
+    def create(cls, root: Path, *, branch: str = "coding") -> "TemporaryGitRepository":
+        root.mkdir(parents=True, exist_ok=True)
+        fixture = cls(root, branch)
+        fixture.git("init", "--initial-branch", branch)
+        fixture.git("config", "user.email", "tests@example.invalid")
+        fixture.git("config", "user.name", "Harness Tests")
+        (root / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        fixture.git("add", "tracked.txt")
+        fixture.git("commit", "-m", "initial")
+        return fixture
+
+    def git(self, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            shell=False,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    @property
+    def common_dir(self) -> Path:
+        value = self.git("rev-parse", "--git-common-dir")
+        path = Path(value)
+        return (self.root / path).resolve() if not path.is_absolute() else path.resolve()
+
+    @property
+    def head(self) -> str:
+        return self.git("rev-parse", "HEAD")
+
+    def declaration(self) -> dict[str, str]:
+        return {
+            "common_dir": str(self.common_dir),
+            "worktree_root": str(self.root.resolve()),
+            "branch": self.branch,
+            "base_commit": self.head,
+        }
+
+    def linked_worktree(self, path: Path, branch: str) -> "TemporaryGitRepository":
+        self.git("worktree", "add", "-b", branch, str(path), self.head)
+        return TemporaryGitRepository(path, branch)
+
+
 SYNTHETIC_CONTROLLER = r"""
 from __future__ import annotations
 import json, os, subprocess, sys, time

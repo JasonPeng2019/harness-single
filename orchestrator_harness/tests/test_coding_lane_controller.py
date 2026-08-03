@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import orchestrator_harness.lane_controller as controller
+from orchestrator_harness.tests.support import TemporaryGitRepository
 
 
 FAKE_CODEX = r'''
@@ -30,6 +31,7 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.run_root = self.root / "run"
+        self.repository = TemporaryGitRepository.create(self.run_root)
         self.workspace = self.run_root / ".agent-workspace"
         self.workspace.mkdir(parents=True)
         self.runtime_root = self.root / "runtime"
@@ -66,6 +68,7 @@ class CodingLaneControllerTests(unittest.TestCase):
             "prompt_sha256": hashlib.sha256(self.prompt.read_bytes()).hexdigest(),
             "output_paths": outputs,
             "resources": ["workspace"],
+            "repository": self.repository.declaration(),
             "codex": {
                 "model": "gpt-5.6-codex",
                 "reasoning_effort": "high",
@@ -161,6 +164,13 @@ class CodingLaneControllerTests(unittest.TestCase):
         status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
         self.assertEqual("CONTROLLER_FAILED", status["state"])
         self.assertIn("does not match", status["error"])
+
+    def test_resume_rejects_a_branch_switch_after_start(self) -> None:
+        start, _ = self.invocation()
+        self.assertEqual(0, controller.main([str(start)]))
+        self.repository.git("checkout", "-b", "switched")
+        resume, _ = self.invocation(action="resume")
+        self.assertEqual(2, controller.main([str(resume)]))
 
 
 if __name__ == "__main__":
