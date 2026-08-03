@@ -11,7 +11,6 @@ from .stable_io import canonical_json
 LANE_EVENT_TYPES = {
     "RUNNING_CODEX": "CONTROLLER_ACTIVE",
     "WAITING_RESOURCE": "LANE_WAITING_RESOURCE",
-    "COORDINATION_FAILED": "COORDINATION_FAILED",
     "WAITING_RELAY": "LANE_WAITING_RELAY",
     "HELPER_RUNNING": "HELPER_ACTIVE",
     "STALE_STATUS": "STALE_STATUS",
@@ -25,7 +24,6 @@ LANE_EVENT_TYPES = {
 PROCESS_EVENT_TYPES = {
     "RUNNING_CODEX": "CONTROLLER_ACTIVE",
     "WAITING_RESOURCE": "LANE_WAITING_RESOURCE",
-    "COORDINATION_FAILED": "COORDINATION_FAILED",
     "STALE_STATUS": "STALE_STATUS",
     "PROCESS_STATE_UNKNOWN": "PROCESS_STATE_UNKNOWN",
     "EXITED": "CONTROLLER_EXITED",
@@ -77,7 +75,7 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
         kind = PROCESS_EVENT_TYPES.get(state, "LANE_STATE_UNKNOWN")
         severity = (
             "error"
-            if state in {"STALE_STATUS", "COORDINATION_FAILED"}
+            if state == "STALE_STATUS"
             else "warning"
             if state in {"PROCESS_STATE_UNKNOWN", "UNKNOWN"}
             else "info"
@@ -104,6 +102,26 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
         }
         identity = f"lane:{lane_id}:process"
         conditions[identity] = _condition(identity, kind, severity, data)
+        coordination_failure = lane.get("coordination_failure")
+        if (
+            lane.get("invocation_schema") == "orchestrator-coding-invocation/v1"
+            and (
+                lane.get("declared_state") == "coordination_failed"
+                or isinstance(coordination_failure, dict)
+            )
+        ):
+            identity = f"lane:{lane_id}:coordination-failure"
+            conditions[identity] = _condition(
+                identity,
+                "COORDINATION_FAILED",
+                "error",
+                {
+                    "lane_id": lane_id,
+                    "worker_invocation_id": lane.get("worker_invocation_id"),
+                    "declared_state": lane.get("declared_state"),
+                    "coordination_failure": coordination_failure,
+                },
+            )
         wait = lane.get("waiting_resource_claim")
         if isinstance(wait, dict):
             identity = f"lane:{lane_id}:resource-wait"

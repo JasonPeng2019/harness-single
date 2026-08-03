@@ -131,10 +131,7 @@ def _controller_observation(
 
     declared = str(raw.get("state") or "unknown").lower()
     terminal = controller.terminal_event
-    if declared == "coordination_failed":
-        operational = "COORDINATION_FAILED"
-        reason = str(raw.get("error") or "coding resource coordination failed")
-    elif declared == "waiting_resource":
+    if declared == "waiting_resource":
         if not snapshot.complete:
             operational = "PROCESS_STATE_UNKNOWN"
             reason = "resource wait cannot be reconciled without complete process inventory"
