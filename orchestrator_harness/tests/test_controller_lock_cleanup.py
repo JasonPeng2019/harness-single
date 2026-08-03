@@ -124,7 +124,9 @@ class ControllerLockCleanupTests(unittest.TestCase):
             self.assertEqual(1, controller.run(invocation))
 
         claims = captured[0]
-        claim_path = invocation.resource_lock_root / claim_filename("named-resource")
+        lock_root = invocation.resource_lock_root
+        assert lock_root is not None
+        claim_path = lock_root / claim_filename("named-resource")
         self.assertTrue(claim_path.is_file())
         self.assertEqual(["named-resource"], [claim["resource"] for claim in claims.held])
         self.assertEqual([], release_calls)
@@ -167,7 +169,9 @@ class ControllerLockCleanupTests(unittest.TestCase):
         ):
             self.assertEqual(1, controller.run(invocation))
 
-        claim_path = invocation.resource_lock_root / claim_filename("named-resource")
+        lock_root = invocation.resource_lock_root
+        assert lock_root is not None
+        claim_path = lock_root / claim_filename("named-resource")
         self.assertTrue(child.killed)
         self.assertEqual([None], release_calls)
         self.assertFalse(claim_path.exists())
