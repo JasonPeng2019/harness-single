@@ -131,7 +131,10 @@ def _controller_observation(
 
     declared = str(raw.get("state") or "unknown").lower()
     terminal = controller.terminal_event
-    if declared == "waiting_resource":
+    if declared == "coordination_failed":
+        operational = "COORDINATION_FAILED"
+        reason = str(raw.get("error") or "coding resource coordination failed")
+    elif declared == "waiting_resource":
         if not snapshot.complete:
             operational = "PROCESS_STATE_UNKNOWN"
             reason = "resource wait cannot be reconciled without complete process inventory"
@@ -275,6 +278,9 @@ def _controller_observation(
         else None,
         "result_valid": raw.get("result_valid")
         if isinstance(raw.get("result_valid"), bool)
+        else None,
+        "coordination_failure": raw.get("coordination_failure")
+        if isinstance(raw.get("coordination_failure"), dict)
         else None,
         "jsonl_path": str(controller.jsonl_path) if controller.jsonl_path else None,
         "board_tokens": sorted(

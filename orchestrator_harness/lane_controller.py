@@ -676,7 +676,17 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
         return 130
     except ResourceLockError as exc:
-        state.update({"state": "COORDINATION_FAILED", "ended_utc": _utc(), "error": str(exc)})
+        retained_claims = resource_claims.held if resource_claims is not None else []
+        state.update({
+            "state": "COORDINATION_FAILED",
+            "ended_utc": _utc(),
+            "error": str(exc),
+            "coordination_failure": {
+                "error": str(exc),
+                "retained_claims": retained_claims,
+            },
+            "held_resource_claims": retained_claims,
+        })
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
         return 1
