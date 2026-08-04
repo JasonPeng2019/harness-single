@@ -104,7 +104,7 @@ class S3OperatorJourneyTests(unittest.TestCase):
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
         recipe = (REPOSITORY_ROOT / "examples" / "dual-path-manager.example.md").read_text(encoding="utf-8")
         safeguard = (REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1").read_text(encoding="utf-8")
-        registry = json.loads((REPOSITORY_ROOT.parents[3] / "passed-tests.json").read_text(encoding="utf-8"))
+        registry = json.loads((REPOSITORY_ROOT.parents[2] / "passed-tests.json").read_text(encoding="utf-8"))
 
         for text in (quick_start, recipe):
             self.assertIn("scan --no-write", text)
@@ -113,7 +113,14 @@ class S3OperatorJourneyTests(unittest.TestCase):
         for required in ("resume_thread_id", "passed-tests.json", "PID-plus-creation", "evaluator_enabled: false", "C3-HARNESS", "service_tier=\"priority\""):
             self.assertIn(required, quick_start)
         self.assertEqual([], registry["invalidated_groups"])
-        self.assertIn("orchestrator_harness.tests.test_general_coding_docs.GeneralCodingDocsTests", registry["green_test_ids"])
+        self.assertIn(
+            "tests/test_general_coding_docs.py::GeneralCodingDocumentationTests::test_documented_harness_examples_parse",
+            registry["green_test_ids"],
+        )
+        self.assertIn(
+            "tests/test_general_coding_docs.py::GeneralCodingDocumentationTests::test_schema_less_firmware_invocation_still_parses",
+            registry["green_test_ids"],
+        )
         for template in ("FINAL_REVIEW.md", "ACCEPTANCE_WATCHER.md", "TOPOLOGY_AUDIT.md", "CRITERIA_AUDIT.md", "PROTECTED_STATE.md", "PROMOTION.md", "COMPLETION.md"):
             self.assertTrue((REPOSITORY_ROOT / "release_evidence_templates" / template).is_file(), template)
         for check in ("ruff", "format", "basedpyright", "compileall", "orchestrator-tests", "watcher-tests", "attention-retention", "codex-integration", "synthetic-cleanup"):
