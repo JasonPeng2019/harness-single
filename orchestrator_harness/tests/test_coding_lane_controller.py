@@ -119,12 +119,23 @@ class CodingLaneControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.InvocationError, "prompt bytes do not match"):
             controller.load_invocation(path)
 
-    def test_coding_rejects_firmware_only_fields(self) -> None:
-        path, raw = self.invocation()
-        raw["policy_sha256"] = "0" * 64
-        self._write(path, raw)
-        with self.assertRaisesRegex(controller.InvocationError, "reserved for the other route"):
-            controller.load_invocation(path)
+    def test_coding_rejects_every_firmware_only_discriminator(self) -> None:
+        firmware_only = {
+            "policy_sha256": "0" * 64,
+            "leases": ["board:firmware"],
+            "board_tokens": ["board:firmware"],
+            "mcp_servers": ["firmware-mcp"],
+            "server_snapshot": {"head": "firmware"},
+        }
+        for field, value in firmware_only.items():
+            with self.subTest(field=field):
+                path, raw = self.invocation()
+                raw[field] = value
+                self._write(path, raw)
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "reserved for the other route"
+                ):
+                    controller.load_invocation(path)
 
     def test_start_records_identity_events_and_configured_codex_argv(self) -> None:
         path, _ = self.invocation()

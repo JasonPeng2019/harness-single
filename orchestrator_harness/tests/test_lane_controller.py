@@ -141,13 +141,49 @@ class LaneControllerTests(unittest.TestCase):
         bad.write_text('{not json', encoding='utf-8')
         self.assertEqual(2, controller.main([str(bad)]))
 
-    def test_schema_less_firmware_rejects_coding_only_fields(self) -> None:
-        path = self.invocation()
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        raw["worker_invocation_id"] = "coding-worker"
-        path.write_text(json.dumps(raw), encoding="utf-8")
-        with self.assertRaisesRegex(controller.InvocationError, "reserved for the other route"):
-            controller.load_invocation(path)
+    def test_schema_less_firmware_rejects_every_coding_only_alias(self) -> None:
+        coding_only = {
+            "worker_invocation_id": "coding-worker",
+            "runtime_root": str(self.root / "runtime"),
+            "resource_lock_root": str(self.root / "locks"),
+            "event_log_path": str(self.root / "events.jsonl"),
+            "event_log": str(self.root / "events.jsonl"),
+            "lane_id": "coding:worker",
+            "resources": ["generic-resource"],
+            "exclusive_resources": ["generic-resource"],
+            "repository": {},
+            "resume_identity": {"thread_id": "coding-thread"},
+            "resume": {"thread_id": "coding-thread"},
+            "codex": {},
+            "codex_settings": {},
+        }
+        for field, value in coding_only.items():
+            with self.subTest(field=field):
+                path = self.invocation(label=f"mixed_{field}")
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw[field] = value
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "reserved for the other route"
+                ):
+                    controller.load_invocation(path)
+
+    def test_schema_less_firmware_rejects_coding_model_settings_aliases(self) -> None:
+        for field, value in {
+            "command": [sys.executable, str(self.fake)],
+            "config_overrides": ["feature_flag=true"],
+            "sandbox": "workspace-write",
+            "approval_policy": "never",
+        }.items():
+            with self.subTest(field=field):
+                path = self.invocation(label=f"nested_{field}")
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                raw["model_settings"][field] = value
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "reserved for the other route"
+                ):
+                    controller.load_invocation(path)
 
     def test_unbound_changed_and_policy_mismatch_prompts_are_rejected(self) -> None:
         raw_prompt = self.run / 'raw.md'

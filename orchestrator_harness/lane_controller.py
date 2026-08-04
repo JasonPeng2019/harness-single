@@ -54,13 +54,25 @@ _CODING_ONLY_FIELDS = frozenset({
     "worker_invocation_id",
     "runtime_root",
     "resource_lock_root",
+    "event_log_path",
+    "event_log",
+    "lane_id",
+    "resources",
     "exclusive_resources",
     "repository",
     "resume_identity",
+    "resume",
     "codex",
     "codex_settings",
-    "event_log_path",
-    "event_log",
+})
+# ``model_settings`` is retained by both routes, but coding accepts these
+# nested settings only as a compatibility fallback.  They must not be silently
+# discarded when a schema-less firmware invocation is parsed.
+_CODING_ONLY_MODEL_SETTINGS_FIELDS = frozenset({
+    "command",
+    "config_overrides",
+    "sandbox",
+    "approval_policy",
 })
 
 
@@ -133,6 +145,17 @@ def _reject_foreign_fields(
             f"{route} invocation contains fields reserved for the other route: "
             + ", ".join(present)
         )
+
+
+def _reject_firmware_coding_model_settings(raw: Mapping[str, Any]) -> None:
+    settings = raw.get("model_settings")
+    if not isinstance(settings, Mapping):
+        return
+    _reject_foreign_fields(
+        settings,
+        route="schema-less firmware model_settings",
+        fields=_CODING_ONLY_MODEL_SETTINGS_FIELDS,
+    )
 
 
 @dataclass(frozen=True)
@@ -228,6 +251,7 @@ def _resume_thread(raw: dict[str, Any]) -> str | None:
 
 def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
     _reject_foreign_fields(raw, route="schema-less firmware", fields=_CODING_ONLY_FIELDS)
+    _reject_firmware_coding_model_settings(raw)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     label = _string(raw, "label")
     expected = {
