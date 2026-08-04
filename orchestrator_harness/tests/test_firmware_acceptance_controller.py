@@ -64,7 +64,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         plan["max_operation_duration_seconds"] = 30  # type: ignore[index]
         permission["granted"] = True  # type: ignore[index]
         governing = {name: ref(name) for name in ("goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness")}
-        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":plan,"permission":permission,"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"board_identity":ref("board"),"mcp_schema":ref("schema"),"policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"server_revision":"f003f84a7df51cd8595a3203c62e225b21da2a22","seed_identity":ref("seed"),"target_identity":ref("target"),"topology_key_release":ref("release"),"governing_documents":governing}
+        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"066FFF514988525067233337","target":"STM32L476RG","profile":"stm-a-l476","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":plan,"permission":permission,"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"board_identity":ref("board"),"mcp_schema":ref("schema"),"policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"server_revision":"f003f84a7df51cd8595a3203c62e225b21da2a22","seed_identity":ref("seed"),"target_identity":ref("target"),"topology_key_release":ref("release"),"governing_documents":governing}
 
     def _flow(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier) -> tuple[Path, Path, Path]:
         proposal_path = root / "broker" / "proposal.json"; proposal = controller.publish_proposal(proposal_path, {"call":self._call(root)})
@@ -94,6 +94,15 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             paths[2].write_text(paths[2].read_text(encoding="utf-8") + "\n", encoding="utf-8")
             with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
             self.assertEqual([], launches); self.assertFalse(claims[0].live)
+
+    def test_lane_template_binding_mutation_matrix_rejects_before_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims = Path(temporary), [], []
+            controller = self._controller(root, launches, claims)
+            for key, value in (("lane_id", "NRF-A"), ("board", "NRF-A"), ("resource", "NRF-A"), ("probe_uid", "683710208"), ("target", "nRF52840"), ("profile", "nrf-a-52840"), ("route", "wrong")):
+                call = self._call(root); call[key] = value
+                with self.subTest(key=key), self.assertRaises(AdmissionError): controller.publish_proposal(root / "broker" / (key + ".json"), {"call": call})
+            self.assertEqual([], claims); self.assertEqual([], launches)
 
     def test_authorization_launch_or_identity_mutation_rejects_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

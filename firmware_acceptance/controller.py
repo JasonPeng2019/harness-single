@@ -274,6 +274,7 @@ class FirmwareAcceptanceController:
         if set(request) != {"call"}: raise AdmissionError("proposal must contain exactly one closed call authority")
         call = _closed_call(request["call"])
         _verify_live_call_inputs(call, self.broker)
+        self.broker.validate_lane_call(call)
         return {"schema": "firmware-controller-proposal/v2", "call": call}
 
     def publish_proposal(self, path: Path, request: dict[str, Any]) -> dict[str, Any]:
@@ -359,6 +360,7 @@ class FirmwareAcceptanceController:
         try:
             for stage, value in (("proposal", proposal), ("policy-evaluation", policy), ("signed-decision", decision), ("authorization", authorization)):
                 evidence.append(self.broker.record(stage, call_id, {**common, **value}, (str(evidence[-1][0]), evidence[-1][1]) if evidence else None))
+            self.broker.validate_lane_call(call)
             config = self.broker.controller_config(call["lane_id"], {})
             config = {**config, "environment": _scrubbed_environment(config)}
             dispatch_start = self.clock()

@@ -296,6 +296,21 @@ class AcceptanceBroker:
                 raise AdmissionError("lane root cannot be a symlink")
         return {"lane": lane, "working_directory": str(server_root), "mcp_command": ["uv", "run", "--project", str(server_root), "--locked", "pyocd-debug-mcp"], "stdio": {"stdin": "controller-only", "stdout": "controller-only-mcp-framing", "stderr_path": str(_safe_child(logs, "mcp.stderr.log"))}, "roots": {"firm": str(firm), "artifacts": str(artifacts), "logs": str(logs), "mcp": str(mcp)}, "environment": {"BYO_MCP_ARTIFACT_ROOT": str(artifacts), "PYOCD_PROBE_UID": lane["probe_uid"], "PYOCD_TARGET": lane["target"], "PYTHONPYCACHEPREFIX": str(_safe_child(self.root, "pycache", lane_id))}, "lifetime": {"owner": "C3-HARNESS", "requires_exact_process_identity": True, "cleanup_requires_reap": True}, "worker_environment": worker_environment()}
 
+    def validate_lane_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        """Bind declared call identity to one locked, reviewed physical lane."""
+        lanes = self.templates.get("lanes") if isinstance(self.templates, dict) else None
+        fixtures = self.manifest.get("fixtures") if isinstance(self.manifest, dict) else None
+        if not isinstance(lanes, list) or not isinstance(fixtures, dict): raise AdmissionError("lane template or manifest is malformed")
+        matches = [row for row in lanes if isinstance(row, dict) and row.get("lane_id") == call.get("lane_id")]
+        if len(matches) != 1 or set(matches[0]) != {"lane_id", "process_id", "firm_root", "artifact_root", "log_root", "probe_uid", "target", "profile", "serial_route", "endpoint"}:
+            raise AdmissionError("lane template is unknown or ambiguous")
+        lane = matches[0]; fixture = fixtures.get(lane["lane_id"])
+        if not isinstance(fixture, dict) or set(fixture) != {"probe_uid", "target", "profile", "serial_route"} or any(lane[key] != fixture[key] for key in fixture):
+            raise AdmissionError("lane template disagrees with locked manifest fixture")
+        if any(call.get(key) != lane[key] for key in ("lane_id", "probe_uid", "target", "profile")) or call.get("board") != lane["lane_id"] or call.get("resource") != lane["lane_id"] or (call.get("route") is not None and call.get("route") != lane["serial_route"]):
+            raise AdmissionError("call identity does not match selected physical lane")
+        return lane
+
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
         if stage not in order or not call_id or "/" in call_id or "\\" in call_id:
