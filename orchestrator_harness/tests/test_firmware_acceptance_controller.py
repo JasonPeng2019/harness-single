@@ -104,6 +104,38 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(AdmissionError): controller.publish_proposal(root / "broker" / (key + ".json"), {"call": call})
             self.assertEqual([], claims); self.assertEqual([], launches)
 
+    def test_existing_result_and_incomplete_authority_reject_before_claim(self) -> None:
+        for mutation in ("result", "duration", "permission", "plan-hash"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+                if mutation == "result":
+                    request, result = root / "request.json", root / "broker" / "result.json"
+                    request.write_text(json.dumps({"call": self._call(root)}), encoding="utf-8"); result.parent.mkdir(parents=True, exist_ok=True); result.write_text("reserved", encoding="utf-8")
+                    with self.assertRaises(AdmissionError): controller.run_lifecycle(request, root / "broker" / "proposal.json", root / "broker" / "decision.json", root / "broker" / "authorization.json", verifier, result_path=result)
+                else:
+                    call = self._call(root)
+                    if mutation == "duration": call["plan"].pop("max_operation_duration_seconds")  # type: ignore[index]
+                    elif mutation == "permission": call["permission"].pop("granted")  # type: ignore[index]
+                    else: call["plan"]["sha256"] = "drift"  # type: ignore[index]
+                    with self.assertRaises(AdmissionError): controller.publish_proposal(root / "broker" / "proposal.json", {"call": call})
+                self.assertEqual([], claims); self.assertEqual([], launches)
+
+    def test_unretained_execution_and_retained_authority_drift_reject_before_launch(self) -> None:
+        for mutation in ("direct", "claim", "template", "manifest", "attempt"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+                proposal, decision, authorization = self._flow(root, controller, verifier)
+                if mutation == "direct":
+                    with self.assertRaises(AdmissionError): controller.execute(json.loads(proposal.read_text()), json.loads(decision.read_text()), json.loads(authorization.read_text()), verifier, proposal, hashlib.sha256(proposal.read_bytes()).hexdigest(), decision, hashlib.sha256(decision.read_bytes()).hexdigest(), root / "broker" / "other.json", "other")
+                    controller._release_live_claim()
+                else:
+                    if mutation == "claim": claims[0].live = False
+                    elif mutation == "template": controller.broker.templates["lanes"][0]["probe_uid"] = "drift"
+                    elif mutation == "manifest": controller.broker.manifest["fixtures"]["STM-A"]["probe_uid"] = "drift"
+                    else: controller.topology = {"attempt_id": "wrong"}
+                    with self.assertRaises(AdmissionError): controller.execute_artifacts(proposal, decision, authorization, verifier)
+                self.assertEqual([], launches); self.assertFalse(claims[0].live)
+
     def test_authorization_launch_or_identity_mutation_rejects_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
