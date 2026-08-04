@@ -241,7 +241,7 @@ class FirmwareAcceptanceController:
             if result_path is not None:
                 reject_linked_path(result_path)
                 safe_result = result_path.resolve()
-                if self.broker.root not in safe_result.parents: raise AdmissionError("result path escapes controller root")
+                if self.broker.root not in safe_result.parents or safe_result.exists(): raise AdmissionError("result path escapes controller root or already exists")
             reject_linked_path(request_path)
             request = self._load_external(request_path, {"call"})
             self.publish_proposal(proposal_path, request)
@@ -334,6 +334,8 @@ class FirmwareAcceptanceController:
     def execute(self, proposal: dict[str, Any], decision: dict[str, Any], authorization: dict[str, Any], verifier: SignatureVerifier, proposal_path: Path | None = None, proposal_sha: str | None = None, decision_path: Path | None = None, decision_sha: str | None = None, authorization_path: Path | None = None, authorization_sha: str | None = None) -> dict[str, Any]:
         if proposal_path is None or proposal_sha is None or decision_path is None or decision_sha is None or authorization_path is None or authorization_sha is None:
             raise AdmissionError("execution requires this controller's live artifact bindings")
+        if self._authorization_binding != (authorization_path.resolve(), authorization_sha):
+            raise AdmissionError("execution requires the retained derived authorization binding")
         self._require_live_claim(proposal_path, proposal_sha, proposal)
         call = _closed_call(proposal.get("call"))
         self._validate_decision(proposal_path, proposal_sha, proposal, decision, verifier)
@@ -467,7 +469,7 @@ class FirmwareAcceptanceController:
 
     def _intent_bound(self, call: dict[str, Any], intent_sha: str, authorization: dict[str, Any], authorization_path: Path, authorization_sha: str, claim: dict[str, Any]) -> dict[str, Any]:
         policy_sha = hashlib.sha256(self.broker.policy_path.read_bytes()).hexdigest()
-        return {"server_commit":call["server_revision"],"method":call["method"],"method_version":call["method_version"],"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":call["mcp_schema"]["sha256"],"resource":call["resource"],"plan_sha256":call["plan"]["sha256"],"permission_sha256":call["permission"]["sha256"],"authorization_sha256":authorization_sha,"authorization_path":str(authorization_path),"claim_sha256":claim["sha256"],"claim":claim,"controller_owner":claim["owner"],"call_id":call["call_id"],"attempt_id":call["attempt_id"],"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call["route"],"governing_hashes":{key: value["sha256"] for key, value in call["governing_documents"].items()},"governing_documents":call["governing_documents"],"c1_reference":call["c1_reference"],"delegated_reference":call["delegated_reference"],"board_identity":call["board_identity"],"mcp_schema":call["mcp_schema"],"policy":call["policy"],"plan":{"path":call["plan"]["path"],"sha256":call["plan"]["sha256"]},"permission":{"path":call["permission"]["path"],"sha256":call["permission"]["sha256"]},"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call["seed_identity"],"target_identity":call["target_identity"],"topology_key_release":call["topology_key_release"],"raw_result_sha256":"PENDING","cleanup_owner":claim["owner"]}
+        return {"server_commit":call["server_revision"],"method":call["method"],"method_version":call["method_version"],"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":call["mcp_schema"]["sha256"],"resource":call["resource"],"plan_sha256":call["plan"]["sha256"],"permission_sha256":call["permission"]["sha256"],"max_operation_duration_seconds":call["plan"]["max_operation_duration_seconds"],"permission_granted":call["permission"]["granted"],"authorization_sha256":authorization_sha,"authorization_path":str(authorization_path),"claim_sha256":claim["sha256"],"claim":claim,"controller_owner":claim["owner"],"call_id":call["call_id"],"attempt_id":call["attempt_id"],"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call["route"],"governing_hashes":{key: value["sha256"] for key, value in call["governing_documents"].items()},"governing_documents":call["governing_documents"],"c1_reference":call["c1_reference"],"delegated_reference":call["delegated_reference"],"board_identity":call["board_identity"],"mcp_schema":call["mcp_schema"],"policy":call["policy"],"plan":{"path":call["plan"]["path"],"sha256":call["plan"]["sha256"]},"permission":{"path":call["permission"]["path"],"sha256":call["permission"]["sha256"]},"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call["seed_identity"],"target_identity":call["target_identity"],"topology_key_release":call["topology_key_release"],"raw_result_sha256":"PENDING","cleanup_owner":claim["owner"]}
 
     def _read_bound(self, path: Path, keys: set[str]) -> tuple[dict[str, Any], str]:
         value = self._load_artifact(path, keys)
@@ -477,6 +479,8 @@ class FirmwareAcceptanceController:
         if self._live_claims is None or self._live_claim is None or self._proposal_binding != (proposal_path.resolve(), proposal_sha):
             raise AdmissionError("controller was restarted or has no retained proposal claim")
         held = self._live_claims.held
+        reject_linked_path(Path(self._live_claim["path"]));
+        if held: reject_linked_path(Path(str(held[0].get("path"))))
         if len(held) != 1 or proposal.get("claim") != self._live_claim or held[0].get("resource") != self._live_claim["resource"] or held[0].get("owner") != self._live_claim["owner"] or Path(str(held[0].get("path"))).resolve() != Path(self._live_claim["path"]).resolve() or hashlib.sha256(Path(self._live_claim["path"]).read_bytes()).hexdigest() != self._live_claim["sha256"]:
             raise AdmissionError("retained exact resource claim drifted or was substituted")
 
@@ -486,7 +490,7 @@ class FirmwareAcceptanceController:
         issued = _utc(decision["issued_utc"], "decision issue")
         if not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["public_key"]): raise AdmissionError("proposal decision signature is invalid")
         if self.topology is not None:
-            if decision["public_key"] != self.topology["public_key"] or decision["orchestrator_identity"] != self.topology["identity_binding"] or decision["topology_key_release"] != self.topology["release"] or issued < self.topology["released_utc"]:
+            if proposal["call"]["attempt_id"] != self.topology["attempt_id"] or decision["public_key"] != self.topology["public_key"] or decision["orchestrator_identity"] != self.topology["identity_binding"] or decision["topology_key_release"] != self.topology["release"] or issued < self.topology["released_utc"]:
                 raise AdmissionError("decision predates key release or has an unbound key")
 
     def _release_live_claim(self) -> None:

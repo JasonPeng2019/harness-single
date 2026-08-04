@@ -95,7 +95,7 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
         "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "deadline_monotonic", "expires_monotonic", "seed_identity",
         "target_identity", "topology_key_release", "raw_result_sha256", "cleanup_owner",
     }
-    if set(value) != required:
+    if not required <= set(value) or set(value) - required - {"max_operation_duration_seconds", "permission_granted"}:
         raise AdmissionError("bound operation must be a closed complete authority object")
     if value["server_commit"] != _PINNED_SERVER_COMMIT or not isinstance(value["method"], str) or not isinstance(value["arguments"], dict):
         raise AdmissionError("bound operation server or method identity is invalid")
@@ -104,7 +104,9 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
             raise AdmissionError("bound operation timing/version is invalid")
     if not all(__import__("math").isfinite(value[key]) for key in ("deadline_monotonic", "expires_monotonic")):
         raise AdmissionError("bound operation timing is not finite")
-    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
+    if ("max_operation_duration_seconds" in value and (not isinstance(value["max_operation_duration_seconds"], int) or value["max_operation_duration_seconds"] <= 0 or value.get("permission_granted") is not True)) or not isinstance(value["authorization_path"], str) or not value["authorization_path"]:
+        raise AdmissionError("bound operation duplicated authority is invalid")
+    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "max_operation_duration_seconds", "permission_granted", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
         if not isinstance(value[key], str) or not value[key]:
             raise AdmissionError("bound operation has an empty identity or hash")
     for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "seed_identity", "target_identity", "topology_key_release"):
@@ -113,9 +115,11 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
             raise AdmissionError("bound operation reference is not exact")
     if not isinstance(value["governing_documents"], dict) or not value["governing_documents"] or any(not isinstance(ref, dict) or set(ref) != {"path", "sha256"} for ref in value["governing_documents"].values()):
         raise AdmissionError("bound governing references are not exact")
+    if value["governing_hashes"] != {key: ref["sha256"] for key, ref in value["governing_documents"].items()} or value["policy_sha256"] != value["policy"]["sha256"] or value["schema_sha256"] != value["mcp_schema"]["sha256"] or value["plan_sha256"] != value["plan"]["sha256"] or value["permission_sha256"] != value["permission"]["sha256"]:
+        raise AdmissionError("bound operation duplicated references drifted")
     claim = value["claim"]
     owner = claim.get("owner") if isinstance(claim, dict) else None
-    if not isinstance(claim, dict) or set(claim) != {"resource", "path", "sha256", "owner"} or value["resource"] != value["board"] or claim["resource"] != value["board"] or claim["owner"] != value["controller_owner"] or value["cleanup_owner"] != value["controller_owner"] or not isinstance(owner, dict) or set(owner) != {"pid", "created_utc", "creation_identity"} or not isinstance(owner["pid"], int) or owner["pid"] <= 0 or not all(isinstance(owner[key], str) and owner[key] for key in ("created_utc", "creation_identity")):
+    if not isinstance(claim, dict) or set(claim) != {"resource", "path", "sha256", "owner"} or value["claim_sha256"] != claim["sha256"] or value["resource"] != value["board"] or claim["resource"] != value["board"] or claim["owner"] != value["controller_owner"] or value["cleanup_owner"] != value["controller_owner"] or not isinstance(owner, dict) or set(owner) != {"pid", "created_utc", "creation_identity"} or not isinstance(owner["pid"], int) or owner["pid"] <= 0 or not all(isinstance(owner[key], str) and owner[key] for key in ("created_utc", "creation_identity")):
         raise AdmissionError("bound claim/controller owner is not exact")
     if value["raw_result_sha256"] != "PENDING" and (not isinstance(value["raw_result_sha256"], str) or len(value["raw_result_sha256"]) != 64):
         raise AdmissionError("bound raw result identity is invalid")
