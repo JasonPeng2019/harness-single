@@ -77,6 +77,26 @@ def validate_findings(path: Path, *, lane_id: str, worker_invocation_id: str, ro
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(findings)}
 
 
+def validate_finding_triage(value: Mapping[str, Any], *, findings_path: Path, findings_sha256: str, finding_ids: set[str]) -> None:
+    required = {"schema", "owner", "findings_path", "findings_sha256", "decisions"}
+    if set(value) != required or value.get("schema") != "orchestrator-review-triage/v1" or value.get("owner") not in {"ROOT-IM", "F.C3.O"}:
+        raise GitSafetyError("triage has invalid closed schema or owner")
+    if value.get("findings_path") != str(findings_path) or value.get("findings_sha256") != findings_sha256:
+        raise GitSafetyError("triage findings reference mismatch")
+    decisions = value.get("decisions")
+    if not isinstance(decisions, list) or len(decisions) != len(finding_ids):
+        raise GitSafetyError("triage must decide every submitted finding exactly once")
+    seen: set[str] = set()
+    for item in decisions:
+        if not isinstance(item, dict) or item.get("id") not in finding_ids or item.get("id") in seen or item.get("decision") not in {"ACCEPT", "REJECT"} or not isinstance(item.get("rationale"), str) or not item["rationale"].strip():
+            raise GitSafetyError("triage decision is invalid")
+        seen.add(item["id"])
+        if item["decision"] == "ACCEPT" and (item.get("conclusion") != "PROBLEM_OUTWEIGHS_FIX_RISK" or not isinstance(item.get("smallest_fix"), str) or not item["smallest_fix"].strip()):
+            raise GitSafetyError("accepted triage requires conclusion and smallest fix")
+        if item["decision"] == "REJECT" and item.get("reason") not in {"unsupported", "not_reproducible", "out_of_scope", "net_negative_complexity"}:
+            raise GitSafetyError("rejected triage requires a bounded reason")
+
+
 def _normalized_path(path: Path) -> str:
     resolved = str(path.resolve(strict=False))
     return os.path.normcase(resolved) if os.name == "nt" else resolved

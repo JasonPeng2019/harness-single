@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orchestrator_harness.git_safety import GitSafetyError, validate_findings
+from orchestrator_harness.git_safety import GitSafetyError, validate_finding_triage, validate_findings
+from firmware_acceptance import finding_gate_fragment
 
 
 class FindingGateTests(unittest.TestCase):
@@ -33,3 +34,12 @@ class FindingGateTests(unittest.TestCase):
             path.write_text(json.dumps(self._value([broken])), encoding="utf-8")
             with self.assertRaises(GitSafetyError):
                 validate_findings(path, lane_id="L", worker_invocation_id="W", role="reviewer", commit="a" * 40, outcome="FAIL")
+
+    def test_triage_and_role_fragment_are_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / ".agent-workspace"; workspace.mkdir()
+            self.assertEqual("reviewer", finding_gate_fragment("reviewer", workspace)["finding_gate"]["role"])
+            findings = workspace / "FINDINGS.json"; findings.write_text("{}", encoding="utf-8")
+            digest = __import__("hashlib").sha256(findings.read_bytes()).hexdigest()
+            value = {"schema":"orchestrator-review-triage/v1","owner":"ROOT-IM","findings_path":str(findings),"findings_sha256":digest,"decisions":[{"id":"F1","decision":"ACCEPT","rationale":"evidence","conclusion":"PROBLEM_OUTWEIGHS_FIX_RISK","smallest_fix":"one check"}]}
+            validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})

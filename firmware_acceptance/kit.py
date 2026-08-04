@@ -51,6 +51,15 @@ def worker_environment() -> dict[str, str]:
     return {"FIRMWARE_ACCEPTANCE_ROLE": "target-worker", **{key: "" for key in _CAPABILITY_KEYS}}
 
 
+def finding_gate_fragment(role: str, workspace: Path) -> dict[str, object]:
+    if role not in {"reviewer", "test_writer", "test_executor"}:
+        raise AdmissionError("unsupported finding-gate role")
+    root = workspace.resolve()
+    if root.name != ".agent-workspace" or root.is_symlink():
+        raise AdmissionError("finding gate requires a real lane .agent-workspace")
+    return {"finding_gate": {"role": role, "path": str(_safe_child(root, "FINDINGS.json"))}}
+
+
 def _load_policy(policy_path: Path) -> dict[str, Any]:
     value = json.loads(policy_path.read_text(encoding="utf-8"))
     if value.get("default") != "deny" or not isinstance(value.get("methods"), dict):

@@ -4,6 +4,6 @@ This package deliberately has no transport, process-launch, probe, serial, or RF
 It validates the records which a controller must create before it can use its own MCP boundary.
 """
 
-from .kit import AdmissionError, evaluate_call, validate_seed_manifest, worker_environment
+from .kit import AdmissionError, evaluate_call, finding_gate_fragment, validate_seed_manifest, worker_environment
 
-__all__ = ["AdmissionError", "evaluate_call", "validate_seed_manifest", "worker_environment"]
+__all__ = ["AdmissionError", "evaluate_call", "finding_gate_fragment", "validate_seed_manifest", "worker_environment"]
