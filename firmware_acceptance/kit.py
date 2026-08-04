@@ -90,12 +90,12 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     """Closed operation authority carried verbatim through every immutable stage."""
     required = {
         "server_commit", "method", "method_version", "arguments", "policy_sha256", "schema_sha256", "resource",
-        "plan_sha256", "permission_sha256", "authorization_sha256", "authorization_path", "claim_sha256", "claim", "controller_owner", "call_id",
+        "plan_sha256", "permission_sha256", "max_operation_duration_seconds", "permission_granted", "authorization_sha256", "authorization_path", "claim_sha256", "claim", "controller_owner", "call_id",
         "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route",
         "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "deadline_monotonic", "expires_monotonic", "seed_identity",
         "target_identity", "topology_key_release", "raw_result_sha256", "cleanup_owner",
     }
-    if not required <= set(value) or set(value) - required - {"max_operation_duration_seconds", "permission_granted"}:
+    if set(value) != required:
         raise AdmissionError("bound operation must be a closed complete authority object")
     if value["server_commit"] != _PINNED_SERVER_COMMIT or not isinstance(value["method"], str) or not isinstance(value["arguments"], dict):
         raise AdmissionError("bound operation server or method identity is invalid")
@@ -104,7 +104,7 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
             raise AdmissionError("bound operation timing/version is invalid")
     if not all(__import__("math").isfinite(value[key]) for key in ("deadline_monotonic", "expires_monotonic")):
         raise AdmissionError("bound operation timing is not finite")
-    if ("max_operation_duration_seconds" in value and (not isinstance(value["max_operation_duration_seconds"], int) or value["max_operation_duration_seconds"] <= 0 or value.get("permission_granted") is not True)) or not isinstance(value["authorization_path"], str) or not value["authorization_path"]:
+    if not isinstance(value["max_operation_duration_seconds"], int) or isinstance(value["max_operation_duration_seconds"], bool) or value["max_operation_duration_seconds"] <= 0 or value["permission_granted"] is not True or not isinstance(value["authorization_path"], str) or not value["authorization_path"]:
         raise AdmissionError("bound operation duplicated authority is invalid")
     for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "max_operation_duration_seconds", "permission_granted", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
         if not isinstance(value[key], str) or not value[key]:
