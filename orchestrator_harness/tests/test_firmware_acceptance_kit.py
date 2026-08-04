@@ -170,6 +170,14 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1)["policy"])
             effect["limits"] = {"max_tx_power_dbm": 1}
             with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
+            effect.update({"effect_action_class":"lora_ping_pong_test","limits":{"bandwidth_hz":125000,"center_frequency_hz":915000000,"coding_rate_denominator":5,"max_campaign_minutes":30,"max_payload_bytes":64,"max_tx_airtime_ms_per_60s":6000,"max_tx_power_dbm":10,"spreading_factor_min":7,"spreading_factor_max":10}})
+            for minimum, maximum, allowed in ((7, 10, True), (8, 10, True), (6, 10, False), (7, 11, False), (10, 9, False)):
+                effect["limits"] |= {"spreading_factor_min":minimum,"spreading_factor_max":maximum}
+                with self.subTest(spreading_factor_min=minimum, spreading_factor_max=maximum):
+                    if allowed:
+                        self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1)["policy"])
+                    else:
+                        with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
             call["scope_effect"] = {"schema":"firmware-call-effect/v1","effect_action_class":None,"target_operation_manifest":None,"electronic_admission":None,"limits":{},"extra":True}
             with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
 
