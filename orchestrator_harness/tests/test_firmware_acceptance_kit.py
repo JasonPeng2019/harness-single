@@ -66,6 +66,9 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         call["arguments"] = {"board_id": "STM-A", "address": 0, "size": 4}
         with self.assertRaises(AdmissionError):
             evaluate_call(call, now_monotonic=1.0)
+        call["arguments"] = {"board_id": "STM-A", "address": 0, "width": 64, "length": 4}
+        with self.assertRaises(AdmissionError):
+            evaluate_call(call, now_monotonic=1.0)
 
     def test_write_serial_uses_locked_utf8_byte_limit(self) -> None:
         call = {"call_id":"serial","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"x" * 256,"timeout_seconds":1},"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True}}
@@ -73,9 +76,6 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         for text in ("x" * 257, "é" * 129):
             call["arguments"]["text"] = text
             with self.subTest(chars=len(text)), self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1.0)
-        call["arguments"] = {"board_id": "STM-A", "address": 0, "width": 64, "length": 4}
-        with self.assertRaises(AdmissionError):
-            evaluate_call(call, now_monotonic=1.0)
 
     def test_worker_environment_has_no_mcp_capability(self) -> None:
         env = worker_environment()
