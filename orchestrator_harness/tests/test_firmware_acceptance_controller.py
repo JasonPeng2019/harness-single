@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -21,10 +22,14 @@ class _Process:
         self.pid, self.stdin, self.stderr = 4242, _Input(), io.BytesIO()
         self.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n')
         self.exit: int | None = None
+        self.terminate_exits, self.wait_timeouts = True, 0
+        self.terminated, self.killed = False, False
     def poll(self) -> int | None: return self.exit
-    def terminate(self) -> None: self.exit = 0
-    def kill(self) -> None: self.exit = -9
-    def wait(self, timeout: float | None = None) -> int: self.exit = 0; return 0
+    def terminate(self) -> None: self.terminated = True; self.exit = 0 if self.terminate_exits else None
+    def kill(self) -> None: self.killed = True; self.exit = -9
+    def wait(self, timeout: float | None = None) -> int:
+        if self.wait_timeouts: self.wait_timeouts -= 1; raise subprocess.TimeoutExpired("fake", timeout)
+        self.exit = 0 if self.exit is None else self.exit; return self.exit
 
 
 class _Claims:
@@ -46,7 +51,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
         def launch(_: dict[str, object]) -> _Process: process = _Process(); launches.append(process); return process
         def factory(_: str, __: str) -> _Claims: item = _Claims(root); claims.append(item); return item
-        return FirmwareAcceptanceController(broker, launcher=launch, clock=lambda: 1.0, identity_provider=lambda pid: {"pid":pid,"created_utc":"synthetic"}, claims_factory=factory)
+        return FirmwareAcceptanceController(broker, launcher=launch, clock=lambda: 1.0, identity_provider=lambda pid: None if launches and launches[-1].exit is not None else {"pid":pid,"created_utc":"synthetic"}, claims_factory=factory)
 
     @staticmethod
     def _call(root: Path) -> dict[str, object]:
@@ -128,7 +133,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
             paths = self._flow(root, controller, verifier)
-            bad = _Process(); bad.stdout = io.BytesIO(b"not-json\n")
+            bad = _Process(); bad.stdout = io.BytesIO(b"not-json\n"); launches.append(bad)
             controller.launcher = lambda _: bad
             with self.assertRaises(AdmissionError) as caught: controller.execute_artifacts(*paths, verifier)
             self.assertEqual("MCP response or exact cleanup failed", str(caught.exception))
@@ -136,3 +141,33 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
             self.assertEqual("FAIL", raw["outcome"]); self.assertEqual("failure", cleanup["classification"])
             self.assertTrue(cleanup["exact_reaped"]); self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)
+
+    def test_terminate_timeout_escalates_to_kill_and_reaps_captured_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            process = _Process(); process.terminate_exits = False; process.wait_timeouts = 1; launches.append(process)
+            controller.launcher = lambda _: process
+            result = controller.execute_artifacts(*paths, verifier)
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertEqual("PASS", result["outcome"]); self.assertTrue(process.terminated); self.assertTrue(process.killed)
+            self.assertEqual(["terminate", "kill"], cleanup["attempts"]); self.assertTrue(cleanup["exact_reaped"])
+
+    def test_same_identity_after_wait_is_cleanup_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            process = _Process(); launches.append(process); controller.launcher = lambda _: process
+            controller.identity_provider = lambda pid: {"pid": pid, "created_utc": "unchanged"}
+            with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertIn("cleanup_error", cleanup); self.assertFalse(cleanup["exact_reaped"]); self.assertFalse(claims[0].live)
+
+    def test_launcher_failure_writes_failure_cleanup_and_releases_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            controller.launcher = lambda _: (_ for _ in ()).throw(OSError("launch"))
+            with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+            self.assertTrue((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").is_file())
+            self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)
