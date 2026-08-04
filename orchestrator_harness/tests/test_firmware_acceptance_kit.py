@@ -130,7 +130,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                         self._assert_uart_admission(method, arguments, plan=plan, allowed=False)
 
     def test_uart_write_transmitted_utf8_limits_apply_direct_and_plan(self) -> None:
-        cases = (("x" * 256, False, True), ("x" * 255, True, True), ("x" * 256, True, False), ("é" * 128, False, True), ("é" * 128, True, False), ("", False, False), ("é" * 129, False, False))
+        cases = (("x" * 256, False, True), ("x" * 255, True, True), ("x" * 256, True, True), ("é" * 128, False, True), ("é" * 128, True, True), ("", False, False), ("é" * 129, False, False))
         for plan in (False, True):
             for text, append_newline, allowed in cases:
                 arguments = self._uart_arguments("write_serial"); arguments |= {"text":text,"append_newline":append_newline}
