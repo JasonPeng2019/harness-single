@@ -736,8 +736,9 @@ def _validate_uart_parameters(method: str, arguments: dict[str, Any]) -> None:
     steps = arguments["steps"]
     if not isinstance(steps, list) or not steps or not _finite_uart_seconds(arguments["read_seconds"], positive=True) or not baud_and_port() or not isinstance(arguments["clear_input"], bool):
         raise AdmissionError("UART exchange parameters do not match the locked safe surface")
+    endings = {"none":"", "lf":"\n", "cr":"\r", "crlf":"\r\n"}
     for row in steps:
-        if not isinstance(row, dict) or set(row) != {"text", "expected_text", "line_ending"} or not isinstance(row["text"], str) or not row["text"] or not 1 <= len(row["text"].encode("utf-8")) <= 256 or not isinstance(row["expected_text"], str) or not row["expected_text"] or not isinstance(row["line_ending"], str) or row["line_ending"] not in {"none", "lf", "cr", "crlf"}:
+        if not isinstance(row, dict) or set(row) != {"text", "expected_text", "line_ending"} or not isinstance(row["text"], str) or not row["text"] or not isinstance(row["expected_text"], str) or not row["expected_text"] or not isinstance(row["line_ending"], str) or row["line_ending"] not in endings or not 1 <= len(f"{row['text']}{endings[row['line_ending']]}".encode("utf-8")) <= 256:
             raise AdmissionError("UART exchange step is not an exact bounded command/response row")
     ready_text, ready_seconds = arguments["ready_text"], arguments["ready_seconds"]
     probe_text, probe_ending, probe_delay = arguments["ready_probe_text"], arguments["ready_probe_line_ending"], arguments["ready_probe_delay_seconds"]
