@@ -15,6 +15,7 @@ class AdmissionError(ValueError):
 
 FORBIDDEN = {"bootloader", "unlock", "mass_erase", "protection", "erase_all", "try_last"}
 _CAPABILITY_KEYS = ("MCP_ENDPOINT", "MCP_COMMAND", "PYOCD_PROBE_UID", "PYOCD_TARGET", "BYO_MCP_ARTIFACT_ROOT", "MCP_CREDENTIAL", "MCP_TOKEN")
+_PINNED_SERVER_ROOT = Path("C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/mcp-candidate")
 
 
 def canonical_sha256(value: Any) -> str:
@@ -114,7 +115,15 @@ class AcceptanceBroker:
         if any(env.get(key) for key in _CAPABILITY_KEYS):
             raise AdmissionError("ambient physical capability is forbidden")
         lane_root = _safe_child(self.root, "lanes", lane_id)
-        return {"lane": lane, "mcp_command": ["uv", "run", "--project", "<absolute-mcp-candidate>", "--locked", "pyocd-debug-mcp"], "environment": {"BYO_MCP_ARTIFACT_ROOT": str(_safe_child(lane_root, "artifacts")), "PYOCD_PROBE_UID": lane["probe_uid"], "PYOCD_TARGET": lane["target"]}, "worker_environment": worker_environment()}
+        server_root = _PINNED_SERVER_ROOT.resolve()
+        if not server_root.is_dir():
+            raise AdmissionError("pinned MCP worktree is unavailable")
+        firm, artifacts, logs, mcp = (_safe_child(lane_root, name) for name in (".firm", "artifacts", "logs", "mcp"))
+        for path in (firm, artifacts, logs, mcp):
+            path.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                raise AdmissionError("lane root cannot be a symlink")
+        return {"lane": lane, "working_directory": str(server_root), "mcp_command": ["uv", "run", "--project", str(server_root), "--locked", "pyocd-debug-mcp"], "stdio": {"stdin": "controller-only", "stdout": "controller-only-mcp-framing", "stderr_path": str(_safe_child(logs, "mcp.stderr.log"))}, "roots": {"firm": str(firm), "artifacts": str(artifacts), "logs": str(logs), "mcp": str(mcp)}, "environment": {"BYO_MCP_ARTIFACT_ROOT": str(artifacts), "PYOCD_PROBE_UID": lane["probe_uid"], "PYOCD_TARGET": lane["target"], "PYTHONPYCACHEPREFIX": str(_safe_child(self.root, "pycache", lane_id))}, "lifetime": {"owner": "C3-HARNESS", "requires_exact_process_identity": True, "cleanup_requires_reap": True}, "worker_environment": worker_environment()}
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
