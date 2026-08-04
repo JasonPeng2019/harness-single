@@ -9,8 +9,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import subprocess
-import sys
+import datetime as _datetime
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -19,11 +19,11 @@ from .controller import Ed25519Verifier, FirmwareAcceptanceController, load_root
 from .kit import AcceptanceBroker, AdmissionError, _safe_child, _write_new, canonical_decision_payload, reject_linked_path
 
 
-_REQUEST_KEYS = {"schema", "request_id", "attempt_id", "topology_key_release", "kind", "issued_monotonic", "expires_monotonic", "payload", "public_key", "signature"}
+_REQUEST_KEYS = {"schema", "request_id", "attempt_id", "c1_reference", "delegated_reference", "orchestrator_identity", "topology_key_release", "kind", "issued_utc", "issued_monotonic", "expires_monotonic", "payload", "public_key", "signature"}
 _ROLES = {
-    "F.C3.A1": ("gpt-5.6-terra", "medium", "default", None),
+    "F.C3.A1": ("gpt-5.6-terra", "medium", "priority", "test_writer"),
     "F.C3.C1": ("gpt-5.6-terra", "medium", "default", None),
-    "F.C3.P1": ("gpt-5.6-luna", "high", "default", None),
+    "F.C3.P1": ("gpt-5.6-luna", "high", "default", "test_executor"),
     "F.C3.R1": ("gpt-5.6-terra", "medium", "priority", "reviewer"),
 }
 
@@ -43,7 +43,9 @@ class C3Harness:
         self.shutdown = False
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
         self.response_root = _safe_child(self.root, "manager-signals", "c3-responses")
+        self.admission_root = _safe_child(self.root, "manager-signals", "c3-admissions")
         self.request_root.mkdir(parents=True, exist_ok=True); self.response_root.mkdir(parents=True, exist_ok=True)
+        self.admission_root.mkdir(parents=True, exist_ok=True)
 
     def _record(self, request_id: str, value: dict[str, Any]) -> dict[str, Any]:
         path = _safe_child(self.response_root, request_id + ".json")
@@ -61,10 +63,15 @@ class C3Harness:
             raise AdmissionError("request is not closed")
         if not isinstance(value["request_id"], str) or not value["request_id"] or path.name != value["request_id"] + ".json":
             raise AdmissionError("request identity is invalid")
-        if value["attempt_id"] != self.topology["attempt_id"] or value["topology_key_release"] != self.topology["release"]:
+        if value["attempt_id"] != self.topology["attempt_id"] or value["topology_key_release"] != self.topology["release"] or value["orchestrator_identity"] != self.topology["identity_binding"]:
             raise AdmissionError("request attempt or ROOT release binding differs")
         if value["public_key"] != self.topology["public_key"] or not isinstance(value["kind"], str) or not isinstance(value["payload"], dict):
             raise AdmissionError("request signer or body is invalid")
+        if not isinstance(value["issued_utc"], str): raise AdmissionError("request issue time is invalid")
+        try: issued = _datetime.datetime.fromisoformat(value["issued_utc"].replace("Z", "+00:00"))
+        except ValueError as exc: raise AdmissionError("request issue time is invalid") from exc
+        released = self.topology.get("released_utc")
+        if released is not None and issued < released: raise AdmissionError("request predates key release")
         if not all(isinstance(value[k], (int, float)) and not isinstance(value[k], bool) for k in ("issued_monotonic", "expires_monotonic")) or value["expires_monotonic"] <= value["issued_monotonic"] or time.monotonic() >= value["expires_monotonic"]:
             raise AdmissionError("request is expired")
         if not self.verifier.verify(canonical_decision_payload(value), value["signature"], value["public_key"]):
@@ -75,13 +82,17 @@ class C3Harness:
         request_id = path.stem
         try:
             request = self._load(path); request_id = request["request_id"]
+            admission = _safe_child(self.admission_root, request_id + ".json")
+            # This is the replay guard, intentionally before every side effect.
+            _write_new(admission, {"schema":"firmware-c3-request-admission/v1","request_id":request_id,"request_path":str(path.resolve()),"request_sha256":_sha(path),"state":"ADMITTED"})
             if self.shutdown and request["kind"] != "shutdown": raise AdmissionError("harness is shut down")
             result = self._dispatch(request["kind"], request["payload"])
             return self._record(request_id, {"outcome": "ACCEPTED", "kind": request["kind"], "result": result})
         except (AdmissionError, OSError, ValueError, json.JSONDecodeError) as exc:
             # Deliberately ordinary orchestration evidence, never a watcher abort.
-            try: return self._record(request_id, {"outcome": "REJECTED", "reason": str(exc)})
-            except AdmissionError: raise
+            response = _safe_child(self.response_root, request_id + ".json")
+            if response.exists(): return {"schema":"firmware-c3-harness-response/v1","request_id":request_id,"outcome":"REJECTED","reason":str(exc),"replay":True,"path":str(response)}
+            return self._record(request_id, {"outcome": "REJECTED", "reason": str(exc)})
 
     def _dispatch(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if kind == "materialize":
@@ -131,29 +142,34 @@ class C3Harness:
         if c is None: raise AdmissionError("unknown retained session")
         if action == "proposal" and set(p) == {"session_id","proposal_path","request"}: return c.session_publish_proposal(Path(p["proposal_path"]), p["request"])
         if action == "execute" and set(p) == {"session_id","proposal_path","decision_path","authorization_path"}: return c.session_execute_artifacts(Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
-        if action == "close" and set(p) == {"session_id","decision_path"}: return c.close_session(Path(p["decision_path"]),self.verifier)
-        if action == "abort" and set(p) == {"session_id","reason"} and isinstance(p["reason"],str) and p["reason"]: return c.abort_session(p["reason"])
+        if action == "close" and set(p) == {"session_id","decision_path"}:
+            result=c.close_session(Path(p["decision_path"]),self.verifier)
+            if not result.get("exact_reaped") or not result.get("claim_released"): raise AdmissionError("session close lacks terminal cleanup")
+            del self.controllers[sid]; return result
+        if action == "abort" and set(p) == {"session_id","reason"} and isinstance(p["reason"],str) and p["reason"]:
+            result=c.abort_session(p["reason"])
+            if not result.get("exact_reaped") or not result.get("claim_released"): raise AdmissionError("session abort lacks terminal cleanup")
+            del self.controllers[sid]; return result
         raise AdmissionError("session operation payload is closed")
 
     def _shutdown(self, p: dict[str, Any]) -> dict[str, Any]:
         if p: raise AdmissionError("shutdown payload must be empty")
         terminals=[]
+        if self.active_worker: return {"state":"BLOCKED","reason":"target worker is active"}
         for sid, controller in list(self.controllers.items()):
-            try: terminals.append({"session_id":sid,"terminal":controller.abort_session("signed harness shutdown")})
-            except AdmissionError: pass
+            terminal=controller.abort_session("signed harness shutdown")
+            if not terminal.get("exact_reaped") or not terminal.get("claim_released"): raise AdmissionError("shutdown session cleanup is incomplete")
+            terminals.append({"session_id":sid,"terminal":terminal}); del self.controllers[sid]
         self.shutdown=True
         return {"state":"SHUTDOWN","sessions":terminals,"active_worker":self.active_worker}
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser=argparse.ArgumentParser(prog="firmware-acceptance-c3-harness"); parser.add_argument("--root",type=Path,required=True); parser.add_argument("--seed",type=Path,required=True); parser.add_argument("--policy",type=Path,required=True); parser.add_argument("--templates",type=Path,required=True); parser.add_argument("--topology-root",type=Path,required=True); sub=parser.add_subparsers(dest="command",required=True); one=sub.add_parser("once"); one.add_argument("request",type=Path); serve=sub.add_parser("serve"); serve.add_argument("--poll-seconds",type=float,default=.25); serve.add_argument("--max-idle-polls",type=int,default=240)
+    parser=argparse.ArgumentParser(prog="firmware-acceptance-c3-harness"); parser.add_argument("--root",type=Path,required=True); parser.add_argument("--seed",type=Path,required=True); parser.add_argument("--policy",type=Path,required=True); parser.add_argument("--templates",type=Path,required=True); parser.add_argument("--topology-root",type=Path,required=True); sub=parser.add_subparsers(dest="command",required=True); serve=sub.add_parser("serve"); serve.add_argument("--poll-seconds",type=float,default=.25)
     a=parser.parse_args(argv); h=C3Harness(a.root,a.seed,a.policy,a.templates,a.topology_root)
-    if a.command=="once": print(json.dumps(h.handle(a.request),sort_keys=True)); return 0
-    idle=0
-    while not h.shutdown and idle<a.max_idle_polls:
+    while not h.shutdown:
         paths=sorted(h.request_root.glob("*.json")); pending=[x for x in paths if not (_safe_child(h.response_root,x.name)).exists()]
-        if not pending: idle+=1; time.sleep(a.poll_seconds); continue
-        idle=0
+        if not pending: time.sleep(a.poll_seconds); continue
         for request in pending: print(json.dumps(h.handle(request),sort_keys=True),flush=True)
     return 0
 
