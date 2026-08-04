@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import firmware_acceptance.kit as kit
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_bound_operation, canonical_sha256, raw_result_sha256
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _USER_ISSUED_SCOPE, canonical_bound_operation, canonical_sha256, raw_result_sha256
 
 
 class _Verifier(SignatureVerifier):
@@ -45,6 +45,8 @@ class FirmwareAcceptanceHostTests(unittest.TestCase):
             "c1_reference": {"path": "c1", "sha256": "h"}, "deadline_monotonic": 100,
             "expires_monotonic": 99, "seed_identity": {"manifest": "x"}, "target_identity": {"commit": "y"},
             "raw_result_sha256": raw_result_sha256({"mcp": "ok"}), "cleanup_owner": "C3-HARNESS",
+            "delegated_user_scope_sha256": canonical_sha256(_USER_ISSUED_SCOPE), "action_class": "debug_halt_resume",
+            "scope_effect": {"schema": "firmware-call-effect/v1", "effect_action_class": None, "target_operation_manifest": None, "electronic_admission": None, "limits": None},
         }
         bound |= {"max_operation_duration_seconds":30,"permission_granted":True,"authorization_path":"authorization","claim":{"resource":"STM-A","path":"claim","sha256":"c","owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}},"controller_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"},"governing_documents":{"goal":{"path":"goal","sha256":"g"}},"delegated_reference":{"path":"delegated","sha256":"d"},"board_identity":{"path":"board","sha256":"b"},"mcp_schema":{"path":"schema","sha256":"s"},"policy":{"path":"policy","sha256":"p"},"plan":{"path":"plan","sha256":"pl"},"permission":{"path":"permission","sha256":"pe"},"seed_identity":{"path":"seed","sha256":"x"},"target_identity":{"path":"target","sha256":"y"},"topology_key_release":{"path":"release","sha256":"r"},"cleanup_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}}
         common = {
