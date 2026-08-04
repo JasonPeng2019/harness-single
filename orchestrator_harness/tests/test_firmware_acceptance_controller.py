@@ -89,12 +89,15 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         return {key: call[key] for key in ("attempt_id","lane_id","board","resource","probe_uid","target","profile","route","c1_reference","delegated_reference","board_identity","mcp_schema","policy","server_revision","seed_identity","target_identity","topology_key_release","governing_documents")} | {"session_id":"123e4567-e89b-12d3-a456-426614174000","deadline_monotonic":100.0,"initial_state":"BOOTSTRAPPED"}
 
     def _session_artifacts(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier, request: dict[str, object]) -> tuple[Path, Path, Path]:
-        proposal_path = root / "broker" / "sessions" / "123e4567-e89b-12d3-a456-426614174000" / "proposal-1.json"
+        sequence = request["sequence_number"]
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+            raise AssertionError("session test fixture requires a positive integer sequence number")
+        proposal_path = root / "broker" / "sessions" / "123e4567-e89b-12d3-a456-426614174000" / f"proposal-{sequence}.json"
         proposal = controller.session_publish_proposal(proposal_path, request)
-        decision_path = proposal_path.with_name("decision-1.json")
+        decision_path = proposal_path.with_name(f"decision-{sequence}.json")
         decision = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","rationale":"session","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":proposal["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
         verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
-        authorization_path = proposal_path.with_name("authorization-1.json")
+        authorization_path = proposal_path.with_name(f"authorization-{sequence}.json")
         authorization = {"schema":"firmware-derived-authorization/v2","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"decision_path":str(decision_path.resolve()),"decision_sha256":hashlib.sha256(decision_path.read_bytes()).hexdigest(),"launch_intent":proposal["call"]["topology_key_release"],"orchestrator_identity":decision["orchestrator_identity"],"topology_key_release":decision["topology_key_release"],"c1_reference":proposal["call"]["c1_reference"],"delegated_reference":proposal["call"]["delegated_reference"],"call":proposal["call"],"claim":proposal["claim"],"expires_monotonic":99.0,"one_shot_id":proposal["call"]["call_id"],"revoked":False}
         authorization_path.write_text(json.dumps(authorization, sort_keys=True, separators=(",",":")), encoding="utf-8")
         return proposal_path, decision_path, authorization_path
@@ -233,12 +236,15 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
             request_path = root / "session-request.json"; request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
-            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Server Run\\n- run_id: run-1\\n- started_at: 2026-01-01T00:00:00Z"}]}}\n{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\\"status\\":\\"ok\\"}"}]}}\n')
+            route = {"display_name":"STM-A","route":"validate","board_id":"server-stm-a","load_call":{"tool":"load_setup_tool","arguments":{"board_id":"server-stm-a","tool_name":"board_validate"}},"next_call":{"tool":"board_validate","arguments":{"board_id":"server-stm-a","probe_id":"probe-1"}}}
+            process = _Process(); process.wait_timeouts = 0; process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Server Run\\n- run_id: run-1\\n- started_at: 2026-01-01T00:00:00Z"}]}}\n' + self._rpc_result(3, {"status":"setup_routes_ready","routes":[route]}) + self._rpc_result(4, {"status":"disconnected"}))
             controller.launcher = lambda _: (launches.append(process) or process); opened = controller.open_session(request_path)
+            overview = self._session_call(root, call_id="route-1", method="setup_overview", arguments={"board_names":["STM-A"],"connection_assignments":None}, action_class="probe_discovery_read")
+            self._execute_session_call(root, controller, verifier, opened, overview, "ROUTED")
             # READY is the prerequisite established by the separately tested setup/validation state graph.
             controller._session["state"] = "READY"
-            call = self._call(root); call.update({"call_id":"disconnect-1","method":"disconnect","method_version":1,"arguments":{"board_id":"STM-A"},"action_class":"connect_setup"})
-            proposal, decision, authorization = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":1,"prior_result":None,"current_state":"READY","next_state":"RETURNED","call":call})
+            call = self._session_call(root, call_id="disconnect-1", method="disconnect", arguments={"board_id":"server-stm-a"})
+            proposal, decision, authorization = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":2,"prior_result":controller._session["prior_result"],"current_state":"READY","next_state":"RETURNED","call":call})
             result = controller.session_execute_artifacts(proposal, decision, authorization, verifier)
             close_path = root / "close.json"; close = {"schema":"firmware-session-close-decision/v1","session_id":opened["session_id"],"session_open_path":opened["path"],"session_open_sha256":opened["raw_sha256"],"final_result":{"path":result["path"],"sha256":result["raw_sha256"]},"final_state":"RETURNED","rationale":"return complete","issued_monotonic":1.0,"expected_returning_state":"disconnected","public_key":"public","signature":"signed"}
             verifier.expected = canonical_decision_payload(close); close_path.write_text(json.dumps(close, sort_keys=True, separators=(",",":")), encoding="utf-8")
