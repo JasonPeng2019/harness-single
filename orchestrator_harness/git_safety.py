@@ -1,6 +1,7 @@
 """Shell-free Git identity and coding-result checks for one declared worktree."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,11 +41,14 @@ _CHECK_OUTCOMES = {"PASS", "FAIL", "SKIP", "NOT_RUN"}
 _MAX_STATUS_BYTES = 256 * 1024
 _MAX_WORKTREES = 256
 _MAX_JSON_CANDIDATES_PER_WORKTREE = 256
+_MAX_FINDINGS_BYTES = 256 * 1024
 
 
 def validate_findings(path: Path, *, lane_id: str, worker_invocation_id: str, role: str, commit: str, outcome: str) -> dict[str, Any]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_FINDINGS_BYTES:
+            raise GitSafetyError("finding gate path is unsafe or oversized")
+        raw = json.loads(path.read_bytes().decode("utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise GitSafetyError(f"finding gate cannot read findings: {exc}") from exc
     required = {"schema", "lane_id", "worker_invocation_id", "role", "commit", "findings"}
@@ -56,7 +60,7 @@ def validate_findings(path: Path, *, lane_id: str, worker_invocation_id: str, ro
     if not isinstance(findings, list) or len(findings) > 32 or (outcome == "PASS" and findings) or (outcome == "FAIL" and not findings):
         raise GitSafetyError("finding gate outcome/count mismatch")
     ids: set[str] = set()
-    required_finding = {"id", "category", "affected_ids", "evidence", "observed", "expected", "impact", "no_fix_consequence", "smallest_fix", "complexity", "regression_risk", "verification_cost", "alternatives", "cost_benefit", "problem_outweighs_fix_risk"}
+    required_finding = {"id", "category", "affected_ids", "evidence", "observed", "expected", "reproduction", "impact", "no_fix_consequence", "smallest_fix", "complexity", "regression_risk", "verification_cost", "alternatives", "cost_benefit", "problem_outweighs_fix_risk"}
     for finding in findings:
         if not isinstance(finding, dict) or set(finding) != required_finding or finding.get("category") not in {"CODEBASE_BREAKING", "FUNCTIONALITY_BREAKING", "WORTH_FIXING"} or finding.get("problem_outweighs_fix_risk") is not True:
             raise GitSafetyError("finding gate finding is malformed or inadmissible")
@@ -64,10 +68,12 @@ def validate_findings(path: Path, *, lane_id: str, worker_invocation_id: str, ro
         if not isinstance(identifier, str) or not identifier or identifier in ids:
             raise GitSafetyError("finding gate IDs must be unique")
         ids.add(identifier)
-        if any(not isinstance(finding.get(key), str) or not finding[key].strip() or len(finding[key]) > 4000 for key in required_finding - {"id", "category", "affected_ids", "problem_outweighs_fix_risk"}):
+        if any(not isinstance(finding.get(key), str) or not finding[key].strip() or len(finding[key]) > 4000 for key in required_finding - {"id", "category", "affected_ids", "evidence", "problem_outweighs_fix_risk"}):
             raise GitSafetyError("finding gate tradeoff evidence is incomplete")
-        if not isinstance(finding.get("affected_ids"), list) or not finding["affected_ids"] or any(not isinstance(item, str) for item in finding["affected_ids"]):
+        if not isinstance(finding.get("affected_ids"), list) or not finding["affected_ids"] or len(finding["affected_ids"]) > 64 or any(not isinstance(item, str) or not item or len(item) > 200 for item in finding["affected_ids"]):
             raise GitSafetyError("finding gate affected IDs are invalid")
+        if not isinstance(finding.get("evidence"), list) or not finding["evidence"] or len(finding["evidence"]) > 32 or any(not isinstance(item, str) or not item or len(item) > 1000 for item in finding["evidence"]):
+            raise GitSafetyError("finding gate evidence references are invalid")
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(findings)}
 
 

@@ -157,6 +157,7 @@ class LaneControllerTests(unittest.TestCase):
             "resume": {"thread_id": "coding-thread"},
             "codex": {},
             "codex_settings": {},
+            "finding_gate": {"role": "reviewer", "path": "FINDINGS.json"},
         }
         self.assertEqual(set(coding_only), controller._CODING_ONLY_FIELDS)
         for field, value in coding_only.items():
