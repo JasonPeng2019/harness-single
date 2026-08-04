@@ -99,6 +99,115 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         authorization_path.write_text(json.dumps(authorization, sort_keys=True, separators=(",",":")), encoding="utf-8")
         return proposal_path, decision_path, authorization_path
 
+    @staticmethod
+    def _rpc_result(identifier: int, payload: dict[str, object]) -> bytes:
+        return json.dumps({"jsonrpc":"2.0", "id":identifier, "result":{"content":[{"type":"text", "text":json.dumps(payload, sort_keys=True, separators=(",",":"))}]}}).encode("utf-8") + b"\n"
+
+    def _open_routed_session(self, root: Path, controller: FirmwareAcceptanceController, launches: list[_Process], payloads: list[dict[str, object]]) -> dict[str, object]:
+        request_path = root / "session-request.json"
+        request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
+        bootstrap = (
+            b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+            b'{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Server Run\\n- run_id: run-1\\n- started_at: 2026-01-01T00:00:00Z"}]}}\n'
+        )
+        process = _Process()
+        process.stdout = io.BytesIO(bootstrap + b"".join(self._rpc_result(index, value) for index, value in enumerate(payloads, start=3)))
+        controller.launcher = lambda _: (launches.append(process) or process)
+        return controller.open_session(request_path)
+
+    def _session_call(self, root: Path, *, call_id: str, method: str, arguments: dict[str, object], action_class: str = "connect_setup") -> dict[str, object]:
+        call = self._call(root)
+        call.update({"call_id":call_id, "method":method, "method_version":1, "arguments":arguments, "action_class":action_class})
+        return call
+
+    def _execute_session_call(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier, opened: dict[str, object], call: dict[str, object], next_state: str) -> dict[str, object]:
+        session = controller._session
+        assert session is not None
+        artifacts = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"], "sequence_number":session["sequence"] + 1, "prior_result":session["prior_result"], "current_state":session["state"], "next_state":next_state, "call":call})
+        return controller.session_execute_artifacts(*artifacts, verifier)
+
+    @staticmethod
+    def _setup_plan_arguments(board_id: str) -> dict[str, object]:
+        return {"board_id":board_id, "hypothesis":"probe is attached", "strategy":"connect normally", "hypothesis_made":True, "strategy_evaluated":True, "expected_fail_return":"setup error", "expected_success_return":"setup complete", "max_calls":1, "max_calls_buffer":1, "action_parameters":{"mode":"normal", "connection_id":"wired", "display_name":"STM-A", "mcu_part_number":"STM32L476RG", "requires_uart":True, "serial_baudrate":115200, "serial_id":"COM1", "datasheet_path":"locked.pdf"}}
+
+    def test_s2_a1_dynamic_route_plan_validation_ready_uart_and_terminal_contract(self) -> None:
+        """One retained child may advance only along its server-returned route."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            board_id = "server-stm-a"
+            null_plan = {"board_id":None,"hypothesis":None,"strategy":None,"hypothesis_made":None,"strategy_evaluated":None,"expected_fail_return":None,"expected_success_return":None,"max_calls":None,"max_calls_buffer":None,"action_parameters":None,"user_permission":None}
+            setup_args = self._setup_plan_arguments(board_id)
+            action_args = {"board_id":board_id, **setup_args["action_parameters"]}
+            route = {"display_name":"STM-A","route":"setup","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_setup-plan"}},"plan_initialization_call":{"tool":"board_setup-plan","arguments":null_plan}}
+            validate_route = {"display_name":"STM-A","route":"validate","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_validate"}},"next_call":{"tool":"board_validate","arguments":{"board_id":board_id,"probe_id":"probe-1"}}}
+            payloads = [
+                {"status":"setup_names_required", "connection_assignments":{"STM-A":"wired"}},
+                {"status":"setup_routes_ready", "routes":[route]},
+                {"status":"setup_tool_loaded", "board_id":board_id, "tool_name":"board_setup-plan"},
+                {"status":"plan_disclosed"},
+                {"status":"plan_accepted", "plan_id":"plan-1", "underlying_action":"board_setup", "preferred_call":{"tool_name":"board_setup", "arguments":action_args}},
+                {"status":"setup_completed"},
+                {"status":"setup_routes_ready", "routes":[validate_route]},
+                {"status":"setup_tool_loaded", "board_id":board_id, "tool_name":"board_validate"},
+                {"status":"validation_passed"},
+                {"status":"setup_ready", "configuration_ready":True, "live_session_ready":True, "ready_for_code":True, "ready_for_uart_work":True},
+                {"status":"disconnected"},
+            ]
+            opened = self._open_routed_session(root, controller, launches, payloads)
+            calls = (
+                ("overview-null", "setup_overview", {"board_names":None,"connection_assignments":None}, "ROUTED", "probe_discovery_read"),
+                ("overview-route", "setup_overview", {"board_names":["STM-A"],"connection_assignments":{"STM-A":"wired"}}, "ROUTED", "probe_discovery_read"),
+                ("load-plan", "load_setup_tool", route["load_call"]["arguments"], "SETUP_LOADED", "connect_setup"),
+                ("plan-null", "board_setup-plan", null_plan, "SETUP_PLAN_DISCLOSED", "connect_setup"),
+                ("plan-filled", "board_setup-plan", setup_args, "SETUP_ACTION_READY", "connect_setup"),
+                ("setup", "board_setup", action_args, "ROUTED", "connect_setup"),
+                ("overview-validate", "setup_overview", {"board_names":["STM-A"],"connection_assignments":{"STM-A":"wired"}}, "ROUTED", "probe_discovery_read"),
+                ("load-validate", "load_setup_tool", validate_route["load_call"]["arguments"], "VALIDATION_LOADED", "connect_setup"),
+                ("validate", "board_validate", validate_route["next_call"]["arguments"], "READY", "connect_setup"),
+                ("ready", "get_setup_status", {"board_id":board_id}, "READY", "connect_setup"),
+                ("disconnect", "disconnect", {"board_id":board_id}, "RETURNED", "connect_setup"),
+            )
+            final: dict[str, object] | None = None
+            for call_id, method, arguments, next_state, action_class in calls:
+                final = self._execute_session_call(root, controller, verifier, opened, self._session_call(root, call_id=call_id, method=method, arguments=arguments, action_class=action_class), next_state)
+            self.assertEqual("RETURNED", final["resulting_state"] if final else None)
+            self.assertEqual(1, len(launches))
+            terminal = controller.abort_session("test terminal")
+            self.assertEqual("firmware-session-terminal/v1", terminal["schema"])
+            self.assertEqual("ABORTED", terminal["terminal_state"])
+            self.assertTrue(terminal["exact_reaped"] and terminal["helpers_stopped"] and terminal["claim_released"])
+
+    def test_s2_a1_continuation_responses_are_closed_and_fresh_per_call(self) -> None:
+        choice = {"status":"setup_needs_user_input", "continuation_id":"choice-1", "choices":[{"choice_id":"one"}, {"choice_id":"two"}], "accepted_response":{"tool":"continue_setup", "response":{"choice_id":"one"}}}
+        continuation = FirmwareAcceptanceController._continuation_from_payload({"method":"board_setup", "arguments":{"board_id":"server-stm-a"}}, choice)
+        self.assertEqual({"choice_id":"one"}, continuation and {"choice_id":"one"})
+        self.assertTrue(FirmwareAcceptanceController._validate_continuation_response(continuation or {}, {"choice_id":"two"}))
+        self.assertFalse(FirmwareAcceptanceController._validate_continuation_response(continuation or {}, {"choice_id":"other"}))
+        self.assertFalse(FirmwareAcceptanceController._validate_continuation_response(continuation or {}, {"choice_id":"one", "extra":True}))
+        with self.assertRaises(AdmissionError):
+            FirmwareAcceptanceController._continuation_from_payload({"method":"board_setup", "arguments":{"board_id":"server-stm-a"}}, {**choice, "choices":[{"choice_id":"one"}, {"choice_id":3}]})
+        target = {"pyocd_target":"stm32l476rg", "evidence":"datasheet", "reasoning_summary":"locked"}
+        pack = {"pack_id":"STM32L4", "version":"1", "filename":"x.pack", "url":"https://official.invalid/x.pack", "source_path":"pack", "official_sha256":None, "evidence":"official", "reasoning_summary":"locked"}
+        for response in (target, {**target, "debug_protocol":"swd", "debug_connect_mode":"normal", "debug_clock_hz":1000000}, pack, {**pack, "debug_protocol":"swd", "debug_connect_mode":"normal", "debug_clock_hz":1000000}):
+            with self.subTest(response=response):
+                payload = {"status":"setup_research_required", "continuation_id":"research-1", "accepted_response":{"tool":"continue_setup", "response":response}}
+                research = FirmwareAcceptanceController._continuation_from_payload({"method":"board_fix_setup", "arguments":{"board_id":"server-stm-a"}}, payload)
+                self.assertTrue(FirmwareAcceptanceController._validate_continuation_response(research or {}, response))
+                self.assertFalse(FirmwareAcceptanceController._validate_continuation_response(research or {}, {**response, "unexpected":True}))
+        with self.assertRaises(AdmissionError):
+            FirmwareAcceptanceController._continuation_from_payload({"method":"board_setup", "arguments":{"board_id":"server-stm-a"}}, {"status":"setup_research_required", "continuation_id":"research-1", "accepted_response":{"tool":"continue_setup", "response":{**target, "official_sha256":None}}})
+
+    def test_s2_a1_pre_result_route_and_continuation_rejections_leave_no_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            opened = self._open_routed_session(root, controller, launches, [{"status":"setup_routes_ready", "routes":[]}])
+            bad = self._session_call(root, call_id="bad-route", method="setup_overview", arguments={"board_names":["STM-A"], "connection_assignments":None}, action_class="probe_discovery_read")
+            artifacts = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"], "sequence_number":1, "prior_result":None, "current_state":"BOOTSTRAPPED", "next_state":"ROUTED", "call":bad})
+            with self.assertRaises(AdmissionError): controller.session_execute_artifacts(*artifacts, verifier)
+            result_root = controller.broker.root / "sessions" / str(opened["session_id"]) / "results"
+            self.assertFalse(result_root.exists())
+            self.assertTrue(controller._session and controller._session["terminal"])
+
     def test_retained_session_bootstraps_once_executes_and_aborts_terminally(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
