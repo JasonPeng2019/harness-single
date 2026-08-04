@@ -60,6 +60,7 @@ _CODING_ONLY_FIELDS = frozenset({
     "resources",
     "exclusive_resources",
     "repository",
+    "git",
     "resume_identity",
     "resume",
     "codex",

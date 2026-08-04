@@ -152,11 +152,13 @@ class LaneControllerTests(unittest.TestCase):
             "resources": ["generic-resource"],
             "exclusive_resources": ["generic-resource"],
             "repository": {},
+            "git": {},
             "resume_identity": {"thread_id": "coding-thread"},
             "resume": {"thread_id": "coding-thread"},
             "codex": {},
             "codex_settings": {},
         }
+        self.assertEqual(set(coding_only), controller._CODING_ONLY_FIELDS)
         for field, value in coding_only.items():
             with self.subTest(field=field):
                 path = self.invocation(label=f"mixed_{field}")
@@ -169,12 +171,16 @@ class LaneControllerTests(unittest.TestCase):
                     controller.load_invocation(path)
 
     def test_schema_less_firmware_rejects_coding_model_settings_aliases(self) -> None:
-        for field, value in {
+        coding_model_settings_only = {
             "command": [sys.executable, str(self.fake)],
             "config_overrides": ["feature_flag=true"],
             "sandbox": "workspace-write",
             "approval_policy": "never",
-        }.items():
+        }
+        self.assertEqual(
+            set(coding_model_settings_only), controller._CODING_ONLY_MODEL_SETTINGS_FIELDS
+        )
+        for field, value in coding_model_settings_only.items():
             with self.subTest(field=field):
                 path = self.invocation(label=f"nested_{field}")
                 raw = json.loads(path.read_text(encoding="utf-8"))

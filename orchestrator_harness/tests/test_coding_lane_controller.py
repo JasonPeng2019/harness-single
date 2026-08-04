@@ -98,6 +98,12 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertIsNone(parsed.policy_path)
         self.assertIsNone(parsed.policy_sha256)
 
+    def test_coding_settings_alias_remains_an_accepted_route_field(self) -> None:
+        path, raw = self.invocation()
+        raw["codex_settings"] = raw.pop("codex")
+        self._write(path, raw)
+        self.assertEqual(controller.CODING_INVOCATION_SCHEMA, controller.load_invocation(path).invocation_schema)
+
     def test_unknown_schema_and_prompt_integrity_or_confinement_are_rejected(self) -> None:
         path, raw = self.invocation()
         raw["schema"] = "unknown/v1"
@@ -127,6 +133,7 @@ class CodingLaneControllerTests(unittest.TestCase):
             "mcp_servers": ["firmware-mcp"],
             "server_snapshot": {"head": "firmware"},
         }
+        self.assertEqual(set(firmware_only), controller._FIRMWARE_ONLY_FIELDS)
         for field, value in firmware_only.items():
             with self.subTest(field=field):
                 path, raw = self.invocation()
