@@ -3,12 +3,13 @@
   "default": "deny",
   "prohibited_actions": ["bootloader replacement", "unlock", "mass erase", "protection changes", "destructive recovery", "try-last", "guessed wiring", "direct pyOCD", "direct serial", "direct MCP bypass"],
   "methods": {
-    "setup_overview": {"mutating": false, "maximum_duration_seconds": 30},
-    "flash_firmware": {"mutating": true, "application_region_only": true, "maximum_duration_seconds": 180},
-    "reset": {"mutating": true, "maximum_duration_seconds": 30},
-    "read_core_register": {"mutating": false, "maximum_duration_seconds": 60},
-    "read_serial": {"mutating": false, "maximum_duration_seconds": 60},
-    "write_serial": {"mutating": true, "maximum_bytes": 256, "maximum_duration_seconds": 30}
+    "setup_overview": {"version": 1, "mutating": false, "parameters": ["board_names", "connection_assignments"], "maximum_duration_seconds": 30},
+    "flash_application": {"version": 1, "mutating": true, "parameters": ["board_id", "artifact"], "application_region_only": true, "maximum_duration_seconds": 180},
+    "reset_and_run": {"version": 1, "mutating": true, "parameters": ["board_id"], "maximum_duration_seconds": 30},
+    "reset_and_halt": {"version": 1, "mutating": true, "parameters": ["board_id"], "maximum_duration_seconds": 30},
+    "read_memory_address": {"version": 1, "mutating": false, "parameters": ["board_id", "address", "size"], "maximum_duration_seconds": 60},
+    "read_serial": {"version": 1, "mutating": false, "parameters": ["board_id", "port", "baudrate", "expected_text", "read_seconds", "reset_on_open"], "maximum_duration_seconds": 60},
+    "write_serial": {"version": 1, "mutating": true, "parameters": ["board_id", "text", "timeout_seconds"], "maximum_bytes": 256, "maximum_duration_seconds": 30}
   },
   "legal_rf_intent": {"frequency_hz": 915000000, "maximum_dbm": 10, "maximum_payload_bytes": 64, "maximum_airtime_ms_per_60s": 6000, "maximum_campaign_minutes": 30, "bandwidth_hz": 125000, "coding_rate": "4/5", "spreading_factor_range": [7, 10]}
 }

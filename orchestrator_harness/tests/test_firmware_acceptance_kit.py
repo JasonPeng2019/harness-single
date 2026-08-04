@@ -12,7 +12,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         validate_seed_manifest(Path("firmware_acceptance/seed"))
 
     def test_controller_admission_is_bounded_and_fail_closed(self) -> None:
-        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset", "arguments": {}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
+        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_halt", "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
         call["arguments"] = {"operation": "mass_erase"}
         with self.assertRaises(AdmissionError):
@@ -35,6 +35,8 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             broker.record("policy-evaluation", "call-1", common, (str(path), digest))
             with self.assertRaises(AdmissionError):
                 broker.record("dispatch", "call-2", common)
+            with self.assertRaises(AdmissionError):
+                broker.record("dispatch", "call-1", common, (str(path), digest))
 
     def test_broker_rejects_ambient_capabilities_and_policy_is_data_driven(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -114,6 +114,9 @@ class AcceptanceBroker:
             previous_path = Path(previous[0]).resolve()
             if self.root not in previous_path.parents or not previous_path.is_file() or hashlib.sha256(previous_path.read_bytes()).hexdigest() != previous[1]:
                 raise AdmissionError("prior immutable artifact is missing or tampered")
+            expected = _safe_child(self.root, "calls", call_id, f"{index - 1:02d}-{order[index - 1]}.json")
+            if previous_path != expected:
+                raise AdmissionError("prior artifact must be the immediately preceding same-call stage")
             record = {**record, "previous_path": previous[0], "previous_sha256": previous[1]}
         required = {"attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity"}
         if not required <= record.keys():
@@ -146,8 +149,11 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         raise AdmissionError("missing live permission")
     if call["method"] == "write_serial" and len(call["arguments"].get("bytes", [])) > 256:
         raise AdmissionError("UART write exceeds 256-byte limit")
-    if call["method"] == "flash_firmware" and not call["arguments"].get("application_region_only"):
-        raise AdmissionError("flash must prove application-region-only containment")
+    allowed_parameters = rule.get("parameters")
+    if not isinstance(allowed_parameters, list) or set(call["arguments"]) - set(allowed_parameters) - {"rf", "dio2_dependent"}:
+        raise AdmissionError("method parameters do not match pinned guarded surface")
+    if call["method"] == "flash_application" and not rule.get("application_region_only"):
+        raise AdmissionError("flash method lacks reviewed application containment")
     if call["arguments"].get("dio2_dependent"):
         raise AdmissionError("DIO2-dependent work is denied while P.05 is unresolved")
     rf = call["arguments"].get("rf")
