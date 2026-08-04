@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -8,6 +10,7 @@ from unittest.mock import patch
 
 import firmware_acceptance.kit as kit
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _USER_ISSUED_SCOPE, canonical_bound_operation, canonical_sha256, evaluate_call, raw_result_sha256, validate_campaign_contract, validate_delegated_authorization, validate_seed_manifest, worker_environment
+from orchestrator_harness.tests.support import TemporaryGitRepository
 
 
 class FirmwareAcceptanceKitTests(unittest.TestCase):
@@ -121,19 +124,93 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                 with self.assertRaises(AdmissionError): validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker" / str(len(str(value))), Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest)
                 value = mutated
 
-    def test_server_limitation_is_create_once_and_fail_closed(self) -> None:
+    def _limitation_evidence(self, root: Path, *, limitation_id: str = "L-1") -> tuple[AcceptanceBroker, Path, dict[str, object]]:
+        """Construct the real, bounded create-once evidence graph; no workflow is simulated."""
+        broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
+        def put(path: Path, value: object) -> dict[str, str]:
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value), encoding="utf-8")
+            return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        raw = {"result": {"server": "pinned failure"}}
+        chain = self._complete_chain(broker, raw)
+        chain_refs = [{"path": str(path), "sha256": digest, "stage": json.loads(path.read_text(encoding="utf-8"))["stage"]} for path, digest in chain[:7]]
+        call = json.loads(chain[-1][0].read_text(encoding="utf-8")); bound = call["bound_operation"]
+        attempt, lane, session, call_id = "attempt-raw", "STM-A", "session-1", "call-raw"
+        c3 = root / "broker" / "hil" / lane / "server-limitations" / attempt / limitation_id / "c3-harness"
+        repo = TemporaryGitRepository.create(root / "candidate")
+        (repo.root / ".gitignore").write_text(".agent-workspace/\n", encoding="utf-8"); repo.git("add", ".gitignore"); repo.git("commit", "-m", "ignore workspace")
+        workspace = repo.root / ".agent-workspace"; workspace.mkdir()
+        prompt = workspace / "prompt.md"; prompt.write_text("bounded diagnostic", encoding="utf-8")
+        status_path, result_path = workspace / "controller.status.json", workspace / "RESULT.json"
+        worker = "limitation-worker"; invocation_path = workspace / "candidate.invocation.json"
+        invocation = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(root / "runtime"), "resource_lock_root":str(root / "runtime" / "locks"), "run_root":str(repo.root), "repository":repo.declaration(), "prompt_path":str(prompt), "prompt_sha256":hashlib.sha256(prompt.read_bytes()).hexdigest(), "output_paths":{"status":str(status_path),"jsonl":str(workspace / "worker.jsonl"),"stderr":str(workspace / "worker.log"),"last_message":str(workspace / "worker.last")}, "event_log_path":str(root / "runtime" / "LANE_EVENTS.jsonl"), "lane_id":lane, "worker_invocation_id":worker, "task":"causal diagnostic", "phase":"test", "exclusive_resources":[], "codex":{"command":["codex"],"model":"gpt-5.6-terra","reasoning_effort":"medium","service_tier":"priority","sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]}}
+        (root / "runtime").mkdir(); invocation_ref = put(invocation_path, invocation)
+        result = {"schema":"orchestrator-lane-result/v1","lane_id":lane,"worker_invocation_id":worker,"branch":repo.branch,"commit":repo.head,"outcome":"PASS","summary":"bounded evidence only","checks":[{"name":"firmware-limitation-credit","command":"pending","outcome":"PASS"}]}
+        result_ref = put(result_path, result)
+        status = {"schema":"orchestrator-lane-controller/v1","invocation_schema":"orchestrator-coding-invocation/v1","state":"CODEX_EXITED","exit_code":0,"declared_lane_id":lane,"worker_invocation_id":worker,"held_resource_claims":[],"result_valid":True,"result_validation":{"state":"VALID","path":str(result_path),"sha256":result_ref["sha256"],"commit":repo.head},"controller_pid":1,"controller_created_utc":"2026-01-01T00:00:00Z","repository":repo.declaration(),"worktree_root":str(repo.root)}
+        status_ref = put(status_path, status)
+        result["checks"][0]["command"] = "pending"  # assignment hash is filled below, then all dependent evidence is rewritten.
+        diagnostic_assignment = {"schema":"firmware-pinned-component-diagnostic-assignment/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"call_id":call_id,"server_commit":kit._PINNED_SERVER_COMMIT,"source_path":"README.md","source_sha256":hashlib.sha256(subprocess.run(["git","show",kit._PINNED_SERVER_COMMIT + ":README.md"],cwd=kit._PINNED_SERVER_ROOT,capture_output=True,check=True).stdout).hexdigest(),"input_signature":canonical_sha256(bound),"failure_signature":raw_result_sha256(raw),"predicate":"PINNED_COMPONENT_REPRODUCTION","worker_invocation_id":worker,"expected_status_path":str(status_path),"expected_result_path":str(result_path)}
+        diagnostic_assignment_ref = put(c3 / "DIAGNOSTIC_ASSIGNMENT.json", diagnostic_assignment)
+        result["checks"][0]["command"] = diagnostic_assignment_ref["sha256"]; result_ref = put(result_path, result); status["result_validation"]["sha256"] = result_ref["sha256"]; status_ref = put(status_path, status)
+        diagnostic = {"schema":"firmware-pinned-component-diagnostic/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"call_id":call_id,"controller_owner":{"pid":1,"creation_identity":"2026-01-01T00:00:00Z"},"server_commit":kit._PINNED_SERVER_COMMIT,"source_path":diagnostic_assignment["source_path"],"source_sha256":diagnostic_assignment["source_sha256"],"input_signature":diagnostic_assignment["input_signature"],"failure_signature":diagnostic_assignment["failure_signature"],"predicate":"PINNED_COMPONENT_REPRODUCTION","target_independent":True,"locked_environment":{"server_commit":kit._PINNED_SERVER_COMMIT,"policy_sha256":bound["policy_sha256"],"schema_sha256":bound["schema_sha256"]},"assignment_path":diagnostic_assignment_ref["path"],"assignment_sha256":diagnostic_assignment_ref["sha256"],"candidate_invocation":invocation_ref,"controller_status":status_ref,"worker_result":result_ref,"worker_invocation_id":worker,"outcome":"PASS"}
+        diagnostic_ref = put(c3 / "DIAGNOSTIC.json", diagnostic)
+        # The substitute is a separate C3 completion; never rewrite the diagnostic's credited result.
+        repo = TemporaryGitRepository.create(root / "substitute-candidate")
+        (repo.root / ".gitignore").write_text(".agent-workspace/\n", encoding="utf-8"); repo.git("add", ".gitignore"); repo.git("commit", "-m", "ignore workspace")
+        workspace = repo.root / ".agent-workspace"; workspace.mkdir()
+        prompt = workspace / "prompt.md"; prompt.write_text("bounded substitute", encoding="utf-8")
+        status_path, result_path = workspace / "controller.status.json", workspace / "RESULT.json"
+        invocation["run_root"] = str(repo.root); invocation["repository"] = repo.declaration(); invocation["prompt_path"] = str(prompt); invocation["prompt_sha256"] = hashlib.sha256(prompt.read_bytes()).hexdigest(); invocation["output_paths"] = {"status":str(status_path),"jsonl":str(workspace / "worker.jsonl"),"stderr":str(workspace / "worker.log"),"last_message":str(workspace / "worker.last")}
+        invocation_ref = put(workspace / "candidate.invocation.json", invocation)
+        assignment = {"schema":"firmware-limitation-substitute-assignment/v1","limitation_id":limitation_id,"attempt_id":attempt,"lane_id":lane,"session_id":session,"kind":"PARTIAL_MCP","stable_id":"SUB-A21","assignment_id":"assign-1","worker_invocation_id":worker,"expected_status_path":str(status_path),"expected_result_path":str(result_path)}
+        assignment_ref = put(c3 / "ASSIGNMENT.json", assignment)
+        # A distinct substitute assignment gets its own exact credit token and the same real C3 completion.
+        result = {**result,"branch":repo.branch,"commit":repo.head,"checks":[{"name":"firmware-limitation-credit","command":assignment_ref["sha256"],"outcome":"PASS"}]}; result_ref = put(result_path, result)
+        status["repository"] = repo.declaration(); status["worktree_root"] = str(repo.root); status["result_validation"] = {"state":"VALID","path":str(result_path),"sha256":result_ref["sha256"],"commit":repo.head}; status_ref = put(status_path, status)
+        launch = {"schema":"firmware-limitation-c3-launch/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"limitation_id":limitation_id,"assignment_path":assignment_ref["path"],"assignment_sha256":assignment_ref["sha256"],"candidate_invocation":invocation_ref,"controller_identity":{"pid":1,"creation_identity":"2026-01-01T00:00:00Z"},"controller_status":status_ref,"worker_result":result_ref,"worker_invocation_id":worker}; launch_ref = put(c3 / "LAUNCH.json", launch)
+        execution = {"schema":"firmware-limitation-substitute-execution/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"limitation_id":limitation_id,"assignment_path":assignment_ref["path"],"assignment_sha256":assignment_ref["sha256"],"launch":launch_ref,"candidate_invocation":invocation_ref,"controller_identity":launch["controller_identity"],"controller_status":status_ref,"worker_result":result_ref,"worker_invocation_id":worker,"execution_id":"execution-1","outcome":"PASS"}; execution_ref = put(c3 / "EXECUTION.json", execution)
+        worker_result = {"schema":"firmware-limitation-c3-worker-result/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"limitation_id":limitation_id,"assignment_path":assignment_ref["path"],"assignment_sha256":assignment_ref["sha256"],"launch":launch_ref,"execution":execution_ref,"candidate_invocation":invocation_ref,"controller_identity":launch["controller_identity"],"controller_status":status_ref,"candidate_result":result_ref,"worker_invocation_id":worker,"outcome":"PASS"}; worker_ref = put(c3 / "WORKER_RESULT.json", worker_result)
+        substitute_result = {"schema":"firmware-limitation-substitute-result/v1","limitation_id":limitation_id,"attempt_id":attempt,"lane_id":lane,"session_id":session,"kind":"PARTIAL_MCP","stable_id":"SUB-A21","assignment_id":"assign-1","result_id":"result-1","assignment_path":assignment_ref["path"],"assignment_sha256":assignment_ref["sha256"],"candidate_invocation":invocation_ref,"controller_identity":launch["controller_identity"],"controller_status":status_ref,"candidate_result":result_ref,"execution":execution_ref,"worker_result":worker_ref,"outcome":"PASS"}; substitute_ref = put(c3 / "RESULT.json", substitute_result)
+        attribution = {"schema":"firmware-pinned-server-attribution/v1","attempt_id":attempt,"lane_id":lane,"session_id":session,"call_id":call_id,"raw_result":{"path":chain_refs[-1]["path"],"sha256":chain_refs[-1]["sha256"]},"source_path":diagnostic_assignment["source_path"],"source_sha256":diagnostic_assignment["source_sha256"],"input_signature":diagnostic_assignment["input_signature"],"failure_signature":diagnostic_assignment["failure_signature"],"predicate":"PINNED_COMPONENT_REPRODUCTION","diagnostic_assignment":diagnostic_assignment_ref,"diagnostic_execution":diagnostic_ref}; attribution_ref = put(root / "attribution.json", attribution)
+        terminal_ref = put(root / "terminal.json", {"schema":"firmware-session-terminal/v1","session_id":session,"session_open_path":"open","session_open_sha256":"open","terminal_state":"ABORTED","reason":"raw failure","natural_eof":True,"exact_reaped":True,"transport_cleanup":True,"helpers_stopped":True,"claim_released":True})
+        process_ref = put(root / "process.json", {"session_id":session,"exact_reaped":True,"helpers_stopped":True,"claim_released":True})
+        protected_ref = put(root / "protected.json", {"schema":"c1-protected-test-ids/v1","c1_reference":call["c1_reference"],"protected_ids":["A21"]})
+        alternatives = [{"kind":"PARTIAL_MCP","available":True,"reason":"safe bounded substitute","evidence":put(root / "partial.json", {"safe":True})},{"kind":"PINNED_COMPONENT_INTEGRATION","available":False,"reason":"not available","evidence":put(root / "integration.json", {"safe":False})},{"kind":"CANDIDATE_BOUNDARY_UNIT","available":False,"reason":"weaker","evidence":put(root / "unit.json", {"safe":False})}]
+        decision = {"schema":"firmware-server-limitation-decision/v1","limitation_id":limitation_id,"attempt_id":attempt,"lane_id":lane,"session_id":session,"original_test":"PHYSICAL-A21","classification":"AUTHORIZED_SERVER_LIMITATION","call_chain":chain_refs,"session_terminal":terminal_ref,"process_evidence":process_ref,"pinned_source":{"commit":kit._PINNED_SERVER_COMMIT,"immutable":True},"attribution":"PINNED_SERVER_SOURCE","attribution_evidence":attribution_ref,"alternatives":alternatives,"substitute":{"kind":"PARTIAL_MCP","stable_id":"SUB-A21","assignment":assignment_ref,"result":substitute_ref},"physical_certification":{"status":"NOT_CERTIFIED"},"o_decision":{"public_key":"key","protected_suite":protected_ref},"created_utc":"2026-01-01T00:00:00Z","signature":"sig"}
+        path = root / "decision.json"; put(path, decision)
+        return broker, path, decision
+
+    def test_server_limitation_create_once_has_causal_and_c3_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
-            def write(name: str, value: object) -> dict[str, str]:
-                path = root / name; path.write_text(__import__("json").dumps(value), encoding="utf-8"); return {"path":str(path),"sha256":__import__("hashlib").sha256(path.read_bytes()).hexdigest()}
-            dispatch = write("dispatch.json", {"stage":"dispatch"}); raw = write("raw.json", {"outcome":"FAIL","raw_result":{"server":"failure"}}); terminal = write("terminal.json", {"terminal":"ABORTED"})
-            decision = {"schema":"firmware-server-limitation-decision/v1","limitation_id":"L-1","attempt_id":"attempt","lane_id":"STM-A","session_id":"session","original_test":"PHYSICAL-A21","classification":"AUTHORIZED_SERVER_LIMITATION","call_chain":[{**dispatch,"stage":"dispatch"},{**raw,"stage":"raw-result"}],"session_terminal":{**terminal,"state":"ABORTED"},"process_evidence":{"exact_reaped":True,"helpers_stopped":True},"pinned_source":{"commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","immutable":True},"attribution":"PINNED_SERVER_SOURCE","alternatives":[{"kind":"PARTIAL_MCP","available":True,"reason":"supported"},{"kind":"PINNED_COMPONENT_INTEGRATION","available":False,"reason":"later"},{"kind":"CANDIDATE_BOUNDARY_UNIT","available":False,"reason":"later"}],"substitute":{"kind":"PARTIAL_MCP","stable_id":"SUB-A21","assignment":"assignment","result":"result"},"physical_certification":{"status":"NOT_CERTIFIED"},"o_decision":{"public_key":"key"},"created_utc":"2026-01-01T00:00:00Z","signature":"sig"}
-            decision_path = root / "decision.json"; decision_path.write_text(__import__("json").dumps(decision), encoding="utf-8")
-            result = broker.record_server_limitation(decision_path, "L-1", self._Verifier())
-            self.assertEqual("AUTHORIZED_SERVER_LIMITATION", result["classification"]); self.assertEqual("NOT_CERTIFIED", result["physical_certification"]["status"])
-            with self.assertRaises(AdmissionError): broker.record_server_limitation(decision_path, "L-1", self._Verifier())
-            decision["attribution"] = "UNKNOWN"; decision_path.write_text(__import__("json").dumps(decision), encoding="utf-8")
-            with self.assertRaises(AdmissionError): broker.record_server_limitation(decision_path, "L-2", self._Verifier())
+            broker, path, decision = self._limitation_evidence(Path(temporary))
+            result = broker.record_server_limitation(path, "L-1", self._Verifier())
+            self.assertEqual("AUTHORIZED_SERVER_LIMITATION", result["classification"]); self.assertEqual({"status":"NOT_CERTIFIED"}, result["physical_certification"])
+            with self.assertRaises(AdmissionError): broker.record_server_limitation(path, "L-1", self._Verifier())
+            with self.assertRaises(AdmissionError): broker.record_server_limitation(path, "L-2", self._Verifier())
+
+    def test_server_limitation_rejects_closed_evidence_mutations(self) -> None:
+        cases = {
+            "self-attribution": lambda d: d.__setitem__("attribution", "SELF_DECLARED"),
+            "unsafe-order": lambda d: d.__setitem__("alternatives", list(reversed(d["alternatives"]))),
+            "protected-original": lambda d: d.__setitem__("original_test", "A21"),
+            "wrong-attempt": lambda d: d.__setitem__("attempt_id", "later-attempt"),
+            "wrong-cleanup": lambda d: d.__setitem__("process_evidence", {"path":"missing","sha256":"missing"}),
+            "wrong-signature": lambda d: d.__setitem__("signature", "forged"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                broker, path, decision = self._limitation_evidence(Path(temporary)); mutate(decision)
+                path.write_text(json.dumps(decision), encoding="utf-8")
+                with self.assertRaises(AdmissionError): broker.record_server_limitation(path, "L-1", self._Verifier())
+
+    def test_plan_action_admits_exact_null_and_populated_shapes_only(self) -> None:
+        base = {"call_id":"plan","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"flash_application-plan","method_version":1,"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True},**self._scope("application_flash")}
+        null = {key: None for key in ("board_id","hypothesis","strategy","hypothesis_made","strategy_evaluated","expected_fail_return","expected_success_return","max_calls","max_calls_buffer","action_parameters","user_permission")}
+        self.assertEqual("ALLOW", evaluate_call({**base,"arguments":null}, now_monotonic=1)["policy"])
+        populated = {"board_id":"server-route","hypothesis":"h","strategy":"s","hypothesis_made":True,"strategy_evaluated":True,"expected_fail_return":"fail","expected_success_return":"ok","max_calls":1,"max_calls_buffer":1,"action_parameters":{"artifact":"app.hex"}}
+        self.assertEqual("ALLOW", evaluate_call({**base,"arguments":populated}, now_monotonic=1)["policy"])
+        for bad in ({**null,"extra":None},{key:value for key,value in null.items() if key != "user_permission"},{**populated,"user_permission":True},{**populated,"max_calls":True}):
+            with self.subTest(arguments=bad), self.assertRaises(AdmissionError): evaluate_call({**base,"arguments":bad}, now_monotonic=1)
 
     def test_worker_environment_has_no_mcp_capability(self) -> None:
         env = worker_environment()
