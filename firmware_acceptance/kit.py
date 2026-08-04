@@ -396,7 +396,7 @@ class AcceptanceBroker:
 
 def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Path | None = None) -> dict[str, Any]:
     """Validate a fully correlated broker request without performing a physical action."""
-    required = {"call_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission"}
+    required = {"call_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "method_version", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission"}
     missing = sorted(required - call.keys())
     if missing:
         raise AdmissionError(f"missing required call fields: {', '.join(missing)}")
@@ -404,6 +404,8 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     rule = policy["methods"].get(call["method"])
     if not isinstance(rule, dict):
         raise AdmissionError("default deny: unmapped MCP method")
+    if not isinstance(call["method_version"], int) or isinstance(call["method_version"], bool) or call["method_version"] <= 0 or not isinstance(rule.get("version"), int) or isinstance(rule["version"], bool) or rule["version"] <= 0 or call["method_version"] != rule["version"]:
+        raise AdmissionError("method version does not exactly match locked policy rule")
     if any(token in json.dumps(call["arguments"], sort_keys=True).lower() for token in FORBIDDEN):
         raise AdmissionError("prohibited destructive or try-last parameter")
     if call["deadline_monotonic"] <= now_monotonic:
