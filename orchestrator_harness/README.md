@@ -229,7 +229,9 @@ worktree, object, index, or Git configuration redirection variables. See
 Coding invocations carry generic `exclusive_resources` and Codex launch settings; `resources`
 remains a compatibility alias. They do not require the
 firmware policy, server snapshot, board token, MCP server, lease, relay, or hardware fields. The
-schema-less legacy firmware shape remains policy-bound. Any other explicit schema is rejected.
+schema-less legacy firmware shape remains policy-bound. Route-discriminating firmware and coding
+fields cannot be mixed: an invocation containing fields reserved for the other route is rejected.
+Any other explicit schema is rejected.
 
 Coding resource names are opaque, non-empty strings. The controller sorts exact names, maps each
 to a SHA-256 filename under `resource_lock_root`, and atomically creates every claim before Codex

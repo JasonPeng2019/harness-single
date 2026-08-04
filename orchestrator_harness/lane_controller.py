@@ -40,6 +40,29 @@ class InvocationError(ValueError):
 
 CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 
+# These keys are route discriminators, rather than optional aliases.  Silently
+# ignoring one on the other route would make a hand-written mixed invocation
+# appear valid while dropping its safety contract.
+_FIRMWARE_ONLY_FIELDS = frozenset({
+    "policy_sha256",
+    "leases",
+    "board_tokens",
+    "mcp_servers",
+    "server_snapshot",
+})
+_CODING_ONLY_FIELDS = frozenset({
+    "worker_invocation_id",
+    "runtime_root",
+    "resource_lock_root",
+    "exclusive_resources",
+    "repository",
+    "resume_identity",
+    "codex",
+    "codex_settings",
+    "event_log_path",
+    "event_log",
+})
+
 
 def _utc() -> str:
     return iso_utc(datetime.now(timezone.utc)) or ""
@@ -99,6 +122,17 @@ def _string_list(value: object, name: str) -> list[str]:
     ):
         raise InvocationError(f"{name} must be a list of non-empty strings")
     return list(value)
+
+
+def _reject_foreign_fields(
+    raw: Mapping[str, Any], *, route: str, fields: frozenset[str],
+) -> None:
+    present = sorted(field for field in fields if field in raw)
+    if present:
+        raise InvocationError(
+            f"{route} invocation contains fields reserved for the other route: "
+            + ", ".join(present)
+        )
 
 
 @dataclass(frozen=True)
@@ -193,6 +227,7 @@ def _resume_thread(raw: dict[str, Any]) -> str | None:
 
 
 def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
+    _reject_foreign_fields(raw, route="schema-less firmware", fields=_CODING_ONLY_FIELDS)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     label = _string(raw, "label")
     expected = {
@@ -282,6 +317,7 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
 
 
 def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
+    _reject_foreign_fields(raw, route="coding", fields=_FIRMWARE_ONLY_FIELDS)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     if (
         outputs["status"].parent != workspace

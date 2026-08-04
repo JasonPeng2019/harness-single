@@ -141,6 +141,14 @@ class LaneControllerTests(unittest.TestCase):
         bad.write_text('{not json', encoding='utf-8')
         self.assertEqual(2, controller.main([str(bad)]))
 
+    def test_schema_less_firmware_rejects_coding_only_fields(self) -> None:
+        path = self.invocation()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["worker_invocation_id"] = "coding-worker"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(controller.InvocationError, "reserved for the other route"):
+            controller.load_invocation(path)
+
     def test_unbound_changed_and_policy_mismatch_prompts_are_rejected(self) -> None:
         raw_prompt = self.run / 'raw.md'
         raw_prompt.write_text('raw task', encoding='utf-8')
