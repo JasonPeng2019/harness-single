@@ -35,14 +35,17 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         validate_seed_manifest(Path("firmware_acceptance/seed"))
 
     def test_controller_admission_is_bounded_and_fail_closed(self) -> None:
-        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_halt", "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
+        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_halt", "method_version": 1, "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
         call["arguments"] = {"operation": "mass_erase"}
         with self.assertRaises(AdmissionError):
             evaluate_call(call, now_monotonic=1.0)
+        call["arguments"] = {"board_id": "STM-A"}; call["method_version"] = 2
+        with self.assertRaises(AdmissionError):
+            evaluate_call(call, now_monotonic=1.0)
 
     def test_read_memory_policy_matches_pinned_signature_and_bounds(self) -> None:
-        call = {"call_id": "m1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "read_memory_address", "arguments": {"board_id": "STM-A", "address": "0x20000000", "width": 32, "length": 4}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
+        call = {"call_id": "m1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "read_memory_address", "method_version": 1, "arguments": {"board_id": "STM-A", "address": "0x20000000", "width": 32, "length": 4}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
         call["arguments"] = {"board_id": "STM-A", "address": 0, "size": 4}
         with self.assertRaises(AdmissionError):
