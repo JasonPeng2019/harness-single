@@ -90,3 +90,101 @@ python examples/disposable_coding_fixture.py
 ```
 
 The legacy policy-bound firmware path remains supported but is not part of this quick start.
+
+## Firmware V2 acceptance and dual-path operation
+
+The acceptance kit is static, host-only input: read `firmware_acceptance/README.md` and its
+`ACCEPTANCE_MANIFEST.json` before configuring a firmware acceptance attempt. It launches neither
+MCP nor hardware. Keep `examples/coding.invocation.example.json` unchanged for coding V1. For an
+existing policy-bound firmware lane, start from
+`examples/legacy-firmware.invocation.example.json`; it intentionally has no `schema` field and no
+coding V1 Git/runtime/resource fields. Do not migrate a schema-less firmware fixture just to share
+an observer epoch.
+
+`examples/dual-path-manager.example.md` is the copyable native-manager sequence for one coding and
+one legacy firmware lane. It uses a fresh config/runtime, `scan --no-write`, and one native
+`watch --until-actionable` call. Its acknowledgement is the returned envelope's top-level
+`event_id`, never `data.signal_id`.
+
+For a firmware-v2 implementation epoch, create fresh ignored paths first (replace the placeholders
+with a unique epoch and the actual suite root), then inspect the frozen registry rather than
+rewriting it:
+
+```powershell
+$epoch = "firmware-v2-$(Get-Date -Format yyyyMMdd-HHmmss)"
+New-Item -ItemType Directory -Force local-config, "runtime/orchestrator-harness/$epoch" | Out-Null
+Copy-Item examples/harness.example.json "local-config/$epoch.json"
+# Set suite_root, run_globs, and output_dir to this epoch's real paths.
+python -m orchestrator_harness --config "local-config/$epoch.json" scan --no-write
+python -m orchestrator_harness --config "local-config/$epoch.json" watch --until-actionable --timeout 60
+python -m orchestrator_harness --config "local-config/$epoch.json" ack --event-id <top-level-event-id>
+Get-Content runtime/firmware-v2/passed-tests.json
+```
+
+Resume a coding controller only with its persisted identity and output paths; the controller, not a
+new wrapper, verifies that resume identity:
+
+```powershell
+python -m orchestrator_harness.lane_controller C:/absolute/path/to/coding.resume.invocation.json
+```
+
+That resume invocation keeps the same `worker_invocation_id` and supplies the recorded thread as
+`resume_thread_id` or `resume_identity.thread_id`. Legacy firmware resumes under its retained
+policy-bound contract.
+
+Before disposal, request cooperative stop and prove absence using every recorded PID plus creation
+time from its status/launch record. Do not kill by process name or command text:
+
+```powershell
+python -m orchestrator_harness --config "local-config/$epoch.json" watch stop
+# For each recorded { pid, creation_time_utc }, prove that the exact identity is absent (or stop only
+# that exact still-live identity cooperatively and re-check it).
+$process = Get-CimInstance Win32_Process -Filter "ProcessId = <recorded-pid>" -ErrorAction SilentlyContinue
+if ($process) { [Management.ManagementDateTimeConverter]::ToDateTime($process.CreationDate).ToUniversalTime().ToString('o') }
+git -C C:/absolute/path/to/worktree status --porcelain
+git worktree remove C:/absolute/path/to/worktree
+```
+
+Treat a missing process as absence only after the recorded PID-plus-creation identity was checked;
+a reused PID is a different process and must never be stopped. Confirm named claims and pending
+events in the epoch runtime before removing a clean, preserved worktree.
+
+## Firmware V2 release roles
+
+`ROOT-IM` is the outside implementation coordinator: it decides implementation findings, starts
+the acceptance topology, and never receives the subagent model/tier assignment. `F.C3.O` is the
+fresh acceptance orchestrator: it decides only final target-project work and submits assignments to
+`C3-HARNESS`. `C3-HARNESS` is the candidate control plane under test, not an agent; it alone launches
+target workers and owns their lifecycle. `F.C3.W` is a separately launched read-only watcher.
+
+Every headless role uses the exact assigned model with no substitution, explicit reasoning effort,
+isolated `-C` root, `--dangerously-bypass-approvals-and-sandbox`,
+`--dangerously-bypass-hook-trust`, `--ignore-user-config`, and `--json`. Fast means exactly
+`service_tier="priority"`; default-tier roles must not set it. The required assignments are:
+
+| Role | Model / effort | Tier |
+| --- | --- | --- |
+| Acceptance orchestrator (`F.C3.O`) | GPT-5.6 Sol / high | Fast (`priority`) |
+| Production coder | GPT-5.6 Terra / medium | default |
+| Reviewer or test writer | GPT-5.6 Terra / medium | Fast (`priority`) |
+| Doer or test executor | GPT-5.6 Luna / high | default |
+| Acceptance watcher (`F.C3.W`) | GPT-5.6 Terra / medium | Fast (`priority`) |
+
+Production coding remains singleton/serial. At most three agents may exist beside `ROOT-IM`; actual
+role fan-out is one through three and only for independent review, test-writing, or test-execution
+slices. The deterministic watcher remains diagnostic-only with `evaluator_enabled: false`.
+
+## Candidate-only final safeguard
+
+After C4 and pre-safeguard admission—not now—run the launcher from the reserved candidate worktree:
+
+```powershell
+& C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/harness-candidate/tools/Invoke-CandidateSafeguard.ps1
+& C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/harness-candidate/tools/Invoke-CandidateSafeguard.ps1 -Run
+```
+
+The first command prints its bound checks. The second runs Ruff, formatting, the retained
+non-expanded BasedPyright baseline, compilation, unit suites, attention retention, the Codex
+integration gate, and synthetic cleanup gate. It refuses any non-reserved, ambiguous, dirty,
+stable-runner, or wrong-branch root; it is a safeguard launcher, not a scheduler, retry controller,
+or alternate harness.

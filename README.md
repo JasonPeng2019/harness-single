@@ -128,6 +128,13 @@ observation remain supported. They are a separate compatibility path and are not
 `orchestrator-coding-invocation/v1`. Firmware work must continue to follow its existing policy,
 authorization, lease, relay, and physical cleanup rules.
 
+The firmware-v2 static acceptance material is in `firmware_acceptance/`. The retained
+`examples/legacy-firmware.invocation.example.json` and
+`examples/dual-path-manager.example.md` show how legacy firmware and coding V1 coexist without a
+schema migration or an alternate event loop. `QUICK_START.md` contains the release-role assignments,
+fresh-epoch/operator commands, exact identity cleanup procedure, and the candidate-only safeguard
+entry point. Release record shells are intentionally small and live in `release_evidence_templates/`.
+
 ## Documentation
 
 - `QUICK_START.md`: shortest ordinary coding run.
