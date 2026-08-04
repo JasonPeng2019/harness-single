@@ -4,10 +4,11 @@ import hashlib
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from firmware_acceptance.controller import FirmwareAcceptanceController
+from firmware_acceptance.controller import FirmwareAcceptanceController, _StdioTransport
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload
 
 
@@ -22,6 +23,7 @@ class _Process:
         self.exit: int | None = None
     def poll(self) -> int | None: return self.exit
     def terminate(self) -> None: self.exit = 0
+    def kill(self) -> None: self.exit = -9
     def wait(self, timeout: float | None = None) -> int: self.exit = 0; return 0
 
 
@@ -67,6 +69,10 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             paths = self._flow(root, controller, verifier)
             result = controller.execute_artifacts(*paths, verifier)
             self.assertEqual("PASS", result["outcome"]); self.assertFalse(claims[0].live); self.assertEqual(1, len(launches))
+            self.assertIsNone(controller._live_claims)
+            messages = [json.loads(line) for line in launches[0].stdin.getvalue().splitlines()]
+            self.assertEqual(["initialize", "notifications/initialized", "tools/call"], [item["method"] for item in messages[:3]])
+            self.assertEqual([1, None, 2], [item.get("id") for item in messages[:3]])
 
     def test_path_hash_owner_claim_and_replay_mismatch_deny_before_launch(self) -> None:
         for mutation in ("path", "hash", "owner", "claim", "replay", "deny"):
@@ -97,4 +103,36 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
                     controller.broker.record = lambda stage, *args, **kwargs: (_ for _ in ()).throw(AdmissionError("result")) if stage == "result" else original_record(stage, *args, **kwargs)  # type: ignore[method-assign]
                 else: controller.broker.admit = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("admit"))  # type: ignore[method-assign]
                 with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
-                self.assertFalse(claims[0].live)
+                self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)
+
+    def test_transport_rejects_malformed_wrong_id_error_and_eof_and_joins_helpers(self) -> None:
+        for frame in (b"not-json\n", b'{"jsonrpc":"2.0","id":9,"result":{}}\n', b'{"jsonrpc":"2.0","id":1,"error":{"code":1}}\n', b""):
+            with self.subTest(frame=frame):
+                process = _Process(); process.stdout = io.BytesIO(frame)
+                transport = _StdioTransport(process, lambda: 1.0, 0.2)
+                with self.assertRaises(AdmissionError): transport.receive(1)
+                stopped, cleanup = transport.close_and_join()
+                self.assertTrue(stopped); self.assertTrue(all(item["stopped"] for item in cleanup["helper_threads"]))
+
+    def test_transport_drains_pipe_sized_stderr_without_blocking_and_serializes_writes(self) -> None:
+        process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        process.stderr = io.BytesIO(b"x" * (128 * 1024))
+        transport = _StdioTransport(process, lambda: 1.0, 0.2)
+        transport.send({"jsonrpc":"2.0", "id":1, "method":"one", "params":{}}, "one")
+        self.assertEqual(1, transport.receive(1)["id"])
+        time.sleep(0.03)
+        stopped, cleanup = transport.close_and_join()
+        self.assertTrue(stopped); self.assertEqual(64 * 1024, len(transport.stderr_bytes))
+
+    def test_failed_transport_commits_raw_failure_and_cleanup_before_claim_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            bad = _Process(); bad.stdout = io.BytesIO(b"not-json\n")
+            controller.launcher = lambda _: bad
+            with self.assertRaises(AdmissionError) as caught: controller.execute_artifacts(*paths, verifier)
+            self.assertEqual("MCP response or exact cleanup failed", str(caught.exception))
+            raw = json.loads((controller.broker.root / "calls" / "controller-1" / "06-raw-result.json").read_text())
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertEqual("FAIL", raw["outcome"]); self.assertEqual("failure", cleanup["classification"])
+            self.assertTrue(cleanup["exact_reaped"]); self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)

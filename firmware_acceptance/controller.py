@@ -10,6 +10,7 @@ import base64
 import subprocess
 import threading
 import time
+import queue
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -26,6 +27,7 @@ class StdioProcess(Protocol):
     stderr: Any
     def poll(self) -> int | None: ...
     def terminate(self) -> None: ...
+    def kill(self) -> None: ...
     def wait(self, timeout: float | None = None) -> int: ...
 
 
@@ -83,19 +85,92 @@ def _process_identity(pid: int) -> dict[str, Any]:
     return {"pid": item.pid, "created_utc": item.created_utc.isoformat()}
 
 
-def _bounded(call: Callable[[], Any], seconds: float, label: str) -> Any:
-    """Windows-safe bounded pipe operation; the blocked reader is daemonized."""
-    result: list[tuple[bool, Any]] = []
-    done = threading.Event()
-    def run() -> None:
-        try: result.append((True, call()))
-        except BaseException as exc: result.append((False, exc))
-        finally: done.set()
-    threading.Thread(target=run, daemon=True, name="firmware-mcp-" + label).start()
-    if not done.wait(seconds): raise AdmissionError("MCP " + label + " timed out")
-    ok, value = result[0]
-    if not ok: raise AdmissionError("MCP " + label + " failed") from value
-    return value
+class _StdioTransport:
+    """The controller's only stdio owner: one writer and permanent stdout/stderr drains."""
+    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float) -> None:
+        self.process, self.remaining, self.io_cap = process, remaining, io_cap
+        self.writes: queue.Queue[tuple[bytes, threading.Event, list[BaseException]]] = queue.Queue()
+        self.responses: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
+        self.stop = threading.Event(); self.stderr_bytes = bytearray(); self._stderr_lock = threading.Lock()
+        self.threads = [threading.Thread(target=self._write, name="firmware-mcp-writer"), threading.Thread(target=self._stdout, name="firmware-mcp-stdout"), threading.Thread(target=self._stderr, name="firmware-mcp-stderr")]
+        for thread in self.threads: thread.start()
+
+    def _wait(self, event: threading.Event, label: str) -> None:
+        while not event.is_set():
+            remaining = self._budget()
+            if remaining <= 0: raise AdmissionError("MCP " + label + " timed out")
+            event.wait(min(remaining, 0.02))
+
+    def _budget(self) -> float:
+        return min(max(0.0, self.remaining()), self.io_cap)
+
+    def send(self, value: dict[str, Any], label: str) -> None:
+        if self.stop.is_set() or self.process.stdin is None: raise AdmissionError("MCP stdin is unavailable")
+        done, errors = threading.Event(), []
+        self.writes.put((json.dumps(value, separators=(",", ":")).encode() + b"\n", done, errors))
+        self._wait(done, label)
+        if errors: raise AdmissionError("MCP " + label + " failed") from errors[0]
+
+    def receive(self, request_id: int) -> dict[str, Any]:
+        while True:
+            remaining = self._budget()
+            if remaining <= 0: raise AdmissionError("MCP read timed out")
+            try: value = self.responses.get(timeout=min(remaining, 0.02))
+            except queue.Empty: continue
+            if value is None: raise AdmissionError("MCP stdout reached EOF")
+            if isinstance(value, BaseException): raise AdmissionError("MCP stdio framing is invalid") from value
+            if value.get("jsonrpc") != "2.0" or value.get("id") != request_id or "error" in value or "result" not in value:
+                raise AdmissionError("MCP response is invalid")
+            return value
+
+    def cancel(self) -> None:
+        if not self.stop.is_set() and self.process.stdin is not None:
+            try: self.send({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{}}, "cancellation")
+            except AdmissionError: pass
+
+    def close_and_join(self) -> tuple[bool, dict[str, Any]]:
+        self.stop.set(); outcome: dict[str, Any] = {"helper_threads": []}
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            try:
+                if stream is not None: stream.close()
+            except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
+        for thread in self.threads:
+            thread.join(max(0.0, self._budget()))
+            outcome["helper_threads"].append({"name": thread.name, "stopped": not thread.is_alive()})
+        outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
+        return all(not thread.is_alive() for thread in self.threads), outcome
+
+    def _write(self) -> None:
+        while not self.stop.is_set():
+            try: data, done, errors = self.writes.get(timeout=0.02)
+            except queue.Empty: continue
+            try:
+                if self.process.stdin is None: raise OSError("stdin unavailable")
+                self.process.stdin.write(data); self.process.stdin.flush()
+            except BaseException as exc: errors.append(exc)
+            finally: done.set()
+
+    def _stdout(self) -> None:
+        try:
+            if self.process.stdout is None: self.responses.put(AdmissionError("stdout unavailable")); return
+            while not self.stop.is_set():
+                line = self.process.stdout.readline()
+                if not line: self.responses.put(None); return
+                if isinstance(line, str): line = line.encode()
+                value = json.loads(line.decode("utf-8"))
+                if not isinstance(value, dict): raise ValueError("non-object JSON-RPC frame")
+                self.responses.put(value)
+        except BaseException as exc: self.responses.put(exc)
+
+    def _stderr(self) -> None:
+        try:
+            if self.process.stderr is None: return
+            while not self.stop.is_set():
+                chunk = self.process.stderr.read(4096)
+                if not chunk: return
+                if isinstance(chunk, str): chunk = chunk.encode("utf-8", "replace")
+                with self._stderr_lock: self.stderr_bytes.extend(chunk[: max(0, 65536 - len(self.stderr_bytes))])
+        except BaseException: return
 
 
 def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
@@ -198,55 +273,82 @@ class FirmwareAcceptanceController:
             config = self.broker.controller_config(call["lane_id"], {})
             config = {**config, "environment": _scrubbed_environment(config)}
         except BaseException:
-            if claims.release_all(): raise AdmissionError("resource claim release failed")
+            self._release_live_claim()
             raise
         process: StdioProcess | None = None
+        transport: _StdioTransport | None = None
         raw: dict[str, Any] | None = None
-        cleanup: dict[str, Any] = {"pid": None, "exact_reaped": False}
+        failure: BaseException | None = None
+        cleanup: dict[str, Any] = {"pid": None, "exact_reaped": False, "classification": "error", "attempts": []}
+        deadline = min(call["deadline_monotonic"], authorization["expires_monotonic"])
+        def remaining() -> float: return deadline - self.clock()
         try:
+            if remaining() <= 0: raise AdmissionError("MCP authority expired before launch")
             process = self.launcher(config)
+            cleanup["pid"] = process.pid
             cleanup["process_identity"] = self.identity_provider(process.pid)
             evidence.append(self.broker.record("dispatch", call_id, {**common, "process_identity": cleanup["process_identity"], "claim": claim_evidence}, (str(evidence[-1][0]), evidence[-1][1])))
-            stderr = self._drain_stderr(process)
-            self._send(process, 1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "firmware-acceptance", "version": "1"}})
-            self._receive(process, 1)
-            self._notify(process, "notifications/initialized", {})
-            self._send(process, 2, "tools/call", {"name": call["method"], "arguments": call["arguments"]})
-            raw = self._receive(process, 2)
+            transport = _StdioTransport(process, remaining, self.io_timeout)
+            transport.send({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"firmware-acceptance", "version":"1"}}}, "initialize")
+            transport.receive(1)
+            transport.send({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}, "initialized notification")
+            transport.send({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":call["method"], "arguments":call["arguments"]}}, "tools/call")
+            raw = transport.receive(2)
+            cleanup["classification"] = "success"
             evidence.append(self.broker.record("raw-result", call_id, {**common, "raw_result": raw, "outcome": "PASS"}, (str(evidence[-1][0]), evidence[-1][1])))
+            raw_record = json.loads(evidence[-1][0].read_text(encoding="utf-8"))
+            common = {**common, "bound_operation": raw_record["bound_operation"], "bound_operation_sha256": raw_record["bound_operation_sha256"]}
+        except BaseException as exc:
+            failure = exc
+            cleanup["classification"] = "expiry" if remaining() <= 0 else "failure"
+            cleanup["error"] = f"{type(exc).__name__}: {exc}"
+            # Failure evidence occupies the same immutable raw-result slot, so cleanup can
+            # remain durably chained even though no successful tool result exists.
+            raw = {"transport_failure": {"classification": cleanup["classification"], "error": cleanup["error"]}}
+            evidence.append(self.broker.record("raw-result", call_id, {**common, "raw_result": raw, "outcome": "FAIL"}, (str(evidence[-1][0]), evidence[-1][1])))
             raw_record = json.loads(evidence[-1][0].read_text(encoding="utf-8"))
             common = {**common, "bound_operation": raw_record["bound_operation"], "bound_operation_sha256": raw_record["bound_operation_sha256"]}
         finally:
             if process is not None:
                 try:
-                    if process.stdin is not None:
-                        process.stdin.close()
-                    if cleanup.get("process_identity") != self.identity_provider(process.pid):
+                    if transport is not None: transport.cancel()
+                    cleanup["attempts"].append("close-input")
+                    if process.stdin is not None: process.stdin.close()
+                    observed = self.identity_provider(process.pid)
+                    cleanup["identity_at_cleanup"] = observed
+                    if observed != cleanup.get("process_identity") and process.poll() is None:
                         raise AdmissionError("MCP PID creation identity changed during cleanup")
                     if process.poll() is None:
+                        cleanup["attempts"].append("terminate")
                         process.terminate()
-                    _bounded(lambda: process.wait(timeout=self.io_timeout), self.io_timeout, "wait")
-                    cleanup["exact_reaped"] = process.poll() is not None
-                    cleanup["stderr_sha256"] = hashlib.sha256(stderr()).hexdigest() if 'stderr' in locals() else hashlib.sha256(b"").hexdigest()
-                    for stream in (process.stdout, process.stderr):
-                        if stream is not None: stream.close()
+                    try:
+                        cleanup["wait_exit_code"] = process.wait(timeout=max(0.0, min(remaining(), self.io_timeout)))
+                    except subprocess.TimeoutExpired:
+                        cleanup["attempts"].append("kill"); process.kill()
+                        cleanup["wait_exit_code"] = process.wait(timeout=max(0.0, min(remaining(), self.io_timeout)))
+                    cleanup["exact_reaped"] = True
                 except Exception as exc:
-                    cleanup["error"] = type(exc).__name__
+                    cleanup["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+                if transport is not None:
+                    stopped, transport_cleanup = transport.close_and_join()
+                    cleanup.update(transport_cleanup)
+                    cleanup["helpers_stopped"] = stopped
+                    if not stopped: cleanup["cleanup_error"] = "MCP helper thread did not stop"
             prior = evidence[-1] if evidence else None
             try:
                 evidence.append(self.broker.record("returning-state-cleanup", call_id, {**common, **cleanup}, (str(prior[0]), prior[1]) if prior else None))
             except BaseException:
-                if claims.release_all(): raise AdmissionError("resource claim release failed")
+                self._release_live_claim()
                 raise
-        if raw is None or not cleanup["exact_reaped"]:
-            if claims.release_all(): raise AdmissionError("resource claim release failed")
-            raise AdmissionError("MCP response or exact cleanup is ambiguous")
+        if failure is not None or raw is None or not cleanup["exact_reaped"] or not cleanup.get("helpers_stopped", process is None) or "cleanup_error" in cleanup:
+            try: self._release_live_claim()
+            finally: raise AdmissionError("MCP response or exact cleanup failed") from failure
         actual = {"raw_result_sha256": raw_result_sha256(raw), "cleanup": cleanup}
         try:
             evidence.append(self.broker.record("result", call_id, {**common, **actual}, (str(evidence[-1][0]), evidence[-1][1])))
             outcome = self.broker.admit(call_id, evidence, self.clock(), verifier)
         finally:
-            if claims.release_all(): raise AdmissionError("resource claim release failed")
+            self._release_live_claim()
         return {"outcome": outcome, "raw_result": raw, "intent_sha256": intent_sha, "actual_sha256": canonical_sha256(actual), "evidence": [(str(path), digest) for path, digest in evidence], "worker_environment": config["worker_environment"]}
 
     def _policy_admission(self, call: dict[str, Any]) -> dict[str, Any]:
@@ -293,44 +395,6 @@ class FirmwareAcceptanceController:
         if not isinstance(value, dict) or set(value) != keys: raise AdmissionError("authorization artifact is not closed")
         return value
 
-    def _send(self, process: StdioProcess, request_id: int, method: str, params: dict[str, Any]) -> None:
-        if process.stdin is None:
-            raise AdmissionError("MCP stdin is unavailable")
-        data = (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}, separators=(",", ":")) + "\n").encode()
-        _bounded(lambda: process.stdin.write(data), self.io_timeout, "write")
-        _bounded(process.stdin.flush, self.io_timeout, "flush")
-
-    def _notify(self, process: StdioProcess, method: str, params: dict[str, Any]) -> None:
-        if process.stdin is None: raise AdmissionError("MCP stdin is unavailable")
-        data = (json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, separators=(",", ":")) + "\n").encode()
-        _bounded(lambda: process.stdin.write(data), self.io_timeout, "notification write")
-        _bounded(process.stdin.flush, self.io_timeout, "notification flush")
-
-    def _receive(self, process: StdioProcess, request_id: int) -> dict[str, Any]:
-        if process.stdout is None:
-            raise AdmissionError("MCP stdout is unavailable")
-        line = _bounded(process.stdout.readline, self.io_timeout, "read")
-        try:
-            value = json.loads(line.decode("utf-8"))
-        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AdmissionError("MCP stdio framing is invalid") from exc
-        if not isinstance(value, dict) or value.get("jsonrpc") != "2.0" or value.get("id") != request_id or "error" in value:
-            raise AdmissionError("MCP response is invalid")
-        return value
-
-    def _drain_stderr(self, process: StdioProcess) -> Callable[[], bytes]:
-        captured = bytearray(); lock = threading.Lock(); cap = 64 * 1024
-        if process.stderr is None: return lambda: b""
-        def drain() -> None:
-            while True:
-                try: chunk = process.stderr.read(4096)
-                except Exception: return
-                if not chunk: return
-                if isinstance(chunk, str): chunk = chunk.encode("utf-8", "replace")
-                with lock:
-                    if len(captured) < cap: captured.extend(chunk[:cap - len(captured)])
-        threading.Thread(target=drain, daemon=True, name="firmware-mcp-stderr").start()
-        return lambda: bytes(captured)
 
 
 def main(argv: list[str] | None = None) -> int:
