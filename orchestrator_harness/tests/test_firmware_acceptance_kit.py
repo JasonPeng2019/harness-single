@@ -85,6 +85,81 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             call["arguments"]["text"] = text
             with self.subTest(chars=len(text)), self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1.0)
 
+    def _uart_call(self, method: str, arguments: dict[str, object], *, plan: bool = False) -> dict[str, object]:
+        call = {"call_id":"uart","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":method + ("-plan" if plan else ""),"method_version":1,"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True},**self._scope("uart_session_io")}
+        if not plan:
+            return {**call, "arguments":{"board_id":"server-route", **arguments}}
+        return {**call, "arguments":{"board_id":"server-route","hypothesis":"h","strategy":"s","hypothesis_made":True,"strategy_evaluated":True,"expected_fail_return":"fail","expected_success_return":"ok","max_calls":1,"max_calls_buffer":1,"action_parameters":arguments}}
+
+    @staticmethod
+    def _uart_arguments(method: str) -> dict[str, object]:
+        if method == "read_serial":
+            return {"expected_text":None,"read_seconds":1,"baudrate":None,"port":None,"reset_on_open":False,"on_exit":None}
+        if method == "write_serial":
+            return {"text":"x","baudrate":None,"port":None,"append_newline":False,"timeout_seconds":1,"on_exit":None}
+        return {"steps":[{"text":"x","expected_text":"ok","line_ending":"none"}],"read_seconds":1,"baudrate":None,"port":None,"ready_text":None,"ready_seconds":0,"ready_probe_text":None,"ready_probe_line_ending":"none","ready_probe_delay_seconds":0,"clear_input":False}
+
+    def _assert_uart_admission(self, method: str, arguments: dict[str, object], *, plan: bool, allowed: bool) -> None:
+        call = self._uart_call(method, arguments, plan=plan)
+        if allowed:
+            self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1)["policy"])
+        else:
+            with self.assertRaises(AdmissionError):
+                evaluate_call(call, now_monotonic=1)
+
+    def test_uart_timing_read_and_write_values_are_closed_direct_and_plan(self) -> None:
+        positive_invalid = (True, 0, -1, 31, float("nan"), float("inf"), 10 ** 1000)
+        for method, field in (("read_serial", "read_seconds"), ("write_serial", "timeout_seconds"), ("serial_exchange", "read_seconds")):
+            for plan in (False, True):
+                for value in (1, 30, 0.5, 30.0):
+                    arguments = self._uart_arguments(method); arguments[field] = value
+                    with self.subTest(method=method, plan=plan, field=field, value=repr(value)):
+                        self._assert_uart_admission(method, arguments, plan=plan, allowed=True)
+                arguments = self._uart_arguments(method); arguments |= {field:1, "baudrate":115200, "port":"COM1"}
+                with self.subTest(method=method, plan=plan, baudrate="positive", port="nonempty"):
+                    self._assert_uart_admission(method, arguments, plan=plan, allowed=True)
+                for value in positive_invalid:
+                    arguments = self._uart_arguments(method); arguments[field] = value
+                    with self.subTest(method=method, plan=plan, field=field, value=repr(value)):
+                        self._assert_uart_admission(method, arguments, plan=plan, allowed=False)
+        for method, field, bad_values in (("read_serial", "expected_text", ("", 1)), ("read_serial", "baudrate", (False, 0, -1, 1.0)), ("read_serial", "port", ("", " ", 1)), ("read_serial", "reset_on_open", (True, 0)), ("read_serial", "on_exit", ("close", False)), ("write_serial", "baudrate", (False, 0, -1, 1.0)), ("write_serial", "port", ("", " ", 1)), ("write_serial", "append_newline", (1, None)), ("write_serial", "on_exit", ("close", False))):
+            for plan in (False, True):
+                for value in bad_values:
+                    arguments = self._uart_arguments(method); arguments[field] = value
+                    with self.subTest(method=method, plan=plan, field=field, value=repr(value)):
+                        self._assert_uart_admission(method, arguments, plan=plan, allowed=False)
+
+    def test_uart_write_transmitted_utf8_limits_apply_direct_and_plan(self) -> None:
+        cases = (("x" * 256, False, True), ("x" * 255, True, True), ("x" * 256, True, False), ("é" * 128, False, True), ("é" * 128, True, False), ("", False, False), ("é" * 129, False, False))
+        for plan in (False, True):
+            for text, append_newline, allowed in cases:
+                arguments = self._uart_arguments("write_serial"); arguments |= {"text":text,"append_newline":append_newline}
+                with self.subTest(plan=plan, chars=len(text), append_newline=append_newline):
+                    self._assert_uart_admission("write_serial", arguments, plan=plan, allowed=allowed)
+
+    def test_uart_exchange_surface_and_null_plan_disclosure_are_closed(self) -> None:
+        null = {key:None for key in ("board_id","hypothesis","strategy","hypothesis_made","strategy_evaluated","expected_fail_return","expected_success_return","max_calls","max_calls_buffer","action_parameters","user_permission")}
+        for method in ("read_serial", "write_serial", "serial_exchange"):
+            self.assertEqual("ALLOW", evaluate_call({**self._uart_call(method, self._uart_arguments(method), plan=True), "arguments":null}, now_monotonic=1)["policy"])
+        invalid_nonnegative = (True, -1, 31, float("nan"), float("inf"), 10 ** 1000)
+        for plan in (False, True):
+            for field, values in (("steps", ([], "row")), ("clear_input", (1, None)), ("ready_seconds", (True, 0, -1, 31, float("nan"), float("inf"), 10 ** 1000)), ("ready_probe_delay_seconds", invalid_nonnegative), ("ready_probe_line_ending", (None, "bad"))):
+                for value in values:
+                    arguments = self._uart_arguments("serial_exchange"); arguments["ready_text"] = "ready"; arguments[field] = value
+                    with self.subTest(plan=plan, field=field, value=repr(value)):
+                        self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=False)
+            for row in ({}, {"text":"","expected_text":"ok","line_ending":"none"}, {"text":"x","expected_text":"","line_ending":"none"}, {"text":1,"expected_text":"ok","line_ending":"none"}, {"text":"x","expected_text":1,"line_ending":"none"}, {"text":"x","expected_text":"ok","line_ending":None}, {"text":"x","expected_text":"ok","line_ending":"bad"}, {"text":"x","expected_text":"ok","line_ending":"none","extra":None}, {"text":"x" * 256,"expected_text":"ok","line_ending":"lf"}):
+                arguments = self._uart_arguments("serial_exchange"); arguments["steps"] = [row]
+                with self.subTest(plan=plan, row=row):
+                    self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=False)
+            for mutate in (lambda a: a.update({"ready_text":None,"ready_seconds":1}), lambda a: a.update({"ready_text":1}), lambda a: a.update({"ready_text":None,"ready_probe_text":"?"}), lambda a: a.update({"ready_text":"ready","ready_seconds":0}), lambda a: a.update({"ready_text":"ready","ready_seconds":1,"ready_probe_text":None,"ready_probe_delay_seconds":1}), lambda a: a.update({"ready_text":"ready","ready_seconds":1,"ready_probe_text":"","ready_probe_line_ending":"none"}), lambda a: a.update({"ready_text":"ready","ready_seconds":1,"ready_probe_text":1}), lambda a: a.update({"ready_text":"ready","ready_seconds":1,"ready_probe_text":"?","ready_probe_delay_seconds":2})):
+                arguments = self._uart_arguments("serial_exchange"); mutate(arguments)
+                with self.subTest(plan=plan, arguments=arguments):
+                    self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=False)
+            for arguments in ({**self._uart_arguments("serial_exchange"), "steps":[{"text":"x" * 254,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "steps":[{"text":"é" * 127,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "ready_text":"ready","ready_seconds":0.5,"ready_probe_text":"?","ready_probe_line_ending":"lf","ready_probe_delay_seconds":0.25}):
+                with self.subTest(plan=plan, valid=arguments):
+                    self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=True)
+
     def test_scope_effect_is_closed_and_independently_limited(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
