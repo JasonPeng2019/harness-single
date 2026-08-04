@@ -22,7 +22,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
     def _scope(action_class: str) -> dict[str, object]:
         return {"delegated_user_scope_sha256": canonical_sha256(_USER_ISSUED_SCOPE), "action_class": action_class, "scope_effect": {"schema":"firmware-call-effect/v1","effect_action_class":None,"target_operation_manifest":None,"electronic_admission":None,"limits":None}}
 
-    def _complete_chain(self, broker: AcceptanceBroker, raw_payload: object, *, bound_digest: str | None = None) -> list[tuple[Path, str]]:
+    def _complete_chain(self, broker: AcceptanceBroker, raw_payload: object, *, bound_digest: str | None = None, raw_outcome: str = "PASS") -> list[tuple[Path, str]]:
         digest = "PENDING" if bound_digest is None else bound_digest
         bound = {"resource":"STM-A","server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-raw","attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":digest,"cleanup_owner":"C3-HARNESS"}
         bound |= {"max_operation_duration_seconds":30,"permission_granted":True,"authorization_path":"authorization","claim":{"resource":"STM-A","path":"claim","sha256":"c","owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}},"controller_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"},"governing_documents":{"goal":{"path":"goal","sha256":"g"}},"delegated_reference":{"path":"delegated","sha256":"d"},"board_identity":{"path":"board","sha256":"b"},"mcp_schema":{"path":"schema","sha256":"s"},"policy":{"path":"policy","sha256":"p"},"plan":{"path":"plan","sha256":"pl"},"permission":{"path":"permission","sha256":"pe"},"seed_identity":{"path":"seed","sha256":"x"},"target_identity":{"path":"target","sha256":"y"},"topology_key_release":{"path":"release","sha256":"r"}}
@@ -34,7 +34,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             extra = {"schema":"firmware-o-decision/v3","proposal_path":"proposal","proposal_sha256":"proposal","call":{},"claim":{},"decision":"approve","rationale":"reviewed","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1,"expires_monotonic":99,"topology_key_release":{},"orchestrator_identity":{},"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
             extra |= {"expires_monotonic":99} if stage == "authorization" else {}
             extra |= {"deadline_monotonic":100} if stage == "dispatch-admission" else {}
-            extra |= {"raw_result":raw_payload,"outcome":"FAIL"} if stage == "raw-result" else {}
+            extra |= {"raw_result":raw_payload,"outcome":raw_outcome} if stage == "raw-result" else {}
             extra |= {"exact_reaped":True} if stage == "returning-state-cleanup" else {}
             stages.append(broker.record(stage, "call-raw", {**common, **extra}, (str(stages[-1][0]), stages[-1][1]) if stages else None))
             if stage == "raw-result":
@@ -131,7 +131,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value), encoding="utf-8")
             return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         raw = {"result": {"server": "pinned failure"}}
-        chain = self._complete_chain(broker, raw)
+        chain = self._complete_chain(broker, raw, raw_outcome="FAIL")
         chain_refs = [{"path": str(path), "sha256": digest, "stage": json.loads(path.read_text(encoding="utf-8"))["stage"]} for path, digest in chain[:7]]
         call = json.loads(chain[-1][0].read_text(encoding="utf-8")); bound = call["bound_operation"]
         attempt, lane, session, call_id = "attempt-raw", "STM-A", "session-1", "call-raw"
