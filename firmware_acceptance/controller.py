@@ -14,6 +14,7 @@ import queue
 import datetime as _datetime
 import math
 import uuid
+import re
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -118,6 +119,28 @@ def _process_identity(pid: int) -> dict[str, Any] | None:
     if pid not in process_snapshot().by_pid:
         return None
     return exact_process_identity(pid)
+
+
+def _pinned_result(raw: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """Decode the one FastMCP text result shape used by the pinned server."""
+    result = raw.get("result") if isinstance(raw, dict) else None
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict) or set(content[0]) - {"type", "text"} or content[0].get("type") != "text" or not isinstance(content[0].get("text"), str):
+        raise AdmissionError("pinned MCP result is not exactly one text item")
+    text = content[0]["text"]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text, None
+    if not isinstance(parsed, dict): raise AdmissionError("pinned MCP JSON text is not an object")
+    return text, parsed
+
+
+def _server_run_id(guidance: str) -> str:
+    matches = re.findall(r"(?m)^- run_id:\s*([^\s]+)\s*$", guidance)
+    if len(matches) != 1 or not matches[0]: raise AdmissionError("handshake guidance has no unambiguous Server Run ID")
+    if len(re.findall(r"(?m)^- started_at:\s*.+$", guidance)) != 1: raise AdmissionError("handshake guidance has no exact start marker")
+    return matches[0]
 
 
 class _StdioTransport:
@@ -336,9 +359,9 @@ class FirmwareAcceptanceController:
             transport.send(initialized, "initialized notification"); transcript.append(initialized)
             handshake = {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"initialization_handshake","arguments":{}}}
             transport.send(handshake, "initialization handshake"); answer = transport.receive(2); transcript += [handshake, answer]
-            if not isinstance(answer.get("result"), dict) or answer["result"].get("isError") is True: raise AdmissionError("initialization handshake failed")
-            server_run_id = answer["result"].get("server_run_id") or answer["result"].get("serverRunId")
-            if not isinstance(server_run_id, str) or not server_run_id: raise AdmissionError("initialization handshake omitted Server Run ID")
+            guidance, parsed_handshake = _pinned_result(answer)
+            if parsed_handshake is not None: raise AdmissionError("initialization handshake must return pinned guidance text")
+            server_run_id = _server_run_id(guidance)
             open_value = {"schema":"firmware-session-open/v1","session_id":request["session_id"],"session_request_path":str(request_record_path),"session_request_sha256":request_sha,"claim":claim,"controller_identity":claim["owner"],"server_process_identity":identity,"server_run_id":server_run_id,"bootstrap_transcript":transcript,"bootstrap_transcript_sha256":canonical_sha256(transcript),"state":"BOOTSTRAPPED"}
             open_sha = _write_new(_safe_child(session_root, "SESSION_OPEN.json"), open_value)
             self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"call_ids":set()}
@@ -401,13 +424,14 @@ class FirmwareAcceptanceController:
             rpc_id = session["rpc_id"]
             session["transport"].send({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":{"name":call["method"],"arguments":call["arguments"]}}, "session tools/call")
             raw = session["transport"].receive(rpc_id)
-            if not isinstance(raw.get("result"), dict) or raw["result"].get("isError") is True: raise AdmissionError("session MCP result failed")
+            _, payload = _pinned_result(raw)
+            if payload is None: raise AdmissionError("session tool did not return pinned JSON text")
             rule = self.broker.policy["methods"][call["method"]]
             if "next_by_server_status" in rule:
-                status = raw["result"].get("status")
+                status = payload.get("status")
                 if rule["next_by_server_status"].get(status) != proposal["next_state"]:
                     raise AdmissionError("server result status did not permit the requested transition")
-            if call["method"] == "board_validate" and raw["result"].get("ready") is not True:
+            if call["method"] == "board_validate" and payload.get("status") != "validation_passed":
                 raise AdmissionError("board validation did not report ready")
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")

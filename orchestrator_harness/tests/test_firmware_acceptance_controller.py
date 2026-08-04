@@ -104,7 +104,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
             request_path = root / "session-request.json"; request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
             # initialize, empty handshake, then the one permitted route call.
-            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"server_run_id":"run-1"}}\n{"jsonrpc":"2.0","id":3,"result":{"ok":true}}\n')
+            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Server Run\\n- run_id: run-1\\n- started_at: 2026-01-01T00:00:00Z"}]}}\n{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\\"status\\":\\"ok\\"}"}]}}\n')
             controller.launcher = lambda _: (launches.append(process) or process)
             opened = controller.open_session(request_path)
             self.assertEqual("BOOTSTRAPPED", opened["state"]); self.assertEqual(1, len(claims)); self.assertTrue(claims[0].live)
@@ -124,7 +124,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
             request_path = root / "session-request.json"; request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
-            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"server_run_id":"run-1"}}\n{"jsonrpc":"2.0","id":3,"result":{"ok":true}}\n')
+            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Server Run\\n- run_id: run-1\\n- started_at: 2026-01-01T00:00:00Z"}]}}\n{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\\"status\\":\\"ok\\"}"}]}}\n')
             controller.launcher = lambda _: (launches.append(process) or process); opened = controller.open_session(request_path)
             # READY is the prerequisite established by the separately tested setup/validation state graph.
             controller._session["state"] = "READY"

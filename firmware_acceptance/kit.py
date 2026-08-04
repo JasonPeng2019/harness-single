@@ -407,13 +407,13 @@ class AcceptanceBroker:
             raise AdmissionError("call identity does not match selected physical lane")
         return lane
 
-    def record_server_limitation(self, o_decision_path: Path, limitation_id: str) -> dict[str, Any]:
+    def record_server_limitation(self, o_decision_path: Path, limitation_id: str, verifier: SignatureVerifier) -> dict[str, Any]:
         """Derive, once, an immutable server-limitation record; this never authorizes a bypass."""
         if not isinstance(limitation_id, str) or not limitation_id or any(char in limitation_id for char in "/\\"):
             raise AdmissionError("limitation identity is invalid")
         decision = self._load_limitation_decision(o_decision_path)
         required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
-        if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"]:
+        if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
             raise AdmissionError("server limitation decision is not closed or signed")
         if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
             raise AdmissionError("server limitation identities are incomplete")
