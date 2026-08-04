@@ -52,6 +52,24 @@ class LimitationEvidenceAdapter:
     def _root(self, value: dict[str, Any]) -> Path:
         return _safe_child(self.broker.root, "hil", value["lane_id"], "server-limitations", value["attempt_id"], value["limitation_id"], "c3-harness")
 
+    def _diagnostic_root(self, path: Path, assignment: dict[str, Any]) -> Path:
+        """Validate the diagnostic subtree without inventing a schema field."""
+        if path.name != "DIAGNOSTIC_ASSIGNMENT.json" or path.parent.name != "c3-harness":
+            raise AdmissionError("diagnostic preparation is outside its exact attempt subtree")
+        limitation_id = self._identity(path.parent.parent.name, "diagnostic limitation")
+        expected = _safe_child(
+            self.broker.root,
+            "hil",
+            assignment["lane_id"],
+            "server-limitations",
+            assignment["attempt_id"],
+            limitation_id,
+            "c3-harness",
+        )
+        if path.parent != expected:
+            raise AdmissionError("diagnostic preparation is outside its exact attempt subtree")
+        return expected
+
     def _confined_path(self, value: Any, label: str, *, exists: bool) -> Path:
         if not isinstance(value, (str, Path)):
             raise AdmissionError(label + " path is invalid")
@@ -138,9 +156,12 @@ class LimitationEvidenceAdapter:
         expected_schema = "firmware-pinned-component-diagnostic-assignment/v1" if diagnostic else "firmware-limitation-substitute-assignment/v1"
         if set(assignment) != assignment_keys or assignment.get("schema") != expected_schema:
             raise AdmissionError("limitation preparation is not a closed assignment")
-        expected = self._root(assignment) / ("DIAGNOSTIC_ASSIGNMENT.json" if diagnostic else "ASSIGNMENT.json")
-        if path != expected:
-            raise AdmissionError("limitation preparation is outside its exact attempt subtree")
+        if diagnostic:
+            root = self._diagnostic_root(path, assignment)
+        else:
+            root = self._root(assignment)
+            if path != root / "ASSIGNMENT.json":
+                raise AdmissionError("limitation preparation is outside its exact attempt subtree")
         worker_role, worker_id = assignment.get("worker_role"), assignment.get("worker_invocation_id")
         if worker_role not in _C3_WORKER_ROLES or not isinstance(worker_id, str) or not worker_id:
             raise AdmissionError("limitation preparation worker identity is invalid")
@@ -148,7 +169,6 @@ class LimitationEvidenceAdapter:
         status = self._reference(controller_status_ref, "C3 controller status")
         result = self._reference(candidate_result_ref, "C3 worker result")
         controller_identity = self.broker._verify_c3_completion(invocation, status, result, worker_role, worker_id, assignment["expected_status_path"], assignment["expected_result_path"], preparation["sha256"])
-        root = self._root(assignment)
         if diagnostic:
             # The assignment binds the retained call identity; the immutable broker
             # path makes its raw artifact the only permissible attribution input.
