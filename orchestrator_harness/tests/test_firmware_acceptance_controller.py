@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import firmware_acceptance.controller as controller_module
 from firmware_acceptance.controller import FirmwareAcceptanceController, _StdioTransport, _process_identity
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _USER_ISSUED_SCOPE, canonical_decision_payload, canonical_sha256
 
 
 class _Input(io.BytesIO):
@@ -67,7 +67,12 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         plan["max_operation_duration_seconds"] = 30  # type: ignore[index]
         permission["granted"] = True  # type: ignore[index]
         governing = {name: ref(name) for name in ("goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness")}
-        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"066FFF514988525067233337","target":"STM32L476RG","profile":"stm-a-l476","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":plan,"permission":permission,"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"board_identity":ref("board"),"mcp_schema":ref("schema"),"policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"server_revision":"f003f84a7df51cd8595a3203c62e225b21da2a22","seed_identity":ref("seed"),"target_identity":ref("target"),"topology_key_release":ref("release"),"governing_documents":governing}
+        pin = ref("pin")
+        delegated_value = {"schema_version":"delegated-hardware-authorization-v1","issuance_source":"goal.md Section 11 USER_HARDWARE_AUTHORIZATION_V1","canonical_user_scope_sha256":canonical_sha256(_USER_ISSUED_SCOPE),"user_issued_scope":_USER_ISSUED_SCOPE,"derived_bindings":{"c1_lock_id":"C1","operative_goal_sha256":"goal","stable_fixtures":{"STM-A":{"probe_uid":"066FFF514988525067233337","target":"STM32L476RG","profile":"stm-a-l476"},"STM-B":{"probe_uid":"0668FF514988525067213913","target":"STM32L476RG","profile":"stm-b-l476"},"NRF-A":{"probe_uid":"683710208","target":"nRF52840","profile":"nrf-a-52840"},"NRF-B":{"probe_uid":"683854191","target":"nRF52840","profile":"nrf-b-52840"}},"destructive_exclusions":_USER_ISSUED_SCOPE["prohibited_action_classes"],"rf_limits":{"ble":_USER_ISSUED_SCOPE["limits"]["ble"],"lora":_USER_ISSUED_SCOPE["limits"]["lora"]},"mcp_server_pin":pin,"mcp_method_policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"governing_documents":governing}}
+        delegated_path = root / "delegated.json"; delegated_path.write_text(json.dumps(delegated_value), encoding="utf-8")
+        delegated = {"path":str(delegated_path),"sha256":hashlib.sha256(delegated_path.read_bytes()).hexdigest()}
+        normal_effect = {"schema":"firmware-call-effect/v1","effect_action_class":None,"target_operation_manifest":None,"electronic_admission":None,"limits":None}
+        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"066FFF514988525067233337","target":"STM32L476RG","profile":"stm-a-l476","route":None,"method":"reset_and_run","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":plan,"permission":permission,"c1_reference":ref("c1"),"delegated_reference":delegated,"board_identity":ref("board"),"mcp_schema":ref("schema"),"policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"server_revision":"f003f84a7df51cd8595a3203c62e225b21da2a22","seed_identity":ref("seed"),"target_identity":ref("target"),"topology_key_release":ref("release"),"governing_documents":governing,"delegated_user_scope_sha256":canonical_sha256(_USER_ISSUED_SCOPE),"action_class":"reset","scope_effect":normal_effect}
 
     def _flow(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier) -> tuple[Path, Path, Path]:
         proposal_path = root / "broker" / "proposal.json"; proposal = controller.publish_proposal(proposal_path, {"call":self._call(root)})
@@ -89,6 +94,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             messages = [json.loads(line) for line in launches[0].stdin.getvalue().splitlines()]
             self.assertEqual(["initialize", "notifications/initialized", "tools/call"], [item["method"] for item in messages[:3]])
             self.assertEqual([1, None, 2], [item.get("id") for item in messages[:3]])
+            self.assertNotIn("scope_effect", messages[2]["params"]["arguments"])
             cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
             self.assertTrue(cleanup["stderr_log_complete"]); self.assertEqual(cleanup["stderr_sha256"], cleanup["stderr_log_sha256"])
 

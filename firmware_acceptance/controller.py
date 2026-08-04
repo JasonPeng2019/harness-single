@@ -20,7 +20,7 @@ from orchestrator_harness.models import ProcessInfo
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import ResourceClaims, ResourceLockError
 from harness_common.process_identity import exact_process_identity
-from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256, reject_linked_path
+from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256, reject_linked_path, validate_delegated_authorization
 
 
 class StdioProcess(Protocol):
@@ -36,7 +36,7 @@ class StdioProcess(Protocol):
 
 Launcher = Callable[[dict[str, Any]], StdioProcess]
 _FORBIDDEN_REQUEST_KEYS = {"endpoint", "stdio", "mcp_command", "environment", "credential", "process", "handle"}
-_CALL_KEYS = {"call_id", "attempt_id", "lane_id", "board", "resource", "probe_uid", "target", "profile", "route", "method", "method_version", "arguments", "deadline_monotonic", "plan", "permission", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "server_revision", "seed_identity", "target_identity", "topology_key_release", "governing_documents"}
+_CALL_KEYS = {"call_id", "attempt_id", "lane_id", "board", "resource", "probe_uid", "target", "profile", "route", "method", "method_version", "arguments", "deadline_monotonic", "plan", "permission", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "server_revision", "seed_identity", "target_identity", "topology_key_release", "governing_documents", "delegated_user_scope_sha256", "action_class", "scope_effect"}
 _REFERENCE_KEYS = {"path", "sha256"}
 _GOVERNING_KEYS = {"goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness"}
 _DECISION_KEYS = {"schema", "proposal_path", "proposal_sha256", "call", "claim", "decision", "rationale", "issued_utc", "issued_monotonic", "expires_monotonic", "topology_key_release", "orchestrator_identity", "public_key", "signature"}
@@ -68,6 +68,7 @@ def _closed_call(call: Any) -> dict[str, Any]:
     if call["route"] is not None and not isinstance(call["route"], str): raise AdmissionError("route must be canonical null or an exact route")
     if call["resource"] != call["board"]: raise AdmissionError("declared resource must equal exact board resource")
     if not isinstance(call["method_version"], int) or isinstance(call["method_version"], bool) or not isinstance(call["arguments"], dict): raise AdmissionError("call method binding is invalid")
+    if not isinstance(call["delegated_user_scope_sha256"], str) or len(call["delegated_user_scope_sha256"]) != 64 or not isinstance(call["action_class"], str) or not isinstance(call["scope_effect"], dict): raise AdmissionError("call scope binding is invalid")
     if not isinstance(call["deadline_monotonic"], (int, float)) or isinstance(call["deadline_monotonic"], bool) or not math.isfinite(call["deadline_monotonic"]): raise AdmissionError("call deadline is invalid")
     for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "seed_identity", "target_identity", "topology_key_release"):
         _reference(call[key], key)
@@ -95,6 +96,12 @@ def _verify_live_call_inputs(call: dict[str, Any], broker: "AcceptanceBroker") -
     if Path(call["policy"]["path"]).resolve() != broker.policy_path or call["policy"]["sha256"] != hashlib.sha256(broker.policy_path.read_bytes()).hexdigest():
         raise AdmissionError("live broker policy is not the bound policy")
     _verify_raw_reference(call["plan"], "plan"); _verify_raw_reference(call["permission"], "permission")
+    delegated = validate_delegated_authorization(call["delegated_reference"], policy_path=broker.policy_path, manifest=broker.manifest)
+    if call["delegated_user_scope_sha256"] != delegated["canonical_user_scope_sha256"]:
+        raise AdmissionError("call delegated user scope hash drifted")
+    fixture = delegated["derived_bindings"]["stable_fixtures"].get(call["board"])
+    if not isinstance(fixture, dict) or any(call[key] != fixture[key] for key in ("probe_uid", "target", "profile")):
+        raise AdmissionError("call is not bound to its delegated fixture")
     return {key: value["sha256"] for key, value in call["governing_documents"].items()}
 
 
@@ -509,7 +516,7 @@ class FirmwareAcceptanceController:
 
     def _intent_bound(self, call: dict[str, Any], intent_sha: str, authorization: dict[str, Any], authorization_path: Path, authorization_sha: str, claim: dict[str, Any]) -> dict[str, Any]:
         policy_sha = hashlib.sha256(self.broker.policy_path.read_bytes()).hexdigest()
-        return {"server_commit":call["server_revision"],"method":call["method"],"method_version":call["method_version"],"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":call["mcp_schema"]["sha256"],"resource":call["resource"],"plan_sha256":call["plan"]["sha256"],"permission_sha256":call["permission"]["sha256"],"max_operation_duration_seconds":call["plan"]["max_operation_duration_seconds"],"permission_granted":call["permission"]["granted"],"authorization_sha256":authorization_sha,"authorization_path":str(authorization_path),"claim_sha256":claim["sha256"],"claim":claim,"controller_owner":claim["owner"],"call_id":call["call_id"],"attempt_id":call["attempt_id"],"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call["route"],"governing_hashes":{key: value["sha256"] for key, value in call["governing_documents"].items()},"governing_documents":call["governing_documents"],"c1_reference":call["c1_reference"],"delegated_reference":call["delegated_reference"],"board_identity":call["board_identity"],"mcp_schema":call["mcp_schema"],"policy":call["policy"],"plan":{"path":call["plan"]["path"],"sha256":call["plan"]["sha256"]},"permission":{"path":call["permission"]["path"],"sha256":call["permission"]["sha256"]},"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call["seed_identity"],"target_identity":call["target_identity"],"topology_key_release":call["topology_key_release"],"raw_result_sha256":"PENDING","cleanup_owner":claim["owner"]}
+        return {"server_commit":call["server_revision"],"method":call["method"],"method_version":call["method_version"],"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":call["mcp_schema"]["sha256"],"resource":call["resource"],"plan_sha256":call["plan"]["sha256"],"permission_sha256":call["permission"]["sha256"],"max_operation_duration_seconds":call["plan"]["max_operation_duration_seconds"],"permission_granted":call["permission"]["granted"],"authorization_sha256":authorization_sha,"authorization_path":str(authorization_path),"claim_sha256":claim["sha256"],"claim":claim,"controller_owner":claim["owner"],"call_id":call["call_id"],"attempt_id":call["attempt_id"],"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call["route"],"governing_hashes":{key: value["sha256"] for key, value in call["governing_documents"].items()},"governing_documents":call["governing_documents"],"c1_reference":call["c1_reference"],"delegated_reference":call["delegated_reference"],"board_identity":call["board_identity"],"mcp_schema":call["mcp_schema"],"policy":call["policy"],"plan":{"path":call["plan"]["path"],"sha256":call["plan"]["sha256"]},"permission":{"path":call["permission"]["path"],"sha256":call["permission"]["sha256"]},"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call["seed_identity"],"target_identity":call["target_identity"],"topology_key_release":call["topology_key_release"],"delegated_user_scope_sha256":call["delegated_user_scope_sha256"],"action_class":call["action_class"],"scope_effect":call["scope_effect"],"raw_result_sha256":"PENDING","cleanup_owner":claim["owner"]}
 
     def _read_bound(self, path: Path, keys: set[str]) -> tuple[dict[str, Any], str]:
         value = self._load_artifact(path, keys)

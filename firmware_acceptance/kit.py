@@ -30,7 +30,91 @@ _SEED_FILES = ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.
 
 
 def canonical_sha256(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    """The delegated-scope canonicalization is compact, sorted, UTF-8, and verbatim."""
+    try:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AdmissionError("value is not canonical JSON") from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
+# This is intentionally data, not a permissive interpretation of goal.md.  C1 must
+# copy this parsed object verbatim and may add only the separately validated bindings.
+_USER_ISSUED_SCOPE = {
+    "allowed_action_classes": ["probe_discovery_read", "connect_setup", "application_flash", "reset", "debug_halt_resume", "memory_register_read", "uart_session_io", "ble_gatt_test", "lora_ping_pong_test"],
+    "expires_at_utc": None,
+    "fixtures": ["STM-A", "STM-B", "NRF-A", "NRF-B"],
+    "limits": {"application_flash": {"application_regions_only": True, "allow_bootloader_replace": False, "allow_mass_erase": False, "allow_protection_change": False, "allow_target_unlock": False}, "ble": {"max_tx_power_dbm": 0}, "lora": {"bandwidth_hz": 125000, "center_frequency_hz": 915000000, "coding_rate_denominator": 5, "max_campaign_minutes": 30, "max_payload_bytes": 64, "max_tx_airtime_ms_per_60s": 6000, "max_tx_power_dbm": 10, "spreading_factor_max": 10, "spreading_factor_min": 7}, "uart": {"max_write_bytes_per_call": 256}},
+    "prohibited_action_classes": ["bootloader_replace", "mass_erase", "protection_change", "target_unlock", "destructive_recovery"],
+    "schema_version": "user-hardware-authorization-v1",
+}
+_DELEGATED_KEYS = {"schema_version", "issuance_source", "canonical_user_scope_sha256", "user_issued_scope", "derived_bindings"}
+_DERIVED_KEYS = {"c1_lock_id", "operative_goal_sha256", "stable_fixtures", "destructive_exclusions", "rf_limits", "mcp_server_pin", "mcp_method_policy", "governing_documents"}
+_EFFECT_KEYS = {"schema", "effect_action_class", "target_operation_manifest", "electronic_admission", "limits"}
+
+
+def _exact_reference(value: Any, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or any(not isinstance(value[key], str) or not value[key] for key in value):
+        raise AdmissionError(label + " must be an exact path/hash reference")
+    return value
+
+
+def _verify_exact_reference_file(value: Any, label: str) -> dict[str, str]:
+    reference = _exact_reference(value, label)
+    path = Path(reference["path"])
+    reject_linked_path(path)
+    if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]:
+        raise AdmissionError(label + " reference drifted")
+    return reference
+
+
+def validate_delegated_authorization(reference: dict[str, str], *, policy_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Load the closed C1 artifact without inventing any user authority."""
+    reference = _exact_reference(reference, "delegated authorization")
+    path = Path(reference["path"])
+    reject_linked_path(path)
+    if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]:
+        raise AdmissionError("delegated authorization reference drifted")
+    try: value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc: raise AdmissionError("delegated authorization is unreadable") from exc
+    if not isinstance(value, dict) or set(value) != _DELEGATED_KEYS or value.get("schema_version") != "delegated-hardware-authorization-v1" or value.get("issuance_source") != "goal.md Section 11 USER_HARDWARE_AUTHORIZATION_V1":
+        raise AdmissionError("delegated authorization is not the closed C1 shape")
+    if value.get("user_issued_scope") != _USER_ISSUED_SCOPE or value.get("canonical_user_scope_sha256") != canonical_sha256(_USER_ISSUED_SCOPE):
+        raise AdmissionError("delegated authorization changed the verbatim user scope")
+    bindings = value.get("derived_bindings")
+    if not isinstance(bindings, dict) or set(bindings) != _DERIVED_KEYS or not isinstance(bindings.get("c1_lock_id"), str) or not bindings["c1_lock_id"] or not isinstance(bindings.get("operative_goal_sha256"), str) or not bindings["operative_goal_sha256"]:
+        raise AdmissionError("delegated derived bindings are incomplete")
+    fixtures = bindings["stable_fixtures"]
+    expected = manifest.get("fixtures")
+    if not isinstance(fixtures, dict) or set(fixtures) != set(_USER_ISSUED_SCOPE["fixtures"]) or not isinstance(expected, dict): raise AdmissionError("delegated fixtures are not closed")
+    for name, fixture in fixtures.items():
+        if not isinstance(fixture, dict) or set(fixture) != {"probe_uid", "target", "profile"} or any(not isinstance(fixture[key], str) or not fixture[key] for key in fixture) or not isinstance(expected.get(name), dict) or any(fixture[key] != expected[name][key] for key in fixture):
+            raise AdmissionError("delegated fixture does not match the locked fixture")
+    if bindings["destructive_exclusions"] != _USER_ISSUED_SCOPE["prohibited_action_classes"] or bindings["rf_limits"] != {"ble": _USER_ISSUED_SCOPE["limits"]["ble"], "lora": _USER_ISSUED_SCOPE["limits"]["lora"]}:
+        raise AdmissionError("delegated bindings expanded or changed user safety limits")
+    for key in ("mcp_server_pin", "mcp_method_policy"):
+        _verify_exact_reference_file(bindings[key], "delegated " + key)
+    if Path(bindings["mcp_method_policy"]["path"]).resolve() != policy_path.resolve() or bindings["mcp_method_policy"]["sha256"] != hashlib.sha256(policy_path.read_bytes()).hexdigest():
+        raise AdmissionError("delegated pin or policy binding drifted")
+    governing = bindings["governing_documents"]
+    if not isinstance(governing, dict) or set(governing) != {"goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness"}: raise AdmissionError("delegated governing bindings are incomplete")
+    for key in governing: _verify_exact_reference_file(governing[key], "delegated governing " + key)
+    return value
+
+
+def _validate_scope_effect(effect: Any, scope: dict[str, Any]) -> None:
+    if not isinstance(effect, dict) or set(effect) != _EFFECT_KEYS or effect.get("schema") != "firmware-call-effect/v1": raise AdmissionError("scope effect is malformed")
+    if effect == {"schema": "firmware-call-effect/v1", "effect_action_class": None, "target_operation_manifest": None, "electronic_admission": None, "limits": None}: return
+    action = effect.get("effect_action_class")
+    if action not in {"ble_gatt_test", "lora_ping_pong_test"} or action not in scope["allowed_action_classes"] or action in scope["prohibited_action_classes"]: raise AdmissionError("scope effect action class is unauthorized")
+    _verify_exact_reference_file(effect.get("target_operation_manifest"), "scope effect target manifest"); _verify_exact_reference_file(effect.get("electronic_admission"), "scope effect electronic admission")
+    limits = effect.get("limits")
+    maximum = scope["limits"]["ble" if action == "ble_gatt_test" else "lora"]
+    if not isinstance(limits, dict) or set(limits) != set(maximum): raise AdmissionError("scope effect limits are not closed")
+    for key, maximum_value in maximum.items():
+        value = limits[key]
+        if isinstance(maximum_value, bool) or not isinstance(value, type(maximum_value)) or (isinstance(maximum_value, int) and value > maximum_value) or (key in {"bandwidth_hz", "center_frequency_hz", "coding_rate_denominator"} and value != maximum_value): raise AdmissionError("scope effect exceeds delegated limits")
+    if action == "lora_ping_pong_test" and limits.get("dio2_dependent") is not None: raise AdmissionError("LoRa effect cannot claim DIO2 authority")
 
 
 def canonical_decision_payload(decision: dict[str, Any]) -> bytes:
@@ -96,12 +180,15 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
         "plan_sha256", "permission_sha256", "max_operation_duration_seconds", "permission_granted", "authorization_sha256", "authorization_path", "claim_sha256", "claim", "controller_owner", "call_id",
         "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route",
         "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "deadline_monotonic", "expires_monotonic", "seed_identity",
-        "target_identity", "topology_key_release", "raw_result_sha256", "cleanup_owner",
+        "target_identity", "topology_key_release", "delegated_user_scope_sha256", "action_class", "scope_effect", "raw_result_sha256", "cleanup_owner",
     }
     if set(value) != required:
         raise AdmissionError("bound operation must be a closed complete authority object")
     if value["server_commit"] != _PINNED_SERVER_COMMIT or not isinstance(value["method"], str) or not isinstance(value["arguments"], dict):
         raise AdmissionError("bound operation server or method identity is invalid")
+    if value["delegated_user_scope_sha256"] != canonical_sha256(_USER_ISSUED_SCOPE) or not isinstance(value["action_class"], str):
+        raise AdmissionError("bound delegated scope or action class is invalid")
+    _validate_scope_effect(value["scope_effect"], _USER_ISSUED_SCOPE)
     for key in ("method_version", "deadline_monotonic", "expires_monotonic"):
         if not isinstance(value[key], (int, float)) or isinstance(value[key], bool):
             raise AdmissionError("bound operation timing/version is invalid")
@@ -109,7 +196,7 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
         raise AdmissionError("bound operation timing is not finite")
     if not isinstance(value["max_operation_duration_seconds"], int) or isinstance(value["max_operation_duration_seconds"], bool) or value["max_operation_duration_seconds"] <= 0 or value["permission_granted"] is not True or not isinstance(value["authorization_path"], str) or not value["authorization_path"]:
         raise AdmissionError("bound operation duplicated authority is invalid")
-    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "max_operation_duration_seconds", "permission_granted", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
+    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "max_operation_duration_seconds", "permission_granted", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "delegated_user_scope_sha256", "action_class", "scope_effect", "raw_result_sha256", "cleanup_owner"}:
         if not isinstance(value[key], str) or not value[key]:
             raise AdmissionError("bound operation has an empty identity or hash")
     for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "seed_identity", "target_identity", "topology_key_release"):
@@ -178,8 +265,14 @@ def finding_gate_fragment(role: str, workspace: Path) -> dict[str, object]:
 
 def _load_policy(policy_path: Path) -> dict[str, Any]:
     value = json.loads(policy_path.read_text(encoding="utf-8"))
-    if value.get("default") != "deny" or not isinstance(value.get("methods"), dict):
+    methods = value.get("methods")
+    if value.get("schema_version") != "firmware-mcp-method-policy/v2" or value.get("default") != "deny" or not isinstance(methods, dict) or len(methods) != 21:
         raise AdmissionError("invalid default-deny policy")
+    states = {"BOOTSTRAPPED", "ROUTED", "SETUP_LOADED", "SETUP_PLAN_DISCLOSED", "SETUP_ACTION_READY", "SETUP_CONTINUATION", "SETUP_FIX_READY", "VALIDATION_LOADED", "READY", "OP_PLAN_DISCLOSED", "OP_ACTION_READY", "RETURNED", "ABORTED", "CLOSED"}
+    for method, rule in methods.items():
+        transitions = [rule.get("next"), *(rule.get("next_by_mode", {}) or {}).values(), *(rule.get("next_by_tool_name", {}) or {}).values(), *(rule.get("next_by_server_status", {}) or {}).values()]
+        if not isinstance(method, str) or not isinstance(rule, dict) or not isinstance(rule.get("action_class"), str) or not isinstance(rule.get("parameters", {}).get("required_exact"), list) or not isinstance(rule.get("allowed_from"), list) or not set(rule["allowed_from"]) <= states or any(item is not None and item not in states for item in transitions):
+            raise AdmissionError("method policy is incomplete")
     return value
 
 
@@ -399,7 +492,7 @@ class AcceptanceBroker:
 
 def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Path | None = None) -> dict[str, Any]:
     """Validate a fully correlated broker request without performing a physical action."""
-    required = {"call_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "method_version", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission"}
+    required = {"call_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "method_version", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission", "delegated_user_scope_sha256", "action_class", "scope_effect"}
     missing = sorted(required - call.keys())
     if missing:
         raise AdmissionError(f"missing required call fields: {', '.join(missing)}")
@@ -411,6 +504,9 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         raise AdmissionError("method version does not exactly match locked policy rule")
     if any(token in json.dumps(call["arguments"], sort_keys=True).lower() for token in FORBIDDEN):
         raise AdmissionError("prohibited destructive or try-last parameter")
+    if call["delegated_user_scope_sha256"] != canonical_sha256(_USER_ISSUED_SCOPE) or call["action_class"] != rule["action_class"] or call["action_class"] not in _USER_ISSUED_SCOPE["allowed_action_classes"] or call["action_class"] in _USER_ISSUED_SCOPE["prohibited_action_classes"]:
+        raise AdmissionError("method action class is not exactly delegated")
+    _validate_scope_effect(call["scope_effect"], _USER_ISSUED_SCOPE)
     if call["deadline_monotonic"] <= now_monotonic:
         raise AdmissionError("expired monotonic deadline")
     maximum = rule.get("maximum_duration_seconds")
@@ -421,25 +517,23 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         raise AdmissionError("deadline cannot cover operation plus cleanup margin")
     if not isinstance(call["permission"], dict) or not call["permission"].get("granted"):
         raise AdmissionError("missing live permission")
-    if call["method"] == "write_serial":
-        text, maximum_bytes = call["arguments"].get("text"), rule.get("maximum_bytes")
-        if not isinstance(text, str) or not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool) or maximum_bytes <= 0 or len(text.encode("utf-8")) > maximum_bytes:
+    if call["method"] in {"write_serial", "write_serial-plan"}:
+        text = call["arguments"].get("text")
+        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 256:
             raise AdmissionError("UART write exceeds locked UTF-8 byte limit")
-    allowed_parameters = rule.get("parameters")
-    if not isinstance(allowed_parameters, list) or set(call["arguments"]) - set(allowed_parameters) - {"rf", "dio2_dependent"}:
+    parameters = rule.get("parameters")
+    if not isinstance(parameters, dict) or set(call["arguments"]) != set(parameters.get("required_exact", ())):
         raise AdmissionError("method parameters do not match pinned guarded surface")
-    if call["method"] == "read_memory_address":
+    if call["method"] == "read_memory_symbol":
         args = call["arguments"]
-        if set(args) != {"board_id", "address", "width", "length"} or args["width"] not in rule["widths"] or not isinstance(args["length"], int) or isinstance(args["length"], bool) or not 1 <= args["length"] <= rule["maximum_length_bytes"]:
+        if not isinstance(args["symbol"], str) or not args["symbol"] or args["width"] not in (8, 16, 32) or args["elf_artifact"] is not None and not isinstance(args["elf_artifact"], str):
             raise AdmissionError("memory diagnostic arguments do not match pinned handler bounds")
-    if call["method"] == "flash_application" and not rule.get("application_region_only"):
+    if call["method"] == "flash_application" and not parameters.get("safe_flags", {}).get("application_region_only"):
         raise AdmissionError("flash method lacks reviewed application containment")
-    if call["arguments"].get("dio2_dependent"):
-        raise AdmissionError("DIO2-dependent work is denied while P.05 is unresolved")
-    rf = call["arguments"].get("rf")
-    if rf is not None:
-        intent = policy["legal_rf_intent"]
-        required_rf = {"electronic_admission", "frequency_hz", "power_dbm", "payload_bytes", "airtime_ms_per_60s", "campaign_minutes", "bandwidth_hz", "coding_rate", "spreading_factor"}
-        if not isinstance(rf, dict) or not required_rf <= rf.keys() or not isinstance(rf["electronic_admission"], dict) or not {"antenna", "supply_current", "module_identity"} <= rf["electronic_admission"].keys() or rf["frequency_hz"] != intent["frequency_hz"] or rf["power_dbm"] > intent["maximum_dbm"] or rf["payload_bytes"] > intent["maximum_payload_bytes"] or rf["airtime_ms_per_60s"] > intent["maximum_airtime_ms_per_60s"] or rf["campaign_minutes"] > intent["maximum_campaign_minutes"] or rf["bandwidth_hz"] != intent["bandwidth_hz"] or rf["coding_rate"] != intent["coding_rate"] or rf["spreading_factor"] not in intent["spreading_factor_range"]:
-            raise AdmissionError("RF call lacks authoritative bounded admission")
+    if call["method"] in {"flash_application", "flash_application-plan"}:
+        artifact = call["arguments"].get("artifact")
+        if not isinstance(artifact, str) or not artifact or any(token in artifact.lower() for token in ("bootloader", "mass_erase", "unlock", "protection")):
+            raise AdmissionError("flash artifact is not an application-only input")
+    if call["method"] in {"read_serial", "write_serial"} and call["arguments"].get("on_exit") is not None:
+        raise AdmissionError("serial action cannot request a hidden exit effect")
     return {"policy": "ALLOW", "evaluation_sha256": canonical_sha256({"call": call, "policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest() if policy_path else "packaged"}), "maximum_duration_seconds": maximum}

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import firmware_acceptance.kit as kit
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_bound_operation, canonical_sha256, evaluate_call, raw_result_sha256, validate_campaign_contract, validate_seed_manifest, worker_environment
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _USER_ISSUED_SCOPE, canonical_bound_operation, canonical_sha256, evaluate_call, raw_result_sha256, validate_campaign_contract, validate_delegated_authorization, validate_seed_manifest, worker_environment
 
 
 class FirmwareAcceptanceKitTests(unittest.TestCase):
@@ -15,11 +15,16 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         def verify(self, payload: bytes, signature: str, public_key: str) -> bool:
             return signature == "sig" and public_key == "key" and bool(payload)
 
+    @staticmethod
+    def _scope(action_class: str) -> dict[str, object]:
+        return {"delegated_user_scope_sha256": canonical_sha256(_USER_ISSUED_SCOPE), "action_class": action_class, "scope_effect": {"schema":"firmware-call-effect/v1","effect_action_class":None,"target_operation_manifest":None,"electronic_admission":None,"limits":None}}
+
     def _complete_chain(self, broker: AcceptanceBroker, raw_payload: object, *, bound_digest: str | None = None) -> list[tuple[Path, str]]:
         digest = "PENDING" if bound_digest is None else bound_digest
         bound = {"resource":"STM-A","server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-raw","attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":digest,"cleanup_owner":"C3-HARNESS"}
         bound |= {"max_operation_duration_seconds":30,"permission_granted":True,"authorization_path":"authorization","claim":{"resource":"STM-A","path":"claim","sha256":"c","owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}},"controller_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"},"governing_documents":{"goal":{"path":"goal","sha256":"g"}},"delegated_reference":{"path":"delegated","sha256":"d"},"board_identity":{"path":"board","sha256":"b"},"mcp_schema":{"path":"schema","sha256":"s"},"policy":{"path":"policy","sha256":"p"},"plan":{"path":"plan","sha256":"pl"},"permission":{"path":"permission","sha256":"pe"},"seed_identity":{"path":"seed","sha256":"x"},"target_identity":{"path":"target","sha256":"y"},"topology_key_release":{"path":"release","sha256":"r"}}
         bound["cleanup_owner"] = {"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}
+        bound |= self._scope("reset")
         common = {"attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"identity":{"controller":"pid:1"},"bound_operation":bound,"bound_operation_sha256":canonical_sha256(canonical_bound_operation(bound))}
         stages: list[tuple[Path, str]] = []
         for stage in ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result"):
@@ -51,7 +56,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                 with self.assertRaises(AdmissionError): kit.validate_pinned_server()
 
     def test_controller_admission_is_bounded_and_fail_closed(self) -> None:
-        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_halt", "method_version": 1, "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
+        call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_run", "method_version": 1, "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}, **self._scope("reset")}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
         call["arguments"] = {"operation": "mass_erase"}
         with self.assertRaises(AdmissionError):
@@ -61,21 +66,60 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             evaluate_call(call, now_monotonic=1.0)
 
     def test_read_memory_policy_matches_pinned_signature_and_bounds(self) -> None:
-        call = {"call_id": "m1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "read_memory_address", "method_version": 1, "arguments": {"board_id": "STM-A", "address": "0x20000000", "width": 32, "length": 4}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}
+        call = {"call_id": "m1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "read_memory_symbol", "method_version": 1, "arguments": {"board_id": "STM-A", "symbol": "state", "width": 32, "elf_artifact": None}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}, **self._scope("memory_register_read")}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
-        call["arguments"] = {"board_id": "STM-A", "address": 0, "size": 4}
+        call["arguments"] = {"board_id": "STM-A", "symbol": "", "width": 32, "elf_artifact": None}
         with self.assertRaises(AdmissionError):
             evaluate_call(call, now_monotonic=1.0)
-        call["arguments"] = {"board_id": "STM-A", "address": 0, "width": 64, "length": 4}
+        call["arguments"] = {"board_id": "STM-A", "symbol": "state", "width": 64, "elf_artifact": None}
         with self.assertRaises(AdmissionError):
             evaluate_call(call, now_monotonic=1.0)
 
     def test_write_serial_uses_locked_utf8_byte_limit(self) -> None:
-        call = {"call_id":"serial","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"x" * 256,"timeout_seconds":1},"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True}}
+        call = {"call_id":"serial","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"x" * 256,"baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None},"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True},**self._scope("uart_session_io")}
         self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1.0)["policy"])
         for text in ("x" * 257, "é" * 129):
             call["arguments"]["text"] = text
             with self.subTest(chars=len(text)), self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1.0)
+
+    def test_scope_effect_is_closed_and_independently_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def ref(name: str) -> dict[str, str]:
+                path = root / name; path.write_text(name, encoding="utf-8"); return {"path":str(path),"sha256":__import__("hashlib").sha256(path.read_bytes()).hexdigest()}
+            call = {"call_id":"effect","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"reset_and_run","method_version":1,"arguments":{"board_id":"STM-A"},"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":100.0,"plan":{"max_operation_duration_seconds":30},"permission":{"granted":True},**self._scope("reset")}
+            effect = call["scope_effect"] = {"schema":"firmware-call-effect/v1","effect_action_class":"ble_gatt_test","target_operation_manifest":ref("manifest"),"electronic_admission":ref("admission"),"limits":{"max_tx_power_dbm":0}}
+            self.assertEqual("ALLOW", evaluate_call(call, now_monotonic=1)["policy"])
+            effect["limits"] = {"max_tx_power_dbm": 1}
+            with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
+            call["scope_effect"] = {"schema":"firmware-call-effect/v1","effect_action_class":None,"target_operation_manifest":None,"electronic_admission":None,"limits":{},"extra":True}
+            with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
+
+    def test_policy_rejects_unknown_state_and_unsafe_flash_arguments(self) -> None:
+        call = {"call_id":"flash","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","method":"flash_application","method_version":1,"arguments":{"board_id":"STM-A","artifact":"bootloader.hex"},"proposal_sha256":"a","decision_sha256":"b","authorization_sha256":"c","deadline_monotonic":200.0,"plan":{"max_operation_duration_seconds":120},"permission":{"granted":True},**self._scope("application_flash")}
+        with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
+        call["method"] = "not-in-inventory"
+        with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = __import__("json").loads(Path("firmware_acceptance/MCP_METHOD_POLICY.json").read_text(encoding="utf-8")); policy["methods"]["reset_and_run"]["allowed_from"] = ["INVENTED"]
+            path = Path(temporary) / "policy.json"; path.write_text(__import__("json").dumps(policy), encoding="utf-8")
+            call["method"] = "reset_and_run"; call["arguments"] = {"board_id":"STM-A"}; call["plan"] = {"max_operation_duration_seconds":30}; call["action_class"] = "reset"
+            with self.assertRaises(AdmissionError): evaluate_call(call, now_monotonic=1, policy_path=path)
+
+    def test_delegated_artifact_is_exact_and_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); policy = Path("firmware_acceptance/MCP_METHOD_POLICY.json").resolve()
+            def ref(name: str) -> dict[str, str]:
+                path = root / name; path.write_text(name, encoding="utf-8"); return {"path":str(path),"sha256":__import__("hashlib").sha256(path.read_bytes()).hexdigest()}
+            governing = {name: ref(name) for name in ("goal","generalization_spec","implementation_roadmap","execution_plan","execution_readiness")}
+            fixtures = {"STM-A":{"probe_uid":"066FFF514988525067233337","target":"STM32L476RG","profile":"stm-a-l476"},"STM-B":{"probe_uid":"0668FF514988525067213913","target":"STM32L476RG","profile":"stm-b-l476"},"NRF-A":{"probe_uid":"683710208","target":"nRF52840","profile":"nrf-a-52840"},"NRF-B":{"probe_uid":"683854191","target":"nRF52840","profile":"nrf-b-52840"}}
+            value = {"schema_version":"delegated-hardware-authorization-v1","issuance_source":"goal.md Section 11 USER_HARDWARE_AUTHORIZATION_V1","canonical_user_scope_sha256":canonical_sha256(_USER_ISSUED_SCOPE),"user_issued_scope":_USER_ISSUED_SCOPE,"derived_bindings":{"c1_lock_id":"C1","operative_goal_sha256":"goal","stable_fixtures":fixtures,"destructive_exclusions":_USER_ISSUED_SCOPE["prohibited_action_classes"],"rf_limits":{"ble":_USER_ISSUED_SCOPE["limits"]["ble"],"lora":_USER_ISSUED_SCOPE["limits"]["lora"]},"mcp_server_pin":ref("pin"),"mcp_method_policy":{"path":str(policy),"sha256":__import__("hashlib").sha256(policy.read_bytes()).hexdigest()},"governing_documents":governing}}
+            artifact = root / "delegated.json"; artifact.write_text(__import__("json").dumps(value), encoding="utf-8"); reference = {"path":str(artifact),"sha256":__import__("hashlib").sha256(artifact.read_bytes()).hexdigest()}
+            self.assertEqual(value, validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest))
+            for mutation in (lambda: value.__setitem__("extra", True), lambda: value.__setitem__("canonical_user_scope_sha256", "0" * 64), lambda: value["derived_bindings"].pop("rf_limits")):
+                mutated = __import__("json").loads(__import__("json").dumps(value)); mutation(); artifact.write_text(__import__("json").dumps(value), encoding="utf-8"); reference["sha256"] = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+                with self.assertRaises(AdmissionError): validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker" / str(len(str(value))), Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest)
+                value = mutated
 
     def test_worker_environment_has_no_mcp_capability(self) -> None:
         env = worker_environment()
@@ -93,6 +137,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             self.assertEqual("", config["worker_environment"]["MCP_ENDPOINT"])
             bound = {"resource":"STM-A","server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-1","attempt_id":"attempt-0001","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":"PENDING","cleanup_owner":"C3-HARNESS"}
             bound |= {"max_operation_duration_seconds":30,"permission_granted":True,"authorization_path":"authorization","claim":{"resource":"STM-A","path":"claim","sha256":"c","owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}},"controller_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"},"governing_documents":{"goal":{"path":"goal","sha256":"g"}},"delegated_reference":{"path":"delegated","sha256":"d"},"board_identity":{"path":"board","sha256":"b"},"mcp_schema":{"path":"schema","sha256":"s"},"policy":{"path":"policy","sha256":"p"},"plan":{"path":"plan","sha256":"pl"},"permission":{"path":"permission","sha256":"pe"},"seed_identity":{"path":"seed","sha256":"x"},"target_identity":{"path":"target","sha256":"y"},"topology_key_release":{"path":"release","sha256":"r"},"cleanup_owner":{"pid":1,"created_utc":"2026-01-01T00:00:00Z","creation_identity":"test"}}
+            bound |= self._scope("reset")
             common = {"attempt_id": "attempt-0001", "lane_id": "STM-A", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "route": "rediscover", "governing_hashes": {"goal": "g"}, "c1_reference": {"path": "c1", "sha256": "h"}, "identity": {"controller": "pid:1"}, "bound_operation": bound, "bound_operation_sha256": __import__("firmware_acceptance.kit", fromlist=["canonical_sha256"]).canonical_sha256(canonical_bound_operation(bound))}
             path, digest = broker.record("proposal", "call-1", common)
             broker.record("policy-evaluation", "call-1", common, (str(path), digest))
