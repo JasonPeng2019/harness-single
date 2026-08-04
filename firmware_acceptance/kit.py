@@ -431,7 +431,7 @@ class AcceptanceBroker:
             raise AdmissionError("limitation requires a dispatched raw server failure chain")
         records: list[dict[str, Any]] = []
         for index, item in enumerate(chain):
-            self._verify_limitation_reference(item, "limitation call chain")
+            self._verify_limitation_reference({"path":item["path"], "sha256":item["sha256"]}, "limitation call chain")
             value = json.loads(Path(item["path"]).read_text(encoding="utf-8"))
             if value.get("stage") != stages[index] or value.get("attempt_id") != decision["attempt_id"] or value.get("lane_id") != decision["lane_id"] or value.get("call_id") is None or (index and (value.get("previous_path") != chain[index - 1]["path"] or value.get("previous_sha256") != chain[index - 1]["sha256"])):
                 raise AdmissionError("limitation call chain identity or predecessor drifted")
