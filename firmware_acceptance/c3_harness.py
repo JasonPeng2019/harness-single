@@ -131,6 +131,7 @@ class C3Harness:
         except subprocess.SubprocessError as exc: raise AdmissionError("cannot prove candidate checkout identity") from exc
         if candidate_root != module_root or candidate.get("branch") != branch or not branch or candidate.get("commit") != head or dirty:
             raise AdmissionError("C1 candidate does not identify this clean checkout")
+        self.candidate_root = candidate_root
         for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy_source",self.policy)):
             if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"]: raise AdmissionError("C1 seed binding drifted")
@@ -295,20 +296,39 @@ class C3Harness:
         out_handle = err_handle = None
         try:
             out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
-            proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.root, stdout=out_handle, stderr=err_handle)
+            proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle)
             identity = exact_process_identity(proc.pid)
             if identity is None:
                 proc.terminate()
                 try: proc.wait(timeout=5)
                 except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
                 raise AdmissionError("cannot prove controller child identity")
+            status_path = Path(outputs["status"])
+            launch_status: dict[str, Any] | None = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    value = json.loads(status_path.read_text(encoding="utf-8"))
+                    if value.get("controller_pid") == proc.pid and isinstance(value.get("controller_created_utc"), str) and value["controller_created_utc"]:
+                        launch_status = value; break
+                except (OSError, json.JSONDecodeError):
+                    pass
+                if proc.poll() is not None: break
+                time.sleep(.05)
+            if launch_status is None:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try: proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
+                else: proc.wait()
+                raise AdmissionError("controller did not publish an authentic initial status")
         finally:
             if out_handle is not None: out_handle.close()
             if err_handle is not None: err_handle.close()
         if proc is None: raise AdmissionError("controller launch failed")
         self.workers[aid] = proc
-        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity}
-        _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
+        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":{"pid":launch_status["controller_pid"],"created_utc":launch_status["controller_created_utc"]}}
+        _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":self.assignments[aid]["status_identity"],"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
         answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
         if preparation is not None: answer["limitation_preparation"] = preparation
         return answer
@@ -408,7 +428,7 @@ class C3Harness:
                 status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
                 status, result = json.loads(status_path.read_text(encoding="utf-8")), json.loads(result_path.read_text(encoding="utf-8"))
                 loaded = load_invocation(_safe_child(self.root,"assignments",aid + ".invocation.json"))
-                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("outcome") == "PASS" and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
+                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("controller_pid") == record["status_identity"]["pid"] and status.get("controller_created_utc") == record["status_identity"]["created_utc"] and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("outcome") == "PASS" and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
                 if inv.get("finding_gate") is not None:
                     valid = valid and isinstance(status.get("result_validation"),dict) and status["result_validation"].get("findings") is not None
                 tip = subprocess.run(["git","rev-parse","HEAD"],cwd=record["worktree"],capture_output=True,text=True,check=True).stdout.strip()
