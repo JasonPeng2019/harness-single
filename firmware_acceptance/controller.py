@@ -13,6 +13,7 @@ import time
 import queue
 import datetime as _datetime
 import math
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -275,6 +276,184 @@ class FirmwareAcceptanceController:
         self._proposal_binding: tuple[Path, str] | None = None
         self._authorization_binding: tuple[Path, str] | None = None
         self.topology = topology
+        self._session: dict[str, Any] | None = None
+
+    # Session APIs deliberately remain narrow: this controller owns exactly one
+    # session/claim/child, and callers can only provide signed call artifacts.
+    _SESSION_REQUEST_KEYS = {"session_id", "attempt_id", "lane_id", "board", "resource", "probe_uid", "target", "profile", "route", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "server_revision", "seed_identity", "target_identity", "topology_key_release", "governing_documents", "deadline_monotonic", "initial_state"}
+    _SESSION_CALL_KEYS = {"session_id", "sequence_number", "prior_result", "current_state", "next_state", "call"}
+    _SESSION_STATES = {"BOOTSTRAPPED", "ROUTED", "SETUP_LOADED", "SETUP_PLAN_DISCLOSED", "SETUP_ACTION_READY", "SETUP_CONTINUATION", "SETUP_FIX_READY", "VALIDATION_LOADED", "READY", "OP_PLAN_DISCLOSED", "OP_ACTION_READY", "RETURNED", "ABORTED", "CLOSED"}
+
+    def create_session_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create the closed, candidate-owned intake; it has no call sequence or transport seam."""
+        if not isinstance(request, dict) or set(request) != self._SESSION_REQUEST_KEYS:
+            raise AdmissionError("session request is not closed")
+        try: uuid.UUID(str(request["session_id"]))
+        except (ValueError, TypeError) as exc: raise AdmissionError("session id is not an opaque UUID") from exc
+        if request["initial_state"] != "BOOTSTRAPPED" or not isinstance(request["deadline_monotonic"], (int, float)) or not math.isfinite(request["deadline_monotonic"]) or request["deadline_monotonic"] <= self.clock():
+            raise AdmissionError("session initial state or deadline is invalid")
+        for key in ("attempt_id", "lane_id", "board", "resource", "probe_uid", "target", "profile", "server_revision"):
+            if not isinstance(request[key], str) or not request[key]: raise AdmissionError("session identity is incomplete")
+        if request["resource"] != request["board"] or request["server_revision"] != "f003f84a7df51cd8595a3203c62e225b21da2a22": raise AdmissionError("session resource or server pin drifted")
+        if request["route"] is not None and not isinstance(request["route"], str): raise AdmissionError("session route is invalid")
+        for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "seed_identity", "target_identity", "topology_key_release"):
+            _reference(request[key], key)
+        if not isinstance(request["governing_documents"], dict) or set(request["governing_documents"]) != _GOVERNING_KEYS: raise AdmissionError("session governing bindings are incomplete")
+        for key in _GOVERNING_KEYS: _reference(request["governing_documents"][key], key)
+        return json.loads(json.dumps(request, sort_keys=True))
+
+    def open_session(self, request_path: Path) -> dict[str, Any]:
+        """Acquire once, bootstrap once, and retain the exact child until terminal cleanup."""
+        if self._session is not None: raise AdmissionError("controller already owns a session")
+        request = self._load_external(request_path, self._SESSION_REQUEST_KEYS)
+        request = self.create_session_request(request)
+        for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "seed_identity", "target_identity", "topology_key_release"):
+            _verify_raw_reference(request[key], key)
+        for key, value in request["governing_documents"].items(): _verify_raw_reference(value, "governing " + key)
+        validate_delegated_authorization(request["delegated_reference"], policy_path=self.broker.policy_path, manifest=self.broker.manifest)
+        self.broker.validate_lane_call(request)
+        session_root = _safe_child(self.broker.root, "sessions", request["session_id"])
+        request_record_path = _safe_child(session_root, "SESSION_REQUEST.json")
+        request_sha = _write_new(request_record_path, {"schema":"firmware-session-request/v1", **request})
+        claims = self._claims(request["lane_id"], request["session_id"])
+        process: StdioProcess | None = None; transport: _StdioTransport | None = None
+        try:
+            claims.acquire_all([request["resource"]], on_wait=lambda finding: (_ for _ in ()).throw(AdmissionError("resource claim unavailable: " + str(finding.get("state")))))
+            held = claims.held
+            if len(held) != 1 or held[0].get("resource") != request["board"]: raise AdmissionError("session claim is unavailable")
+            claim_path = Path(str(held[0]["path"])).resolve(); reject_linked_path(claim_path)
+            claim = {"resource":request["board"],"path":str(claim_path),"sha256":hashlib.sha256(claim_path.read_bytes()).hexdigest(),"owner":held[0]["owner"]}
+            config = self.broker.controller_config(request["lane_id"], {})
+            config = {**config, "environment": _scrubbed_environment(config)}
+            process = self.launcher(config); identity = self.identity_provider(process.pid)
+            if not isinstance(identity, dict) or identity.get("pid") != process.pid: raise AdmissionError("session child identity is unavailable")
+            remaining = lambda: request["deadline_monotonic"] - self.clock()
+            transport = _StdioTransport(process, remaining, self.io_timeout, _safe_child(Path(config["roots"]["logs"]), request["session_id"] + ".stderr.log"))
+            transcript: list[dict[str, Any]] = []
+            initialize = {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"firmware-acceptance","version":"1"}}}
+            transport.send(initialize, "initialize"); transcript += [initialize, transport.receive(1)]
+            initialized = {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+            transport.send(initialized, "initialized notification"); transcript.append(initialized)
+            handshake = {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"initialization_handshake","arguments":{}}}
+            transport.send(handshake, "initialization handshake"); answer = transport.receive(2); transcript += [handshake, answer]
+            if not isinstance(answer.get("result"), dict) or answer["result"].get("isError") is True: raise AdmissionError("initialization handshake failed")
+            server_run_id = answer["result"].get("server_run_id") or answer["result"].get("serverRunId")
+            if not isinstance(server_run_id, str) or not server_run_id: raise AdmissionError("initialization handshake omitted Server Run ID")
+            open_value = {"schema":"firmware-session-open/v1","session_id":request["session_id"],"session_request_path":str(request_record_path),"session_request_sha256":request_sha,"claim":claim,"controller_identity":claim["owner"],"server_process_identity":identity,"server_run_id":server_run_id,"bootstrap_transcript":transcript,"bootstrap_transcript_sha256":canonical_sha256(transcript),"state":"BOOTSTRAPPED"}
+            open_sha = _write_new(_safe_child(session_root, "SESSION_OPEN.json"), open_value)
+            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"call_ids":set()}
+            return {**open_value,"path":str(self._session["open_path"]),"raw_sha256":open_sha}
+        except BaseException:
+            if transport is not None: transport.close_and_join()
+            if process is not None and process.poll() is None: process.terminate(); process.wait(timeout=self.io_timeout)
+            claims.release_all(); raise
+
+    def session_publish_proposal(self, path: Path, request: dict[str, Any]) -> dict[str, Any]:
+        """Validate one predecessor-bound session call and publish its normal four-artifact proposal."""
+        session = self._require_session()
+        if not isinstance(request, dict) or set(request) != self._SESSION_CALL_KEYS or session["pending_call_id"] is not None: raise AdmissionError("session call request is not closed or another call is pending")
+        call = _closed_call(request["call"])
+        if request["session_id"] != session["request"]["session_id"] or request["sequence_number"] != session["sequence"] + 1 or request["prior_result"] != session["prior_result"] or request["current_state"] != session["state"] or not isinstance(request["next_state"], str) or call["call_id"] in session["call_ids"]: raise AdmissionError("session sequence or predecessor drifted")
+        for key in ("attempt_id","lane_id","board","resource","probe_uid","target","profile","route","c1_reference","delegated_reference","board_identity","mcp_schema","policy","server_revision","seed_identity","target_identity","topology_key_release","governing_documents"):
+            if call[key] != session["request"][key]: raise AdmissionError("call changed a session binding")
+        rule = self.broker.policy["methods"].get(call["method"])
+        if not isinstance(rule, dict) or session["state"] not in rule["allowed_from"]: raise AdmissionError("method is not allowed from current session state")
+        expected = rule.get("next")
+        plan_parameters = None
+        if "next_by_mode" in rule:
+            values = call["arguments"]
+            mode = "all_null" if all(value is None for value in values.values()) else "populated"
+            expected = rule["next_by_mode"].get(mode)
+        elif session["active_plan"] is not None:
+            plan = session["active_plan"]
+            if call["method"] != plan["method"] or call["arguments"] != {"board_id":call["board"], **plan["parameters"]}: raise AdmissionError("paired action is not exactly bound to its accepted plan")
+            session["active_plan"] = None
+        if expected != request["next_state"]: raise AdmissionError("session next state is not the locked policy transition")
+        _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
+        proposal = {"schema":"firmware-session-call-proposal/v1","session_id":request["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"sequence_number":request["sequence_number"],"prior_result":request["prior_result"],"current_state":request["current_state"],"next_state":request["next_state"],"call":call,"claim":session["claim"],"plan_label":"candidate_control_plan" if rule.get("candidate_control_plan") else "mcp_native_plan"}
+        resolved = path.resolve()
+        if _safe_child(self.broker.root, "sessions", session["request"]["session_id"]) not in resolved.parents or resolved.is_symlink(): raise AdmissionError("session proposal path escapes session root")
+        raw_sha = _write_new(resolved, proposal)
+        session["pending_call_id"] = call["call_id"]
+        return {**proposal,"path":str(path.resolve()),"raw_sha256":raw_sha}
+
+    def session_execute_artifacts(self, proposal_path: Path, decision_path: Path, authorization_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
+        """Dispatch exactly one signed call over the retained transport; never relaunch it."""
+        session = self._require_session()
+        proposal, proposal_sha = self._read_bound(proposal_path, {"schema","session_id","session_open_path","session_open_sha256","sequence_number","prior_result","current_state","next_state","call","claim","plan_label"})
+        decision, decision_sha = self._read_bound(decision_path, _DECISION_KEYS)
+        if decision.get("proposal_path") != str(proposal_path.resolve()) or decision.get("proposal_sha256") != proposal_sha or decision.get("call") != proposal["call"] or decision.get("claim") != session["claim"]:
+            self.abort_session("decision binding mismatch"); raise AdmissionError("session decision does not bind the exact proposal")
+        if not verifier.verify(canonical_decision_payload(decision), decision.get("signature",""), decision.get("public_key","")) or decision.get("decision") != "approve" or self.clock() >= decision.get("expires_monotonic", -1):
+            self.abort_session("missing, invalid, or expired O decision"); raise AdmissionError("session decision is invalid")
+        authorization, authorization_sha = self._read_bound(authorization_path, _AUTH_KEYS)
+        if authorization.get("proposal_path") != str(proposal_path.resolve()) or authorization.get("proposal_sha256") != proposal_sha or authorization.get("decision_path") != str(decision_path.resolve()) or authorization.get("decision_sha256") != decision_sha or authorization.get("call") != proposal["call"] or authorization.get("claim") != session["claim"] or authorization.get("revoked") is not False or self.clock() >= authorization.get("expires_monotonic", -1):
+            self.abort_session("authorization mismatch"); raise AdmissionError("session authorization is invalid")
+        call = proposal["call"]
+        try:
+            self._policy_admission({**call,"proposal_sha256":proposal_sha,"decision_sha256":decision_sha,"authorization_sha256":authorization_sha})
+            if self.identity_provider(session["process"].pid) != session["open"]["server_process_identity"]: raise AdmissionError("retained server process identity changed")
+            session["rpc_id"] += 1
+            rpc_id = session["rpc_id"]
+            session["transport"].send({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":{"name":call["method"],"arguments":call["arguments"]}}, "session tools/call")
+            raw = session["transport"].receive(rpc_id)
+            if not isinstance(raw.get("result"), dict) or raw["result"].get("isError") is True: raise AdmissionError("session MCP result failed")
+            result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
+            result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
+            result_sha = _write_new(result_path, result)
+            rule = self.broker.policy["methods"][call["method"]]
+            if "next_by_mode" in rule and any(value is not None for value in call["arguments"].values()):
+                session["active_plan"] = {"method":rule["plan_action"],"parameters":call["arguments"]}
+            session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}
+            session["call_ids"].add(call["call_id"]); session["pending_call_id"] = None
+            return {**result,"path":str(result_path),"raw_sha256":result_sha}
+        except BaseException:
+            self.abort_session("call failure or process ambiguity")
+            raise
+
+    def close_session(self, close_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
+        """Only a separately signed, predecessor-bound normal close can produce CLOSED."""
+        session = self._require_session()
+        keys = {"schema","session_id","session_open_path","session_open_sha256","final_result","final_state","rationale","issued_monotonic","expected_returning_state","public_key","signature"}
+        decision = self._load_external(close_path, keys)
+        if decision["schema"] != "firmware-session-close-decision/v1" or decision["session_id"] != session["request"]["session_id"] or decision["session_open_path"] != str(session["open_path"]) or decision["session_open_sha256"] != session["open_sha256"] or decision["final_result"] != session["prior_result"] or decision["final_state"] != "RETURNED" or session["state"] != "RETURNED" or decision["expected_returning_state"] != "disconnected" or not isinstance(decision["rationale"], str) or not decision["rationale"] or not isinstance(decision["issued_monotonic"], (int,float)) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["public_key"]):
+            self.abort_session("normal close decision invalid"); raise AdmissionError("normal close decision is invalid")
+        cleanup = self._cleanup_session("SESSION_CLOSED.json", "CLOSED")
+        return cleanup
+
+    def abort_session(self, reason: str) -> dict[str, Any]:
+        if self._session is None: raise AdmissionError("no session to abort")
+        if self._session["terminal"]: raise AdmissionError("session is terminal")
+        return self._cleanup_session("SESSION_ABORTED.json", "ABORTED", reason)
+
+    def _require_session(self) -> dict[str, Any]:
+        if self._session is None or self._session["terminal"]: raise AdmissionError("session is absent or terminal")
+        if self.clock() >= self._session["request"]["deadline_monotonic"]:
+            self.abort_session("session deadline expired"); raise AdmissionError("session deadline expired")
+        return self._session
+
+    def _cleanup_session(self, filename: str, terminal_state: str, reason: str | None = None) -> dict[str, Any]:
+        session = self._session
+        assert session is not None
+        process, transport = session["process"], session["transport"]
+        cleanup: dict[str, Any] = {"schema":"firmware-session-terminal/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"terminal_state":terminal_state,"reason":reason,"natural_eof":False,"exact_reaped":False}
+        try:
+            try: process.stdin.close()
+            except Exception: pass
+            try: process.wait(timeout=self.io_timeout); cleanup["natural_eof"] = True
+            except subprocess.TimeoutExpired:
+                before = self.identity_provider(process.pid)
+                if before != session["open"]["server_process_identity"]: raise AdmissionError("child identity changed before termination")
+                process.terminate(); process.wait(timeout=self.io_timeout)
+            if self.identity_provider(process.pid) == session["open"]["server_process_identity"]: raise AdmissionError("exact child remains after reap")
+            cleanup["exact_reaped"] = True
+        finally:
+            stopped, transport_cleanup = transport.close_and_join(); cleanup["transport_cleanup"] = transport_cleanup; cleanup["helpers_stopped"] = stopped
+            session["claims"].release_all(); session["terminal"] = True; session["state"] = terminal_state
+        path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],filename)
+        cleanup["claim_released"] = not bool(session["claims"].held)
+        _write_new(path, cleanup)
+        return {**cleanup,"path":str(path)}
 
     def run_lifecycle(self, request_path: Path, proposal_path: Path, decision_path: Path,
                       authorization_path: Path, verifier: SignatureVerifier, *,

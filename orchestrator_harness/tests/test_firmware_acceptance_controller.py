@@ -84,6 +84,58 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         authorization_path = root / "broker" / "authorization.json"; controller.derive_authorization(proposal_path, decision_path, authorization_path, verifier)
         return proposal_path, decision_path, authorization_path
 
+    def _session_request(self, root: Path) -> dict[str, object]:
+        call = self._call(root)
+        return {key: call[key] for key in ("attempt_id","lane_id","board","resource","probe_uid","target","profile","route","c1_reference","delegated_reference","board_identity","mcp_schema","policy","server_revision","seed_identity","target_identity","topology_key_release","governing_documents")} | {"session_id":"123e4567-e89b-12d3-a456-426614174000","deadline_monotonic":100.0,"initial_state":"BOOTSTRAPPED"}
+
+    def _session_artifacts(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier, request: dict[str, object]) -> tuple[Path, Path, Path]:
+        proposal_path = root / "broker" / "sessions" / "123e4567-e89b-12d3-a456-426614174000" / "proposal-1.json"
+        proposal = controller.session_publish_proposal(proposal_path, request)
+        decision_path = proposal_path.with_name("decision-1.json")
+        decision = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","rationale":"session","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":proposal["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
+        verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
+        authorization_path = proposal_path.with_name("authorization-1.json")
+        authorization = {"schema":"firmware-derived-authorization/v2","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"decision_path":str(decision_path.resolve()),"decision_sha256":hashlib.sha256(decision_path.read_bytes()).hexdigest(),"launch_intent":proposal["call"]["topology_key_release"],"orchestrator_identity":decision["orchestrator_identity"],"topology_key_release":decision["topology_key_release"],"c1_reference":proposal["call"]["c1_reference"],"delegated_reference":proposal["call"]["delegated_reference"],"call":proposal["call"],"claim":proposal["claim"],"expires_monotonic":99.0,"one_shot_id":proposal["call"]["call_id"],"revoked":False}
+        authorization_path.write_text(json.dumps(authorization, sort_keys=True, separators=(",",":")), encoding="utf-8")
+        return proposal_path, decision_path, authorization_path
+
+    def test_retained_session_bootstraps_once_executes_and_aborts_terminally(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            request_path = root / "session-request.json"; request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
+            # initialize, empty handshake, then the one permitted route call.
+            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"server_run_id":"run-1"}}\n{"jsonrpc":"2.0","id":3,"result":{"ok":true}}\n')
+            controller.launcher = lambda _: (launches.append(process) or process)
+            opened = controller.open_session(request_path)
+            self.assertEqual("BOOTSTRAPPED", opened["state"]); self.assertEqual(1, len(claims)); self.assertTrue(claims[0].live)
+            call = self._call(root); call.update({"call_id":"route-1","method":"setup_overview","method_version":1,"arguments":{"board_names":None,"connection_assignments":None},"action_class":"probe_discovery_read"})
+            paths = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":1,"prior_result":None,"current_state":"BOOTSTRAPPED","next_state":"ROUTED","call":call})
+            result = controller.session_execute_artifacts(*paths, verifier)
+            self.assertEqual("ROUTED", result["resulting_state"]); self.assertEqual(1, len(launches))
+            with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "bad.json", {"session_id":opened["session_id"],"sequence_number":3,"prior_result":None,"current_state":"ROUTED","next_state":"ROUTED","call":call})
+            controller._session["state"] = "OP_ACTION_READY"; controller._session["active_plan"] = {"method":"write_serial","parameters":{"text":"expected","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None}}
+            action = self._call(root); action.update({"call_id":"action-2","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"altered","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None},"action_class":"uart_session_io"})
+            with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "paired-action.json", {"session_id":opened["session_id"],"sequence_number":2,"prior_result":{"path":result["path"],"sha256":result["raw_sha256"]},"current_state":"OP_ACTION_READY","next_state":"READY","call":action})
+            aborted = controller.abort_session("synthetic")
+            self.assertEqual("ABORTED", aborted["terminal_state"]); self.assertTrue(aborted["exact_reaped"]); self.assertFalse(claims[0].live)
+            with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "after.json", {"session_id":opened["session_id"],"sequence_number":2,"prior_result":result["path"],"current_state":"ROUTED","next_state":"ROUTED","call":call})
+
+    def test_retained_session_signed_close_requires_returned_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            request_path = root / "session-request.json"; request_path.write_text(json.dumps(self._session_request(root)), encoding="utf-8")
+            process = _Process(); process.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"server_run_id":"run-1"}}\n{"jsonrpc":"2.0","id":3,"result":{"ok":true}}\n')
+            controller.launcher = lambda _: (launches.append(process) or process); opened = controller.open_session(request_path)
+            # READY is the prerequisite established by the separately tested setup/validation state graph.
+            controller._session["state"] = "READY"
+            call = self._call(root); call.update({"call_id":"disconnect-1","method":"disconnect","method_version":1,"arguments":{"board_id":"STM-A"},"action_class":"connect_setup"})
+            proposal, decision, authorization = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":1,"prior_result":None,"current_state":"READY","next_state":"RETURNED","call":call})
+            result = controller.session_execute_artifacts(proposal, decision, authorization, verifier)
+            close_path = root / "close.json"; close = {"schema":"firmware-session-close-decision/v1","session_id":opened["session_id"],"session_open_path":opened["path"],"session_open_sha256":opened["raw_sha256"],"final_result":{"path":result["path"],"sha256":result["raw_sha256"]},"final_state":"RETURNED","rationale":"return complete","issued_monotonic":1.0,"expected_returning_state":"disconnected","public_key":"public","signature":"signed"}
+            verifier.expected = canonical_decision_payload(close); close_path.write_text(json.dumps(close, sort_keys=True, separators=(",",":")), encoding="utf-8")
+            closed = controller.close_session(close_path, verifier)
+            self.assertEqual("CLOSED", closed["terminal_state"]); self.assertTrue(closed["claim_released"]); self.assertTrue(closed["natural_eof"]); self.assertEqual(1, len(launches))
+
     def test_begin_sign_derive_authorize_and_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
