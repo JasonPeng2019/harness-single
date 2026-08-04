@@ -34,6 +34,7 @@ class C3HarnessTests(unittest.TestCase):
     def _bare(self, root: Path) -> c3.C3Harness:
         harness = object.__new__(c3.C3Harness)
         harness.root = root; harness.seed = Path("firmware_acceptance/seed").resolve()
+        harness.candidate_root = Path(__file__).resolve().parents[2]
         harness.policy = Path("firmware_acceptance/MCP_METHOD_POLICY.json").resolve(); harness.templates = Path("firmware_acceptance/LANE_TEMPLATES.json").resolve()
         harness.seed_identity = c3._seed_snapshot(harness.seed)
         harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, Path("firmware_acceptance/ACCEPTANCE_MANIFEST.json"))
@@ -70,19 +71,24 @@ class C3HarnessTests(unittest.TestCase):
     def test_c3_cp_04_disposable_target_assignment_and_fail_closed_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); target = root / "targets" / "target"; harness.broker.materialize_seed(target)
-            payload = {"assignment_id":"a1", "role":"F.C3.A1", "sprint":"S23", "task":"host test", "prompt":"do bounded work", "target_id":"target", "declared_resources":[]}; process = _Process()
+            payload = {"assignment_id":"a1", "role":"F.C3.A1", "sprint":"S23", "task":"host test", "prompt":"do bounded work", "target_id":"target", "declared_resources":[]}; process = _Process(); launches: list[tuple[list[str], Path]] = []
+            def launch(command: list[str], *, cwd: Path, **_: object) -> _Process:
+                invocation = json.loads(Path(command[-1]).read_text(encoding="utf-8")); status = Path(invocation["output_paths"]["status"])
+                status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","controller_pid":process.pid,"controller_created_utc":"2026-08-04T00:00:00Z"}), encoding="utf-8")
+                launches.append((command, cwd)); return process
             try:
-                with patch.object(c3.subprocess, "Popen", return_value=process), patch.object(c3, "exact_process_identity", return_value={"pid":4242,"creation_identity":"created"}): launched = harness._assignment(payload)
+                with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "exact_process_identity", return_value={"pid":4242,"creation_identity":"created"}): launched = harness._assignment(payload)
                 record = harness.assignments["a1"]; worktree = Path(record["worktree"])
                 self.assertTrue((worktree / ".git").is_file()); self.assertEqual("LAUNCHED", launched["state"])
+                self.assertEqual(harness.candidate_root, launches[0][1]); self.assertEqual(str(worktree), record["invocation"]["run_root"])
                 self.assertEqual(harness.seed_identity, {name:_digest(worktree / name) for name in harness.seed_identity})
                 self.assertTrue(all(not ((worktree / name).stat().st_mode & stat.S_IWRITE) for name in harness.seed_identity))
                 changed = worktree / "TARGET_CHARTER.md"; changed.chmod(stat.S_IWRITE | stat.S_IREAD)
                 with self.assertRaises(AdmissionError): c3._protected_seed_snapshot(worktree, harness.seed_identity)
                 changed.chmod(stat.S_IREAD); c3._protected_seed_snapshot(worktree, harness.seed_identity)
                 status_path = Path(record["invocation"]["output_paths"]["status"]); result_path = worktree / ".agent-workspace" / "RESULT.json"; tip = subprocess.run(["git","rev-parse","HEAD"], cwd=worktree, capture_output=True, text=True, check=True).stdout.strip()
-                result_path.write_text(json.dumps({"schema":"orchestrator-lane-result/v1","lane_id":"F.C3.A1","worker_invocation_id":"a1","branch":record["branch"],"commit":tip,"outcome":"FAIL","summary":"candidate failed","checks":[]}), encoding="utf-8")
-                status_path.write_text(json.dumps({"state":"CODEX_EXITED","exit_code":0,"held_resource_claims":[],"result_valid":True,"result_validation":{"findings":{}},"schema":"orchestrator-lane-controller/v1"}), encoding="utf-8")
+                result_path.write_text(json.dumps({"schema":"orchestrator-lane-result/v1","lane_id":"F.C3.A1","worker_invocation_id":"a1","branch":record["branch"],"commit":tip,"outcome":"PASS","summary":"candidate passed","checks":[]}), encoding="utf-8")
+                status_path.write_text(json.dumps({"state":"CODEX_EXITED","exit_code":0,"controller_pid":process.pid,"controller_created_utc":"2026-08-04T00:00:01Z","held_resource_claims":[],"result_valid":True,"result_validation":{"findings":{}},"schema":"orchestrator-lane-controller/v1"}), encoding="utf-8")
                 process.code = 0; harness.reap_workers()
                 self.assertEqual("FAIL", harness.assignments["a1"]["completion"]["outcome"])
                 with self.assertRaises(AdmissionError): harness._accept_assignment({"assignment_id":"a1","target_id":"target"})
