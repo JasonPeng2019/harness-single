@@ -15,9 +15,8 @@ function Invoke-Git([string[]]$Arguments) {
 }
 
 $script:candidateRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$normalizedRoot = $script:candidateRoot.Replace('/', '\').TrimEnd('\').ToLowerInvariant()
-$reservedTail = '\plans\general-coding-harness\runtime\firmware-v2\worktrees\harness-candidate'
-if (-not $normalizedRoot.EndsWith($reservedTail)) {
+$expectedCandidateRoot = [IO.Path]::GetFullPath('C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/harness-candidate').TrimEnd('\\')
+if ($script:candidateRoot.TrimEnd('\\') -ine $expectedCandidateRoot) {
     throw "refusing non-reserved candidate root: $script:candidateRoot"
 }
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,6 +33,31 @@ class CandidateSafeguardTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("refusing non-reserved candidate root", completed.stderr)
+
+    def test_launcher_rejects_different_same_suffix_root(self) -> None:
+        script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
+        with tempfile.TemporaryDirectory() as temporary:
+            same_suffix_root = (
+                Path(temporary)
+                / "other-clone"
+                / "plans"
+                / "general-coding-harness"
+                / "runtime"
+                / "firmware-v2"
+                / "worktrees"
+                / "harness-candidate"
+            )
+            copied_script = same_suffix_root / "tools" / script.name
+            copied_script.parent.mkdir(parents=True)
+            shutil.copy2(script, copied_script)
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(copied_script)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("refusing non-reserved candidate root", completed.stderr)
 
