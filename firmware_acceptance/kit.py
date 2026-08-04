@@ -55,6 +55,25 @@ def raw_result_sha256(payload: Any) -> str:
     return hashlib.sha256(canonical_raw_result_bytes(payload)).hexdigest()
 
 
+def reject_linked_path(path: Path) -> None:
+    """Reject links/reparse points in the *spelled* existing path components."""
+    original = Path(path)
+    absolute = original if original.is_absolute() else Path.cwd() / original
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if not current.exists() and not current.is_symlink():
+            break
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise AdmissionError("path component is unreadable") from exc
+        junction = getattr(current, "is_junction", lambda: False)()
+        reparse = bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if current.is_symlink() or junction or reparse:
+            raise AdmissionError("path contains a symlink, junction, or reparse point")
+
+
 def validate_pinned_server() -> str:
     """Prove the controller is configured against the exact clean candidate tree."""
     if not _PINNED_SERVER_ROOT.is_dir() or _PINNED_SERVER_ROOT.is_symlink():
@@ -70,10 +89,10 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     """Closed operation authority carried verbatim through every immutable stage."""
     required = {
         "server_commit", "method", "method_version", "arguments", "policy_sha256", "schema_sha256",
-        "plan_sha256", "permission_sha256", "authorization_sha256", "claim_sha256", "call_id",
+        "plan_sha256", "permission_sha256", "authorization_sha256", "authorization_path", "claim_sha256", "claim", "controller_owner", "call_id",
         "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route",
-        "governing_hashes", "c1_reference", "deadline_monotonic", "expires_monotonic", "seed_identity",
-        "target_identity", "raw_result_sha256", "cleanup_owner",
+        "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "deadline_monotonic", "expires_monotonic", "seed_identity",
+        "target_identity", "topology_key_release", "raw_result_sha256", "cleanup_owner",
     }
     if set(value) != required:
         raise AdmissionError("bound operation must be a closed complete authority object")
@@ -82,9 +101,18 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     for key in ("method_version", "deadline_monotonic", "expires_monotonic"):
         if not isinstance(value[key], (int, float)) or isinstance(value[key], bool):
             raise AdmissionError("bound operation timing/version is invalid")
-    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "c1_reference", "seed_identity", "target_identity", "route", "raw_result_sha256"}:
+    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
         if not isinstance(value[key], str) or not value[key]:
             raise AdmissionError("bound operation has an empty identity or hash")
+    for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "seed_identity", "target_identity", "topology_key_release"):
+        ref = value[key]
+        if not isinstance(ref, dict) or set(ref) != {"path", "sha256"} or not all(isinstance(ref[item], str) and ref[item] for item in ref):
+            raise AdmissionError("bound operation reference is not exact")
+    if not isinstance(value["governing_documents"], dict) or not value["governing_documents"] or any(not isinstance(ref, dict) or set(ref) != {"path", "sha256"} for ref in value["governing_documents"].values()):
+        raise AdmissionError("bound governing references are not exact")
+    claim = value["claim"]
+    if not isinstance(claim, dict) or set(claim) != {"resource", "path", "sha256", "owner"} or claim["owner"] != value["controller_owner"] or value["cleanup_owner"] != value["controller_owner"]:
+        raise AdmissionError("bound claim/controller owner is not exact")
     if value["raw_result_sha256"] != "PENDING" and (not isinstance(value["raw_result_sha256"], str) or len(value["raw_result_sha256"]) != 64):
         raise AdmissionError("bound raw result identity is invalid")
     return json.loads(json.dumps(value, sort_keys=True))
@@ -157,6 +185,7 @@ def validate_manifest(manifest_path: Path) -> dict[str, Any]:
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
+    reject_linked_path(root)
     root = root.resolve()
     candidate = root.joinpath(*parts).resolve()
     if candidate == root or root not in candidate.parents:
@@ -167,6 +196,7 @@ def _safe_child(root: Path, *parts: str) -> Path:
 
 
 def _write_new(path: Path, value: dict[str, Any]) -> str:
+    reject_linked_path(path)
     if path.exists() or path.is_symlink():
         raise AdmissionError("immutable artifact already exists")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,6 +213,7 @@ class AcceptanceBroker:
     """Controller-side materializer and immutable evidence chain; it never dispatches MCP itself."""
 
     def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path, manifest_path: Path | None = None) -> None:
+        for item in (root, seed, policy_path, templates_path, manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json")): reject_linked_path(item)
         self.root, self.seed, self.policy_path = root.resolve(), seed.resolve(), policy_path.resolve()
         self.templates = json.loads(templates_path.read_text(encoding="utf-8"))
         self.policy = _load_policy(self.policy_path)
@@ -261,7 +292,7 @@ class AcceptanceBroker:
         if index and previous is None:
             raise AdmissionError("immutable call artifacts are out of order")
         if previous is not None:
-            previous_path = Path(previous[0]).resolve()
+            reject_linked_path(Path(previous[0])); previous_path = Path(previous[0]).resolve()
             if self.root not in previous_path.parents or not previous_path.is_file() or hashlib.sha256(previous_path.read_bytes()).hexdigest() != previous[1]:
                 raise AdmissionError("prior immutable artifact is missing or tampered")
             expected = _safe_child(self.root, "calls", call_id, f"{index - 1:02d}-{order[index - 1]}.json")
@@ -295,7 +326,7 @@ class AcceptanceBroker:
         records: list[dict[str, Any]] = []
         digests: list[str] = []
         for index, (path, expected_hash) in enumerate(stages):
-            resolved = path.resolve()
+            reject_linked_path(path); resolved = path.resolve()
             expected = _safe_child(self.root, "calls", call_id, f"{index:02d}-{names[index]}.json")
             if resolved != expected or resolved.is_symlink() or hashlib.sha256(resolved.read_bytes()).hexdigest() != expected_hash:
                 raise AdmissionError("artifact path, hash, or stage mismatch")

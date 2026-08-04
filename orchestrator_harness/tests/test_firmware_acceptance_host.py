@@ -46,6 +46,7 @@ class FirmwareAcceptanceHostTests(unittest.TestCase):
             "expires_monotonic": 99, "seed_identity": {"manifest": "x"}, "target_identity": {"commit": "y"},
             "raw_result_sha256": raw_result_sha256({"mcp": "ok"}), "cleanup_owner": "C3-HARNESS",
         }
+        bound |= {"authorization_path":"authorization","claim":{"resource":"STM-A","path":"claim","sha256":"c","owner":"pid:1"},"controller_owner":"pid:1","governing_documents":{"goal":{"path":"goal","sha256":"g"}},"delegated_reference":{"path":"delegated","sha256":"d"},"board_identity":{"path":"board","sha256":"b"},"mcp_schema":{"path":"schema","sha256":"s"},"policy":{"path":"policy","sha256":"p"},"plan":{"path":"plan","sha256":"pl"},"permission":{"path":"permission","sha256":"pe"},"seed_identity":{"path":"seed","sha256":"x"},"target_identity":{"path":"target","sha256":"y"},"topology_key_release":{"path":"release","sha256":"r"},"cleanup_owner":"pid:1"}
         common = {
             "attempt_id": "attempt-host", "lane_id": "STM-A", "board": "STM-A", "probe_uid": "uid",
             "target": "STM32L476RG", "profile": "stm", "route": "rediscover", "governing_hashes": {"goal": "g"},
