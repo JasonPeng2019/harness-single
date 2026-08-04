@@ -4,10 +4,28 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, canonical_bound_operation, evaluate_call, validate_campaign_contract, validate_seed_manifest, worker_environment
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_bound_operation, canonical_sha256, evaluate_call, raw_result_sha256, validate_campaign_contract, validate_seed_manifest, worker_environment
 
 
 class FirmwareAcceptanceKitTests(unittest.TestCase):
+    class _Verifier(SignatureVerifier):
+        def verify(self, payload: bytes, signature: str, public_key: str) -> bool:
+            return signature == "sig" and public_key == "key" and bool(payload)
+
+    def _complete_chain(self, broker: AcceptanceBroker, raw_payload: object, *, bound_digest: str | None = None) -> list[tuple[Path, str]]:
+        digest = bound_digest or raw_result_sha256(raw_payload)
+        bound = {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-raw","attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":digest,"cleanup_owner":"C3-HARNESS"}
+        common = {"attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"identity":{"controller":"pid:1"},"bound_operation":bound,"bound_operation_sha256":canonical_sha256(canonical_bound_operation(bound))}
+        stages: list[tuple[Path, str]] = []
+        for stage in ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result"):
+            extra = {"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
+            extra |= {"expires_monotonic":99} if stage == "authorization" else {}
+            extra |= {"deadline_monotonic":100} if stage == "dispatch-admission" else {}
+            extra |= {"raw_result":raw_payload,"outcome":"PASS"} if stage == "raw-result" else {}
+            extra |= {"exact_reaped":True} if stage == "returning-state-cleanup" else {}
+            stages.append(broker.record(stage, "call-raw", {**common, **extra}, (str(stages[-1][0]), stages[-1][1]) if stages else None))
+        return stages
+
     def test_seed_is_exact_and_hash_bound(self) -> None:
         validate_seed_manifest(Path("firmware_acceptance/seed"))
 
@@ -50,6 +68,18 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                 broker.record("dispatch", "call-2", common)
             with self.assertRaises(AdmissionError):
                 broker.record("dispatch", "call-1", common, (str(path), digest))
+
+    def test_admission_accepts_hash_bound_retained_raw_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = AcceptanceBroker(Path(temporary) / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
+            stages = self._complete_chain(broker, {"mcp": {"result": "ok"}})
+            self.assertEqual("PASS", broker.admit("call-raw", stages, 50, self._Verifier()))
+
+    def test_admission_rejects_raw_result_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = AcceptanceBroker(Path(temporary) / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
+            with self.assertRaises(AdmissionError):
+                self._complete_chain(broker, {"mcp": {"result": "substituted"}}, bound_digest=raw_result_sha256({"mcp": {"result": "authorized"}}))
 
     def test_campaign_contract_is_closed_and_seed_rewrite_fails(self) -> None:
         validate_campaign_contract(Path("firmware_acceptance/seed"))

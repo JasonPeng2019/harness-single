@@ -33,6 +33,18 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def canonical_raw_result_bytes(payload: Any) -> bytes:
+    """The retained raw MCP result representation: UTF-8 canonical JSON, never a caller digest."""
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AdmissionError("raw result is not a canonical JSON payload") from exc
+
+
+def raw_result_sha256(payload: Any) -> str:
+    return hashlib.sha256(canonical_raw_result_bytes(payload)).hexdigest()
+
+
 def validate_pinned_server() -> str:
     """Prove the controller is configured against the exact clean candidate tree."""
     if not _PINNED_SERVER_ROOT.is_dir() or _PINNED_SERVER_ROOT.is_symlink():
@@ -250,6 +262,9 @@ class AcceptanceBroker:
         bound = canonical_bound_operation(record["bound_operation"])
         if record["bound_operation_sha256"] != canonical_sha256(bound) or bound["call_id"] != call_id:
             raise AdmissionError("bound operation hash or call identity mismatch")
+        if stage == "raw-result":
+            if "raw_result" not in record or raw_result_sha256(record["raw_result"]) != bound["raw_result_sha256"]:
+                raise AdmissionError("retained raw result does not match the bound result identity")
         path = _safe_child(self.root, "calls", call_id, f"{order.index(stage):02d}-{stage}.json")
         return path, _write_new(path, {"schema": "firmware-call-evidence/v1", "stage": stage, "call_id": call_id, **record})
 
@@ -290,6 +305,8 @@ class AcceptanceBroker:
         if not isinstance(deadline, (int, float)):
             raise AdmissionError("admission deadline missing")
         raw = records[6]
+        if "raw_result" not in raw or raw_result_sha256(raw["raw_result"]) != bound["raw_result_sha256"]:
+            raise AdmissionError("retained raw result does not match the bound result identity")
         cleanup = records[7]
         if not cleanup.get("exact_reaped") or cleanup.get("call_id") != call_id:
             raise AdmissionError("exact returning-state cleanup is required")
