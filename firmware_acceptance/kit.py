@@ -79,6 +79,9 @@ def validate_pinned_server() -> str:
     reject_linked_path(_PINNED_SERVER_ROOT)
     if not _PINNED_SERVER_ROOT.is_dir() or _PINNED_SERVER_ROOT.is_symlink():
         raise AdmissionError("pinned MCP worktree is unavailable")
+    dotenv = _PINNED_SERVER_ROOT / ".env"
+    if dotenv.exists() or dotenv.is_symlink():
+        raise AdmissionError("unreviewed pinned MCP .env is forbidden")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PINNED_SERVER_ROOT, capture_output=True, text=True)
     status = subprocess.run(["git", "status", "--porcelain"], cwd=_PINNED_SERVER_ROOT, capture_output=True, text=True)
     if head.returncode or status.returncode or head.stdout.strip() != _PINNED_SERVER_COMMIT or status.stdout.strip():

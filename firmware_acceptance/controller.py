@@ -114,8 +114,11 @@ def _process_identity(pid: int) -> dict[str, Any] | None:
 
 class _StdioTransport:
     """The controller's only stdio owner: one writer and permanent stdout/stderr drains."""
-    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float) -> None:
+    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float, stderr_path: Path | None = None) -> None:
         self.process, self.remaining, self.io_cap = process, remaining, io_cap
+        self.stderr_path = stderr_path
+        try: self.stderr_log = stderr_path.open("xb") if stderr_path is not None else None
+        except OSError as exc: raise AdmissionError("MCP stderr log path is unavailable") from exc
         self.writes: queue.Queue[tuple[bytes, threading.Event, list[BaseException]]] = queue.Queue()
         self.responses: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self.stop = threading.Event(); self.accepting = threading.Event(); self.accepting.set()
@@ -173,6 +176,11 @@ class _StdioTransport:
             thread.join(max(0.0, self._budget()))
             outcome["helper_threads"].append({"name": thread.name, "stopped": not thread.is_alive()})
         outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
+        if self.stderr_log is not None and self.stderr_path is not None:
+            try: self.stderr_log.close()
+            except OSError as exc: outcome["stderr_log_close_error"] = type(exc).__name__
+            outcome["stderr_path"] = str(self.stderr_path)
+            outcome["stderr_log_sha256"] = hashlib.sha256(self.stderr_path.read_bytes()).hexdigest()
         return all(not thread.is_alive() for thread in self.threads), outcome
 
     def _write(self) -> None:
@@ -204,6 +212,7 @@ class _StdioTransport:
                 chunk = self.process.stderr.read(4096)
                 if not chunk: return
                 if isinstance(chunk, str): chunk = chunk.encode("utf-8", "replace")
+                if self.stderr_log is not None: self.stderr_log.write(chunk); self.stderr_log.flush()
                 with self._stderr_lock: self.stderr_bytes.extend(chunk[: max(0, 65536 - len(self.stderr_bytes))])
         except BaseException: return
 
@@ -386,7 +395,8 @@ class FirmwareAcceptanceController:
                 raise AdmissionError("MCP process creation identity is unavailable")
             cleanup["initial_process_identity"] = initial_identity
             evidence.append(self.broker.record("dispatch", call_id, {**common, "process_identity": initial_identity, "claim": claim_evidence}, (str(evidence[-1][0]), evidence[-1][1])))
-            transport = _StdioTransport(process, operation_remaining, self.io_timeout)
+            stderr_path = _safe_child(Path(config["roots"]["logs"]), call_id + ".stderr.log")
+            transport = _StdioTransport(process, operation_remaining, self.io_timeout, stderr_path)
             transport.send({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2024-11-05", "capabilities":{}, "clientInfo":{"name":"firmware-acceptance", "version":"1"}}}, "initialize")
             transport.receive(1)
             transport.send({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}, "initialized notification")
