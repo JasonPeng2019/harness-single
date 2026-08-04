@@ -37,7 +37,7 @@ class _Claims:
     def __init__(self, root: Path) -> None: self.path, self.live = root / "claim.json", False
     def acquire_all(self, resources: list[str], *, on_wait: object) -> None: self.path.write_text('{"claim":"live"}', encoding="utf-8"); self.live = True
     @property
-    def held(self) -> list[dict[str, object]]: return [{"resource": "STM-A", "path": str(self.path), "owner": {"pid": 1}}] if self.live else []
+    def held(self) -> list[dict[str, object]]: return [{"resource": "STM-A", "path": str(self.path), "owner": {"pid": 1, "created_utc": "2026-01-01T00:00:00Z", "creation_identity": "test-process-1"}}] if self.live else []
     def release_all(self) -> list[str]: self.live = False; return []
 
 
@@ -86,6 +86,23 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             messages = [json.loads(line) for line in launches[0].stdin.getvalue().splitlines()]
             self.assertEqual(["initialize", "notifications/initialized", "tools/call"], [item["method"] for item in messages[:3]])
             self.assertEqual([1, None, 2], [item.get("id") for item in messages[:3]])
+
+    def test_retained_authorization_raw_rewrite_rejects_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            paths[2].write_text(paths[2].read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+            self.assertEqual([], launches); self.assertFalse(claims[0].live)
+
+    def test_authorization_launch_or_identity_mutation_rejects_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            artifact = json.loads(paths[2].read_text(encoding="utf-8")); artifact["launch_intent"] = {"path":"mutated","sha256":"mutated"}
+            paths[2].write_text(json.dumps(artifact), encoding="utf-8")
+            with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+            self.assertEqual([], launches); self.assertFalse(claims[0].live)
 
     def test_single_lifecycle_retains_the_publishing_controller_until_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

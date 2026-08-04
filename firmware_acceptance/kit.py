@@ -76,6 +76,7 @@ def reject_linked_path(path: Path) -> None:
 
 def validate_pinned_server() -> str:
     """Prove the controller is configured against the exact clean candidate tree."""
+    reject_linked_path(_PINNED_SERVER_ROOT)
     if not _PINNED_SERVER_ROOT.is_dir() or _PINNED_SERVER_ROOT.is_symlink():
         raise AdmissionError("pinned MCP worktree is unavailable")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PINNED_SERVER_ROOT, capture_output=True, text=True)
@@ -88,7 +89,7 @@ def validate_pinned_server() -> str:
 def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     """Closed operation authority carried verbatim through every immutable stage."""
     required = {
-        "server_commit", "method", "method_version", "arguments", "policy_sha256", "schema_sha256",
+        "server_commit", "method", "method_version", "arguments", "policy_sha256", "schema_sha256", "resource",
         "plan_sha256", "permission_sha256", "authorization_sha256", "authorization_path", "claim_sha256", "claim", "controller_owner", "call_id",
         "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route",
         "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "deadline_monotonic", "expires_monotonic", "seed_identity",
@@ -101,6 +102,8 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     for key in ("method_version", "deadline_monotonic", "expires_monotonic"):
         if not isinstance(value[key], (int, float)) or isinstance(value[key], bool):
             raise AdmissionError("bound operation timing/version is invalid")
+    if not all(__import__("math").isfinite(value[key]) for key in ("deadline_monotonic", "expires_monotonic")):
+        raise AdmissionError("bound operation timing is not finite")
     for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "governing_documents", "c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "plan", "permission", "claim", "controller_owner", "seed_identity", "target_identity", "topology_key_release", "route", "raw_result_sha256", "cleanup_owner"}:
         if not isinstance(value[key], str) or not value[key]:
             raise AdmissionError("bound operation has an empty identity or hash")
@@ -111,7 +114,8 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value["governing_documents"], dict) or not value["governing_documents"] or any(not isinstance(ref, dict) or set(ref) != {"path", "sha256"} for ref in value["governing_documents"].values()):
         raise AdmissionError("bound governing references are not exact")
     claim = value["claim"]
-    if not isinstance(claim, dict) or set(claim) != {"resource", "path", "sha256", "owner"} or claim["owner"] != value["controller_owner"] or value["cleanup_owner"] != value["controller_owner"]:
+    owner = claim.get("owner") if isinstance(claim, dict) else None
+    if not isinstance(claim, dict) or set(claim) != {"resource", "path", "sha256", "owner"} or value["resource"] != value["board"] or claim["resource"] != value["board"] or claim["owner"] != value["controller_owner"] or value["cleanup_owner"] != value["controller_owner"] or not isinstance(owner, dict) or set(owner) != {"pid", "created_utc", "creation_identity"} or not isinstance(owner["pid"], int) or owner["pid"] <= 0 or not all(isinstance(owner[key], str) and owner[key] for key in ("created_utc", "creation_identity")):
         raise AdmissionError("bound claim/controller owner is not exact")
     if value["raw_result_sha256"] != "PENDING" and (not isinstance(value["raw_result_sha256"], str) or len(value["raw_result_sha256"]) != 64):
         raise AdmissionError("bound raw result identity is invalid")
@@ -186,8 +190,10 @@ def validate_manifest(manifest_path: Path) -> dict[str, Any]:
 
 def _safe_child(root: Path, *parts: str) -> Path:
     reject_linked_path(root)
+    spelled = root.joinpath(*parts)
+    reject_linked_path(spelled)
     root = root.resolve()
-    candidate = root.joinpath(*parts).resolve()
+    candidate = spelled.resolve()
     if candidate == root or root not in candidate.parents:
         raise AdmissionError("artifact path escapes confined root")
     if any(part in {"", ".", ".."} for part in parts):
@@ -225,6 +231,7 @@ class AcceptanceBroker:
         validate_seed_manifest(self.seed)
 
     def materialize_seed(self, target_root: Path) -> None:
+        reject_linked_path(target_root)
         target = target_root.resolve()
         target_parent = _safe_child(self.root, "targets")
         if target.parent != target_parent or target.exists() or target.is_symlink():
@@ -248,6 +255,7 @@ class AcceptanceBroker:
         self._target_identities[target] = {"seed_sha256": canonical_sha256(json.loads((target / "TARGET_SEED_MANIFEST.json").read_text(encoding="utf-8"))), "initial_commit": head}
 
     def validate_target(self, target_root: Path) -> str:
+        reject_linked_path(target_root)
         target = target_root.resolve()
         if target.parent != _safe_child(self.root, "targets") or target.is_symlink():
             raise AdmissionError("target escaped confined root")
