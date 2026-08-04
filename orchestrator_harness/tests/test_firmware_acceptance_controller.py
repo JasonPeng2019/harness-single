@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import json
@@ -8,10 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-from firmware_acceptance.controller import Ed25519Verifier, FirmwareAcceptanceController
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload, canonical_sha256
+from firmware_acceptance.controller import FirmwareAcceptanceController
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload
 
 
 class _Input(io.BytesIO):
@@ -19,9 +16,10 @@ class _Input(io.BytesIO):
 
 
 class _Process:
-    def __init__(self, replies: list[dict[str, object]], stderr: bytes = b"") -> None:
-        self.pid, self.stdin, self.stderr = 4242, _Input(), io.BytesIO(stderr)
-        self.stdout = io.BytesIO(b"".join((json.dumps(reply) + "\n").encode() for reply in replies)); self.exit: int | None = None
+    def __init__(self) -> None:
+        self.pid, self.stdin, self.stderr = 4242, _Input(), io.BytesIO()
+        self.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n')
+        self.exit: int | None = None
     def poll(self) -> int | None: return self.exit
     def terminate(self) -> None: self.exit = 0
     def wait(self, timeout: float | None = None) -> int: self.exit = 0; return 0
@@ -35,62 +33,68 @@ class _Claims:
     def release_all(self) -> list[str]: self.live = False; return []
 
 
-class _ExactVerifier(SignatureVerifier):
-    def __init__(self, expected: bytes) -> None: self.expected = expected
-    def verify(self, payload: bytes, signature: str, public_key: str) -> bool: return payload == self.expected and signature == "signed" and public_key == "public"
+class _Verifier(SignatureVerifier):
+    def verify(self, payload: bytes, signature: str, public_key: str) -> bool:
+        return signature == "signed" and public_key == "public" and payload == self.expected
+    expected = b""
 
 
 class FirmwareAcceptanceControllerTests(unittest.TestCase):
-    def _controller(self, root: Path, replies: list[dict[str, object]], launches: list[_Process], claims: list[_Claims]) -> FirmwareAcceptanceController:
+    def _controller(self, root: Path, launches: list[_Process], claims: list[_Claims]) -> FirmwareAcceptanceController:
         broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
-        def launch(_: dict[str, object]) -> _Process:
-            process = _Process(replies); launches.append(process); return process
-        def factory(_: str, __: str) -> _Claims:
-            item = _Claims(root); claims.append(item); return item
-        return FirmwareAcceptanceController(broker, launcher=launch, clock=lambda: 1.0, identity_provider=lambda pid: {"pid": pid, "created_utc": "synthetic"}, claims_factory=factory)
+        def launch(_: dict[str, object]) -> _Process: process = _Process(); launches.append(process); return process
+        def factory(_: str, __: str) -> _Claims: item = _Claims(root); claims.append(item); return item
+        return FirmwareAcceptanceController(broker, launcher=launch, clock=lambda: 1.0, identity_provider=lambda pid: {"pid":pid,"created_utc":"synthetic"}, claims_factory=factory)
 
     @staticmethod
     def _call(root: Path) -> dict[str, object]:
-        ref = lambda name: {"path": str(root / (name + ".json")), "sha256": name * 8}
-        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"proposal_sha256":"p","decision_sha256":"d","authorization_sha256":"a","deadline_monotonic":100.0,"plan":{"path":"plan","sha256":"planhash","max_operation_duration_seconds":30},"permission":{"path":"permission","sha256":"permissionhash","granted":True},"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"topology":ref("topology"),"claim":{"path":str(root / "claim.json"),"sha256":hashlib.sha256(b'{"claim":"live"}').hexdigest()},"governing_hashes":{"goal":"g","plan":"p","readiness":"r","policy":"m","topology":"t"},"seed_identity":ref("seed"),"target_identity":ref("target")}
+        ref = lambda name: {"path":str(root / (name + ".json")), "sha256":name * 8}
+        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":{"path":"plan","sha256":"planhash","max_operation_duration_seconds":30},"permission":{"path":"permission","sha256":"permissionhash","granted":True},"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"topology":ref("topology"),"governing_hashes":{"goal":"g","plan":"p","readiness":"r","policy":"m","topology":"t"},"seed_identity":ref("seed"),"target_identity":ref("target")}
 
-    def _artifacts(self, root: Path, controller: FirmwareAcceptanceController) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
-        proposal = controller.create_proposal({"call": self._call(root)})
-        call = proposal["call"]
-        decision: dict[str, object] = {"schema":"firmware-o-decision/v2","proposal_path":"proposal","proposal_sha256":proposal["sha256"],"call":call,"decision":"approve","issued_monotonic":1.0,"expires_monotonic":99.0,"topology":call["topology"],"public_key":"public","signature":"signed"}
-        authorization = {"schema":"firmware-derived-authorization/v2","proposal_path":"proposal","proposal_sha256":proposal["sha256"],"decision_path":"decision","decision_sha256":canonical_sha256(decision),"call":call,"expires_monotonic":99.0,"one_shot_id":"controller-1","revoked":False}
-        return proposal, decision, authorization
+    def _flow(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier) -> tuple[Path, Path, Path]:
+        proposal_path = root / "broker" / "proposal.json"; proposal = controller.publish_proposal(proposal_path, {"call":self._call(root)})
+        self.assertTrue(controller._live_claims.held)  # O signs only after exact claim is live.
+        self.assertFalse({"proposal_sha256","decision_sha256","authorization_sha256"} & set(proposal["call"]))
+        decision_path = root / "broker" / "decision.json"
+        decision = {"schema":"firmware-o-decision/v2","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","issued_monotonic":1.0,"expires_monotonic":99.0,"topology":proposal["call"]["topology"],"public_key":"public","signature":"signed"}
+        verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
+        authorization_path = root / "broker" / "authorization.json"; controller.derive_authorization(proposal_path, decision_path, authorization_path, verifier)
+        return proposal_path, decision_path, authorization_path
 
-    def test_exact_canonical_decision_payload_is_used_before_launch_and_admission(self) -> None:
+    def test_begin_sign_derive_authorize_and_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root, launches, claims = Path(temporary), [], []
-            controller = self._controller(root, [{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":2,"result":{"ok":True}}], launches, claims)
-            proposal, decision, authorization = self._artifacts(root, controller)
-            result = controller.execute(proposal, decision, authorization, _ExactVerifier(canonical_decision_payload(decision)))
-            self.assertEqual("PASS", result["outcome"]); self.assertTrue(claims[0].live is False); self.assertEqual(0, launches[0].poll())
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            result = controller.execute_artifacts(*paths, verifier)
+            self.assertEqual("PASS", result["outcome"]); self.assertFalse(claims[0].live); self.assertEqual(1, len(launches))
 
-    def test_real_ed25519_verifier_rejects_payload_mutation(self) -> None:
-        key = Ed25519PrivateKey.generate(); public = base64.b64encode(key.public_key().public_bytes_raw()).decode()
-        decision = {"schema":"x","signature":""}; decision["signature"] = base64.b64encode(key.sign(canonical_decision_payload(decision))).decode()
-        self.assertTrue(Ed25519Verifier().verify(canonical_decision_payload(decision), decision["signature"], public))
-        self.assertFalse(Ed25519Verifier().verify(b"different", decision["signature"], public))
-
-    def test_deny_replay_revocation_and_claim_mismatch_do_not_launch(self) -> None:
-        for mutation in ("deny", "replay", "revoked", "claim"):
+    def test_path_hash_owner_claim_and_replay_mismatch_deny_before_launch(self) -> None:
+        for mutation in ("path", "hash", "owner", "claim", "replay", "deny"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                root, launches, claims = Path(temporary), [], []
-                controller = self._controller(root, [], launches, claims); proposal, decision, authorization = self._artifacts(root, controller)
-                if mutation == "deny": decision["decision"] = "deny"
-                if mutation == "replay": authorization["one_shot_id"] = "other"
-                if mutation == "revoked": authorization["revoked"] = True
-                if mutation == "claim": proposal["call"]["claim"]["sha256"] = "wrong"  # type: ignore[index]
-                with self.assertRaises(AdmissionError): controller.execute(proposal, decision, authorization, _ExactVerifier(canonical_decision_payload(decision)))
-                self.assertEqual([], launches)
+                root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+                proposal, decision, authorization = self._flow(root, controller, verifier)
+                value = json.loads(decision.read_text())
+                if mutation == "path": value["proposal_path"] = "other"
+                elif mutation == "hash": value["proposal_sha256"] = "bad"
+                elif mutation == "claim": value["claim"]["resource"] = "other"
+                elif mutation == "replay":
+                    value = json.loads(authorization.read_text()); value["one_shot_id"] = "other"; authorization.write_text(json.dumps(value), encoding="utf-8")
+                elif mutation == "deny": value["decision"] = "deny"
+                elif mutation == "owner": controller._live_claim["owner"] = {"pid":2}
+                if mutation not in ("replay", "owner"): decision.write_text(json.dumps(value, sort_keys=True, separators=(",",":")), encoding="utf-8")
+                with self.assertRaises(AdmissionError): controller.execute_artifacts(proposal, decision, authorization, verifier)
+                self.assertEqual([], launches); self.assertFalse(claims[0].live)
 
-    def test_silent_stdout_reaps_and_releases_claim(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root, launches, claims = Path(temporary), [], []
-            controller = self._controller(root, [], launches, claims); controller.io_timeout = .01
-            proposal, decision, authorization = self._artifacts(root, controller)
-            with self.assertRaises(AdmissionError): controller.execute(proposal, decision, authorization, _ExactVerifier(canonical_decision_payload(decision)))
-            self.assertEqual(0, launches[0].poll()); self.assertFalse(claims[0].live)
+    def test_record_config_result_and_admit_errors_release_retained_claim(self) -> None:
+        for failure in ("record", "config", "result", "admit"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+                paths = self._flow(root, controller, verifier)
+                original_record, original_config, original_admit = controller.broker.record, controller.broker.controller_config, controller.broker.admit
+                if failure == "record": controller.broker.record = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("record"))  # type: ignore[method-assign]
+                elif failure == "config": controller.broker.controller_config = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("config"))  # type: ignore[method-assign]
+                elif failure == "result":
+                    controller.broker.record = lambda stage, *args, **kwargs: (_ for _ in ()).throw(AdmissionError("result")) if stage == "result" else original_record(stage, *args, **kwargs)  # type: ignore[method-assign]
+                else: controller.broker.admit = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("admit"))  # type: ignore[method-assign]
+                with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+                self.assertFalse(claims[0].live)

@@ -18,7 +18,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         common = {"attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"identity":{"controller":"pid:1"},"bound_operation":bound,"bound_operation_sha256":canonical_sha256(canonical_bound_operation(bound))}
         stages: list[tuple[Path, str]] = []
         for stage in ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result"):
-            extra = {"schema":"firmware-o-decision/v2","proposal_path":"proposal","proposal_sha256":"proposal","call":{},"decision":"approve","issued_monotonic":1,"expires_monotonic":99,"topology":{},"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
+            extra = {"schema":"firmware-o-decision/v2","proposal_path":"proposal","proposal_sha256":"proposal","call":{},"claim":{},"decision":"approve","issued_monotonic":1,"expires_monotonic":99,"topology":{},"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
             extra |= {"expires_monotonic":99} if stage == "authorization" else {}
             extra |= {"deadline_monotonic":100} if stage == "dispatch-admission" else {}
             extra |= {"raw_result":raw_payload,"outcome":"PASS"} if stage == "raw-result" else {}

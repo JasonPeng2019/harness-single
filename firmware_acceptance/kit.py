@@ -315,7 +315,7 @@ class AcceptanceBroker:
         if {key: value for key, value in intent.items() if key != "raw_result_sha256"} != {key: value for key, value in bound.items() if key != "raw_result_sha256"} or bound["raw_result_sha256"] == "PENDING":
             raise AdmissionError("raw result binding drifted from immutable intent")
         decision = records[2]
-        decision_keys = {"schema", "proposal_path", "proposal_sha256", "call", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"}
+        decision_keys = {"schema", "proposal_path", "proposal_sha256", "call", "claim", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"}
         signed_decision = {key: decision[key] for key in decision_keys if key in decision}
         if set(signed_decision) != decision_keys or verifier is None or not verifier.verify(canonical_decision_payload(signed_decision), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
             raise AdmissionError("signed decision is absent or invalid")
