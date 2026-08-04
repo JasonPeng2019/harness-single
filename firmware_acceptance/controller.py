@@ -122,7 +122,7 @@ class _StdioTransport:
         self.writes: queue.Queue[tuple[bytes, threading.Event, list[BaseException]]] = queue.Queue()
         self.responses: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self.stop = threading.Event(); self.accepting = threading.Event(); self.accepting.set()
-        self.stderr_bytes = bytearray(); self.stderr_error: str | None = None; self._stderr_lock = threading.Lock()
+        self.stderr_bytes = bytearray(); self.stderr_error: str | None = None; self.stderr_eof = threading.Event(); self._stderr_lock = threading.Lock()
         self.threads = [threading.Thread(target=self._write, name="firmware-mcp-writer"), threading.Thread(target=self._stdout, name="firmware-mcp-stdout"), threading.Thread(target=self._stderr, name="firmware-mcp-stderr")]
         for thread in self.threads: thread.start()
 
@@ -168,13 +168,21 @@ class _StdioTransport:
 
     def close_and_join(self) -> tuple[bool, dict[str, Any]]:
         self.accepting.clear(); self.stop.set(); outcome: dict[str, Any] = {"helper_threads": []}
-        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+        for stream in (self.process.stdin,):
             try:
                 if stream is not None: stream.close()
             except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
         for thread in self.threads:
             thread.join(max(0.0, self._budget()))
             outcome["helper_threads"].append({"name": thread.name, "stopped": not thread.is_alive()})
+        if any(thread.is_alive() for thread in self.threads):
+            for stream in (self.process.stdout, self.process.stderr):
+                try:
+                    if stream is not None: stream.close()
+                except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
+            for thread in self.threads:
+                if thread.is_alive(): thread.join(max(0.0, self._budget()))
+            outcome["helper_threads"] = [{"name": thread.name, "stopped": not thread.is_alive()} for thread in self.threads]
         with self._stderr_lock:
             outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
             stderr_error = self.stderr_error
@@ -186,14 +194,15 @@ class _StdioTransport:
             except OSError as exc:
                 stderr_log_sha256 = None
                 stderr_error = stderr_error or f"{type(exc).__name__}: {exc}"
-            if stderr_error is None and stderr_log_sha256 is not None:
+            outcome["stderr_eof"] = self.stderr_eof.is_set()
+            if stderr_error is None and self.stderr_eof.is_set() and stderr_log_sha256 is not None:
                 outcome["stderr_log_complete"] = True
                 outcome["stderr_log_sha256"] = stderr_log_sha256
             else:
                 outcome["stderr_log_complete"] = False
-                outcome["stderr_log_error"] = stderr_error or "stderr log digest is unavailable"
+                outcome["stderr_log_error"] = stderr_error or "stderr EOF drain is incomplete"
                 if stderr_log_sha256 is not None: outcome["stderr_log_partial_sha256"] = stderr_log_sha256
-                outcome["cleanup_error"] = "MCP stderr log persistence failed"
+                outcome["cleanup_error"] = "MCP stderr log persistence or drain failed"
         return all(not thread.is_alive() for thread in self.threads), outcome
 
     def _write(self) -> None:
@@ -221,9 +230,10 @@ class _StdioTransport:
     def _stderr(self) -> None:
         try:
             if self.process.stderr is None: return
-            while not self.stop.is_set():
+            while True:
                 chunk = self.process.stderr.read(4096)
-                if not chunk: return
+                if not chunk:
+                    self.stderr_eof.set(); return
                 if isinstance(chunk, str): chunk = chunk.encode("utf-8", "replace")
                 if self.stderr_log is not None: self.stderr_log.write(chunk); self.stderr_log.flush()
                 with self._stderr_lock: self.stderr_bytes.extend(chunk[: max(0, 65536 - len(self.stderr_bytes))])
