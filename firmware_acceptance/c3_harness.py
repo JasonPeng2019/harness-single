@@ -29,6 +29,8 @@ from .kit import (AcceptanceBroker, AdmissionError, _safe_child, _write_new,
                   canonical_decision_payload, reject_linked_path, validate_seed_manifest,
                   validate_delegated_authorization, validate_manifest)
 from orchestrator_harness.lane_controller import load_invocation
+from orchestrator_harness.models import iso_utc
+from orchestrator_harness.processes import process_snapshot
 
 _REQUEST_KEYS = {"schema", "request_id", "attempt_id", "c1_reference", "delegated_reference", "orchestrator_identity", "topology_key_release", "kind", "issued_utc", "issued_monotonic", "expires_monotonic", "payload", "public_key", "signature"}
 _ROLES = {
@@ -298,18 +300,23 @@ class C3Harness:
             out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
             proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle)
             identity = exact_process_identity(proc.pid)
-            if identity is None:
+            snapshot = process_snapshot()
+            observed = snapshot.by_pid.get(proc.pid)
+            after_identity = exact_process_identity(proc.pid)
+            expected_created = iso_utc(observed.created_utc) if observed is not None else None
+            if identity is None or after_identity is None or identity != after_identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None:
                 proc.terminate()
                 try: proc.wait(timeout=5)
                 except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
-                raise AdmissionError("cannot prove controller child identity")
+                raise AdmissionError("cannot prove controller child OS identity")
+            status_identity = {"pid": proc.pid, "created_utc": expected_created}
             status_path = Path(outputs["status"])
             launch_status: dict[str, Any] | None = None
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 try:
                     value = json.loads(status_path.read_text(encoding="utf-8"))
-                    if value.get("controller_pid") == proc.pid and isinstance(value.get("controller_created_utc"), str) and value["controller_created_utc"]:
+                    if value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"]:
                         launch_status = value; break
                 except (OSError, json.JSONDecodeError):
                     pass
@@ -327,7 +334,7 @@ class C3Harness:
             if err_handle is not None: err_handle.close()
         if proc is None: raise AdmissionError("controller launch failed")
         self.workers[aid] = proc
-        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":{"pid":launch_status["controller_pid"],"created_utc":launch_status["controller_created_utc"]}}
+        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":status_identity}
         _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":self.assignments[aid]["status_identity"],"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
         answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
         if preparation is not None: answer["limitation_preparation"] = preparation
