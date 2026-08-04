@@ -13,9 +13,11 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,8 @@ from harness_common.process_identity import exact_process_identity
 from .controller import Ed25519Verifier, FirmwareAcceptanceController, load_root_topology
 from .kit import (AcceptanceBroker, AdmissionError, _safe_child, _write_new,
                   canonical_decision_payload, reject_linked_path, validate_seed_manifest,
-                  worker_environment)
+                  validate_delegated_authorization, validate_manifest)
+from orchestrator_harness.lane_controller import load_invocation
 
 _REQUEST_KEYS = {"schema", "request_id", "attempt_id", "c1_reference", "delegated_reference", "orchestrator_identity", "topology_key_release", "kind", "issued_utc", "issued_monotonic", "expires_monotonic", "payload", "public_key", "signature"}
 _ROLES = {
@@ -64,35 +67,53 @@ def _ref(value: Any, label: str, expected: dict[str, str] | None = None) -> dict
     return result
 
 
+def _seed_snapshot(seed: Path) -> dict[str, tuple[str, int]]:
+    reject_linked_path(seed)
+    if seed.is_symlink() or not seed.is_dir(): raise AdmissionError("seed input is not a safe directory")
+    validate_seed_manifest(seed)
+    names = ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json")
+    if {p.name for p in seed.iterdir() if p.is_file()} != set(names): raise AdmissionError("seed does not contain exactly five files")
+    result = {}
+    for name in names:
+        path = seed / name
+        if path.is_symlink() or path.stat().st_mode & 0o222: raise AdmissionError("seed file is writable or linked")
+        result[name] = (_sha(path), path.stat().st_mode & 0o777)
+    return result
+
+
 class C3Harness:
     def __init__(self, root: Path, seed: Path, policy: Path, templates: Path, topology_root: Path,
                  *, c1: dict[str, str] | None = None, delegated: dict[str, str] | None = None,
                  manifest: Path | None = None) -> None:
         reject_linked_path(root); reject_linked_path(topology_root)
         self.root = root.resolve(); self.seed = seed.resolve(); self.policy = policy.resolve(); self.templates = templates.resolve()
-        for source, label in ((self.seed, "seed"), (self.policy, "policy"), (self.templates, "templates")):
+        self.seed_identity = _seed_snapshot(self.seed)
+        for source, label in ((self.policy, "policy"), (self.templates, "templates")):
             reject_linked_path(source)
             if source.is_symlink() or not source.is_file(): raise AdmissionError(label + " input is unsafe or absent")
         if manifest is not None:
             reject_linked_path(manifest)
             if manifest.is_symlink() or not manifest.is_file(): raise AdmissionError("manifest input is unsafe or absent")
-        if c1 is not None: _ref(c1, "startup C1")
-        if delegated is not None: _ref(delegated, "startup delegated authorization")
+        if c1 is None or delegated is None or manifest is None: raise AdmissionError("C3 startup requires exact C1, delegated, and manifest inputs")
+        c1 = _ref(c1, "startup C1"); delegated = _ref(delegated, "startup delegated authorization")
         self.topology = load_root_topology(topology_root)
         self.c1 = c1; self.delegated = delegated; self.manifest = manifest.resolve() if manifest else None
-        if self.c1 is not None and self.delegated is not None and self.manifest is not None:
-            # C1 remains the authority artifact, but every startup input must be
-            # visibly pinned in its raw immutable body before this service makes
-            # any attempt-local directory or readiness record.
-            c1_body = Path(self.c1["path"]).read_text(encoding="utf-8")
-            required_hashes = (_sha(self.seed), _sha(self.policy), _sha(self.templates),
-                               _sha(self.manifest), self.delegated["sha256"],
-                               self.topology["release"]["sha256"])
-            if any(value not in c1_body for value in required_hashes) or self.topology["attempt_id"] not in c1_body:
-                raise AdmissionError("C1 does not bind the exact startup inputs")
+        locked_manifest = validate_manifest(self.manifest)
+        validate_delegated_authorization(self.delegated, policy_path=self.policy, manifest=locked_manifest)
+        try: c1_body = json.loads(Path(self.c1["path"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc: raise AdmissionError("C1 lock is unreadable") from exc
+        required = {"schema","candidate","authorization","server","candidate_acceptance_inputs","target_seed"}
+        if not isinstance(c1_body, dict) or not required <= set(c1_body) or c1_body.get("schema") != "firmware-v2-c1-lock/v1": raise AdmissionError("C1 lock is not the closed C1 shape")
+        candidate, auth, server, inputs, target_seed = (c1_body[k] for k in ("candidate","authorization","server","candidate_acceptance_inputs","target_seed"))
+        if not isinstance(candidate,dict) or not isinstance(candidate.get("commit"),str) or not candidate.get("clean") or not isinstance(auth,dict) or auth.get("path") != self.delegated["path"] or auth.get("sha256") != self.delegated["sha256"] or not isinstance(server,dict) or server.get("commit") != "f003f84a7df51cd8595a3203c62e225b21da2a22" or not server.get("immutable_fixture") or not isinstance(inputs,dict) or not isinstance(target_seed,dict): raise AdmissionError("C1 startup bindings are incomplete")
+        for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy_source",self.policy)):
+            if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
+        if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"][0]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
         self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}
-        self.workers: dict[str, subprocess.Popen[Any]] = {}; self.shutdown = False; self.admission_closed = False
+        self.workers: dict[str, subprocess.Popen[Any]] = {}; self.assignments: dict[str, dict[str, Any]] = {}
+        self.operations: dict[str, Future[Any]] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
+        self.shutdown = False; self.admission_closed = False; self.last_heartbeat = 0.0
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
         self.response_root = _safe_child(self.root, "manager-signals", "c3-responses")
         self.admission_root = _safe_child(self.root, "manager-signals", "c3-admissions")
@@ -117,6 +138,8 @@ class C3Harness:
             closed_sessions = {x.get("session_id") for x in live if x.get("schema") == "firmware-c3-session-lifecycle/v1" and x.get("state") == "TERMINAL"}
             if starts - terminals or sessions - closed_sessions:
                 raise AdmissionError("prior C3 process has incomplete worker lifecycle; refusing adoption")
+        if any(_safe_child(self.root,"sessions").rglob("*.PENDING.json")):
+            raise AdmissionError("prior C3 process has incomplete session operation; refusing adoption")
 
     def _status(self, state: str, **extra: Any) -> None:
         _atomic_append(self.status_path, {"schema": "firmware-c3-harness-status/v1", "state": state, "pid": os.getpid(), "monotonic": time.monotonic(), **extra})
@@ -136,7 +159,8 @@ class C3Harness:
         path = _safe_child(self.response_root, request_id + ".json")
         answer = {"schema": "firmware-c3-harness-response/v1", "request_id": request_id, **value}
         try: _write_new(path, answer)
-        except FileExistsError:
+        except (FileExistsError, AdmissionError):
+            if not path.is_file(): raise
             preserved = json.loads(path.read_text(encoding="utf-8")); return {**preserved, "path": str(path), "raw_sha256": _sha(path)}
         return {**answer, "path": str(path), "raw_sha256": _sha(path)}
 
@@ -169,7 +193,14 @@ class C3Harness:
             request = self._load(path); request_id = request["request_id"]
             claim = _safe_child(self.admission_root, request_id + ".json")
             # The exclusive immutable claim precedes every dispatch side effect.
-            _write_new(claim, {"schema":"firmware-c3-request-admission/v1", "request_id":request_id, "request_sha256":_sha(path), "state":"CLAIMED"})
+            raw_sha = _sha(path)
+            try: _write_new(claim, {"schema":"firmware-c3-request-admission/v1", "request_id":request_id, "request_sha256":raw_sha, "state":"CLAIMED"})
+            except AdmissionError:
+                if not claim.is_file(): raise
+                prior = json.loads(claim.read_text(encoding="utf-8"))
+                response = _safe_child(self.response_root, request_id + ".json")
+                if prior.get("request_sha256") == raw_sha and response.is_file(): return {**json.loads(response.read_text(encoding="utf-8")),"path":str(response),"raw_sha256":_sha(response)}
+                raise AdmissionError("request replay or request-id collision")
             if self.admission_closed and request["kind"] != "shutdown": raise AdmissionError("harness admission is closed")
             result = self._dispatch(request["kind"], request["payload"])
             self._status("HEARTBEAT", request_id=request_id, outcome="ACCEPTED")
@@ -188,8 +219,7 @@ class C3Harness:
         if kind == "session-open": return self._open(payload)
         if kind in {"session-proposal", "session-execute", "session-close", "session-abort"}: return self._session(payload, kind.removeprefix("session-"))
         if kind == "server-limitation":
-            if set(payload) != {"decision_path", "limitation_id"}: raise AdmissionError("limitation payload is closed")
-            return self.broker.record_server_limitation(Path(payload["decision_path"]), _id(payload["limitation_id"], "limitation"), self.verifier)
+            raise AdmissionError("server limitation is locked pending exact LimitationEvidenceAdapter completion")
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
@@ -197,7 +227,7 @@ class C3Harness:
         allowed = {"assignment_id", "role", "sprint", "task", "prompt", "target_id", "declared_resources", "limitation"}
         if not set(p) <= allowed or not {"assignment_id","role","sprint","task","prompt","target_id","declared_resources"} <= set(p): raise AdmissionError("assignment payload is closed")
         aid, role, target_id = _id(p["assignment_id"], "assignment"), p.get("role"), _id(p["target_id"], "target")
-        if role not in _ROLES or not all(isinstance(p[k], str) and p[k] for k in ("task","prompt")) or not isinstance(p["declared_resources"], list) or any(not isinstance(x, str) for x in p["declared_resources"]): raise AdmissionError("assignment fields are invalid")
+        if role not in _ROLES or not all(isinstance(p[k], str) and p[k] for k in ("sprint","task","prompt")) or not isinstance(p["declared_resources"], list) or any(_id(x,"resource") != x for x in p["declared_resources"]) or len(set(p["declared_resources"])) != len(p["declared_resources"]): raise AdmissionError("assignment fields are invalid")
         if "limitation" in p and (not isinstance(p["limitation"], dict) or set(p["limitation"]) != {"limitation_id", "stable_id"} or not all(isinstance(p["limitation"].get(k), str) and p["limitation"][k] for k in ("limitation_id", "stable_id"))): raise AdmissionError("assignment limitation metadata is not closed")
         if self.active_worker: raise AdmissionError("exactly one target worker may be active")
         target = _safe_child(self.root, "targets", target_id); base = self.broker.validate_target(target)
@@ -205,28 +235,41 @@ class C3Harness:
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
         if created.returncode: raise AdmissionError("candidate worktree creation failed")
-        validate_seed_manifest(worktree)  # seed content remains immutable in the assigned copy
+        if _seed_snapshot(worktree) != self.seed_identity: raise AdmissionError("assigned worktree seed identity drifted")
         model, effort, tier, finding = _ROLES[role]; workspace = worktree / ".agent-workspace"; workspace.mkdir(exist_ok=True)
         inbox = _safe_child(self.root, "worker-channel", aid); inbox.mkdir(parents=True, exist_ok=False)
-        token = hashlib.sha256((aid + str(time.monotonic())).encode()).hexdigest()
-        prompt = workspace / "C3_PROMPT.md"; prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly write closed session-proposal records beneath " + str(inbox) + ".\n\n" + p["prompt"], encoding="utf-8")
+        response_root = _safe_child(self.root, "worker-channel-responses", aid); response_root.mkdir(parents=True, exist_ok=False)
+        token = secrets.token_urlsafe(32)
+        prompt = workspace / "C3_PROMPT.md"; prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + ".\n\n" + p["prompt"], encoding="utf-8")
         outputs = {name:str(workspace / (aid + suffix)) for name, suffix in {"status":".status.json","jsonl":".jsonl","stderr":".stderr.log","last_message":".last-message.txt"}.items()}
-        invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(_safe_child(self.root,"runtime")), "run_root":str(worktree), "repository":{"common_dir":str((worktree / ".git").resolve()),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":_sha(prompt),"output_paths":outputs,"event_log_path":str(_safe_child(self.root,"events","LANE_EVENTS.jsonl")),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":[],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True,"worker_environment":worker_environment()}
+        runtime = _safe_child(self.root,"runtime"); locks = _safe_child(runtime,"coding-resource-locks"); events = _safe_child(runtime,"events"); runtime.mkdir(parents=True,exist_ok=True); locks.mkdir(parents=True,exist_ok=True); events.mkdir(parents=True,exist_ok=True)
+        common = subprocess.run(["git","rev-parse","--git-common-dir"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip()
+        common_dir = (worktree / common).resolve() if not Path(common).is_absolute() else Path(common).resolve()
+        invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(runtime), "resource_lock_root":str(locks), "run_root":str(worktree), "repository":{"common_dir":str(common_dir),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":_sha(prompt),"output_paths":outputs,"event_log_path":str(events / "LANE_EVENTS.jsonl"),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":p["declared_resources"],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True}
         if finding: invocation["finding_gate"] = {"role":finding,"path":str(workspace / "FINDINGS.json")}
         invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json"); _write_new(invocation_path, invocation)
-        proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        controller_stdout, controller_stderr = workspace / (aid + ".controller.stdout.log"), workspace / (aid + ".controller.stderr.log")
+        out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
+        proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.root, stdout=out_handle, stderr=err_handle)
+        out_handle.close(); err_handle.close()
+        identity = exact_process_identity(proc.pid)
+        if identity is None: raise AdmissionError("cannot prove controller child identity")
         self.workers[aid] = proc
-        _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"pid":proc.pid,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox)})
+        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":p.get("limitation"),"identity":identity}
+        _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
         return {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
 
     def _accept_assignment(self, p: dict[str, Any]) -> dict[str, Any]:
         if set(p) != {"assignment_id", "target_id"}: raise AdmissionError("assignment acceptance is closed")
         aid, target_id = _id(p["assignment_id"], "assignment"), _id(p["target_id"], "target")
         if aid in self.workers: raise AdmissionError("assignment is still active")
+        record = self.assignments.get(aid)
+        if record is None or record.get("target_id") != target_id or record.get("completion",{}).get("outcome") != "PASS": raise AdmissionError("assignment has no exact PASS completion")
         invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json")
         if not invocation_path.is_file(): raise AdmissionError("assignment invocation is absent")
         invocation = json.loads(invocation_path.read_text(encoding="utf-8")); worktree = Path(invocation["run_root"]); target = _safe_child(self.root,"targets",target_id)
-        validate_seed_manifest(worktree); status = Path(invocation["output_paths"]["status"])
+        if _seed_snapshot(worktree) != record["seed"]: raise AdmissionError("assigned seed drifted before acceptance")
+        status = Path(invocation["output_paths"]["status"])
         result = worktree / ".agent-workspace" / "RESULT.json"
         if not status.is_file() or not result.is_file(): raise AdmissionError("assignment has no complete controller result")
         state = json.loads(status.read_text(encoding="utf-8"))
@@ -251,7 +294,13 @@ class C3Harness:
         sid = p.get("session_id"); controller = self.controllers.get(sid) if isinstance(sid,str) else None
         if controller is None: raise AdmissionError("unknown retained session")
         if action == "proposal" and set(p) == {"session_id","proposal_path","request"}: return controller.session_publish_proposal(Path(p["proposal_path"]),p["request"])
-        if action == "execute" and set(p) == {"session_id","proposal_path","decision_path","authorization_path"}: return controller.session_execute_artifacts(Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
+        if action == "execute" and set(p) == {"session_id","proposal_path","decision_path","authorization_path"}:
+            if sid in self.operations: raise AdmissionError("same-lane session operation is active")
+            pending = _safe_child(self.root,"sessions",sid,"operations",hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest() + ".PENDING.json")
+            _write_new(pending,{"schema":"firmware-c3-session-operation/v1","state":"PENDING","session_id":sid,"payload":p})
+            self.operations[sid] = self.executor.submit(controller.session_execute_artifacts,Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
+            return {"state":"PENDING","path":str(pending),"raw_sha256":_sha(pending)}
+        if action in {"close","abort"} and sid in self.operations: raise AdmissionError("session operation is active")
         if action == "close" and set(p) == {"session_id","decision_path"}: result = controller.close_session(Path(p["decision_path"]),self.verifier)
         elif action == "abort" and set(p) == {"session_id","reason"} and isinstance(p["reason"],str) and p["reason"]: result = controller.abort_session(p["reason"])
         else: raise AdmissionError("session operation payload is closed")
@@ -262,13 +311,57 @@ class C3Harness:
         for aid, process in list(self.workers.items()):
             exit_code = process.poll()
             if exit_code is None: continue
-            process.wait(); del self.workers[aid]
-            _atomic_append(self.registry_path,{"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"pid":process.pid,"exit_code":exit_code,"reaped":True})
+            process.wait(); del self.workers[aid]; record = self.assignments[aid]; inv = record["invocation"]
+            completion: dict[str, Any] = {"schema":"firmware-c3-worker-completion/v1","assignment_id":aid,"exit_code":exit_code,"controller_identity":record["identity"],"outcome":"FAIL"}
+            try:
+                if _seed_snapshot(record["worktree"]) != record["seed"]: raise AdmissionError("seed changed during worker execution")
+                status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
+                status, result = json.loads(status_path.read_text(encoding="utf-8")), json.loads(result_path.read_text(encoding="utf-8"))
+                loaded = load_invocation(_safe_child(self.root,"assignments",aid + ".invocation.json"))
+                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
+                if inv.get("finding_gate") is not None:
+                    valid = valid and isinstance(status.get("result_validation"),dict) and status["result_validation"].get("findings") is not None
+                tip = subprocess.run(["git","rev-parse","HEAD"],cwd=record["worktree"],capture_output=True,text=True,check=True).stdout.strip()
+                valid = valid and result.get("commit") == tip
+                if not valid: raise AdmissionError("controller completion identity is not exact")
+                completion.update({"outcome":"PASS","current_tip":tip,"status":{"path":str(status_path),"sha256":_sha(status_path)},"result":{"path":str(result_path),"sha256":_sha(result_path)}})
+            except (OSError, ValueError, subprocess.SubprocessError, AdmissionError) as exc: completion["reason"] = str(exc)
+            completion_path = _safe_child(self.root,"assignments",aid + ".WORKER_COMPLETION.json"); _write_new(completion_path,completion)
+            record["completion"] = {"path":str(completion_path),"sha256":_sha(completion_path),"outcome":completion["outcome"]}
+            _atomic_append(self.registry_path,{"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"controller_identity":record["identity"],"exit_code":exit_code,"reaped":True,"completion":record["completion"]})
+
+    def reap_operations(self) -> None:
+        for sid, future in list(self.operations.items()):
+            if not future.done(): continue
+            try: value = future.result(); outcome, error = "PASS", None
+            except Exception as exc: value, outcome, error = None, "FAIL", str(exc)
+            terminal = _safe_child(self.root,"sessions",sid,"operations",str(int(time.monotonic()*1000000)) + ".TERMINAL.json")
+            _write_new(terminal,{"schema":"firmware-c3-session-operation/v1","state":"TERMINAL","session_id":sid,"outcome":outcome,"result":value,"error":error})
+            del self.operations[sid]
+
+    def service_worker_channels(self) -> None:
+        """The only worker-facing ingress: one active P1 inbox, closed and token-bound."""
+        for aid, record in list(self.assignments.items()):
+            if record["invocation"]["lane_id"] != "F.C3.P1" or aid not in self.workers: continue
+            for path in sorted(record["inbox"].glob("*.json")):
+                response = _safe_child(record["responses"], path.name)
+                if response.exists(): continue
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8")); required = {"schema","request_id","assignment_id","token","kind","session_id","sequence","predecessor_state","current_state","next_state","call"}
+                    if not isinstance(raw,dict) or set(raw) != required or raw.get("schema") != "firmware-c3-worker-request/v1" or raw.get("kind") != "session-proposal" or raw.get("assignment_id") != aid or path.name != raw.get("request_id","") + ".json" or not isinstance(raw.get("token"),str) or not secrets.compare_digest(hashlib.sha256(raw["token"].encode()).hexdigest(),record["token_hash"]): raise AdmissionError("worker request is not closed or token-bound")
+                    sid = _id(raw.get("session_id"),"session")
+                    if sid not in self.controllers or not isinstance(raw.get("sequence"),int) or raw["sequence"] < 0 or not all(isinstance(raw.get(k),str) and raw[k] for k in ("predecessor_state","current_state","next_state")) or not isinstance(raw.get("call"),dict): raise AdmissionError("worker request state is invalid")
+                    proposal = _safe_child(self.root,"sessions",sid,"worker-proposals",raw["request_id"] + ".json")
+                    value = self.controllers[sid].session_publish_proposal(proposal,raw["call"])
+                    _write_new(response,{"schema":"firmware-c3-worker-response/v1","request_id":raw["request_id"],"outcome":"ACCEPTED","proposal":{"path":str(proposal),"sha256":_sha(proposal)},"result":value})
+                except (AdmissionError,OSError,ValueError,json.JSONDecodeError) as exc:
+                    if not response.exists(): _write_new(response,{"schema":"firmware-c3-worker-response/v1","request_id":path.stem,"outcome":"REJECTED","reason":str(exc)})
 
     def _shutdown(self, p: dict[str, Any]) -> dict[str, Any]:
         if p: raise AdmissionError("shutdown payload must be empty")
         self.reap_workers()
-        if self.workers: return {"state":"BLOCKED","reason":"target worker is active"}
+        self.reap_operations()
+        if self.workers or self.operations: return {"state":"BLOCKED","reason":"target worker or session operation is active"}
         self.admission_closed = True; terminals=[]
         for sid, controller in list(self.controllers.items()):
             result = controller.abort_session("signed harness shutdown")
@@ -290,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
     harness = C3Harness(args.root,args.seed,args.policy,args.templates,args.topology_root,c1={"path":str(args.c1_path.resolve()),"sha256":args.c1_sha256},delegated={"path":str(args.delegated_path.resolve()),"sha256":args.delegated_sha256},manifest=args.manifest)
     harness.write_readiness(); harness._status("READY")
     while not harness.shutdown:
-        harness.reap_workers()
+        harness.reap_workers(); harness.reap_operations(); harness.service_worker_channels()
+        if time.monotonic() - harness.last_heartbeat >= 30:
+            harness._status("HEARTBEAT", idle=True); harness.last_heartbeat = time.monotonic()
         for request in sorted(harness.request_root.glob("*.json")):
             if not (_safe_child(harness.response_root,request.name)).exists(): print(json.dumps(harness.handle(request),sort_keys=True),flush=True)
         time.sleep(args.poll_seconds)
