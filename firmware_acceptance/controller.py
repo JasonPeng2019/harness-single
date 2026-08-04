@@ -122,7 +122,7 @@ class _StdioTransport:
         self.writes: queue.Queue[tuple[bytes, threading.Event, list[BaseException]]] = queue.Queue()
         self.responses: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self.stop = threading.Event(); self.accepting = threading.Event(); self.accepting.set()
-        self.stderr_bytes = bytearray(); self.stderr_error: str | None = None; self.stderr_eof = threading.Event(); self._stderr_lock = threading.Lock()
+        self.stderr_bytes = bytearray(); self.stderr_error: str | None = None; self.stderr_eof = threading.Event(); self.stderr_forced_close = False; self._stderr_lock = threading.Lock()
         self.threads = [threading.Thread(target=self._write, name="firmware-mcp-writer"), threading.Thread(target=self._stdout, name="firmware-mcp-stdout"), threading.Thread(target=self._stderr, name="firmware-mcp-stderr")]
         for thread in self.threads: thread.start()
 
@@ -176,10 +176,13 @@ class _StdioTransport:
             thread.join(max(0.0, self._budget()))
             outcome["helper_threads"].append({"name": thread.name, "stopped": not thread.is_alive()})
         if any(thread.is_alive() for thread in self.threads):
-            for stream in (self.process.stdout, self.process.stderr):
-                try:
-                    if stream is not None: stream.close()
-                except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
+            try:
+                if self.process.stdout is not None: self.process.stdout.close()
+            except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
+            self.stderr_forced_close = True
+            try:
+                if self.process.stderr is not None: self.process.stderr.close()
+            except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
             for thread in self.threads:
                 if thread.is_alive(): thread.join(max(0.0, self._budget()))
             outcome["helper_threads"] = [{"name": thread.name, "stopped": not thread.is_alive()} for thread in self.threads]
@@ -195,12 +198,13 @@ class _StdioTransport:
                 stderr_log_sha256 = None
                 stderr_error = stderr_error or f"{type(exc).__name__}: {exc}"
             outcome["stderr_eof"] = self.stderr_eof.is_set()
-            if stderr_error is None and self.stderr_eof.is_set() and stderr_log_sha256 is not None:
+            outcome["stderr_forced_close"] = self.stderr_forced_close
+            if stderr_error is None and not self.stderr_forced_close and self.stderr_eof.is_set() and stderr_log_sha256 is not None:
                 outcome["stderr_log_complete"] = True
                 outcome["stderr_log_sha256"] = stderr_log_sha256
             else:
                 outcome["stderr_log_complete"] = False
-                outcome["stderr_log_error"] = stderr_error or "stderr EOF drain is incomplete"
+                outcome["stderr_log_error"] = stderr_error or ("stderr was force-closed before EOF" if self.stderr_forced_close else "stderr EOF drain is incomplete")
                 if stderr_log_sha256 is not None: outcome["stderr_log_partial_sha256"] = stderr_log_sha256
                 outcome["cleanup_error"] = "MCP stderr log persistence or drain failed"
         return all(not thread.is_alive() for thread in self.threads), outcome
