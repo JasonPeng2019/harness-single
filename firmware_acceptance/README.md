@@ -1,6 +1,6 @@
 # Firmware V2 acceptance kit
 
-This is the S2 static test medium. It does not launch MCP, use a serial port, invoke pyOCD, or touch hardware. A future controller alone materializes one template per lane, starts its own pinned-server stdio process, and creates the immutable call chain: proposal, canonical policy evaluation, signed O decision, delegated authorization, dispatch admission, dispatch, raw result, and returning-state cleanup.
+This is the S2 static test medium. It does not launch MCP, use a serial port, invoke pyOCD, or touch hardware. The candidate-owned `python -m firmware_acceptance.c3_harness` facade accepts only signed immutable attempt-local requests, materializes targets, dispatches target workers through the existing lane controller, and retains controller-owned sessions. It exposes no process, endpoint, credential, or physical capability to `F.C3.O`.
 
 `ACCEPTANCE_MANIFEST.json` pins the candidate, clean server revision, resource-mirror manifest, fixtures, datasheets, and toolchain locks. `LANE_TEMPLATES.json` requires separate process, `.firm`, artifact, log, probe/profile/target, and rediscovered-route values for each board. Its empty worker environment is intentional: target workers and `F.C3.O` receive no endpoint, command, credential, secret, or physical-launch capability.
 
