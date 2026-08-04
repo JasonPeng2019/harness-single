@@ -12,6 +12,7 @@ import threading
 import time
 import queue
 import datetime as _datetime
+import math
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -67,7 +68,7 @@ def _closed_call(call: Any) -> dict[str, Any]:
     if call["route"] is not None and not isinstance(call["route"], str): raise AdmissionError("route must be canonical null or an exact route")
     if call["resource"] != call["board"]: raise AdmissionError("declared resource must equal exact board resource")
     if not isinstance(call["method_version"], int) or isinstance(call["method_version"], bool) or not isinstance(call["arguments"], dict): raise AdmissionError("call method binding is invalid")
-    if not isinstance(call["deadline_monotonic"], (int, float)) or isinstance(call["deadline_monotonic"], bool): raise AdmissionError("call deadline is invalid")
+    if not isinstance(call["deadline_monotonic"], (int, float)) or isinstance(call["deadline_monotonic"], bool) or not math.isfinite(call["deadline_monotonic"]): raise AdmissionError("call deadline is invalid")
     for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "seed_identity", "target_identity", "topology_key_release"):
         _reference(call[key], key)
     if not isinstance(call["governing_documents"], dict) or set(call["governing_documents"]) != _GOVERNING_KEYS: raise AdmissionError("governing documents are incomplete")
@@ -350,8 +351,8 @@ class FirmwareAcceptanceController:
         raw: dict[str, Any] | None = None
         failure: BaseException | None = None
         cleanup: dict[str, Any] = {"pid": None, "exact_reaped": False, "classification": "error", "attempts": []}
-        now = self.clock()
-        operation_deadline = min(now + call["plan"]["max_operation_duration_seconds"], call["deadline_monotonic"], authorization["expires_monotonic"])
+        dispatch_start = self.clock()
+        operation_deadline = min(dispatch_start + call["plan"]["max_operation_duration_seconds"], call["deadline_monotonic"], authorization["expires_monotonic"])
         cleanup_deadline = min(call["deadline_monotonic"], authorization["expires_monotonic"])
         def operation_remaining() -> float: return operation_deadline - self.clock()
         def cleanup_remaining() -> float: return cleanup_deadline - self.clock()
@@ -370,6 +371,8 @@ class FirmwareAcceptanceController:
             transport.send({"jsonrpc":"2.0", "method":"notifications/initialized", "params":{}}, "initialized notification")
             transport.send({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":call["method"], "arguments":call["arguments"]}}, "tools/call")
             raw = transport.receive(2)
+            if not isinstance(raw.get("result"), dict): raise AdmissionError("MCP tool result is not an object")
+            if raw["result"].get("isError") is True: raise AdmissionError("MCP tool returned isError")
             if operation_remaining() <= 0: raise AdmissionError("MCP operation deadline expired")
             cleanup["classification"] = "success"
             evidence.append(self.broker.record("raw-result", call_id, {**common, "raw_result": raw, "outcome": "PASS"}, (str(evidence[-1][0]), evidence[-1][1])))
@@ -437,7 +440,7 @@ class FirmwareAcceptanceController:
 
     def _policy_admission(self, call: dict[str, Any]) -> dict[str, Any]:
         from .kit import evaluate_call
-        return evaluate_call(call, now_monotonic=self.clock())
+        return evaluate_call(call, now_monotonic=self.clock(), policy_path=self.broker.policy_path)
 
     def _claims(self, lane: str, call_id: str) -> Any:
         if self.claims_factory is not None: return self.claims_factory(lane, call_id)
@@ -461,7 +464,7 @@ class FirmwareAcceptanceController:
             raise AdmissionError("retained exact resource claim drifted or was substituted")
 
     def _validate_decision(self, proposal_path: Path, proposal_sha: str, proposal: dict[str, Any], decision: dict[str, Any], verifier: SignatureVerifier) -> None:
-        if set(decision) != _DECISION_KEYS or decision["schema"] != "firmware-o-decision/v3" or decision["proposal_path"] != str(proposal_path.resolve()) or decision["proposal_sha256"] != proposal_sha or decision["call"] != proposal["call"] or decision["claim"] != proposal["claim"] or decision["decision"] != "approve" or not isinstance(decision["rationale"], str) or not decision["rationale"] or not isinstance(decision["issued_monotonic"], (int, float)) or not isinstance(decision["expires_monotonic"], (int, float)) or decision["issued_monotonic"] > decision["expires_monotonic"] or _reference(decision["topology_key_release"], "decision release") != proposal["call"]["topology_key_release"] or not isinstance(decision["orchestrator_identity"], dict):
+        if set(decision) != _DECISION_KEYS or decision["schema"] != "firmware-o-decision/v3" or decision["proposal_path"] != str(proposal_path.resolve()) or decision["proposal_sha256"] != proposal_sha or decision["call"] != proposal["call"] or decision["claim"] != proposal["claim"] or decision["decision"] != "approve" or not isinstance(decision["rationale"], str) or not decision["rationale"] or not isinstance(decision["issued_monotonic"], (int, float)) or not isinstance(decision["expires_monotonic"], (int, float)) or not math.isfinite(decision["issued_monotonic"]) or not math.isfinite(decision["expires_monotonic"]) or decision["issued_monotonic"] > decision["expires_monotonic"] or _reference(decision["topology_key_release"], "decision release") != proposal["call"]["topology_key_release"] or not isinstance(decision["orchestrator_identity"], dict):
             raise AdmissionError("decision does not bind the exact proposal")
         issued = _utc(decision["issued_utc"], "decision issue")
         if not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["public_key"]): raise AdmissionError("proposal decision signature is invalid")
