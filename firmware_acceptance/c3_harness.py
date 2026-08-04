@@ -23,6 +23,7 @@ from typing import Any
 
 from harness_common.process_identity import exact_process_identity
 from .controller import Ed25519Verifier, FirmwareAcceptanceController, load_root_topology
+from .c3_limitation import LimitationEvidenceAdapter
 from .kit import (AcceptanceBroker, AdmissionError, _safe_child, _write_new,
                   canonical_decision_payload, reject_linked_path, validate_seed_manifest,
                   validate_delegated_authorization, validate_manifest)
@@ -133,8 +134,10 @@ class C3Harness:
             if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"][0]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
+        self.limitation_adapter = LimitationEvidenceAdapter(self.broker)
         self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}
         self.workers: dict[str, subprocess.Popen[Any]] = {}; self.assignments: dict[str, dict[str, Any]] = {}
+        self.limitation_completed: dict[str, dict[str, dict[str, Any]]] = {}
         self.operations: dict[str, Future[Any]] = {}; self.operation_pending: dict[str, Path] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
         self.shutdown = False; self.admission_closed = False; self.last_heartbeat = 0.0
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
@@ -245,8 +248,8 @@ class C3Harness:
         if kind == "assignment-accept": return self._accept_assignment(payload)
         if kind == "session-open": return self._open(payload)
         if kind in {"session-proposal", "session-execute", "session-close", "session-abort"}: return self._session(payload, kind.removeprefix("session-"))
-        if kind == "server-limitation":
-            raise AdmissionError("server limitation is locked pending exact LimitationEvidenceAdapter completion")
+        if kind == "limitation-complete": return self._limitation_complete(payload)
+        if kind == "server-limitation": return self._server_limitation(payload)
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
@@ -255,7 +258,7 @@ class C3Harness:
         if not set(p) <= allowed or not {"assignment_id","role","sprint","task","prompt","target_id","declared_resources"} <= set(p): raise AdmissionError("assignment payload is closed")
         aid, role, target_id = _id(p["assignment_id"], "assignment"), p.get("role"), _id(p["target_id"], "target")
         if role not in _ROLES or not all(isinstance(p[k], str) and p[k] for k in ("sprint","task","prompt")) or not isinstance(p["declared_resources"], list) or any(_id(x,"resource") != x for x in p["declared_resources"]) or len(set(p["declared_resources"])) != len(p["declared_resources"]): raise AdmissionError("assignment fields are invalid")
-        if "limitation" in p and (not isinstance(p["limitation"], dict) or set(p["limitation"]) != {"limitation_id", "stable_id"} or not all(isinstance(p["limitation"].get(k), str) and p["limitation"][k] for k in ("limitation_id", "stable_id"))): raise AdmissionError("assignment limitation metadata is not closed")
+        limitation = self._limitation_metadata(p.get("limitation"), role) if "limitation" in p else None
         if self.active_worker: raise AdmissionError("exactly one target worker may be active")
         target = _safe_child(self.root, "targets", target_id); base = self.broker.validate_target(target)
         worktree = _safe_child(self.root, "assignment-worktrees", aid); branch = "c3/" + target_id + "/" + aid
@@ -267,14 +270,23 @@ class C3Harness:
         inbox = _safe_child(self.root, "worker-channel", aid); inbox.mkdir(parents=True, exist_ok=False)
         response_root = _safe_child(self.root, "worker-channel-responses", aid); response_root.mkdir(parents=True, exist_ok=False)
         token = secrets.token_urlsafe(32)
-        prompt = workspace / "C3_PROMPT.md"; prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + ".\n\n" + p["prompt"], encoding="utf-8")
+        prompt = workspace / "C3_PROMPT.md"
         outputs = {name:str(workspace / (aid + suffix)) for name, suffix in {"status":".status.json","jsonl":".jsonl","stderr":".stderr.log","last_message":".last-message.txt"}.items()}
         runtime = _safe_child(self.root,"runtime"); locks = _safe_child(runtime,"coding-resource-locks"); events = _safe_child(runtime,"events"); runtime.mkdir(parents=True,exist_ok=True); locks.mkdir(parents=True,exist_ok=True); events.mkdir(parents=True,exist_ok=True)
         common = subprocess.run(["git","rev-parse","--git-common-dir"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip()
         common_dir = (worktree / common).resolve() if not Path(common).is_absolute() else Path(common).resolve()
-        invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(runtime), "resource_lock_root":str(locks), "run_root":str(worktree), "repository":{"common_dir":str(common_dir),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":_sha(prompt),"output_paths":outputs,"event_log_path":str(events / "LANE_EVENTS.jsonl"),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":p["declared_resources"],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True}
+        invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(runtime), "resource_lock_root":str(locks), "run_root":str(worktree), "repository":{"common_dir":str(common_dir),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":"PENDING","output_paths":outputs,"event_log_path":str(events / "LANE_EVENTS.jsonl"),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":p["declared_resources"],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True}
         if finding: invocation["finding_gate"] = {"role":finding,"path":str(workspace / "FINDINGS.json")}
-        invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json"); _write_new(invocation_path, invocation)
+        invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json")
+        preparation = None
+        if limitation is not None:
+            preparation = self.limitation_adapter.prepare(limitation, aid, outputs["status"], str(worktree / ".agent-workspace" / "RESULT.json"))
+        credit = ""
+        if preparation is not None:
+            credit = "\nFinal RESULT.json checks must contain {name: firmware-limitation-credit, command: " + preparation["sha256"] + ", outcome: PASS}.\n"
+        prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + "." + credit + "\n" + p["prompt"], encoding="utf-8")
+        invocation["prompt_sha256"] = _sha(prompt)
+        _write_new(invocation_path, invocation)
         controller_stdout, controller_stderr = workspace / (aid + ".controller.stdout.log"), workspace / (aid + ".controller.stderr.log")
         proc: subprocess.Popen[Any] | None = None
         out_handle = err_handle = None
@@ -292,9 +304,45 @@ class C3Harness:
             if err_handle is not None: err_handle.close()
         if proc is None: raise AdmissionError("controller launch failed")
         self.workers[aid] = proc
-        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":p.get("limitation"),"identity":identity}
+        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity}
         _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
-        return {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
+        answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
+        if preparation is not None: answer["limitation_preparation"] = preparation
+        return answer
+
+    def _limitation_metadata(self, value: Any, worker_role: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or value.get("mode") not in {"diagnostic", "substitute"}: raise AdmissionError("limitation metadata mode is invalid")
+        diagnostic = {"mode","limitation_id","attempt_id","lane_id","session_id","raw_result","source_path"}
+        substitute = {"mode","limitation_id","attempt_id","lane_id","session_id","kind","stable_id"}
+        if set(value) != (diagnostic if value["mode"] == "diagnostic" else substitute): raise AdmissionError("limitation metadata is not closed")
+        if value.get("attempt_id") != self.topology["attempt_id"]: raise AdmissionError("limitation attempt differs")
+        for key in ("limitation_id","lane_id","session_id"):_id(value.get(key), "limitation " + key)
+        lanes = self.broker.templates.get("lanes") if isinstance(self.broker.templates,dict) else None
+        if not isinstance(lanes,list) or sum(isinstance(row,dict) and row.get("lane_id") == value["lane_id"] for row in lanes) != 1: raise AdmissionError("limitation physical lane is invalid")
+        result = {**value,"worker_role":worker_role}
+        if value["mode"] == "substitute" and value.get("kind") not in {"PARTIAL_MCP","PINNED_COMPONENT_INTEGRATION","CANDIDATE_BOUNDARY_UNIT"}: raise AdmissionError("limitation substitute kind is unsupported")
+        return result
+
+    def _limitation_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"assignment_id"}: raise AdmissionError("limitation completion payload is closed")
+        aid = _id(payload["assignment_id"], "assignment")
+        record = self.assignments.get(aid)
+        if record is None or record.get("preparation") is None or aid in self.workers or record.get("completion",{}).get("outcome") != "PASS": raise AdmissionError("limitation worker has not completed exact PASS")
+        metadata, preparation = record["limitation"], record["preparation"]
+        lid, mode = metadata["limitation_id"], metadata["mode"]
+        if mode in self.limitation_completed.get(lid, {}): raise AdmissionError("limitation completion already exists")
+        invocation = _safe_child(self.root,"assignments",aid + ".invocation.json")
+        completed = self.limitation_adapter.complete(preparation,{"path":str(invocation),"sha256":_sha(invocation)},record["completion"]["status"],record["completion"]["result"])
+        self.limitation_completed.setdefault(lid,{})[mode] = completed
+        _atomic_append(self.registry_path,{"schema":"firmware-c3-limitation-completion/v1","assignment_id":aid,"limitation_id":lid,"mode":mode,"preparation":preparation,"completion":completed})
+        return {"limitation_id":lid,"mode":mode,"preparation":preparation,"completion":completed}
+
+    def _server_limitation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"decision_path","limitation_id"}: raise AdmissionError("limitation payload is closed")
+        lid = _id(payload["limitation_id"], "limitation")
+        completed = self.limitation_completed.get(lid,{})
+        if set(completed) != {"diagnostic","substitute"}: raise AdmissionError("server limitation lacks exact diagnostic and substitute completion")
+        return self.broker.record_server_limitation(Path(payload["decision_path"]), lid, self.verifier)
 
     def _accept_assignment(self, p: dict[str, Any]) -> dict[str, Any]:
         if set(p) != {"assignment_id", "target_id"}: raise AdmissionError("assignment acceptance is closed")
