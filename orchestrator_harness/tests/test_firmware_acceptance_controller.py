@@ -56,15 +56,22 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
 
     @staticmethod
     def _call(root: Path) -> dict[str, object]:
-        ref = lambda name: {"path":str(root / (name + ".json")), "sha256":name * 8}
-        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":{"path":"plan","sha256":"planhash","max_operation_duration_seconds":30},"permission":{"path":"permission","sha256":"permissionhash","granted":True},"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"topology":ref("topology"),"governing_hashes":{"goal":"g","plan":"p","readiness":"r","policy":"m","topology":"t"},"seed_identity":ref("seed"),"target_identity":ref("target")}
+        def ref(name: str) -> dict[str, str]:
+            path = root / (name + ".json"); path.write_text(name, encoding="utf-8")
+            return {"path":str(path), "sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
+        policy = Path("firmware_acceptance/MCP_METHOD_POLICY.json").resolve()
+        plan, permission = ref("plan"), ref("permission")
+        plan["max_operation_duration_seconds"] = 30  # type: ignore[index]
+        permission["granted"] = True  # type: ignore[index]
+        governing = {name: ref(name) for name in ("goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness")}
+        return {"call_id":"controller-1","attempt_id":"attempt-1","lane_id":"STM-A","board":"STM-A","resource":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":None,"method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"deadline_monotonic":100.0,"plan":plan,"permission":permission,"c1_reference":ref("c1"),"delegated_reference":ref("delegated"),"board_identity":ref("board"),"mcp_schema":ref("schema"),"policy":{"path":str(policy),"sha256":hashlib.sha256(policy.read_bytes()).hexdigest()},"server_revision":"f003f84a7df51cd8595a3203c62e225b21da2a22","seed_identity":ref("seed"),"target_identity":ref("target"),"topology_key_release":ref("release"),"governing_documents":governing}
 
     def _flow(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier) -> tuple[Path, Path, Path]:
         proposal_path = root / "broker" / "proposal.json"; proposal = controller.publish_proposal(proposal_path, {"call":self._call(root)})
         self.assertTrue(controller._live_claims.held)  # O signs only after exact claim is live.
         self.assertFalse({"proposal_sha256","decision_sha256","authorization_sha256"} & set(proposal["call"]))
         decision_path = root / "broker" / "decision.json"
-        decision = {"schema":"firmware-o-decision/v2","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","issued_monotonic":1.0,"expires_monotonic":99.0,"topology":proposal["call"]["topology"],"public_key":"public","signature":"signed"}
+        decision = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","rationale":"reviewed","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":proposal["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
         verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
         authorization_path = root / "broker" / "authorization.json"; controller.derive_authorization(proposal_path, decision_path, authorization_path, verifier)
         return proposal_path, decision_path, authorization_path
@@ -88,7 +95,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             def observe(path: Path) -> None:
                 published = json.loads(proposal.read_text())
                 self.assertIsNotNone(controller._live_claims)
-                signed = {"schema":"firmware-o-decision/v2","proposal_path":str(proposal.resolve()),"proposal_sha256":hashlib.sha256(proposal.read_bytes()).hexdigest(),"call":published["call"],"claim":published["claim"],"decision":"approve","issued_monotonic":1.0,"expires_monotonic":99.0,"topology":published["call"]["topology"],"public_key":"public","signature":"signed"}
+                signed = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal.resolve()),"proposal_sha256":hashlib.sha256(proposal.read_bytes()).hexdigest(),"call":published["call"],"claim":published["claim"],"decision":"approve","rationale":"reviewed","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":published["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
                 verifier.expected = canonical_decision_payload(signed); path.write_text(json.dumps(signed, sort_keys=True, separators=(",", ":")), encoding="utf-8")
             outcome = controller.run_lifecycle(request, proposal, decision, authorization, verifier, wait_for_decision=observe, result_path=result)
             self.assertEqual("PASS", outcome["outcome"]); self.assertTrue(result.is_file()); self.assertFalse(claims[0].live)
