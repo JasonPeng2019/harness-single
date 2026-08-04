@@ -81,19 +81,22 @@ def validate_finding_triage(value: Mapping[str, Any], *, findings_path: Path, fi
     required = {"schema", "owner", "findings_path", "findings_sha256", "decisions"}
     if set(value) != required or value.get("schema") != "orchestrator-review-triage/v1" or value.get("owner") not in {"ROOT-IM", "F.C3.O"}:
         raise GitSafetyError("triage has invalid closed schema or owner")
-    if value.get("findings_path") != str(findings_path) or value.get("findings_sha256") != findings_sha256:
+    if findings_path.is_symlink() or not findings_path.is_file() or findings_path.stat().st_size > _MAX_FINDINGS_BYTES:
+        raise GitSafetyError("triage findings path is unsafe or oversized")
+    actual_hash = hashlib.sha256(findings_path.read_bytes()).hexdigest()
+    if value.get("findings_path") != str(findings_path) or value.get("findings_sha256") != actual_hash or findings_sha256 != actual_hash:
         raise GitSafetyError("triage findings reference mismatch")
     decisions = value.get("decisions")
     if not isinstance(decisions, list) or len(decisions) != len(finding_ids):
         raise GitSafetyError("triage must decide every submitted finding exactly once")
     seen: set[str] = set()
     for item in decisions:
-        if not isinstance(item, dict) or item.get("id") not in finding_ids or item.get("id") in seen or item.get("decision") not in {"ACCEPT", "REJECT"} or not isinstance(item.get("rationale"), str) or not item["rationale"].strip():
+        if not isinstance(item, dict) or item.get("id") not in finding_ids or item.get("id") in seen or item.get("decision") not in {"ACCEPT", "REJECT"} or not isinstance(item.get("rationale"), str) or not item["rationale"].strip() or len(item["rationale"]) > 4000:
             raise GitSafetyError("triage decision is invalid")
         seen.add(item["id"])
-        if item["decision"] == "ACCEPT" and (item.get("conclusion") != "PROBLEM_OUTWEIGHS_FIX_RISK" or not isinstance(item.get("smallest_fix"), str) or not item["smallest_fix"].strip()):
+        if item["decision"] == "ACCEPT" and (set(item) != {"id", "decision", "rationale", "conclusion", "smallest_fix"} or item.get("conclusion") != "PROBLEM_OUTWEIGHS_FIX_RISK" or not isinstance(item.get("smallest_fix"), str) or not item["smallest_fix"].strip() or len(item["smallest_fix"]) > 4000):
             raise GitSafetyError("accepted triage requires conclusion and smallest fix")
-        if item["decision"] == "REJECT" and item.get("reason") not in {"unsupported", "not_reproducible", "out_of_scope", "net_negative_complexity"}:
+        if item["decision"] == "REJECT" and (set(item) != {"id", "decision", "rationale", "reason"} or item.get("reason") not in {"unsupported", "not_reproducible", "out_of_scope", "net_negative_complexity"}):
             raise GitSafetyError("rejected triage requires a bounded reason")
 
 

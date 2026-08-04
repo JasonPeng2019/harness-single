@@ -43,3 +43,16 @@ class FindingGateTests(unittest.TestCase):
             digest = __import__("hashlib").sha256(findings.read_bytes()).hexdigest()
             value = {"schema":"orchestrator-review-triage/v1","owner":"ROOT-IM","findings_path":str(findings),"findings_sha256":digest,"decisions":[{"id":"F1","decision":"ACCEPT","rationale":"evidence","conclusion":"PROBLEM_OUTWEIGHS_FIX_RISK","smallest_fix":"one check"}]}
             validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})
+            value["findings_sha256"] = "0" * 64
+            with self.assertRaises(GitSafetyError):
+                validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})
+
+    def test_triage_reject_shape_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            findings = Path(temporary) / "FINDINGS.json"; findings.write_text("{}", encoding="utf-8")
+            digest = __import__("hashlib").sha256(findings.read_bytes()).hexdigest()
+            value = {"schema":"orchestrator-review-triage/v1","owner":"F.C3.O","findings_path":str(findings),"findings_sha256":digest,"decisions":[{"id":"F1","decision":"REJECT","rationale":"not reproducible","reason":"not_reproducible"}]}
+            validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})
+            value["decisions"][0]["extra"] = "no"
+            with self.assertRaises(GitSafetyError):
+                validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})
