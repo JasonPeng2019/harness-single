@@ -16,7 +16,7 @@ class CandidateSafeguardTests(unittest.TestCase):
         script = (REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("worktrees\\harness-candidate", script)
+        self.assertIn("worktrees/harness-candidate", script)
         self.assertIn("firmware/v2-candidate", script)
         self.assertIn("refusing dirty candidate root", script)
         self.assertIn("4699d27bd5bf7c0b41bbed9ddb6b0b7d019e215f", script)
