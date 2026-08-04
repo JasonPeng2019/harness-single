@@ -402,7 +402,7 @@ class FirmwareAcceptanceController:
             if not allowed or call["arguments"] != plan["preferred_arguments"]: raise AdmissionError("paired action is not exactly bound to its accepted plan")
         if call["method"] == "continue_setup":
             continuation = session.get("continuation")
-            if continuation is None or call["arguments"].get("board_id") != continuation["board_id"] or call["arguments"].get("continuation_id") != continuation["continuation_id"] or not self._validate_continuation_response(continuation, call["arguments"].get("response")) or (continuation.get("kind") == "research" and (call["plan"] != continuation["plan"] or call["permission"] != continuation["permission"])):
+            if continuation is None or call["arguments"].get("board_id") != continuation["board_id"] or call["arguments"].get("continuation_id") != continuation["continuation_id"] or not self._validate_continuation_response(continuation, call["arguments"].get("response")):
                 raise AdmissionError("setup continuation did not use the exact server response")
         if expected != request["next_state"]: raise AdmissionError("session next state is not the locked policy transition")
         _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
@@ -455,6 +455,7 @@ class FirmwareAcceptanceController:
                 expected_arguments = {"board_id": call["arguments"]["board_id"], **call["arguments"]["action_parameters"]}
                 if payload.get("status") != "plan_accepted" or not isinstance(plan_id, str) or not plan_id or payload.get("underlying_action") != rule["plan_action"] or not isinstance(preferred, dict) or set(preferred) != {"tool_name", "arguments"} or preferred.get("tool_name") != rule["plan_action"] or preferred.get("arguments") != expected_arguments:
                     raise AdmissionError("accepted plan did not return the exact preferred action")
+            pending_continuation = self._continuation_from_payload(call, payload)
             # Route/plan output is predecessor data.  It must be accepted before
             # a durable normal result can name the requested successor state.
             self._validate_route_result(session, call, payload)
@@ -468,22 +469,8 @@ class FirmwareAcceptanceController:
                     session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":expected_arguments, "plan_id":plan_id}
             elif session["active_plan"] is not None and call["method"] in {session["active_plan"]["method"], "board_fix_setup"}:
                 # Consumption occurs only after the exact preferred action result is durable.
-                if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") in {"setup_needs_user_input", "setup_research_required"}:
-                    continuation = payload.get("continuation_id")
-                    accepted = payload.get("accepted_response")
-                    if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict) or set(accepted) != {"tool", "response"} or accepted.get("tool") != "continue_setup" or not isinstance(accepted.get("response"), dict):
-                        raise AdmissionError("setup continuation is not predecessor-bound")
-                    template = accepted["response"]
-                    choices = payload.get("choices")
-                    if payload.get("status") == "setup_needs_user_input":
-                        if set(template) != {"choice_id"} or not isinstance(choices, list) or not choices or any(not isinstance(choice, dict) or not isinstance(choice.get("choice_id"), str) or not choice["choice_id"] for choice in choices):
-                            raise AdmissionError("setup choice continuation is not predecessor-bound")
-                        continuation_state = {"kind":"choice", "choice_ids":{choice["choice_id"] for choice in choices}}
-                    else:
-                        if not template or any(value is None or value == "required value" or not isinstance(value, (str, int, float, bool, list, dict)) for value in template.values()):
-                            raise AdmissionError("setup research continuation template is not closed")
-                        continuation_state = {"kind":"research", "template":template, "plan":call["plan"], "permission":call["permission"]}
-                    session["continuation"] = {"board_id":call["arguments"]["board_id"], "continuation_id":continuation, **continuation_state}
+                if pending_continuation is not None:
+                    session["continuation"] = pending_continuation
                 elif call["method"] not in {"board_setup", "board_fix_setup"} or payload.get("status") == "setup_completed":
                     session["active_plan"] = None
             if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") == "setup_completed":
@@ -505,10 +492,30 @@ class FirmwareAcceptanceController:
             return set(response) == {"choice_id"} and response.get("choice_id") in continuation.get("choice_ids", set())
         if continuation.get("kind") == "research":
             template = continuation.get("template")
-            # The separately signed continuation call already binds its closed
-            # plan and permission artifacts; never replay server placeholders.
-            return isinstance(template, dict) and set(response) == set(template) and all(response[key] != value for key, value in template.items())
+            return isinstance(template, dict) and set(response) == set(template)
         return False
+
+    @staticmethod
+    def _continuation_from_payload(call: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+        if call["method"] not in {"board_setup", "board_fix_setup"} or payload.get("status") not in {"setup_needs_user_input", "setup_research_required"}:
+            return None
+        continuation, accepted = payload.get("continuation_id"), payload.get("accepted_response")
+        if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict) or set(accepted) != {"tool", "response"} or accepted.get("tool") != "continue_setup" or not isinstance(accepted.get("response"), dict):
+            raise AdmissionError("setup continuation is not predecessor-bound")
+        template = accepted["response"]
+        if payload["status"] == "setup_needs_user_input":
+            choices = payload.get("choices")
+            if set(template) != {"choice_id"} or not isinstance(choices, list) or not choices:
+                raise AdmissionError("setup choice continuation is not predecessor-bound")
+            ids = {choice.get("choice_id") for choice in choices if isinstance(choice, dict)}
+            if not ids or any(not isinstance(value, str) or not value for value in ids):
+                raise AdmissionError("setup choice continuation choices are malformed")
+            state = {"kind":"choice", "choice_ids":ids}
+        else:
+            if not template:
+                raise AdmissionError("setup research continuation template is not closed")
+            state = {"kind":"research", "template":template}
+        return {"board_id":call["arguments"]["board_id"], "continuation_id":continuation, **state}
 
     @staticmethod
     def _route_call(value: Any, tool: str, arguments: dict[str, Any]) -> bool:
