@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -225,6 +226,55 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         time.sleep(0.03)
         stopped, cleanup = transport.close_and_join()
         self.assertTrue(stopped); self.assertEqual(64 * 1024, len(transport.stderr_bytes))
+
+    def test_transport_post_reap_stderr_drain_reaches_eof_before_join_budget(self) -> None:
+        class CoordinatedStderr:
+            def __init__(self) -> None:
+                self.initial_read, self.release_suffix = threading.Event(), threading.Event()
+                self.chunks = [b"initial-", b"suffix"]
+            def read(self, _: int) -> bytes:
+                if self.chunks:
+                    chunk = self.chunks.pop(0)
+                    if chunk == b"initial-":
+                        self.initial_read.set()
+                        if not self.release_suffix.wait(1.0): raise AssertionError("suffix was not released")
+                    return chunk
+                return b""
+            def close(self) -> None: raise AssertionError("natural EOF stream must not be force-closed")
+        with tempfile.TemporaryDirectory() as temporary:
+            process = _Process(); process.stderr = CoordinatedStderr()
+            stderr_path = Path(temporary) / "stderr.log"
+            transport = _StdioTransport(process, lambda: 1.0, 0.5, stderr_path)
+            self.assertTrue(process.stderr.initial_read.wait(1.0))
+            process.stderr.release_suffix.set()
+            stopped, cleanup = transport.close_and_join()
+            expected = b"initial-suffix"
+            self.assertTrue(stopped); self.assertEqual(expected, stderr_path.read_bytes())
+            self.assertTrue(cleanup["stderr_eof"]); self.assertFalse(cleanup["stderr_forced_close"])
+            self.assertTrue(cleanup["stderr_log_complete"])
+            self.assertEqual(hashlib.sha256(expected).hexdigest(), cleanup["stderr_sha256"])
+            self.assertEqual(cleanup["stderr_sha256"], cleanup["stderr_log_sha256"])
+            self.assertTrue(all(item["stopped"] for item in cleanup["helper_threads"]))
+
+    def test_transport_forced_close_of_blocked_stderr_is_incomplete_with_partial_digest(self) -> None:
+        class BlockedStderr:
+            def __init__(self) -> None: self.reading, self.closed = threading.Event(), threading.Event()
+            def read(self, _: int) -> bytes:
+                self.reading.set()
+                if not self.closed.wait(1.0): raise AssertionError("blocked stream was not closed")
+                return b""
+            def close(self) -> None: self.closed.set()
+        with tempfile.TemporaryDirectory() as temporary:
+            process = _Process(); process.stderr = BlockedStderr()
+            stderr_path = Path(temporary) / "stderr.log"
+            transport = _StdioTransport(process, lambda: 1.0, 0.2, stderr_path)
+            self.assertTrue(process.stderr.reading.wait(1.0))
+            stopped, cleanup = transport.close_and_join()
+            self.assertTrue(stopped); self.assertTrue(process.stderr.closed.is_set())
+            self.assertTrue(cleanup["stderr_eof"]); self.assertTrue(cleanup["stderr_forced_close"])
+            self.assertFalse(cleanup["stderr_log_complete"]); self.assertIn("stderr_log_partial_sha256", cleanup)
+            self.assertIn("cleanup_error", cleanup)
+            self.assertTrue(all(item["stopped"] for item in cleanup["helper_threads"]))
 
     def test_failed_transport_commits_raw_failure_and_cleanup_before_claim_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
