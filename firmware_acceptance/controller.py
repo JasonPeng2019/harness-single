@@ -122,7 +122,7 @@ class _StdioTransport:
         self.writes: queue.Queue[tuple[bytes, threading.Event, list[BaseException]]] = queue.Queue()
         self.responses: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self.stop = threading.Event(); self.accepting = threading.Event(); self.accepting.set()
-        self.stderr_bytes = bytearray(); self._stderr_lock = threading.Lock()
+        self.stderr_bytes = bytearray(); self.stderr_error: str | None = None; self._stderr_lock = threading.Lock()
         self.threads = [threading.Thread(target=self._write, name="firmware-mcp-writer"), threading.Thread(target=self._stdout, name="firmware-mcp-stdout"), threading.Thread(target=self._stderr, name="firmware-mcp-stderr")]
         for thread in self.threads: thread.start()
 
@@ -175,12 +175,25 @@ class _StdioTransport:
         for thread in self.threads:
             thread.join(max(0.0, self._budget()))
             outcome["helper_threads"].append({"name": thread.name, "stopped": not thread.is_alive()})
-        outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
+        with self._stderr_lock:
+            outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
+            stderr_error = self.stderr_error
         if self.stderr_log is not None and self.stderr_path is not None:
             try: self.stderr_log.close()
-            except OSError as exc: outcome["stderr_log_close_error"] = type(exc).__name__
+            except OSError as exc: stderr_error = stderr_error or f"{type(exc).__name__}: {exc}"
             outcome["stderr_path"] = str(self.stderr_path)
-            outcome["stderr_log_sha256"] = hashlib.sha256(self.stderr_path.read_bytes()).hexdigest()
+            try: stderr_log_sha256 = hashlib.sha256(self.stderr_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                stderr_log_sha256 = None
+                stderr_error = stderr_error or f"{type(exc).__name__}: {exc}"
+            if stderr_error is None and stderr_log_sha256 is not None:
+                outcome["stderr_log_complete"] = True
+                outcome["stderr_log_sha256"] = stderr_log_sha256
+            else:
+                outcome["stderr_log_complete"] = False
+                outcome["stderr_log_error"] = stderr_error or "stderr log digest is unavailable"
+                if stderr_log_sha256 is not None: outcome["stderr_log_partial_sha256"] = stderr_log_sha256
+                outcome["cleanup_error"] = "MCP stderr log persistence failed"
         return all(not thread.is_alive() for thread in self.threads), outcome
 
     def _write(self) -> None:
@@ -214,7 +227,8 @@ class _StdioTransport:
                 if isinstance(chunk, str): chunk = chunk.encode("utf-8", "replace")
                 if self.stderr_log is not None: self.stderr_log.write(chunk); self.stderr_log.flush()
                 with self._stderr_lock: self.stderr_bytes.extend(chunk[: max(0, 65536 - len(self.stderr_bytes))])
-        except BaseException: return
+        except BaseException as exc:
+            with self._stderr_lock: self.stderr_error = f"{type(exc).__name__}: {exc}"
 
 
 def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
