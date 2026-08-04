@@ -444,7 +444,7 @@ class AcceptanceBroker:
         if not isinstance(terminal, dict) or set(terminal) != {"path", "sha256"}: raise AdmissionError("terminal session evidence is incomplete")
         self._verify_limitation_reference(terminal, "terminal session")
         terminal_value = json.loads(Path(terminal["path"]).read_text(encoding="utf-8"))
-        if terminal_value.get("session_id") != decision["session_id"] or terminal_value.get("state") not in {"ABORTED", "CLOSED"}:
+        if not isinstance(terminal_value, dict) or set(terminal_value) != {"schema", "session_id", "session_open_path", "session_open_sha256", "terminal_state", "reason", "natural_eof", "exact_reaped", "transport_cleanup", "helpers_stopped", "claim_released"} or terminal_value.get("schema") != "firmware-session-terminal/v1" or terminal_value.get("session_id") != decision["session_id"] or terminal_value.get("terminal_state") not in {"ABORTED", "CLOSED"} or not terminal_value.get("exact_reaped") or not terminal_value.get("helpers_stopped") or not terminal_value.get("claim_released"):
             raise AdmissionError("terminal session evidence does not close this session")
         process = decision["process_evidence"]
         if not isinstance(process, dict) or set(process) != {"path", "sha256"}: raise AdmissionError("terminal process cleanup is incomplete")
@@ -498,36 +498,40 @@ class AcceptanceBroker:
         if self.root not in Path(reference["path"]).resolve().parents:
             raise AdmissionError(label + " escapes the authorized broker evidence root")
 
+    def _limitation_c3_path(self, decision: dict[str, Any], name: str) -> Path:
+        return _safe_child(self.root, "hil", decision["lane_id"], "server-limitations", decision["limitation_id"], "c3-harness", name)
+
     def _verify_pinned_source_attribution(self, decision: dict[str, Any], records: list[dict[str, Any]], raw_reference: dict[str, Any]) -> None:
         reference = decision["attribution_evidence"]
         self._verify_limitation_reference(reference, "pinned-source attribution")
         value = json.loads(Path(reference["path"]).read_text(encoding="utf-8"))
-        keys = {"schema", "attempt_id", "lane_id", "session_id", "call_id", "raw_result", "source", "exclusions"}
+        keys = {"schema", "attempt_id", "lane_id", "session_id", "call_id", "raw_result", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate", "diagnostic_execution"}
         if not isinstance(value, dict) or set(value) != keys or value.get("schema") != "firmware-pinned-server-attribution/v1":
             raise AdmissionError("pinned-source attribution is not closed")
         if any(value.get(key) != decision[key] for key in ("attempt_id", "lane_id", "session_id")) or value.get("call_id") != records[-1].get("call_id") or value.get("raw_result") != {"path":raw_reference["path"], "sha256":raw_reference["sha256"]}:
             raise AdmissionError("pinned-source attribution does not bind the failed call")
-        source = value.get("source")
-        if not isinstance(source, dict) or set(source) != {"kind", "commit", "source_path", "behavior_signature"} or source.get("kind") not in {"PINNED_SOURCE_BEHAVIOR", "DETERMINISTIC_REPRODUCTION_SIGNATURE"} or source.get("commit") != _PINNED_SERVER_COMMIT or not isinstance(source.get("behavior_signature"), str) or not source["behavior_signature"]:
-            raise AdmissionError("pinned-source attribution source is unsupported")
-        source_path = source.get("source_path")
-        if source["kind"] == "PINNED_SOURCE_BEHAVIOR":
-            if not isinstance(source_path, str) or not source_path or Path(source_path).is_absolute() or ".." in Path(source_path).parts:
-                raise AdmissionError("pinned-source attribution path is unsafe")
-            shown = subprocess.run(["git", "show", _PINNED_SERVER_COMMIT + ":" + source_path], cwd=_PINNED_SERVER_ROOT, capture_output=True)
-            if shown.returncode:
-                raise AdmissionError("pinned-source attribution path is absent from immutable pin")
-        elif source_path is not None:
-            raise AdmissionError("deterministic attribution cannot assert a source path")
-        exclusions = value.get("exclusions")
-        expected = {"target", "fixture", "operator", "environment", "hardware_absence", "unknown"}
-        if not isinstance(exclusions, dict) or set(exclusions) != expected:
-            raise AdmissionError("pinned-source attribution exclusions are incomplete")
-        for category, exclusion_reference in exclusions.items():
-            self._verify_limitation_reference(exclusion_reference, "attribution exclusion " + category)
-            exclusion = json.loads(Path(exclusion_reference["path"]).read_text(encoding="utf-8"))
-            if not isinstance(exclusion, dict) or set(exclusion) != {"schema", "attempt_id", "lane_id", "session_id", "call_id", "category", "excluded"} or exclusion.get("schema") != "firmware-limitation-attribution-exclusion/v1" or exclusion.get("category") != category or exclusion.get("excluded") is not True or any(exclusion.get(key) != value[key] for key in ("attempt_id", "lane_id", "session_id", "call_id")):
-                raise AdmissionError("attribution exclusion is not evidence-bound")
+        source_path = value.get("source_path")
+        if not isinstance(source_path, str) or not source_path or Path(source_path).is_absolute() or ".." in Path(source_path).parts:
+            raise AdmissionError("pinned-source attribution path is unsafe")
+        shown = subprocess.run(["git", "show", _PINNED_SERVER_COMMIT + ":" + source_path], cwd=_PINNED_SERVER_ROOT, capture_output=True)
+        if shown.returncode or value.get("source_sha256") != hashlib.sha256(shown.stdout).hexdigest():
+            raise AdmissionError("pinned-source attribution source bytes drifted")
+        raw_signature = raw_result_sha256(records[-1]["raw_result"])
+        input_signature = canonical_sha256(records[-1]["bound_operation"])
+        if value.get("failure_signature") != raw_signature or value.get("input_signature") != input_signature or value.get("predicate") != "PINNED_COMPONENT_REPRODUCTION":
+            raise AdmissionError("pinned-source attribution signatures do not bind retained bytes")
+        diagnostic_ref = value.get("diagnostic_execution")
+        self._verify_limitation_reference(diagnostic_ref, "pinned component diagnostic")
+        diagnostic_path = Path(diagnostic_ref["path"]).resolve()
+        if self.root not in diagnostic_path.parents:
+            raise AdmissionError("pinned component diagnostic escapes broker evidence root")
+        diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        diagnostic_keys = {"schema", "attempt_id", "lane_id", "session_id", "call_id", "controller_owner", "server_commit", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate", "target_independent", "locked_environment", "outcome"}
+        if not isinstance(diagnostic, dict) or set(diagnostic) != diagnostic_keys or diagnostic.get("schema") != "firmware-pinned-component-diagnostic/v1" or diagnostic.get("outcome") != "PASS" or diagnostic.get("target_independent") is not True or any(diagnostic.get(key) != value.get(key) for key in ("attempt_id", "lane_id", "session_id", "call_id", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate")) or diagnostic.get("server_commit") != _PINNED_SERVER_COMMIT or diagnostic.get("controller_owner") != records[-1]["bound_operation"].get("controller_owner"):
+            raise AdmissionError("pinned component diagnostic is not a causal witness")
+        environment = diagnostic.get("locked_environment")
+        if not isinstance(environment, dict) or set(environment) != {"server_commit", "policy_sha256", "schema_sha256"} or environment != {"server_commit":_PINNED_SERVER_COMMIT, "policy_sha256":records[-1]["bound_operation"].get("policy_sha256"), "schema_sha256":records[-1]["bound_operation"].get("schema_sha256")}:
+            raise AdmissionError("pinned component diagnostic environment drifted")
 
     def _verify_substitute_identity(self, substitute: dict[str, Any], decision: dict[str, Any]) -> None:
         """Bind the C3-HARNESS substitute artifacts without granting launch authority."""
@@ -537,12 +541,14 @@ class AcceptanceBroker:
             result = json.loads(Path(result_ref["path"]).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise AdmissionError("substitute assignment or result is unreadable") from exc
-        assignment_keys = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "kind", "stable_id", "assignment_id"}
-        result_keys = assignment_keys | {"result_id", "assignment_path", "assignment_sha256", "execution", "outcome"}
+        assignment_keys = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "kind", "stable_id", "assignment_id", "c3_controller", "launch", "worker_invocation_id"}
+        result_keys = assignment_keys | {"result_id", "assignment_path", "assignment_sha256", "execution", "worker_result", "outcome"}
         if not isinstance(assignment, dict) or set(assignment) != assignment_keys or assignment.get("schema") != "firmware-limitation-substitute-assignment/v1":
             raise AdmissionError("substitute assignment is not a closed identity artifact")
         if not isinstance(result, dict) or set(result) != result_keys or result.get("schema") != "firmware-limitation-substitute-result/v1":
             raise AdmissionError("substitute result is not a closed identity artifact")
+        if Path(assignment_ref["path"]).resolve() != self._limitation_c3_path(decision, "ASSIGNMENT.json") or Path(result_ref["path"]).resolve() != self._limitation_c3_path(decision, "RESULT.json"):
+            raise AdmissionError("substitute artifacts are outside their exact C3 attempt subtree")
         identity = {"limitation_id":decision["limitation_id"], "attempt_id":decision["attempt_id"], "lane_id":decision["lane_id"], "session_id":decision["session_id"], "kind":substitute["kind"], "stable_id":substitute["stable_id"]}
         if any(assignment.get(key) != value or result.get(key) != value for key, value in identity.items()):
             raise AdmissionError("substitute artifacts do not bind this limitation attempt")
@@ -552,17 +558,33 @@ class AcceptanceBroker:
             raise AdmissionError("substitute result does not reference its exact assignment")
         if result.get("outcome") != "PASS":
             raise AdmissionError("substitute result did not pass")
+        launch_ref = assignment.get("launch")
+        self._verify_limitation_reference(launch_ref, "C3 substitute launch")
+        if Path(launch_ref["path"]).resolve() != self._limitation_c3_path(decision, "LAUNCH.json"):
+            raise AdmissionError("C3 substitute launch is outside the exact attempt subtree")
+        launch = json.loads(Path(launch_ref["path"]).read_text(encoding="utf-8"))
+        launch_keys = {"schema", "attempt_id", "lane_id", "session_id", "limitation_id", "controller_identity", "worker_invocation_id"}
+        if not isinstance(launch, dict) or set(launch) != launch_keys or launch.get("schema") != "firmware-limitation-c3-launch/v1" or any(launch.get(key) != assignment.get(key) for key in ("attempt_id", "lane_id", "session_id", "limitation_id", "worker_invocation_id")) or launch.get("controller_identity") != assignment.get("c3_controller"):
+            raise AdmissionError("C3 substitute launch identity is not exact")
         execution_reference = result.get("execution")
         self._verify_limitation_reference(execution_reference, "substitute execution")
         execution_path = Path(execution_reference["path"]).resolve()
         if self.root not in execution_path.parents:
             raise AdmissionError("substitute execution escapes the authorized broker evidence root")
         execution = json.loads(execution_path.read_text(encoding="utf-8"))
-        execution_keys = assignment_keys | {"execution_id", "assignment_path", "assignment_sha256", "outcome"}
+        execution_keys = assignment_keys | {"execution_id", "assignment_path", "assignment_sha256", "worker_result", "outcome"}
         if not isinstance(execution, dict) or set(execution) != execution_keys or execution.get("schema") != "firmware-limitation-substitute-execution/v1" or execution.get("outcome") != "PASS":
             raise AdmissionError("substitute execution is not a closed PASS artifact")
-        if any(execution.get(key) != value for key, value in identity.items()) or execution.get("assignment_id") != assignment["assignment_id"] or execution.get("assignment_path") != assignment_ref["path"] or execution.get("assignment_sha256") != assignment_ref["sha256"] or not isinstance(execution.get("execution_id"), str) or not execution["execution_id"]:
+        if execution_path != self._limitation_c3_path(decision, "EXECUTION.json") or any(execution.get(key) != value for key, value in identity.items()) or execution.get("assignment_id") != assignment["assignment_id"] or execution.get("assignment_path") != assignment_ref["path"] or execution.get("assignment_sha256") != assignment_ref["sha256"] or execution.get("c3_controller") != assignment["c3_controller"] or execution.get("launch") != launch_ref or execution.get("worker_invocation_id") != assignment["worker_invocation_id"] or not isinstance(execution.get("execution_id"), str) or not execution["execution_id"]:
             raise AdmissionError("substitute execution does not bind this assignment")
+        worker_ref = execution.get("worker_result")
+        self._verify_limitation_reference(worker_ref, "C3 substitute worker result")
+        if worker_ref != result.get("worker_result") or Path(worker_ref["path"]).resolve() != self._limitation_c3_path(decision, "WORKER_RESULT.json"):
+            raise AdmissionError("C3 substitute worker result is outside the exact attempt subtree")
+        worker = json.loads(Path(worker_ref["path"]).read_text(encoding="utf-8"))
+        worker_keys = {"schema", "attempt_id", "lane_id", "session_id", "limitation_id", "assignment_path", "assignment_sha256", "worker_invocation_id", "outcome"}
+        if not isinstance(worker, dict) or set(worker) != worker_keys or worker.get("schema") != "firmware-limitation-c3-worker-result/v1" or worker.get("outcome") != "PASS" or any(worker.get(key) != decision[key] for key in ("attempt_id", "lane_id", "session_id", "limitation_id")) or worker.get("assignment_path") != assignment_ref["path"] or worker.get("assignment_sha256") != assignment_ref["sha256"] or worker.get("worker_invocation_id") != assignment["worker_invocation_id"]:
+            raise AdmissionError("C3 substitute worker completion is not exact PASS")
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
