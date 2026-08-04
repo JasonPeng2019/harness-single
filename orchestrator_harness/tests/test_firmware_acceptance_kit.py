@@ -27,7 +27,9 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
-            broker.materialize_seed(root / "target")
+            target = root / "broker" / "targets" / "target"
+            broker.materialize_seed(target)
+            self.assertEqual(40, len(broker.validate_target(target)))
             config = broker.controller_config("STM-A", {})
             self.assertEqual("", config["worker_environment"]["MCP_ENDPOINT"])
             common = {"attempt_id": "attempt-0001", "lane_id": "STM-A", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "route": None, "governing_hashes": {"goal": "g"}, "c1_reference": {"path": "c1", "sha256": "h"}, "identity": {"controller": "pid:1"}}

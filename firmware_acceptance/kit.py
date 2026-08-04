@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -106,13 +108,37 @@ class AcceptanceBroker:
 
     def materialize_seed(self, target_root: Path) -> None:
         target = target_root.resolve()
-        if target.exists() and any(target.iterdir()):
-            raise AdmissionError("target root must be fresh")
-        target.mkdir(parents=True, exist_ok=True)
+        target_parent = _safe_child(self.root, "targets")
+        if target.parent != target_parent or target.exists() or target.is_symlink():
+            raise AdmissionError("target root must be a fresh direct child of the confined targets root")
+        target_parent.mkdir(parents=True, exist_ok=True)
+        target.mkdir()
         for name in ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"):
             destination = _safe_child(target, name)
-            _write_new(destination, {"seed_copy_sha256": hashlib.sha256((self.seed / name).read_bytes()).hexdigest()}) if False else destination.write_bytes((self.seed / name).read_bytes())
+            with destination.open("xb") as handle:
+                handle.write((self.seed / name).read_bytes())
+            destination.chmod(stat.S_IREAD)
         validate_seed_manifest(target)
+        completed = subprocess.run(["git", "init", "-q"], cwd=target, check=False, capture_output=True, text=True)
+        if completed.returncode:
+            raise AdmissionError("disposable Git initialization failed")
+        subprocess.run(["git", "add", "--", "."], cwd=target, check=True, capture_output=True, text=True)
+        completed = subprocess.run(["git", "-c", "user.name=Firmware Acceptance", "-c", "user.email=firmware-acceptance@invalid", "commit", "-q", "-m", "seed"], cwd=target, check=False, capture_output=True, text=True)
+        if completed.returncode:
+            raise AdmissionError("disposable Git seed commit failed")
+
+    def validate_target(self, target_root: Path) -> str:
+        target = target_root.resolve()
+        if target.parent != _safe_child(self.root, "targets") or target.is_symlink():
+            raise AdmissionError("target escaped confined root")
+        validate_seed_manifest(target)
+        for name in ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"):
+            if target.joinpath(name).stat().st_mode & stat.S_IWRITE:
+                raise AdmissionError("seed file is writable")
+        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target, check=False, capture_output=True, text=True)
+        if result.returncode:
+            raise AdmissionError("target seed commit missing")
+        return result.stdout.strip()
 
     def controller_config(self, lane_id: str, inherited: dict[str, str] | None = None) -> dict[str, Any]:
         lane = next((item for item in self.templates["lanes"] if item["lane_id"] == lane_id), None)
