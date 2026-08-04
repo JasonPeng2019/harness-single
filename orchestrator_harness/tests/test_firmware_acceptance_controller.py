@@ -80,6 +80,19 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             self.assertEqual(["initialize", "notifications/initialized", "tools/call"], [item["method"] for item in messages[:3]])
             self.assertEqual([1, None, 2], [item.get("id") for item in messages[:3]])
 
+    def test_single_lifecycle_retains_the_publishing_controller_until_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            request = root / "request.json"; request.write_text(json.dumps({"call": self._call(root)}), encoding="utf-8")
+            proposal, decision, authorization, result = (root / "broker" / name for name in ("proposal.json", "decision.json", "authorization.json", "result.json"))
+            def observe(path: Path) -> None:
+                published = json.loads(proposal.read_text())
+                self.assertIsNotNone(controller._live_claims)
+                signed = {"schema":"firmware-o-decision/v2","proposal_path":str(proposal.resolve()),"proposal_sha256":hashlib.sha256(proposal.read_bytes()).hexdigest(),"call":published["call"],"claim":published["claim"],"decision":"approve","issued_monotonic":1.0,"expires_monotonic":99.0,"topology":published["call"]["topology"],"public_key":"public","signature":"signed"}
+                verifier.expected = canonical_decision_payload(signed); path.write_text(json.dumps(signed, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            outcome = controller.run_lifecycle(request, proposal, decision, authorization, verifier, wait_for_decision=observe, result_path=result)
+            self.assertEqual("PASS", outcome["outcome"]); self.assertTrue(result.is_file()); self.assertFalse(claims[0].live)
+
     def test_path_hash_owner_claim_and_replay_mismatch_deny_before_launch(self) -> None:
         for mutation in ("path", "hash", "owner", "claim", "replay", "deny"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:

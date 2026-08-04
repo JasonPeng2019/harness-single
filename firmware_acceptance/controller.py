@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import queue
+import datetime as _datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -197,12 +198,30 @@ def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
 class FirmwareAcceptanceController:
     """Two-phase controller that alone owns the MCP stdio process and physical capability."""
 
-    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0) -> None:
+    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0, topology: dict[str, Any] | None = None) -> None:
         self.broker, self.launcher, self.clock, self.identity_provider = broker, launcher or _launch, clock, identity_provider
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
         self._live_claims: Any | None = None
         self._live_claim: dict[str, Any] | None = None
         self._proposal_binding: tuple[Path, str] | None = None
+        self.topology = topology
+
+    def run_lifecycle(self, request_path: Path, proposal_path: Path, decision_path: Path,
+                      authorization_path: Path, verifier: SignatureVerifier, *,
+                      wait_for_decision: Callable[[Path], None], result_path: Path | None = None) -> dict[str, Any]:
+        """One retained-controller lifecycle.  The waiter only observes the O-owned decision."""
+        try:
+            request = self._load_external(request_path, {"call"})
+            self.publish_proposal(proposal_path, request)
+            wait_for_decision(decision_path)
+            self.derive_authorization(proposal_path, decision_path, authorization_path, verifier)
+            result = self.execute_artifacts(proposal_path, decision_path, authorization_path, verifier)
+            if result_path is not None:
+                _write_new(result_path.resolve(), result)
+            return result
+        except BaseException:
+            self._release_live_claim()
+            raise
 
     def create_proposal(self, request: dict[str, Any]) -> dict[str, Any]:
         if set(request) != {"call"}: raise AdmissionError("proposal must contain exactly one closed call authority")
@@ -403,6 +422,9 @@ class FirmwareAcceptanceController:
         if set(decision) != {"schema", "proposal_path", "proposal_sha256", "call", "claim", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"} or decision["schema"] != "firmware-o-decision/v2" or decision["proposal_path"] != str(proposal_path.resolve()) or decision["proposal_sha256"] != proposal_sha or decision["call"] != proposal["call"] or decision["claim"] != proposal["claim"] or decision["decision"] != "approve" or not isinstance(decision["issued_monotonic"], (int, float)) or not isinstance(decision["expires_monotonic"], (int, float)) or decision["issued_monotonic"] > decision["expires_monotonic"] or _reference(decision["topology"], "decision topology") != proposal["call"]["topology"]:
             raise AdmissionError("decision does not bind the exact proposal")
         if not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["public_key"]): raise AdmissionError("proposal decision signature is invalid")
+        if self.topology is not None:
+            if decision["public_key"] != self.topology["public_key"] or decision["issued_monotonic"] < self.topology["released_monotonic"]:
+                raise AdmissionError("decision predates key release or has an unbound key")
 
     def _release_live_claim(self) -> None:
         claims, self._live_claims = self._live_claims, None
@@ -418,35 +440,87 @@ class FirmwareAcceptanceController:
         if not isinstance(value, dict) or set(value) != keys: raise AdmissionError("authorization artifact is not closed")
         return value
 
+    def _load_external(self, path: Path, keys: set[str]) -> dict[str, Any]:
+        """Read-only request input; unlike artifacts it need not live beneath broker evidence."""
+        resolved = path.resolve()
+        if resolved.is_symlink() or not resolved.is_file():
+            raise AdmissionError("request path is unsafe")
+        try: value = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc: raise AdmissionError("request is unreadable") from exc
+        if not isinstance(value, dict) or set(value) != keys: raise AdmissionError("request is not closed")
+        return value
+
+
+
+def _raw_topology_record(root: Path, name: str) -> tuple[Path, dict[str, Any], str]:
+    """Topology is ROOT-owned raw evidence, never canonicalized or repaired by C3."""
+    root = root.resolve()
+    path = root / name
+    if root.is_symlink() or path.parent != root or path.is_symlink() or not path.is_file():
+        raise AdmissionError("ROOT topology record is unsafe")
+    raw = path.read_bytes()
+    try: value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise AdmissionError("ROOT topology record is malformed") from exc
+    if not isinstance(value, dict): raise AdmissionError("ROOT topology record is not an object")
+    return path.resolve(), value, hashlib.sha256(raw).hexdigest()
+
+
+def _utc(value: Any, label: str) -> _datetime.datetime:
+    if not isinstance(value, str): raise AdmissionError(label + " must be UTC text")
+    try: parsed = _datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc: raise AdmissionError(label + " is malformed") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != _datetime.timedelta(0): raise AdmissionError(label + " is not UTC")
+    return parsed
+
+
+def load_root_topology(root: Path) -> dict[str, Any]:
+    """Validate the launch -> identity -> key-release chain using raw-file hashes only."""
+    intent_path, intent, intent_sha = _raw_topology_record(root, "ORCHESTRATOR_LAUNCH_INTENT.json")
+    identity_path, identity, identity_sha = _raw_topology_record(root, "ORCHESTRATOR_IDENTITY.json")
+    release_path, release, release_sha = _raw_topology_record(root, "ORCHESTRATOR_KEY_RELEASE.json")
+    required_intent = {"attempt_id", "nonce", "public_key", "model", "reasoning_effort", "service_tier", "issued_utc"}
+    required_identity = required_intent | {"intent_path", "intent_sha256", "pid", "created_utc", "thread_id", "acknowledgement"}
+    required_release = {"identity_path", "identity_sha256", "acknowledgement", "released_utc"}
+    if not required_intent <= set(intent) or not required_identity <= set(identity) or not required_release <= set(release):
+        raise AdmissionError("ROOT topology fields are incomplete")
+    if identity["intent_path"] != str(intent_path) or identity["intent_sha256"] != intent_sha or release["identity_path"] != str(identity_path) or release["identity_sha256"] != identity_sha:
+        raise AdmissionError("ROOT topology raw-file binding drifted")
+    for key in ("attempt_id", "nonce", "public_key", "model", "reasoning_effort", "service_tier"):
+        if identity[key] != intent[key]: raise AdmissionError("ROOT identity substituted launch binding")
+    if release["acknowledgement"] != identity["acknowledgement"] or not isinstance(identity["pid"], int) or identity["pid"] <= 0 or not isinstance(identity["thread_id"], str) or not identity["thread_id"]:
+        raise AdmissionError("ROOT identity acknowledgement is invalid")
+    if _utc(identity["created_utc"], "identity creation") < _utc(intent["issued_utc"], "intent issue") or _utc(release["released_utc"], "key release") < _utc(identity["created_utc"], "identity creation"):
+        raise AdmissionError("ROOT topology timing is invalid")
+    # monotonic decisions used by the existing controller are separately checked against this
+    # release marker; the UTC chain remains immutable evidence for external audit.
+    return {"public_key": intent["public_key"], "attempt_id": intent["attempt_id"], "identity": identity,
+            "launch": {"path": str(intent_path), "sha256": intent_sha},
+            "identity_binding": {"path": str(identity_path), "sha256": identity_sha},
+            "release": {"path": str(release_path), "sha256": release_sha}, "released_monotonic": float("-inf")}
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Dedicated structured-artifact entry point; production requires an injected verifier."""
+    """Single-controller production entry point; it has no endpoint or launch seam."""
     parser = argparse.ArgumentParser(prog="firmware-acceptance-controller")
+    parser.add_argument("--request", required=True)
     parser.add_argument("--proposal", required=True)
     parser.add_argument("--decision", required=True)
     parser.add_argument("--authorization", required=True)
+    parser.add_argument("--result", required=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--seed", required=True)
     parser.add_argument("--policy", required=True)
     parser.add_argument("--templates", required=True)
     parser.add_argument("--topology-root", required=True)
     args = parser.parse_args(argv)
-    topology = Path(args.topology_root).resolve()
-    intent = json.loads((topology / "ORCHESTRATOR_LAUNCH_INTENT.json").read_text(encoding="utf-8"))
-    identity = json.loads((topology / "ORCHESTRATOR_IDENTITY.json").read_text(encoding="utf-8"))
-    release = json.loads((topology / "ORCHESTRATOR_KEY_RELEASE.json").read_text(encoding="utf-8"))
-    if not all(isinstance(item, dict) for item in (intent, identity, release)) or identity.get("intent_sha256") != canonical_sha256(intent) or release.get("identity_sha256") != canonical_sha256(identity) or identity.get("public_key") != intent.get("public_key"):
-        raise SystemExit("ROOT topology launch identity is incomplete or substituted")
-    try:
-        decision = json.loads(Path(args.decision).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit("O decision is unreadable") from exc
-    if decision.get("public_key") != intent.get("public_key"):
-        raise SystemExit("O decision key is not bound to ROOT launch intent")
+    topology = load_root_topology(Path(args.topology_root))
     verifier = Ed25519Verifier()
     broker = AcceptanceBroker(Path(args.root), Path(args.seed), Path(args.policy), Path(args.templates))
-    result = FirmwareAcceptanceController(broker).execute_artifacts(Path(args.proposal), Path(args.decision), Path(args.authorization), verifier)
+    controller = FirmwareAcceptanceController(broker, topology=topology)
+    def decision_ready(path: Path) -> None:
+        # CLI does not own O's path and deliberately never creates, rewrites, or waits by polling it.
+        if not path.is_file() or path.is_symlink(): raise AdmissionError("O decision is not ready")
+    result = controller.run_lifecycle(Path(args.request), Path(args.proposal), Path(args.decision), Path(args.authorization), verifier, wait_for_decision=decision_ready, result_path=Path(args.result))
     print(json.dumps({"outcome": result["outcome"], "evidence": result["evidence"]}, sort_keys=True))
     return 0
 
