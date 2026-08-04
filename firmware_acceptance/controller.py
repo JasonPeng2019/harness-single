@@ -364,6 +364,10 @@ class FirmwareAcceptanceController:
             values = call["arguments"]
             mode = "all_null" if all(value is None for value in values.values()) else "populated"
             expected = rule["next_by_mode"].get(mode)
+        elif "next_by_tool_name" in rule:
+            expected = rule["next_by_tool_name"].get(call["arguments"].get("tool_name"))
+        elif "next_by_server_status" in rule:
+            expected = request["next_state"] if request["next_state"] in set(rule["next_by_server_status"].values()) else None
         elif session["active_plan"] is not None:
             plan = session["active_plan"]
             if call["method"] != plan["method"] or call["arguments"] != {"board_id":call["board"], **plan["parameters"]}: raise AdmissionError("paired action is not exactly bound to its accepted plan")
@@ -398,10 +402,16 @@ class FirmwareAcceptanceController:
             session["transport"].send({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":{"name":call["method"],"arguments":call["arguments"]}}, "session tools/call")
             raw = session["transport"].receive(rpc_id)
             if not isinstance(raw.get("result"), dict) or raw["result"].get("isError") is True: raise AdmissionError("session MCP result failed")
+            rule = self.broker.policy["methods"][call["method"]]
+            if "next_by_server_status" in rule:
+                status = raw["result"].get("status")
+                if rule["next_by_server_status"].get(status) != proposal["next_state"]:
+                    raise AdmissionError("server result status did not permit the requested transition")
+            if call["method"] == "board_validate" and raw["result"].get("ready") is not True:
+                raise AdmissionError("board validation did not report ready")
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
             result_sha = _write_new(result_path, result)
-            rule = self.broker.policy["methods"][call["method"]]
             if "next_by_mode" in rule and any(value is not None for value in call["arguments"].values()):
                 session["active_plan"] = {"method":rule["plan_action"],"parameters":call["arguments"]}
             session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}

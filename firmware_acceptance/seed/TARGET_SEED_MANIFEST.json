@@ -1,9 +1,9 @@
 {
   "schema_version": "firmware-v2-target-seed-manifest/v1",
   "files": [
-    {"path": "TARGET_CHARTER.md", "sha256": "5aea61dec6babcc2dd09abecc41349139f1e5fc01c2ec6f10df9af18beeb8a78"},
+    {"path": "TARGET_CHARTER.md", "sha256": "4a624cb41018e06738706d4a24958554491e953ff8c0af18e6ba17aecf385944"},
     {"path": "PINNED_INPUTS.json", "sha256": "67fbc2adc499f11c32c99d4484f2ff8ae14a3ca6ee4b899acf35d7897c4623f6"},
-    {"path": "TEST_CONTRACT.json", "sha256": "3154e0c102b5379de03d57161da2f9ea4d2d0f083a411e577aa7431541e5736a"},
-    {"path": "EVIDENCE_SCHEMA.json", "sha256": "e4670ca5901421813d30476630a5347ff1e286f60634651b1cd284c66f201114"}
+    {"path": "TEST_CONTRACT.json", "sha256": "1a9bafa07b3d44d0bcd2384083ab53495cd31ecd8e503b2ca0f72ddd1693224d"},
+    {"path": "EVIDENCE_SCHEMA.json", "sha256": "87d8b2e85abb49d434310d2fe38b9b0aac35804dd77b42421a076f43e9045ce3"}
   ]
 }

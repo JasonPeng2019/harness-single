@@ -69,7 +69,7 @@ class FirmwareAcceptanceTargetTests(unittest.TestCase):
         self.assertEqual(tuple(contract["gating_ids"]), tuple(item["id"] for item in definitions))
         self.assertEqual(18, len(definitions))
         self.assertEqual(
-            {"TARGET_LOCAL_REPAIR", "HARNESS_WATCHER_ABORT", "PINNED_SERVER_REPAIR"},
+            {"TARGET_LOCAL_REPAIR", "HARNESS_WATCHER_ABORT", "AUTHORIZED_SERVER_LIMITATION"},
             {item["failure_route"] for item in definitions},
         )
         self.assertTrue(all(item["dependency_inputs"] for item in definitions))

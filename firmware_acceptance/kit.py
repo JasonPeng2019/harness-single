@@ -243,7 +243,7 @@ def validate_campaign_contract(seed: Path) -> None:
     if {item.get("id") for item in value["definitions"] if isinstance(item, dict)} != set(ids):
         raise AdmissionError("campaign contract IDs are not exact")
     for item in value["definitions"]:
-        if not isinstance(item, dict) or set(item) != definition_keys or not isinstance(item["dependency_inputs"], list) or not item["dependency_inputs"] or item["fingerprint_algorithm"] != "sha256-canonical-json" or item["failure_route"] not in {"TARGET_LOCAL_REPAIR", "HARNESS_WATCHER_ABORT", "PINNED_SERVER_REPAIR"}:
+        if not isinstance(item, dict) or set(item) != definition_keys or not isinstance(item["dependency_inputs"], list) or not item["dependency_inputs"] or item["fingerprint_algorithm"] != "sha256-canonical-json" or item["failure_route"] not in {"TARGET_LOCAL_REPAIR", "HARNESS_WATCHER_ABORT", "AUTHORIZED_SERVER_LIMITATION"}:
             raise AdmissionError("campaign definition is malformed")
     if value["passed_registry"] != {"schema": "firmware-passed-registry/v1", "key": "stable_test_id+dependency_fingerprint", "rerun_on": "fingerprint_change"}:
         raise AdmissionError("passed registry/selective rerun contract is invalid")
@@ -406,6 +406,64 @@ class AcceptanceBroker:
         if any(call.get(key) != lane[key] for key in ("lane_id", "probe_uid", "target", "profile")) or call.get("board") != lane["lane_id"] or call.get("resource") != lane["lane_id"] or (call.get("route") is not None and call.get("route") != lane["serial_route"]):
             raise AdmissionError("call identity does not match selected physical lane")
         return lane
+
+    def record_server_limitation(self, o_decision_path: Path, limitation_id: str) -> dict[str, Any]:
+        """Derive, once, an immutable server-limitation record; this never authorizes a bypass."""
+        if not isinstance(limitation_id, str) or not limitation_id or any(char in limitation_id for char in "/\\"):
+            raise AdmissionError("limitation identity is invalid")
+        decision = self._load_limitation_decision(o_decision_path)
+        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
+        if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"]:
+            raise AdmissionError("server limitation decision is not closed or signed")
+        if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
+            raise AdmissionError("server limitation identities are incomplete")
+        pinned = decision["pinned_source"]
+        if not isinstance(pinned, dict) or set(pinned) != {"commit", "immutable"} or pinned != {"commit":_PINNED_SERVER_COMMIT, "immutable":True}:
+            raise AdmissionError("server limitation cannot edit or repin the immutable server")
+        if decision["attribution"] not in {"PINNED_SERVER_SOURCE"}:
+            raise AdmissionError("server limitation attribution is not pinned-server source")
+        chain = decision["call_chain"]
+        if not isinstance(chain, list) or len(chain) < 1 or any(not isinstance(item, dict) or set(item) != {"path", "sha256", "stage"} or item["stage"] not in {"dispatch", "raw-result"} for item in chain) or {item["stage"] for item in chain} != {"dispatch", "raw-result"}:
+            raise AdmissionError("limitation requires a dispatched raw server failure chain")
+        raw = next(item for item in chain if item["stage"] == "raw-result")
+        self._verify_limitation_reference(raw, "raw server failure")
+        raw_value = json.loads(Path(raw["path"]).read_text(encoding="utf-8"))
+        if raw_value.get("outcome") != "FAIL" or "raw_result" not in raw_value:
+            raise AdmissionError("limitation requires raw pinned-server failure, not pre-dispatch rejection")
+        terminal = decision["session_terminal"]
+        if not isinstance(terminal, dict) or set(terminal) != {"path", "sha256", "state"} or terminal["state"] not in {"ABORTED", "CLOSED"}: raise AdmissionError("terminal session evidence is incomplete")
+        self._verify_limitation_reference(terminal, "terminal session")
+        process = decision["process_evidence"]
+        if not isinstance(process, dict) or process.get("exact_reaped") is not True or process.get("helpers_stopped") is not True: raise AdmissionError("terminal process cleanup is incomplete")
+        alternatives = decision["alternatives"]
+        order = ["PARTIAL_MCP", "PINNED_COMPONENT_INTEGRATION", "CANDIDATE_BOUNDARY_UNIT"]
+        if not isinstance(alternatives, list) or [item.get("kind") for item in alternatives if isinstance(item, dict)] != order or any(not isinstance(item, dict) or set(item) != {"kind", "available", "reason"} or not isinstance(item["available"], bool) or not isinstance(item["reason"], str) for item in alternatives): raise AdmissionError("limitation alternatives are not closed and ordered")
+        available = next((item for item in alternatives if item["available"]), None)
+        substitute = decision["substitute"]
+        if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not all(isinstance(substitute[key], str) and substitute[key] for key in ("stable_id", "assignment", "result")):
+            raise AdmissionError("limitation substitute is not the first safe available alternative")
+        if any(item["available"] is False and not item["reason"] for item in alternatives[:order.index(available["kind"])]): raise AdmissionError("skipped alternative lacks evidence-linked reason")
+        if decision["original_test"] == substitute["stable_id"] or "protected" in decision["original_test"].lower() or any(token in json.dumps(decision, sort_keys=True).lower() for token in ("pyocd", "direct serial", "direct mcp", "hardware absent", "operator error", "fixture error", "environment error", "unsafe call")):
+            raise AdmissionError("limitation cannot substitute protected tests or bypass physical authority")
+        result = {key: decision[key] for key in required - {"signature"}}
+        result["schema"] = "firmware-server-limitation/v1"
+        result["o_decision"] = {"path":str(o_decision_path.resolve()),"sha256":hashlib.sha256(o_decision_path.read_bytes()).hexdigest()}
+        path = _safe_child(self.root, "hil", decision["lane_id"], "server-limitations", limitation_id + ".json")
+        digest = _write_new(path, result)
+        return {**result, "path":str(path), "raw_sha256":digest}
+
+    def _load_limitation_decision(self, path: Path) -> dict[str, Any]:
+        reject_linked_path(path)
+        if path.is_symlink() or not path.is_file(): raise AdmissionError("O limitation decision is unsafe")
+        try: value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc: raise AdmissionError("O limitation decision is unreadable") from exc
+        if not isinstance(value, dict): raise AdmissionError("O limitation decision is not an object")
+        return value
+
+    @staticmethod
+    def _verify_limitation_reference(reference: dict[str, Any], label: str) -> None:
+        path = Path(reference["path"]); reject_linked_path(path)
+        if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]: raise AdmissionError(label + " reference drifted")
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")

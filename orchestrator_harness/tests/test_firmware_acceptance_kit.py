@@ -121,6 +121,20 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                 with self.assertRaises(AdmissionError): validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker" / str(len(str(value))), Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest)
                 value = mutated
 
+    def test_server_limitation_is_create_once_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
+            def write(name: str, value: object) -> dict[str, str]:
+                path = root / name; path.write_text(__import__("json").dumps(value), encoding="utf-8"); return {"path":str(path),"sha256":__import__("hashlib").sha256(path.read_bytes()).hexdigest()}
+            dispatch = write("dispatch.json", {"stage":"dispatch"}); raw = write("raw.json", {"outcome":"FAIL","raw_result":{"server":"failure"}}); terminal = write("terminal.json", {"terminal":"ABORTED"})
+            decision = {"schema":"firmware-server-limitation-decision/v1","limitation_id":"L-1","attempt_id":"attempt","lane_id":"STM-A","session_id":"session","original_test":"PHYSICAL-A21","classification":"AUTHORIZED_SERVER_LIMITATION","call_chain":[{**dispatch,"stage":"dispatch"},{**raw,"stage":"raw-result"}],"session_terminal":{**terminal,"state":"ABORTED"},"process_evidence":{"exact_reaped":True,"helpers_stopped":True},"pinned_source":{"commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","immutable":True},"attribution":"PINNED_SERVER_SOURCE","alternatives":[{"kind":"PARTIAL_MCP","available":True,"reason":"supported"},{"kind":"PINNED_COMPONENT_INTEGRATION","available":False,"reason":"later"},{"kind":"CANDIDATE_BOUNDARY_UNIT","available":False,"reason":"later"}],"substitute":{"kind":"PARTIAL_MCP","stable_id":"SUB-A21","assignment":"assignment","result":"result"},"physical_certification":{"status":"NOT_CERTIFIED"},"o_decision":{"issuer":"F.C3.O"},"created_utc":"2026-01-01T00:00:00Z","signature":"signed"}
+            decision_path = root / "decision.json"; decision_path.write_text(__import__("json").dumps(decision), encoding="utf-8")
+            result = broker.record_server_limitation(decision_path, "L-1")
+            self.assertEqual("AUTHORIZED_SERVER_LIMITATION", result["classification"]); self.assertEqual("NOT_CERTIFIED", result["physical_certification"]["status"])
+            with self.assertRaises(AdmissionError): broker.record_server_limitation(decision_path, "L-1")
+            decision["attribution"] = "UNKNOWN"; decision_path.write_text(__import__("json").dumps(decision), encoding="utf-8")
+            with self.assertRaises(AdmissionError): broker.record_server_limitation(decision_path, "L-2")
+
     def test_worker_environment_has_no_mcp_capability(self) -> None:
         env = worker_environment()
         self.assertEqual("", env["MCP_ENDPOINT"])
