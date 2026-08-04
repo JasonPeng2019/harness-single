@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import firmware_acceptance.kit as kit
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_bound_operation, canonical_sha256, evaluate_call, raw_result_sha256, validate_campaign_contract, validate_seed_manifest, worker_environment
 
 
@@ -33,6 +36,19 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
 
     def test_seed_is_exact_and_hash_bound(self) -> None:
         validate_seed_manifest(Path("firmware_acceptance/seed"))
+
+    def test_pinned_server_rejects_regular_and_linked_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); subprocess.run(["git", "init", "-q"], cwd=root, check=True); (root / "pin").write_text("pin")
+            subprocess.run(["git", "add", "pin"], cwd=root, check=True); subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@invalid", "commit", "-qm", "pin"], cwd=root, check=True)
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            with patch.object(kit, "_PINNED_SERVER_ROOT", root), patch.object(kit, "_PINNED_SERVER_COMMIT", commit):
+                (root / ".env").write_text("forbidden")
+                with self.assertRaises(AdmissionError): kit.validate_pinned_server()
+                (root / ".env").unlink()
+                try: (root / ".env").symlink_to(root / "missing.env")
+                except OSError: return
+                with self.assertRaises(AdmissionError): kit.validate_pinned_server()
 
     def test_controller_admission_is_bounded_and_fail_closed(self) -> None:
         call = {"call_id": "c1", "lane_id": "P3.STM", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "method": "reset_and_halt", "method_version": 1, "arguments": {"board_id": "STM-A"}, "proposal_sha256": "a", "decision_sha256": "b", "authorization_sha256": "c", "deadline_monotonic": 100.0, "plan": {"max_operation_duration_seconds": 30}, "permission": {"granted": True}}

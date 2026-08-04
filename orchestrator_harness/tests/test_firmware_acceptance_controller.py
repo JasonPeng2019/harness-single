@@ -9,7 +9,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import firmware_acceptance.controller as controller_module
 from firmware_acceptance.controller import FirmwareAcceptanceController, _StdioTransport, _process_identity
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload
 
@@ -86,6 +88,22 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             messages = [json.loads(line) for line in launches[0].stdin.getvalue().splitlines()]
             self.assertEqual(["initialize", "notifications/initialized", "tools/call"], [item["method"] for item in messages[:3]])
             self.assertEqual([1, None, 2], [item.get("id") for item in messages[:3]])
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertTrue(cleanup["stderr_log_complete"]); self.assertEqual(cleanup["stderr_sha256"], cleanup["stderr_log_sha256"])
+
+    def test_stderr_persistence_failure_is_incomplete_and_fails_closed(self) -> None:
+        class FailingSink:
+            def write(self, _: bytes) -> int: raise OSError("synthetic write failure")
+            def flush(self) -> None: raise OSError("synthetic flush failure")
+            def close(self) -> None: pass
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims); paths = self._flow(root, controller, verifier)
+            original = controller_module._StdioTransport
+            def transport(process: _Process, *args: object) -> _StdioTransport:
+                value = original(process, *args); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
+            with patch.object(controller_module, "_StdioTransport", transport), self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertFalse(cleanup["stderr_log_complete"]); self.assertIn("stderr_log_error", cleanup); self.assertFalse(claims[0].live)
 
     def test_retained_authorization_raw_rewrite_rejects_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
