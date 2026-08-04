@@ -1,0 +1,14 @@
+{
+  "schema_version": "firmware-mcp-method-policy/v1",
+  "default": "deny",
+  "prohibited_actions": ["bootloader replacement", "unlock", "mass erase", "protection changes", "destructive recovery", "try-last", "guessed wiring", "direct pyOCD", "direct serial", "direct MCP bypass"],
+  "methods": {
+    "setup_overview/v1": {"mutating": false, "maximum_duration_seconds": 30},
+    "flash_application/v1": {"mutating": true, "application_region_only": true, "maximum_duration_seconds": 180},
+    "reset/v1": {"mutating": true, "maximum_duration_seconds": 30},
+    "debug_snapshot/v1": {"mutating": false, "maximum_duration_seconds": 60},
+    "uart_capture/v1": {"mutating": false, "maximum_duration_seconds": 60},
+    "uart_write/v1": {"mutating": true, "maximum_bytes": 256, "maximum_duration_seconds": 30}
+  },
+  "legal_rf_intent": {"frequency_hz": 915000000, "maximum_dbm": 10, "maximum_payload_bytes": 64, "maximum_airtime_ms_per_60s": 6000, "bandwidth_hz": 125000, "coding_rate": "4/5", "spreading_factor_range": [7, 10]}
+}

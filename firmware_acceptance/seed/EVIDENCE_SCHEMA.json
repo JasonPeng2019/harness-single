@@ -1,0 +1,1 @@
+{"schema_version":"target-evidence/v1","required":["stable_test_id","dependency_fingerprint","proposal","policy_evaluation","signed_decision","authorization","dispatch_admission","dispatch","raw_result","returning_state_cleanup"],"result":{"outcomes":["PASS","FAIL","INDETERMINATE_EXPIRED","INDETERMINATE_TIMEOUT"],"success_requires_behavioral_oracle":true}}
