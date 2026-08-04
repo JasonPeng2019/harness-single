@@ -14,8 +14,9 @@ from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureV
 
 
 class _Verifier(SignatureVerifier):
+    def __init__(self, payload: bytes | None = None) -> None: self.payload = payload
     def verify(self, payload: bytes, signature: str, public_key: str) -> bool:
-        return signature == "signed" and public_key == "public" and bool(payload)
+        return signature == "signed" and public_key == "public" and (self.payload is None or payload == self.payload)
 
 
 class _Input(io.BytesIO):
@@ -44,9 +45,10 @@ class _Claims:
 
 
 class FirmwareAcceptanceControllerTests(unittest.TestCase):
-    def _controller(self, root: Path, replies: list[dict[str, object]], launches: list[_Process]) -> FirmwareAcceptanceController:
+    def _controller(self, root: Path, replies: list[dict[str, object]], launches: list[_Process], configs: list[dict[str, object]] | None = None) -> FirmwareAcceptanceController:
         broker = AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
-        def launch(_: dict[str, object]) -> _Process:
+        def launch(config: dict[str, object]) -> _Process:
+            if configs is not None: configs.append(config)
             process = _Process(replies); launches.append(process); return process
         return FirmwareAcceptanceController(broker, launcher=launch, clock=lambda: 1.0, identity_provider=lambda pid: {"pid": pid, "created_utc": "synthetic"}, claims_factory=lambda _lane, _call: _Claims(root))
 
@@ -58,14 +60,16 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
     def test_fake_stdio_success_is_controller_owned(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             launches: list[_Process] = []
-            controller = self._controller(Path(temporary), [{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}], launches)
+            configs: list[dict[str, object]] = []
+            controller = self._controller(Path(temporary), [{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}], launches, configs)
             proposal = controller.create_proposal(self._request())
-            result = controller.execute(proposal, {"proposal_sha256":proposal["sha256"],"signature":"signed","public_key":"public"}, {"proposal_sha256":proposal["sha256"],"expires_monotonic":99,"delegated_authority":"grant"}, _Verifier())
+            result = controller.execute(proposal, {"proposal_sha256":proposal["sha256"],"signature":"signed","public_key":"public"}, {"proposal_sha256":proposal["sha256"],"expires_monotonic":99,"delegated_authority":"grant"}, _Verifier(proposal["sha256"].encode()))
             self.assertEqual("PASS", result["outcome"])
             self.assertEqual("", result["worker_environment"]["MCP_ENDPOINT"])
             self.assertTrue(launches[0].poll() is not None)
             self.assertIn(b'"method":"tools/call"', launches[0].stdin.getvalue())
             self.assertIn(b'"method":"notifications/initialized"', launches[0].stdin.getvalue())
+            self.assertTrue({"BYO_MCP_ARTIFACT_ROOT", "PYOCD_PROBE_UID", "PYOCD_TARGET", "PYTHONPYCACHEPREFIX"} <= set(configs[0]["environment"]))
 
     def test_no_launch_before_signature_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

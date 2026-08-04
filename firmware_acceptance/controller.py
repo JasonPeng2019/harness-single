@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import argparse
+import importlib
 import subprocess
 import threading
 import time
@@ -68,7 +69,7 @@ def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k.upper() in keep and not k.upper().startswith(blocked)}
     env.update({"PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1"})
     for key, value in config["environment"].items():
-        if key in {"FIRMWARE_ARTIFACT_ROOT", "FIRMWARE_CACHE_ROOT", "FIRMWARE_PROBE_UID", "FIRMWARE_TARGET"}:
+        if key in {"BYO_MCP_ARTIFACT_ROOT", "PYOCD_PROBE_UID", "PYOCD_TARGET", "PYTHONPYCACHEPREFIX"}:
             env[key] = value
     return env
 
@@ -251,12 +252,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--proposal", required=True)
     parser.add_argument("--decision", required=True)
     parser.add_argument("--authorization", required=True)
-    parser.add_argument("--help-artifacts", action="store_true")
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--seed", required=True)
+    parser.add_argument("--policy", required=True)
+    parser.add_argument("--templates", required=True)
+    parser.add_argument("--verifier", required=True, help="trusted C3 verifier factory module:attribute")
     args = parser.parse_args(argv)
-    if args.help_artifacts:
-        print("proposal, decision, and authorization must be exact controller-root artifact paths")
-        return 0
-    raise SystemExit("a production signature verifier must be supplied by C3-HARNESS; refusing launch")
+    module, separator, attribute = args.verifier.partition(":")
+    if not separator or not module or not attribute: raise SystemExit("verifier must be module:attribute")
+    factory = getattr(importlib.import_module(module), attribute)
+    verifier = factory()
+    if not isinstance(verifier, SignatureVerifier): raise SystemExit("trusted verifier factory returned an invalid verifier")
+    broker = AcceptanceBroker(Path(args.root), Path(args.seed), Path(args.policy), Path(args.templates))
+    result = FirmwareAcceptanceController(broker).execute_artifacts(Path(args.proposal), Path(args.decision), Path(args.authorization), verifier)
+    print(json.dumps({"outcome": result["outcome"], "evidence": result["evidence"]}, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

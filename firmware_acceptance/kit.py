@@ -305,7 +305,9 @@ class AcceptanceBroker:
         if {key: value for key, value in intent.items() if key != "raw_result_sha256"} != {key: value for key, value in bound.items() if key != "raw_result_sha256"} or bound["raw_result_sha256"] == "PENDING":
             raise AdmissionError("raw result binding drifted from immutable intent")
         decision = records[2]
-        if verifier is None or not verifier.verify(canonical_sha256(records[0]).encode(), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
+        # O signs the immutable proposal digest bytes, not a mutable evidence wrapper.
+        proposal_digest = records[0].get("sha256")
+        if not isinstance(proposal_digest, str) or verifier is None or not verifier.verify(proposal_digest.encode("ascii"), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
             raise AdmissionError("signed decision is absent or invalid")
         authorization = records[3]
         expiry = authorization.get("expires_monotonic")
