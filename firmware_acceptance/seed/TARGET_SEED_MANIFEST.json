@@ -3,7 +3,7 @@
   "files": [
     {"path": "TARGET_CHARTER.md", "sha256": "5aea61dec6babcc2dd09abecc41349139f1e5fc01c2ec6f10df9af18beeb8a78"},
     {"path": "PINNED_INPUTS.json", "sha256": "67fbc2adc499f11c32c99d4484f2ff8ae14a3ca6ee4b899acf35d7897c4623f6"},
-    {"path": "TEST_CONTRACT.json", "sha256": "3b78958b0aa13b639bb11e52f3685aa76c86cea921a5ebd16c2f890429fbac72"},
-    {"path": "EVIDENCE_SCHEMA.json", "sha256": "ea219be88400c2210c762c84a14e994fcb3e2fbb8dea8b151cb9229cab30c0d4"}
+    {"path": "TEST_CONTRACT.json", "sha256": "3154e0c102b5379de03d57161da2f9ea4d2d0f083a411e577aa7431541e5736a"},
+    {"path": "EVIDENCE_SCHEMA.json", "sha256": "e4670ca5901421813d30476630a5347ff1e286f60634651b1cd284c66f201114"}
   ]
 }

@@ -67,6 +67,7 @@ _CODING_ONLY_FIELDS = frozenset({
     "codex",
     "codex_settings",
     "finding_gate",
+    "child_environment_isolation",
 })
 # ``model_settings`` is retained by both routes, but coding accepts these
 # nested settings only as a compatibility fallback.  They must not be silently
@@ -81,6 +82,18 @@ _CODING_ONLY_MODEL_SETTINGS_FIELDS = frozenset({
 
 def _utc() -> str:
     return iso_utc(datetime.now(timezone.utc)) or ""
+
+
+_PHYSICAL_CHILD_PREFIXES = ("MCP_", "PYOCD_", "BYO_MCP_", "FIRMWARE_MCP_", "PROBE_", "TARGET_", "SERIAL_", "OPENOCD_", "JLINK_", "CREDENTIAL_", "SECRET_", "TOKEN_", "FIRMWARE_CONFIG_")
+_CHILD_ENV_ALLOW = frozenset({"PATH", "PATHEXT", "SYSTEMROOT", "COMSPEC", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "PYTHONUTF8", "PYTHONIOENCODING", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"})
+
+
+def isolated_coding_child_environment(inherited: Mapping[str, str] | None = None) -> tuple[dict[str, str], list[str]]:
+    """Return the optional Codex-only child environment without physical lane capability."""
+    source = dict(os.environ if inherited is None else inherited)
+    cleared = sorted(key for key in source if key.upper().startswith(_PHYSICAL_CHILD_PREFIXES))
+    allowed = {key: value for key, value in source.items() if key.upper() in _CHILD_ENV_ALLOW and not key.upper().startswith(_PHYSICAL_CHILD_PREFIXES)}
+    return allowed, cleared
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -199,6 +212,7 @@ class Invocation:
     last_message_path: Path
     event_log: Path
     finding_gate: dict[str, str] | None = None
+    child_environment_isolation: bool = False
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -427,13 +441,16 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         if finding_path.parent != workspace or finding_path.name != "FINDINGS.json":
             raise InvocationError("finding_gate.path must be workspace/FINDINGS.json")
         normalized_gate = {"role": finding_gate["role"], "path": str(finding_path)}
+    isolation = raw.get("child_environment_isolation", False)
+    if not isinstance(isolation, bool):
+        raise InvocationError("child_environment_isolation must be boolean")
     return Invocation(
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
         prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
         _string(raw, "phase"), lane_id, [], [], [], {}, resources, resource_lock_root,
         model, reasoning, tier, command,
         overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
-        outputs["stderr"], outputs["last_message"], event_log, normalized_gate,
+        outputs["stderr"], outputs["last_message"], event_log, normalized_gate, isolation,
     )
 
 
@@ -754,7 +771,11 @@ def run(invocation: Invocation) -> int:
             })
             _atomic_json(invocation.status_path, state)
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
-            process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            child_env = None
+            if invocation.child_environment_isolation:
+                child_env, cleared = isolated_coding_child_environment()
+                state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
+            process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
             child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
             state.update({"state": "RUNNING_CODEX", "codex_pid": child.pid, "codex_started_utc": iso_utc(child.created_utc), "codex_created_utc": iso_utc(child.created_utc)})

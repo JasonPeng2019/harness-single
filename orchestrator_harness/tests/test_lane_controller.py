@@ -158,6 +158,7 @@ class LaneControllerTests(unittest.TestCase):
             "codex": {},
             "codex_settings": {},
             "finding_gate": {"role": "reviewer", "path": "FINDINGS.json"},
+            "child_environment_isolation": True,
         }
         self.assertEqual(set(coding_only), controller._CODING_ONLY_FIELDS)
         for field, value in coding_only.items():

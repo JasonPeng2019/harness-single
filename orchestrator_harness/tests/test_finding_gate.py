@@ -7,6 +7,7 @@ from pathlib import Path
 
 from orchestrator_harness.git_safety import GitSafetyError, validate_finding_triage, validate_findings
 from firmware_acceptance import finding_gate_fragment
+from orchestrator_harness.lane_controller import isolated_coding_child_environment
 
 
 class FindingGateTests(unittest.TestCase):
@@ -56,3 +57,8 @@ class FindingGateTests(unittest.TestCase):
             value["decisions"][0]["extra"] = "no"
             with self.assertRaises(GitSafetyError):
                 validate_finding_triage(value, findings_path=findings, findings_sha256=digest, finding_ids={"F1"})
+
+    def test_isolated_child_environment_has_no_physical_handles(self) -> None:
+        env, cleared = isolated_coding_child_environment({"PATH": "x", "MCP_ENDPOINT": "secret", "PYOCD_TARGET": "board", "BYO_MCP_ARTIFACT_ROOT": "artifact", "KEEP": "no"})
+        self.assertEqual({"PATH": "x"}, env)
+        self.assertEqual(["BYO_MCP_ARTIFACT_ROOT", "MCP_ENDPOINT", "PYOCD_TARGET"], cleared)

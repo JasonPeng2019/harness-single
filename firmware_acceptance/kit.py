@@ -25,15 +25,50 @@ class SignatureVerifier:
 FORBIDDEN = {"bootloader", "unlock", "mass_erase", "protection", "erase_all", "try_last"}
 _CAPABILITY_KEYS = ("MCP_ENDPOINT", "MCP_COMMAND", "PYOCD_PROBE_UID", "PYOCD_TARGET", "BYO_MCP_ARTIFACT_ROOT", "MCP_CREDENTIAL", "MCP_TOKEN")
 _PINNED_SERVER_ROOT = Path("C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/mcp-candidate")
+_PINNED_SERVER_COMMIT = "f003f84a7df51cd8595a3203c62e225b21da2a22"
+_SEED_FILES = ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json")
 
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def validate_pinned_server() -> str:
+    """Prove the controller is configured against the exact clean candidate tree."""
+    if not _PINNED_SERVER_ROOT.is_dir() or _PINNED_SERVER_ROOT.is_symlink():
+        raise AdmissionError("pinned MCP worktree is unavailable")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_PINNED_SERVER_ROOT, capture_output=True, text=True)
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=_PINNED_SERVER_ROOT, capture_output=True, text=True)
+    if head.returncode or status.returncode or head.stdout.strip() != _PINNED_SERVER_COMMIT or status.stdout.strip():
+        raise AdmissionError("pinned MCP worktree revision or cleanliness mismatch")
+    return _PINNED_SERVER_COMMIT
+
+
+def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
+    """Closed operation authority carried verbatim through every immutable stage."""
+    required = {
+        "server_commit", "method", "method_version", "arguments", "policy_sha256", "schema_sha256",
+        "plan_sha256", "permission_sha256", "authorization_sha256", "claim_sha256", "call_id",
+        "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route",
+        "governing_hashes", "c1_reference", "deadline_monotonic", "expires_monotonic", "seed_identity",
+        "target_identity", "raw_result_sha256", "cleanup_owner",
+    }
+    if set(value) != required:
+        raise AdmissionError("bound operation must be a closed complete authority object")
+    if value["server_commit"] != _PINNED_SERVER_COMMIT or not isinstance(value["method"], str) or not isinstance(value["arguments"], dict):
+        raise AdmissionError("bound operation server or method identity is invalid")
+    for key in ("method_version", "deadline_monotonic", "expires_monotonic"):
+        if not isinstance(value[key], (int, float)) or isinstance(value[key], bool):
+            raise AdmissionError("bound operation timing/version is invalid")
+    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "c1_reference", "seed_identity", "target_identity", "route"}:
+        if not isinstance(value[key], str) or not value[key]:
+            raise AdmissionError("bound operation has an empty identity or hash")
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
 def validate_seed_manifest(seed: Path) -> None:
     manifest = json.loads((seed / "TARGET_SEED_MANIFEST.json").read_text(encoding="utf-8"))
-    expected = {"TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"}
+    expected = set(_SEED_FILES[1:])
     entries = manifest.get("files")
     if not isinstance(entries, list) or {item.get("path") for item in entries if isinstance(item, dict)} != expected:
         raise AdmissionError("seed manifest must enumerate exactly the four locked seed files")
@@ -44,6 +79,24 @@ def validate_seed_manifest(seed: Path) -> None:
         payload = (seed / item["path"]).read_bytes()
         if hashlib.sha256(payload).hexdigest() != item.get("sha256"):
             raise AdmissionError(f"seed hash mismatch: {item['path']}")
+    validate_campaign_contract(seed)
+
+
+def validate_campaign_contract(seed: Path) -> None:
+    """Consume the compact campaign contract; documentation alone is not admission evidence."""
+    value = json.loads((seed / "TEST_CONTRACT.json").read_text(encoding="utf-8"))
+    ids = ("H00", "H01", "H02", "H05", "S10", "S11", "S12", "S13", "A21", "A23", "A24", "D30", "D31", "D32", "D33", "D34", "D35", "D36")
+    required = {"schema_version", "gating_ids", "definitions", "non_gating", "passed_registry", "selective_rerun", "review_test_findings"}
+    if set(value) != required or tuple(value["gating_ids"]) != ids or not isinstance(value["definitions"], list) or len(value["definitions"]) != len(ids):
+        raise AdmissionError("campaign contract is incomplete or not closed")
+    definition_keys = {"id", "board", "family", "input", "action", "oracle", "failure_injection", "evidence_type", "dependency_inputs", "fingerprint_algorithm", "cleanup", "resume_contention", "failure_route"}
+    if {item.get("id") for item in value["definitions"] if isinstance(item, dict)} != set(ids):
+        raise AdmissionError("campaign contract IDs are not exact")
+    for item in value["definitions"]:
+        if not isinstance(item, dict) or set(item) != definition_keys or not isinstance(item["dependency_inputs"], list) or not item["dependency_inputs"] or item["fingerprint_algorithm"] != "sha256-canonical-json" or item["failure_route"] not in {"TARGET_LOCAL_REPAIR", "HARNESS_WATCHER_ABORT", "PINNED_SERVER_REPAIR"}:
+            raise AdmissionError("campaign definition is malformed")
+    if value["passed_registry"] != {"schema": "firmware-passed-registry/v1", "key": "stable_test_id+dependency_fingerprint", "rerun_on": "fingerprint_change"}:
+        raise AdmissionError("passed registry/selective rerun contract is invalid")
 
 
 def worker_environment() -> dict[str, str]:
@@ -111,6 +164,7 @@ class AcceptanceBroker:
         self.policy = _load_policy(self.policy_path)
         self.manifest = validate_manifest(manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json"))
         self.root.mkdir(parents=True, exist_ok=True)
+        self._target_identities: dict[Path, dict[str, str]] = {}
         if self.root.is_symlink():
             raise AdmissionError("broker root cannot be a symlink")
         validate_seed_manifest(self.seed)
@@ -122,7 +176,7 @@ class AcceptanceBroker:
             raise AdmissionError("target root must be a fresh direct child of the confined targets root")
         target_parent.mkdir(parents=True, exist_ok=True)
         target.mkdir()
-        for name in ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"):
+        for name in _SEED_FILES:
             destination = _safe_child(target, name)
             with destination.open("xb") as handle:
                 handle.write((self.seed / name).read_bytes())
@@ -135,18 +189,27 @@ class AcceptanceBroker:
         completed = subprocess.run(["git", "-c", "user.name=Firmware Acceptance", "-c", "user.email=firmware-acceptance@invalid", "commit", "-q", "-m", "seed"], cwd=target, check=False, capture_output=True, text=True)
         if completed.returncode:
             raise AdmissionError("disposable Git seed commit failed")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target, check=True, capture_output=True, text=True).stdout.strip()
+        self._target_identities[target] = {"seed_sha256": canonical_sha256(json.loads((target / "TARGET_SEED_MANIFEST.json").read_text(encoding="utf-8"))), "initial_commit": head}
 
     def validate_target(self, target_root: Path) -> str:
         target = target_root.resolve()
         if target.parent != _safe_child(self.root, "targets") or target.is_symlink():
             raise AdmissionError("target escaped confined root")
         validate_seed_manifest(target)
-        for name in ("TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"):
+        for name in _SEED_FILES:
             if target.joinpath(name).stat().st_mode & stat.S_IWRITE:
                 raise AdmissionError("seed file is writable")
         result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target, check=False, capture_output=True, text=True)
         if result.returncode:
             raise AdmissionError("target seed commit missing")
+        identity = self._target_identities.get(target)
+        if identity is None:
+            raise AdmissionError("target seed identity is unknown")
+        for name in _SEED_FILES:
+            blob = subprocess.run(["git", "show", f"{identity['initial_commit']}:{name}"], cwd=target, capture_output=True)
+            if blob.returncode or hashlib.sha256(blob.stdout).hexdigest() != hashlib.sha256((target / name).read_bytes()).hexdigest():
+                raise AdmissionError("seed tree was substituted or rewritten")
         return result.stdout.strip()
 
     def controller_config(self, lane_id: str, inherited: dict[str, str] | None = None) -> dict[str, Any]:
@@ -157,9 +220,8 @@ class AcceptanceBroker:
         if any(env.get(key) for key in _CAPABILITY_KEYS):
             raise AdmissionError("ambient physical capability is forbidden")
         lane_root = _safe_child(self.root, "lanes", lane_id)
+        validate_pinned_server()
         server_root = _PINNED_SERVER_ROOT.resolve()
-        if not server_root.is_dir():
-            raise AdmissionError("pinned MCP worktree is unavailable")
         firm, artifacts, logs, mcp = (_safe_child(lane_root, name) for name in (".firm", "artifacts", "logs", "mcp"))
         for path in (firm, artifacts, logs, mcp):
             path.mkdir(parents=True, exist_ok=True)
@@ -182,15 +244,19 @@ class AcceptanceBroker:
             if previous_path != expected:
                 raise AdmissionError("prior artifact must be the immediately preceding same-call stage")
             record = {**record, "previous_path": previous[0], "previous_sha256": previous[1]}
-        required = {"attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity"}
+        required = {"attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity", "bound_operation", "bound_operation_sha256"}
         if not required <= record.keys():
             raise AdmissionError("missing exact identity or lock bindings")
+        bound = canonical_bound_operation(record["bound_operation"])
+        if record["bound_operation_sha256"] != canonical_sha256(bound) or bound["call_id"] != call_id:
+            raise AdmissionError("bound operation hash or call identity mismatch")
         path = _safe_child(self.root, "calls", call_id, f"{order.index(stage):02d}-{stage}.json")
         return path, _write_new(path, {"schema": "firmware-call-evidence/v1", "stage": stage, "call_id": call_id, **record})
 
     def admit(self, call_id: str, stages: list[tuple[Path, str]], now_monotonic: float, verifier: SignatureVerifier | None) -> str:
         """Verify the complete immutable chain and produce a terminal classification only after cleanup."""
         names = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
+        validate_pinned_server()
         if len(stages) != len(names):
             raise AdmissionError("incomplete immutable evidence chain")
         records: list[dict[str, Any]] = []
@@ -206,9 +272,12 @@ class AcceptanceBroker:
             if index and (item.get("previous_path") != str(stages[index - 1][0]) or item.get("previous_sha256") != digests[-1]):
                 raise AdmissionError("broken immediate evidence chain")
             records.append(item); digests.append(expected_hash)
-        baseline = {key: records[0][key] for key in ("attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity")}
+        baseline = {key: records[0][key] for key in ("attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity", "bound_operation", "bound_operation_sha256")}
         if any(any(item.get(key) != value for key, value in baseline.items()) for item in records[1:]):
             raise AdmissionError("bound call identity changed")
+        bound = canonical_bound_operation(records[0]["bound_operation"])
+        if records[0]["bound_operation_sha256"] != canonical_sha256(bound):
+            raise AdmissionError("canonical bound operation hash mismatch")
         decision = records[2]
         if verifier is None or not verifier.verify(canonical_sha256(records[0]).encode(), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
             raise AdmissionError("signed decision is absent or invalid")
@@ -254,6 +323,10 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     allowed_parameters = rule.get("parameters")
     if not isinstance(allowed_parameters, list) or set(call["arguments"]) - set(allowed_parameters) - {"rf", "dio2_dependent"}:
         raise AdmissionError("method parameters do not match pinned guarded surface")
+    if call["method"] == "read_memory_address":
+        args = call["arguments"]
+        if set(args) != {"board_id", "address", "width", "length"} or args["width"] not in rule["widths"] or not isinstance(args["length"], int) or isinstance(args["length"], bool) or not 1 <= args["length"] <= rule["maximum_length_bytes"]:
+            raise AdmissionError("memory diagnostic arguments do not match pinned handler bounds")
     if call["method"] == "flash_application" and not rule.get("application_region_only"):
         raise AdmissionError("flash method lacks reviewed application containment")
     if call["arguments"].get("dio2_dependent"):
