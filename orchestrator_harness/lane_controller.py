@@ -28,6 +28,7 @@ from .git_safety import (
     invalid_result_evidence,
     repository_status,
     validate_coding_result,
+    validate_findings,
 )
 from .models import ProcessInfo, iso_utc
 from .processes import process_snapshot
@@ -65,6 +66,7 @@ _CODING_ONLY_FIELDS = frozenset({
     "resume",
     "codex",
     "codex_settings",
+    "finding_gate",
 })
 # ``model_settings`` is retained by both routes, but coding accepts these
 # nested settings only as a compatibility fallback.  They must not be silently
@@ -196,6 +198,7 @@ class Invocation:
     stderr_path: Path
     last_message_path: Path
     event_log: Path
+    finding_gate: dict[str, str] | None = None
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -413,13 +416,24 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     doer_value = raw.get("doer", lane_id)
     if not isinstance(doer_value, str) or not doer_value.strip():
         raise InvocationError("doer must be a non-empty string when supplied")
+    finding_gate = raw.get("finding_gate")
+    normalized_gate = None
+    if finding_gate is not None:
+        if not isinstance(finding_gate, dict) or set(finding_gate) != {"role", "path"}:
+            raise InvocationError("finding_gate must contain only role and path")
+        if finding_gate.get("role") not in {"reviewer", "test_writer", "test_executor"}:
+            raise InvocationError("finding_gate role is invalid")
+        finding_path = _safe_path(finding_gate.get("path"), root=workspace, name="finding_gate.path")
+        if finding_path.parent != workspace or finding_path.name != "FINDINGS.json":
+            raise InvocationError("finding_gate.path must be workspace/FINDINGS.json")
+        normalized_gate = {"role": finding_gate["role"], "path": str(finding_path)}
     return Invocation(
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
         prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
         _string(raw, "phase"), lane_id, [], [], [], {}, resources, resource_lock_root,
         model, reasoning, tier, command,
         overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
-        outputs["stderr"], outputs["last_message"], event_log,
+        outputs["stderr"], outputs["last_message"], event_log, normalized_gate,
     )
 
 
@@ -587,11 +601,19 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
             worker_invocation_id=invocation.worker_invocation_id,
             declaration=invocation.repository,
         )
+        findings: dict[str, Any] | None = None
+        if invocation.finding_gate is not None:
+            findings_path = Path(invocation.finding_gate["path"])
+            findings = validate_findings(
+                findings_path, lane_id=invocation.lane_id, worker_invocation_id=invocation.worker_invocation_id,
+                role=invocation.finding_gate["role"], commit=identity.head_commit, outcome=value["outcome"],
+            )
         return {
             "state": "VALID",
             "path": str(path),
             "sha256": sha256,
             "commit": identity.head_commit,
+            "findings": findings,
         }, True
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, GitSafetyError) as exc:
         return invalid_result_evidence(path, str(exc), sha256=sha256), False
