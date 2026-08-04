@@ -34,7 +34,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             extra = {"schema":"firmware-o-decision/v3","proposal_path":"proposal","proposal_sha256":"proposal","call":{},"claim":{},"decision":"approve","rationale":"reviewed","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1,"expires_monotonic":99,"topology_key_release":{},"orchestrator_identity":{},"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
             extra |= {"expires_monotonic":99} if stage == "authorization" else {}
             extra |= {"deadline_monotonic":100} if stage == "dispatch-admission" else {}
-            extra |= {"raw_result":raw_payload,"outcome":"PASS"} if stage == "raw-result" else {}
+            extra |= {"raw_result":raw_payload,"outcome":"FAIL"} if stage == "raw-result" else {}
             extra |= {"exact_reaped":True} if stage == "returning-state-cleanup" else {}
             stages.append(broker.record(stage, "call-raw", {**common, **extra}, (str(stages[-1][0]), stages[-1][1]) if stages else None))
             if stage == "raw-result":
