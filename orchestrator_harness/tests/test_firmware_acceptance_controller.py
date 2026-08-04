@@ -4,12 +4,13 @@ import hashlib
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from firmware_acceptance.controller import FirmwareAcceptanceController, _StdioTransport
+from firmware_acceptance.controller import FirmwareAcceptanceController, _StdioTransport, _process_identity
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, SignatureVerifier, canonical_decision_payload
 
 
@@ -171,3 +172,15 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
             self.assertTrue((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").is_file())
             self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)
+
+    def test_default_identity_provider_proves_tiny_subprocess_reaped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
+            paths = self._flow(root, controller, verifier)
+            fixture = "import sys,json\nfor line in sys.stdin:\n v=json.loads(line)\n if 'id' in v: print(json.dumps({'jsonrpc':'2.0','id':v['id'],'result':{}}),flush=True)\n"
+            controller.identity_provider = _process_identity
+            controller.launcher = lambda _: subprocess.Popen([sys.executable, "-c", fixture], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = controller.execute_artifacts(*paths, verifier)
+            cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
+            self.assertEqual("PASS", result["outcome"]); self.assertTrue(cleanup["initial_process_identity"])
+            self.assertIsNone(cleanup["post_reap_identity"]); self.assertTrue(cleanup["exact_reaped"])

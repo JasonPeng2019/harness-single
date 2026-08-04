@@ -17,6 +17,7 @@ from typing import Any, Callable, Protocol
 from orchestrator_harness.models import ProcessInfo
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import ResourceClaims, ResourceLockError
+from harness_common.process_identity import exact_process_identity
 from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256
 
 
@@ -78,11 +79,11 @@ def _launch(config: dict[str, Any]) -> StdioProcess:
     )
 
 
-def _process_identity(pid: int) -> dict[str, Any]:
-    item = process_snapshot().by_pid.get(pid)
-    if item is None or item.created_utc is None:
-        raise AdmissionError("MCP process creation identity is unavailable")
-    return {"pid": item.pid, "created_utc": item.created_utc.isoformat()}
+def _process_identity(pid: int) -> dict[str, Any] | None:
+    """The OS-level primitive returns None once the exact child is absent."""
+    if pid not in process_snapshot().by_pid:
+        return None
+    return exact_process_identity(pid)
 
 
 class _StdioTransport:
@@ -131,6 +132,10 @@ class _StdioTransport:
                 return True
             except AdmissionError: return False
         return False
+
+    def use_budget(self, remaining: Callable[[], float]) -> None:
+        """Switch only teardown to its reserved authorization authority."""
+        self.remaining = remaining
 
     def close_and_join(self) -> tuple[bool, dict[str, Any]]:
         self.accepting.clear(); self.stop.set(); outcome: dict[str, Any] = {"helper_threads": []}
@@ -192,7 +197,7 @@ def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
 class FirmwareAcceptanceController:
     """Two-phase controller that alone owns the MCP stdio process and physical capability."""
 
-    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any]] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0) -> None:
+    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0) -> None:
         self.broker, self.launcher, self.clock, self.identity_provider = broker, launcher or _launch, clock, identity_provider
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
         self._live_claims: Any | None = None
@@ -325,7 +330,8 @@ class FirmwareAcceptanceController:
             if process is not None:
                 try:
                     if transport is not None:
-                        cleanup["cancellation_sent"] = transport.cancel(2, cleanup["classification"])
+                        transport.use_budget(cleanup_remaining)
+                        cleanup["cancellation_sent"] = transport.cancel(2, cleanup["classification"]) if failure is not None else False
                         transport.accepting.clear()
                     observed = self.identity_provider(process.pid)
                     cleanup["pre_termination_identity"] = observed
