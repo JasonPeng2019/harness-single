@@ -397,10 +397,11 @@ class FirmwareAcceptanceController:
             expected = request["next_state"] if request["next_state"] in set(rule["next_by_server_status"].values()) else None
         if session["active_plan"] is not None and call["method"] in {session["active_plan"].get("method"), "board_fix_setup"}:
             plan = session["active_plan"]
-            if call["method"] != plan["method"] or call["arguments"] != plan["preferred_arguments"]: raise AdmissionError("paired action is not exactly bound to its accepted plan")
+            allowed = call["method"] == plan["method"] or (call["method"] == "board_fix_setup" and plan["method"] == "board_setup" and session["state"] == "SETUP_FIX_READY")
+            if not allowed or call["arguments"] != plan["preferred_arguments"]: raise AdmissionError("paired action is not exactly bound to its accepted plan")
         if call["method"] == "continue_setup":
             continuation = session.get("continuation")
-            if continuation is None or call["arguments"] != {"board_id":call["board"], **continuation}:
+            if continuation is None or call["arguments"] != {"board_id":continuation["board_id"], **continuation["value"]}:
                 raise AdmissionError("setup continuation did not use the exact server response")
         if expected != request["next_state"]: raise AdmissionError("session next state is not the locked policy transition")
         _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
@@ -468,7 +469,7 @@ class FirmwareAcceptanceController:
                     accepted = payload.get("accepted_response")
                     if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict):
                         raise AdmissionError("setup continuation is not predecessor-bound")
-                    session["continuation"] = {"continuation_id":continuation, "response":accepted}
+                    session["continuation"] = {"board_id":call["arguments"]["board_id"], "value":{"continuation_id":continuation, "response":accepted}}
                 elif call["method"] != "board_setup" or payload.get("status") == "setup_completed":
                     session["active_plan"] = None
             session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}

@@ -413,7 +413,7 @@ class AcceptanceBroker:
             raise AdmissionError("limitation identity is invalid")
         decision = self._load_limitation_decision(o_decision_path)
         required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
-        if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
+        if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or set(decision["o_decision"]) != {"public_key", "protected_suite"} or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
             raise AdmissionError("server limitation decision is not closed or signed")
         if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
             raise AdmissionError("server limitation identities are incomplete")
@@ -464,7 +464,7 @@ class AcceptanceBroker:
         self._verify_limitation_reference(protected, "protected suite")
         protected_value = json.loads(Path(protected["path"]).read_text(encoding="utf-8"))
         protected_ids = protected_value.get("protected_ids") if isinstance(protected_value, dict) else None
-        if not isinstance(protected_ids, list) or any(not isinstance(value, str) or not value for value in protected_ids): raise AdmissionError("protected suite artifact is not closed")
+        if not isinstance(protected_value, dict) or protected_value.get("schema") != "c1-protected-test-ids/v1" or protected_value.get("c1_reference") != records[0].get("c1_reference") or not isinstance(protected_ids, list) or not protected_ids or len(set(protected_ids)) != len(protected_ids) or any(not isinstance(value, str) or not value for value in protected_ids): raise AdmissionError("protected suite artifact is not closed")
         if decision["original_test"] == substitute["stable_id"] or decision["original_test"] in protected_ids or substitute["stable_id"] in protected_ids or any(token in json.dumps(decision, sort_keys=True).lower() for token in ("pyocd", "direct serial", "direct mcp", "hardware absent", "operator error", "fixture error", "environment error", "unsafe call", "xfail", "skip", "weaken")):
             raise AdmissionError("limitation cannot substitute protected tests or bypass physical authority")
         result = {key: decision[key] for key in required - {"signature"}}
@@ -484,6 +484,8 @@ class AcceptanceBroker:
 
     @staticmethod
     def _verify_limitation_reference(reference: dict[str, Any], label: str) -> None:
+        if not isinstance(reference, dict) or set(reference) != {"path", "sha256"} or not all(isinstance(reference.get(key), str) and reference[key] for key in ("path", "sha256")):
+            raise AdmissionError(label + " reference is not closed")
         path = Path(reference["path"]); reject_linked_path(path)
         if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]: raise AdmissionError(label + " reference drifted")
 
