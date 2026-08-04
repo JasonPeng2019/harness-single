@@ -117,7 +117,8 @@ def _validate_scope_effect(effect: Any, scope: dict[str, Any]) -> None:
     if not isinstance(limits, dict) or set(limits) != set(maximum): raise AdmissionError("scope effect limits are not closed")
     for key, maximum_value in maximum.items():
         value = limits[key]
-        if isinstance(maximum_value, bool) or not isinstance(value, type(maximum_value)) or (isinstance(maximum_value, int) and value > maximum_value) or (key in {"bandwidth_hz", "center_frequency_hz", "coding_rate_denominator"} and value != maximum_value): raise AdmissionError("scope effect exceeds delegated limits")
+        if isinstance(maximum_value, bool) or not isinstance(value, type(maximum_value)) or (key == "spreading_factor_min" and value < maximum_value) or (key != "spreading_factor_min" and isinstance(maximum_value, int) and value > maximum_value) or (key in {"bandwidth_hz", "center_frequency_hz", "coding_rate_denominator"} and value != maximum_value): raise AdmissionError("scope effect exceeds delegated limits")
+    if action == "lora_ping_pong_test" and limits["spreading_factor_min"] > limits["spreading_factor_max"]: raise AdmissionError("LoRa spreading-factor range is inverted")
     if action == "lora_ping_pong_test" and limits.get("dio2_dependent") is not None: raise AdmissionError("LoRa effect cannot claim DIO2 authority")
 
 
