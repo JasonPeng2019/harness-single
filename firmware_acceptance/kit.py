@@ -503,16 +503,25 @@ class AcceptanceBroker:
     def _limitation_c3_path(self, decision: dict[str, Any], name: str) -> Path:
         return _safe_child(self.root, "hil", decision["lane_id"], "server-limitations", decision["attempt_id"], decision["limitation_id"], "c3-harness", name)
 
-    def _verify_c3_completion(self, status_ref: Any, result_ref: Any, lane_id: str, worker_id: str) -> None:
+    def _verify_c3_completion(self, status_ref: Any, result_ref: Any, lane_id: str, worker_id: str, credit_token: str) -> dict[str, Any]:
         self._verify_limitation_reference(status_ref, "C3 controller status"); self._verify_limitation_reference(result_ref, "C3 worker result")
         try:
             status = json.loads(Path(status_ref["path"]).read_text(encoding="utf-8")); result = json.loads(Path(result_ref["path"]).read_text(encoding="utf-8"))
             validation = status.get("result_validation") if isinstance(status, dict) else None
-            if not isinstance(status, dict) or status.get("schema") != "orchestrator-lane-controller/v1" or status.get("state") != "CODEX_EXITED" or status.get("exit_code") != 0 or status.get("declared_lane_id") != lane_id or status.get("worker_invocation_id") != worker_id or status.get("held_resource_claims") != [] or status.get("result_valid") is not True or not isinstance(validation, dict) or validation.get("state") != "VALID" or validation.get("path") != result_ref["path"] or validation.get("sha256") != result_ref["sha256"] or not isinstance(status.get("controller_pid"), int) or not isinstance(status.get("controller_created_utc", status.get("controller_started_utc")), str):
+            creation_identity = (status.get("controller_created_utc") or status.get("controller_started_utc")) if isinstance(status, dict) else None
+            if not isinstance(credit_token, str) or not credit_token or not isinstance(status, dict) or status.get("schema") != "orchestrator-lane-controller/v1" or status.get("state") != "CODEX_EXITED" or status.get("exit_code") != 0 or status.get("declared_lane_id") != lane_id or status.get("worker_invocation_id") != worker_id or status.get("held_resource_claims") != [] or status.get("result_valid") is not True or not isinstance(validation, dict) or validation.get("state") != "VALID" or validation.get("path") != result_ref["path"] or validation.get("sha256") != result_ref["sha256"] or not isinstance(status.get("controller_pid"), int) or status["controller_pid"] <= 0 or not isinstance(creation_identity, str) or not creation_identity:
                 raise AdmissionError("C3 terminal status is not exact")
-            identity = validate_coding_result(result, lane_id=lane_id, worker_invocation_id=worker_id, declaration=declaration_from_status(status, Path(status["worktree_root"])))
+            declaration = declaration_from_status(status, Path(status["worktree_root"]))
+            workspace = declaration.worktree_root / ".agent-workspace"
+            if Path(result_ref["path"]).resolve() != (workspace / "RESULT.json").resolve() or workspace not in Path(status_ref["path"]).resolve().parents:
+                raise AdmissionError("C3 references are not the controller's real status and result")
+            identity = validate_coding_result(result, lane_id=lane_id, worker_invocation_id=worker_id, declaration=declaration)
             if result.get("outcome") != "PASS" or validation.get("commit") != identity.head_commit:
                 raise AdmissionError("C3 worker result is not current PASS")
+            credit = {"name":"firmware-limitation-credit", "command":credit_token, "outcome":"PASS"}
+            if sum(check == credit for check in result.get("checks", [])) != 1:
+                raise AdmissionError("C3 worker result lacks the exact credited PASS check")
+            return {"pid":status["controller_pid"], "creation_identity":creation_identity}
         except (OSError, ValueError, KeyError, json.JSONDecodeError, GitSafetyError) as exc:
             raise AdmissionError("C3 controller/result validation failed") from exc
 
@@ -542,14 +551,14 @@ class AcceptanceBroker:
             raise AdmissionError("pinned component diagnostic is outside the exact attempt subtree")
         diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
         diagnostic_keys = {"schema", "attempt_id", "lane_id", "session_id", "call_id", "controller_owner", "server_commit", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate", "target_independent", "locked_environment", "controller_status", "worker_result", "worker_invocation_id", "outcome"}
-        if not isinstance(diagnostic, dict) or set(diagnostic) != diagnostic_keys or diagnostic.get("schema") != "firmware-pinned-component-diagnostic/v1" or diagnostic.get("outcome") != "PASS" or diagnostic.get("target_independent") is not True or any(diagnostic.get(key) != value.get(key) for key in ("attempt_id", "lane_id", "session_id", "call_id", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate")) or diagnostic.get("server_commit") != _PINNED_SERVER_COMMIT or diagnostic.get("controller_owner") != records[-1]["bound_operation"].get("controller_owner"):
+        if not isinstance(diagnostic, dict) or set(diagnostic) != diagnostic_keys or diagnostic.get("schema") != "firmware-pinned-component-diagnostic/v1" or diagnostic.get("outcome") != "PASS" or diagnostic.get("target_independent") is not True or any(diagnostic.get(key) != value.get(key) for key in ("attempt_id", "lane_id", "session_id", "call_id", "source_path", "source_sha256", "input_signature", "failure_signature", "predicate")) or diagnostic.get("server_commit") != _PINNED_SERVER_COMMIT:
             raise AdmissionError("pinned component diagnostic is not a causal witness")
         environment = diagnostic.get("locked_environment")
         if not isinstance(environment, dict) or set(environment) != {"server_commit", "policy_sha256", "schema_sha256"} or environment != {"server_commit":_PINNED_SERVER_COMMIT, "policy_sha256":records[-1]["bound_operation"].get("policy_sha256"), "schema_sha256":records[-1]["bound_operation"].get("schema_sha256")}:
             raise AdmissionError("pinned component diagnostic environment drifted")
-        if Path(diagnostic["controller_status"]["path"]).resolve() != self._limitation_c3_path(decision, "DIAGNOSTIC_STATUS.json") or Path(diagnostic["worker_result"]["path"]).resolve() != self._limitation_c3_path(decision, "DIAGNOSTIC_RESULT.json"):
-            raise AdmissionError("pinned component diagnostic C3 evidence is outside the exact attempt subtree")
-        self._verify_c3_completion(diagnostic["controller_status"], diagnostic["worker_result"], diagnostic["lane_id"], diagnostic["worker_invocation_id"])
+        controller_identity = self._verify_c3_completion(diagnostic["controller_status"], diagnostic["worker_result"], diagnostic["lane_id"], diagnostic["worker_invocation_id"], canonical_sha256(value))
+        if diagnostic.get("controller_owner") != controller_identity:
+            raise AdmissionError("pinned component diagnostic controller identity drifted")
 
     def _verify_substitute_identity(self, substitute: dict[str, Any], decision: dict[str, Any]) -> None:
         """Bind the C3-HARNESS substitute artifacts without granting launch authority."""
@@ -584,9 +593,9 @@ class AcceptanceBroker:
         launch_keys = {"schema", "attempt_id", "lane_id", "session_id", "limitation_id", "controller_identity", "controller_status", "worker_result", "worker_invocation_id"}
         if not isinstance(launch, dict) or set(launch) != launch_keys or launch.get("schema") != "firmware-limitation-c3-launch/v1" or any(launch.get(key) != assignment.get(key) for key in ("attempt_id", "lane_id", "session_id", "limitation_id", "worker_invocation_id")) or launch.get("controller_identity") != assignment.get("c3_controller"):
             raise AdmissionError("C3 substitute launch identity is not exact")
-        if Path(launch["controller_status"]["path"]).resolve() != self._limitation_c3_path(decision, "STATUS.json") or Path(launch["worker_result"]["path"]).resolve() != self._limitation_c3_path(decision, "CANDIDATE_RESULT.json"):
-            raise AdmissionError("C3 launch evidence is outside the exact attempt subtree")
-        self._verify_c3_completion(launch["controller_status"], launch["worker_result"], launch["lane_id"], launch["worker_invocation_id"])
+        controller_identity = self._verify_c3_completion(launch["controller_status"], launch["worker_result"], launch["lane_id"], launch["worker_invocation_id"], assignment_ref["sha256"])
+        if assignment.get("c3_controller") != controller_identity or launch.get("controller_identity") != controller_identity:
+            raise AdmissionError("C3 substitute controller is not the validated controller")
         execution_reference = result.get("execution")
         self._verify_limitation_reference(execution_reference, "substitute execution")
         execution_path = Path(execution_reference["path"]).resolve()
@@ -603,9 +612,11 @@ class AcceptanceBroker:
         if worker_ref != result.get("worker_result") or Path(worker_ref["path"]).resolve() != self._limitation_c3_path(decision, "WORKER_RESULT.json"):
             raise AdmissionError("C3 substitute worker result is outside the exact attempt subtree")
         worker = json.loads(Path(worker_ref["path"]).read_text(encoding="utf-8"))
-        worker_keys = {"schema", "attempt_id", "lane_id", "session_id", "limitation_id", "assignment_path", "assignment_sha256", "worker_invocation_id", "outcome"}
-        if not isinstance(worker, dict) or set(worker) != worker_keys or worker.get("schema") != "firmware-limitation-c3-worker-result/v1" or worker.get("outcome") != "PASS" or any(worker.get(key) != decision[key] for key in ("attempt_id", "lane_id", "session_id", "limitation_id")) or worker.get("assignment_path") != assignment_ref["path"] or worker.get("assignment_sha256") != assignment_ref["sha256"] or worker.get("worker_invocation_id") != assignment["worker_invocation_id"]:
+        worker_keys = {"schema", "attempt_id", "lane_id", "session_id", "limitation_id", "assignment_path", "assignment_sha256", "worker_invocation_id", "controller_status", "candidate_result", "outcome"}
+        if not isinstance(worker, dict) or set(worker) != worker_keys or worker.get("schema") != "firmware-limitation-c3-worker-result/v1" or worker.get("outcome") != "PASS" or any(worker.get(key) != decision[key] for key in ("attempt_id", "lane_id", "session_id", "limitation_id")) or worker.get("assignment_path") != assignment_ref["path"] or worker.get("assignment_sha256") != assignment_ref["sha256"] or worker.get("worker_invocation_id") != assignment["worker_invocation_id"] or worker.get("controller_status") != launch["controller_status"] or worker.get("candidate_result") != launch["worker_result"]:
             raise AdmissionError("C3 substitute worker completion is not exact PASS")
+        if self._verify_c3_completion(worker["controller_status"], worker["candidate_result"], worker["lane_id"], worker["worker_invocation_id"], assignment_ref["sha256"]) != controller_identity:
+            raise AdmissionError("C3 substitute worker controller identity drifted")
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")

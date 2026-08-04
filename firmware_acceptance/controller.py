@@ -507,12 +507,15 @@ class FirmwareAcceptanceController:
             choices = payload.get("choices")
             if set(template) != {"choice_id"} or not isinstance(choices, list) or not choices:
                 raise AdmissionError("setup choice continuation is not predecessor-bound")
-            ids = {choice.get("choice_id") for choice in choices if isinstance(choice, dict)}
-            if not ids or any(not isinstance(value, str) or not value for value in ids):
+            if any(not isinstance(choice, dict) or not isinstance(choice.get("choice_id"), str) or not choice["choice_id"] for choice in choices):
                 raise AdmissionError("setup choice continuation choices are malformed")
+            ids = {choice["choice_id"] for choice in choices}
             state = {"kind":"choice", "choice_ids":ids}
         else:
-            if not template:
+            attachments = {"debug_protocol", "debug_connect_mode", "debug_clock_hz"}
+            target = {"pyocd_target", "evidence", "reasoning_summary"}
+            pack = {"pack_id", "version", "filename", "url", "source_path", "official_sha256", "evidence", "reasoning_summary"}
+            if set(template) not in (target, target | attachments, pack, pack | attachments):
                 raise AdmissionError("setup research continuation template is not closed")
             state = {"kind":"research", "template":template}
         return {"board_id":call["arguments"]["board_id"], "continuation_id":continuation, **state}
