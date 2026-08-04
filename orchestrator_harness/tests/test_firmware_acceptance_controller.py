@@ -60,6 +60,20 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
                 controller.execute(proposal, {"proposal_sha256":proposal["sha256"],"signature":"bad","public_key":"public"}, {"proposal_sha256":proposal["sha256"],"expires_monotonic":99,"delegated_authority":"grant"}, _Verifier())
             self.assertEqual([], launches)
 
+    def test_durable_proposal_mutation_rejects_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, launches = Path(temporary), []
+            controller = self._controller(root, [], launches)
+            proposal_path = root / "broker" / "proposal.json"
+            proposal = controller.publish_proposal(proposal_path, self._request())
+            mutated = json.loads(proposal_path.read_text(encoding="utf-8")); mutated["request"]["call"]["method"] = "reset_and_run"
+            proposal_path.chmod(0o600); proposal_path.write_text(json.dumps(mutated), encoding="utf-8")
+            decision_path, auth_path = root / "broker" / "decision.json", root / "broker" / "authorization.json"
+            decision_path.write_text(json.dumps({"proposal_sha256": proposal["sha256"], "signature": "signed", "public_key": "public"}), encoding="utf-8")
+            auth_path.write_text(json.dumps({"proposal_sha256": proposal["sha256"], "expires_monotonic": 99, "delegated_authority": "grant"}), encoding="utf-8")
+            with self.assertRaises(AdmissionError): controller.execute_artifacts(proposal_path, decision_path, auth_path, _Verifier())
+            self.assertEqual([], launches)
+
     def test_direct_capability_is_denied(self) -> None:
         request = self._request(); request["call"]["endpoint"] = "stdio://bypass"  # type: ignore[index]
         with tempfile.TemporaryDirectory() as temporary:

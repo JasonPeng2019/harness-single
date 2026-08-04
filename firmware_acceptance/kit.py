@@ -72,9 +72,11 @@ def canonical_bound_operation(value: dict[str, Any]) -> dict[str, Any]:
     for key in ("method_version", "deadline_monotonic", "expires_monotonic"):
         if not isinstance(value[key], (int, float)) or isinstance(value[key], bool):
             raise AdmissionError("bound operation timing/version is invalid")
-    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "c1_reference", "seed_identity", "target_identity", "route"}:
+    for key in required - {"method", "arguments", "method_version", "deadline_monotonic", "expires_monotonic", "governing_hashes", "c1_reference", "seed_identity", "target_identity", "route", "raw_result_sha256"}:
         if not isinstance(value[key], str) or not value[key]:
             raise AdmissionError("bound operation has an empty identity or hash")
+    if value["raw_result_sha256"] != "PENDING" and (not isinstance(value["raw_result_sha256"], str) or len(value["raw_result_sha256"]) != 64):
+        raise AdmissionError("bound raw result identity is invalid")
     return json.loads(json.dumps(value, sort_keys=True))
 
 
@@ -263,7 +265,13 @@ class AcceptanceBroker:
         if record["bound_operation_sha256"] != canonical_sha256(bound) or bound["call_id"] != call_id:
             raise AdmissionError("bound operation hash or call identity mismatch")
         if stage == "raw-result":
-            if "raw_result" not in record or raw_result_sha256(record["raw_result"]) != bound["raw_result_sha256"]:
+            if "raw_result" not in record:
+                raise AdmissionError("raw result is required")
+            actual = raw_result_sha256(record["raw_result"])
+            if bound["raw_result_sha256"] == "PENDING":
+                final_bound = {**bound, "raw_result_sha256": actual}
+                record = {**record, "bound_operation": final_bound, "bound_operation_sha256": canonical_sha256(final_bound), "pre_dispatch_operation_sha256": canonical_sha256(bound)}
+            elif actual != bound["raw_result_sha256"]:
                 raise AdmissionError("retained raw result does not match the bound result identity")
         path = _safe_child(self.root, "calls", call_id, f"{order.index(stage):02d}-{stage}.json")
         return path, _write_new(path, {"schema": "firmware-call-evidence/v1", "stage": stage, "call_id": call_id, **record})
@@ -287,12 +295,15 @@ class AcceptanceBroker:
             if index and (item.get("previous_path") != str(stages[index - 1][0]) or item.get("previous_sha256") != digests[-1]):
                 raise AdmissionError("broken immediate evidence chain")
             records.append(item); digests.append(expected_hash)
-        baseline = {key: records[0][key] for key in ("attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity", "bound_operation", "bound_operation_sha256")}
+        baseline = {key: records[0][key] for key in ("attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "governing_hashes", "c1_reference", "identity")}
         if any(any(item.get(key) != value for key, value in baseline.items()) for item in records[1:]):
             raise AdmissionError("bound call identity changed")
-        bound = canonical_bound_operation(records[0]["bound_operation"])
-        if records[0]["bound_operation_sha256"] != canonical_sha256(bound):
+        intent = canonical_bound_operation(records[0]["bound_operation"])
+        bound = canonical_bound_operation(records[-1]["bound_operation"])
+        if records[0]["bound_operation_sha256"] != canonical_sha256(intent) or intent["raw_result_sha256"] != "PENDING" or any(canonical_bound_operation(item["bound_operation"]) != intent for item in records[1:6]) or any(canonical_bound_operation(item["bound_operation"]) != bound for item in records[6:]):
             raise AdmissionError("canonical bound operation hash mismatch")
+        if {key: value for key, value in intent.items() if key != "raw_result_sha256"} != {key: value for key, value in bound.items() if key != "raw_result_sha256"} or bound["raw_result_sha256"] == "PENDING":
+            raise AdmissionError("raw result binding drifted from immutable intent")
         decision = records[2]
         if verifier is None or not verifier.verify(canonical_sha256(records[0]).encode(), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
             raise AdmissionError("signed decision is absent or invalid")
