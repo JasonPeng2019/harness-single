@@ -81,6 +81,20 @@ def _seed_snapshot(seed: Path) -> dict[str, tuple[str, int]]:
     return result
 
 
+def _protected_seed_snapshot(root: Path, expected: dict[str, tuple[str, int]]) -> None:
+    """Validate only protected seed files in a target/worktree, never its full tree."""
+    reject_linked_path(root)
+    if root.is_symlink() or not root.is_dir(): raise AdmissionError("target worktree is unsafe")
+    for name, identity in expected.items():
+        path = root / name
+        if path.is_symlink() or not path.is_file() or (_sha(path), path.stat().st_mode & 0o777) != identity:
+            raise AdmissionError("protected seed file drifted")
+
+
+def _seed_digest(snapshot: dict[str, tuple[str, int]]) -> str:
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 class C3Harness:
     def __init__(self, root: Path, seed: Path, policy: Path, templates: Path, topology_root: Path,
                  *, c1: dict[str, str] | None = None, delegated: dict[str, str] | None = None,
@@ -106,13 +120,22 @@ class C3Harness:
         if not isinstance(c1_body, dict) or not required <= set(c1_body) or c1_body.get("schema") != "firmware-v2-c1-lock/v1": raise AdmissionError("C1 lock is not the closed C1 shape")
         candidate, auth, server, inputs, target_seed = (c1_body[k] for k in ("candidate","authorization","server","candidate_acceptance_inputs","target_seed"))
         if not isinstance(candidate,dict) or not isinstance(candidate.get("commit"),str) or not candidate.get("clean") or not isinstance(auth,dict) or auth.get("path") != self.delegated["path"] or auth.get("sha256") != self.delegated["sha256"] or not isinstance(server,dict) or server.get("commit") != "f003f84a7df51cd8595a3203c62e225b21da2a22" or not server.get("immutable_fixture") or not isinstance(inputs,dict) or not isinstance(target_seed,dict): raise AdmissionError("C1 startup bindings are incomplete")
+        candidate_root = Path(candidate.get("path", "")).resolve()
+        module_root = Path(__file__).resolve().parent.parent
+        try:
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=module_root, capture_output=True, text=True, check=True).stdout.strip()
+            branch = subprocess.run(["git", "branch", "--show-current"], cwd=module_root, capture_output=True, text=True, check=True).stdout.strip()
+            dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=module_root, capture_output=True, text=True, check=True).stdout
+        except subprocess.SubprocessError as exc: raise AdmissionError("cannot prove candidate checkout identity") from exc
+        if candidate_root != module_root or candidate.get("branch") != branch or not branch or candidate.get("commit") != head or dirty:
+            raise AdmissionError("C1 candidate does not identify this clean checkout")
         for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy_source",self.policy)):
             if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"][0]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
         self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}
         self.workers: dict[str, subprocess.Popen[Any]] = {}; self.assignments: dict[str, dict[str, Any]] = {}
-        self.operations: dict[str, Future[Any]] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
+        self.operations: dict[str, Future[Any]] = {}; self.operation_pending: dict[str, Path] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
         self.shutdown = False; self.admission_closed = False; self.last_heartbeat = 0.0
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
         self.response_root = _safe_child(self.root, "manager-signals", "c3-responses")
@@ -138,8 +161,11 @@ class C3Harness:
             closed_sessions = {x.get("session_id") for x in live if x.get("schema") == "firmware-c3-session-lifecycle/v1" and x.get("state") == "TERMINAL"}
             if starts - terminals or sessions - closed_sessions:
                 raise AdmissionError("prior C3 process has incomplete worker lifecycle; refusing adoption")
-        if any(_safe_child(self.root,"sessions").rglob("*.PENDING.json")):
-            raise AdmissionError("prior C3 process has incomplete session operation; refusing adoption")
+        for pending in _safe_child(self.root,"sessions").rglob("*.PENDING.json"):
+            terminal = pending.with_name(pending.name.removesuffix(".PENDING.json") + ".TERMINAL.json")
+            if not terminal.is_file(): raise AdmissionError("prior C3 process has incomplete session operation; refusing adoption")
+            value = json.loads(terminal.read_text(encoding="utf-8"))
+            if value.get("pending") != {"path":str(pending),"sha256":_sha(pending)}: raise AdmissionError("session operation terminal does not bind pending evidence")
 
     def _status(self, state: str, **extra: Any) -> None:
         _atomic_append(self.status_path, {"schema": "firmware-c3-harness-status/v1", "state": state, "pid": os.getpid(), "monotonic": time.monotonic(), **extra})
@@ -147,7 +173,7 @@ class C3Harness:
     def write_readiness(self) -> None:
         """Publish the one immutable service identity only after all validation."""
         ready = _safe_child(self.state_root, "C3_HARNESS_READY.json")
-        bindings = {"seed": _sha(self.seed), "policy": _sha(self.policy), "templates": _sha(self.templates)}
+        bindings = {"seed": _seed_digest(self.seed_identity), "policy": _sha(self.policy), "templates": _sha(self.templates)}
         if self.manifest is not None: bindings["manifest"] = _sha(self.manifest)
         if self.c1 is not None: bindings["c1"] = self.c1["sha256"]
         if self.delegated is not None: bindings["delegated"] = self.delegated["sha256"]
@@ -183,7 +209,8 @@ class C3Harness:
         released = self.topology.get("released_utc")
         if released is not None and issued < released: raise AdmissionError("request predates topology release")
         start, end = value.get("issued_monotonic"), value.get("expires_monotonic")
-        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (start, end)) or end <= start or time.monotonic() >= end: raise AdmissionError("request monotonic window is invalid")
+        now = time.monotonic()
+        if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in (start, end)) or end <= start or not start <= now < end: raise AdmissionError("request monotonic window is invalid")
         if not self.verifier.verify(canonical_decision_payload(value), value["signature"], value["public_key"]): raise AdmissionError("request signature is invalid")
         return value
 
@@ -235,7 +262,7 @@ class C3Harness:
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
         if created.returncode: raise AdmissionError("candidate worktree creation failed")
-        if _seed_snapshot(worktree) != self.seed_identity: raise AdmissionError("assigned worktree seed identity drifted")
+        _protected_seed_snapshot(worktree, self.seed_identity)
         model, effort, tier, finding = _ROLES[role]; workspace = worktree / ".agent-workspace"; workspace.mkdir(exist_ok=True)
         inbox = _safe_child(self.root, "worker-channel", aid); inbox.mkdir(parents=True, exist_ok=False)
         response_root = _safe_child(self.root, "worker-channel-responses", aid); response_root.mkdir(parents=True, exist_ok=False)
@@ -249,11 +276,21 @@ class C3Harness:
         if finding: invocation["finding_gate"] = {"role":finding,"path":str(workspace / "FINDINGS.json")}
         invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json"); _write_new(invocation_path, invocation)
         controller_stdout, controller_stderr = workspace / (aid + ".controller.stdout.log"), workspace / (aid + ".controller.stderr.log")
-        out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
-        proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.root, stdout=out_handle, stderr=err_handle)
-        out_handle.close(); err_handle.close()
-        identity = exact_process_identity(proc.pid)
-        if identity is None: raise AdmissionError("cannot prove controller child identity")
+        proc: subprocess.Popen[Any] | None = None
+        out_handle = err_handle = None
+        try:
+            out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
+            proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.root, stdout=out_handle, stderr=err_handle)
+            identity = exact_process_identity(proc.pid)
+            if identity is None:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
+                raise AdmissionError("cannot prove controller child identity")
+        finally:
+            if out_handle is not None: out_handle.close()
+            if err_handle is not None: err_handle.close()
+        if proc is None: raise AdmissionError("controller launch failed")
         self.workers[aid] = proc
         self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":p.get("limitation"),"identity":identity}
         _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
@@ -268,7 +305,7 @@ class C3Harness:
         invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json")
         if not invocation_path.is_file(): raise AdmissionError("assignment invocation is absent")
         invocation = json.loads(invocation_path.read_text(encoding="utf-8")); worktree = Path(invocation["run_root"]); target = _safe_child(self.root,"targets",target_id)
-        if _seed_snapshot(worktree) != record["seed"]: raise AdmissionError("assigned seed drifted before acceptance")
+        _protected_seed_snapshot(worktree, record["seed"])
         status = Path(invocation["output_paths"]["status"])
         result = worktree / ".agent-workspace" / "RESULT.json"
         if not status.is_file() or not result.is_file(): raise AdmissionError("assignment has no complete controller result")
@@ -299,6 +336,7 @@ class C3Harness:
             pending = _safe_child(self.root,"sessions",sid,"operations",hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest() + ".PENDING.json")
             _write_new(pending,{"schema":"firmware-c3-session-operation/v1","state":"PENDING","session_id":sid,"payload":p})
             self.operations[sid] = self.executor.submit(controller.session_execute_artifacts,Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
+            self.operation_pending[sid] = pending
             return {"state":"PENDING","path":str(pending),"raw_sha256":_sha(pending)}
         if action in {"close","abort"} and sid in self.operations: raise AdmissionError("session operation is active")
         if action == "close" and set(p) == {"session_id","decision_path"}: result = controller.close_session(Path(p["decision_path"]),self.verifier)
@@ -314,7 +352,7 @@ class C3Harness:
             process.wait(); del self.workers[aid]; record = self.assignments[aid]; inv = record["invocation"]
             completion: dict[str, Any] = {"schema":"firmware-c3-worker-completion/v1","assignment_id":aid,"exit_code":exit_code,"controller_identity":record["identity"],"outcome":"FAIL"}
             try:
-                if _seed_snapshot(record["worktree"]) != record["seed"]: raise AdmissionError("seed changed during worker execution")
+                _protected_seed_snapshot(record["worktree"], record["seed"])
                 status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
                 status, result = json.loads(status_path.read_text(encoding="utf-8")), json.loads(result_path.read_text(encoding="utf-8"))
                 loaded = load_invocation(_safe_child(self.root,"assignments",aid + ".invocation.json"))
@@ -335,9 +373,10 @@ class C3Harness:
             if not future.done(): continue
             try: value = future.result(); outcome, error = "PASS", None
             except Exception as exc: value, outcome, error = None, "FAIL", str(exc)
-            terminal = _safe_child(self.root,"sessions",sid,"operations",str(int(time.monotonic()*1000000)) + ".TERMINAL.json")
-            _write_new(terminal,{"schema":"firmware-c3-session-operation/v1","state":"TERMINAL","session_id":sid,"outcome":outcome,"result":value,"error":error})
-            del self.operations[sid]
+            pending = self.operation_pending[sid]
+            terminal = pending.with_name(pending.name.removesuffix(".PENDING.json") + ".TERMINAL.json")
+            _write_new(terminal,{"schema":"firmware-c3-session-operation/v1","state":"TERMINAL","session_id":sid,"pending":{"path":str(pending),"sha256":_sha(pending)},"outcome":outcome,"result":value,"error":error})
+            del self.operations[sid]; del self.operation_pending[sid]
 
     def service_worker_channels(self) -> None:
         """The only worker-facing ingress: one active P1 inbox, closed and token-bound."""
@@ -359,6 +398,7 @@ class C3Harness:
 
     def _shutdown(self, p: dict[str, Any]) -> dict[str, Any]:
         if p: raise AdmissionError("shutdown payload must be empty")
+        self.admission_closed = True
         self.reap_workers()
         self.reap_operations()
         if self.workers or self.operations: return {"state":"BLOCKED","reason":"target worker or session operation is active"}
@@ -368,6 +408,7 @@ class C3Harness:
             if not result.get("exact_reaped") or not result.get("claim_released"): raise AdmissionError("shutdown session cleanup is incomplete")
             terminals.append({"session_id":sid,"terminal":result}); del self.controllers[sid]
         evidence = _safe_child(self.state_root,"C3_HARNESS_SHUTDOWN.json")
+        self.executor.shutdown(wait=True, cancel_futures=False)
         _write_new(evidence,{"schema":"firmware-c3-harness-shutdown/v1","pid":os.getpid(),"sessions":terminals,"workers_reaped":True,"admission_closed":True})
         self.shutdown = True; self._status("SHUTDOWN", shutdown_path=str(evidence)); return {"state":"SHUTDOWN","sessions":terminals,"shutdown_path":str(evidence)}
 
