@@ -539,7 +539,7 @@ class FirmwareAcceptanceController:
         if not isinstance(route, dict):
             raise AdmissionError("a fresh accepted setup overview route is required")
         board_id = route["board_id"]
-        if "board_id" in args and args["board_id"] != board_id:
+        if "board_id" in args and args["board_id"] is not None and args["board_id"] != board_id:
             raise AdmissionError("call board_id differs from the retained server route")
         if method == "load_setup_tool" and not self._route_call(route["load_call"], method, args):
             raise AdmissionError("setup tool load differs from the retained server route")
