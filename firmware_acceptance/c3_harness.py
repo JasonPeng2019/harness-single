@@ -14,6 +14,7 @@ import json
 import math
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -68,7 +69,7 @@ def _ref(value: Any, label: str, expected: dict[str, str] | None = None) -> dict
     return result
 
 
-def _seed_snapshot(seed: Path) -> dict[str, tuple[str, int]]:
+def _seed_snapshot(seed: Path) -> dict[str, str]:
     reject_linked_path(seed)
     if seed.is_symlink() or not seed.is_dir(): raise AdmissionError("seed input is not a safe directory")
     validate_seed_manifest(seed)
@@ -77,22 +78,22 @@ def _seed_snapshot(seed: Path) -> dict[str, tuple[str, int]]:
     result = {}
     for name in names:
         path = seed / name
-        if path.is_symlink() or path.stat().st_mode & 0o222: raise AdmissionError("seed file is writable or linked")
-        result[name] = (_sha(path), path.stat().st_mode & 0o777)
+        if path.is_symlink(): raise AdmissionError("seed file is linked")
+        result[name] = _sha(path)
     return result
 
 
-def _protected_seed_snapshot(root: Path, expected: dict[str, tuple[str, int]]) -> None:
+def _protected_seed_snapshot(root: Path, expected: dict[str, str]) -> None:
     """Validate only protected seed files in a target/worktree, never its full tree."""
     reject_linked_path(root)
     if root.is_symlink() or not root.is_dir(): raise AdmissionError("target worktree is unsafe")
     for name, identity in expected.items():
         path = root / name
-        if path.is_symlink() or not path.is_file() or (_sha(path), path.stat().st_mode & 0o777) != identity:
+        if path.is_symlink() or not path.is_file() or _sha(path) != identity or path.stat().st_mode & stat.S_IWRITE:
             raise AdmissionError("protected seed file drifted")
 
 
-def _seed_digest(snapshot: dict[str, tuple[str, int]]) -> str:
+def _seed_digest(snapshot: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -132,7 +133,7 @@ class C3Harness:
             raise AdmissionError("C1 candidate does not identify this clean checkout")
         for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy_source",self.policy)):
             if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
-        if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"][0]: raise AdmissionError("C1 seed binding drifted")
+        if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
         self.limitation_adapter = LimitationEvidenceAdapter(self.broker)
         self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}
@@ -265,6 +266,8 @@ class C3Harness:
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
         if created.returncode: raise AdmissionError("candidate worktree creation failed")
+        for name in self.seed_identity:
+            (worktree / name).chmod(stat.S_IREAD)
         _protected_seed_snapshot(worktree, self.seed_identity)
         model, effort, tier, finding = _ROLES[role]; workspace = worktree / ".agent-workspace"; workspace.mkdir(exist_ok=True)
         inbox = _safe_child(self.root, "worker-channel", aid); inbox.mkdir(parents=True, exist_ok=False)
