@@ -736,7 +736,7 @@ def _validate_uart_parameters(method: str, arguments: dict[str, Any]) -> None:
         return
     if method == "write_serial":
         text, append_newline = arguments["text"], arguments["append_newline"]
-        if not isinstance(text, str) or not isinstance(append_newline, bool) or not 1 <= len((text + ("\n" if append_newline else "")).encode("utf-8")) <= 256 or not _finite_uart_seconds(arguments["timeout_seconds"], positive=True) or not baud_and_port() or arguments["on_exit"] is not None:
+        if not isinstance(text, str) or not isinstance(append_newline, bool) or not 1 <= len(text.encode("utf-8")) <= 256 or not _finite_uart_seconds(arguments["timeout_seconds"], positive=True) or not baud_and_port() or arguments["on_exit"] is not None:
             raise AdmissionError("UART write parameters do not match the locked safe surface")
         return
     steps = arguments["steps"]
