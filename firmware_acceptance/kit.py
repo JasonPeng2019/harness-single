@@ -421,8 +421,10 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         raise AdmissionError("deadline cannot cover operation plus cleanup margin")
     if not isinstance(call["permission"], dict) or not call["permission"].get("granted"):
         raise AdmissionError("missing live permission")
-    if call["method"] == "write_serial" and len(call["arguments"].get("bytes", [])) > 256:
-        raise AdmissionError("UART write exceeds 256-byte limit")
+    if call["method"] == "write_serial":
+        text, maximum_bytes = call["arguments"].get("text"), rule.get("maximum_bytes")
+        if not isinstance(text, str) or not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool) or maximum_bytes <= 0 or len(text.encode("utf-8")) > maximum_bytes:
+            raise AdmissionError("UART write exceeds locked UTF-8 byte limit")
     allowed_parameters = rule.get("parameters")
     if not isinstance(allowed_parameters, list) or set(call["arguments"]) - set(allowed_parameters) - {"rf", "dio2_dependent"}:
         raise AdmissionError("method parameters do not match pinned guarded surface")
