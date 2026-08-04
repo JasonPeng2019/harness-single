@@ -48,6 +48,18 @@ def _load_policy(policy_path: Path) -> dict[str, Any]:
     return value
 
 
+def validate_manifest(manifest_path: Path) -> dict[str, Any]:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("harness_commit") != "5d7c36e3dd38dc813c91f4462f4298c73883c59a" or manifest.get("mcp_server", {}).get("commit") != "f003f84a7df51cd8595a3203c62e225b21da2a22":
+        raise AdmissionError("manifest pin mismatch")
+    if manifest.get("resource_mirror", {}).get("manifest_rows") != 47 or len(manifest.get("datasheets", [])) != 4:
+        raise AdmissionError("incomplete verified resource provenance")
+    for item in [manifest.get("fixture_declaration"), *manifest.get("toolchain_locks", []), *manifest.get("datasheets", [])]:
+        if not isinstance(item, dict) or not isinstance(item.get("sha256"), str) or not isinstance(item.get("bytes"), int):
+            raise AdmissionError("malformed provenance identity")
+    return manifest
+
+
 def _safe_child(root: Path, *parts: str) -> Path:
     root = root.resolve()
     candidate = root.joinpath(*parts).resolve()
@@ -74,10 +86,11 @@ def _write_new(path: Path, value: dict[str, Any]) -> str:
 class AcceptanceBroker:
     """Controller-side materializer and immutable evidence chain; it never dispatches MCP itself."""
 
-    def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path) -> None:
+    def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path, manifest_path: Path | None = None) -> None:
         self.root, self.seed, self.policy_path = root.resolve(), seed.resolve(), policy_path.resolve()
         self.templates = json.loads(templates_path.read_text(encoding="utf-8"))
         self.policy = _load_policy(self.policy_path)
+        self.manifest = validate_manifest(manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json"))
         self.root.mkdir(parents=True, exist_ok=True)
         if self.root.is_symlink():
             raise AdmissionError("broker root cannot be a symlink")

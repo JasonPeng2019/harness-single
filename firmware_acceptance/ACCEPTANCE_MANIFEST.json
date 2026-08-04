@@ -2,9 +2,11 @@
   "schema_version": "firmware-v2-acceptance-manifest/v1",
   "harness_commit": "5d7c36e3dd38dc813c91f4462f4298c73883c59a",
   "mcp_server": {"commit": "f003f84a7df51cd8595a3203c62e225b21da2a22", "clean_required": true, "command": "uv run --project <absolute-mcp-candidate> --locked pyocd-debug-mcp"},
-  "resource_mirror": {"manifest_rows": 47, "manifest_sha256": "94ca7a484d11284eb9c27a947589bb3ac4e6e2fb38c847f858794922eaffb5a4"},
+  "resource_mirror": {"path": "Firmware/Firmware resources/SOURCE_MANIFEST.csv", "bytes": 9141, "manifest_rows": 47, "manifest_sha256": "94ca7a484d11284eb9c27a947589bb3ac4e6e2fb38c847f858794922eaffb5a4"},
   "fixtures": {"STM-A": {"probe_uid": "066FFF514988525067233337", "target": "STM32L476RG", "profile": "stm-a-l476", "serial_route": "rediscover"}, "STM-B": {"probe_uid": "0668FF514988525067213913", "target": "STM32L476RG", "profile": "stm-b-l476", "serial_route": "rediscover"}, "NRF-A": {"probe_uid": "683710208", "target": "nRF52840", "profile": "nrf-a-52840", "serial_route": "rediscover"}, "NRF-B": {"probe_uid": "683854191", "target": "nRF52840", "profile": "nrf-b-52840", "serial_route": "rediscover"}},
   "p05_disposition": "DIO2-independent: no GPIO mapping is invented; DIO2-dependent work is non-gating",
-  "toolchain_locks": ["ARM_TOOLCHAIN_LOCK.json", "NCS_V3_3_1_LOCK.json"],
-  "datasheet_hashes": ["a45a857e3aa75ac166dd532c76d76d5dd8377b9c5bf6f15c03c9cf85aeec0f65", "c619e336b9c0610663273041f057f2537a65fd408ce0c5b8214a26de2aa88422", "6d783125dbef567954ce53095ad068d0950b2a8de52f95bb2cfde4146c4306c2"]
+  "fixture_declaration": {"path": "Firmware/Firmware resources/fixture-and-toolchain/CONNECTED_HARDWARE.md", "bytes": 4563, "sha256": "c736183cadf325c50d61f2620ec4d48c086003cf62dccd580d33f7a939b91e71"},
+  "toolchain_locks": [{"path": "Firmware/Firmware resources/fixture-and-toolchain/ARM_TOOLCHAIN_LOCK.json", "bytes": 2573, "sha256": "4578ded8834a404df8cdfa2eb1986c006cdfda122ea7872a40474ec376286c5b"}, {"path": "Firmware/Firmware resources/fixture-and-toolchain/NCS_V3_3_1_LOCK.json", "bytes": 36540, "sha256": "d4be18a5cfeb2c833606f6fbd91fc2d1836ffd0209a1ffa7ac19490ac892669c"}],
+  "datasheets": [{"path":"Firmware/Firmware resources/datasheets/60852689.DS_SX1261_2 V2-2.pdf","bytes":4459535,"sha256":"6d783125dbef567954ce53095ad068d0950b2a8de52f95bb2cfde4146c4306c2"},{"path":"Firmware/Firmware resources/datasheets/waveshare-lora-module.pdf","bytes":1655142,"sha256":"3a26f2e62a6717000f921826408aeb2e9b9d5e766289e432bddb0241aa9361eb"},{"path":"Firmware/Firmware resources/datasheets/Nano_BLE_MCU-nRF52840_PS_v1.1.pdf","bytes":18277247,"sha256":"c619e336b9c0610663273041f057f2537a65fd408ce0c5b8214a26de2aa88422"},{"path":"Firmware/Firmware resources/datasheets/stm32L476rgt.pdf","bytes":5509345,"sha256":"a45a857e3aa75ac166dd532c76d76d5dd8377b9c5bf6f15c03c9cf85aeec0f65"}],
+  "build_provenance_required": ["source_commit", "toolchain_lock_sha256", "artifact_sha256", "build_command_sha256"]
 }
