@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import subprocess
@@ -714,6 +715,46 @@ class AcceptanceBroker:
         return "INDETERMINATE_TIMEOUT" if now_monotonic > deadline else str(raw.get("outcome", "FAIL"))
 
 
+def _finite_uart_seconds(value: Any, *, positive: bool) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) and (float(value) > 0 if positive else float(value) >= 0) and float(value) <= 30
+
+
+def _validate_uart_parameters(method: str, arguments: dict[str, Any]) -> None:
+    def baud_and_port() -> bool:
+        baudrate, port = arguments["baudrate"], arguments["port"]
+        return (baudrate is None or isinstance(baudrate, int) and not isinstance(baudrate, bool) and baudrate > 0) and (port is None or isinstance(port, str) and bool(port.strip()))
+
+    if method == "read_serial":
+        if (arguments["expected_text"] is not None and (not isinstance(arguments["expected_text"], str) or not arguments["expected_text"])) or not _finite_uart_seconds(arguments["read_seconds"], positive=True) or not baud_and_port() or arguments["reset_on_open"] is not False or arguments["on_exit"] is not None:
+            raise AdmissionError("UART read parameters do not match the locked safe surface")
+        return
+    if method == "write_serial":
+        text = arguments["text"]
+        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 256 or not _finite_uart_seconds(arguments["timeout_seconds"], positive=True) or not baud_and_port() or not isinstance(arguments["append_newline"], bool) or arguments["on_exit"] is not None:
+            raise AdmissionError("UART write parameters do not match the locked safe surface")
+        return
+    steps = arguments["steps"]
+    if not isinstance(steps, list) or not steps or not _finite_uart_seconds(arguments["read_seconds"], positive=True) or not baud_and_port() or not isinstance(arguments["clear_input"], bool):
+        raise AdmissionError("UART exchange parameters do not match the locked safe surface")
+    for row in steps:
+        if not isinstance(row, dict) or set(row) != {"text", "expected_text", "line_ending"} or not isinstance(row["text"], str) or not row["text"] or not 1 <= len(row["text"].encode("utf-8")) <= 256 or not isinstance(row["expected_text"], str) or not row["expected_text"] or not isinstance(row["line_ending"], str) or row["line_ending"] not in {"none", "lf", "cr", "crlf"}:
+            raise AdmissionError("UART exchange step is not an exact bounded command/response row")
+    ready_text, ready_seconds = arguments["ready_text"], arguments["ready_seconds"]
+    probe_text, probe_ending, probe_delay = arguments["ready_probe_text"], arguments["ready_probe_line_ending"], arguments["ready_probe_delay_seconds"]
+    if not _finite_uart_seconds(ready_seconds, positive=False) or not _finite_uart_seconds(probe_delay, positive=False) or not isinstance(probe_ending, str) or probe_ending not in {"none", "lf", "cr", "crlf"}:
+        raise AdmissionError("UART exchange readiness timing or line ending is invalid")
+    if ready_text is None:
+        if ready_seconds != 0 or probe_text is not None or probe_delay != 0 or probe_ending != "none":
+            raise AdmissionError("UART exchange readiness values require ready_text")
+    elif not isinstance(ready_text, str) or not ready_text or ready_seconds <= 0:
+        raise AdmissionError("UART exchange ready_text requires a positive readiness window")
+    elif probe_text is None:
+        if probe_delay != 0 or probe_ending != "none":
+            raise AdmissionError("UART exchange probe values require ready_probe_text")
+    elif not isinstance(probe_text, str) or not probe_text and probe_ending == "none" or probe_delay > ready_seconds:
+        raise AdmissionError("UART exchange readiness probe is invalid")
+
+
 def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Path | None = None) -> dict[str, Any]:
     """Validate a fully correlated broker request without performing a physical action."""
     required = {"call_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "method_version", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission", "delegated_user_scope_sha256", "action_class", "scope_effect"}
@@ -767,10 +808,9 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     elif set(call["arguments"]) != set(parameters.get("required_exact", ())):
         raise AdmissionError("method parameters do not match pinned guarded surface")
     action_arguments = call["arguments"].get("action_parameters", call["arguments"])
-    if call["method"] in {"write_serial", "write_serial-plan"}:
-        text = action_arguments.get("text")
-        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 256:
-            raise AdmissionError("UART write exceeds locked UTF-8 byte limit")
+    uart_method = call["method"].removesuffix("-plan")
+    if uart_method in {"read_serial", "write_serial", "serial_exchange"}:
+        _validate_uart_parameters(uart_method, action_arguments)
     if call["method"] == "read_memory_symbol":
         args = call["arguments"]
         if not isinstance(args["symbol"], str) or not args["symbol"] or args["width"] not in (8, 16, 32) or args["elf_artifact"] is not None and not isinstance(args["elf_artifact"], str):
@@ -781,6 +821,4 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         artifact = action_arguments.get("artifact")
         if not isinstance(artifact, str) or not artifact or any(token in artifact.lower() for token in ("bootloader", "mass_erase", "unlock", "protection")):
             raise AdmissionError("flash artifact is not an application-only input")
-    if call["method"] in {"read_serial", "write_serial"} and call["arguments"].get("on_exit") is not None:
-        raise AdmissionError("serial action cannot request a hidden exit effect")
     return {"policy": "ALLOW", "evaluation_sha256": canonical_sha256({"call": call, "policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest() if policy_path else "packaged"}), "maximum_duration_seconds": maximum}
