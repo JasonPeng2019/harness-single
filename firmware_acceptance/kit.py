@@ -460,12 +460,15 @@ class AcceptanceBroker:
         if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not isinstance(substitute.get("stable_id"), str) or not substitute["stable_id"]:
             raise AdmissionError("limitation substitute is not the first safe available alternative")
         self._verify_limitation_reference(substitute["assignment"], "substitute assignment"); self._verify_limitation_reference(substitute["result"], "substitute result")
+        self._verify_substitute_identity(substitute, decision)
         protected = decision["o_decision"].get("protected_suite") if isinstance(decision["o_decision"], dict) else None
         self._verify_limitation_reference(protected, "protected suite")
         protected_value = json.loads(Path(protected["path"]).read_text(encoding="utf-8"))
         protected_ids = protected_value.get("protected_ids") if isinstance(protected_value, dict) else None
         if not isinstance(protected_value, dict) or protected_value.get("schema") != "c1-protected-test-ids/v1" or protected_value.get("c1_reference") != records[0].get("c1_reference") or not isinstance(protected_ids, list) or not protected_ids or len(set(protected_ids)) != len(protected_ids) or any(not isinstance(value, str) or not value for value in protected_ids): raise AdmissionError("protected suite artifact is not closed")
-        if decision["original_test"] == substitute["stable_id"] or decision["original_test"] in protected_ids or substitute["stable_id"] in protected_ids or any(token in json.dumps(decision, sort_keys=True).lower() for token in ("pyocd", "direct serial", "direct mcp", "hardware absent", "operator error", "fixture error", "environment error", "unsafe call", "xfail", "skip", "weaken")):
+        # Limitation admission is entirely structural.  Free-text rationale may
+        # explain a decision, but it is not an authority or a denial heuristic.
+        if decision["original_test"] == substitute["stable_id"] or decision["original_test"] in protected_ids or substitute["stable_id"] in protected_ids:
             raise AdmissionError("limitation cannot substitute protected tests or bypass physical authority")
         result = {key: decision[key] for key in required - {"signature"}}
         result["schema"] = "firmware-server-limitation/v1"
@@ -488,6 +491,29 @@ class AcceptanceBroker:
             raise AdmissionError(label + " reference is not closed")
         path = Path(reference["path"]); reject_linked_path(path)
         if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]: raise AdmissionError(label + " reference drifted")
+
+    @staticmethod
+    def _verify_substitute_identity(substitute: dict[str, Any], decision: dict[str, Any]) -> None:
+        """Bind the C3-HARNESS substitute artifacts without granting launch authority."""
+        assignment_ref, result_ref = substitute["assignment"], substitute["result"]
+        try:
+            assignment = json.loads(Path(assignment_ref["path"]).read_text(encoding="utf-8"))
+            result = json.loads(Path(result_ref["path"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AdmissionError("substitute assignment or result is unreadable") from exc
+        assignment_keys = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "kind", "stable_id", "assignment_id"}
+        result_keys = assignment_keys | {"result_id", "assignment_path", "assignment_sha256"}
+        if not isinstance(assignment, dict) or set(assignment) != assignment_keys or assignment.get("schema") != "firmware-limitation-substitute-assignment/v1":
+            raise AdmissionError("substitute assignment is not a closed identity artifact")
+        if not isinstance(result, dict) or set(result) != result_keys or result.get("schema") != "firmware-limitation-substitute-result/v1":
+            raise AdmissionError("substitute result is not a closed identity artifact")
+        identity = {"limitation_id":decision["limitation_id"], "attempt_id":decision["attempt_id"], "lane_id":decision["lane_id"], "session_id":decision["session_id"], "kind":substitute["kind"], "stable_id":substitute["stable_id"]}
+        if any(assignment.get(key) != value or result.get(key) != value for key, value in identity.items()):
+            raise AdmissionError("substitute artifacts do not bind this limitation attempt")
+        if not all(isinstance(item.get(key), str) and item[key] for item in (assignment, result) for key in ("assignment_id",)) or not isinstance(result.get("result_id"), str) or not result["result_id"] or result.get("assignment_id") != assignment["assignment_id"]:
+            raise AdmissionError("substitute artifact identities are incomplete")
+        if result.get("assignment_path") != assignment_ref["path"] or result.get("assignment_sha256") != assignment_ref["sha256"]:
+            raise AdmissionError("substitute result does not reference its exact assignment")
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
@@ -608,7 +634,10 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         if all_null:
             return {"policy": "ALLOW", "evaluation_sha256": canonical_sha256({"call": call, "policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest() if policy_path else "packaged"}), "maximum_duration_seconds": maximum}
         plan = call["arguments"]
-        if (plan["board_id"] != call["board"] or not all(isinstance(plan[key], str) and plan[key] for key in ("hypothesis", "strategy", "expected_fail_return", "expected_success_return")) or plan["hypothesis_made"] is not True or plan["strategy_evaluated"] is not True or any(not isinstance(plan[key], int) or isinstance(plan[key], bool) or plan[key] <= 0 for key in ("max_calls", "max_calls_buffer")) or not isinstance(plan["action_parameters"], dict) or (plan["user_permission"] is not None and (not isinstance(plan["user_permission"], dict) or not plan["user_permission"]))):
+        # The MCP board_id is a server-generated route value, not the lane's
+        # logical fixture name.  The retained-session controller binds it to
+        # setup_overview before dispatch.
+        if (not isinstance(plan["board_id"], str) or not plan["board_id"] or not all(isinstance(plan[key], str) and plan[key] for key in ("hypothesis", "strategy", "expected_fail_return", "expected_success_return")) or plan["hypothesis_made"] is not True or plan["strategy_evaluated"] is not True or any(not isinstance(plan[key], int) or isinstance(plan[key], bool) or plan[key] <= 0 for key in ("max_calls", "max_calls_buffer")) or not isinstance(plan["action_parameters"], dict) or (plan["user_permission"] is not None and (not isinstance(plan["user_permission"], dict) or not plan["user_permission"]))):
             raise AdmissionError("populated plan does not have the exact guarded envelope")
         action_parameters = rule.get("action_parameters")
         if not isinstance(action_parameters, dict) or set(plan["action_parameters"]) != set(action_parameters.get("required_exact", ())):

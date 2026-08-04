@@ -364,7 +364,7 @@ class FirmwareAcceptanceController:
             server_run_id = _server_run_id(guidance)
             open_value = {"schema":"firmware-session-open/v1","session_id":request["session_id"],"session_request_path":str(request_record_path),"session_request_sha256":request_sha,"claim":claim,"controller_identity":claim["owner"],"server_process_identity":identity,"server_run_id":server_run_id,"bootstrap_transcript":transcript,"bootstrap_transcript_sha256":canonical_sha256(transcript),"state":"BOOTSTRAPPED"}
             open_sha = _write_new(_safe_child(session_root, "SESSION_OPEN.json"), open_value)
-            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"pending_proposal":None,"call_ids":set(),"route":None,"continuation":None}
+            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"pending_proposal":None,"call_ids":set(),"route":None,"connection_assignments":None,"continuation":None,"requires_uart":None}
             return {**open_value,"path":str(self._session["open_path"]),"raw_sha256":open_sha}
         except BaseException:
             if transport is not None: transport.close_and_join()
@@ -395,6 +395,7 @@ class FirmwareAcceptanceController:
             expected = rule["next_by_tool_name"].get(call["arguments"].get("tool_name"))
         elif "next_by_server_status" in rule:
             expected = request["next_state"] if request["next_state"] in set(rule["next_by_server_status"].values()) else None
+        self._validate_route_pre_dispatch(session, call)
         if session["active_plan"] is not None and call["method"] in {session["active_plan"].get("method"), "board_fix_setup"}:
             plan = session["active_plan"]
             allowed = call["method"] == plan["method"] or (call["method"] == "board_fix_setup" and plan["method"] == "board_setup" and session["state"] == "SETUP_FIX_READY")
@@ -457,27 +458,108 @@ class FirmwareAcceptanceController:
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
             result_sha = _write_new(result_path, result)
+            self._validate_route_result(session, call, payload)
             if "next_by_mode" in rule:
                 if all(value is None for value in call["arguments"].values()):
                     session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":None, "plan_id":None}
                 else:
                     session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":expected_arguments, "plan_id":plan_id}
-            elif session["active_plan"] is not None and call["method"] == session["active_plan"]["method"]:
+            elif session["active_plan"] is not None and call["method"] in {session["active_plan"]["method"], "board_fix_setup"}:
                 # Consumption occurs only after the exact preferred action result is durable.
-                if call["method"] == "board_setup" and payload.get("status") in {"setup_needs_user_input", "setup_research_required"}:
+                if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") in {"setup_needs_user_input", "setup_research_required"}:
                     continuation = payload.get("continuation_id")
                     accepted = payload.get("accepted_response")
                     if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict):
                         raise AdmissionError("setup continuation is not predecessor-bound")
                     session["continuation"] = {"board_id":call["arguments"]["board_id"], "value":{"continuation_id":continuation, "response":accepted}}
-                elif call["method"] != "board_setup" or payload.get("status") == "setup_completed":
+                elif call["method"] not in {"board_setup", "board_fix_setup"} or payload.get("status") == "setup_completed":
                     session["active_plan"] = None
+            if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") == "setup_completed":
+                # A completed setup may only proceed through a freshly returned
+                # validation route.  Keep UART knowledge, but discard stale calls.
+                session["route"] = None; session["continuation"] = None
             session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}
             session["call_ids"].add(call["call_id"]); session["pending_call_id"] = None; session["pending_proposal"] = None
             return {**result,"path":str(result_path),"raw_sha256":result_sha}
         except BaseException:
             self.abort_session("call failure or process ambiguity")
             raise
+
+    @staticmethod
+    def _route_call(value: Any, tool: str, arguments: dict[str, Any]) -> bool:
+        return isinstance(value, dict) and set(value) == {"tool", "arguments"} and value.get("tool") == tool and value.get("arguments") == arguments
+
+    def _validate_route_pre_dispatch(self, session: dict[str, Any], call: dict[str, Any]) -> None:
+        """Bind dynamic server route values before any tools/call is written."""
+        args, method = call["arguments"], call["method"]
+        if method == "setup_overview":
+            names = args.get("board_names")
+            if names is not None and names != [call["board"]]:
+                raise AdmissionError("setup overview names are not the one logical fixture")
+            assignments = args.get("connection_assignments")
+            if assignments is not None and assignments != session.get("connection_assignments"):
+                raise AdmissionError("setup overview assignments were not predecessor-returned")
+            return
+        route = session.get("route")
+        if not isinstance(route, dict):
+            raise AdmissionError("a fresh accepted setup overview route is required")
+        board_id = route["board_id"]
+        if "board_id" in args and args["board_id"] != board_id:
+            raise AdmissionError("call board_id differs from the retained server route")
+        if method == "load_setup_tool" and not self._route_call(route["load_call"], method, args):
+            raise AdmissionError("setup tool load differs from the retained server route")
+        if method == "board_setup-plan" and all(value is None for value in args.values()) and args != route.get("plan_initialization_call", {}).get("arguments"):
+            raise AdmissionError("setup plan initialization differs from the retained route")
+        if method == "board_validate" and not self._route_call(route.get("next_call"), method, args):
+            raise AdmissionError("validation differs from the retained server route")
+
+    def _validate_route_result(self, session: dict[str, Any], call: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Accept only the pinned overview/load results and retain their exact values."""
+        method, args = call["method"], call["arguments"]
+        if method == "setup_overview":
+            if args["board_names"] is None:
+                if payload.get("status") != "setup_names_required":
+                    raise AdmissionError("null setup overview did not require names")
+                returned = payload.get("connection_assignments")
+                if returned is not None and not isinstance(returned, dict):
+                    raise AdmissionError("setup overview returned malformed assignments")
+                session["connection_assignments"] = returned
+                return
+            routes = payload.get("routes")
+            if payload.get("status") != "setup_routes_ready" or not isinstance(routes, list):
+                raise AdmissionError("assigned setup overview did not return routes")
+            rows = [row for row in routes if isinstance(row, dict) and row.get("display_name") == call["board"]]
+            if len(routes) != 1 or len(rows) != 1:
+                raise AdmissionError("setup overview did not return exactly one relevant route")
+            row = rows[0]; kind, board_id = row.get("route"), row.get("board_id")
+            if kind not in {"setup", "repair", "validate"} or not isinstance(board_id, str) or not board_id:
+                raise AdmissionError("setup overview returned an unsupported route")
+            load_call = row.get("load_call")
+            expected_tool = "board_setup-plan" if kind in {"setup", "repair"} else "board_validate"
+            if not self._route_call(load_call, "load_setup_tool", {"board_id":board_id, "tool_name":expected_tool}):
+                raise AdmissionError("setup overview load call is not closed")
+            retained: dict[str, Any] = {"kind":kind,"board_id":board_id,"load_call":load_call}
+            if kind in {"setup", "repair"}:
+                initial = row.get("plan_initialization_call")
+                null_args = {"board_id":None,"hypothesis":None,"strategy":None,"hypothesis_made":None,"strategy_evaluated":None,"expected_fail_return":None,"expected_success_return":None,"max_calls":None,"max_calls_buffer":None,"action_parameters":None,"user_permission":None}
+                if not self._route_call(initial, "board_setup-plan", null_args):
+                    raise AdmissionError("setup overview plan initialization is not exact")
+                retained["plan_initialization_call"] = initial
+            else:
+                next_call = row.get("next_call")
+                if not self._route_call(next_call, "board_validate", {"board_id":board_id, "probe_id":next_call.get("arguments", {}).get("probe_id") if isinstance(next_call, dict) else None}) or not isinstance(next_call["arguments"]["probe_id"], str) or not next_call["arguments"]["probe_id"]:
+                    raise AdmissionError("setup overview validation call is not exact")
+                retained["next_call"] = next_call
+            session["route"] = retained; return
+        route = session.get("route")
+        if method == "load_setup_tool":
+            if not isinstance(route, dict) or payload.get("status") != "setup_tool_loaded" or payload.get("board_id") != route["board_id"] or payload.get("tool_name") != route["load_call"]["arguments"]["tool_name"]:
+                raise AdmissionError("setup tool load result differs from retained route")
+        if method == "board_setup-plan" and any(value is not None for value in args.values()):
+            requires_uart = args["action_parameters"].get("requires_uart")
+            if not isinstance(requires_uart, bool):
+                raise AdmissionError("accepted setup plan has no boolean UART requirement")
+            session["requires_uart"] = requires_uart
 
     def close_session(self, close_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
         """Only a separately signed, predecessor-bound normal close can produce CLOSED."""
