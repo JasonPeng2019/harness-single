@@ -412,7 +412,7 @@ class AcceptanceBroker:
         if not isinstance(limitation_id, str) or not limitation_id or any(char in limitation_id for char in "/\\"):
             raise AdmissionError("limitation identity is invalid")
         decision = self._load_limitation_decision(o_decision_path)
-        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
+        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "protected_suite", "physical_certification", "o_decision", "created_utc", "signature"}
         if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
             raise AdmissionError("server limitation decision is not closed or signed")
         if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
@@ -423,27 +423,49 @@ class AcceptanceBroker:
         if decision["attribution"] not in {"PINNED_SERVER_SOURCE"}:
             raise AdmissionError("server limitation attribution is not pinned-server source")
         chain = decision["call_chain"]
-        if not isinstance(chain, list) or len(chain) < 1 or any(not isinstance(item, dict) or set(item) != {"path", "sha256", "stage"} or item["stage"] not in {"dispatch", "raw-result"} for item in chain) or {item["stage"] for item in chain} != {"dispatch", "raw-result"}:
+        stages = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result")
+        if not isinstance(chain, list) or len(chain) != len(stages) or any(not isinstance(item, dict) or set(item) != {"path", "sha256", "stage"} for item in chain) or tuple(item["stage"] for item in chain) != stages:
             raise AdmissionError("limitation requires a dispatched raw server failure chain")
-        raw = next(item for item in chain if item["stage"] == "raw-result")
-        self._verify_limitation_reference(raw, "raw server failure")
-        raw_value = json.loads(Path(raw["path"]).read_text(encoding="utf-8"))
-        if raw_value.get("outcome") != "FAIL" or "raw_result" not in raw_value:
+        records: list[dict[str, Any]] = []
+        for index, item in enumerate(chain):
+            self._verify_limitation_reference(item, "limitation call chain")
+            value = json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+            if value.get("stage") != stages[index] or value.get("attempt_id") != decision["attempt_id"] or value.get("lane_id") != decision["lane_id"] or value.get("call_id") is None or (index and (value.get("previous_path") != chain[index - 1]["path"] or value.get("previous_sha256") != chain[index - 1]["sha256"])):
+                raise AdmissionError("limitation call chain identity or predecessor drifted")
+            records.append(value)
+        if len({value["call_id"] for value in records}) != 1 or any(value.get("bound_operation", {}).get("server_commit") != _PINNED_SERVER_COMMIT for value in records):
+            raise AdmissionError("limitation chain is not one pinned-server call")
+        raw_value = records[-1]
+        raw_payload = raw_value.get("raw_result")
+        if raw_value.get("outcome") != "FAIL" or not isinstance(raw_payload, dict) or "transport_failure" in raw_payload or not isinstance(raw_payload.get("result"), dict):
             raise AdmissionError("limitation requires raw pinned-server failure, not pre-dispatch rejection")
         terminal = decision["session_terminal"]
-        if not isinstance(terminal, dict) or set(terminal) != {"path", "sha256", "state"} or terminal["state"] not in {"ABORTED", "CLOSED"}: raise AdmissionError("terminal session evidence is incomplete")
+        if not isinstance(terminal, dict) or set(terminal) != {"path", "sha256"}: raise AdmissionError("terminal session evidence is incomplete")
         self._verify_limitation_reference(terminal, "terminal session")
+        terminal_value = json.loads(Path(terminal["path"]).read_text(encoding="utf-8"))
+        if terminal_value.get("session_id") != decision["session_id"] or terminal_value.get("state") not in {"ABORTED", "CLOSED"}:
+            raise AdmissionError("terminal session evidence does not close this session")
         process = decision["process_evidence"]
-        if not isinstance(process, dict) or process.get("exact_reaped") is not True or process.get("helpers_stopped") is not True: raise AdmissionError("terminal process cleanup is incomplete")
+        if not isinstance(process, dict) or set(process) != {"path", "sha256"}: raise AdmissionError("terminal process cleanup is incomplete")
+        self._verify_limitation_reference(process, "terminal process")
+        process_value = json.loads(Path(process["path"]).read_text(encoding="utf-8"))
+        if process_value.get("session_id") != decision["session_id"] or process_value.get("exact_reaped") is not True or process_value.get("helpers_stopped") is not True or process_value.get("claim_released") is not True:
+            raise AdmissionError("terminal process evidence is not exact cleanup evidence")
         alternatives = decision["alternatives"]
         order = ["PARTIAL_MCP", "PINNED_COMPONENT_INTEGRATION", "CANDIDATE_BOUNDARY_UNIT"]
-        if not isinstance(alternatives, list) or [item.get("kind") for item in alternatives if isinstance(item, dict)] != order or any(not isinstance(item, dict) or set(item) != {"kind", "available", "reason"} or not isinstance(item["available"], bool) or not isinstance(item["reason"], str) for item in alternatives): raise AdmissionError("limitation alternatives are not closed and ordered")
+        if not isinstance(alternatives, list) or [item.get("kind") for item in alternatives if isinstance(item, dict)] != order or any(not isinstance(item, dict) or set(item) != {"kind", "available", "reason", "evidence"} or not isinstance(item["available"], bool) or not isinstance(item["reason"], str) or not item["reason"] for item in alternatives): raise AdmissionError("limitation alternatives are not closed and ordered")
+        for item in alternatives: self._verify_limitation_reference(item["evidence"], "alternative evidence")
         available = next((item for item in alternatives if item["available"]), None)
         substitute = decision["substitute"]
-        if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not all(isinstance(substitute[key], str) and substitute[key] for key in ("stable_id", "assignment", "result")):
+        if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not isinstance(substitute.get("stable_id"), str) or not substitute["stable_id"]:
             raise AdmissionError("limitation substitute is not the first safe available alternative")
-        if any(item["available"] is False and not item["reason"] for item in alternatives[:order.index(available["kind"])]): raise AdmissionError("skipped alternative lacks evidence-linked reason")
-        if decision["original_test"] == substitute["stable_id"] or "protected" in decision["original_test"].lower() or any(token in json.dumps(decision, sort_keys=True).lower() for token in ("pyocd", "direct serial", "direct mcp", "hardware absent", "operator error", "fixture error", "environment error", "unsafe call")):
+        self._verify_limitation_reference(substitute["assignment"], "substitute assignment"); self._verify_limitation_reference(substitute["result"], "substitute result")
+        protected = decision["protected_suite"]
+        self._verify_limitation_reference(protected, "protected suite")
+        protected_value = json.loads(Path(protected["path"]).read_text(encoding="utf-8"))
+        protected_ids = protected_value.get("protected_ids") if isinstance(protected_value, dict) else None
+        if not isinstance(protected_ids, list) or any(not isinstance(value, str) or not value for value in protected_ids): raise AdmissionError("protected suite artifact is not closed")
+        if decision["original_test"] == substitute["stable_id"] or decision["original_test"] in protected_ids or substitute["stable_id"] in protected_ids or any(token in json.dumps(decision, sort_keys=True).lower() for token in ("pyocd", "direct serial", "direct mcp", "hardware absent", "operator error", "fixture error", "environment error", "unsafe call", "xfail", "skip", "weaken")):
             raise AdmissionError("limitation cannot substitute protected tests or bypass physical authority")
         result = {key: decision[key] for key in required - {"signature"}}
         result["schema"] = "firmware-server-limitation/v1"
@@ -582,6 +604,19 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     parameters = rule.get("parameters")
     if not isinstance(parameters, dict) or set(call["arguments"]) != set(parameters.get("required_exact", ())):
         raise AdmissionError("method parameters do not match pinned guarded surface")
+    action_parameters = parameters
+    if "plan_action" in rule:
+        all_null = all(value is None for value in call["arguments"].values())
+        if all_null:
+            return {"policy": "ALLOW", "evaluation_sha256": canonical_sha256({"call": call, "policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest() if policy_path else "packaged"}), "maximum_duration_seconds": maximum}
+        plan = call["arguments"]
+        if (plan["board_id"] != call["board"] or not all(isinstance(plan[key], str) and plan[key] for key in ("hypothesis", "strategy", "expected_fail_return", "expected_success_return")) or plan["hypothesis_made"] is not True or plan["strategy_evaluated"] is not True or any(not isinstance(plan[key], int) or isinstance(plan[key], bool) or plan[key] <= 0 for key in ("max_calls", "max_calls_buffer")) or not isinstance(plan["action_parameters"], dict) or (plan["user_permission"] is not None and (not isinstance(plan["user_permission"], dict) or not plan["user_permission"]))):
+            raise AdmissionError("populated plan does not have the exact guarded envelope")
+        action_parameters = rule.get("action_parameters")
+        if not isinstance(action_parameters, dict) or set(plan["action_parameters"]) != set(action_parameters.get("required_exact", ())):
+            raise AdmissionError("plan action parameters do not match the closed action schema")
+        # The nested action must itself be suitable for the paired handler.
+        parameters = action_parameters
     if call["method"] == "read_memory_symbol":
         args = call["arguments"]
         if not isinstance(args["symbol"], str) or not args["symbol"] or args["width"] not in (8, 16, 32) or args["elf_artifact"] is not None and not isinstance(args["elf_artifact"], str):

@@ -364,7 +364,7 @@ class FirmwareAcceptanceController:
             server_run_id = _server_run_id(guidance)
             open_value = {"schema":"firmware-session-open/v1","session_id":request["session_id"],"session_request_path":str(request_record_path),"session_request_sha256":request_sha,"claim":claim,"controller_identity":claim["owner"],"server_process_identity":identity,"server_run_id":server_run_id,"bootstrap_transcript":transcript,"bootstrap_transcript_sha256":canonical_sha256(transcript),"state":"BOOTSTRAPPED"}
             open_sha = _write_new(_safe_child(session_root, "SESSION_OPEN.json"), open_value)
-            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"call_ids":set()}
+            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"pending_proposal":None,"call_ids":set(),"route":None,"continuation":None}
             return {**open_value,"path":str(self._session["open_path"]),"raw_sha256":open_sha}
         except BaseException:
             if transport is not None: transport.close_and_join()
@@ -386,6 +386,10 @@ class FirmwareAcceptanceController:
         if "next_by_mode" in rule:
             values = call["arguments"]
             mode = "all_null" if all(value is None for value in values.values()) else "populated"
+            if session["state"] in {"SETUP_PLAN_DISCLOSED", "OP_PLAN_DISCLOSED"}:
+                disclosed = session["active_plan"]
+                if disclosed is None or call["method"] != disclosed["plan_method"] or mode != "populated":
+                    raise AdmissionError("only the exact disclosed plan may be populated")
             expected = rule["next_by_mode"].get(mode)
         elif "next_by_tool_name" in rule:
             expected = rule["next_by_tool_name"].get(call["arguments"].get("tool_name"))
@@ -393,8 +397,7 @@ class FirmwareAcceptanceController:
             expected = request["next_state"] if request["next_state"] in set(rule["next_by_server_status"].values()) else None
         elif session["active_plan"] is not None:
             plan = session["active_plan"]
-            if call["method"] != plan["method"] or call["arguments"] != {"board_id":call["board"], **plan["parameters"]}: raise AdmissionError("paired action is not exactly bound to its accepted plan")
-            session["active_plan"] = None
+            if call["method"] != plan["method"] or call["arguments"] != plan["preferred_arguments"]: raise AdmissionError("paired action is not exactly bound to its accepted plan")
         if expected != request["next_state"]: raise AdmissionError("session next state is not the locked policy transition")
         _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
         proposal = {"schema":"firmware-session-call-proposal/v1","session_id":request["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"sequence_number":request["sequence_number"],"prior_result":request["prior_result"],"current_state":request["current_state"],"next_state":request["next_state"],"call":call,"claim":session["claim"],"plan_label":"candidate_control_plan" if rule.get("candidate_control_plan") else "mcp_native_plan"}
@@ -402,12 +405,15 @@ class FirmwareAcceptanceController:
         if _safe_child(self.broker.root, "sessions", session["request"]["session_id"]) not in resolved.parents or resolved.is_symlink(): raise AdmissionError("session proposal path escapes session root")
         raw_sha = _write_new(resolved, proposal)
         session["pending_call_id"] = call["call_id"]
+        session["pending_proposal"] = (resolved, raw_sha)
         return {**proposal,"path":str(path.resolve()),"raw_sha256":raw_sha}
 
     def session_execute_artifacts(self, proposal_path: Path, decision_path: Path, authorization_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
         """Dispatch exactly one signed call over the retained transport; never relaunch it."""
         session = self._require_session()
         proposal, proposal_sha = self._read_bound(proposal_path, {"schema","session_id","session_open_path","session_open_sha256","sequence_number","prior_result","current_state","next_state","call","claim","plan_label"})
+        if session["pending_proposal"] != (proposal_path.resolve(), proposal_sha) or session["pending_call_id"] != proposal["call"]["call_id"]:
+            self.abort_session("proposal was not the one pending call"); raise AdmissionError("session execution proposal is not the pending proposal")
         decision, decision_sha = self._read_bound(decision_path, _DECISION_KEYS)
         if decision.get("proposal_path") != str(proposal_path.resolve()) or decision.get("proposal_sha256") != proposal_sha or decision.get("call") != proposal["call"] or decision.get("claim") != session["claim"]:
             self.abort_session("decision binding mismatch"); raise AdmissionError("session decision does not bind the exact proposal")
@@ -433,13 +439,40 @@ class FirmwareAcceptanceController:
                     raise AdmissionError("server result status did not permit the requested transition")
             if call["method"] == "board_validate" and payload.get("status") != "validation_passed":
                 raise AdmissionError("board validation did not report ready")
+            if call["method"] == "get_setup_status":
+                required_ready = {"status":"setup_ready", "configuration_ready":True, "live_session_ready":True, "ready_for_code":True}
+                if any(payload.get(key) != value for key, value in required_ready.items()) or (session.get("requires_uart") is True and payload.get("ready_for_uart_work") is not True):
+                    raise AdmissionError("setup status did not meet the locked readiness barrier")
+            if "next_by_mode" in rule and any(value is not None for value in call["arguments"].values()):
+                preferred = payload.get("preferred_call")
+                plan_id = payload.get("plan_id")
+                expected_arguments = {"board_id": call["arguments"]["board_id"], **call["arguments"]["action_parameters"]}
+                if payload.get("status") != "plan_accepted" or not isinstance(plan_id, str) or not plan_id or payload.get("underlying_action") != rule["plan_action"] or not isinstance(preferred, dict) or set(preferred) != {"tool", "arguments"} or preferred.get("tool") != rule["plan_action"] or preferred.get("arguments") != expected_arguments:
+                    raise AdmissionError("accepted plan did not return the exact preferred action")
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
             result_sha = _write_new(result_path, result)
-            if "next_by_mode" in rule and any(value is not None for value in call["arguments"].values()):
-                session["active_plan"] = {"method":rule["plan_action"],"parameters":call["arguments"]}
+            if "next_by_mode" in rule:
+                if all(value is None for value in call["arguments"].values()):
+                    session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":None, "plan_id":None}
+                else:
+                    session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":expected_arguments, "plan_id":plan_id}
+            elif session["active_plan"] is not None and call["method"] == session["active_plan"]["method"]:
+                # Consumption occurs only after the exact preferred action result is durable.
+                if call["method"] == "board_setup" and payload.get("status") in {"setup_needs_user_input", "setup_research_required"}:
+                    continuation = payload.get("continuation_id")
+                    accepted = payload.get("accepted_response")
+                    if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict):
+                        raise AdmissionError("setup continuation is not predecessor-bound")
+                    session["continuation"] = {"continuation_id":continuation, "response":accepted}
+                elif call["method"] != "board_setup" or payload.get("status") == "setup_completed":
+                    session["active_plan"] = None
+            if call["method"] == "continue_setup":
+                continuation = session.get("continuation")
+                if continuation is None or call["arguments"] != {"board_id":call["board"], **continuation}:
+                    raise AdmissionError("setup continuation did not use the exact server response")
             session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}
-            session["call_ids"].add(call["call_id"]); session["pending_call_id"] = None
+            session["call_ids"].add(call["call_id"]); session["pending_call_id"] = None; session["pending_proposal"] = None
             return {**result,"path":str(result_path),"raw_sha256":result_sha}
         except BaseException:
             self.abort_session("call failure or process ambiguity")
