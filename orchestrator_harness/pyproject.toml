@@ -3,7 +3,7 @@ name = "portable-orchestrator-harness"
 version = "0.1.0"
 description = "Durable event observation and lane control for parallel coding work"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["cryptography>=42"]
 
 [tool.pyright]
 pythonVersion = "3.11"

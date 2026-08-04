@@ -13,17 +13,20 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             return signature == "sig" and public_key == "key" and bool(payload)
 
     def _complete_chain(self, broker: AcceptanceBroker, raw_payload: object, *, bound_digest: str | None = None) -> list[tuple[Path, str]]:
-        digest = bound_digest or raw_result_sha256(raw_payload)
+        digest = "PENDING" if bound_digest is None else bound_digest
         bound = {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-raw","attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":digest,"cleanup_owner":"C3-HARNESS"}
         common = {"attempt_id":"attempt-raw","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"identity":{"controller":"pid:1"},"bound_operation":bound,"bound_operation_sha256":canonical_sha256(canonical_bound_operation(bound))}
         stages: list[tuple[Path, str]] = []
         for stage in ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result"):
-            extra = {"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
+            extra = {"schema":"firmware-o-decision/v2","proposal_path":"proposal","proposal_sha256":"proposal","call":{},"decision":"approve","issued_monotonic":1,"expires_monotonic":99,"topology":{},"signature":"sig","public_key":"key"} if stage == "signed-decision" else {}
             extra |= {"expires_monotonic":99} if stage == "authorization" else {}
             extra |= {"deadline_monotonic":100} if stage == "dispatch-admission" else {}
             extra |= {"raw_result":raw_payload,"outcome":"PASS"} if stage == "raw-result" else {}
             extra |= {"exact_reaped":True} if stage == "returning-state-cleanup" else {}
             stages.append(broker.record(stage, "call-raw", {**common, **extra}, (str(stages[-1][0]), stages[-1][1]) if stages else None))
+            if stage == "raw-result":
+                recorded = __import__("json").loads(stages[-1][0].read_text(encoding="utf-8"))
+                common = {**common, "bound_operation": recorded["bound_operation"], "bound_operation_sha256": recorded["bound_operation_sha256"]}
         return stages
 
     def test_seed_is_exact_and_hash_bound(self) -> None:
@@ -60,7 +63,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             self.assertEqual(40, len(broker.validate_target(target)))
             config = broker.controller_config("STM-A", {})
             self.assertEqual("", config["worker_environment"]["MCP_ENDPOINT"])
-            bound = {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-1","attempt_id":"attempt-0001","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":"r","cleanup_owner":"C3-HARNESS"}
+            bound = {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":"reset_and_halt","method_version":1,"arguments":{"board_id":"STM-A"},"policy_sha256":"p","schema_sha256":"s","plan_sha256":"pl","permission_sha256":"pe","authorization_sha256":"a","claim_sha256":"c","call_id":"call-1","attempt_id":"attempt-0001","lane_id":"STM-A","board":"STM-A","probe_uid":"uid","target":"STM32L476RG","profile":"stm","route":"rediscover","governing_hashes":{"goal":"g"},"c1_reference":{"path":"c1","sha256":"h"},"deadline_monotonic":100,"expires_monotonic":99,"seed_identity":{"manifest":"x"},"target_identity":{"commit":"y"},"raw_result_sha256":"PENDING","cleanup_owner":"C3-HARNESS"}
             common = {"attempt_id": "attempt-0001", "lane_id": "STM-A", "board": "STM-A", "probe_uid": "uid", "target": "STM32L476RG", "profile": "stm", "route": "rediscover", "governing_hashes": {"goal": "g"}, "c1_reference": {"path": "c1", "sha256": "h"}, "identity": {"controller": "pid:1"}, "bound_operation": bound, "bound_operation_sha256": __import__("firmware_acceptance.kit", fromlist=["canonical_sha256"]).canonical_sha256(canonical_bound_operation(bound))}
             path, digest = broker.record("proposal", "call-1", common)
             broker.record("policy-evaluation", "call-1", common, (str(path), digest))

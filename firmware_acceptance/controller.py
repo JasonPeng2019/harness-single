@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import argparse
-import importlib
+import base64
 import subprocess
 import threading
 import time
@@ -16,7 +16,7 @@ from typing import Any, Callable, Protocol
 from orchestrator_harness.models import ProcessInfo
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import ResourceClaims, ResourceLockError
-from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_sha256, raw_result_sha256
+from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256
 
 
 class StdioProcess(Protocol):
@@ -31,6 +31,41 @@ class StdioProcess(Protocol):
 
 Launcher = Callable[[dict[str, Any]], StdioProcess]
 _FORBIDDEN_REQUEST_KEYS = {"endpoint", "stdio", "mcp_command", "environment", "credential", "process", "handle"}
+_CALL_KEYS = {"call_id", "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "route", "method", "method_version", "arguments", "proposal_sha256", "decision_sha256", "authorization_sha256", "deadline_monotonic", "plan", "permission", "c1_reference", "delegated_reference", "topology", "claim", "governing_hashes", "seed_identity", "target_identity"}
+_REFERENCE_KEYS = {"path", "sha256"}
+
+
+class Ed25519Verifier(SignatureVerifier):
+    """Production verifier; its key is read only from ROOT's launch evidence."""
+    def verify(self, payload: bytes, signature: str, public_key: str) -> bool:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key, validate=True)).verify(base64.b64decode(signature, validate=True), payload)
+            return True
+        except Exception:
+            return False
+
+
+def _reference(value: Any, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != _REFERENCE_KEYS or not all(isinstance(value[key], str) and value[key] for key in _REFERENCE_KEYS):
+        raise AdmissionError(label + " must be an exact path/hash binding")
+    return value
+
+
+def _closed_call(call: Any) -> dict[str, Any]:
+    if not isinstance(call, dict) or set(call) != _CALL_KEYS or _FORBIDDEN_REQUEST_KEYS & set(call):
+        raise AdmissionError("call authority is not closed")
+    for key in ("call_id", "attempt_id", "lane_id", "board", "probe_uid", "target", "profile", "method", "proposal_sha256", "decision_sha256", "authorization_sha256"):
+        if not isinstance(call[key], str) or not call[key]: raise AdmissionError("call identity is incomplete")
+    if call["route"] is not None and not isinstance(call["route"], str): raise AdmissionError("route must be canonical null or an exact route")
+    if not isinstance(call["method_version"], int) or isinstance(call["method_version"], bool) or not isinstance(call["arguments"], dict): raise AdmissionError("call method binding is invalid")
+    if not isinstance(call["deadline_monotonic"], (int, float)) or isinstance(call["deadline_monotonic"], bool): raise AdmissionError("call deadline is invalid")
+    for key in ("c1_reference", "delegated_reference", "topology", "claim", "seed_identity", "target_identity"):
+        _reference(call[key], key)
+    if not isinstance(call["governing_hashes"], dict) or set(call["governing_hashes"]) != {"goal", "plan", "readiness", "policy", "topology"} or not all(isinstance(value, str) and value for value in call["governing_hashes"].values()): raise AdmissionError("governing hashes are incomplete")
+    if not isinstance(call["plan"], dict) or set(call["plan"]) != {"path", "sha256", "max_operation_duration_seconds"} or not isinstance(call["plan"]["max_operation_duration_seconds"], int) or call["plan"]["max_operation_duration_seconds"] <= 0: raise AdmissionError("plan authority is invalid")
+    if not isinstance(call["permission"], dict) or set(call["permission"]) != {"path", "sha256", "granted"} or call["permission"]["granted"] is not True: raise AdmissionError("permission authority is invalid")
+    return json.loads(json.dumps(call, sort_keys=True))
 
 
 def _launch(config: dict[str, Any]) -> StdioProcess:
@@ -82,13 +117,9 @@ class FirmwareAcceptanceController:
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
 
     def create_proposal(self, request: dict[str, Any]) -> dict[str, Any]:
-        if set(request) != {"call", "lane_id", "claim"} or not isinstance(request["call"], dict):
-            raise AdmissionError("proposal must contain only call, lane_id, and claim")
-        if request["lane_id"] != request["call"].get("lane_id") or not isinstance(request["claim"], str) or not request["claim"]:
-            raise AdmissionError("proposal lane or claim mismatch")
-        if _FORBIDDEN_REQUEST_KEYS & set(request["call"]):
-            raise AdmissionError("workers cannot supply an MCP endpoint, command, environment, or handle")
-        proposal = {"schema": "firmware-controller-proposal/v1", "request": json.loads(json.dumps(request, sort_keys=True))}
+        if set(request) != {"call"}: raise AdmissionError("proposal must contain exactly one closed call authority")
+        call = _closed_call(request["call"])
+        proposal = {"schema": "firmware-controller-proposal/v2", "call": call}
         proposal["sha256"] = canonical_sha256(proposal)
         return proposal
 
@@ -102,20 +133,20 @@ class FirmwareAcceptanceController:
         return {**proposal, "path": str(resolved)}
 
     def execute_artifacts(self, proposal_path: Path, decision_path: Path, authorization_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
-        proposal = self._load_artifact(proposal_path, {"schema", "request", "sha256"})
-        if proposal.get("sha256") != canonical_sha256({"schema": proposal.get("schema"), "request": proposal.get("request")}):
+        proposal = self._load_artifact(proposal_path, {"schema", "call", "sha256"})
+        if proposal.get("sha256") != canonical_sha256({"schema": proposal.get("schema"), "call": proposal.get("call")}):
             raise AdmissionError("proposal bytes were mutated or substituted")
-        decision = self._load_artifact(decision_path, {"proposal_sha256", "signature", "public_key"})
-        authorization = self._load_artifact(authorization_path, {"proposal_sha256", "expires_monotonic", "delegated_authority"})
+        decision = self._load_artifact(decision_path, {"schema", "proposal_path", "proposal_sha256", "call", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"})
+        authorization = self._load_artifact(authorization_path, {"schema", "proposal_path", "proposal_sha256", "decision_path", "decision_sha256", "call", "expires_monotonic", "one_shot_id", "revoked"})
         return self.execute(proposal, decision, authorization, verifier)
 
     def execute(self, proposal: dict[str, Any], decision: dict[str, Any], authorization: dict[str, Any], verifier: SignatureVerifier) -> dict[str, Any]:
-        if set(decision) != {"proposal_sha256", "signature", "public_key"} or decision["proposal_sha256"] != proposal.get("sha256"):
+        call = _closed_call(proposal.get("call"))
+        if set(decision) != {"schema", "proposal_path", "proposal_sha256", "call", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"} or decision["schema"] != "firmware-o-decision/v2" or decision["proposal_sha256"] != proposal.get("sha256") or decision["call"] != call or decision["decision"] != "approve" or not isinstance(decision["issued_monotonic"], (int, float)) or not isinstance(decision["expires_monotonic"], (int, float)) or decision["issued_monotonic"] > decision["expires_monotonic"] or _reference(decision["topology"], "decision topology") != call["topology"]:
             raise AdmissionError("decision does not bind the exact proposal")
-        if not verifier.verify(str(proposal["sha256"]).encode(), decision["signature"], decision["public_key"]):
+        if not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["public_key"]):
             raise AdmissionError("proposal decision signature is invalid")
-        call = proposal["request"]["call"]
-        if set(authorization) != {"proposal_sha256", "expires_monotonic", "delegated_authority"} or authorization["proposal_sha256"] != proposal["sha256"] or not isinstance(authorization["expires_monotonic"], (int, float)) or self.clock() >= authorization["expires_monotonic"] or not authorization["delegated_authority"]:
+        if set(authorization) != {"schema", "proposal_path", "proposal_sha256", "decision_path", "decision_sha256", "call", "expires_monotonic", "one_shot_id", "revoked"} or authorization["schema"] != "firmware-derived-authorization/v2" or authorization["proposal_sha256"] != proposal["sha256"] or authorization["decision_sha256"] != canonical_sha256(decision) or authorization["call"] != call or not isinstance(authorization["expires_monotonic"], (int, float)) or authorization["expires_monotonic"] != decision["expires_monotonic"] or self.clock() >= authorization["expires_monotonic"] or authorization["revoked"] is not False or not isinstance(authorization["one_shot_id"], str) or authorization["one_shot_id"] != call["call_id"]:
             raise AdmissionError("delegated authorization is absent, stale, or mismatched")
         policy = self._policy_admission(call)
         call_id = call["call_id"]
@@ -127,17 +158,25 @@ class FirmwareAcceptanceController:
         except ResourceLockError as exc:
             raise AdmissionError("resource claim acquisition failed") from exc
         held = claims.held
-        if len(held) != 1 or not isinstance(held[0].get("path"), str):
+        if len(held) != 1 or not isinstance(held[0].get("path"), str) or held[0].get("resource") != call["board"] or held[0].get("owner") is None:
+            _ = claims.release_all()
             raise AdmissionError("resource claim evidence is unavailable")
         claim_path = Path(str(held[0]["path"]))
-        claim_evidence = {"path": str(claim_path), "sha256": hashlib.sha256(claim_path.read_bytes()).hexdigest(), "owner": held[0].get("owner")}
+        claim_evidence = {"resource": held[0]["resource"], "path": str(claim_path), "sha256": hashlib.sha256(claim_path.read_bytes()).hexdigest(), "owner": held[0].get("owner")}
+        if claim_evidence["path"] != call["claim"]["path"] or claim_evidence["sha256"] != call["claim"]["sha256"]:
+            _ = claims.release_all()
+            raise AdmissionError("acquired resource claim differs from proposal")
         bound = self._intent_bound(call, intent_sha, authorization, claim_evidence["sha256"])
         common = {"attempt_id": bound["attempt_id"], "lane_id": bound["lane_id"], "board": bound["board"], "probe_uid": bound["probe_uid"], "target": bound["target"], "profile": bound["profile"], "route": bound["route"], "governing_hashes": bound["governing_hashes"], "c1_reference": bound["c1_reference"], "identity": {"controller": "C3-HARNESS"}, "bound_operation": bound, "bound_operation_sha256": canonical_sha256(bound)}
         evidence: list[tuple[Path, str]] = []
-        for stage, value in (("proposal", proposal), ("policy-evaluation", policy), ("signed-decision", decision), ("authorization", authorization), ("dispatch-admission", {"deadline_monotonic": call["deadline_monotonic"], "intent_sha256": intent_sha})):
-            evidence.append(self.broker.record(stage, call_id, {**common, **value}, (str(evidence[-1][0]), evidence[-1][1]) if evidence else None))
-        config = self.broker.controller_config(call["lane_id"], {})
-        config = {**config, "environment": _scrubbed_environment(config)}
+        try:
+            for stage, value in (("proposal", proposal), ("policy-evaluation", policy), ("signed-decision", decision), ("authorization", authorization), ("dispatch-admission", {"deadline_monotonic": call["deadline_monotonic"], "intent_sha256": intent_sha})):
+                evidence.append(self.broker.record(stage, call_id, {**common, **value}, (str(evidence[-1][0]), evidence[-1][1]) if evidence else None))
+            config = self.broker.controller_config(call["lane_id"], {})
+            config = {**config, "environment": _scrubbed_environment(config)}
+        except BaseException:
+            if claims.release_all(): raise AdmissionError("resource claim release failed")
+            raise
         process: StdioProcess | None = None
         raw: dict[str, Any] | None = None
         cleanup: dict[str, Any] = {"pid": None, "exact_reaped": False}
@@ -171,7 +210,11 @@ class FirmwareAcceptanceController:
                 except Exception as exc:
                     cleanup["error"] = type(exc).__name__
             prior = evidence[-1] if evidence else None
-            evidence.append(self.broker.record("returning-state-cleanup", call_id, {**common, **cleanup}, (str(prior[0]), prior[1]) if prior else None))
+            try:
+                evidence.append(self.broker.record("returning-state-cleanup", call_id, {**common, **cleanup}, (str(prior[0]), prior[1]) if prior else None))
+            except BaseException:
+                if claims.release_all(): raise AdmissionError("resource claim release failed")
+                raise
         if raw is None or not cleanup["exact_reaped"]:
             if claims.release_all(): raise AdmissionError("resource claim release failed")
             raise AdmissionError("MCP response or exact cleanup is ambiguous")
@@ -195,7 +238,7 @@ class FirmwareAcceptanceController:
 
     def _intent_bound(self, call: dict[str, Any], intent_sha: str, authorization: dict[str, Any], claim_sha: str) -> dict[str, Any]:
         policy_sha = hashlib.sha256(self.broker.policy_path.read_bytes()).hexdigest()
-        return {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":call["method"],"method_version":1,"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":intent_sha,"plan_sha256":canonical_sha256(call["plan"]),"permission_sha256":canonical_sha256(call["permission"]),"authorization_sha256":canonical_sha256(authorization),"claim_sha256":claim_sha,"call_id":call["call_id"],"attempt_id":call.get("attempt_id", call["call_id"]),"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call.get("route", "rediscover"),"governing_hashes":call.get("governing_hashes", {"controller": "local"}),"c1_reference":call.get("c1_reference", {"path": "C1", "sha256": "local"}),"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call.get("seed_identity", {"manifest": "local"}),"target_identity":call.get("target_identity", {"commit": "local"}),"raw_result_sha256":"PENDING","cleanup_owner":"C3-HARNESS"}
+        return {"server_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","method":call["method"],"method_version":call["method_version"],"arguments":call["arguments"],"policy_sha256":policy_sha,"schema_sha256":intent_sha,"plan_sha256":canonical_sha256(call["plan"]),"permission_sha256":canonical_sha256(call["permission"]),"authorization_sha256":canonical_sha256(authorization),"claim_sha256":claim_sha,"call_id":call["call_id"],"attempt_id":call["attempt_id"],"lane_id":call["lane_id"],"board":call["board"],"probe_uid":call["probe_uid"],"target":call["target"],"profile":call["profile"],"route":call["route"],"governing_hashes":call["governing_hashes"],"c1_reference":call["c1_reference"],"deadline_monotonic":call["deadline_monotonic"],"expires_monotonic":authorization["expires_monotonic"],"seed_identity":call["seed_identity"],"target_identity":call["target_identity"],"raw_result_sha256":"PENDING","cleanup_owner":"C3-HARNESS"}
 
     def _load_artifact(self, path: Path, keys: set[str]) -> dict[str, Any]:
         resolved = path.resolve()
@@ -256,13 +299,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", required=True)
     parser.add_argument("--policy", required=True)
     parser.add_argument("--templates", required=True)
-    parser.add_argument("--verifier", required=True, help="trusted C3 verifier factory module:attribute")
+    parser.add_argument("--topology-root", required=True)
     args = parser.parse_args(argv)
-    module, separator, attribute = args.verifier.partition(":")
-    if not separator or not module or not attribute: raise SystemExit("verifier must be module:attribute")
-    factory = getattr(importlib.import_module(module), attribute)
-    verifier = factory()
-    if not isinstance(verifier, SignatureVerifier): raise SystemExit("trusted verifier factory returned an invalid verifier")
+    topology = Path(args.topology_root).resolve()
+    intent = json.loads((topology / "ORCHESTRATOR_LAUNCH_INTENT.json").read_text(encoding="utf-8"))
+    identity = json.loads((topology / "ORCHESTRATOR_IDENTITY.json").read_text(encoding="utf-8"))
+    release = json.loads((topology / "ORCHESTRATOR_KEY_RELEASE.json").read_text(encoding="utf-8"))
+    if not all(isinstance(item, dict) for item in (intent, identity, release)) or identity.get("intent_sha256") != canonical_sha256(intent) or release.get("identity_sha256") != canonical_sha256(identity) or identity.get("public_key") != intent.get("public_key"):
+        raise SystemExit("ROOT topology launch identity is incomplete or substituted")
+    try:
+        decision = json.loads(Path(args.decision).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("O decision is unreadable") from exc
+    if decision.get("public_key") != intent.get("public_key"):
+        raise SystemExit("O decision key is not bound to ROOT launch intent")
+    verifier = Ed25519Verifier()
     broker = AcceptanceBroker(Path(args.root), Path(args.seed), Path(args.policy), Path(args.templates))
     result = FirmwareAcceptanceController(broker).execute_artifacts(Path(args.proposal), Path(args.decision), Path(args.authorization), verifier)
     print(json.dumps({"outcome": result["outcome"], "evidence": result["evidence"]}, sort_keys=True))

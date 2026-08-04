@@ -33,6 +33,16 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def canonical_decision_payload(decision: dict[str, Any]) -> bytes:
+    """The one O-decision signing representation: compact sorted UTF-8 JSON minus signature."""
+    if not isinstance(decision, dict) or "signature" not in decision:
+        raise AdmissionError("decision signature field is required")
+    try:
+        return json.dumps({key: value for key, value in decision.items() if key != "signature"}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AdmissionError("decision is not canonical JSON") from exc
+
+
 def canonical_raw_result_bytes(payload: Any) -> bytes:
     """The retained raw MCP result representation: UTF-8 canonical JSON, never a caller digest."""
     try:
@@ -305,9 +315,9 @@ class AcceptanceBroker:
         if {key: value for key, value in intent.items() if key != "raw_result_sha256"} != {key: value for key, value in bound.items() if key != "raw_result_sha256"} or bound["raw_result_sha256"] == "PENDING":
             raise AdmissionError("raw result binding drifted from immutable intent")
         decision = records[2]
-        # O signs the immutable proposal digest bytes, not a mutable evidence wrapper.
-        proposal_digest = records[0].get("sha256")
-        if not isinstance(proposal_digest, str) or verifier is None or not verifier.verify(proposal_digest.encode("ascii"), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
+        decision_keys = {"schema", "proposal_path", "proposal_sha256", "call", "decision", "issued_monotonic", "expires_monotonic", "topology", "public_key", "signature"}
+        signed_decision = {key: decision[key] for key in decision_keys if key in decision}
+        if set(signed_decision) != decision_keys or verifier is None or not verifier.verify(canonical_decision_payload(signed_decision), str(decision.get("signature", "")), str(decision.get("public_key", ""))):
             raise AdmissionError("signed decision is absent or invalid")
         authorization = records[3]
         expiry = authorization.get("expires_monotonic")
