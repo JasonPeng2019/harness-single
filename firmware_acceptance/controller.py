@@ -395,9 +395,13 @@ class FirmwareAcceptanceController:
             expected = rule["next_by_tool_name"].get(call["arguments"].get("tool_name"))
         elif "next_by_server_status" in rule:
             expected = request["next_state"] if request["next_state"] in set(rule["next_by_server_status"].values()) else None
-        elif session["active_plan"] is not None:
+        if session["active_plan"] is not None and call["method"] in {session["active_plan"].get("method"), "board_fix_setup"}:
             plan = session["active_plan"]
             if call["method"] != plan["method"] or call["arguments"] != plan["preferred_arguments"]: raise AdmissionError("paired action is not exactly bound to its accepted plan")
+        if call["method"] == "continue_setup":
+            continuation = session.get("continuation")
+            if continuation is None or call["arguments"] != {"board_id":call["board"], **continuation}:
+                raise AdmissionError("setup continuation did not use the exact server response")
         if expected != request["next_state"]: raise AdmissionError("session next state is not the locked policy transition")
         _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
         proposal = {"schema":"firmware-session-call-proposal/v1","session_id":request["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"sequence_number":request["sequence_number"],"prior_result":request["prior_result"],"current_state":request["current_state"],"next_state":request["next_state"],"call":call,"claim":session["claim"],"plan_label":"candidate_control_plan" if rule.get("candidate_control_plan") else "mcp_native_plan"}
@@ -447,7 +451,7 @@ class FirmwareAcceptanceController:
                 preferred = payload.get("preferred_call")
                 plan_id = payload.get("plan_id")
                 expected_arguments = {"board_id": call["arguments"]["board_id"], **call["arguments"]["action_parameters"]}
-                if payload.get("status") != "plan_accepted" or not isinstance(plan_id, str) or not plan_id or payload.get("underlying_action") != rule["plan_action"] or not isinstance(preferred, dict) or set(preferred) != {"tool", "arguments"} or preferred.get("tool") != rule["plan_action"] or preferred.get("arguments") != expected_arguments:
+                if payload.get("status") != "plan_accepted" or not isinstance(plan_id, str) or not plan_id or payload.get("underlying_action") != rule["plan_action"] or not isinstance(preferred, dict) or set(preferred) != {"tool_name", "arguments"} or preferred.get("tool_name") != rule["plan_action"] or preferred.get("arguments") != expected_arguments:
                     raise AdmissionError("accepted plan did not return the exact preferred action")
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
@@ -467,10 +471,6 @@ class FirmwareAcceptanceController:
                     session["continuation"] = {"continuation_id":continuation, "response":accepted}
                 elif call["method"] != "board_setup" or payload.get("status") == "setup_completed":
                     session["active_plan"] = None
-            if call["method"] == "continue_setup":
-                continuation = session.get("continuation")
-                if continuation is None or call["arguments"] != {"board_id":call["board"], **continuation}:
-                    raise AdmissionError("setup continuation did not use the exact server response")
             session["state"], session["sequence"], session["prior_result"] = proposal["next_state"], proposal["sequence_number"], {"path":str(result_path),"sha256":result_sha}
             session["call_ids"].add(call["call_id"]); session["pending_call_id"] = None; session["pending_proposal"] = None
             return {**result,"path":str(result_path),"raw_sha256":result_sha}

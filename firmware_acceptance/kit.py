@@ -412,7 +412,7 @@ class AcceptanceBroker:
         if not isinstance(limitation_id, str) or not limitation_id or any(char in limitation_id for char in "/\\"):
             raise AdmissionError("limitation identity is invalid")
         decision = self._load_limitation_decision(o_decision_path)
-        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "protected_suite", "physical_certification", "o_decision", "created_utc", "signature"}
+        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
         if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
             raise AdmissionError("server limitation decision is not closed or signed")
         if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
@@ -460,7 +460,7 @@ class AcceptanceBroker:
         if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not isinstance(substitute.get("stable_id"), str) or not substitute["stable_id"]:
             raise AdmissionError("limitation substitute is not the first safe available alternative")
         self._verify_limitation_reference(substitute["assignment"], "substitute assignment"); self._verify_limitation_reference(substitute["result"], "substitute result")
-        protected = decision["protected_suite"]
+        protected = decision["o_decision"].get("protected_suite") if isinstance(decision["o_decision"], dict) else None
         self._verify_limitation_reference(protected, "protected suite")
         protected_value = json.loads(Path(protected["path"]).read_text(encoding="utf-8"))
         protected_ids = protected_value.get("protected_ids") if isinstance(protected_value, dict) else None
@@ -597,10 +597,6 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
         raise AdmissionError("deadline cannot cover operation plus cleanup margin")
     if not isinstance(call["permission"], dict) or not call["permission"].get("granted"):
         raise AdmissionError("missing live permission")
-    if call["method"] in {"write_serial", "write_serial-plan"}:
-        text = call["arguments"].get("text")
-        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 256:
-            raise AdmissionError("UART write exceeds locked UTF-8 byte limit")
     parameters = rule.get("parameters")
     if not isinstance(parameters, dict) or set(call["arguments"]) != set(parameters.get("required_exact", ())):
         raise AdmissionError("method parameters do not match pinned guarded surface")
@@ -617,6 +613,11 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
             raise AdmissionError("plan action parameters do not match the closed action schema")
         # The nested action must itself be suitable for the paired handler.
         parameters = action_parameters
+    action_arguments = call["arguments"].get("action_parameters", call["arguments"])
+    if call["method"] in {"write_serial", "write_serial-plan"}:
+        text = action_arguments.get("text")
+        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 256:
+            raise AdmissionError("UART write exceeds locked UTF-8 byte limit")
     if call["method"] == "read_memory_symbol":
         args = call["arguments"]
         if not isinstance(args["symbol"], str) or not args["symbol"] or args["width"] not in (8, 16, 32) or args["elf_artifact"] is not None and not isinstance(args["elf_artifact"], str):
@@ -624,7 +625,7 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     if call["method"] == "flash_application" and not parameters.get("safe_flags", {}).get("application_region_only"):
         raise AdmissionError("flash method lacks reviewed application containment")
     if call["method"] in {"flash_application", "flash_application-plan"}:
-        artifact = call["arguments"].get("artifact")
+        artifact = action_arguments.get("artifact")
         if not isinstance(artifact, str) or not artifact or any(token in artifact.lower() for token in ("bootloader", "mass_erase", "unlock", "protection")):
             raise AdmissionError("flash artifact is not an application-only input")
     if call["method"] in {"read_serial", "write_serial"} and call["arguments"].get("on_exit") is not None:
