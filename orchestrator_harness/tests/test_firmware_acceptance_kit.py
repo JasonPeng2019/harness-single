@@ -122,7 +122,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                     arguments = self._uart_arguments(method); arguments[field] = value
                     with self.subTest(method=method, plan=plan, field=field, value=repr(value)):
                         self._assert_uart_admission(method, arguments, plan=plan, allowed=False)
-        for method, field, bad_values in (("read_serial", "expected_text", ("", 1)), ("read_serial", "baudrate", (False, 0, -1, 1.0)), ("read_serial", "port", ("", " ", 1)), ("read_serial", "reset_on_open", (True, 0)), ("read_serial", "on_exit", ("close", False)), ("write_serial", "baudrate", (False, 0, -1, 1.0)), ("write_serial", "port", ("", " ", 1)), ("write_serial", "append_newline", (1, None)), ("write_serial", "on_exit", ("close", False))):
+        for method, field, bad_values in (("read_serial", "expected_text", ("", 1)), ("read_serial", "baudrate", (False, 0, -1, 1.0)), ("read_serial", "port", ("", " ", 1)), ("read_serial", "reset_on_open", (True, 0)), ("read_serial", "on_exit", ("close", False)), ("write_serial", "baudrate", (False, 0, -1, 1.0)), ("write_serial", "port", ("", " ", 1)), ("write_serial", "append_newline", (1, None)), ("write_serial", "on_exit", ("close", False)), ("serial_exchange", "baudrate", (False, 0, -1, 1.0)), ("serial_exchange", "port", ("", " ", 1))):
             for plan in (False, True):
                 for value in bad_values:
                     arguments = self._uart_arguments(method); arguments[field] = value
@@ -156,7 +156,7 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
                 arguments = self._uart_arguments("serial_exchange"); mutate(arguments)
                 with self.subTest(plan=plan, arguments=arguments):
                     self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=False)
-            for arguments in ({**self._uart_arguments("serial_exchange"), "steps":[{"text":"x" * 254,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "steps":[{"text":"é" * 127,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "ready_text":"ready","ready_seconds":0.5,"ready_probe_text":"?","ready_probe_line_ending":"lf","ready_probe_delay_seconds":0.25}):
+            for arguments in ({**self._uart_arguments("serial_exchange"), "steps":[{"text":"x" * 254,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "steps":[{"text":"é" * 127,"expected_text":"ok","line_ending":"crlf"}]}, {**self._uart_arguments("serial_exchange"), "ready_text":"ready","ready_seconds":0.5,"ready_probe_text":"?","ready_probe_line_ending":"lf","ready_probe_delay_seconds":0.25}, {**self._uart_arguments("serial_exchange"), "ready_text":"ready","ready_seconds":1,"ready_probe_text":"","ready_probe_line_ending":"cr","ready_probe_delay_seconds":0}):
                 with self.subTest(plan=plan, valid=arguments):
                     self._assert_uart_admission("serial_exchange", arguments, plan=plan, allowed=True)
 
