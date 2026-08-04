@@ -235,7 +235,7 @@ class C3Harness:
             result = self._dispatch(request["kind"], request["payload"])
             self._status("HEARTBEAT", request_id=request_id, outcome="ACCEPTED")
             return self._record(request_id, {"outcome":"ACCEPTED", "kind":request["kind"], "result":result})
-        except (AdmissionError, OSError, ValueError, json.JSONDecodeError) as exc:
+        except (AdmissionError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self._status("HEARTBEAT", request_id=request_id, outcome="REJECTED")
             return self._record(request_id, {"outcome":"REJECTED", "reason":str(exc)})
 
@@ -358,7 +358,8 @@ class C3Harness:
         result = worktree / ".agent-workspace" / "RESULT.json"
         if not status.is_file() or not result.is_file(): raise AdmissionError("assignment has no complete controller result")
         state = json.loads(status.read_text(encoding="utf-8"))
-        if state.get("state") != "CODEX_EXITED" or state.get("exit_code") != 0 or state.get("result_valid") is not True: raise AdmissionError("assignment completion is not valid")
+        result_value = json.loads(result.read_text(encoding="utf-8"))
+        if state.get("state") != "CODEX_EXITED" or state.get("exit_code") != 0 or state.get("result_valid") is not True or result_value.get("outcome") != "PASS": raise AdmissionError("assignment completion is not valid PASS")
         current = subprocess.run(["git","rev-parse","HEAD"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip()
         ff = subprocess.run(["git","merge-base","--is-ancestor",subprocess.run(["git","rev-parse","HEAD"],cwd=target,capture_output=True,text=True,check=True).stdout.strip(),current],cwd=target)
         if ff.returncode: raise AdmissionError("assignment result is not a target fast-forward")
@@ -404,7 +405,7 @@ class C3Harness:
                 status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
                 status, result = json.loads(status_path.read_text(encoding="utf-8")), json.loads(result_path.read_text(encoding="utf-8"))
                 loaded = load_invocation(_safe_child(self.root,"assignments",aid + ".invocation.json"))
-                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
+                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("outcome") == "PASS" and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
                 if inv.get("finding_gate") is not None:
                     valid = valid and isinstance(status.get("result_validation"),dict) and status["result_validation"].get("findings") is not None
                 tip = subprocess.run(["git","rev-parse","HEAD"],cwd=record["worktree"],capture_output=True,text=True,check=True).stdout.strip()
