@@ -455,10 +455,12 @@ class FirmwareAcceptanceController:
                 expected_arguments = {"board_id": call["arguments"]["board_id"], **call["arguments"]["action_parameters"]}
                 if payload.get("status") != "plan_accepted" or not isinstance(plan_id, str) or not plan_id or payload.get("underlying_action") != rule["plan_action"] or not isinstance(preferred, dict) or set(preferred) != {"tool_name", "arguments"} or preferred.get("tool_name") != rule["plan_action"] or preferred.get("arguments") != expected_arguments:
                     raise AdmissionError("accepted plan did not return the exact preferred action")
+            # Route/plan output is predecessor data.  It must be accepted before
+            # a durable normal result can name the requested successor state.
+            self._validate_route_result(session, call, payload)
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
             result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
             result_sha = _write_new(result_path, result)
-            self._validate_route_result(session, call, payload)
             if "next_by_mode" in rule:
                 if all(value is None for value in call["arguments"].values()):
                     session["active_plan"] = {"plan_method":call["method"], "method":rule["plan_action"], "preferred_arguments":None, "plan_id":None}
@@ -469,9 +471,9 @@ class FirmwareAcceptanceController:
                 if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") in {"setup_needs_user_input", "setup_research_required"}:
                     continuation = payload.get("continuation_id")
                     accepted = payload.get("accepted_response")
-                    if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict):
+                    if not isinstance(continuation, str) or not continuation or not isinstance(accepted, dict) or set(accepted) != {"tool", "response"} or accepted.get("tool") != "continue_setup" or not isinstance(accepted.get("response"), dict):
                         raise AdmissionError("setup continuation is not predecessor-bound")
-                    session["continuation"] = {"board_id":call["arguments"]["board_id"], "value":{"continuation_id":continuation, "response":accepted}}
+                    session["continuation"] = {"board_id":call["arguments"]["board_id"], "value":{"continuation_id":continuation, "response":accepted["response"]}}
                 elif call["method"] not in {"board_setup", "board_fix_setup"} or payload.get("status") == "setup_completed":
                     session["active_plan"] = None
             if call["method"] in {"board_setup", "board_fix_setup"} and payload.get("status") == "setup_completed":

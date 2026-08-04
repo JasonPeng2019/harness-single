@@ -412,7 +412,7 @@ class AcceptanceBroker:
         if not isinstance(limitation_id, str) or not limitation_id or any(char in limitation_id for char in "/\\"):
             raise AdmissionError("limitation identity is invalid")
         decision = self._load_limitation_decision(o_decision_path)
-        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
+        required = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "original_test", "classification", "call_chain", "session_terminal", "process_evidence", "pinned_source", "attribution", "attribution_evidence", "alternatives", "substitute", "physical_certification", "o_decision", "created_utc", "signature"}
         if set(decision) != required or decision["schema"] != "firmware-server-limitation-decision/v1" or decision["limitation_id"] != limitation_id or decision["classification"] != "AUTHORIZED_SERVER_LIMITATION" or decision["physical_certification"] != {"status":"NOT_CERTIFIED"} or not isinstance(decision["signature"], str) or not decision["signature"] or not isinstance(decision.get("o_decision"), dict) or set(decision["o_decision"]) != {"public_key", "protected_suite"} or not isinstance(decision["o_decision"].get("public_key"), str) or not verifier.verify(canonical_decision_payload(decision), decision["signature"], decision["o_decision"]["public_key"]):
             raise AdmissionError("server limitation decision is not closed or signed")
         if not all(isinstance(decision[key], str) and decision[key] for key in ("attempt_id", "lane_id", "session_id", "original_test", "created_utc")):
@@ -439,6 +439,7 @@ class AcceptanceBroker:
         raw_payload = raw_value.get("raw_result")
         if raw_value.get("outcome") != "FAIL" or not isinstance(raw_payload, dict) or "transport_failure" in raw_payload or not isinstance(raw_payload.get("result"), dict):
             raise AdmissionError("limitation requires raw pinned-server failure, not pre-dispatch rejection")
+        self._verify_pinned_source_attribution(decision, records, chain[-1])
         terminal = decision["session_terminal"]
         if not isinstance(terminal, dict) or set(terminal) != {"path", "sha256"}: raise AdmissionError("terminal session evidence is incomplete")
         self._verify_limitation_reference(terminal, "terminal session")
@@ -460,6 +461,7 @@ class AcceptanceBroker:
         if available is None or not isinstance(substitute, dict) or set(substitute) != {"kind", "stable_id", "assignment", "result"} or substitute["kind"] != available["kind"] or not isinstance(substitute.get("stable_id"), str) or not substitute["stable_id"]:
             raise AdmissionError("limitation substitute is not the first safe available alternative")
         self._verify_limitation_reference(substitute["assignment"], "substitute assignment"); self._verify_limitation_reference(substitute["result"], "substitute result")
+        self._verify_broker_reference(substitute["assignment"], "substitute assignment"); self._verify_broker_reference(substitute["result"], "substitute result")
         self._verify_substitute_identity(substitute, decision)
         protected = decision["o_decision"].get("protected_suite") if isinstance(decision["o_decision"], dict) else None
         self._verify_limitation_reference(protected, "protected suite")
@@ -492,8 +494,42 @@ class AcceptanceBroker:
         path = Path(reference["path"]); reject_linked_path(path)
         if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != reference["sha256"]: raise AdmissionError(label + " reference drifted")
 
-    @staticmethod
-    def _verify_substitute_identity(substitute: dict[str, Any], decision: dict[str, Any]) -> None:
+    def _verify_broker_reference(self, reference: dict[str, Any], label: str) -> None:
+        if self.root not in Path(reference["path"]).resolve().parents:
+            raise AdmissionError(label + " escapes the authorized broker evidence root")
+
+    def _verify_pinned_source_attribution(self, decision: dict[str, Any], records: list[dict[str, Any]], raw_reference: dict[str, Any]) -> None:
+        reference = decision["attribution_evidence"]
+        self._verify_limitation_reference(reference, "pinned-source attribution")
+        value = json.loads(Path(reference["path"]).read_text(encoding="utf-8"))
+        keys = {"schema", "attempt_id", "lane_id", "session_id", "call_id", "raw_result", "source", "exclusions"}
+        if not isinstance(value, dict) or set(value) != keys or value.get("schema") != "firmware-pinned-server-attribution/v1":
+            raise AdmissionError("pinned-source attribution is not closed")
+        if any(value.get(key) != decision[key] for key in ("attempt_id", "lane_id", "session_id")) or value.get("call_id") != records[-1].get("call_id") or value.get("raw_result") != {"path":raw_reference["path"], "sha256":raw_reference["sha256"]}:
+            raise AdmissionError("pinned-source attribution does not bind the failed call")
+        source = value.get("source")
+        if not isinstance(source, dict) or set(source) != {"kind", "commit", "source_path", "behavior_signature"} or source.get("kind") not in {"PINNED_SOURCE_BEHAVIOR", "DETERMINISTIC_REPRODUCTION_SIGNATURE"} or source.get("commit") != _PINNED_SERVER_COMMIT or not isinstance(source.get("behavior_signature"), str) or not source["behavior_signature"]:
+            raise AdmissionError("pinned-source attribution source is unsupported")
+        source_path = source.get("source_path")
+        if source["kind"] == "PINNED_SOURCE_BEHAVIOR":
+            if not isinstance(source_path, str) or not source_path or Path(source_path).is_absolute() or ".." in Path(source_path).parts:
+                raise AdmissionError("pinned-source attribution path is unsafe")
+            shown = subprocess.run(["git", "show", _PINNED_SERVER_COMMIT + ":" + source_path], cwd=_PINNED_SERVER_ROOT, capture_output=True)
+            if shown.returncode:
+                raise AdmissionError("pinned-source attribution path is absent from immutable pin")
+        elif source_path is not None:
+            raise AdmissionError("deterministic attribution cannot assert a source path")
+        exclusions = value.get("exclusions")
+        expected = {"target", "fixture", "operator", "environment", "hardware_absence", "unknown"}
+        if not isinstance(exclusions, dict) or set(exclusions) != expected:
+            raise AdmissionError("pinned-source attribution exclusions are incomplete")
+        for category, exclusion_reference in exclusions.items():
+            self._verify_limitation_reference(exclusion_reference, "attribution exclusion " + category)
+            exclusion = json.loads(Path(exclusion_reference["path"]).read_text(encoding="utf-8"))
+            if not isinstance(exclusion, dict) or set(exclusion) != {"schema", "attempt_id", "lane_id", "session_id", "call_id", "category", "excluded"} or exclusion.get("schema") != "firmware-limitation-attribution-exclusion/v1" or exclusion.get("category") != category or exclusion.get("excluded") is not True or any(exclusion.get(key) != value[key] for key in ("attempt_id", "lane_id", "session_id", "call_id")):
+                raise AdmissionError("attribution exclusion is not evidence-bound")
+
+    def _verify_substitute_identity(self, substitute: dict[str, Any], decision: dict[str, Any]) -> None:
         """Bind the C3-HARNESS substitute artifacts without granting launch authority."""
         assignment_ref, result_ref = substitute["assignment"], substitute["result"]
         try:
@@ -502,7 +538,7 @@ class AcceptanceBroker:
         except (OSError, json.JSONDecodeError) as exc:
             raise AdmissionError("substitute assignment or result is unreadable") from exc
         assignment_keys = {"schema", "limitation_id", "attempt_id", "lane_id", "session_id", "kind", "stable_id", "assignment_id"}
-        result_keys = assignment_keys | {"result_id", "assignment_path", "assignment_sha256"}
+        result_keys = assignment_keys | {"result_id", "assignment_path", "assignment_sha256", "execution", "outcome"}
         if not isinstance(assignment, dict) or set(assignment) != assignment_keys or assignment.get("schema") != "firmware-limitation-substitute-assignment/v1":
             raise AdmissionError("substitute assignment is not a closed identity artifact")
         if not isinstance(result, dict) or set(result) != result_keys or result.get("schema") != "firmware-limitation-substitute-result/v1":
@@ -514,6 +550,19 @@ class AcceptanceBroker:
             raise AdmissionError("substitute artifact identities are incomplete")
         if result.get("assignment_path") != assignment_ref["path"] or result.get("assignment_sha256") != assignment_ref["sha256"]:
             raise AdmissionError("substitute result does not reference its exact assignment")
+        if result.get("outcome") != "PASS":
+            raise AdmissionError("substitute result did not pass")
+        execution_reference = result.get("execution")
+        self._verify_limitation_reference(execution_reference, "substitute execution")
+        execution_path = Path(execution_reference["path"]).resolve()
+        if self.root not in execution_path.parents:
+            raise AdmissionError("substitute execution escapes the authorized broker evidence root")
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        execution_keys = assignment_keys | {"execution_id", "assignment_path", "assignment_sha256", "outcome"}
+        if not isinstance(execution, dict) or set(execution) != execution_keys or execution.get("schema") != "firmware-limitation-substitute-execution/v1" or execution.get("outcome") != "PASS":
+            raise AdmissionError("substitute execution is not a closed PASS artifact")
+        if any(execution.get(key) != value for key, value in identity.items()) or execution.get("assignment_id") != assignment["assignment_id"] or execution.get("assignment_path") != assignment_ref["path"] or execution.get("assignment_sha256") != assignment_ref["sha256"] or not isinstance(execution.get("execution_id"), str) or not execution["execution_id"]:
+            raise AdmissionError("substitute execution does not bind this assignment")
 
     def record(self, stage: str, call_id: str, record: dict[str, Any], previous: tuple[str, str] | None = None) -> tuple[Path, str]:
         order = ("proposal", "policy-evaluation", "signed-decision", "authorization", "dispatch-admission", "dispatch", "raw-result", "returning-state-cleanup", "result")
@@ -626,24 +675,30 @@ def evaluate_call(call: dict[str, Any], *, now_monotonic: float, policy_path: Pa
     if not isinstance(call["permission"], dict) or not call["permission"].get("granted"):
         raise AdmissionError("missing live permission")
     parameters = rule.get("parameters")
-    if not isinstance(parameters, dict) or set(call["arguments"]) != set(parameters.get("required_exact", ())):
+    if not isinstance(parameters, dict):
         raise AdmissionError("method parameters do not match pinned guarded surface")
     action_parameters = parameters
     if "plan_action" in rule:
-        all_null = all(value is None for value in call["arguments"].values())
+        null_keys = parameters.get("null_required_exact")
+        populated_keys = parameters.get("populated_required_exact")
+        if not isinstance(null_keys, list) or not isinstance(populated_keys, list) or len(null_keys) != 11 or len(populated_keys) != 10 or set(populated_keys) != set(null_keys) - {"user_permission"}:
+            raise AdmissionError("plan policy does not define the two exact pinned shapes")
+        all_null = set(call["arguments"]) == set(null_keys) and all(value is None for value in call["arguments"].values())
         if all_null:
             return {"policy": "ALLOW", "evaluation_sha256": canonical_sha256({"call": call, "policy_sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest() if policy_path else "packaged"}), "maximum_duration_seconds": maximum}
         plan = call["arguments"]
         # The MCP board_id is a server-generated route value, not the lane's
         # logical fixture name.  The retained-session controller binds it to
         # setup_overview before dispatch.
-        if (not isinstance(plan["board_id"], str) or not plan["board_id"] or not all(isinstance(plan[key], str) and plan[key] for key in ("hypothesis", "strategy", "expected_fail_return", "expected_success_return")) or plan["hypothesis_made"] is not True or plan["strategy_evaluated"] is not True or any(not isinstance(plan[key], int) or isinstance(plan[key], bool) or plan[key] <= 0 for key in ("max_calls", "max_calls_buffer")) or not isinstance(plan["action_parameters"], dict) or (plan["user_permission"] is not None and (not isinstance(plan["user_permission"], dict) or not plan["user_permission"]))):
+        if set(plan) != set(populated_keys) or (not isinstance(plan["board_id"], str) or not plan["board_id"] or not all(isinstance(plan[key], str) and plan[key] for key in ("hypothesis", "strategy", "expected_fail_return", "expected_success_return")) or plan["hypothesis_made"] is not True or plan["strategy_evaluated"] is not True or any(not isinstance(plan[key], int) or isinstance(plan[key], bool) or plan[key] <= 0 for key in ("max_calls", "max_calls_buffer")) or not isinstance(plan["action_parameters"], dict)):
             raise AdmissionError("populated plan does not have the exact guarded envelope")
         action_parameters = rule.get("action_parameters")
         if not isinstance(action_parameters, dict) or set(plan["action_parameters"]) != set(action_parameters.get("required_exact", ())):
             raise AdmissionError("plan action parameters do not match the closed action schema")
         # The nested action must itself be suitable for the paired handler.
         parameters = action_parameters
+    elif set(call["arguments"]) != set(parameters.get("required_exact", ())):
+        raise AdmissionError("method parameters do not match pinned guarded surface")
     action_arguments = call["arguments"].get("action_parameters", call["arguments"])
     if call["method"] in {"write_serial", "write_serial-plan"}:
         text = action_arguments.get("text")
