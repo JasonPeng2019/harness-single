@@ -190,7 +190,21 @@ class C3HarnessTests(unittest.TestCase):
 
     def test_c3_cp_05_sessions_overlap_and_p1_channel_is_token_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); harness = self._bare(root); first, second = Future(), Future(); harness.controllers = {"s1":Mock(), "s2":Mock()}; harness.session_lanes = {"s1":"STM-A", "s2":"NRF-A"}; harness.executor.submit.side_effect = [first, second]
+            root = Path(temporary); harness = self._bare(root); first, second = Future(), Future(); controllers = {"s1":Mock(), "s2":Mock(), "bad":Mock()}; harness.controllers = controllers; harness.session_lanes = {"s1":"STM-A", "s2":"NRF-A", "bad":"BAD-A"}
+            def rejected(*args: object) -> None:
+                self.assertEqual((Path("bad-p"), Path("bad-d"), Path("bad-a"), harness.verifier), args); self.assertFalse((root / "hil" / "BAD-A" / "sessions" / "bad" / "operations").exists()); self.assertEqual(0, harness.executor.submit.call_count); raise AdmissionError("authorization rejected")
+            controllers["bad"].derive_authorization.side_effect = rejected
+            with self.assertRaises(AdmissionError): harness._session({"session_id":"bad","proposal_path":"bad-p","decision_path":"bad-d","authorization_path":"bad-a"}, "execute")
+            self.assertNotIn("bad", harness.operations); self.assertNotIn("bad", harness.operation_pending); harness.executor.submit.assert_not_called()
+            futures = [first, second]
+            def derived(sid: str, *args: object) -> None:
+                operation_root = root / "hil" / harness.session_lanes[sid] / "sessions" / sid / "operations"
+                self.assertEqual((Path("p"), Path("d"), Path("a"), harness.verifier), args); self.assertFalse(operation_root.exists()); self.assertNotIn(sid, harness.operations); self.assertNotIn(sid, harness.operation_pending); self.assertEqual(("s1", "s2").index(sid), harness.executor.submit.call_count)
+            for sid in ("s1", "s2"): controllers[sid].derive_authorization.side_effect = lambda *args, sid=sid: derived(sid, *args)
+            def submit(*args: object) -> Future[object]:
+                sid = ("s1", "s2")[harness.executor.submit.call_count - 1]; operation_root = root / "hil" / harness.session_lanes[sid] / "sessions" / sid / "operations"
+                controllers[sid].derive_authorization.assert_called_once_with(Path("p"), Path("d"), Path("a"), harness.verifier); self.assertEqual(1, len(list(operation_root.glob("*.PENDING.json")))); return futures.pop(0)
+            harness.executor.submit.side_effect = submit
             outer_session, request_session = str(uuid.uuid4()), str(uuid.uuid4()); request = root / "closed-session.json"; request.write_text(json.dumps({"session_id":request_session,"lane_id":"STM-A"}), encoding="utf-8")
             mismatch_controller = c3.FirmwareAcceptanceController(harness.broker, topology=harness.topology)
             with patch.object(mismatch_controller, "_load_external", return_value={"session_id":request_session}), patch.object(mismatch_controller, "create_session_request") as create_request, patch.object(c3, "FirmwareAcceptanceController", return_value=mismatch_controller), self.assertRaises(AdmissionError): harness._open({"session_id":outer_session,"request_path":str(request)})
