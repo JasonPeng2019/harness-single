@@ -78,6 +78,64 @@ class C3HarnessTests(unittest.TestCase):
             tampered = {**request,"request_id":"r3","signature":"tampered"}; tampered_path = harness.request_root / "r3.json"; tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
             with patch.object(c3, "_ref", side_effect=lambda value, label, expected=None: value), patch.object(harness.verifier, "verify", return_value=False): self.assertEqual("REJECTED", harness.handle(tampered_path)["outcome"])
 
+    def test_c3_startup_distinguishes_operative_and_source_policy_bindings(self) -> None:
+        policy_body = {"schema": "firmware-mcp-method-policy/v1", "methods": ["observe"]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+
+            def build(case: str) -> tuple[dict[str, object], Path, Path, Path]:
+                case_root = base / case; candidate = case_root / "candidate"; source_dir = candidate / "firmware_acceptance"
+                source_dir.mkdir(parents=True); root = case_root / "runtime"; root.mkdir(); topology = case_root / "topology"; topology.mkdir()
+                operative = case_root / "c1-local-policy.json"; operative.write_text(json.dumps(policy_body, indent=2), encoding="utf-8")
+                source = source_dir / "MCP_METHOD_POLICY.json"; source.write_text(json.dumps(policy_body, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+                templates, manifest, delegated = case_root / "templates.json", case_root / "manifest.json", case_root / "delegated.json"
+                for path in (templates, manifest, delegated): path.write_text("{}", encoding="utf-8")
+                if case == "substitution":
+                    source_binding = {"path": str(source_dir / "substitute.json"), "sha256": _digest(source)}
+                elif case == "hash-drift":
+                    source_binding = {"path": str(source), "sha256": "0" * 64}
+                else:
+                    source_binding = {"path": str(source), "sha256": _digest(source)}
+                if case == "malformed": source.write_text("{", encoding="utf-8"); source_binding["sha256"] = _digest(source)
+                if case == "semantic-mismatch":
+                    source.write_text(json.dumps({"schema": "firmware-mcp-method-policy/v1", "methods": ["operate"]}), encoding="utf-8"); source_binding["sha256"] = _digest(source)
+                if case == "linked":
+                    linked_dir = case_root / "linked-policy-source"; linked_dir.mkdir(); linked_source = linked_dir / source.name
+                    linked_source.write_bytes(source.read_bytes()); source.unlink(); source_dir.rmdir()
+                    created = subprocess.run(["cmd", "/c", "mklink", "/J", str(source_dir), str(linked_dir)], capture_output=True, text=True)
+                    self.assertEqual(0, created.returncode, created.stderr)
+                    source = source_dir / source.name; source_binding = {"path": str(source), "sha256": _digest(linked_source)}
+                seed = Path("firmware_acceptance/seed").resolve()
+                c1_body = {"schema":"firmware-v2-c1-lock/v1", "candidate":{"path":str(candidate),"branch":"test-branch","commit":"test-commit","clean":True}, "authorization":{"path":str(delegated),"sha256":_digest(delegated)}, "server":{"commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","immutable_fixture":True}, "candidate_acceptance_inputs":{"acceptance_manifest":{"path":str(manifest),"sha256":_digest(manifest)},"lane_templates":{"path":str(templates),"sha256":_digest(templates)},"mcp_method_policy":{"path":str(operative),"sha256":_digest(operative)},"mcp_method_policy_source":source_binding}, "target_seed":{"manifest":{"path":str(seed / "TARGET_SEED_MANIFEST.json"),"sha256":_digest(seed / "TARGET_SEED_MANIFEST.json")}}}
+                c1 = case_root / "C1.json"; c1.write_text(json.dumps(c1_body), encoding="utf-8")
+                return c1_body, root, topology, c1
+
+            def git_identity(command: list[str], **_: object) -> SimpleNamespace:
+                if command[1:] == ["rev-parse", "HEAD"]: return SimpleNamespace(stdout="test-commit\n")
+                if command[1:] == ["branch", "--show-current"]: return SimpleNamespace(stdout="test-branch\n")
+                if command[1:] == ["status", "--porcelain", "--untracked-files=all"]: return SimpleNamespace(stdout="")
+                raise AssertionError(command)
+
+            def construct(case: str) -> tuple[c3.C3Harness, dict[str, object], Path]:
+                c1_body, root, topology, c1 = build(case); candidate = Path(c1_body["candidate"]["path"])
+                with patch.object(c3, "__file__", str(candidate / "firmware_acceptance" / "c3_harness.py")), patch.object(c3.subprocess, "run", side_effect=git_identity), patch.object(c3, "load_root_topology", return_value={"attempt_id":"attempt"}), patch.object(c3, "validate_manifest", return_value={}), patch.object(c3, "validate_delegated_authorization", return_value={}), patch.object(c3, "AcceptanceBroker"), patch.object(c3, "LimitationEvidenceAdapter"):
+                    harness = c3.C3Harness(root, Path(c1_body["candidate_acceptance_inputs"]["mcp_method_policy"]["path"]), Path(c1_body["candidate_acceptance_inputs"]["lane_templates"]["path"]), topology, c1={"path":str(c1),"sha256":_digest(c1)}, delegated=c1_body["authorization"], manifest=Path(c1_body["candidate_acceptance_inputs"]["acceptance_manifest"]["path"]))
+                return harness, c1_body, root
+
+            harness, valid, _ = construct("valid")
+            try:
+                operative = valid["candidate_acceptance_inputs"]["mcp_method_policy"]
+                source = valid["candidate_acceptance_inputs"]["mcp_method_policy_source"]
+                self.assertNotEqual(operative["path"], source["path"]); self.assertNotEqual(operative["sha256"], source["sha256"])
+                self.assertEqual(operative["path"], str(harness.policy)); self.assertEqual(operative["sha256"], _digest(harness.policy))
+                self.assertEqual(source["path"], str(harness.candidate_root / "firmware_acceptance" / "MCP_METHOD_POLICY.json")); self.assertEqual(source["sha256"], _digest(Path(source["path"])))
+            finally:
+                harness.executor.shutdown(wait=True)
+            for case in ("substitution", "hash-drift", "linked", "malformed", "semantic-mismatch"):
+                with self.assertRaises(AdmissionError): construct(case)
+                self.assertFalse((base / case / "runtime" / "c3-harness" / "C3_HARNESS_READY.json").exists())
+
     def test_c3_cp_04_disposable_target_assignment_and_fail_closed_acceptance(self) -> None:
         self.assertEqual({"F.C3.A1":"priority", "F.C3.C1":"priority", "F.C3.P1":"priority", "F.C3.R1":"priority"}, {role:spec[2] for role, spec in c3._ROLES.items()})
         with tempfile.TemporaryDirectory() as temporary:
