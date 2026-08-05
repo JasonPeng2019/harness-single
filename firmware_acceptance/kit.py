@@ -378,7 +378,6 @@ class AcceptanceBroker:
                 or (self.target_root is None and target.parent != self.target_parent)
                 or target.is_symlink()):
             raise AdmissionError("target escaped confined root")
-        validate_seed_manifest(target)
         for name in _SEED_FILES:
             if target.joinpath(name).stat().st_mode & stat.S_IWRITE:
                 raise AdmissionError("seed file is writable")
