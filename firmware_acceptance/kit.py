@@ -353,6 +353,10 @@ class AcceptanceBroker:
         completed = subprocess.run(["git", "init", "-q"], cwd=target, check=False, capture_output=True, text=True)
         if completed.returncode:
             raise AdmissionError("disposable Git initialization failed")
+        for key, value in (("core.autocrlf", "false"), ("core.eol", "lf")):
+            configured = subprocess.run(["git", "config", "--local", key, value], cwd=target, check=False, capture_output=True, text=True)
+            if configured.returncode:
+                raise AdmissionError("disposable Git byte-stable checkout configuration failed")
         subprocess.run(["git", "add", "--", "."], cwd=target, check=True, capture_output=True, text=True)
         completed = subprocess.run(["git", "-c", "user.name=Firmware Acceptance", "-c", "user.email=firmware-acceptance@invalid", "commit", "-q", "-m", "seed"], cwd=target, check=False, capture_output=True, text=True)
         if completed.returncode:
