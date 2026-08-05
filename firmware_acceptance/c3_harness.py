@@ -134,8 +134,22 @@ class C3Harness:
         if candidate_root != module_root or candidate.get("branch") != branch or not branch or candidate.get("commit") != head or dirty:
             raise AdmissionError("C1 candidate does not identify this clean checkout")
         self.candidate_root = candidate_root
-        for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy_source",self.policy)):
+        for key, path in (("acceptance_manifest",self.manifest),("lane_templates",self.templates),("mcp_method_policy",self.policy)):
             if not isinstance(inputs.get(key),dict) or inputs[key].get("path") != str(path) or inputs[key].get("sha256") != _sha(path): raise AdmissionError("C1 candidate input binding drifted")
+        source_policy = candidate_root / "firmware_acceptance" / "MCP_METHOD_POLICY.json"
+        source_binding = inputs.get("mcp_method_policy_source")
+        reject_linked_path(source_policy)
+        if (not isinstance(source_binding, dict) or source_binding.get("path") != str(source_policy)
+                or source_policy.is_symlink() or not source_policy.is_file()
+                or source_binding.get("sha256") != _sha(source_policy)):
+            raise AdmissionError("C1 candidate source policy binding drifted")
+        try:
+            operative_policy = json.loads(self.policy.read_text(encoding="utf-8"))
+            candidate_source_policy = json.loads(source_policy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AdmissionError("C1 policy input is unreadable") from exc
+        if operative_policy != candidate_source_policy:
+            raise AdmissionError("C1 operative and candidate source policies differ")
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
         self.limitation_adapter = LimitationEvidenceAdapter(self.broker)
