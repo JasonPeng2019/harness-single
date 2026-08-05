@@ -11,6 +11,7 @@ import unittest
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import firmware_acceptance.c3_harness as c3
@@ -82,7 +83,8 @@ class C3HarnessTests(unittest.TestCase):
             try:
                 identity = {"pid":4242,"creation_identity":"created"}
                 observations = Mock(side_effect=[identity, identity])
-                with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", observations): launched = harness._assignment(payload)
+                controller_subprocess = SimpleNamespace(Popen=launch, run=subprocess.run, TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError)
+                with patch.object(c3, "subprocess", controller_subprocess), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", observations): launched = harness._assignment(payload)
                 record = harness.assignments["a1"]; worktree = Path(record["worktree"])
                 self.assertTrue((worktree / ".git").is_file()); self.assertEqual("LAUNCHED", launched["state"])
                 self.assertEqual(harness.candidate_root, launches[0][1]); self.assertEqual(str(worktree), record["invocation"]["run_root"])
@@ -100,7 +102,8 @@ class C3HarnessTests(unittest.TestCase):
                 self.assertEqual("FAIL", harness.assignments["a1"]["completion"]["outcome"])
                 with self.assertRaises(AdmissionError): harness._accept_assignment({"assignment_id":"a1","target_id":"target"})
                 rejected = _Process(); rejected_snapshot = ProcessSnapshot(True, (ProcessInfo(rejected.pid, 1, "python", "lane controller", created),), (), "synthetic")
-                with patch.object(c3.subprocess, "Popen", return_value=rejected), patch.object(c3, "process_snapshot", return_value=rejected_snapshot), patch.object(c3, "exact_process_identity", side_effect=[{"pid":4242,"creation_identity":"before"}, {"pid":4242,"creation_identity":"after"}]):
+                rejected_subprocess = SimpleNamespace(Popen=Mock(return_value=rejected), run=subprocess.run, TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError)
+                with patch.object(c3, "subprocess", rejected_subprocess), patch.object(c3, "process_snapshot", return_value=rejected_snapshot), patch.object(c3, "exact_process_identity", side_effect=[{"pid":4242,"creation_identity":"before"}, {"pid":4242,"creation_identity":"after"}]):
                     with self.assertRaises(AdmissionError): harness._assignment({**payload,"assignment_id":"a2"})
                 self.assertTrue(rejected.terminated); self.assertTrue(rejected.waited)
             finally:
