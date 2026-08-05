@@ -225,6 +225,10 @@ class C3Harness:
         request_id = path.stem
         try:
             request = self._load(path); request_id = request["request_id"]
+            response = _safe_child(self.response_root, request_id + ".json")
+            if response.is_file():
+                preserved = json.loads(response.read_text(encoding="utf-8"))
+                return {**preserved, "path": str(response), "raw_sha256": _sha(response)}
             claim = _safe_child(self.admission_root, request_id + ".json")
             # The exclusive immutable claim precedes every dispatch side effect.
             raw_sha = _sha(path)
