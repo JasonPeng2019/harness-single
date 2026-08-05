@@ -5,6 +5,7 @@ import hashlib
 import json
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -29,7 +30,10 @@ class _Process:
 
     def __init__(self, code: int | None = None) -> None: self.code = code; self.terminated = False; self.waited = False
     def poll(self) -> int | None: return self.code
-    def wait(self, timeout: float | None = None) -> int: self.waited = True; return self.code or 0
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        if self.code is None: raise subprocess.TimeoutExpired(["synthetic"], timeout)
+        return self.code
     def terminate(self) -> None: self.terminated = True; self.code = -15
     def kill(self) -> None: self.code = -9
 
@@ -176,7 +180,7 @@ class C3HarnessTests(unittest.TestCase):
                 rejected_subprocess = SimpleNamespace(Popen=Mock(return_value=rejected), run=subprocess.run, TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError)
                 with patch.object(c3, "subprocess", rejected_subprocess), patch.object(c3, "process_snapshot", return_value=rejected_snapshot), patch.object(c3, "exact_process_identity", side_effect=[{"pid":4242,"created_utc":"before"}, {"pid":4242,"created_utc":"after"}, {"pid":4242,"created_utc":"after"}, {"pid":4242,"created_utc":"after"}]):
                     with self.assertRaises(AdmissionError): harness._assignment({**payload,"assignment_id":"a2"})
-                self.assertFalse(rejected.terminated); self.assertFalse(rejected.waited); self.assertTrue(harness.admission_closed)
+                self.assertFalse(rejected.terminated); self.assertTrue(rejected.waited); self.assertTrue(harness.admission_closed)
                 recovery = json.loads((harness.state_root / "RECOVERY_REQUIRED.json").read_text()); self.assertEqual("RECOVERY_REQUIRED", recovery["cleanup"]["outcome"]); self.assertEqual({"pid":4242,"created_utc":"after"}, recovery["observed_identity"])
             finally:
                 for assignment_id in ("a1", "a2"):
@@ -282,6 +286,7 @@ class C3HarnessTests(unittest.TestCase):
             subprocess.run(["git","worktree","add","-b",branch,str(worktree),"HEAD"],cwd=target,check=True,capture_output=True,text=True)
             for channel in channels: channel.mkdir(parents=True)
             recovery_cleanup = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"identity changed","controller_identity":identity,"handles_closed":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED","process_identity_unresolved":True}
+            c3._write_new(root / "assignments" / "a1.PRESTART_REJECTED.json", recovery_cleanup)
             first_path = harness.request_root / "first.json"; first_path.write_text("{}", encoding="utf-8"); first = {"request_id":"first","kind":"assignment","payload":{}}
             def discover(_: str, __: dict[str, object]) -> dict[str, object]:
                 harness._require_recovery("a1",process,identity,worktree,branch,channels,recovery_cleanup)
