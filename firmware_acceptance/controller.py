@@ -325,10 +325,12 @@ class FirmwareAcceptanceController:
         for key in _GOVERNING_KEYS: _reference(request["governing_documents"][key], key)
         return json.loads(json.dumps(request, sort_keys=True))
 
-    def open_session(self, request_path: Path) -> dict[str, Any]:
+    def open_session(self, request_path: Path, *, expected_session_id: str | None = None) -> dict[str, Any]:
         """Acquire once, bootstrap once, and retain the exact child until terminal cleanup."""
         if self._session is not None: raise AdmissionError("controller already owns a session")
         request = self._load_external(request_path, self._SESSION_REQUEST_KEYS)
+        if expected_session_id is not None and request.get("session_id") != expected_session_id:
+            raise AdmissionError("session-open identity differs from immutable request")
         request = self.create_session_request(request)
         for key in ("c1_reference", "delegated_reference", "board_identity", "mcp_schema", "policy", "seed_identity", "target_identity", "topology_key_release"):
             _verify_raw_reference(request[key], key)

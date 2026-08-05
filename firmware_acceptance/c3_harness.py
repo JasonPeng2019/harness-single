@@ -403,7 +403,7 @@ class C3Harness:
         if sid in self.controllers: raise AdmissionError("session already exists")
         request = Path(p["request_path"]); reject_linked_path(request)
         if self.root not in request.resolve().parents or not request.is_file(): raise AdmissionError("session request escapes attempt")
-        controller = FirmwareAcceptanceController(self.broker, topology=self.topology); result = controller.open_session(request); self.controllers[sid] = controller
+        controller = FirmwareAcceptanceController(self.broker, topology=self.topology); result = controller.open_session(request, expected_session_id=sid); self.controllers[sid] = controller
         _atomic_append(self.registry_path,{"schema":"firmware-c3-session-lifecycle/v1","state":"OPEN","session_id":sid}); return result
 
     def _session(self, p: dict[str, Any], action: str) -> dict[str, Any]:
