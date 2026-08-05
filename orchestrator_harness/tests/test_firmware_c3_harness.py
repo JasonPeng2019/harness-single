@@ -79,6 +79,7 @@ class C3HarnessTests(unittest.TestCase):
             with patch.object(c3, "_ref", side_effect=lambda value, label, expected=None: value), patch.object(harness.verifier, "verify", return_value=False): self.assertEqual("REJECTED", harness.handle(tampered_path)["outcome"])
 
     def test_c3_cp_04_disposable_target_assignment_and_fail_closed_acceptance(self) -> None:
+        self.assertEqual({"F.C3.A1":"priority", "F.C3.C1":"priority", "F.C3.P1":"priority", "F.C3.R1":"priority"}, {role:spec[2] for role, spec in c3._ROLES.items()})
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); target = root / "targets" / "target"; harness.broker.materialize_seed(target)
             payload = {"assignment_id":"a1", "role":"F.C3.A1", "sprint":"S23", "task":"host test", "prompt":"do bounded work", "target_id":"target", "declared_resources":[]}; process = _Process(); launches: list[tuple[list[str], Path]] = []
