@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import firmware_acceptance.c3_harness as c3
+import firmware_acceptance.c3_process_identity as c3_process
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, worker_environment
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
 
@@ -464,61 +465,60 @@ class C3HarnessTests(unittest.TestCase):
             self.assertEqual("ACCEPTED",json.loads((harness.response_root / "b-shutdown.json").read_text())["outcome"])
 
 
-    def test_s26_a1_controller_relationship_requires_exact_tokens_and_creation_identity(self) -> None:
-        """A controller admission is not a substring match or a PID-only match."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); invocation = root / "a1.invocation.json"; invocation.write_text("{}", encoding="utf-8")
-            created = datetime(2026, 8, 5, tzinfo=timezone.utc)
-            launcher = ProcessInfo(100, 1, "python", f'python -m orchestrator_harness.lane_controller "{invocation}"', created)
-            status = {"controller_pid":100, "controller_created_utc":iso_utc(created), "state":"WAITING_RESOURCE"}
-            snapshot = ProcessSnapshot(True, (launcher,), (), "synthetic")
-            identity = {"pid":100, "created_utc":"identity-created"}
-            with patch.object(c3, "exact_process_identity", return_value=identity):
-                self.assertIsNone(c3._initial_controller_relationship(snapshot, identity, 100, status, invocation))
-            for command in (
-                f'python -m orchestrator_harness.lane_controller_extra "{invocation}"',
-                f'python -m other.module "{invocation}" --note=orchestrator_harness.lane_controller',
-                f'python --x-misleading -m orchestrator_harness.lane_controller "{invocation}.bak"',
-            ):
-                with self.subTest(command=command):
-                    forged = ProcessSnapshot(True, (ProcessInfo(100, 1, "python", command, created),), (), "synthetic")
-                    with patch.object(c3, "exact_process_identity", return_value={"pid":100, "created_utc":iso_utc(created)}):
-                        self.assertIsNone(c3._initial_controller_relationship(forged, {"pid":100, "created_utc":iso_utc(created)}, 100, status, invocation))
-
-    def test_s26_a1_controller_relationship_accepts_only_complete_same_or_direct_snapshot(self) -> None:
+    def test_s26_a1_observation_brackets_opaque_identity_and_accepts_same_or_direct_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); invocation = root / "a1.invocation.json"; invocation.write_text("{}", encoding="utf-8")
             created = datetime(2026, 8, 5, tzinfo=timezone.utc); stamp = iso_utc(created)
-            command = f'python -m orchestrator_harness.lane_controller "{invocation}"'
-            launcher = ProcessInfo(100, 1, "python", command, created)
-            controller = ProcessInfo(200, 100, "python", command, created)
-            identities = {100:{"pid":100,"created_utc":stamp}, 200:{"pid":200,"created_utc":stamp}}
-            for label, infos, pid, expected_shape in (
-                ("same", (launcher,), 100, "same-process"),
-                ("direct-redirector", (launcher, controller), 200, "direct-venv-redirector"),
-            ):
-                with self.subTest(label=label), patch.object(c3, "exact_process_identity", side_effect=lambda observed: identities[observed]):
-                    relationship = c3._initial_controller_relationship(ProcessSnapshot(True, infos, (), "synthetic"), identities[100], 100, {"controller_pid":pid,"controller_created_utc":stamp,"state":"RUNNING_CODEX"}, invocation)
-                    self.assertIsNotNone(relationship); self.assertEqual(expected_shape, relationship["shape"])
-            descendant = ProcessInfo(300, 200, "python", command, created)
-            identities[300] = {"pid":300,"created_utc":stamp}
-            for label, snapshot in (
-                ("incomplete", ProcessSnapshot(False, (launcher, controller), (), "synthetic")),
-                ("non-direct-descendant", ProcessSnapshot(True, (launcher, controller, descendant), (), "synthetic")),
-            ):
-                with self.subTest(label=label), patch.object(c3, "exact_process_identity", side_effect=lambda observed: identities[observed]):
-                    pid = 200 if label == "incomplete" else 300
-                    self.assertIsNone(c3._initial_controller_relationship(snapshot, identities[100], 100, {"controller_pid":pid,"controller_created_utc":stamp,"state":"RUNNING_CODEX"}, invocation))
+            launcher = ProcessInfo(100, 1, "python", "lossy posix command", created); controller = ProcessInfo(200, 100, "python", "windows argv", created)
+            status = {"schema":"orchestrator-lane-controller/v1","state":"WAITING_RESOURCE","controller_pid":100,"controller_created_utc":stamp}; opaque = {"pid":100,"created_utc":"windows-filetime:133000000000000000"}
+            with patch.object(c3, "exact_process_identity", side_effect=[opaque, opaque]):
+                same = c3._controller_observation(ProcessSnapshot(True, (launcher,), (), "synthetic"), opaque, 100, status, json.dumps(status).encode(), root / "status.json", invocation, opaque)
+            self.assertIsNotNone(same); self.assertTrue(c3._observation_authenticates(same)); self.assertEqual("same-process", same["shape"])
+            direct_status = {**status,"controller_pid":200}; direct = {"pid":200,"created_utc":"windows-filetime:133000000000000001"}; launcher_identity = {"pid":100,"created_utc":"windows-filetime:133000000000000000"}
+            with patch.object(c3, "exact_process_identity", side_effect=[direct, launcher_identity]), patch.object(c3, "lane_controller_command_matches", return_value=True) as matcher:
+                observation = c3._controller_observation(ProcessSnapshot(True, (launcher, controller), (), "synthetic"), launcher_identity, 100, direct_status, json.dumps(direct_status).encode(), root / "status.json", invocation, direct)
+                self.assertTrue(c3._observation_authenticates(observation)); matcher.assert_called_once()
+            with patch.object(c3, "exact_process_identity", return_value={"pid":100,"created_utc":"windows-filetime:new"}):
+                self.assertIsNone(c3._controller_observation(ProcessSnapshot(True, (launcher,), (), "synthetic"), opaque, 100, status, b"{}", root / "status.json", invocation, opaque))
 
-    def test_s26_a1_recovery_never_persists_unvalidated_observed_controller_identity(self) -> None:
+    def test_s26_a1_windows_redirector_requires_exact_python_module_argv(self) -> None:
+        class Function:
+            def __init__(self, result: object) -> None: self.result = result
+            def __call__(self, *_: object) -> object: return self.result
+        class Count:
+            def __init__(self) -> None: self.value = 4
+        def matches(argv: list[str]) -> bool:
+            shell = SimpleNamespace(CommandLineToArgvW=Function(argv)); kernel = SimpleNamespace(LocalFree=Function(None))
+            fake = SimpleNamespace(c_int=Count, POINTER=lambda _: object, c_wchar_p=str, c_void_p=object, byref=lambda value: value, cast=lambda value, _: value, WinDLL=lambda name, **_: shell if name == "shell32" else kernel)
+            with patch.object(c3_process.os, "name", "nt"), patch.dict(sys.modules, {"ctypes":fake}):
+                return c3_process.lane_controller_command_matches("direct-venv-redirector", "opaque", "C:/a path/a1.json")
+        self.assertTrue(matches(["python.exe","-m","orchestrator_harness.lane_controller","C:/a path/a1.json"]))
+        for argv in (["worker.exe","-m","orchestrator_harness.lane_controller","C:/a path/a1.json"], ["python.exe","-m","orchestrator_harness.lane_controller_extra","C:/a path/a1.json"], ["python.exe","-m","orchestrator_harness.lane_controller","C:/a path/a1.json.bak"], ["python.exe","orchestrator_harness.lane_controller","-m","C:/a path/a1.json"], ["python.exe","-m","orchestrator_harness.lane_controller","C:/a path/a1.json","extra"]):
+            with self.subTest(argv=argv): self.assertFalse(matches(argv))
+
+    def test_s26_a1_observation_rejects_incomplete_non_direct_and_invalid_initial_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); harness = self._bare(root); process = _Process()
-            cleanup = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":"a1", "reason":"rejected", "launcher_identity":{"pid":4242,"created_utc":"launcher"}, "controller_identity":None, "handles_closed":True, "launcher_reaped":False, "controller_reaped":True, "process_reaped":False, "worktree_removed":False, "branch_removed":False, "channels_removed":False, "outcome":"RECOVERY_REQUIRED"}
-            with patch.object(c3, "exact_process_identity", return_value="not-an-identity"):
-                with self.assertRaises(AdmissionError):
-                    harness._require_recovery("a1", process, {"pid":4242,"created_utc":"launcher"}, None, root / "assignment-worktrees" / "a1", "c3/target/a1", (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1"), cleanup)
+            root = Path(temporary); invocation = root / "a1.invocation.json"; invocation.write_text("{}", encoding="utf-8")
+            created = datetime(2026, 8, 5, tzinfo=timezone.utc); stamp = iso_utc(created); identity = {"pid":100,"created_utc":"windows-filetime:1"}; launcher = ProcessInfo(100, 1, "python", "x", created); child = ProcessInfo(200, 101, "python", "x", created)
+            status = {"schema":"orchestrator-lane-controller/v1","state":"WAITING_RESOURCE","controller_pid":100,"controller_created_utc":stamp}
+            with patch.object(c3, "exact_process_identity", return_value=identity):
+                self.assertIsNone(c3._controller_observation(ProcessSnapshot(False, (launcher,), (), "synthetic"), identity, 100, status, b"{}", root / "status", invocation, identity))
+                self.assertIsNone(c3._controller_observation(ProcessSnapshot(True, (launcher, child), (), "synthetic"), identity, 100, {**status,"controller_pid":200}, b"{}", root / "status", invocation, {"pid":200,"created_utc":"windows-filetime:2"}))
+            for key, value in (("controller_pid", True), ("controller_pid", 0), ("controller_created_utc", ""), ("state", "CODEX_EXITED"), ("schema", "other")):
+                with self.subTest(key=key, value=value), patch.object(c3, "exact_process_identity", side_effect=[identity, identity]):
+                    candidate = c3._controller_observation(ProcessSnapshot(True, (launcher,), (), "synthetic"), identity, 100, {**status,key:value}, b"status", root / "status", invocation, identity)
+                    self.assertTrue(candidate is None or not c3._observation_authenticates(candidate))
+
+    def test_s26_a1_recovery_validates_before_persisting_and_allows_null_or_changed_launcher_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); process = _Process(); channels = (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1"); worktree = root / "assignment-worktrees" / "a1"
+            cleanup = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"rejected","launcher_identity":None,"controller_identity":None,"handles_closed":True,"launcher_reaped":False,"controller_reaped":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED"}
+            with patch.object(c3, "exact_process_identity", return_value=None), self.assertRaises(c3.RecoveryRequired): harness._require_recovery("a1", process, None, None, worktree, "c3/target/a1", channels, cleanup)
+            record = json.loads((harness.state_root / "RECOVERY_REQUIRED.json").read_text()); self.assertEqual(process.pid, record["launcher_pid"])
+            (harness.state_root / "RECOVERY_REQUIRED.json").unlink(); harness.recovery = None
+            bad = {**cleanup,"launcher_identity":{"pid":999,"created_utc":"bad"}}
+            with patch.object(c3, "exact_process_identity", return_value="not-an-identity"), self.assertRaises(AdmissionError): harness._require_recovery("a1", process, bad["launcher_identity"], None, worktree, "c3/target/a1", channels, bad)
             self.assertFalse((harness.state_root / "RECOVERY_REQUIRED.json").exists())
-            self.assertIsNone(harness.recovery)
 
     def test_s26_a1_rejection_keeps_worktree_and_channels_when_launcher_exits_but_controller_survives(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -533,6 +533,20 @@ class C3HarnessTests(unittest.TestCase):
             self.assertEqual("RECOVERY_REQUIRED", cleanup["outcome"])
             self.assertFalse(cleanup["process_reaped"]); self.assertFalse(cleanup["controller_reaped"])
             self.assertTrue(worktree.exists()); self.assertTrue(all(channel.exists() for channel in channels)); git.assert_not_called()
+
+    def test_s26_a1_terminal_popen_without_captured_identity_reaps_and_completion_keeps_legacy_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); target = root / "target"; target.mkdir(); process = _Process(7)
+            channels = (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1")
+            with patch.object(c3.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+                cleanup = harness._reject_unregistered_assignment("a1", process, None, None, root / "missing-worktree", "c3/target/a1", target, channels, (), "terminal handle")
+            self.assertTrue(cleanup["launcher_reaped"])
+            harness.workers = {"a1":process}; harness.assignments = {"a1":{"identity":None,"controller_identity":None,"worktree":root,"seed":{},"invocation":{"output_paths":{}},"status_identity":{}}}
+            with patch.object(c3, "_protected_seed_snapshot", side_effect=AdmissionError("synthetic")):
+                harness.reap_workers()
+            completion = json.loads((root / "assignments" / "a1.WORKER_COMPLETION.json").read_text())
+            self.assertEqual(7, completion["exit_code"]); self.assertEqual(7, completion["launcher_exit_code"])
+            terminal = json.loads(harness.registry_path.read_text().splitlines()[-1]); self.assertEqual(7, terminal["exit_code"]); self.assertEqual(7, terminal["launcher_exit_code"])
 
 
 def _digest_token(value: str) -> str:
