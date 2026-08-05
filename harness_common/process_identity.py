@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from typing import Any
 
 
@@ -41,4 +42,30 @@ def exact_process_identity(pid: int) -> dict[str, Any] | None:
         return {"pid": pid, "created_utc": f"linux-start-ticks:{start_ticks}"}
     except (OSError, IndexError):
         return None
+
+
+def lane_controller_argv_matches(command_line: str, invocation_path: str) -> bool:
+    """Recognize only the exact Python module invocation C3 constructs."""
+    if not isinstance(command_line, str) or not command_line or not isinstance(invocation_path, str) or not invocation_path:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            argc = ctypes.c_int()
+            shell32 = ctypes.windll.shell32
+            shell32.CommandLineToArgvW.argtypes = (ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int))
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+            argv_ptr = shell32.CommandLineToArgvW(command_line, ctypes.byref(argc))
+            if not argv_ptr:
+                return False
+            try:
+                argv = [argv_ptr[index] for index in range(argc.value)]
+            finally:
+                ctypes.windll.kernel32.LocalFree(argv_ptr)
+        else:
+            argv = shlex.split(command_line, posix=True)
+    except (AttributeError, OSError, ValueError):
+        return False
+    return (len(argv) == 4 and isinstance(argv[0], str) and bool(argv[0])
+            and argv[1:] == ["-m", "orchestrator_harness.lane_controller", invocation_path])
 
