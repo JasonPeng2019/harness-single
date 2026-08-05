@@ -432,7 +432,7 @@ class C3Harness:
             while time.monotonic() < deadline:
                 try: value = json.loads(status_path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, json.JSONDecodeError): value = None
-                if isinstance(value, dict) and value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES and proc.poll() is None and exact_process_identity(proc.pid) == identity:
+                if isinstance(value, dict) and value.get("schema") == "orchestrator-lane-controller/v1" and value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES and proc.poll() is None and exact_process_identity(proc.pid) == identity:
                     launch_status = value; break
                 if proc.poll() is not None: break
                 time.sleep(.05)
@@ -506,7 +506,7 @@ class C3Harness:
         if not status.is_file() or not result.is_file(): raise AdmissionError("assignment has no complete controller result")
         state = json.loads(status.read_text(encoding="utf-8"))
         result_value = json.loads(result.read_text(encoding="utf-8"))
-        if state.get("state") != "CODEX_EXITED" or state.get("exit_code") != 0 or state.get("result_valid") is not True or result_value.get("outcome") != "PASS": raise AdmissionError("assignment completion is not valid PASS")
+        if not isinstance(state,dict) or not isinstance(result_value,dict) or state.get("schema") != "orchestrator-lane-controller/v1" or result_value.get("schema") != "orchestrator-lane-result/v1" or state.get("state") != "CODEX_EXITED" or state.get("exit_code") != 0 or state.get("result_valid") is not True or result_value.get("outcome") != "PASS": raise AdmissionError("assignment completion is not valid PASS")
         current = subprocess.run(["git","rev-parse","HEAD"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip()
         ff = subprocess.run(["git","merge-base","--is-ancestor",subprocess.run(["git","rev-parse","HEAD"],cwd=target,capture_output=True,text=True,check=True).stdout.strip(),current],cwd=target)
         if ff.returncode: raise AdmissionError("assignment result is not a target fast-forward")
@@ -555,7 +555,7 @@ class C3Harness:
                 status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
                 status, result = json.loads(status_path.read_text(encoding="utf-8")), json.loads(result_path.read_text(encoding="utf-8"))
                 loaded = load_invocation(_safe_child(self.root,"assignments",aid + ".invocation.json"))
-                valid = status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("controller_pid") == record["status_identity"]["pid"] and status.get("controller_created_utc") == record["status_identity"]["created_utc"] and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("outcome") == "PASS" and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
+                valid = isinstance(status,dict) and isinstance(result,dict) and status.get("schema") == "orchestrator-lane-controller/v1" and result.get("schema") == "orchestrator-lane-result/v1" and status.get("state") == "CODEX_EXITED" and exit_code == 0 and status.get("exit_code") == 0 and status.get("controller_pid") == record["status_identity"]["pid"] and status.get("controller_created_utc") == record["status_identity"]["created_utc"] and status.get("held_resource_claims") == [] and status.get("result_valid") is True and result.get("outcome") == "PASS" and result.get("lane_id") == inv["lane_id"] and result.get("worker_invocation_id") == aid and result.get("branch") == record["branch"] and loaded.repository is not None and loaded.repository.branch == record["branch"]
                 if inv.get("finding_gate") is not None:
                     valid = valid and isinstance(status.get("result_validation"),dict) and status["result_validation"].get("findings") is not None
                 tip = subprocess.run(["git","rev-parse","HEAD"],cwd=record["worktree"],capture_output=True,text=True,check=True).stdout.strip()
