@@ -9,11 +9,13 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import Future
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import firmware_acceptance.c3_harness as c3
 from firmware_acceptance.kit import AcceptanceBroker, AdmissionError, worker_environment
+from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
 
 
 def _digest(path: Path) -> str:
@@ -23,10 +25,10 @@ def _digest(path: Path) -> str:
 class _Process:
     pid = 4242
 
-    def __init__(self, code: int | None = None) -> None: self.code = code
+    def __init__(self, code: int | None = None) -> None: self.code = code; self.terminated = False; self.waited = False
     def poll(self) -> int | None: return self.code
-    def wait(self, timeout: float | None = None) -> int: return self.code or 0
-    def terminate(self) -> None: self.code = -15
+    def wait(self, timeout: float | None = None) -> int: self.waited = True; return self.code or 0
+    def terminate(self) -> None: self.terminated = True; self.code = -15
     def kill(self) -> None: self.code = -9
 
 
@@ -72,15 +74,20 @@ class C3HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); target = root / "targets" / "target"; harness.broker.materialize_seed(target)
             payload = {"assignment_id":"a1", "role":"F.C3.A1", "sprint":"S23", "task":"host test", "prompt":"do bounded work", "target_id":"target", "declared_resources":[]}; process = _Process(); launches: list[tuple[list[str], Path]] = []
+            created = datetime(2026, 8, 4, tzinfo=timezone.utc); snapshot = ProcessSnapshot(True, (ProcessInfo(process.pid, 1, "python", "lane controller", created),), (), "synthetic")
             def launch(command: list[str], *, cwd: Path, **_: object) -> _Process:
                 invocation = json.loads(Path(command[-1]).read_text(encoding="utf-8")); status = Path(invocation["output_paths"]["status"])
-                status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","controller_pid":process.pid,"controller_created_utc":"2026-08-04T00:00:00Z"}), encoding="utf-8")
+                status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","controller_pid":process.pid,"controller_created_utc":iso_utc(created)}), encoding="utf-8")
                 launches.append((command, cwd)); return process
             try:
-                with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "exact_process_identity", return_value={"pid":4242,"creation_identity":"created"}): launched = harness._assignment(payload)
+                identity = {"pid":4242,"creation_identity":"created"}
+                observations = Mock(side_effect=[identity, identity])
+                with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", observations): launched = harness._assignment(payload)
                 record = harness.assignments["a1"]; worktree = Path(record["worktree"])
                 self.assertTrue((worktree / ".git").is_file()); self.assertEqual("LAUNCHED", launched["state"])
                 self.assertEqual(harness.candidate_root, launches[0][1]); self.assertEqual(str(worktree), record["invocation"]["run_root"])
+                self.assertEqual(2, observations.call_count)
+                self.assertEqual({"pid":process.pid,"created_utc":iso_utc(created)}, record["status_identity"])
                 self.assertEqual(harness.seed_identity, {name:_digest(worktree / name) for name in harness.seed_identity})
                 self.assertTrue(all(not ((worktree / name).stat().st_mode & stat.S_IWRITE) for name in harness.seed_identity))
                 changed = worktree / "TARGET_CHARTER.md"; changed.chmod(stat.S_IWRITE | stat.S_IREAD)
@@ -92,8 +99,14 @@ class C3HarnessTests(unittest.TestCase):
                 process.code = 0; harness.reap_workers()
                 self.assertEqual("FAIL", harness.assignments["a1"]["completion"]["outcome"])
                 with self.assertRaises(AdmissionError): harness._accept_assignment({"assignment_id":"a1","target_id":"target"})
+                rejected = _Process(); rejected_snapshot = ProcessSnapshot(True, (ProcessInfo(rejected.pid, 1, "python", "lane controller", created),), (), "synthetic")
+                with patch.object(c3.subprocess, "Popen", return_value=rejected), patch.object(c3, "process_snapshot", return_value=rejected_snapshot), patch.object(c3, "exact_process_identity", side_effect=[{"pid":4242,"creation_identity":"before"}, {"pid":4242,"creation_identity":"after"}]):
+                    with self.assertRaises(AdmissionError): harness._assignment({**payload,"assignment_id":"a2"})
+                self.assertTrue(rejected.terminated); self.assertTrue(rejected.waited)
             finally:
-                if (root / "assignment-worktrees" / "a1").exists(): subprocess.run(["git","worktree","remove","--force",str(root / "assignment-worktrees" / "a1")], cwd=target, check=True, capture_output=True, text=True)
+                for assignment_id in ("a1", "a2"):
+                    worktree = root / "assignment-worktrees" / assignment_id
+                    if worktree.exists(): subprocess.run(["git","worktree","remove","--force",str(worktree)], cwd=target, check=True, capture_output=True, text=True)
 
     def test_c3_cp_05_sessions_overlap_and_p1_channel_is_token_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
