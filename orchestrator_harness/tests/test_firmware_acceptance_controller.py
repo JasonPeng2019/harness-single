@@ -264,6 +264,8 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             self.assertNotIn("scope_effect", messages[2]["params"]["arguments"])
             cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
             self.assertTrue(cleanup["stderr_log_complete"]); self.assertEqual(cleanup["stderr_sha256"], cleanup["stderr_log_sha256"])
+            self.assertTrue(launches[0].stdout.closed); self.assertTrue(launches[0].stderr.closed)
+            self.assertNotIn("stream_close_errors", cleanup)
 
     def test_stderr_persistence_failure_is_incomplete_and_fails_closed(self) -> None:
         class FailingSink:
@@ -274,7 +276,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims); paths = self._flow(root, controller, verifier)
             original = controller_module._StdioTransport
             def transport(process: _Process, *args: object) -> _StdioTransport:
-                value = original(process, *args); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
+                value = original(process, *args); stderr_log = value.stderr_log; self.assertIsNotNone(stderr_log); assert stderr_log is not None; self.assertFalse(stderr_log.closed); stderr_log.close(); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
             with patch.object(controller_module, "_StdioTransport", transport), self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
             cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
             self.assertFalse(cleanup["stderr_log_complete"]); self.assertIn("stderr_log_error", cleanup); self.assertFalse(claims[0].live)
@@ -405,6 +407,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.initial_read, self.release_suffix = threading.Event(), threading.Event()
                 self.chunks = [b"initial-", b"suffix"]
+                self.closed = False
             def read(self, _: int) -> bytes:
                 if self.chunks:
                     chunk = self.chunks.pop(0)
@@ -413,7 +416,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
                         if not self.release_suffix.wait(1.0): raise AssertionError("suffix was not released")
                     return chunk
                 return b""
-            def close(self) -> None: raise AssertionError("natural EOF stream must not be force-closed")
+            def close(self) -> None: self.closed = True
         with tempfile.TemporaryDirectory() as temporary:
             process = _Process(); process.stderr = CoordinatedStderr()
             stderr_path = Path(temporary) / "stderr.log"
@@ -428,6 +431,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(expected).hexdigest(), cleanup["stderr_sha256"])
             self.assertEqual(cleanup["stderr_sha256"], cleanup["stderr_log_sha256"])
             self.assertTrue(all(item["stopped"] for item in cleanup["helper_threads"]))
+            self.assertTrue(process.stderr.closed); self.assertNotIn("stream_close_errors", cleanup)
 
     def test_transport_forced_close_of_blocked_stderr_is_incomplete_with_partial_digest(self) -> None:
         class BlockedStderr:
