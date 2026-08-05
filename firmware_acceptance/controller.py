@@ -291,7 +291,7 @@ def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
 class FirmwareAcceptanceController:
     """Two-phase controller that alone owns the MCP stdio process and physical capability."""
 
-    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0, topology: dict[str, Any] | None = None) -> None:
+    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0, topology: dict[str, Any] | None = None, session_root_for: Callable[[dict[str, Any]], Path] | None = None, lane_root_for: Callable[[str], Path] | None = None) -> None:
         self.broker, self.launcher, self.clock, self.identity_provider = broker, launcher or _launch, clock, identity_provider
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
         self._live_claims: Any | None = None
@@ -299,6 +299,8 @@ class FirmwareAcceptanceController:
         self._proposal_binding: tuple[Path, str] | None = None
         self._authorization_binding: tuple[Path, str] | None = None
         self.topology = topology
+        self.session_root_for = session_root_for
+        self.lane_root_for = lane_root_for
         self._session: dict[str, Any] | None = None
 
     # Session APIs deliberately remain narrow: this controller owns exactly one
@@ -337,7 +339,9 @@ class FirmwareAcceptanceController:
         for key, value in request["governing_documents"].items(): _verify_raw_reference(value, "governing " + key)
         validate_delegated_authorization(request["delegated_reference"], policy_path=self.broker.policy_path, manifest=self.broker.manifest)
         self.broker.validate_lane_call(request)
-        session_root = _safe_child(self.broker.root, "sessions", request["session_id"])
+        session_root = (self.session_root_for(request) if self.session_root_for is not None
+                        else _safe_child(self.broker.root, "sessions", request["session_id"]))
+        reject_linked_path(session_root)
         request_record_path = _safe_child(session_root, "SESSION_REQUEST.json")
         request_sha = _write_new(request_record_path, {"schema":"firmware-session-request/v1", **request})
         claims = self._claims(request["lane_id"], request["session_id"])
@@ -348,7 +352,7 @@ class FirmwareAcceptanceController:
             if len(held) != 1 or held[0].get("resource") != request["board"]: raise AdmissionError("session claim is unavailable")
             claim_path = Path(str(held[0]["path"])).resolve(); reject_linked_path(claim_path)
             claim = {"resource":request["board"],"path":str(claim_path),"sha256":hashlib.sha256(claim_path.read_bytes()).hexdigest(),"owner":held[0]["owner"]}
-            config = self.broker.controller_config(request["lane_id"], {})
+            config = self.broker.controller_config(request["lane_id"], {}, lane_root=(self.lane_root_for(request["lane_id"]) if self.lane_root_for is not None else None))
             config = {**config, "environment": _scrubbed_environment(config)}
             process = self.launcher(config); identity = self.identity_provider(process.pid)
             if not isinstance(identity, dict) or identity.get("pid") != process.pid: raise AdmissionError("session child identity is unavailable")

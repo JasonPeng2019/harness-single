@@ -385,14 +385,21 @@ class AcceptanceBroker:
                 raise AdmissionError("seed tree was substituted or rewritten")
         return result.stdout.strip()
 
-    def controller_config(self, lane_id: str, inherited: dict[str, str] | None = None) -> dict[str, Any]:
+    def controller_config(self, lane_id: str, inherited: dict[str, str] | None = None, *, lane_root: Path | None = None) -> dict[str, Any]:
         lane = next((item for item in self.templates["lanes"] if item["lane_id"] == lane_id), None)
         if not isinstance(lane, dict):
             raise AdmissionError("unknown lane template")
         env = dict(inherited or os.environ)
         if any(env.get(key) for key in _CAPABILITY_KEYS):
             raise AdmissionError("ambient physical capability is forbidden")
-        lane_root = _safe_child(self.root, "lanes", lane_id)
+        if lane_root is None:
+            lane_root = _safe_child(self.root, "lanes", lane_id)
+        else:
+            reject_linked_path(lane_root)
+            lane_root = lane_root.resolve()
+        reject_linked_path(lane_root)
+        if self.root not in lane_root.parents:
+            raise AdmissionError("lane root escapes acceptance root")
         validate_pinned_server()
         server_root = _PINNED_SERVER_ROOT.resolve()
         firm, artifacts, logs, mcp = (_safe_child(lane_root, name) for name in (".firm", "artifacts", "logs", "mcp"))
@@ -400,7 +407,7 @@ class AcceptanceBroker:
             path.mkdir(parents=True, exist_ok=True)
             if path.is_symlink():
                 raise AdmissionError("lane root cannot be a symlink")
-        return {"lane": lane, "working_directory": str(server_root), "mcp_command": ["uv", "run", "--project", str(server_root), "--locked", "pyocd-debug-mcp"], "stdio": {"stdin": "controller-only", "stdout": "controller-only-mcp-framing", "stderr_path": str(_safe_child(logs, "mcp.stderr.log"))}, "roots": {"firm": str(firm), "artifacts": str(artifacts), "logs": str(logs), "mcp": str(mcp)}, "environment": {"BYO_MCP_ARTIFACT_ROOT": str(artifacts), "PYOCD_PROBE_UID": lane["probe_uid"], "PYOCD_TARGET": lane["target"], "PYTHONPYCACHEPREFIX": str(_safe_child(self.root, "pycache", lane_id))}, "lifetime": {"owner": "C3-HARNESS", "requires_exact_process_identity": True, "cleanup_requires_reap": True}, "worker_environment": worker_environment()}
+        return {"lane": lane, "working_directory": str(server_root), "mcp_command": ["uv", "run", "--project", str(server_root), "--locked", "pyocd-debug-mcp"], "stdio": {"stdin": "controller-only", "stdout": "controller-only-mcp-framing", "stderr_path": str(_safe_child(logs, "mcp.stderr.log"))}, "roots": {"firm": str(firm), "artifacts": str(artifacts), "logs": str(logs), "mcp": str(mcp)}, "environment": {"BYO_MCP_ARTIFACT_ROOT": str(artifacts), "PYOCD_PROBE_UID": lane["probe_uid"], "PYOCD_TARGET": lane["target"], "PYTHONPYCACHEPREFIX": str(_safe_child(lane_root, "pycache"))}, "lifetime": {"owner": "C3-HARNESS", "requires_exact_process_identity": True, "cleanup_requires_reap": True}, "worker_environment": worker_environment()}
 
     def validate_lane_call(self, call: dict[str, Any]) -> dict[str, Any]:
         """Bind declared call identity to one locked, reviewed physical lane."""

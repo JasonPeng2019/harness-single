@@ -40,6 +40,8 @@ _ROLES = {
     "F.C3.R1": ("gpt-5.6-terra", "medium", "priority", "reviewer"),
 }
 _SAFE_ID = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_INITIAL_CONTROLLER_STATES = {"WAITING_RESOURCE", "RUNNING_CODEX"}
+_INITIAL_STATUS_TIMEOUT_SECONDS = 90.0
 
 
 def _sha(path: Path) -> str:
@@ -153,7 +155,7 @@ class C3Harness:
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"]: raise AdmissionError("C1 seed binding drifted")
         self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
         self.limitation_adapter = LimitationEvidenceAdapter(self.broker)
-        self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}
+        self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}; self.session_lanes: dict[str, str] = {}
         self.workers: dict[str, subprocess.Popen[Any]] = {}; self.assignments: dict[str, dict[str, Any]] = {}
         self.limitation_completed: dict[str, dict[str, dict[str, Any]]] = {}
         self.operations: dict[str, Future[Any]] = {}; self.operation_pending: dict[str, Path] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
@@ -182,7 +184,7 @@ class C3Harness:
             closed_sessions = {x.get("session_id") for x in live if x.get("schema") == "firmware-c3-session-lifecycle/v1" and x.get("state") == "TERMINAL"}
             if starts - terminals or sessions - closed_sessions:
                 raise AdmissionError("prior C3 process has incomplete worker lifecycle; refusing adoption")
-        for pending in _safe_child(self.root,"sessions").rglob("*.PENDING.json"):
+        for pending in _safe_child(self.root,"hil").rglob("*.PENDING.json"):
             terminal = pending.with_name(pending.name.removesuffix(".PENDING.json") + ".TERMINAL.json")
             if not terminal.is_file(): raise AdmissionError("prior C3 process has incomplete session operation; refusing adoption")
             value = json.loads(terminal.read_text(encoding="utf-8"))
@@ -264,7 +266,9 @@ class C3Harness:
     def _dispatch(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if kind == "materialize":
             if set(payload) != {"target_id"}: raise AdmissionError("materialize payload is closed")
-            target = _safe_child(self.root, "targets", _id(payload["target_id"], "target")); self.broker.materialize_seed(target)
+            target_id = _id(payload["target_id"], "target")
+            if target_id != "target": raise AdmissionError("C3 supports exactly the singular target id")
+            target = _safe_child(self.root, target_id); self.broker.materialize_seed(target)
             return {"target":str(target), "accepted_commit":self.broker.validate_target(target)}
         if kind == "assignment": return self._assignment(payload)
         if kind == "assignment-accept": return self._accept_assignment(payload)
@@ -275,6 +279,29 @@ class C3Harness:
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
+    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, reason: str) -> dict[str, Any]:
+        """Reap only this proven child, then remove only its unpublished Git ownership."""
+        cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "controller_identity":identity, "process_reaped":False, "worktree_removed":False, "branch_removed":False}
+        current = exact_process_identity(proc.pid)
+        if proc.poll() is None and (identity is None or (current is not None and current == identity)):
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if identity is None or exact_process_identity(proc.pid) == identity:
+                    proc.kill(); proc.wait(timeout=5)
+        if proc.poll() is None or (identity is not None and exact_process_identity(proc.pid) == identity):
+            cleanup["outcome"] = "FAILED"; _write_new(_safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json"), cleanup)
+            raise AdmissionError("exact controller child could not be reaped")
+        cleanup["process_reaped"] = True
+        removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True)
+        cleanup["worktree_removed"] = removed.returncode == 0 and not worktree.exists()
+        deleted = subprocess.run(["git", "branch", "-D", branch], cwd=target, capture_output=True, text=True)
+        cleanup["branch_removed"] = deleted.returncode == 0
+        cleanup["outcome"] = "REAPED" if cleanup["worktree_removed"] and cleanup["branch_removed"] else "FAILED"
+        _write_new(_safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json"), cleanup)
+        if cleanup["outcome"] != "REAPED": raise AdmissionError("pre-registration Git cleanup failed")
+        return cleanup
+
     def _assignment(self, p: dict[str, Any]) -> dict[str, Any]:
         allowed = {"assignment_id", "role", "sprint", "task", "prompt", "target_id", "declared_resources", "limitation"}
         if not set(p) <= allowed or not {"assignment_id","role","sprint","task","prompt","target_id","declared_resources"} <= set(p): raise AdmissionError("assignment payload is closed")
@@ -282,7 +309,8 @@ class C3Harness:
         if role not in _ROLES or not all(isinstance(p[k], str) and p[k] for k in ("sprint","task","prompt")) or not isinstance(p["declared_resources"], list) or any(_id(x,"resource") != x for x in p["declared_resources"]) or len(set(p["declared_resources"])) != len(p["declared_resources"]): raise AdmissionError("assignment fields are invalid")
         limitation = self._limitation_metadata(p.get("limitation"), role) if "limitation" in p else None
         if self.active_worker: raise AdmissionError("exactly one target worker may be active")
-        target = _safe_child(self.root, "targets", target_id); base = self.broker.validate_target(target)
+        if target_id != "target": raise AdmissionError("C3 supports exactly the singular target id")
+        target = _safe_child(self.root, target_id); base = self.broker.validate_target(target)
         worktree = _safe_child(self.root, "assignment-worktrees", aid); branch = "c3/" + target_id + "/" + aid
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
@@ -323,30 +351,25 @@ class C3Harness:
             after_identity = exact_process_identity(proc.pid)
             expected_created = iso_utc(observed.created_utc) if observed is not None else None
             if identity is None or after_identity is None or identity != after_identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None:
-                proc.terminate()
-                try: proc.wait(timeout=5)
-                except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
+                self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, "cannot prove controller child OS identity")
                 raise AdmissionError("cannot prove controller child OS identity")
             status_identity = {"pid": proc.pid, "created_utc": expected_created}
             status_path = Path(outputs["status"])
             launch_status: dict[str, Any] | None = None
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + _INITIAL_STATUS_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 try:
                     value = json.loads(status_path.read_text(encoding="utf-8"))
-                    if value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"]:
+                    if (value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES):
                         launch_status = value; break
                 except (OSError, json.JSONDecodeError):
                     pass
                 if proc.poll() is not None: break
                 time.sleep(.05)
             if launch_status is None:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try: proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=5)
-                else: proc.wait()
-                raise AdmissionError("controller did not publish an authentic initial status")
+                reason = "controller did not publish an authentic initial status"
+                self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, reason)
+                raise AdmissionError(reason)
         finally:
             if out_handle is not None: out_handle.close()
             if err_handle is not None: err_handle.close()
@@ -400,7 +423,7 @@ class C3Harness:
         if record is None or record.get("target_id") != target_id or record.get("completion",{}).get("outcome") != "PASS": raise AdmissionError("assignment has no exact PASS completion")
         invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json")
         if not invocation_path.is_file(): raise AdmissionError("assignment invocation is absent")
-        invocation = json.loads(invocation_path.read_text(encoding="utf-8")); worktree = Path(invocation["run_root"]); target = _safe_child(self.root,"targets",target_id)
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8")); worktree = Path(invocation["run_root"]); target = _safe_child(self.root,target_id)
         _protected_seed_snapshot(worktree, record["seed"])
         status = Path(invocation["output_paths"]["status"])
         result = worktree / ".agent-workspace" / "RESULT.json"
@@ -421,7 +444,10 @@ class C3Harness:
         if sid in self.controllers: raise AdmissionError("session already exists")
         request = Path(p["request_path"]); reject_linked_path(request)
         if self.root not in request.resolve().parents or not request.is_file(): raise AdmissionError("session request escapes attempt")
-        controller = FirmwareAcceptanceController(self.broker, topology=self.topology); result = controller.open_session(request, expected_session_id=sid); self.controllers[sid] = controller
+        controller = FirmwareAcceptanceController(self.broker, topology=self.topology, session_root_for=lambda value: _safe_child(self.root, "hil", _id(value["lane_id"], "lane"), "sessions", _id(value["session_id"], "session")), lane_root_for=lambda lane: _safe_child(self.root, "hil", _id(lane, "lane")))
+        result = controller.open_session(request, expected_session_id=sid)
+        lane_id = _id(json.loads(request.read_text(encoding="utf-8"))["lane_id"], "lane")
+        self.controllers[sid] = controller; self.session_lanes[sid] = lane_id
         _atomic_append(self.registry_path,{"schema":"firmware-c3-session-lifecycle/v1","state":"OPEN","session_id":sid}); return result
 
     def _session(self, p: dict[str, Any], action: str) -> dict[str, Any]:
@@ -430,7 +456,7 @@ class C3Harness:
         if action == "proposal" and set(p) == {"session_id","proposal_path","request"}: return controller.session_publish_proposal(Path(p["proposal_path"]),p["request"])
         if action == "execute" and set(p) == {"session_id","proposal_path","decision_path","authorization_path"}:
             if sid in self.operations: raise AdmissionError("same-lane session operation is active")
-            pending = _safe_child(self.root,"sessions",sid,"operations",hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest() + ".PENDING.json")
+            pending = _safe_child(self.root,"hil",self.session_lanes[sid],"sessions",sid,"operations",hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest() + ".PENDING.json")
             _write_new(pending,{"schema":"firmware-c3-session-operation/v1","state":"PENDING","session_id":sid,"payload":p})
             self.operations[sid] = self.executor.submit(controller.session_execute_artifacts,Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
             self.operation_pending[sid] = pending
@@ -440,7 +466,7 @@ class C3Harness:
         elif action == "abort" and set(p) == {"session_id","reason"} and isinstance(p["reason"],str) and p["reason"]: result = controller.abort_session(p["reason"])
         else: raise AdmissionError("session operation payload is closed")
         if not result.get("exact_reaped") or not result.get("claim_released"): raise AdmissionError("session terminal cleanup is incomplete")
-        del self.controllers[sid]; _atomic_append(self.registry_path,{"schema":"firmware-c3-session-lifecycle/v1","state":"TERMINAL","session_id":sid,"terminal":result}); return result
+        del self.controllers[sid]; del self.session_lanes[sid]; _atomic_append(self.registry_path,{"schema":"firmware-c3-session-lifecycle/v1","state":"TERMINAL","session_id":sid,"terminal":result}); return result
 
     def reap_workers(self) -> None:
         for aid, process in list(self.workers.items()):
@@ -487,7 +513,7 @@ class C3Harness:
                     if not isinstance(raw,dict) or set(raw) != required or raw.get("schema") != "firmware-c3-worker-request/v1" or raw.get("kind") != "session-proposal" or raw.get("assignment_id") != aid or path.name != raw.get("request_id","") + ".json" or not isinstance(raw.get("token"),str) or not secrets.compare_digest(hashlib.sha256(raw["token"].encode()).hexdigest(),record["token_hash"]): raise AdmissionError("worker request is not closed or token-bound")
                     sid = _id(raw.get("session_id"),"session")
                     if sid not in self.controllers or not isinstance(raw.get("sequence"),int) or raw["sequence"] < 0 or not all(isinstance(raw.get(k),str) and raw[k] for k in ("predecessor_state","current_state","next_state")) or not isinstance(raw.get("call"),dict): raise AdmissionError("worker request state is invalid")
-                    proposal = _safe_child(self.root,"sessions",sid,"worker-proposals",raw["request_id"] + ".json")
+                    proposal = _safe_child(self.root,"hil",self.session_lanes[sid],"sessions",sid,"worker-proposals",raw["request_id"] + ".json")
                     value = self.controllers[sid].session_publish_proposal(proposal,raw["call"])
                     _write_new(response,{"schema":"firmware-c3-worker-response/v1","request_id":raw["request_id"],"outcome":"ACCEPTED","proposal":{"path":str(proposal),"sha256":_sha(proposal)},"result":value})
                 except (AdmissionError,OSError,ValueError,json.JSONDecodeError) as exc:
@@ -503,7 +529,7 @@ class C3Harness:
         for sid, controller in list(self.controllers.items()):
             result = controller.abort_session("signed harness shutdown")
             if not result.get("exact_reaped") or not result.get("claim_released"): raise AdmissionError("shutdown session cleanup is incomplete")
-            terminals.append({"session_id":sid,"terminal":result}); del self.controllers[sid]
+            terminals.append({"session_id":sid,"terminal":result}); del self.controllers[sid]; del self.session_lanes[sid]
         evidence = _safe_child(self.state_root,"C3_HARNESS_SHUTDOWN.json")
         self.executor.shutdown(wait=True, cancel_futures=False)
         _write_new(evidence,{"schema":"firmware-c3-harness-shutdown/v1","pid":os.getpid(),"sessions":terminals,"workers_reaped":True,"admission_closed":True})
