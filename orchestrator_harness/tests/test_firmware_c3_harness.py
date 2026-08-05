@@ -120,7 +120,7 @@ class C3HarnessTests(unittest.TestCase):
             def construct(case: str) -> tuple[c3.C3Harness, dict[str, object], Path]:
                 c1_body, root, topology, c1 = build(case); candidate = Path(c1_body["candidate"]["path"])
                 with patch.object(c3, "__file__", str(candidate / "firmware_acceptance" / "c3_harness.py")), patch.object(c3.subprocess, "run", side_effect=git_identity), patch.object(c3, "load_root_topology", return_value={"attempt_id":"attempt"}), patch.object(c3, "validate_manifest", return_value={}), patch.object(c3, "validate_delegated_authorization", return_value={}), patch.object(c3, "AcceptanceBroker"), patch.object(c3, "LimitationEvidenceAdapter"):
-                    harness = c3.C3Harness(root, Path(c1_body["candidate_acceptance_inputs"]["mcp_method_policy"]["path"]), Path(c1_body["candidate_acceptance_inputs"]["lane_templates"]["path"]), topology, c1={"path":str(c1),"sha256":_digest(c1)}, delegated=c1_body["authorization"], manifest=Path(c1_body["candidate_acceptance_inputs"]["acceptance_manifest"]["path"]))
+                    harness = c3.C3Harness(root, Path("firmware_acceptance/seed").resolve(), Path(c1_body["candidate_acceptance_inputs"]["mcp_method_policy"]["path"]), Path(c1_body["candidate_acceptance_inputs"]["lane_templates"]["path"]), topology, c1={"path":str(c1),"sha256":_digest(c1)}, delegated=c1_body["authorization"], manifest=Path(c1_body["candidate_acceptance_inputs"]["acceptance_manifest"]["path"]))
                 return harness, c1_body, root
 
             harness, valid, _ = construct("valid")
