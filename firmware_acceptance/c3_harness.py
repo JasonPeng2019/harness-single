@@ -192,8 +192,7 @@ class C3Harness:
                 recovery_value = json.loads(recovery.read_text(encoding="utf-8")); value = json.loads(reconciled.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise AdmissionError("prior C3 recovery reconciliation is unreadable") from exc
-            aid = recovery_value.get("assignment_id") if isinstance(recovery_value,dict) else None
-            if not isinstance(aid,str) or _id(aid,"recovery assignment") != aid: raise AdmissionError("prior C3 recovery assignment is invalid")
+            aid = self._validate_recovery_record(recovery_value)
             cleanup_path = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
             expected = {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":str(recovery),"sha256":_sha(recovery)}}
             if not isinstance(value,dict) or set(value) != {"schema","recovery","cleanup"} or value.get("schema") != expected["schema"] or value.get("recovery") != expected["recovery"]:
@@ -222,6 +221,21 @@ class C3Harness:
             if not terminal.is_file(): raise AdmissionError("prior C3 process has incomplete session operation; refusing adoption")
             value = json.loads(terminal.read_text(encoding="utf-8"))
             if value.get("pending") != {"path":str(pending),"sha256":_sha(pending)}: raise AdmissionError("session operation terminal does not bind pending evidence")
+
+    def _validate_recovery_record(self, value: Any) -> str:
+        keys = {"schema","assignment_id","pid","controller_identity","observed_identity","worktree","branch","channels","cleanup"}
+        if not isinstance(value,dict) or set(value) != keys or value.get("schema") != "firmware-c3-recovery-required/v1": raise AdmissionError("recovery record is not closed")
+        aid = _id(value.get("assignment_id"), "recovery assignment")
+        pid = value.get("pid")
+        if isinstance(pid,bool) or not isinstance(pid,int) or pid <= 0: raise AdmissionError("recovery PID is invalid")
+        for key in ("controller_identity","observed_identity"):
+            identity = value[key]
+            if identity is not None and (not isinstance(identity,dict) or set(identity) != {"pid","created_utc"} or identity.get("pid") != pid or not isinstance(identity.get("created_utc"),str) or not identity["created_utc"]): raise AdmissionError("recovery process identity is invalid")
+        expected_worktree = _safe_child(self.root,"assignment-worktrees",aid); expected_channels = [_safe_child(self.root,"worker-channel",aid),_safe_child(self.root,"worker-channel-responses",aid)]
+        if value.get("worktree") != str(expected_worktree) or value.get("branch") != "c3/target/" + aid or value.get("channels") != [str(path) for path in expected_channels]: raise AdmissionError("recovery ownership paths are invalid")
+        cleanup = value["cleanup"]; cleanup_keys = {"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome","process_identity_unresolved"}
+        if (not isinstance(cleanup,dict) or set(cleanup) != cleanup_keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("controller_identity") != value["controller_identity"] or cleanup.get("outcome") != "RECOVERY_REQUIRED" or cleanup.get("process_identity_unresolved") is not True or not isinstance(cleanup.get("reason"),str) or not cleanup["reason"] or any(type(cleanup.get(key)) is not bool for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed"))): raise AdmissionError("recovery cleanup is invalid")
+        return aid
 
     def _status(self, state: str, **extra: Any) -> None:
         _atomic_append(self.status_path, {"schema": "firmware-c3-harness-status/v1", "state": state, "pid": os.getpid(), "monotonic": time.monotonic(), **extra})
@@ -367,6 +381,7 @@ class C3Harness:
         """Retain the unproven live child for exact external recovery; never downgrade it."""
         self.admission_closed = True
         record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"pid":proc.pid,"controller_identity":identity,"observed_identity":exact_process_identity(proc.pid),"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
+        self._validate_recovery_record(record)
         path = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
         _write_new(path, record)
         self.recovery = {**record,"path":str(path),"sha256":_sha(path),"process":proc}
