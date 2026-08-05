@@ -98,8 +98,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         decision = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","rationale":"session","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":proposal["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
         verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
         authorization_path = proposal_path.with_name(f"authorization-{sequence}.json")
-        authorization = {"schema":"firmware-derived-authorization/v2","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"decision_path":str(decision_path.resolve()),"decision_sha256":hashlib.sha256(decision_path.read_bytes()).hexdigest(),"launch_intent":proposal["call"]["topology_key_release"],"orchestrator_identity":decision["orchestrator_identity"],"topology_key_release":decision["topology_key_release"],"c1_reference":proposal["call"]["c1_reference"],"delegated_reference":proposal["call"]["delegated_reference"],"call":proposal["call"],"claim":proposal["claim"],"expires_monotonic":99.0,"one_shot_id":proposal["call"]["call_id"],"revoked":False}
-        authorization_path.write_text(json.dumps(authorization, sort_keys=True, separators=(",",":")), encoding="utf-8")
+        controller.session_derive_authorization(proposal_path, decision_path, authorization_path, verifier)
         return proposal_path, decision_path, authorization_path
 
     @staticmethod
