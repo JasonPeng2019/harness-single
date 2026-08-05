@@ -396,7 +396,7 @@ class C3Harness:
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
-    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str) -> dict[str, Any]:
+    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str, *, persist_evidence: bool = True) -> dict[str, Any]:
         """Close unpublished ownership transactionally; never signal an identity-unknown PID."""
         cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "launcher_identity":identity, "controller_identity":controller_identity, "handles_closed":True, "launcher_reaped":proc is None, "controller_reaped":controller_identity is None, "process_reaped":proc is None and controller_identity is None, "worktree_removed":False, "branch_removed":False, "channels_removed":False}
         for handle in handles:
@@ -414,7 +414,7 @@ class C3Harness:
                         proc.kill(); proc.wait(timeout=5)
             try: proc.wait(timeout=0)
             except subprocess.TimeoutExpired: pass
-            cleanup["launcher_reaped"] = proc.poll() is not None and (identity is None or exact_process_identity(proc.pid) != identity)
+            cleanup["launcher_reaped"] = proc.poll() is not None
         if controller_identity is not None:
             cleanup["controller_reaped"] = exact_process_identity(controller_identity["pid"]) != controller_identity
         cleanup["process_reaped"] = cleanup["launcher_reaped"] and cleanup["controller_reaped"]
@@ -431,16 +431,18 @@ class C3Harness:
                     cleanup["channels_removed"] = all(not channel.exists() for channel in channels)
                 except OSError: pass
         cleanup["outcome"] = "REAPED" if all(cleanup[key] for key in ("handles_closed", "launcher_reaped", "controller_reaped", "process_reaped", "worktree_removed", "branch_removed", "channels_removed")) else "RECOVERY_REQUIRED"
-        evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
-        if evidence.exists(): evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
-        _write_new(evidence, cleanup)
+        if persist_evidence:
+            evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
+            if evidence.exists(): evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
+            _write_new(evidence, cleanup)
         return cleanup
 
     def reap_recovery(self) -> None:
         if self.recovery is None or self.recovery["process"].poll() is None: return
-        cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["launcher_identity"], self.recovery.get("controller_identity"), Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery")
+        cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["launcher_identity"], self.recovery.get("controller_identity"), Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery", persist_evidence=False)
         if cleanup["outcome"] != "REAPED": return
         cleanup_path = _safe_child(self.root,"assignments",self.recovery["assignment_id"] + ".PRESTART_RECOVERY_RECONCILED.json")
+        _write_new(cleanup_path, cleanup)
         _write_new(_safe_child(self.state_root,"RECOVERY_RECONCILED.json"), {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":self.recovery["path"],"sha256":self.recovery["sha256"]},"cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
         self.recovery = None
 
@@ -510,8 +512,8 @@ class C3Harness:
                             observation_path = _safe_child(self.root,"assignments",aid + ".CONTROLLER_OBSERVATION.json")
                             candidate["assignment_id"] = aid; _write_new(observation_path, candidate)
                             observation = candidate
-                        if not _observation_authenticates(candidate): raise AdmissionError("controller initial observation is not authentic")
                         controller_identity = candidate["controller_identity"]
+                        if not _observation_authenticates(candidate): raise AdmissionError("controller initial observation is not authentic")
                         status_identity = candidate["controller_status_identity"]; launch_status = value; break
                 if proc.poll() is not None: break
                 time.sleep(.05)

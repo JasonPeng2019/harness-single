@@ -764,12 +764,10 @@ def run(invocation: Invocation) -> int:
 
             resource_claims.acquire_all(invocation.resources, on_wait=record_wait)
             state.update({
-                "state": "LAUNCH_FAILED",
                 "held_resource_claims": resource_claims.held,
                 "waiting_resource_claim": None,
                 "resource_claim_findings": list(resource_claims.findings),
             })
-            _atomic_json(invocation.status_path, state)
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             child_env = None
             if invocation.child_environment_isolation:
