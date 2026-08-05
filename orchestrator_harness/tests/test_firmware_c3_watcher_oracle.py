@@ -1,4 +1,4 @@
-"""Closed, host-only oracle regressions for the C3 initial-status invariant."""
+"""Adversarial, host-only tests for C3 identity watcher containment."""
 from __future__ import annotations
 
 import hashlib
@@ -11,62 +11,51 @@ from firmware_acceptance.c3_watcher_oracle import classify
 
 
 class C3WatcherOracleTests(unittest.TestCase):
-    PID = 4242
-    CREATED = "2026-08-05T00:00:00Z"
-
     def _put(self, root: Path, name: str, value: object) -> Path:
         path = root / name
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
 
-    def _response(self) -> dict[str, object]:
-        return {"schema":"firmware-c3-harness-response/v1", "request_id":"r1", "outcome":"REJECTED", "reason":"controller did not publish an authentic initial status"}
+    def _evidence(self, root: Path, *, request_id: str = "a1",
+                  reason: str = "controller did not publish an authentic initial status",
+                  command: str | None = None) -> tuple[Path, Path, Path]:
+        invocation = root / "a1.invocation.json"
+        invocation.write_text("{}", encoding="utf-8")
+        digest = hashlib.sha256(invocation.read_bytes()).hexdigest()
+        status = self._put(root, "status.json", {"schema":"orchestrator-lane-controller/v1", "state":"WAITING_RESOURCE", "controller_pid":4242, "controller_created_utc":"created"})
+        status_digest = hashlib.sha256(status.read_bytes()).hexdigest()
+        controller_command = command or f'python -m orchestrator_harness.lane_controller "{invocation}"'
+        identity = {"pid":4242, "created_utc":"created"}
+        snapshot = {"pid":4242, "ppid":1, "name":"python", "command_line":controller_command, "created_utc":"created"}
+        relationship = self._put(root, "relationship.json", {"schema":"firmware-c3-controller-relationship/v1", "assignment_id":"a1", "shape":"same-process", "launcher_identity":identity, "controller_identity":identity, "controller_status_identity":identity, "launcher_snapshot":snapshot, "controller_snapshot":snapshot, "invocation":{"path":str(invocation.resolve()), "sha256":digest}, "initial_status":{"path":str(status.resolve()), "sha256":status_digest, "state":"WAITING_RESOURCE", "controller_identity":identity}})
+        response = self._put(root, "response.json", {"schema":"firmware-c3-harness-response/v1", "request_id":request_id, "outcome":"REJECTED", "reason":reason})
+        return response, status, relationship
 
-    def _status(self) -> dict[str, object]:
-        return {"schema":"orchestrator-lane-controller/v1", "controller_pid":self.PID, "controller_created_utc":self.CREATED, "state":"WAITING_RESOURCE", "held_resource_claims":[]}
-
-    def test_s25_a1_oracle_closed_authentic_contradiction_and_hash_evidence(self) -> None:
+    def test_s26_a1_watcher_aborts_only_for_bound_raw_or_recovery_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); response = self._put(root, "response.json", self._response()); status = self._put(root, "status.json", self._status())
-            result = classify(response, status, expected_pid=self.PID, expected_created_utc=self.CREATED)
-            self.assertEqual("ABORT_REQUIRED", result["classification"])
-            self.assertEqual({"schema","classification","invariant","expected_controller_identity","response","status","evidence"}, set(result))
-            self.assertEqual({"path":str(response.resolve()),"sha256":hashlib.sha256(response.read_bytes()).hexdigest()}, result["response"])
-            self.assertTrue(result["evidence"]["candidate_rejected_unauthentic_status"])
-            self.assertTrue(result["evidence"]["status_authentic_for_expected_live_controller"])
-            self._put(root, "running.json", {**self._status(), "state":"RUNNING_CODEX"})
-            self.assertEqual("ABORT_REQUIRED", classify(response, root / "running.json", expected_pid=self.PID, expected_created_utc=self.CREATED)["classification"])
+            root = Path(temporary)
+            for reason in ("controller did not publish an authentic initial status", "pre-registration cleanup requires recovery: controller did not publish an authentic initial status"):
+                with self.subTest(reason=reason):
+                    response, status, relationship = self._evidence(root, reason=reason)
+                    result = classify(response, status, relationship)
+                    self.assertEqual("ABORT_REQUIRED", result["classification"])
+                    self.assertEqual({"schema", "classification", "invariant", "response", "status", "relationship", "evidence"}, set(result))
 
-    def test_s25_a1_oracle_contains_malformed_wrong_identity_and_noncontradictions(self) -> None:
+    def test_s26_a1_watcher_contains_mutable_stale_unrelated_and_self_correlated_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); response = self._put(root, "response.json", self._response()); status = self._put(root, "status.json", self._status())
-            cases = [
-                ("malformed-response", "{", self._status()),
-                ("scalar-response", [], self._status()),
-                ("response-extra-key", {**self._response(), "extra":True}, self._status()),
-                ("response-missing-key", {key:value for key,value in self._response().items() if key != "reason"}, self._status()),
-                ("candidate-accepted", {**self._response(), "outcome":"ACCEPTED"}, self._status()),
-                ("wrong-pid", self._response(), {**self._status(), "controller_pid":1}),
-                ("wrong-created", self._response(), {**self._status(), "controller_created_utc":"other"}),
-                ("unsupported-state", self._response(), {**self._status(), "state":"CODEX_EXITED"}),
-                ("unauthentic-rejected", {**self._response(), "reason":"other rejection"}, self._status()),
-            ]
-            for name, response_value, status_value in cases:
+            root = Path(temporary)
+            cases = {
+                "unrelated-reason": {"reason":"some other rejection"},
+                "stale-status": {"status":{"controller_created_utc":"reused"}},
+                "mutable-status": {"mutate_status":True},
+                "unrelated-request": {"request_id":"other-assignment"},
+                "command-token-collision": {"command":"python -m orchestrator_harness.lane_controller_extra a1.invocation.json.bak"},
+            }
+            for name, case in cases.items():
                 with self.subTest(name=name):
-                    if isinstance(response_value, str): (root / "response.json").write_text(response_value, encoding="utf-8")
-                    else: response = self._put(root, "response.json", response_value)
-                    status = self._put(root, "status.json", status_value)
-                    result = classify(response, status, expected_pid=self.PID, expected_created_utc=self.CREATED)
-                    self.assertEqual("EXPECTED_CONTAINMENT", result["classification"])
-                    self.assertFalse(result["evidence"]["candidate_rejected_unauthentic_status"] and result["evidence"]["status_authentic_for_expected_live_controller"])
-            for name, status_value in {
-                "malformed-status":"{", "scalar-status":42, "list-status":[], "null-status":None,
-                "status-missing-created":{key:value for key,value in self._status().items() if key != "controller_created_utc"},
-                "status-wrong-schema":{**self._status(), "schema":"other"},
-            }.items():
-                with self.subTest(name=name):
-                    response = self._put(root, "response.json", self._response())
-                    if isinstance(status_value, str): (root / "status.json").write_text(status_value, encoding="utf-8")
-                    else: status = self._put(root, "status.json", status_value)
-                    result = classify(response, root / "status.json", expected_pid=self.PID, expected_created_utc=self.CREATED)
-                    self.assertEqual("EXPECTED_CONTAINMENT", result["classification"])
+                    response, status, relationship = self._evidence(root, **{key:value for key, value in case.items() if key in {"request_id", "reason", "command"}})
+                    if "status" in case:
+                        status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1", "state":"WAITING_RESOURCE", "controller_pid":4242, **case["status"]}), encoding="utf-8")
+                    if case.get("mutate_status"):
+                        status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1", "state":"RUNNING_CODEX", "controller_pid":4242, "controller_created_utc":"created"}), encoding="utf-8")
+                    self.assertEqual("EXPECTED_CONTAINMENT", classify(response, status, relationship)["classification"])
