@@ -43,6 +43,8 @@ class C3WatcherOracleTests(unittest.TestCase):
             cases = [
                 ("malformed-response", "{", self._status()),
                 ("scalar-response", [], self._status()),
+                ("response-extra-key", {**self._response(), "extra":True}, self._status()),
+                ("response-missing-key", {key:value for key,value in self._response().items() if key != "reason"}, self._status()),
                 ("candidate-accepted", {**self._response(), "outcome":"ACCEPTED"}, self._status()),
                 ("wrong-pid", self._response(), {**self._status(), "controller_pid":1}),
                 ("wrong-created", self._response(), {**self._status(), "controller_created_utc":"other"}),
@@ -57,4 +59,15 @@ class C3WatcherOracleTests(unittest.TestCase):
                     result = classify(response, status, expected_pid=self.PID, expected_created_utc=self.CREATED)
                     self.assertEqual("EXPECTED_CONTAINMENT", result["classification"])
                     self.assertFalse(result["evidence"]["candidate_rejected_unauthentic_status"] and result["evidence"]["status_authentic_for_expected_live_controller"])
-
+            for name, status_value in {
+                "malformed-status":"{", "scalar-status":42, "list-status":[], "null-status":None,
+                "status-extra-key":{**self._status(), "extra":True},
+                "status-missing-created":{key:value for key,value in self._status().items() if key != "controller_created_utc"},
+                "status-wrong-schema":{**self._status(), "schema":"other"},
+            }.items():
+                with self.subTest(name=name):
+                    response = self._put(root, "response.json", self._response())
+                    if isinstance(status_value, str): (root / "status.json").write_text(status_value, encoding="utf-8")
+                    else: status = self._put(root, "status.json", status_value)
+                    result = classify(response, root / "status.json", expected_pid=self.PID, expected_created_utc=self.CREATED)
+                    self.assertEqual("EXPECTED_CONTAINMENT", result["classification"])
