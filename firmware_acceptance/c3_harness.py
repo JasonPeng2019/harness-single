@@ -23,8 +23,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from harness_common.process_identity import exact_process_identity, lane_controller_argv_matches
+from harness_common.process_identity import exact_process_identity
 from .controller import Ed25519Verifier, FirmwareAcceptanceController, load_root_topology
+from .c3_process_identity import lane_controller_command_matches
 from .c3_limitation import LimitationEvidenceAdapter
 from .kit import (AcceptanceBroker, AdmissionError, _safe_child, _write_new,
                   canonical_decision_payload, reject_linked_path, validate_seed_manifest,
@@ -109,14 +110,20 @@ def _seed_digest(snapshot: dict[str, str]) -> str:
 def _snapshot_process(value: Any) -> dict[str, Any] | None:
     """Serialize only the closed process facts needed to authenticate a launch."""
     created = iso_utc(getattr(value, "created_utc", None))
-    if (not isinstance(getattr(value, "pid", None), int) or value.pid <= 0
-            or not isinstance(getattr(value, "ppid", None), int) or value.ppid < 0
+    if (isinstance(getattr(value, "pid", None), bool) or not isinstance(getattr(value, "pid", None), int) or value.pid <= 0
+            or isinstance(getattr(value, "ppid", None), bool) or not isinstance(getattr(value, "ppid", None), int) or value.ppid < 0
             or not isinstance(getattr(value, "name", None), str) or not value.name
             or not isinstance(getattr(value, "command_line", None), str) or not value.command_line
             or created is None):
         return None
     return {"pid":value.pid,"ppid":value.ppid,"name":value.name,
             "command_line":value.command_line,"created_utc":created}
+
+
+def _process_identity(value: Any, pid: int) -> bool:
+    return (isinstance(value,dict) and set(value) == {"pid","created_utc"}
+            and value.get("pid") == pid and not isinstance(value.get("pid"),bool)
+            and isinstance(value.get("created_utc"),str) and bool(value["created_utc"]))
 
 
 def _controller_observation(snapshot: Any, launcher_identity: dict[str, Any], launcher_pid: int,
@@ -141,21 +148,25 @@ def _controller_observation(snapshot: Any, launcher_identity: dict[str, Any], la
     launcher_observed = exact_process_identity(launcher_pid)
     if launcher_observed != launcher_identity:
         return None
+    initial_status = {key:status.get(key) for key in ("schema","state","controller_pid","controller_created_utc")}
     return {"schema":"firmware-c3-controller-observation/v1","shape":shape,
             "launcher_identity":launcher_identity,"launcher_observed_identity":launcher_observed,"controller_identity":controller_before,
             "controller_status_identity":{"pid":controller_pid,"created_utc":created},
             "launcher_snapshot":launcher,"controller_snapshot":controller,
             "invocation":{"path":str(invocation_path.resolve()),"sha256":_sha(invocation_path)},
-            "initial_status":{"sha256":hashlib.sha256(status_bytes).hexdigest(),"value":status},
+            "initial_status":{"sha256":hashlib.sha256(status_bytes).hexdigest(),"value":initial_status},
             "status_source":{"path":str(status_path.resolve()),"sha256":hashlib.sha256(status_bytes).hexdigest()}}
 
 
 def _observation_authenticates(value: dict[str, Any]) -> bool:
     status = value["initial_status"]["value"]; controller = value["controller_snapshot"]
-    return (status.get("schema") == "orchestrator-lane-controller/v1" and status.get("state") in _INITIAL_CONTROLLER_STATES
+    return (set(status) == {"schema","state","controller_pid","controller_created_utc"}
+            and status.get("schema") == "orchestrator-lane-controller/v1" and status.get("state") in _INITIAL_CONTROLLER_STATES
+            and not isinstance(status.get("controller_pid"),bool) and isinstance(status.get("controller_pid"),int) and status["controller_pid"] > 0
+            and isinstance(status.get("controller_created_utc"),str) and bool(status["controller_created_utc"])
             and status.get("controller_pid") == value["controller_status_identity"]["pid"]
             and status.get("controller_created_utc") == value["controller_status_identity"]["created_utc"]
-            and lane_controller_argv_matches(controller["command_line"], value["invocation"]["path"]))
+            and lane_controller_command_matches(value["shape"], controller["command_line"], value["invocation"]["path"]))
 
 
 class C3Harness:
@@ -275,19 +286,21 @@ class C3Harness:
             if value.get("pending") != {"path":str(pending),"sha256":_sha(pending)}: raise AdmissionError("session operation terminal does not bind pending evidence")
 
     def _validate_recovery_record(self, value: Any) -> str:
-        keys = {"schema","assignment_id","launcher_identity","observed_launcher_identity","controller_identity","worktree","branch","channels","cleanup"}
+        keys = {"schema","assignment_id","launcher_pid","launcher_identity","observed_launcher_identity","controller_identity","worktree","branch","channels","cleanup"}
         if not isinstance(value,dict) or set(value) != keys or value.get("schema") != "firmware-c3-recovery-required/v1": raise AdmissionError("recovery record is not closed")
         aid = _id(value.get("assignment_id"), "recovery assignment")
+        launcher_pid = value.get("launcher_pid")
+        if isinstance(launcher_pid,bool) or not isinstance(launcher_pid,int) or launcher_pid <= 0: raise AdmissionError("recovery launcher PID is invalid")
         launcher = value.get("launcher_identity")
-        if not isinstance(launcher,dict) or set(launcher) != {"pid","created_utc"} or isinstance(launcher.get("pid"),bool) or not isinstance(launcher.get("pid"),int) or launcher["pid"] <= 0 or not isinstance(launcher.get("created_utc"),str) or not launcher["created_utc"]: raise AdmissionError("recovery launcher identity is invalid")
-        for key in ("observed_launcher_identity", "controller_identity"):
-            identity = value[key]
-            if identity is not None and (not isinstance(identity,dict) or set(identity) != {"pid","created_utc"} or isinstance(identity.get("pid"),bool) or not isinstance(identity.get("pid"),int) or identity["pid"] <= 0 or not isinstance(identity.get("created_utc"),str) or not identity["created_utc"]): raise AdmissionError("recovery process identity is invalid")
-        if value["observed_launcher_identity"] is not None and value["observed_launcher_identity"] != launcher: raise AdmissionError("recovery launcher continuity is invalid")
+        observed = value.get("observed_launcher_identity")
+        if (launcher is not None and not _process_identity(launcher,launcher_pid)) or (observed is not None and not _process_identity(observed,launcher_pid)):
+            raise AdmissionError("recovery launcher identity is invalid")
+        controller = value["controller_identity"]
+        if controller is not None and not _process_identity(controller,controller["pid"]): raise AdmissionError("recovery controller identity is invalid")
         expected_worktree = _safe_child(self.root,"assignment-worktrees",aid); expected_channels = [_safe_child(self.root,"worker-channel",aid),_safe_child(self.root,"worker-channel-responses",aid)]
         if value.get("worktree") != str(expected_worktree) or value.get("branch") != "c3/target/" + aid or value.get("channels") != [str(path) for path in expected_channels]: raise AdmissionError("recovery ownership paths are invalid")
         cleanup = value["cleanup"]; cleanup_keys = {"schema","assignment_id","reason","launcher_identity","controller_identity","handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}
-        if (not isinstance(cleanup,dict) or set(cleanup) != cleanup_keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("launcher_identity") != launcher or cleanup.get("controller_identity") != value["controller_identity"] or cleanup.get("outcome") != "RECOVERY_REQUIRED" or not isinstance(cleanup.get("reason"),str) or not cleanup["reason"] or any(type(cleanup.get(key)) is not bool for key in ("handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed")) or any(cleanup[key] is not False for key in ("process_reaped","worktree_removed","branch_removed","channels_removed"))): raise AdmissionError("recovery cleanup is invalid")
+        if (not isinstance(cleanup,dict) or set(cleanup) != cleanup_keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("launcher_identity") != launcher or cleanup.get("controller_identity") != controller or cleanup.get("outcome") != "RECOVERY_REQUIRED" or not isinstance(cleanup.get("reason"),str) or not cleanup["reason"] or any(type(cleanup.get(key)) is not bool for key in ("handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed")) or any(cleanup[key] is not False for key in ("process_reaped","worktree_removed","branch_removed","channels_removed"))): raise AdmissionError("recovery cleanup is invalid")
         return aid
 
     def _status(self, state: str, **extra: Any) -> None:
@@ -401,7 +414,7 @@ class C3Harness:
                         proc.kill(); proc.wait(timeout=5)
             try: proc.wait(timeout=0)
             except subprocess.TimeoutExpired: pass
-            cleanup["launcher_reaped"] = proc.poll() is not None and identity is not None and exact_process_identity(proc.pid) != identity
+            cleanup["launcher_reaped"] = proc.poll() is not None and (identity is None or exact_process_identity(proc.pid) != identity)
         if controller_identity is not None:
             cleanup["controller_reaped"] = exact_process_identity(controller_identity["pid"]) != controller_identity
         cleanup["process_reaped"] = cleanup["launcher_reaped"] and cleanup["controller_reaped"]
@@ -434,7 +447,7 @@ class C3Harness:
     def _require_recovery(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, channels: tuple[Path, ...], cleanup: dict[str, Any]) -> None:
         """Retain the unproven live child for exact external recovery; never downgrade it."""
         self.admission_closed = True
-        record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"launcher_identity":identity,"observed_launcher_identity":exact_process_identity(proc.pid),"controller_identity":controller_identity,"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
+        record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"launcher_pid":proc.pid,"launcher_identity":identity,"observed_launcher_identity":exact_process_identity(proc.pid),"controller_identity":controller_identity,"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
         self._validate_recovery_record(record)
         path = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
         _write_new(path, record)
