@@ -43,6 +43,7 @@ _ROLES = {
 _SAFE_ID = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 _INITIAL_CONTROLLER_STATES = {"WAITING_RESOURCE", "RUNNING_CODEX"}
 _INITIAL_STATUS_TIMEOUT_SECONDS = 90.0
+_LANE_CONTROLLER_MODULE = "orchestrator_harness.lane_controller"
 
 
 class RecoveryRequired(AdmissionError):
@@ -104,6 +105,58 @@ def _protected_seed_snapshot(root: Path, expected: dict[str, str]) -> None:
 
 def _seed_digest(snapshot: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _snapshot_process(value: Any) -> dict[str, Any] | None:
+    """Serialize only the closed process facts needed to authenticate a launch."""
+    created = iso_utc(getattr(value, "created_utc", None))
+    if (not isinstance(getattr(value, "pid", None), int) or value.pid <= 0
+            or not isinstance(getattr(value, "ppid", None), int) or value.ppid < 0
+            or not isinstance(getattr(value, "name", None), str) or not value.name
+            or not isinstance(getattr(value, "command_line", None), str) or not value.command_line
+            or created is None):
+        return None
+    return {"pid":value.pid,"ppid":value.ppid,"name":value.name,
+            "command_line":value.command_line,"created_utc":created}
+
+
+def _controller_command_matches(command_line: str, invocation_path: Path) -> bool:
+    """Require the module launch and this exact invocation path, not merely Python."""
+    normalized = command_line.casefold()
+    invocation = str(invocation_path.resolve()).casefold()
+    return ("-m" in normalized and _LANE_CONTROLLER_MODULE.casefold() in normalized
+            and invocation in normalized)
+
+
+def _initial_controller_relationship(snapshot: Any, launcher_identity: dict[str, Any],
+                                     launcher_pid: int, status: dict[str, Any],
+                                     invocation_path: Path) -> dict[str, Any] | None:
+    """Authenticate one controller from one complete, live process snapshot."""
+    if not getattr(snapshot, "complete", False): return None
+    launcher = _snapshot_process(snapshot.by_pid.get(launcher_pid))
+    controller_pid, created = status.get("controller_pid"), status.get("controller_created_utc")
+    if launcher is None or not isinstance(controller_pid, int) or controller_pid <= 0 or not isinstance(created, str) or not created:
+        return None
+    controller = _snapshot_process(snapshot.by_pid.get(controller_pid))
+    if controller is None or controller["created_utc"] != created or not _controller_command_matches(controller["command_line"], invocation_path):
+        return None
+    controller_identity = exact_process_identity(controller_pid)
+    if controller_identity is None:
+        return None
+    if controller_pid == launcher_pid:
+        shape = "same-process"
+    elif controller["ppid"] == launcher_pid:
+        shape = "direct-venv-redirector"
+    else:
+        return None
+    if exact_process_identity(launcher_pid) != launcher_identity:
+        return None
+    return {"schema":"firmware-c3-controller-relationship/v1","shape":shape,
+            "launcher_identity":launcher_identity,"controller_identity":controller_identity,
+            "controller_status_identity":{"pid":controller_pid,"created_utc":created},
+            "launcher_snapshot":launcher,"controller_snapshot":controller,
+            "invocation":{"path":str(invocation_path.resolve()),"sha256":_sha(invocation_path)},
+            "initial_status":{"state":status["state"]}}
 
 
 class C3Harness:
@@ -203,8 +256,8 @@ class C3Harness:
             if cleanup_path.is_symlink() or not cleanup_path.is_file() or _sha(cleanup_path) != cleanup_ref["sha256"]: raise AdmissionError("prior C3 recovery cleanup drifted")
             try: cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
             except (OSError,json.JSONDecodeError) as exc: raise AdmissionError("prior C3 recovery cleanup is unreadable") from exc
-            keys = {"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}
-            if not isinstance(cleanup,dict) or set(cleanup) != keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("outcome") != "REAPED" or not all(cleanup.get(key) is True for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed")):
+            keys = {"schema","assignment_id","reason","launcher_identity","controller_identity","handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}
+            if not isinstance(cleanup,dict) or set(cleanup) != keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("outcome") != "REAPED" or not all(cleanup.get(key) is True for key in ("handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed")):
                 raise AdmissionError("prior C3 recovery cleanup is incomplete")
             self.admission_closed = True; self.recovery_closed = True
         if self.registry_path.exists():
@@ -223,7 +276,7 @@ class C3Harness:
             if value.get("pending") != {"path":str(pending),"sha256":_sha(pending)}: raise AdmissionError("session operation terminal does not bind pending evidence")
 
     def _validate_recovery_record(self, value: Any) -> str:
-        keys = {"schema","assignment_id","pid","controller_identity","observed_identity","worktree","branch","channels","cleanup"}
+        keys = {"schema","assignment_id","pid","controller_identity","observed_identity","observed_controller_identity","worktree","branch","channels","cleanup"}
         if not isinstance(value,dict) or set(value) != keys or value.get("schema") != "firmware-c3-recovery-required/v1": raise AdmissionError("recovery record is not closed")
         aid = _id(value.get("assignment_id"), "recovery assignment")
         pid = value.get("pid")
@@ -233,8 +286,8 @@ class C3Harness:
             if identity is not None and (not isinstance(identity,dict) or set(identity) != {"pid","created_utc"} or identity.get("pid") != pid or not isinstance(identity.get("created_utc"),str) or not identity["created_utc"]): raise AdmissionError("recovery process identity is invalid")
         expected_worktree = _safe_child(self.root,"assignment-worktrees",aid); expected_channels = [_safe_child(self.root,"worker-channel",aid),_safe_child(self.root,"worker-channel-responses",aid)]
         if value.get("worktree") != str(expected_worktree) or value.get("branch") != "c3/target/" + aid or value.get("channels") != [str(path) for path in expected_channels]: raise AdmissionError("recovery ownership paths are invalid")
-        cleanup = value["cleanup"]; cleanup_keys = {"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome","process_identity_unresolved"}
-        if (not isinstance(cleanup,dict) or set(cleanup) != cleanup_keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("controller_identity") != value["controller_identity"] or cleanup.get("outcome") != "RECOVERY_REQUIRED" or cleanup.get("process_identity_unresolved") is not True or not isinstance(cleanup.get("reason"),str) or not cleanup["reason"] or any(type(cleanup.get(key)) is not bool for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed")) or any(cleanup[key] is not False for key in ("process_reaped","worktree_removed","branch_removed","channels_removed")) or (value["controller_identity"] is not None and value["controller_identity"] == value["observed_identity"])): raise AdmissionError("recovery cleanup is invalid")
+        cleanup = value["cleanup"]; cleanup_keys = {"schema","assignment_id","reason","launcher_identity","controller_identity","handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}
+        if (not isinstance(cleanup,dict) or set(cleanup) != cleanup_keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("launcher_identity") != value["controller_identity"] or cleanup.get("controller_identity") != value["observed_controller_identity"] or cleanup.get("outcome") != "RECOVERY_REQUIRED" or not isinstance(cleanup.get("reason"),str) or not cleanup["reason"] or any(type(cleanup.get(key)) is not bool for key in ("handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed")) or any(cleanup[key] is not False for key in ("process_reaped","worktree_removed","branch_removed","channels_removed"))): raise AdmissionError("recovery cleanup is invalid")
         return aid
 
     def _status(self, state: str, **extra: Any) -> None:
@@ -330,9 +383,9 @@ class C3Harness:
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
-    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str) -> dict[str, Any]:
+    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str) -> dict[str, Any]:
         """Close unpublished ownership transactionally; never signal an identity-unknown PID."""
-        cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "controller_identity":identity, "handles_closed":True, "process_reaped":proc is None, "worktree_removed":False, "branch_removed":False, "channels_removed":False}
+        cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "launcher_identity":identity, "controller_identity":controller_identity, "handles_closed":True, "launcher_reaped":proc is None, "controller_reaped":controller_identity is None, "process_reaped":proc is None and controller_identity is None, "worktree_removed":False, "branch_removed":False, "channels_removed":False}
         for handle in handles:
             if handle is not None:
                 try: handle.close()
@@ -350,7 +403,10 @@ class C3Harness:
                 cleanup["process_identity_unresolved"] = True
             try: proc.wait(timeout=0)
             except subprocess.TimeoutExpired: pass
-            cleanup["process_reaped"] = proc.poll() is not None and (identity is None or exact_process_identity(proc.pid) != identity)
+            cleanup["launcher_reaped"] = proc.poll() is not None and identity is not None and exact_process_identity(proc.pid) != identity
+        if controller_identity is not None:
+            cleanup["controller_reaped"] = exact_process_identity(controller_identity["pid"]) != controller_identity
+        cleanup["process_reaped"] = cleanup["launcher_reaped"] and cleanup["controller_reaped"]
         if cleanup["process_reaped"] and cleanup["handles_closed"]:
             removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True) if worktree.exists() else None
             cleanup["worktree_removed"] = not worktree.exists() or (removed is not None and removed.returncode == 0 and not worktree.exists())
@@ -363,7 +419,7 @@ class C3Harness:
                         if channel.exists(): shutil.rmtree(channel)
                     cleanup["channels_removed"] = all(not channel.exists() for channel in channels)
                 except OSError: pass
-        cleanup["outcome"] = "REAPED" if all(cleanup[key] for key in ("handles_closed", "process_reaped", "worktree_removed", "branch_removed", "channels_removed")) else "RECOVERY_REQUIRED"
+        cleanup["outcome"] = "REAPED" if all(cleanup[key] for key in ("handles_closed", "launcher_reaped", "controller_reaped", "process_reaped", "worktree_removed", "branch_removed", "channels_removed")) else "RECOVERY_REQUIRED"
         evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
         if evidence.exists(): evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
         _write_new(evidence, cleanup)
@@ -371,17 +427,16 @@ class C3Harness:
 
     def reap_recovery(self) -> None:
         if self.recovery is None or self.recovery["process"].poll() is None: return
-        cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["controller_identity"], Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery")
+        cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["controller_identity"], self.recovery.get("observed_controller_identity"), Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery")
         if cleanup["outcome"] != "REAPED": return
         cleanup_path = _safe_child(self.root,"assignments",self.recovery["assignment_id"] + ".PRESTART_RECOVERY_RECONCILED.json")
         _write_new(_safe_child(self.state_root,"RECOVERY_RECONCILED.json"), {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":self.recovery["path"],"sha256":self.recovery["sha256"]},"cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
         self.recovery = None
 
-    def _require_recovery(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, worktree: Path, branch: str, channels: tuple[Path, ...], cleanup: dict[str, Any]) -> None:
+    def _require_recovery(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, channels: tuple[Path, ...], cleanup: dict[str, Any]) -> None:
         """Retain the unproven live child for exact external recovery; never downgrade it."""
         self.admission_closed = True
-        record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"pid":proc.pid,"controller_identity":identity,"observed_identity":exact_process_identity(proc.pid),"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
-        self._validate_recovery_record(record)
+        record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"pid":proc.pid,"controller_identity":identity,"observed_identity":exact_process_identity(proc.pid),"observed_controller_identity":controller_identity,"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
         path = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
         _write_new(path, record)
         self.recovery = {**record,"path":str(path),"sha256":_sha(path),"process":proc}
@@ -405,9 +460,10 @@ class C3Harness:
         if created.returncode:
             branch_after = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=target, capture_output=True).returncode == 0
             if worktree.exists() or branch_after:
-                self._reject_unregistered_assignment(aid, None, None, worktree, branch, target, (inbox, response_root), (), "candidate worktree creation failed")
+                self._reject_unregistered_assignment(aid, None, None, None, worktree, branch, target, (inbox, response_root), (), "candidate worktree creation failed")
             raise AdmissionError("candidate worktree creation failed")
         proc: subprocess.Popen[Any] | None = None; identity: dict[str, Any] | None = None
+        controller_identity: dict[str, Any] | None = None; relationship: dict[str, Any] | None = None
         out_handle = err_handle = None; started = False; started_publication = False
         try:
             for name in self.seed_identity: (worktree / name).chmod(stat.S_IREAD)
@@ -427,30 +483,42 @@ class C3Harness:
             out_handle = (workspace / (aid + ".controller.stdout.log")).open("xb")
             err_handle = (workspace / (aid + ".controller.stderr.log")).open("xb")
             proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle); identity = exact_process_identity(proc.pid)
-            snapshot = process_snapshot(); observed = snapshot.by_pid.get(proc.pid); after_identity = exact_process_identity(proc.pid); expected_created = iso_utc(observed.created_utc) if observed is not None else None
-            if identity is None or after_identity != identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None: raise AdmissionError("cannot prove controller child OS identity")
-            status_identity = {"pid":proc.pid,"created_utc":expected_created}; status_path = Path(outputs["status"]); launch_status = None; deadline = time.monotonic() + _INITIAL_STATUS_TIMEOUT_SECONDS
+            snapshot = process_snapshot(); observed = snapshot.by_pid.get(proc.pid); after_identity = exact_process_identity(proc.pid)
+            if identity is None or after_identity != identity or proc.poll() is not None or not snapshot.complete or _snapshot_process(observed) is None: raise AdmissionError("cannot prove controller launcher OS identity")
+            status_identity: dict[str, Any] | None = None; status_path = Path(outputs["status"]); launch_status = None; deadline = time.monotonic() + _INITIAL_STATUS_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 try: value = json.loads(status_path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, json.JSONDecodeError): value = None
-                if isinstance(value, dict) and value.get("schema") == "orchestrator-lane-controller/v1" and value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES and proc.poll() is None and exact_process_identity(proc.pid) == identity:
-                    launch_status = value; break
+                if (isinstance(value, dict) and value.get("schema") == "orchestrator-lane-controller/v1"
+                        and value.get("state") in _INITIAL_CONTROLLER_STATES and proc.poll() is None):
+                    candidate_pid = value.get("controller_pid")
+                    if isinstance(candidate_pid, int) and candidate_pid > 0:
+                        candidate_identity = exact_process_identity(candidate_pid)
+                        if candidate_identity is not None:
+                            controller_identity = candidate_identity
+                    candidate = _initial_controller_relationship(process_snapshot(), identity, proc.pid, value, invocation_path)
+                    if candidate is not None:
+                        relationship = candidate; controller_identity = candidate["controller_identity"]
+                        status_identity = candidate["controller_status_identity"]; launch_status = value; break
                 if proc.poll() is not None: break
                 time.sleep(.05)
             if launch_status is None: raise AdmissionError("controller did not publish an authentic initial status")
-            if proc.poll() is not None or exact_process_identity(proc.pid) != identity: raise AdmissionError("controller did not remain authentically live for STARTED registration")
+            if proc.poll() is not None or exact_process_identity(proc.pid) != identity or controller_identity is None or exact_process_identity(controller_identity["pid"]) != controller_identity: raise AdmissionError("controller did not remain authentically live for STARTED registration")
+            relationship_path = _safe_child(self.root,"assignments",aid + ".CONTROLLER_RELATIONSHIP.json")
+            relationship["assignment_id"] = aid; relationship["initial_status"] = {"path":str(status_path),"sha256":_sha(status_path),"state":launch_status["state"],"controller_identity":status_identity}
+            _write_new(relationship_path, relationship)
             out_handle.close(); err_handle.close(); out_handle = err_handle = None
-            record = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":status_identity}
+            record = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"controller_identity":controller_identity,"status_identity":status_identity,"relationship":{"path":str(relationship_path),"sha256":_sha(relationship_path)}}
             started_publication = True
-            _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":status_identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":record["token_hash"],"limitation":p.get("limitation")})
+            _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"launcher_identity":identity,"controller_identity":controller_identity,"controller_status_identity":status_identity,"controller_relationship":record["relationship"],"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":record["token_hash"],"limitation":p.get("limitation")})
             self.workers[aid] = proc; self.assignments[aid] = record; started = True
         except Exception as exc:
-            cleanup = self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, (inbox, response_root), (out_handle, err_handle), str(exc))
-            if cleanup.get("process_identity_unresolved") and proc is not None and proc.poll() is None:
-                self._require_recovery(aid, proc, identity, worktree, branch, (inbox, response_root), cleanup)
+            cleanup = self._reject_unregistered_assignment(aid, proc, identity, controller_identity, worktree, branch, target, (inbox, response_root), (out_handle, err_handle), str(exc))
+            if cleanup["outcome"] != "REAPED" and proc is not None:
+                self._require_recovery(aid, proc, identity, controller_identity, worktree, branch, (inbox, response_root), cleanup)
             if started_publication and cleanup["outcome"] == "REAPED":
                 cleanup_path = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
-                _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"controller_identity":identity,"rejected":True,"reaped":True,"prestart_cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
+                _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"launcher_identity":identity,"controller_identity":controller_identity,"rejected":True,"reaped":True,"prestart_cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
             raise AdmissionError(str(exc) if cleanup["outcome"] == "REAPED" else "pre-registration cleanup requires recovery: " + str(exc)) from exc
         if proc is None or not started: raise AdmissionError("controller launch failed")
         answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
@@ -550,7 +618,7 @@ class C3Harness:
             exit_code = process.poll()
             if exit_code is None: continue
             process.wait(); del self.workers[aid]; record = self.assignments[aid]; inv = record["invocation"]
-            completion: dict[str, Any] = {"schema":"firmware-c3-worker-completion/v1","assignment_id":aid,"exit_code":exit_code,"controller_identity":record["identity"],"outcome":"FAIL"}
+            completion: dict[str, Any] = {"schema":"firmware-c3-worker-completion/v1","assignment_id":aid,"launcher_exit_code":exit_code,"launcher_identity":record["identity"],"controller_identity":record["controller_identity"],"outcome":"FAIL"}
             try:
                 _protected_seed_snapshot(record["worktree"], record["seed"])
                 status_path, result_path = Path(inv["output_paths"]["status"]), record["worktree"] / ".agent-workspace" / "RESULT.json"
@@ -566,7 +634,7 @@ class C3Harness:
             except (OSError, ValueError, subprocess.SubprocessError, AdmissionError) as exc: completion["reason"] = str(exc)
             completion_path = _safe_child(self.root,"assignments",aid + ".WORKER_COMPLETION.json"); _write_new(completion_path,completion)
             record["completion"] = {"path":str(completion_path),"sha256":_sha(completion_path),"outcome":completion["outcome"]}
-            _atomic_append(self.registry_path,{"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"controller_identity":record["identity"],"exit_code":exit_code,"reaped":True,"completion":record["completion"]})
+            _atomic_append(self.registry_path,{"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"launcher_identity":record["identity"],"controller_identity":record["controller_identity"],"launcher_exit_code":exit_code,"reaped":True,"completion":record["completion"]})
 
     def reap_operations(self) -> None:
         for sid, future in list(self.operations.items()):
