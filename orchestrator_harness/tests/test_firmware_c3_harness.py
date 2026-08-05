@@ -56,7 +56,7 @@ class C3HarnessTests(unittest.TestCase):
             root = Path(temporary); harness = self._bare(root)
             expected_names = {"TARGET_SEED_MANIFEST.json", "TARGET_CHARTER.md", "PINNED_INPUTS.json", "TEST_CONTRACT.json", "EVIDENCE_SCHEMA.json"}
             self.assertEqual(expected_names, set(harness.seed_identity)); self.assertTrue(all(isinstance(value, str) and len(value) == 64 for value in harness.seed_identity.values()))
-            with patch.object(c3, "exact_process_identity", return_value={"pid":1,"creation_identity":"created"}):
+            with patch.object(c3, "exact_process_identity", return_value={"pid":1,"created_utc":"created"}):
                 harness.write_readiness()
             readiness = json.loads((harness.state_root / "C3_HARNESS_READY.json").read_text(encoding="utf-8"))
             self.assertEqual(c3._seed_digest(harness.seed_identity), readiness["bindings"]["seed"])
@@ -149,7 +149,7 @@ class C3HarnessTests(unittest.TestCase):
                 delayed_sleeps.append(publish_delayed)
                 launches.append((command, cwd)); return process
             try:
-                identity = {"pid":4242,"creation_identity":"created"}
+                identity = {"pid":4242,"created_utc":"created"}
                 observations = Mock(side_effect=[identity, identity, identity, identity])
                 delayed_sleeps: list[object] = []
                 controller_subprocess = SimpleNamespace(Popen=launch, run=subprocess.run, TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError)
@@ -277,17 +277,21 @@ class C3HarnessTests(unittest.TestCase):
             root = Path(temporary); harness = self._bare(root); process = _Process(); process.code = None
             identity, observed = {"pid":4242,"created_utc":"old"}, {"pid":4242,"created_utc":"new"}
             channels = (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1")
+            target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
+            worktree, branch = root / "assignment-worktrees" / "a1", "c3/target/a1"
+            subprocess.run(["git","worktree","add","-b",branch,str(worktree),"HEAD"],cwd=target,check=True,capture_output=True,text=True)
+            for channel in channels: channel.mkdir(parents=True)
             with patch.object(c3, "exact_process_identity", return_value=observed):
-                with self.assertRaises(c3.RecoveryRequired): harness._require_recovery("a1", process, identity, root / "assignment-worktrees" / "a1", "c3/target/a1", channels, {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"identity changed","controller_identity":identity,"handles_closed":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED","process_identity_unresolved":True})
+                with self.assertRaises(c3.RecoveryRequired): harness._require_recovery("a1", process, identity, worktree, branch, channels, {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"identity changed","controller_identity":identity,"handles_closed":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED","process_identity_unresolved":True})
             self.assertTrue(harness.admission_closed); self.assertIs(harness.recovery["process"], process)
             request_path = root / "ignored.json"; request_path.write_text("{}", encoding="utf-8"); request = {"request_id":"r1", "kind":"assignment", "payload":{}}
             with patch.object(harness, "_load", return_value=request), patch.object(harness, "_dispatch", side_effect=c3.RecoveryRequired("required")):
                 self.assertEqual("RECOVERY_REQUIRED", harness.handle(request_path)["outcome"])
             process.code = 0
-            cleanup = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"exact child absence observed during recovery","controller_identity":identity,"handles_closed":True,"process_reaped":True,"worktree_removed":True,"branch_removed":True,"channels_removed":True,"outcome":"REAPED"}; cleanup_path = root / "assignments" / "a1.PRESTART_RECOVERY_RECONCILED.json"; cleanup_path.parent.mkdir(parents=True)
-            cleanup_path.write_text(json.dumps(cleanup), encoding="utf-8")
-            with patch.object(harness, "_reject_unregistered_assignment", return_value=cleanup): harness.reap_recovery()
-            self.assertIsNone(harness.recovery); self.assertTrue((harness.state_root / "RECOVERY_RECONCILED.json").is_file())
+            harness.reap_recovery(); cleanup_path = root / "assignments" / "a1.PRESTART_RECOVERY_RECONCILED.json"; cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+            self.assertEqual({"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"},set(cleanup)); self.assertEqual("REAPED",cleanup["outcome"]); self.assertTrue(all(cleanup[key] for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed")))
+            self.assertFalse(worktree.exists()); self.assertFalse(any(channel.exists() for channel in channels)); self.assertNotEqual(0,subprocess.run(["git","show-ref","--verify","--quiet","refs/heads/" + branch],cwd=target).returncode)
+            reconciled = json.loads((harness.state_root / "RECOVERY_RECONCILED.json").read_text(encoding="utf-8")); self.assertEqual({"path":str(cleanup_path),"sha256":_digest(cleanup_path)},reconciled["cleanup"]); self.assertIsNone(harness.recovery)
 
     def test_s25_a1_recovery_restart_rejects_closed_evidence_mutation_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -342,7 +346,7 @@ class C3HarnessTests(unittest.TestCase):
                     status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"])
                     if name != "timeout" and name != "quick-exit": status.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
                     return process
-                identity = {"pid":4242,"creation_identity":"exact"}
+                identity = {"pid":4242,"created_utc":"exact"}
                 def exact(_: int) -> dict[str, object] | None: return identity if process.poll() is None else None
                 payload = {"assignment_id":"a-" + name,"role":"F.C3.A1","sprint":"S25","task":"status","prompt":"x","target_id":"target","declared_resources":[]}
                 # The synthetic clock consumes one attempted read, then expires; sleep is a no-op.
@@ -377,14 +381,17 @@ class C3HarnessTests(unittest.TestCase):
                         with self.assertRaises(AdmissionError): harness._assignment(payload)
                     evidence = root / "assignments" / (aid + ".PRESTART_REJECTED.json")
                     cleanup = json.loads(evidence.read_text(encoding="utf-8")); self.assertEqual("REAPED", cleanup["outcome"])
+                    self.assertEqual({"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"},set(cleanup))
                     self.assertTrue(all(cleanup[key] for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed")))
                     self.assertFalse(worktree.exists()); self.assertFalse(any(path.exists() for path in channels)); self.assertNotIn(aid, harness.workers)
                     self.assertNotEqual(0, real_run(["git","show-ref","--verify","--quiet","refs/heads/" + branch], cwd=target).returncode); self.assertFalse(harness.registry_path.exists())
+                    invocation = root / "assignments" / (aid + ".invocation.json")
+                    if failure in {"open","popen"}: self.assertTrue(invocation.is_file()); self.assertEqual(64,len(_digest(invocation)))
 
     def test_s25_a1_started_publication_ambiguity_gets_bound_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); aid = "a1"; target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
-            process = _Process(); identity = {"pid":4242,"creation_identity":"exact"}; created = datetime(2026,8,4,tzinfo=timezone.utc); snapshot = ProcessSnapshot(True,(ProcessInfo(4242,1,"python","lane",created),),(),"synthetic")
+            process = _Process(); identity = {"pid":4242,"created_utc":"exact"}; created = datetime(2026,8,4,tzinfo=timezone.utc); snapshot = ProcessSnapshot(True,(ProcessInfo(4242,1,"python","lane",created),),(),"synthetic")
             def launch(command: list[str], **_: object) -> _Process:
                 status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"]); status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","state":"RUNNING_CODEX","controller_pid":4242,"controller_created_utc":iso_utc(created)}), encoding="utf-8"); return process
             def exact(_: int) -> dict[str, object] | None: return identity if process.poll() is None else None
@@ -411,12 +418,13 @@ class C3HarnessTests(unittest.TestCase):
             def request(request_id: str, kind: str, payload: dict[str, object]) -> None:
                 value = {"schema":"firmware-c3-harness-request/v1","request_id":request_id,"attempt_id":"attempt-1","c1_reference":{"path":str(c1),"sha256":_digest(c1)},"delegated_reference":{"path":str(delegated),"sha256":_digest(delegated),},"orchestrator_identity":harness.topology["identity_binding"],"topology_key_release":harness.topology["release"],"kind":kind,"issued_utc":"2026-08-05T00:00:00+00:00","issued_monotonic":0.0,"expires_monotonic":100.0,"payload":payload,"public_key":"key","signature":"signed"}
                 (harness.request_root / (request_id + ".json")).write_text(json.dumps(value),encoding="utf-8")
-            request("a-nonshutdown","assignment",{}); request("b-shutdown","shutdown",{})
+            request("a-nonshutdown","materialize",{"target_id":"target"}); request("b-shutdown","shutdown",{})
             harness.last_heartbeat = 0.0
-            with patch.object(c3,"C3Harness",return_value=harness), patch.object(c3.time,"monotonic",return_value=1.0), patch.object(c3.time,"sleep"):
+            with patch.object(c3,"C3Harness",return_value=harness), patch.object(c3.time,"monotonic",return_value=31.0), patch.object(c3.time,"sleep"):
                 self.assertEqual(0,c3.main(["--root",str(root),"--seed",str(harness.seed),"--policy",str(harness.policy),"--templates",str(harness.templates),"--topology-root",str(root),"--c1-path",str(c1),"--c1-sha256",_digest(c1),"--delegated-path",str(delegated),"--delegated-sha256",_digest(delegated),"--manifest",str(harness.manifest),"serve","--poll-seconds","0"]))
-            statuses = [json.loads(line)["state"] for line in harness.status_path.read_text().splitlines()]; self.assertIn("RECOVERY_RECONCILED_CLOSED",statuses); self.assertIn("SHUTDOWN",statuses); self.assertNotIn("READY",statuses)
-            self.assertEqual("REJECTED",json.loads((harness.response_root / "a-nonshutdown.json").read_text())["outcome"]); self.assertEqual("ACCEPTED",json.loads((harness.response_root / "b-shutdown.json").read_text())["outcome"])
+            statuses = [json.loads(line)["state"] for line in harness.status_path.read_text().splitlines()]; self.assertGreaterEqual(statuses.count("RECOVERY_RECONCILED_CLOSED"),2); self.assertIn("SHUTDOWN",statuses); self.assertNotIn("READY",statuses)
+            rejected = json.loads((harness.response_root / "a-nonshutdown.json").read_text()); self.assertEqual("REJECTED",rejected["outcome"]); self.assertIn("admission is closed",rejected["reason"]); self.assertFalse((root / "target").exists())
+            self.assertEqual("ACCEPTED",json.loads((harness.response_root / "b-shutdown.json").read_text())["outcome"])
 
 
 def _digest_token(value: str) -> str:
