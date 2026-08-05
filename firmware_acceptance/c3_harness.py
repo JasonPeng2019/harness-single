@@ -187,14 +187,26 @@ class C3Harness:
         if recovery.is_file():
             if not reconciled.is_file(): raise AdmissionError("prior C3 process requires exact controller recovery")
             try:
-                value = json.loads(reconciled.read_text(encoding="utf-8"))
+                reject_linked_path(recovery); reject_linked_path(reconciled)
+                if recovery.is_symlink() or reconciled.is_symlink(): raise AdmissionError("prior C3 recovery evidence is linked")
+                recovery_value = json.loads(recovery.read_text(encoding="utf-8")); value = json.loads(reconciled.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise AdmissionError("prior C3 recovery reconciliation is unreadable") from exc
+            aid = recovery_value.get("assignment_id") if isinstance(recovery_value,dict) else None
+            if not isinstance(aid,str) or _id(aid,"recovery assignment") != aid: raise AdmissionError("prior C3 recovery assignment is invalid")
+            cleanup_path = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
             expected = {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":str(recovery),"sha256":_sha(recovery)}}
-            if (not isinstance(value,dict) or value.get("schema") != expected["schema"]
-                    or value.get("recovery") != expected["recovery"]
-                    or not isinstance(value.get("cleanup"),dict) or value["cleanup"].get("outcome") != "REAPED"):
+            if not isinstance(value,dict) or set(value) != {"schema","recovery","cleanup"} or value.get("schema") != expected["schema"] or value.get("recovery") != expected["recovery"]:
                 raise AdmissionError("prior C3 recovery reconciliation is malformed or mismatched")
+            cleanup_ref = value["cleanup"]
+            if not isinstance(cleanup_ref,dict) or set(cleanup_ref) != {"path","sha256"} or cleanup_ref.get("path") != str(cleanup_path) or not isinstance(cleanup_ref.get("sha256"),str) or len(cleanup_ref["sha256"]) != 64: raise AdmissionError("prior C3 recovery cleanup reference is invalid")
+            reject_linked_path(cleanup_path)
+            if cleanup_path.is_symlink() or not cleanup_path.is_file() or _sha(cleanup_path) != cleanup_ref["sha256"]: raise AdmissionError("prior C3 recovery cleanup drifted")
+            try: cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+            except (OSError,json.JSONDecodeError) as exc: raise AdmissionError("prior C3 recovery cleanup is unreadable") from exc
+            keys = {"schema","assignment_id","reason","controller_identity","handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}
+            if not isinstance(cleanup,dict) or set(cleanup) != keys or cleanup.get("schema") != "firmware-c3-prestart-rejection/v1" or cleanup.get("assignment_id") != aid or cleanup.get("outcome") != "REAPED" or not all(cleanup.get(key) is True for key in ("handles_closed","process_reaped","worktree_removed","branch_removed","channels_removed")):
+                raise AdmissionError("prior C3 recovery cleanup is incomplete")
             self.admission_closed = True; self.recovery_closed = True
         if self.registry_path.exists():
             lines = self.registry_path.read_text(encoding="utf-8").splitlines()
@@ -347,7 +359,8 @@ class C3Harness:
         if self.recovery is None or self.recovery["process"].poll() is None: return
         cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["controller_identity"], Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery")
         if cleanup["outcome"] != "REAPED": return
-        _write_new(_safe_child(self.state_root,"RECOVERY_RECONCILED.json"), {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":self.recovery["path"],"sha256":self.recovery["sha256"]},"cleanup":cleanup})
+        cleanup_path = _safe_child(self.root,"assignments",self.recovery["assignment_id"] + ".PRESTART_RECOVERY_RECONCILED.json")
+        _write_new(_safe_child(self.state_root,"RECOVERY_RECONCILED.json"), {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":self.recovery["path"],"sha256":self.recovery["sha256"]},"cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
         self.recovery = None
 
     def _require_recovery(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, worktree: Path, branch: str, channels: tuple[Path, ...], cleanup: dict[str, Any]) -> None:
