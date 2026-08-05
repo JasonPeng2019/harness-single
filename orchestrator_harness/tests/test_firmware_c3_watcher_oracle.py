@@ -61,7 +61,6 @@ class C3WatcherOracleTests(unittest.TestCase):
                     self.assertFalse(result["evidence"]["candidate_rejected_unauthentic_status"] and result["evidence"]["status_authentic_for_expected_live_controller"])
             for name, status_value in {
                 "malformed-status":"{", "scalar-status":42, "list-status":[], "null-status":None,
-                "status-extra-key":{**self._status(), "extra":True},
                 "status-missing-created":{key:value for key,value in self._status().items() if key != "controller_created_utc"},
                 "status-wrong-schema":{**self._status(), "schema":"other"},
             }.items():

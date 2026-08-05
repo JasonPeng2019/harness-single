@@ -325,6 +325,69 @@ class C3HarnessTests(unittest.TestCase):
             broker = AcceptanceBroker(root / "generic", Path("firmware_acceptance/seed"), Path("firmware_acceptance/MCP_METHOD_POLICY.json"), Path("firmware_acceptance/LANE_TEMPLATES.json"))
             self.assertEqual(str(root / "generic" / "lanes" / lane / ".firm"), broker.controller_config(lane, {})["roots"]["firm"])
 
+    def test_s25_a1_initial_status_rejects_malformed_wrong_identity_exit_and_timeout(self) -> None:
+        """Real assignment admission never registers STARTED without one exact live status."""
+        cases: dict[str, object] = {"malformed":"{", "scalar":1, "list":[], "null":None,
+                                    "wrong-pid":{"state":"WAITING_RESOURCE","controller_pid":1,"controller_created_utc":"2026-08-04T00:00:00Z"},
+                                    "wrong-created":{"state":"WAITING_RESOURCE","controller_pid":4242,"controller_created_utc":"other"},
+                                    "wrong-state":{"state":"CODEX_EXITED","controller_pid":4242,"controller_created_utc":"2026-08-04T00:00:00Z"},
+                                    "timeout":None, "quick-exit":None}
+        for name, value in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); harness = self._bare(root); target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
+                process = _Process(9 if name == "quick-exit" else None); created = datetime(2026, 8, 4, tzinfo=timezone.utc); snapshot = ProcessSnapshot(True, (ProcessInfo(4242, 1, "python", "lane", created),), (), "synthetic")
+                def launch(command: list[str], **_: object) -> _Process:
+                    status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"])
+                    if name != "timeout" and name != "quick-exit": status.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+                    return process
+                identity = {"pid":4242,"creation_identity":"exact"}
+                def exact(_: int) -> dict[str, object] | None: return identity if process.poll() is None else None
+                payload = {"assignment_id":"a-" + name,"role":"F.C3.A1","sprint":"S25","task":"status","prompt":"x","target_id":"target","declared_resources":[]}
+                # The synthetic clock consumes one attempted read, then expires; sleep is a no-op.
+                with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", side_effect=exact), patch.object(c3.time, "monotonic", side_effect=[0.0, 0.0, 91.0]), patch.object(c3.time, "sleep"):
+                    with self.assertRaises(AdmissionError): harness._assignment(payload)
+                self.assertNotIn(payload["assignment_id"], harness.workers); self.assertFalse(harness.registry_path.exists())
+                cleanup = json.loads((root / "assignments" / (payload["assignment_id"] + ".PRESTART_REJECTED.json")).read_text(encoding="utf-8"))
+                self.assertEqual("REAPED", cleanup["outcome"]); self.assertTrue(cleanup["process_reaped"]); self.assertTrue(process.terminated or name == "quick-exit")
+
+    def test_s25_a1_prestart_branch_only_and_setup_launch_failures_cleanup_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
+            for name, failure in {"branch-only": "worktree", "setup": "seed", "handle": "open", "popen": "popen"}.items():
+                with self.subTest(name=name):
+                    aid, branch, worktree = "a-" + name, "c3/target/a-" + name, root / "assignment-worktrees" / ("a-" + name)
+                    channels = (root / "worker-channel" / aid, root / "worker-channel-responses" / aid)
+                    if failure == "worktree":
+                        with patch.object(c3.subprocess, "run", side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]), patch.object(harness, "_reject_unregistered_assignment", wraps=harness._reject_unregistered_assignment) as cleanup:
+                            with self.assertRaises(AdmissionError): harness._assignment({"assignment_id":aid,"role":"F.C3.A1","sprint":"S25","task":"x","prompt":"x","target_id":"target","declared_resources":[]})
+                        cleanup.assert_not_called(); continue
+                    # Direct transactional cleanup covers failures after ownership was created without inventing a second Git owner.
+                    worktree.mkdir(parents=True); [path.mkdir(parents=True) for path in channels]
+                    handle = Mock(); process = _Process(None); identity = {"pid":4242,"creation_identity":"exact"}
+                    with patch.object(c3, "exact_process_identity", side_effect=[identity, None]), patch.object(c3.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+                        cleanup = harness._reject_unregistered_assignment(aid, process if failure == "popen" else None, identity if failure == "popen" else None, worktree, branch, target, channels, (handle if failure == "handle" else None,), failure)
+                    self.assertTrue(cleanup["handles_closed"]); self.assertTrue(cleanup["process_reaped"]); self.assertIn(cleanup["outcome"], {"REAPED","RECOVERY_REQUIRED"})
+
+    def test_s25_a1_started_publication_ambiguity_gets_bound_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); aid = "a1"; identity = {"pid":4242,"creation_identity":"exact"}; cleanup_path = root / "assignments" / (aid + ".PRESTART_REJECTED.json"); cleanup_path.parent.mkdir()
+            cleanup = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":aid,"reason":"fsync ambiguous","controller_identity":identity,"handles_closed":True,"process_reaped":True,"worktree_removed":True,"branch_removed":True,"channels_removed":True,"outcome":"REAPED"}; cleanup_path.write_text(json.dumps(cleanup), encoding="utf-8")
+            c3._atomic_append(harness.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity})
+            c3._atomic_append(harness.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"controller_identity":identity,"rejected":True,"reaped":True,"prestart_cleanup":{"path":str(cleanup_path),"sha256":_digest(cleanup_path)}})
+            harness._recover_or_fail_closed(); lines = [json.loads(line) for line in harness.registry_path.read_text().splitlines()]
+            self.assertEqual(["STARTED","TERMINAL"], [line["state"] for line in lines]); self.assertEqual(cleanup_path, Path(lines[-1]["prestart_cleanup"]["path"]))
+
+    def test_s25_a1_reconciled_restart_emits_closed_status_and_allows_signed_shutdown_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); aid = "a1"; old, new = {"pid":4242,"created_utc":"old"}, {"pid":4242,"created_utc":"new"}
+            required = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":aid,"reason":"identity unresolved","controller_identity":old,"handles_closed":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED","process_identity_unresolved":True}; recovery = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"pid":4242,"controller_identity":old,"observed_identity":new,"worktree":str(root / "assignment-worktrees" / aid),"branch":"c3/target/a1","channels":[str(root / "worker-channel" / aid),str(root / "worker-channel-responses" / aid)],"cleanup":required}
+            recovery_path = harness.state_root / "RECOVERY_REQUIRED.json"; recovery_path.write_text(json.dumps(recovery), encoding="utf-8"); cleanup_path = root / "assignments" / "a1.PRESTART_RECOVERY_RECONCILED.json"; cleanup_path.parent.mkdir(); reaped = {key:value for key,value in required.items() if key != "process_identity_unresolved"} | {"process_reaped":True,"worktree_removed":True,"branch_removed":True,"channels_removed":True,"outcome":"REAPED"}; cleanup_path.write_text(json.dumps(reaped), encoding="utf-8")
+            (harness.state_root / "RECOVERY_RECONCILED.json").write_text(json.dumps({"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":str(recovery_path),"sha256":_digest(recovery_path)},"cleanup":{"path":str(cleanup_path),"sha256":_digest(cleanup_path)}}), encoding="utf-8")
+            harness._recover_or_fail_closed(); self.assertTrue(harness.admission_closed); self.assertFalse((harness.state_root / "C3_HARNESS_READY.json").exists())
+            blocked = harness.request_root / "r.json"; blocked.write_text("{}", encoding="utf-8")
+            with patch.object(harness, "_load", return_value={"request_id":"r","kind":"assignment","payload":{}}), patch.object(harness, "_dispatch") as dispatch: self.assertEqual("REJECTED", harness.handle(blocked)["outcome"])
+            dispatch.assert_not_called(); self.assertEqual("SHUTDOWN", harness._shutdown({})["state"]); self.assertIn("SHUTDOWN", harness.status_path.read_text())
+
 
 def _digest_token(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
