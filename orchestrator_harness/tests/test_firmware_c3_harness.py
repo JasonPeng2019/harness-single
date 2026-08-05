@@ -45,7 +45,7 @@ class C3HarnessTests(unittest.TestCase):
         harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, Path("firmware_acceptance/ACCEPTANCE_MANIFEST.json"))
         harness.verifier = Mock(); harness.controllers = {}; harness.workers = {}; harness.assignments = {}; harness.limitation_completed = {}
         harness.operations = {}; harness.operation_pending = {}; harness.executor = Mock(); harness.shutdown = False; harness.admission_closed = False
-        harness.topology = {"attempt_id":"attempt-1", "release":{"path":"release","sha256":"r"}, "identity_binding":{"path":"identity","sha256":"i"}}
+        harness.topology = {"attempt_id":"attempt-1", "public_key":"key", "release":{"path":"release","sha256":"r"}, "identity_binding":{"path":"identity","sha256":"i"}}
         harness.request_root = root / "manager-signals" / "c3-requests"; harness.response_root = root / "manager-signals" / "c3-responses"; harness.admission_root = root / "manager-signals" / "c3-admissions"; harness.state_root = root / "c3-harness"
         for path in (harness.request_root, harness.response_root, harness.admission_root, harness.state_root): path.mkdir(parents=True, exist_ok=True)
         harness.status_path = harness.state_root / "STATUS.jsonl"; harness.registry_path = harness.state_root / "REGISTRY.jsonl"
