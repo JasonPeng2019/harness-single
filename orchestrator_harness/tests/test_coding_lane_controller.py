@@ -193,8 +193,10 @@ class CodingLaneControllerTests(unittest.TestCase):
             published.append(dict(value)); original_atomic_json(path, value)
 
         def launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
-            self.assertFalse(status_path.exists())
-            self.assertTrue(any(lock_root.iterdir()))
+            command = args[0] if args else None
+            if isinstance(command, list) and command[:2] == [sys.executable, str(self.fake)]:
+                self.assertFalse(status_path.exists())
+                self.assertTrue(any(lock_root.iterdir()))
             return original_popen(*args, **kwargs)
 
         with patch.object(controller, "_atomic_json", side_effect=record), patch.object(controller.subprocess, "Popen", side_effect=launch):
@@ -202,7 +204,13 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual("RUNNING_CODEX", published[0]["state"])
 
         path, _ = self.invocation(worker_id="worker-popen-failure")
-        with patch.object(controller.subprocess, "Popen", side_effect=OSError("synthetic Popen failure")):
+        def fail_codex_launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            command = args[0] if args else None
+            if isinstance(command, list) and command[:2] == [sys.executable, str(self.fake)]:
+                raise OSError("synthetic Popen failure")
+            return original_popen(*args, **kwargs)
+
+        with patch.object(controller.subprocess, "Popen", side_effect=fail_codex_launch):
             self.assertEqual(1, controller.main([str(path)]))
         status = json.loads(status_path.read_text(encoding="utf-8"))
         self.assertEqual("LAUNCH_FAILED", status["state"])

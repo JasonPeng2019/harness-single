@@ -384,7 +384,10 @@ class C3HarnessTests(unittest.TestCase):
             process = _Process(); launcher = {"pid":4242,"created_utc":"launcher"}; controller_identity = {"pid":4343,"created_utc":"controller"}
             launcher_created, controller_created = datetime(2026, 8, 4, tzinfo=timezone.utc), datetime(2026, 8, 4, 0, 0, 1, tzinfo=timezone.utc)
             snapshot = ProcessSnapshot(True, (ProcessInfo(4242, 1, "python", "launcher", launcher_created), ProcessInfo(4343, 4242, "python", "controller", controller_created)), (), "synthetic")
-            def launch(command: list[str], **_: object) -> _Process:
+            real_popen = subprocess.Popen
+            def launch(command: object, *args: object, **kwargs: object) -> _Process | subprocess.Popen[bytes]:
+                if not (isinstance(command, list) and command[:3] == [sys.executable, "-m", "orchestrator_harness.lane_controller"]):
+                    return real_popen(command, *args, **kwargs)
                 status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"])
                 status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","state":"CODEX_EXITED","controller_pid":4343,"controller_created_utc":iso_utc(controller_created)}), encoding="utf-8")
                 return process
