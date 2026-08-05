@@ -414,14 +414,25 @@ class C3HarnessTests(unittest.TestCase):
             (harness.state_root / "RECOVERY_RECONCILED.json").write_text(json.dumps({"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":str(recovery_path),"sha256":_digest(recovery_path)},"cleanup":{"path":str(cleanup_path),"sha256":_digest(cleanup_path)}}), encoding="utf-8")
             harness._recover_or_fail_closed(); self.assertTrue(harness.admission_closed); self.assertFalse((harness.state_root / "C3_HARNESS_READY.json").exists())
             c1, delegated = root / "c1.json", root / "delegated.json"; c1.write_text("{}",encoding="utf-8"); delegated.write_text("{}",encoding="utf-8")
-            harness.verifier = SimpleNamespace(verify=lambda payload, signature, key: signature == "signed" and key == "key" and payload == c3.canonical_decision_payload(json.loads(payload.decode("utf-8"))))
-            def request(request_id: str, kind: str, payload: dict[str, object]) -> None:
+            observed_payloads: list[bytes] = []
+            class RecordingVerifier:
+                def verify(self, payload: bytes, signature: str, key: str) -> bool:
+                    observed_payloads.append(payload)
+                    return signature == "signed" and key == "key" and bool(payload)
+            harness.verifier = RecordingVerifier()
+            def request(request_id: str, kind: str, payload: dict[str, object]) -> dict[str, object]:
                 value = {"schema":"firmware-c3-harness-request/v1","request_id":request_id,"attempt_id":"attempt-1","c1_reference":{"path":str(c1),"sha256":_digest(c1)},"delegated_reference":{"path":str(delegated),"sha256":_digest(delegated),},"orchestrator_identity":harness.topology["identity_binding"],"topology_key_release":harness.topology["release"],"kind":kind,"issued_utc":"2026-08-05T00:00:00+00:00","issued_monotonic":0.0,"expires_monotonic":100.0,"payload":payload,"public_key":"key","signature":"signed"}
                 (harness.request_root / (request_id + ".json")).write_text(json.dumps(value),encoding="utf-8")
-            request("a-nonshutdown","materialize",{"target_id":"target"}); request("b-shutdown","shutdown",{})
+                return value
+            materialize_request = request("a-nonshutdown","materialize",{"target_id":"target"}); shutdown_request = request("b-shutdown","shutdown",{})
             harness.last_heartbeat = 0.0
-            with patch.object(c3,"C3Harness",return_value=harness), patch.object(c3.time,"monotonic",return_value=31.0), patch.object(c3.time,"sleep"):
+            sleeps = {"count":0, "limit":3}
+            def bounded_sleep(_: float) -> None:
+                sleeps["count"] += 1
+                if sleeps["count"] > sleeps["limit"]: raise AssertionError("shutdown did not terminate bounded C3 service loop")
+            with patch.object(c3,"C3Harness",return_value=harness), patch.object(c3.time,"monotonic",return_value=31.0), patch.object(c3.time,"sleep",side_effect=bounded_sleep):
                 self.assertEqual(0,c3.main(["--root",str(root),"--seed",str(harness.seed),"--policy",str(harness.policy),"--templates",str(harness.templates),"--topology-root",str(root),"--c1-path",str(c1),"--c1-sha256",_digest(c1),"--delegated-path",str(delegated),"--delegated-sha256",_digest(delegated),"--manifest",str(harness.manifest),"serve","--poll-seconds","0"]))
+            self.assertLessEqual(sleeps["count"],sleeps["limit"]); self.assertEqual([c3.canonical_decision_payload(materialize_request),c3.canonical_decision_payload(shutdown_request)],observed_payloads)
             statuses = [json.loads(line)["state"] for line in harness.status_path.read_text().splitlines()]; self.assertGreaterEqual(statuses.count("RECOVERY_RECONCILED_CLOSED"),2); self.assertIn("SHUTDOWN",statuses); self.assertNotIn("READY",statuses)
             rejected = json.loads((harness.response_root / "a-nonshutdown.json").read_text()); self.assertEqual("REJECTED",rejected["outcome"]); self.assertIn("admission is closed",rejected["reason"]); self.assertFalse((root / "target").exists())
             self.assertEqual("ACCEPTED",json.loads((harness.response_root / "b-shutdown.json").read_text())["outcome"])
