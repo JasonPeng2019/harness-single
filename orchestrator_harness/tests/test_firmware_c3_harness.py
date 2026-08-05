@@ -410,7 +410,7 @@ class C3HarnessTests(unittest.TestCase):
                     self.assertNotEqual(0, real_run(["git","show-ref","--verify","--quiet","refs/heads/" + branch], cwd=target).returncode); self.assertFalse(harness.registry_path.exists())
                     invocation = root / "assignments" / (aid + ".invocation.json")
                     if failure in {"open","popen"}: self.assertTrue(invocation.is_file()); self.assertEqual(64,len(_digest(invocation)))
-                    if failure == "open": self.assertEqual(1,len(captured_stdout)); self.assertTrue(captured_stdout[0].closed)
+                    if failure == "open": self.assertEqual(1,len(captured_stdout)); self.assertTrue(bool(getattr(captured_stdout[0], "closed", False)))
 
     def test_s25_a1_started_publication_ambiguity_gets_bound_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
