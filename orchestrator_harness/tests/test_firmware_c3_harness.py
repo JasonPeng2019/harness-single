@@ -389,9 +389,12 @@ class C3HarnessTests(unittest.TestCase):
                         return real_run(command, **kwargs)
                     protected = AdmissionError("synthetic setup failure") if failure == "seed" else c3._protected_seed_snapshot
                     original_open = Path.open
+                    captured_stdout: list[object] = []
                     def open_fault(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
                         if failure == "open" and path.name == aid + ".controller.stderr.log" and mode == "xb": raise OSError("synthetic second-handle failure")
-                        return original_open(path, mode, *args, **kwargs)
+                        handle = original_open(path, mode, *args, **kwargs)
+                        if failure == "open" and path.name == aid + ".controller.stdout.log" and mode == "xb": captured_stdout.append(handle)
+                        return handle
                     real_popen = subprocess.Popen
                     def controller_popen(command: list[str], *args: object, **kwargs: object) -> object:
                         if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return real_popen(command, *args, **kwargs)
@@ -407,6 +410,7 @@ class C3HarnessTests(unittest.TestCase):
                     self.assertNotEqual(0, real_run(["git","show-ref","--verify","--quiet","refs/heads/" + branch], cwd=target).returncode); self.assertFalse(harness.registry_path.exists())
                     invocation = root / "assignments" / (aid + ".invocation.json")
                     if failure in {"open","popen"}: self.assertTrue(invocation.is_file()); self.assertEqual(64,len(_digest(invocation)))
+                    if failure == "open": self.assertEqual(1,len(captured_stdout)); self.assertTrue(captured_stdout[0].closed)
 
     def test_s25_a1_started_publication_ambiguity_gets_bound_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
