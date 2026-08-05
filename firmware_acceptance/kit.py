@@ -324,13 +324,19 @@ def _write_new(path: Path, value: dict[str, Any]) -> str:
 class AcceptanceBroker:
     """Controller-side materializer and immutable evidence chain; it never dispatches MCP itself."""
 
-    def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path, manifest_path: Path | None = None) -> None:
+    def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path, manifest_path: Path | None = None, *, target_root: Path | None = None) -> None:
         for item in (root, seed, policy_path, templates_path, manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json")): reject_linked_path(item)
         self.root, self.seed, self.policy_path = root.resolve(), seed.resolve(), policy_path.resolve()
         self.templates = json.loads(templates_path.read_text(encoding="utf-8"))
         self.policy = _load_policy(self.policy_path)
         self.manifest = validate_manifest(manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json"))
         self.root.mkdir(parents=True, exist_ok=True)
+        self.target_parent = _safe_child(self.root, "targets")
+        if target_root is not None:
+            reject_linked_path(target_root)
+        self.target_root = target_root.resolve() if target_root is not None else None
+        if self.target_root is not None and self.target_root != self.root and self.root not in self.target_root.parents:
+            raise AdmissionError("target root escapes broker root")
         self._target_identities: dict[Path, dict[str, str]] = {}
         if self.root.is_symlink():
             raise AdmissionError("broker root cannot be a symlink")
@@ -339,10 +345,11 @@ class AcceptanceBroker:
     def materialize_seed(self, target_root: Path) -> None:
         reject_linked_path(target_root)
         target = target_root.resolve()
-        target_parent = _safe_child(self.root, "targets")
-        if target.parent != target_parent or target.exists() or target.is_symlink():
-            raise AdmissionError("target root must be a fresh direct child of the confined targets root")
-        target_parent.mkdir(parents=True, exist_ok=True)
+        if ((self.target_root is not None and target != self.target_root)
+                or (self.target_root is None and target.parent != self.target_parent)
+                or target.exists() or target.is_symlink()):
+            raise AdmissionError("target root is not the configured fresh confined target")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.mkdir()
         for name in _SEED_FILES:
             destination = _safe_child(target, name)
@@ -367,7 +374,9 @@ class AcceptanceBroker:
     def validate_target(self, target_root: Path) -> str:
         reject_linked_path(target_root)
         target = target_root.resolve()
-        if target.parent != _safe_child(self.root, "targets") or target.is_symlink():
+        if ((self.target_root is not None and target != self.target_root)
+                or (self.target_root is None and target.parent != self.target_parent)
+                or target.is_symlink()):
             raise AdmissionError("target escaped confined root")
         validate_seed_manifest(target)
         for name in _SEED_FILES:

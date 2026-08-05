@@ -370,7 +370,7 @@ class FirmwareAcceptanceController:
             server_run_id = _server_run_id(guidance)
             open_value = {"schema":"firmware-session-open/v1","session_id":request["session_id"],"session_request_path":str(request_record_path),"session_request_sha256":request_sha,"claim":claim,"controller_identity":claim["owner"],"server_process_identity":identity,"server_run_id":server_run_id,"bootstrap_transcript":transcript,"bootstrap_transcript_sha256":canonical_sha256(transcript),"state":"BOOTSTRAPPED"}
             open_sha = _write_new(_safe_child(session_root, "SESSION_OPEN.json"), open_value)
-            self._session = {"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"pending_proposal":None,"call_ids":set(),"route":None,"connection_assignments":None,"continuation":None,"requires_uart":None}
+            self._session = {"root":session_root,"request":request,"request_path":request_record_path,"request_sha256":request_sha,"claim":claim,"claims":claims,"process":process,"transport":transport,"config":config,"open":open_value,"open_path":_safe_child(session_root,"SESSION_OPEN.json"),"open_sha256":open_sha,"state":"BOOTSTRAPPED","sequence":0,"prior_result":None,"terminal":False,"rpc_id":2,"active_plan":None,"pending_call_id":None,"pending_proposal":None,"call_ids":set(),"route":None,"connection_assignments":None,"continuation":None,"requires_uart":None}
             return {**open_value,"path":str(self._session["open_path"]),"raw_sha256":open_sha}
         except BaseException:
             if transport is not None: transport.close_and_join()
@@ -414,7 +414,7 @@ class FirmwareAcceptanceController:
         _verify_live_call_inputs(call, self.broker); self.broker.validate_lane_call(call)
         proposal = {"schema":"firmware-session-call-proposal/v1","session_id":request["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"sequence_number":request["sequence_number"],"prior_result":request["prior_result"],"current_state":request["current_state"],"next_state":request["next_state"],"call":call,"claim":session["claim"],"plan_label":"candidate_control_plan" if rule.get("candidate_control_plan") else "mcp_native_plan"}
         resolved = path.resolve()
-        if _safe_child(self.broker.root, "sessions", session["request"]["session_id"]) not in resolved.parents or resolved.is_symlink(): raise AdmissionError("session proposal path escapes session root")
+        if session["root"] not in resolved.parents or resolved.is_symlink(): raise AdmissionError("session proposal path escapes session root")
         raw_sha = _write_new(resolved, proposal)
         session["pending_call_id"] = call["call_id"]
         session["pending_proposal"] = (resolved, raw_sha)
@@ -423,6 +423,10 @@ class FirmwareAcceptanceController:
     def session_execute_artifacts(self, proposal_path: Path, decision_path: Path, authorization_path: Path, verifier: SignatureVerifier) -> dict[str, Any]:
         """Dispatch exactly one signed call over the retained transport; never relaunch it."""
         session = self._require_session()
+        reject_linked_path(proposal_path)
+        if session["root"] not in proposal_path.resolve().parents or proposal_path.resolve().is_symlink():
+            self.abort_session("proposal path escaped retained session root")
+            raise AdmissionError("session execution proposal path escapes session root")
         proposal, proposal_sha = self._read_bound(proposal_path, {"schema","session_id","session_open_path","session_open_sha256","sequence_number","prior_result","current_state","next_state","call","claim","plan_label"})
         if session["pending_proposal"] != (proposal_path.resolve(), proposal_sha) or session["pending_call_id"] != proposal["call"]["call_id"]:
             self.abort_session("proposal was not the one pending call"); raise AdmissionError("session execution proposal is not the pending proposal")
@@ -466,7 +470,7 @@ class FirmwareAcceptanceController:
             # a durable normal result can name the requested successor state.
             self._validate_route_result(session, call, payload)
             result = {"schema":"firmware-session-result/v1","session_id":session["request"]["session_id"],"session_open_path":str(session["open_path"]),"session_open_sha256":session["open_sha256"],"proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal_sha,"decision_path":str(decision_path.resolve()),"decision_sha256":decision_sha,"authorization_path":str(authorization_path.resolve()),"authorization_sha256":authorization_sha,"sequence_number":proposal["sequence_number"],"prior_result":proposal["prior_result"],"method":call["method"],"arguments":call["arguments"],"raw_result":raw,"resulting_state":proposal["next_state"]}
-            result_path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
+            result_path = _safe_child(session["root"],"results",f"{proposal['sequence_number']:04d}-{call['call_id']}.json")
             result_sha = _write_new(result_path, result)
             if "next_by_mode" in rule:
                 if all(value is None for value in call["arguments"].values()):
@@ -641,7 +645,7 @@ class FirmwareAcceptanceController:
         finally:
             stopped, transport_cleanup = transport.close_and_join(); cleanup["transport_cleanup"] = transport_cleanup; cleanup["helpers_stopped"] = stopped
             session["claims"].release_all(); session["terminal"] = True; session["state"] = terminal_state
-        path = _safe_child(self.broker.root,"sessions",session["request"]["session_id"],filename)
+        path = _safe_child(session["root"],filename)
         cleanup["claim_released"] = not bool(session["claims"].held)
         _write_new(path, cleanup)
         return {**cleanup,"path":str(path)}

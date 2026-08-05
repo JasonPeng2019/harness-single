@@ -14,6 +14,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -153,7 +154,7 @@ class C3Harness:
         if operative_policy != candidate_source_policy:
             raise AdmissionError("C1 operative and candidate source policies differ")
         if not isinstance(target_seed.get("manifest"),dict) or target_seed["manifest"].get("path") != str(self.seed / "TARGET_SEED_MANIFEST.json") or target_seed["manifest"].get("sha256") != self.seed_identity["TARGET_SEED_MANIFEST.json"]: raise AdmissionError("C1 seed binding drifted")
-        self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest)
+        self.broker = AcceptanceBroker(self.root, self.seed, self.policy, self.templates, self.manifest, target_root=_safe_child(self.root, "target"))
         self.limitation_adapter = LimitationEvidenceAdapter(self.broker)
         self.verifier = Ed25519Verifier(); self.controllers: dict[str, FirmwareAcceptanceController] = {}; self.session_lanes: dict[str, str] = {}
         self.workers: dict[str, subprocess.Popen[Any]] = {}; self.assignments: dict[str, dict[str, Any]] = {}
@@ -279,27 +280,41 @@ class C3Harness:
         if kind == "shutdown": return self._shutdown(payload)
         raise AdmissionError("unknown request kind")
 
-    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, reason: str) -> dict[str, Any]:
-        """Reap only this proven child, then remove only its unpublished Git ownership."""
-        cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "controller_identity":identity, "process_reaped":False, "worktree_removed":False, "branch_removed":False}
-        current = exact_process_identity(proc.pid)
-        if proc.poll() is None and (identity is None or (current is not None and current == identity)):
-            proc.terminate()
-            try: proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                if identity is None or exact_process_identity(proc.pid) == identity:
-                    proc.kill(); proc.wait(timeout=5)
-        if proc.poll() is None or (identity is not None and exact_process_identity(proc.pid) == identity):
-            cleanup["outcome"] = "FAILED"; _write_new(_safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json"), cleanup)
-            raise AdmissionError("exact controller child could not be reaped")
-        cleanup["process_reaped"] = True
-        removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True)
-        cleanup["worktree_removed"] = removed.returncode == 0 and not worktree.exists()
-        deleted = subprocess.run(["git", "branch", "-D", branch], cwd=target, capture_output=True, text=True)
-        cleanup["branch_removed"] = deleted.returncode == 0
-        cleanup["outcome"] = "REAPED" if cleanup["worktree_removed"] and cleanup["branch_removed"] else "FAILED"
+    def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str) -> dict[str, Any]:
+        """Close unpublished ownership transactionally; never signal an identity-unknown PID."""
+        cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "controller_identity":identity, "handles_closed":True, "process_reaped":proc is None, "worktree_removed":False, "branch_removed":False, "channels_removed":False}
+        for handle in handles:
+            if handle is not None:
+                try: handle.close()
+                except OSError: cleanup["handles_closed"] = False
+        if proc is not None:
+            exited = proc.poll()
+            current = exact_process_identity(proc.pid) if exited is None else None
+            if exited is None and identity is not None and current == identity:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if exact_process_identity(proc.pid) == identity:
+                        proc.kill(); proc.wait(timeout=5)
+            elif exited is None:
+                cleanup["process_identity_unresolved"] = True
+            try: proc.wait(timeout=0)
+            except subprocess.TimeoutExpired: pass
+            cleanup["process_reaped"] = proc.poll() is not None and (identity is None or exact_process_identity(proc.pid) != identity)
+        if cleanup["process_reaped"] and cleanup["handles_closed"]:
+            removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True)
+            cleanup["worktree_removed"] = removed.returncode == 0 and not worktree.exists()
+            exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=target, capture_output=True)
+            deleted = subprocess.run(["git", "branch", "-D", branch], cwd=target, capture_output=True, text=True) if exists.returncode == 0 else None
+            cleanup["branch_removed"] = exists.returncode != 0 or (deleted is not None and deleted.returncode == 0)
+            if cleanup["worktree_removed"] and cleanup["branch_removed"]:
+                try:
+                    for channel in channels:
+                        if channel.exists(): shutil.rmtree(channel)
+                    cleanup["channels_removed"] = all(not channel.exists() for channel in channels)
+                except OSError: pass
+        cleanup["outcome"] = "REAPED" if all(cleanup[key] for key in ("handles_closed", "process_reaped", "worktree_removed", "branch_removed", "channels_removed")) else "RECOVERY_REQUIRED"
         _write_new(_safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json"), cleanup)
-        if cleanup["outcome"] != "REAPED": raise AdmissionError("pre-registration Git cleanup failed")
         return cleanup
 
     def _assignment(self, p: dict[str, Any]) -> dict[str, Any]:
@@ -314,69 +329,50 @@ class C3Harness:
         worktree = _safe_child(self.root, "assignment-worktrees", aid); branch = "c3/" + target_id + "/" + aid
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
-        if created.returncode: raise AdmissionError("candidate worktree creation failed")
-        for name in self.seed_identity:
-            (worktree / name).chmod(stat.S_IREAD)
-        _protected_seed_snapshot(worktree, self.seed_identity)
-        model, effort, tier, finding = _ROLES[role]; workspace = worktree / ".agent-workspace"; workspace.mkdir(exist_ok=True)
-        inbox = _safe_child(self.root, "worker-channel", aid); inbox.mkdir(parents=True, exist_ok=False)
-        response_root = _safe_child(self.root, "worker-channel-responses", aid); response_root.mkdir(parents=True, exist_ok=False)
-        token = secrets.token_urlsafe(32)
-        prompt = workspace / "C3_PROMPT.md"
-        outputs = {name:str(workspace / (aid + suffix)) for name, suffix in {"status":".status.json","jsonl":".jsonl","stderr":".stderr.log","last_message":".last-message.txt"}.items()}
-        runtime = _safe_child(self.root,"runtime"); locks = _safe_child(runtime,"coding-resource-locks"); events = _safe_child(runtime,"events"); runtime.mkdir(parents=True,exist_ok=True); locks.mkdir(parents=True,exist_ok=True); events.mkdir(parents=True,exist_ok=True)
-        common = subprocess.run(["git","rev-parse","--git-common-dir"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip()
-        common_dir = (worktree / common).resolve() if not Path(common).is_absolute() else Path(common).resolve()
-        invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(runtime), "resource_lock_root":str(locks), "run_root":str(worktree), "repository":{"common_dir":str(common_dir),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":"PENDING","output_paths":outputs,"event_log_path":str(events / "LANE_EVENTS.jsonl"),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":p["declared_resources"],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True}
-        if finding: invocation["finding_gate"] = {"role":finding,"path":str(workspace / "FINDINGS.json")}
-        invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json")
-        preparation = None
-        if limitation is not None:
-            preparation = self.limitation_adapter.prepare(limitation, aid, outputs["status"], str(worktree / ".agent-workspace" / "RESULT.json"))
-        credit = ""
-        if preparation is not None:
-            credit = "\nFinal RESULT.json checks must contain {name: firmware-limitation-credit, command: " + preparation["sha256"] + ", outcome: PASS}.\n"
-        prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + "." + credit + "\n" + p["prompt"], encoding="utf-8")
-        invocation["prompt_sha256"] = _sha(prompt)
-        _write_new(invocation_path, invocation)
-        controller_stdout, controller_stderr = workspace / (aid + ".controller.stdout.log"), workspace / (aid + ".controller.stderr.log")
-        proc: subprocess.Popen[Any] | None = None
-        out_handle = err_handle = None
+        inbox, response_root = _safe_child(self.root, "worker-channel", aid), _safe_child(self.root, "worker-channel-responses", aid)
+        if created.returncode:
+            if worktree.exists():
+                self._reject_unregistered_assignment(aid, None, None, worktree, branch, target, (inbox, response_root), (), "candidate worktree creation failed")
+            raise AdmissionError("candidate worktree creation failed")
+        proc: subprocess.Popen[Any] | None = None; identity: dict[str, Any] | None = None
+        out_handle = err_handle = None; started = False
         try:
-            out_handle, err_handle = controller_stdout.open("xb"), controller_stderr.open("xb")
-            proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle)
-            identity = exact_process_identity(proc.pid)
-            snapshot = process_snapshot()
-            observed = snapshot.by_pid.get(proc.pid)
-            after_identity = exact_process_identity(proc.pid)
-            expected_created = iso_utc(observed.created_utc) if observed is not None else None
-            if identity is None or after_identity is None or identity != after_identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None:
-                self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, "cannot prove controller child OS identity")
-                raise AdmissionError("cannot prove controller child OS identity")
-            status_identity = {"pid": proc.pid, "created_utc": expected_created}
-            status_path = Path(outputs["status"])
-            launch_status: dict[str, Any] | None = None
-            deadline = time.monotonic() + _INITIAL_STATUS_TIMEOUT_SECONDS
+            for name in self.seed_identity: (worktree / name).chmod(stat.S_IREAD)
+            _protected_seed_snapshot(worktree, self.seed_identity)
+            model, effort, tier, finding = _ROLES[role]; workspace = worktree / ".agent-workspace"; workspace.mkdir(exist_ok=True)
+            inbox.mkdir(parents=True, exist_ok=False); response_root.mkdir(parents=True, exist_ok=False)
+            token = secrets.token_urlsafe(32); prompt = workspace / "C3_PROMPT.md"
+            outputs = {name:str(workspace / (aid + suffix)) for name, suffix in {"status":".status.json","jsonl":".jsonl","stderr":".stderr.log","last_message":".last-message.txt"}.items()}
+            runtime = _safe_child(self.root,"runtime"); locks = _safe_child(runtime,"coding-resource-locks"); events = _safe_child(runtime,"events"); runtime.mkdir(parents=True,exist_ok=True); locks.mkdir(parents=True,exist_ok=True); events.mkdir(parents=True,exist_ok=True)
+            common = subprocess.run(["git","rev-parse","--git-common-dir"],cwd=worktree,capture_output=True,text=True,check=True).stdout.strip(); common_dir = (worktree / common).resolve() if not Path(common).is_absolute() else Path(common).resolve()
+            invocation: dict[str, Any] = {"schema":"orchestrator-coding-invocation/v1", "action":"start", "runtime_root":str(runtime), "resource_lock_root":str(locks), "run_root":str(worktree), "repository":{"common_dir":str(common_dir),"worktree_root":str(worktree),"branch":branch,"base_commit":base,"merge_inputs":[]}, "prompt_path":str(prompt),"prompt_sha256":"PENDING","output_paths":outputs,"event_log_path":str(events / "LANE_EVENTS.jsonl"),"lane_id":role,"worker_invocation_id":aid,"task":p["task"],"phase":"c3","exclusive_resources":p["declared_resources"],"codex":{"command":["codex"],"model":model,"reasoning_effort":effort,"service_tier":tier,"sandbox":"danger-full-access","approval_policy":"never","config_overrides":[]},"child_environment_isolation":True}
+            if finding: invocation["finding_gate"] = {"role":finding,"path":str(workspace / "FINDINGS.json")}
+            invocation_path = _safe_child(self.root, "assignments", aid + ".invocation.json"); preparation = self.limitation_adapter.prepare(limitation, aid, outputs["status"], str(worktree / ".agent-workspace" / "RESULT.json")) if limitation is not None else None
+            credit = "" if preparation is None else "\nFinal RESULT.json checks must contain {name: firmware-limitation-credit, command: " + preparation["sha256"] + ", outcome: PASS}.\n"
+            prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + "." + credit + "\n" + p["prompt"], encoding="utf-8")
+            invocation["prompt_sha256"] = _sha(prompt); _write_new(invocation_path, invocation)
+            out_handle, err_handle = (workspace / (aid + ".controller.stdout.log")).open("xb"), (workspace / (aid + ".controller.stderr.log")).open("xb")
+            proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle); identity = exact_process_identity(proc.pid)
+            snapshot = process_snapshot(); observed = snapshot.by_pid.get(proc.pid); after_identity = exact_process_identity(proc.pid); expected_created = iso_utc(observed.created_utc) if observed is not None else None
+            if identity is None or after_identity != identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None: raise AdmissionError("cannot prove controller child OS identity")
+            status_identity = {"pid":proc.pid,"created_utc":expected_created}; status_path = Path(outputs["status"]); launch_status = None; deadline = time.monotonic() + _INITIAL_STATUS_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
-                try:
-                    value = json.loads(status_path.read_text(encoding="utf-8"))
-                    if (value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES):
-                        launch_status = value; break
-                except (OSError, json.JSONDecodeError):
-                    pass
+                try: value = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError): value = None
+                if isinstance(value, dict) and value.get("controller_pid") == status_identity["pid"] and value.get("controller_created_utc") == status_identity["created_utc"] and value.get("state") in _INITIAL_CONTROLLER_STATES and proc.poll() is None and exact_process_identity(proc.pid) == identity:
+                    launch_status = value; break
                 if proc.poll() is not None: break
                 time.sleep(.05)
-            if launch_status is None:
-                reason = "controller did not publish an authentic initial status"
-                self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, reason)
-                raise AdmissionError(reason)
-        finally:
-            if out_handle is not None: out_handle.close()
-            if err_handle is not None: err_handle.close()
-        if proc is None: raise AdmissionError("controller launch failed")
-        self.workers[aid] = proc
-        self.assignments[aid] = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":status_identity}
-        _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":self.assignments[aid]["status_identity"],"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":self.assignments[aid]["token_hash"],"limitation":p.get("limitation")})
+            if launch_status is None: raise AdmissionError("controller did not publish an authentic initial status")
+            if proc.poll() is not None or exact_process_identity(proc.pid) != identity: raise AdmissionError("controller did not remain authentically live for STARTED registration")
+            out_handle.close(); err_handle.close(); out_handle = err_handle = None
+            record = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":status_identity}
+            _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":status_identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":record["token_hash"],"limitation":p.get("limitation")})
+            self.workers[aid] = proc; self.assignments[aid] = record; started = True
+        except Exception as exc:
+            cleanup = self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, (inbox, response_root), (out_handle, err_handle), str(exc))
+            raise AdmissionError(str(exc) if cleanup["outcome"] == "REAPED" else "pre-registration cleanup requires recovery: " + str(exc)) from exc
+        if proc is None or not started: raise AdmissionError("controller launch failed")
         answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
         if preparation is not None: answer["limitation_preparation"] = preparation
         return answer
@@ -418,6 +414,7 @@ class C3Harness:
     def _accept_assignment(self, p: dict[str, Any]) -> dict[str, Any]:
         if set(p) != {"assignment_id", "target_id"}: raise AdmissionError("assignment acceptance is closed")
         aid, target_id = _id(p["assignment_id"], "assignment"), _id(p["target_id"], "target")
+        if target_id != "target": raise AdmissionError("C3 supports exactly the singular target id")
         if aid in self.workers: raise AdmissionError("assignment is still active")
         record = self.assignments.get(aid)
         if record is None or record.get("target_id") != target_id or record.get("completion",{}).get("outcome") != "PASS": raise AdmissionError("assignment has no exact PASS completion")

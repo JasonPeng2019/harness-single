@@ -9,6 +9,8 @@ from typing import Any
 
 
 _LIVE_STATES = {"WAITING_RESOURCE", "RUNNING_CODEX"}
+_REJECTION_KEYS = {"schema", "request_id", "outcome", "reason"}
+_STATUS_REQUIRED_KEYS = {"schema", "state", "controller_pid", "controller_created_utc"}
 
 
 def _sha(path: Path) -> str:
@@ -32,9 +34,14 @@ def classify(response_path: Path, status_path: Path, *, expected_pid: int, expec
     """Classify only the proven contradiction; malformed or unrelated data contains normally."""
     response, response_ref = _load(response_path)
     status, status_ref = _load(status_path)
-    rejected_unauthentic = (isinstance(response, dict) and response.get("outcome") == "REJECTED"
+    rejected_unauthentic = (isinstance(response, dict) and set(response) == _REJECTION_KEYS
+                            and response.get("schema") == "firmware-c3-harness-response/v1"
+                            and isinstance(response.get("request_id"), str) and response["request_id"]
+                            and response.get("outcome") == "REJECTED"
                             and response.get("reason") == "controller did not publish an authentic initial status")
-    authentic = (isinstance(status, dict) and status.get("controller_pid") == expected_pid
+    authentic = (isinstance(status, dict) and _STATUS_REQUIRED_KEYS <= set(status)
+                 and status.get("schema") == "orchestrator-lane-controller/v1"
+                 and status.get("controller_pid") == expected_pid
                  and status.get("controller_created_utc") == expected_created_utc
                  and status.get("state") in _LIVE_STATES)
     contradiction = rejected_unauthentic and authentic
