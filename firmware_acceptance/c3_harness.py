@@ -166,6 +166,7 @@ class C3Harness:
         self.operations: dict[str, Future[Any]] = {}; self.operation_pending: dict[str, Path] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
         self.shutdown = False; self.admission_closed = False; self.last_heartbeat = 0.0
         self.recovery: dict[str, Any] | None = None
+        self.recovery_closed = False
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
         self.response_root = _safe_child(self.root, "manager-signals", "c3-responses")
         self.admission_root = _safe_child(self.root, "manager-signals", "c3-admissions")
@@ -182,8 +183,19 @@ class C3Harness:
     def _recover_or_fail_closed(self) -> None:
         # A process restart never adopts an incompletely recorded controller/worker.
         recovery = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
-        if recovery.is_file() and not _safe_child(self.state_root, "RECOVERY_RECONCILED.json").is_file():
-            raise AdmissionError("prior C3 process requires exact controller recovery")
+        reconciled = _safe_child(self.state_root, "RECOVERY_RECONCILED.json")
+        if recovery.is_file():
+            if not reconciled.is_file(): raise AdmissionError("prior C3 process requires exact controller recovery")
+            try:
+                value = json.loads(reconciled.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AdmissionError("prior C3 recovery reconciliation is unreadable") from exc
+            expected = {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":str(recovery),"sha256":_sha(recovery)}}
+            if (not isinstance(value,dict) or value.get("schema") != expected["schema"]
+                    or value.get("recovery") != expected["recovery"]
+                    or not isinstance(value.get("cleanup"),dict) or value["cleanup"].get("outcome") != "REAPED"):
+                raise AdmissionError("prior C3 recovery reconciliation is malformed or mismatched")
+            self.admission_closed = True; self.recovery_closed = True
         if self.registry_path.exists():
             lines = self.registry_path.read_text(encoding="utf-8").splitlines()
             live = [json.loads(line) for line in lines if line.strip()]
@@ -583,11 +595,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command",required=True); serve=sub.add_parser("serve"); serve.add_argument("--poll-seconds",type=float,default=.25)
     args = parser.parse_args(argv)
     harness = C3Harness(args.root,args.seed,args.policy,args.templates,args.topology_root,c1={"path":str(args.c1_path.resolve()),"sha256":args.c1_sha256},delegated={"path":str(args.delegated_path.resolve()),"sha256":args.delegated_sha256},manifest=args.manifest)
-    harness.write_readiness(); harness._status("READY")
+    if harness.recovery_closed:
+        harness._status("RECOVERY_RECONCILED_CLOSED")
+    else:
+        harness.write_readiness(); harness._status("READY")
     while not harness.shutdown:
         harness.reap_recovery(); harness.reap_workers(); harness.reap_operations(); harness.service_worker_channels()
         if time.monotonic() - harness.last_heartbeat >= 30:
-            harness._status("HEARTBEAT", idle=True); harness.last_heartbeat = time.monotonic()
+            harness._status("RECOVERY_RECONCILED_CLOSED" if harness.recovery_closed else "HEARTBEAT", idle=True); harness.last_heartbeat = time.monotonic()
         for request in sorted(harness.request_root.glob("*.json")):
             if not (_safe_child(harness.response_root,request.name)).exists(): print(json.dumps(harness.handle(request),sort_keys=True),flush=True)
         time.sleep(args.poll_seconds)
