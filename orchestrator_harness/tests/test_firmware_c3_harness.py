@@ -488,9 +488,9 @@ class C3HarnessTests(unittest.TestCase):
         class Function:
             def __init__(self, result: object) -> None: self.result = result
             def __call__(self, *_: object) -> object: return self.result
-        class Count:
-            def __init__(self) -> None: self.value = 4
         def matches(argv: list[str]) -> bool:
+            class Count:
+                def __init__(self) -> None: self.value = len(argv)
             shell = SimpleNamespace(CommandLineToArgvW=Function(argv)); kernel = SimpleNamespace(LocalFree=Function(None))
             fake = SimpleNamespace(c_int=Count, POINTER=lambda _: object, c_wchar_p=str, c_void_p=object, byref=lambda value: value, cast=lambda value, _: value, WinDLL=lambda name, **_: shell if name == "shell32" else kernel)
             with patch.object(c3_process.os, "name", "nt"), patch.dict(sys.modules, {"ctypes":fake}):
