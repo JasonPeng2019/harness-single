@@ -38,6 +38,7 @@ class FirmwareAcceptanceTargetTests(unittest.TestCase):
             self.assertTrue(all(not (target / name).stat().st_mode & 0o222 for name in seed_files))
 
             additions = {
+                ".gitignore": "*.local\n",
                 "src/main.c": "int main(void) { return 0; }\n",
                 "tests/test_target.py": "def test_target():\n    assert True\n",
                 "build/firmware.bin": "synthetic artifact\n",
