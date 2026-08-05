@@ -424,7 +424,8 @@ class C3Harness:
             credit = "" if preparation is None else "\nFinal RESULT.json checks must contain {name: firmware-limitation-credit, command: " + preparation["sha256"] + ", outcome: PASS}.\n"
             prompt.write_text("C3-HARNESS assignment token: " + token + "\nOnly create closed session-proposal requests in fixed inbox " + str(inbox) + "; responses appear only in " + str(response_root) + "." + credit + "\n" + p["prompt"], encoding="utf-8")
             invocation["prompt_sha256"] = _sha(prompt); _write_new(invocation_path, invocation)
-            out_handle, err_handle = (workspace / (aid + ".controller.stdout.log")).open("xb"), (workspace / (aid + ".controller.stderr.log")).open("xb")
+            out_handle = (workspace / (aid + ".controller.stdout.log")).open("xb")
+            err_handle = (workspace / (aid + ".controller.stderr.log")).open("xb")
             proc = subprocess.Popen([sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation_path)], cwd=self.candidate_root, stdout=out_handle, stderr=err_handle); identity = exact_process_identity(proc.pid)
             snapshot = process_snapshot(); observed = snapshot.by_pid.get(proc.pid); after_identity = exact_process_identity(proc.pid); expected_created = iso_utc(observed.created_utc) if observed is not None else None
             if identity is None or after_identity != identity or proc.poll() is not None or not snapshot.complete or observed is None or observed.pid != proc.pid or expected_created is None: raise AdmissionError("cannot prove controller child OS identity")

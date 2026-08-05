@@ -199,6 +199,7 @@ class _StdioTransport:
 
     def close_and_join(self) -> tuple[bool, dict[str, Any]]:
         self.accepting.clear(); self.stop.set(); outcome: dict[str, Any] = {"helper_threads": []}
+        pipes_closed = False
         for stream in (self.process.stdin,):
             try:
                 if stream is not None: stream.close()
@@ -214,9 +215,15 @@ class _StdioTransport:
             try:
                 if self.process.stderr is not None: self.process.stderr.close()
             except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
+            pipes_closed = True
             for thread in self.threads:
                 if thread.is_alive(): thread.join(max(0.0, self._budget()))
             outcome["helper_threads"] = [{"name": thread.name, "stopped": not thread.is_alive()} for thread in self.threads]
+        if not pipes_closed and all(not thread.is_alive() for thread in self.threads):
+            for stream in (self.process.stdout, self.process.stderr):
+                try:
+                    if stream is not None: stream.close()
+                except BaseException as exc: outcome.setdefault("stream_close_errors", []).append(type(exc).__name__)
         with self._stderr_lock:
             outcome["stderr_sha256"] = hashlib.sha256(bytes(self.stderr_bytes)).hexdigest()
             stderr_error = self.stderr_error
