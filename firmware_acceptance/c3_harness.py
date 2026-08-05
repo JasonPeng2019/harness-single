@@ -614,6 +614,7 @@ class C3Harness:
         if action == "proposal" and set(p) == {"session_id","proposal_path","request"}: return controller.session_publish_proposal(Path(p["proposal_path"]),p["request"])
         if action == "execute" and set(p) == {"session_id","proposal_path","decision_path","authorization_path"}:
             if sid in self.operations: raise AdmissionError("same-lane session operation is active")
+            controller.derive_authorization(Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
             pending = _safe_child(self.root,"hil",self.session_lanes[sid],"sessions",sid,"operations",hashlib.sha256(json.dumps(p,sort_keys=True).encode()).hexdigest() + ".PENDING.json")
             _write_new(pending,{"schema":"firmware-c3-session-operation/v1","state":"PENDING","session_id":sid,"payload":p})
             self.operations[sid] = self.executor.submit(controller.session_execute_artifacts,Path(p["proposal_path"]),Path(p["decision_path"]),Path(p["authorization_path"]),self.verifier)
