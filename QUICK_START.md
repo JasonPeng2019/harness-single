@@ -157,17 +157,17 @@ fresh acceptance orchestrator: it decides only final target-project work and sub
 `C3-HARNESS`. `C3-HARNESS` is the candidate control plane under test, not an agent; it alone launches
 target workers and owns their lifecycle. `F.C3.W` is a separately launched read-only watcher.
 
-Every headless role uses the exact assigned model with no substitution, explicit reasoning effort,
-isolated `-C` root, `--dangerously-bypass-approvals-and-sandbox`,
+Every headless child role uses the exact assigned model with no substitution, explicit reasoning effort,
+explicit `service_tier="priority"`, isolated `-C` root, `--dangerously-bypass-approvals-and-sandbox`,
 `--dangerously-bypass-hook-trust`, `--ignore-user-config`, and `--json`. Fast means exactly
 `service_tier="priority"`; default-tier roles must not set it. The required assignments are:
 
 | Role | Model / effort | Tier |
 | --- | --- | --- |
 | Acceptance orchestrator (`F.C3.O`) | GPT-5.6 Sol / high | Fast (`priority`) |
-| Production coder | GPT-5.6 Terra / medium | default |
+| Production coder | GPT-5.6 Terra / medium | Fast (`priority`) |
 | Reviewer or test writer | GPT-5.6 Terra / medium | Fast (`priority`) |
-| Doer or test executor | GPT-5.6 Luna / high | default |
+| Doer or test executor | GPT-5.6 Luna / high | Fast (`priority`) |
 | Acceptance watcher (`F.C3.W`) | GPT-5.6 Terra / medium | Fast (`priority`) |
 
 Production coding remains singleton/serial. At most three agents may exist beside `ROOT-IM`; actual

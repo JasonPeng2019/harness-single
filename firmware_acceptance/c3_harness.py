@@ -35,8 +35,8 @@ from orchestrator_harness.processes import process_snapshot
 _REQUEST_KEYS = {"schema", "request_id", "attempt_id", "c1_reference", "delegated_reference", "orchestrator_identity", "topology_key_release", "kind", "issued_utc", "issued_monotonic", "expires_monotonic", "payload", "public_key", "signature"}
 _ROLES = {
     "F.C3.A1": ("gpt-5.6-terra", "medium", "priority", "test_writer"),
-    "F.C3.C1": ("gpt-5.6-terra", "medium", "default", None),
-    "F.C3.P1": ("gpt-5.6-luna", "high", "default", "test_executor"),
+    "F.C3.C1": ("gpt-5.6-terra", "medium", "priority", None),
+    "F.C3.P1": ("gpt-5.6-luna", "high", "priority", "test_executor"),
     "F.C3.R1": ("gpt-5.6-terra", "medium", "priority", "reviewer"),
 }
 _SAFE_ID = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
