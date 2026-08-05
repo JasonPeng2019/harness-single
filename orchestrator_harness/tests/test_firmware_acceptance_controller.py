@@ -276,7 +276,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims); paths = self._flow(root, controller, verifier)
             original = controller_module._StdioTransport
             def transport(process: _Process, *args: object) -> _StdioTransport:
-                value = original(process, *args); self.assertIsNotNone(value.stderr_log); self.assertFalse(value.stderr_log.closed); value.stderr_log.close(); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
+                value = original(process, *args); stderr_log = value.stderr_log; self.assertIsNotNone(stderr_log); assert stderr_log is not None; self.assertFalse(stderr_log.closed); stderr_log.close(); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
             with patch.object(controller_module, "_StdioTransport", transport), self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
             cleanup = json.loads((controller.broker.root / "calls" / "controller-1" / "07-returning-state-cleanup.json").read_text())
             self.assertFalse(cleanup["stderr_log_complete"]); self.assertIn("stderr_log_error", cleanup); self.assertFalse(claims[0].live)
