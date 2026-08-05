@@ -371,10 +371,11 @@ class C3HarnessTests(unittest.TestCase):
                 self.assertNotIn(payload["assignment_id"], harness.workers); self.assertFalse(harness.registry_path.exists())
                 cleanup = json.loads((root / "assignments" / (payload["assignment_id"] + ".PRESTART_REJECTED.json")).read_text(encoding="utf-8"))
                 self.assertEqual({"schema","assignment_id","reason","launcher_identity","controller_identity","handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed","outcome"}, set(cleanup)); self.assertEqual("REAPED", cleanup["outcome"])
-                self.assertEqual(identity, cleanup["launcher_identity"]); self.assertIsNone(cleanup["controller_identity"])
+                self.assertEqual(None if name == "quick-exit" else identity, cleanup["launcher_identity"]); self.assertIsNone(cleanup["controller_identity"])
                 self.assertTrue(all(cleanup[key] for key in ("handles_closed","launcher_reaped","controller_reaped","process_reaped","worktree_removed","branch_removed","channels_removed")))
                 self.assertFalse((root / "assignment-worktrees" / payload["assignment_id"]).exists()); self.assertFalse((root / "worker-channel" / payload["assignment_id"]).exists()); self.assertFalse((root / "worker-channel-responses" / payload["assignment_id"]).exists())
                 self.assertNotEqual(0, subprocess.run(["git","show-ref","--verify","--quiet","refs/heads/c3/target/" + payload["assignment_id"]], cwd=target).returncode); self.assertTrue(process.terminated or name == "quick-exit")
+                if name == "quick-exit": self.assertFalse(process.terminated); self.assertEqual(9, process.code)
 
     def test_s25_a1_prestart_branch_only_and_setup_launch_failures_cleanup_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
