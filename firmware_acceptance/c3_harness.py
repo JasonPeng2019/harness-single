@@ -45,6 +45,10 @@ _INITIAL_CONTROLLER_STATES = {"WAITING_RESOURCE", "RUNNING_CODEX"}
 _INITIAL_STATUS_TIMEOUT_SECONDS = 90.0
 
 
+class RecoveryRequired(AdmissionError):
+    pass
+
+
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -161,6 +165,7 @@ class C3Harness:
         self.limitation_completed: dict[str, dict[str, dict[str, Any]]] = {}
         self.operations: dict[str, Future[Any]] = {}; self.operation_pending: dict[str, Path] = {}; self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c3-lane")
         self.shutdown = False; self.admission_closed = False; self.last_heartbeat = 0.0
+        self.recovery: dict[str, Any] | None = None
         self.request_root = _safe_child(self.root, "manager-signals", "c3-requests")
         self.response_root = _safe_child(self.root, "manager-signals", "c3-responses")
         self.admission_root = _safe_child(self.root, "manager-signals", "c3-admissions")
@@ -176,6 +181,9 @@ class C3Harness:
 
     def _recover_or_fail_closed(self) -> None:
         # A process restart never adopts an incompletely recorded controller/worker.
+        recovery = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
+        if recovery.is_file() and not _safe_child(self.state_root, "RECOVERY_RECONCILED.json").is_file():
+            raise AdmissionError("prior C3 process requires exact controller recovery")
         if self.registry_path.exists():
             lines = self.registry_path.read_text(encoding="utf-8").splitlines()
             live = [json.loads(line) for line in lines if line.strip()]
@@ -260,6 +268,10 @@ class C3Harness:
             result = self._dispatch(request["kind"], request["payload"])
             self._status("HEARTBEAT", request_id=request_id, outcome="ACCEPTED")
             return self._record(request_id, {"outcome":"ACCEPTED", "kind":request["kind"], "result":result})
+        except RecoveryRequired as exc:
+            self._status("RECOVERY_REQUIRED", request_id=request_id, outcome="RECOVERY_REQUIRED")
+            recovery = {key:value for key,value in (self.recovery or {}).items() if key != "process"}
+            return self._record(request_id, {"outcome":"RECOVERY_REQUIRED", "reason":str(exc), "recovery":recovery})
         except (AdmissionError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self._status("HEARTBEAT", request_id=request_id, outcome="REJECTED")
             return self._record(request_id, {"outcome":"REJECTED", "reason":str(exc)})
@@ -302,8 +314,8 @@ class C3Harness:
             except subprocess.TimeoutExpired: pass
             cleanup["process_reaped"] = proc.poll() is not None and (identity is None or exact_process_identity(proc.pid) != identity)
         if cleanup["process_reaped"] and cleanup["handles_closed"]:
-            removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True)
-            cleanup["worktree_removed"] = removed.returncode == 0 and not worktree.exists()
+            removed = subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=target, capture_output=True, text=True) if worktree.exists() else None
+            cleanup["worktree_removed"] = not worktree.exists() or (removed is not None and removed.returncode == 0 and not worktree.exists())
             exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=target, capture_output=True)
             deleted = subprocess.run(["git", "branch", "-D", branch], cwd=target, capture_output=True, text=True) if exists.returncode == 0 else None
             cleanup["branch_removed"] = exists.returncode != 0 or (deleted is not None and deleted.returncode == 0)
@@ -314,8 +326,26 @@ class C3Harness:
                     cleanup["channels_removed"] = all(not channel.exists() for channel in channels)
                 except OSError: pass
         cleanup["outcome"] = "REAPED" if all(cleanup[key] for key in ("handles_closed", "process_reaped", "worktree_removed", "branch_removed", "channels_removed")) else "RECOVERY_REQUIRED"
-        _write_new(_safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json"), cleanup)
+        evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
+        if evidence.exists(): evidence = _safe_child(self.root,"assignments",aid + ".PRESTART_RECOVERY_RECONCILED.json")
+        _write_new(evidence, cleanup)
         return cleanup
+
+    def reap_recovery(self) -> None:
+        if self.recovery is None or self.recovery["process"].poll() is None: return
+        cleanup = self._reject_unregistered_assignment(self.recovery["assignment_id"], self.recovery["process"], self.recovery["controller_identity"], Path(self.recovery["worktree"]), self.recovery["branch"], _safe_child(self.root,"target"), tuple(Path(item) for item in self.recovery["channels"]), (), "exact child absence observed during recovery")
+        if cleanup["outcome"] != "REAPED": return
+        _write_new(_safe_child(self.state_root,"RECOVERY_RECONCILED.json"), {"schema":"firmware-c3-recovery-reconciled/v1","recovery":{"path":self.recovery["path"],"sha256":self.recovery["sha256"]},"cleanup":cleanup})
+        self.recovery = None
+
+    def _require_recovery(self, aid: str, proc: subprocess.Popen[Any], identity: dict[str, Any] | None, worktree: Path, branch: str, channels: tuple[Path, ...], cleanup: dict[str, Any]) -> None:
+        """Retain the unproven live child for exact external recovery; never downgrade it."""
+        self.admission_closed = True
+        record = {"schema":"firmware-c3-recovery-required/v1","assignment_id":aid,"pid":proc.pid,"controller_identity":identity,"observed_identity":exact_process_identity(proc.pid),"worktree":str(worktree),"branch":branch,"channels":[str(item) for item in channels],"cleanup":cleanup}
+        path = _safe_child(self.state_root, "RECOVERY_REQUIRED.json")
+        _write_new(path, record)
+        self.recovery = {**record,"path":str(path),"sha256":_sha(path),"process":proc}
+        raise RecoveryRequired("pre-registration controller identity is unresolved; recovery is required")
 
     def _assignment(self, p: dict[str, Any]) -> dict[str, Any]:
         allowed = {"assignment_id", "role", "sprint", "task", "prompt", "target_id", "declared_resources", "limitation"}
@@ -328,14 +358,17 @@ class C3Harness:
         target = _safe_child(self.root, target_id); base = self.broker.validate_target(target)
         worktree = _safe_child(self.root, "assignment-worktrees", aid); branch = "c3/" + target_id + "/" + aid
         if worktree.exists(): raise AdmissionError("candidate assignment worktree already exists")
+        branch_before = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=target, capture_output=True).returncode == 0
+        if branch_before: raise AdmissionError("candidate assignment branch already exists")
         created = subprocess.run(["git", "worktree", "add", "-b", branch, str(worktree), base], cwd=target, capture_output=True, text=True)
         inbox, response_root = _safe_child(self.root, "worker-channel", aid), _safe_child(self.root, "worker-channel-responses", aid)
         if created.returncode:
-            if worktree.exists():
+            branch_after = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/" + branch], cwd=target, capture_output=True).returncode == 0
+            if worktree.exists() or branch_after:
                 self._reject_unregistered_assignment(aid, None, None, worktree, branch, target, (inbox, response_root), (), "candidate worktree creation failed")
             raise AdmissionError("candidate worktree creation failed")
         proc: subprocess.Popen[Any] | None = None; identity: dict[str, Any] | None = None
-        out_handle = err_handle = None; started = False
+        out_handle = err_handle = None; started = False; started_publication = False
         try:
             for name in self.seed_identity: (worktree / name).chmod(stat.S_IREAD)
             _protected_seed_snapshot(worktree, self.seed_identity)
@@ -367,10 +400,16 @@ class C3Harness:
             if proc.poll() is not None or exact_process_identity(proc.pid) != identity: raise AdmissionError("controller did not remain authentically live for STARTED registration")
             out_handle.close(); err_handle.close(); out_handle = err_handle = None
             record = {"target_id":target_id,"worktree":worktree,"branch":branch,"base":base,"invocation":invocation,"inbox":inbox,"responses":response_root,"token_hash":hashlib.sha256(token.encode()).hexdigest(),"seed":self.seed_identity,"limitation":limitation,"preparation":preparation,"identity":identity,"status_identity":status_identity}
+            started_publication = True
             _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"STARTED","assignment_id":aid,"controller_identity":identity,"controller_status_identity":status_identity,"invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worktree":str(worktree),"branch":branch,"worker_channel":str(inbox),"response_root":str(response_root),"token_sha256":record["token_hash"],"limitation":p.get("limitation")})
             self.workers[aid] = proc; self.assignments[aid] = record; started = True
         except Exception as exc:
             cleanup = self._reject_unregistered_assignment(aid, proc, identity, worktree, branch, target, (inbox, response_root), (out_handle, err_handle), str(exc))
+            if cleanup.get("process_identity_unresolved") and proc is not None and proc.poll() is None:
+                self._require_recovery(aid, proc, identity, worktree, branch, (inbox, response_root), cleanup)
+            if started_publication and cleanup["outcome"] == "REAPED":
+                cleanup_path = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
+                _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"controller_identity":identity,"rejected":True,"reaped":True,"prestart_cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})
             raise AdmissionError(str(exc) if cleanup["outcome"] == "REAPED" else "pre-registration cleanup requires recovery: " + str(exc)) from exc
         if proc is None or not started: raise AdmissionError("controller launch failed")
         answer = {"assignment_id":aid,"state":"LAUNCHED","invocation":{"path":str(invocation_path),"sha256":_sha(invocation_path)},"worker_channel":{"path":str(inbox)}}
@@ -519,6 +558,8 @@ class C3Harness:
     def _shutdown(self, p: dict[str, Any]) -> dict[str, Any]:
         if p: raise AdmissionError("shutdown payload must be empty")
         self.admission_closed = True
+        if self.recovery is not None:
+            return {"state":"BLOCKED","reason":"identity-unresolved controller requires exact recovery","recovery":{key:value for key,value in self.recovery.items() if key != "process"}}
         self.reap_workers()
         self.reap_operations()
         if self.workers or self.operations: return {"state":"BLOCKED","reason":"target worker or session operation is active"}
@@ -544,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     harness = C3Harness(args.root,args.seed,args.policy,args.templates,args.topology_root,c1={"path":str(args.c1_path.resolve()),"sha256":args.c1_sha256},delegated={"path":str(args.delegated_path.resolve()),"sha256":args.delegated_sha256},manifest=args.manifest)
     harness.write_readiness(); harness._status("READY")
     while not harness.shutdown:
-        harness.reap_workers(); harness.reap_operations(); harness.service_worker_channels()
+        harness.reap_recovery(); harness.reap_workers(); harness.reap_operations(); harness.service_worker_channels()
         if time.monotonic() - harness.last_heartbeat >= 30:
             harness._status("HEARTBEAT", idle=True); harness.last_heartbeat = time.monotonic()
         for request in sorted(harness.request_root.glob("*.json")):
