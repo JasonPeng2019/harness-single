@@ -117,9 +117,9 @@ class C3HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); first, second = Future(), Future(); harness.controllers = {"s1":Mock(), "s2":Mock()}; harness.executor.submit.side_effect = [first, second]
             outer_session, request_session = str(uuid.uuid4()), str(uuid.uuid4()); request = root / "closed-session.json"; request.write_text(json.dumps({"session_id":request_session}), encoding="utf-8")
-            controller_factory = Mock()
-            with patch.object(c3, "FirmwareAcceptanceController", controller_factory), self.assertRaises(AdmissionError): harness._open({"session_id":outer_session,"request_path":str(request)})
-            controller_factory.assert_not_called(); self.assertNotIn(outer_session, harness.controllers); self.assertFalse(harness.registry_path.exists())
+            mismatch_controller = c3.FirmwareAcceptanceController(harness.broker, topology=harness.topology)
+            with patch.object(mismatch_controller, "_load_external", return_value={"session_id":request_session}), patch.object(mismatch_controller, "create_session_request") as create_request, patch.object(c3, "FirmwareAcceptanceController", return_value=mismatch_controller), self.assertRaises(AdmissionError): harness._open({"session_id":outer_session,"request_path":str(request)})
+            create_request.assert_not_called(); self.assertNotIn(outer_session, harness.controllers); self.assertFalse(harness.registry_path.exists())
             for sid in ("s1","s2"): self.assertEqual("PENDING", harness._session({"session_id":sid,"proposal_path":"p","decision_path":"d","authorization_path":"a"}, "execute")["state"])
             with self.assertRaises(AdmissionError): harness._session({"session_id":"s1","proposal_path":"p","decision_path":"d","authorization_path":"a"}, "execute")
             first.set_result({"call":"one"}); second.set_result({"call":"two"}); harness.reap_operations()
@@ -130,7 +130,7 @@ class C3HarnessTests(unittest.TestCase):
             with self.assertRaises(AdmissionError): harness._recover_or_fail_closed()
             controller = Mock(); controller.open_session.return_value = {"session_id":request_session}
             with patch.object(c3, "FirmwareAcceptanceController", return_value=controller): self.assertEqual({"session_id":request_session}, harness._open({"session_id":request_session,"request_path":str(request)}))
-            controller.open_session.assert_called_once_with(request); self.assertIs(harness.controllers[request_session], controller)
+            controller.open_session.assert_called_once_with(request, expected_session_id=request_session); self.assertIs(harness.controllers[request_session], controller)
             inbox, responses = root / "inbox", root / "responses"; inbox.mkdir(); responses.mkdir(); controller = Mock(); harness.controllers = {"s1":controller}; harness.workers = {"p1":_Process()}; harness.assignments = {"p1":{"invocation":{"lane_id":"F.C3.P1"},"inbox":inbox,"responses":responses,"token_hash":_digest_token("token")}}
             (inbox / "bad.json").write_text(json.dumps({"endpoint":"forbidden"}), encoding="utf-8")
             def publish(path: Path, call: dict[str, object]) -> dict[str, object]: path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(call), encoding="utf-8"); return {"accepted":True}
