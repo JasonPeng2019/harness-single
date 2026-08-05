@@ -377,6 +377,29 @@ class C3HarnessTests(unittest.TestCase):
                 self.assertNotEqual(0, subprocess.run(["git","show-ref","--verify","--quiet","refs/heads/c3/target/" + payload["assignment_id"]], cwd=target).returncode); self.assertTrue(process.terminated or name == "quick-exit")
                 if name == "quick-exit": self.assertFalse(process.terminated); self.assertEqual(9, process.code)
 
+    def test_s27_a1_inauthentic_direct_controller_observation_retains_exact_identity_for_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); target = root / "target"
+            harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
+            process = _Process(); launcher = {"pid":4242,"created_utc":"launcher"}; controller_identity = {"pid":4343,"created_utc":"controller"}
+            launcher_created, controller_created = datetime(2026, 8, 4, tzinfo=timezone.utc), datetime(2026, 8, 4, 0, 0, 1, tzinfo=timezone.utc)
+            snapshot = ProcessSnapshot(True, (ProcessInfo(4242, 1, "python", "launcher", launcher_created), ProcessInfo(4343, 4242, "python", "controller", controller_created)), (), "synthetic")
+            def launch(command: list[str], **_: object) -> _Process:
+                status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"])
+                status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","state":"CODEX_EXITED","controller_pid":4343,"controller_created_utc":iso_utc(controller_created)}), encoding="utf-8")
+                return process
+            def exact(pid: int) -> dict[str, object] | None:
+                if process.poll() is not None: return None
+                return launcher if pid == 4242 else controller_identity if pid == 4343 else None
+            payload = {"assignment_id":"a1","role":"F.C3.A1","sprint":"S27","task":"x","prompt":"x","target_id":"target","declared_resources":[]}
+            with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", side_effect=exact):
+                with self.assertRaises(AdmissionError): harness._assignment(payload)
+            cleanup = json.loads((root / "assignments" / "a1.PRESTART_REJECTED.json").read_text(encoding="utf-8"))
+            observation = json.loads((root / "assignments" / "a1.CONTROLLER_OBSERVATION.json").read_text(encoding="utf-8"))
+            self.assertEqual(controller_identity, observation["controller_identity"])
+            self.assertEqual(controller_identity, cleanup["controller_identity"])
+            self.assertEqual("REAPED", cleanup["outcome"])
+
     def test_s25_a1_prestart_branch_only_and_setup_launch_failures_cleanup_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
@@ -550,6 +573,30 @@ class C3HarnessTests(unittest.TestCase):
             completion = json.loads((root / "assignments" / "a1.WORKER_COMPLETION.json").read_text())
             self.assertEqual(7, completion["exit_code"]); self.assertEqual(7, completion["launcher_exit_code"])
             terminal = json.loads(harness.registry_path.read_text().splitlines()[-1]); self.assertEqual(7, terminal["exit_code"]); self.assertEqual(7, terminal["launcher_exit_code"])
+
+    def test_s27_a1_recovery_retries_stay_artifact_free_until_terminal_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); harness = self._bare(root); process = _Process(0)
+            launcher, controller_identity = {"pid":4242,"created_utc":"windows-filetime:1"}, {"pid":4343,"created_utc":"controller"}
+            recovery_path = harness.state_root / "RECOVERY_REQUIRED.json"; recovery_path.write_text(json.dumps({"synthetic":True}), encoding="utf-8")
+            harness.recovery = {"assignment_id":"a1","process":process,"launcher_identity":launcher,"controller_identity":controller_identity,"worktree":str(root / "missing-worktree"),"branch":"c3/target/a1","channels":[str(root / "missing-inbox"),str(root / "missing-responses")],"path":str(recovery_path),"sha256":_digest(recovery_path)}
+            controller_live = True
+            def exact(pid: int) -> dict[str, object] | None:
+                if pid == launcher["pid"]: return launcher
+                return controller_identity if pid == controller_identity["pid"] and controller_live else None
+            with patch.object(c3, "exact_process_identity", side_effect=exact), patch.object(c3.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+                harness.reap_recovery(); harness.reap_recovery()
+                cleanup_path = root / "assignments" / "a1.PRESTART_RECOVERY_RECONCILED.json"
+                reconciled_path = harness.state_root / "RECOVERY_RECONCILED.json"
+                self.assertFalse(cleanup_path.exists()); self.assertFalse(reconciled_path.exists())
+                controller_live = False
+                harness.reap_recovery()
+                cleanup_bytes, reconciled_bytes = cleanup_path.read_bytes(), reconciled_path.read_bytes()
+                self.assertEqual("REAPED", json.loads(cleanup_bytes)["outcome"])
+                self.assertIsNone(harness.recovery); self.assertTrue(process.waited)
+                harness.reap_recovery()
+            self.assertEqual(cleanup_bytes, cleanup_path.read_bytes())
+            self.assertEqual(reconciled_bytes, reconciled_path.read_bytes())
 
 
 def _digest_token(value: str) -> str:

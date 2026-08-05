@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.tests.support import TemporaryGitRepository
@@ -178,6 +180,34 @@ class CodingLaneControllerTests(unittest.TestCase):
             controller.load_invocation(path)
         path, _ = self.invocation(action="resume", worker_id="worker-2")
         self.assertEqual(2, controller.main([str(path)]))
+
+    def test_resource_acquisition_publishes_running_only_after_child_launch_and_popen_failure_releases_claim(self) -> None:
+        path, _ = self.invocation()
+        status_path = self.workspace / "controller.status.json"
+        lock_root = self.runtime_root / "coding-resource-locks"
+        published: list[dict[str, object]] = []
+        original_atomic_json = controller._atomic_json
+        original_popen = controller.subprocess.Popen
+
+        def record(path: Path, value: dict[str, object]) -> None:
+            published.append(dict(value)); original_atomic_json(path, value)
+
+        def launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            self.assertFalse(status_path.exists())
+            self.assertTrue(any(lock_root.iterdir()))
+            return original_popen(*args, **kwargs)
+
+        with patch.object(controller, "_atomic_json", side_effect=record), patch.object(controller.subprocess, "Popen", side_effect=launch):
+            self.assertEqual(0, controller.main([str(path)]))
+        self.assertEqual("RUNNING_CODEX", published[0]["state"])
+
+        path, _ = self.invocation(worker_id="worker-popen-failure")
+        with patch.object(controller.subprocess, "Popen", side_effect=OSError("synthetic Popen failure")):
+            self.assertEqual(1, controller.main([str(path)]))
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual("LAUNCH_FAILED", status["state"])
+        self.assertEqual([], status["held_resource_claims"])
+        self.assertFalse(any(lock_root.iterdir()))
 
     def test_resume_rejects_child_thread_mismatch(self) -> None:
         start, _ = self.invocation()
