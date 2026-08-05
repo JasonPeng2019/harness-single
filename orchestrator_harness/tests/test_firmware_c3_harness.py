@@ -64,14 +64,19 @@ class C3HarnessTests(unittest.TestCase):
             path = harness.request_root / "r1.json"; path.write_text(json.dumps(request), encoding="utf-8")
             with patch.object(c3, "_ref", side_effect=lambda value, label, expected=None: value), patch.object(harness.verifier, "verify", return_value=True): self.assertEqual("r1", harness._load(path)["request_id"])
             request["payload"] = []; path.write_text(json.dumps(request), encoding="utf-8")
-            self.assertEqual("REJECTED", harness.handle(path)["outcome"])
+            with patch.object(c3, "_ref", side_effect=lambda value, label, expected=None: value), patch.object(harness.verifier, "verify", return_value=True): self.assertEqual("REJECTED", harness.handle(path)["outcome"])
+            self.assertFalse((harness.admission_root / "r1.json").exists())
             request["payload"] = {"target_id":"target"}; path.write_text(json.dumps(request), encoding="utf-8")
-            side_effect = Mock(return_value={"target":"target"})
-            with patch.object(harness, "_load", return_value=request), patch.object(harness, "_dispatch", side_effect=side_effect):
-                self.assertEqual("ACCEPTED", harness.handle(path)["outcome"]); self.assertEqual("ACCEPTED", harness.handle(path)["outcome"])
-            self.assertEqual(1, side_effect.call_count)
-            request["signature"] = "tampered"; path.write_text(json.dumps(request), encoding="utf-8")
-            with patch.object(harness.verifier, "verify", return_value=False): self.assertEqual("REJECTED", harness.handle(path)["outcome"])
+            stale_dispatch = Mock(return_value={"target":"target"})
+            with patch.object(harness, "_load", return_value=request), patch.object(harness, "_dispatch", side_effect=stale_dispatch): self.assertEqual("REJECTED", harness.handle(path)["outcome"])
+            self.assertEqual(0, stale_dispatch.call_count)
+            accepted = {**request,"request_id":"r2"}; accepted_path = harness.request_root / "r2.json"; accepted_path.write_text(json.dumps(accepted), encoding="utf-8")
+            accepted_dispatch = Mock(return_value={"target":"target"})
+            with patch.object(harness, "_load", return_value=accepted), patch.object(harness, "_dispatch", side_effect=accepted_dispatch):
+                self.assertEqual("ACCEPTED", harness.handle(accepted_path)["outcome"]); self.assertEqual("ACCEPTED", harness.handle(accepted_path)["outcome"])
+            self.assertEqual(1, accepted_dispatch.call_count)
+            tampered = {**request,"request_id":"r3","signature":"tampered"}; tampered_path = harness.request_root / "r3.json"; tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with patch.object(c3, "_ref", side_effect=lambda value, label, expected=None: value), patch.object(harness.verifier, "verify", return_value=False): self.assertEqual("REJECTED", harness.handle(tampered_path)["outcome"])
 
     def test_c3_cp_04_disposable_target_assignment_and_fail_closed_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
