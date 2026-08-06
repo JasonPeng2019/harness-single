@@ -88,13 +88,13 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
         call = self._call(root)
         return {key: call[key] for key in ("attempt_id","lane_id","board","resource","probe_uid","target","profile","route","c1_reference","delegated_reference","board_identity","mcp_schema","policy","server_revision","seed_identity","target_identity","topology_key_release","governing_documents")} | {"session_id":"123e4567-e89b-12d3-a456-426614174000","deadline_monotonic":100.0,"initial_state":"BOOTSTRAPPED"}
 
-    def _session_artifacts(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier, request: dict[str, object]) -> tuple[Path, Path, Path]:
+    def _session_artifacts(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier, request: dict[str, object], *, decision_path: Path | None = None) -> tuple[Path, Path, Path]:
         sequence = request["sequence_number"]
         if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
             raise AssertionError("session test fixture requires a positive integer sequence number")
         proposal_path = root / "broker" / "sessions" / "123e4567-e89b-12d3-a456-426614174000" / f"proposal-{sequence}.json"
         proposal = controller.session_publish_proposal(proposal_path, request)
-        decision_path = proposal_path.with_name(f"decision-{sequence}.json")
+        decision_path = decision_path or proposal_path.with_name(f"decision-{sequence}.json")
         decision = {"schema":"firmware-o-decision/v3","proposal_path":str(proposal_path.resolve()),"proposal_sha256":proposal["raw_sha256"],"call":proposal["call"],"claim":proposal["claim"],"decision":"approve","rationale":"session","issued_utc":"2026-01-01T00:00:00Z","issued_monotonic":1.0,"expires_monotonic":99.0,"topology_key_release":proposal["call"]["topology_key_release"],"orchestrator_identity":{"path":"identity","sha256":"identity"},"public_key":"public","signature":"signed"}
         verifier.expected = canonical_decision_payload(decision); decision_path.write_text(json.dumps(decision, sort_keys=True, separators=(",",":")), encoding="utf-8")
         authorization_path = proposal_path.with_name(f"authorization-{sequence}.json")
@@ -220,9 +220,14 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             opened = controller.open_session(request_path)
             self.assertEqual("BOOTSTRAPPED", opened["state"]); self.assertEqual(1, len(claims)); self.assertTrue(claims[0].live)
             call = self._call(root); call.update({"call_id":"route-1","method":"setup_overview","method_version":1,"arguments":{"board_names":None,"connection_assignments":None},"action_class":"probe_discovery_read"})
-            paths = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":1,"prior_result":None,"current_state":"BOOTSTRAPPED","next_state":"ROUTED","call":call})
+            decision_path = root / "evidence" / "authorization-decisions" / "route-1.json"
+            decision_path.parent.mkdir(parents=True)
+            paths = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":1,"prior_result":None,"current_state":"BOOTSTRAPPED","next_state":"ROUTED","call":call}, decision_path=decision_path)
             result = controller.session_execute_artifacts(*paths, verifier)
             self.assertEqual("ROUTED", result["resulting_state"]); self.assertEqual(1, len(launches))
+            self.assertEqual(str(decision_path.resolve()), result["decision_path"])
+            self.assertEqual(hashlib.sha256(decision_path.read_bytes()).hexdigest(), result["decision_sha256"])
+            self.assertTrue(controller.broker.root in paths[2].resolve().parents)
             with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "bad.json", {"session_id":opened["session_id"],"sequence_number":3,"prior_result":None,"current_state":"ROUTED","next_state":"ROUTED","call":call})
             controller._session["state"] = "OP_ACTION_READY"; controller._session["active_plan"] = {"method":"write_serial","parameters":{"text":"expected","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None}}
             action = self._call(root); action.update({"call_id":"action-2","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"altered","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None},"action_class":"uart_session_io"})
