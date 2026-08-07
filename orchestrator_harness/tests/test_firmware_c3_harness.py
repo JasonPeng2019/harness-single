@@ -14,6 +14,7 @@ from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Callable, cast
 from unittest.mock import Mock, patch
 
 import firmware_acceptance.c3_harness as c3
@@ -33,15 +34,15 @@ class _Process:
     def poll(self) -> int | None: return self.code
     def wait(self, timeout: float | None = None) -> int:
         self.waited = True
-        if self.code is None: raise subprocess.TimeoutExpired(["synthetic"], timeout)
+        if self.code is None: raise subprocess.TimeoutExpired(["synthetic"], timeout if timeout is not None else 0.0)
         return self.code
     def terminate(self) -> None: self.terminated = True; self.code = -15
     def kill(self) -> None: self.code = -9
 
 
 class C3HarnessTests(unittest.TestCase):
-    def _bare(self, root: Path) -> c3.C3Harness:
-        harness = object.__new__(c3.C3Harness)
+    def _bare(self, root: Path) -> Any:
+        harness: Any = object.__new__(c3.C3Harness)
         harness.root = root; harness.seed = Path("firmware_acceptance/seed").resolve()
         harness.candidate_root = Path(__file__).resolve().parents[2]
         harness.policy = Path("firmware_acceptance/MCP_METHOD_POLICY.json").resolve(); harness.templates = Path("firmware_acceptance/LANE_TEMPLATES.json").resolve()
@@ -89,7 +90,7 @@ class C3HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
 
-            def build(case: str) -> tuple[dict[str, object], Path, Path, Path]:
+            def build(case: str) -> tuple[dict[str, Any], Path, Path, Path]:
                 case_root = base / case; candidate = case_root / "candidate"; source_dir = candidate / "firmware_acceptance"
                 source_dir.mkdir(parents=True); root = case_root / "runtime"; root.mkdir(); topology = case_root / "topology"; topology.mkdir()
                 operative = case_root / "c1-local-policy.json"; operative.write_text(json.dumps(policy_body, indent=2), encoding="utf-8")
@@ -122,7 +123,7 @@ class C3HarnessTests(unittest.TestCase):
                 if command[1:] == ["status", "--porcelain", "--untracked-files=all"]: return SimpleNamespace(stdout="")
                 raise AssertionError(command)
 
-            def construct(case: str) -> tuple[c3.C3Harness, dict[str, object], Path]:
+            def construct(case: str) -> tuple[c3.C3Harness, dict[str, Any], Path]:
                 c1_body, root, topology, c1 = build(case); candidate = Path(c1_body["candidate"]["path"])
                 with patch.object(c3, "__file__", str(candidate / "firmware_acceptance" / "c3_harness.py")), patch.object(c3.subprocess, "run", side_effect=git_identity), patch.object(c3, "load_root_topology", return_value={"attempt_id":"attempt"}), patch.object(c3, "validate_manifest", return_value={}), patch.object(c3, "validate_delegated_authorization", return_value={}), patch.object(c3, "AcceptanceBroker"), patch.object(c3, "LimitationEvidenceAdapter"):
                     harness = c3.C3Harness(root, Path("firmware_acceptance/seed").resolve(), Path(c1_body["candidate_acceptance_inputs"]["mcp_method_policy"]["path"]), Path(c1_body["candidate_acceptance_inputs"]["lane_templates"]["path"]), topology, c1={"path":str(c1),"sha256":_digest(c1)}, delegated=c1_body["authorization"], manifest=Path(c1_body["candidate_acceptance_inputs"]["acceptance_manifest"]["path"]))
@@ -156,7 +157,7 @@ class C3HarnessTests(unittest.TestCase):
             try:
                 identity = {"pid":4242,"created_utc":"created"}
                 observations = Mock(side_effect=[identity] * 7)
-                delayed_sleeps: list[object] = []
+                delayed_sleeps: list[Callable[[float], None]] = []
                 controller_subprocess = SimpleNamespace(Popen=launch, run=subprocess.run, TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError)
                 def sleep(_: float) -> None:
                     delayed_sleeps.pop(0)(_)  # authentic publication happens only after the first poll.
@@ -308,7 +309,7 @@ class C3HarnessTests(unittest.TestCase):
                 raise AssertionError("recovery must raise")
             with patch.object(c3, "exact_process_identity", return_value=observed), patch.object(harness,"_load",return_value=first), patch.object(harness,"_dispatch",side_effect=discover):
                 response = harness.handle(first_path)
-            self.assertEqual("RECOVERY_REQUIRED",response["outcome"]); self.assertTrue(harness.admission_closed); self.assertIs(harness.recovery["process"], process)
+            self.assertEqual("RECOVERY_REQUIRED",response["outcome"]); self.assertTrue(harness.admission_closed); self.assertIsNotNone(harness.recovery); assert harness.recovery is not None; self.assertIs(harness.recovery["process"], process)
             recovery_ref = response["recovery"]; recovery_path = Path(recovery_ref["path"]); self.assertEqual({"path":str(recovery_path),"sha256":_digest(recovery_path)}, {"path":recovery_ref["path"],"sha256":recovery_ref["sha256"]})
             statuses = [json.loads(line) for line in harness.status_path.read_text().splitlines()]; self.assertEqual("RECOVERY_REQUIRED",statuses[-1]["state"])
             second_path = harness.request_root / "second.json"; second_path.write_text("{}",encoding="utf-8"); second = {"request_id":"second","kind":"materialize","payload":{"target_id":"target"}}
@@ -370,15 +371,15 @@ class C3HarnessTests(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary); harness = self._bare(root); target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
                 process = _Process(9 if name == "quick-exit" else None); created = datetime(2026, 8, 4, tzinfo=timezone.utc); snapshot = ProcessSnapshot(True, (ProcessInfo(4242, 1, "python", "lane", created),), (), "synthetic")
-                def launch(command: list[str], **_: object) -> _Process:
-                    if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return real_popen(command, **_)
+                real_popen: Any = subprocess.Popen
+                def launch(command: list[str], *args: object, _real_popen=real_popen, _name=name, _value=value, _process=process, **kwargs: object) -> _Process:
+                    if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return _real_popen(command, *args, **kwargs)
                     status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"])
-                    if name != "timeout" and name != "quick-exit": status.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
-                    return process
+                    if _name != "timeout" and _name != "quick-exit": status.write_text(_value if isinstance(_value, str) else json.dumps(_value), encoding="utf-8")
+                    return _process
                 identity = {"pid":4242,"created_utc":"exact"}
-                def exact(_: int) -> dict[str, object] | None: return identity if process.poll() is None else None
+                def exact(_: int, _identity=identity, _process=process) -> dict[str, object] | None: return _identity if _process.poll() is None else None
                 payload = {"assignment_id":"a-" + name,"role":"F.C3.A1","sprint":"S25","task":"status","prompt":"x","target_id":"target","declared_resources":[]}
-                real_popen = subprocess.Popen
                 # The synthetic clock consumes one attempted read, then expires; sleep is a no-op.
                 with patch.object(c3.subprocess, "Popen", side_effect=launch), patch.object(c3, "process_snapshot", return_value=snapshot), patch.object(c3, "exact_process_identity", side_effect=exact), patch.object(c3.time, "monotonic", side_effect=[0.0, 0.0, 91.0]), patch.object(c3.time, "sleep"):
                     with self.assertRaises(AdmissionError): harness._assignment(payload)
@@ -398,7 +399,7 @@ class C3HarnessTests(unittest.TestCase):
             process = _Process(); launcher = {"pid":4242,"created_utc":"launcher"}; controller_identity = {"pid":4343,"created_utc":"controller"}
             launcher_created, controller_created = datetime(2026, 8, 4, tzinfo=timezone.utc), datetime(2026, 8, 4, 0, 0, 1, tzinfo=timezone.utc)
             snapshot = ProcessSnapshot(True, (ProcessInfo(4242, 1, "python", "launcher", launcher_created), ProcessInfo(4343, 4242, "python", "controller", controller_created)), (), "synthetic")
-            real_popen = subprocess.Popen
+            real_popen: Any = subprocess.Popen
             def launch(command: object, *args: object, **kwargs: object) -> _Process | subprocess.Popen[bytes]:
                 if not (isinstance(command, list) and command[:3] == [sys.executable, "-m", "orchestrator_harness.lane_controller"]):
                     return real_popen(command, *args, **kwargs)
@@ -424,25 +425,25 @@ class C3HarnessTests(unittest.TestCase):
                 with self.subTest(name=name):
                     aid, branch, worktree = "a-" + name, "c3/target/a-" + name, root / "assignment-worktrees" / ("a-" + name)
                     channels = (root / "worker-channel" / aid, root / "worker-channel-responses" / aid)
-                    payload = {"assignment_id":aid,"role":"F.C3.A1","sprint":"S25","task":"x","prompt":"x","target_id":"target","declared_resources":[]}; real_run = subprocess.run
-                    def run(command: list[str], **kwargs: object) -> object:
-                        if failure == "worktree" and command[:3] == ["git","worktree","add"]:
-                            real_run(["git","branch",branch,command[-1]], cwd=target, check=True, capture_output=True, text=True)
+                    payload = {"assignment_id":aid,"role":"F.C3.A1","sprint":"S25","task":"x","prompt":"x","target_id":"target","declared_resources":[]}; real_run: Any = subprocess.run
+                    def run(command: list[str], *, _failure=failure, _real_run=real_run, _branch=branch, **kwargs: object) -> object:
+                        if _failure == "worktree" and command[:3] == ["git","worktree","add"]:
+                            _real_run(["git","branch",_branch,command[-1]], cwd=target, check=True, capture_output=True, text=True)
                             return SimpleNamespace(returncode=1, stdout="", stderr="synthetic branch-only failure")
-                        return real_run(command, **kwargs)
+                        return _real_run(command, **kwargs)
                     protected = AdmissionError("synthetic setup failure") if failure == "seed" else c3._protected_seed_snapshot
-                    original_open = Path.open
+                    original_open: Any = Path.open
                     captured_stdout: list[object] = []
-                    def open_fault(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
-                        if failure == "open" and path.name == aid + ".controller.stderr.log" and mode == "xb": raise OSError("synthetic second-handle failure")
-                        handle = original_open(path, mode, *args, **kwargs)
-                        if failure == "open" and path.name == aid + ".controller.stdout.log" and mode == "xb": captured_stdout.append(handle)
+                    def open_fault(path: Path, mode: str = "r", *args: object, _failure=failure, _aid=aid, _original_open=original_open, _captured_stdout=captured_stdout, **kwargs: object) -> object:
+                        if _failure == "open" and path.name == _aid + ".controller.stderr.log" and mode == "xb": raise OSError("synthetic second-handle failure")
+                        handle = _original_open(path, mode, *args, **kwargs)
+                        if _failure == "open" and path.name == _aid + ".controller.stdout.log" and mode == "xb": _captured_stdout.append(handle)
                         return handle
-                    real_popen = subprocess.Popen
-                    def controller_popen(command: list[str], *args: object, **kwargs: object) -> object:
-                        if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return real_popen(command, *args, **kwargs)
-                        if failure == "popen": raise OSError("synthetic Popen failure")
-                        raise AssertionError("controller launch must not run for " + failure)
+                    real_popen: Any = subprocess.Popen
+                    def controller_popen(command: list[str], *args: object, _real_popen=real_popen, _failure=failure, **kwargs: object) -> object:
+                        if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return _real_popen(command, *args, **kwargs)
+                        if _failure == "popen": raise OSError("synthetic Popen failure")
+                        raise AssertionError("controller launch must not run for " + _failure)
                     with patch.object(c3.subprocess, "run", side_effect=run), patch.object(c3, "_protected_seed_snapshot", side_effect=protected), patch.object(Path, "open", new=open_fault), patch.object(c3.subprocess, "Popen", side_effect=controller_popen):
                         with self.assertRaises(AdmissionError): harness._assignment(payload)
                     evidence = root / "assignments" / (aid + ".PRESTART_REJECTED.json")
@@ -460,6 +461,7 @@ class C3HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); aid = "a1"; target = root / "target"; harness.broker = AcceptanceBroker(root, harness.seed, harness.policy, harness.templates, harness.manifest, target_root=target); harness.broker.materialize_seed(target)
             process = _Process(); identity = {"pid":4242,"created_utc":"exact"}; created = datetime(2026,8,4,tzinfo=timezone.utc); snapshot = ProcessSnapshot(True,(ProcessInfo(4242,1,"python","lane",created),),(),"synthetic")
+            real_popen: Any = subprocess.Popen
             def launch(command: list[str], **_: object) -> _Process:
                 if command[:3] != [sys.executable, "-m", "orchestrator_harness.lane_controller"]: return real_popen(command, **_)
                 status = Path(json.loads(Path(command[-1]).read_text(encoding="utf-8"))["output_paths"]["status"]); status.write_text(json.dumps({"schema":"orchestrator-lane-controller/v1","state":"RUNNING_CODEX","controller_pid":4242,"controller_created_utc":iso_utc(created)}), encoding="utf-8"); return process
@@ -469,7 +471,6 @@ class C3HarnessTests(unittest.TestCase):
                 original_append(path, value)
                 if value.get("state") == "STARTED" and not persisted["started"]: persisted["started"] = True; raise OSError("fsync acknowledgement ambiguous")
             payload = {"assignment_id":aid,"role":"F.C3.A1","sprint":"S25","task":"x","prompt":"x","target_id":"target","declared_resources":[]}
-            real_popen = subprocess.Popen
             with patch.object(c3.subprocess,"Popen",side_effect=launch), patch.object(c3,"process_snapshot",return_value=snapshot), patch.object(c3,"exact_process_identity",side_effect=exact), patch.object(c3,"_atomic_append",side_effect=ambiguous):
                 with self.assertRaises(AdmissionError): harness._assignment(payload)
             cleanup_path = root / "assignments" / (aid + ".PRESTART_REJECTED.json"); cleanup = json.loads(cleanup_path.read_text(encoding="utf-8")); self.assertEqual("REAPED",cleanup["outcome"])
@@ -489,7 +490,7 @@ class C3HarnessTests(unittest.TestCase):
                 def verify(self, payload: bytes, signature: str, key: str) -> bool:
                     observed_payloads.append(payload)
                     return signature == "signed" and key == "key" and bool(payload)
-            harness.verifier = RecordingVerifier()
+            harness.verifier = cast(Any, RecordingVerifier())
             def request(request_id: str, kind: str, payload: dict[str, object]) -> dict[str, object]:
                 value = {"schema":"firmware-c3-harness-request/v1","request_id":request_id,"attempt_id":"attempt-1","c1_reference":{"path":str(c1),"sha256":_digest(c1)},"delegated_reference":{"path":str(delegated),"sha256":_digest(delegated),},"orchestrator_identity":harness.topology["identity_binding"],"topology_key_release":harness.topology["release"],"kind":kind,"issued_utc":"2026-08-05T00:00:00+00:00","issued_monotonic":0.0,"expires_monotonic":100.0,"payload":payload,"public_key":"key","signature":"signed"}
                 (harness.request_root / (request_id + ".json")).write_text(json.dumps(value),encoding="utf-8")
@@ -516,11 +517,11 @@ class C3HarnessTests(unittest.TestCase):
             status = {"schema":"orchestrator-lane-controller/v1","state":"WAITING_RESOURCE","controller_pid":100,"controller_created_utc":stamp}; opaque = {"pid":100,"created_utc":"windows-filetime:133000000000000000"}
             with patch.object(c3, "exact_process_identity", side_effect=[opaque, opaque]):
                 same = c3._controller_observation(ProcessSnapshot(True, (launcher,), (), "synthetic"), opaque, 100, status, json.dumps(status).encode(), root / "status.json", invocation, opaque)
-            self.assertIsNotNone(same); self.assertTrue(c3._observation_authenticates(same)); self.assertEqual("same-process", same["shape"])
+            self.assertIsNotNone(same); assert same is not None; self.assertTrue(c3._observation_authenticates(same)); self.assertEqual("same-process", same["shape"])
             direct_status = {**status,"controller_pid":200}; direct = {"pid":200,"created_utc":"windows-filetime:133000000000000001"}; launcher_identity = {"pid":100,"created_utc":"windows-filetime:133000000000000000"}
             with patch.object(c3, "exact_process_identity", side_effect=[direct, launcher_identity]), patch.object(c3, "lane_controller_command_matches", return_value=True) as matcher:
                 observation = c3._controller_observation(ProcessSnapshot(True, (launcher, controller), (), "synthetic"), launcher_identity, 100, direct_status, json.dumps(direct_status).encode(), root / "status.json", invocation, direct)
-                self.assertTrue(c3._observation_authenticates(observation)); matcher.assert_called_once()
+                assert observation is not None; self.assertTrue(c3._observation_authenticates(observation)); matcher.assert_called_once()
             with patch.object(c3, "exact_process_identity", return_value={"pid":100,"created_utc":"windows-filetime:new"}):
                 self.assertIsNone(c3._controller_observation(ProcessSnapshot(True, (launcher,), (), "synthetic"), opaque, 100, status, b"{}", root / "status.json", invocation, opaque))
 
@@ -556,11 +557,11 @@ class C3HarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); harness = self._bare(root); process = _Process(); channels = (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1"); worktree = root / "assignment-worktrees" / "a1"
             cleanup = {"schema":"firmware-c3-prestart-rejection/v1","assignment_id":"a1","reason":"rejected","launcher_identity":None,"controller_identity":None,"handles_closed":True,"launcher_reaped":False,"controller_reaped":True,"process_reaped":False,"worktree_removed":False,"branch_removed":False,"channels_removed":False,"outcome":"RECOVERY_REQUIRED"}
-            with patch.object(c3, "exact_process_identity", return_value=None), self.assertRaises(c3.RecoveryRequired): harness._require_recovery("a1", process, None, None, worktree, "c3/target/a1", channels, cleanup)
+            with patch.object(c3, "exact_process_identity", return_value=None), self.assertRaises(c3.RecoveryRequired): harness._require_recovery("a1", cast(Any, process), None, None, worktree, "c3/target/a1", channels, cleanup)
             record = json.loads((harness.state_root / "RECOVERY_REQUIRED.json").read_text()); self.assertEqual(process.pid, record["launcher_pid"])
             (harness.state_root / "RECOVERY_REQUIRED.json").unlink(); harness.recovery = None
             bad = {**cleanup,"launcher_identity":{"pid":999,"created_utc":"bad"}}
-            with patch.object(c3, "exact_process_identity", return_value="not-an-identity"), self.assertRaises(AdmissionError): harness._require_recovery("a1", process, bad["launcher_identity"], None, worktree, "c3/target/a1", channels, bad)
+            with patch.object(c3, "exact_process_identity", return_value="not-an-identity"), self.assertRaises(AdmissionError): harness._require_recovery("a1", cast(Any, process), bad["launcher_identity"], None, worktree, "c3/target/a1", channels, bad)
             self.assertFalse((harness.state_root / "RECOVERY_REQUIRED.json").exists())
 
     def test_s26_a1_rejection_keeps_worktree_and_channels_when_launcher_exits_but_controller_survives(self) -> None:
@@ -572,7 +573,7 @@ class C3HarnessTests(unittest.TestCase):
             launcher, controller = {"pid":4242,"created_utc":"launcher"}, {"pid":4343,"created_utc":"controller"}
             process = _Process(0)
             with patch.object(c3, "exact_process_identity", side_effect=lambda pid: controller if pid == 4343 else None), patch.object(c3.subprocess, "run") as git:
-                cleanup = harness._reject_unregistered_assignment("a1", process, launcher, controller, worktree, "c3/target/a1", target, channels, (), "controller survived launcher exit")
+                cleanup = harness._reject_unregistered_assignment("a1", cast(Any, process), launcher, controller, worktree, "c3/target/a1", target, channels, (), "controller survived launcher exit")
             self.assertEqual("RECOVERY_REQUIRED", cleanup["outcome"])
             self.assertFalse(cleanup["process_reaped"]); self.assertFalse(cleanup["controller_reaped"])
             self.assertTrue(worktree.exists()); self.assertTrue(all(channel.exists() for channel in channels)); git.assert_not_called()
@@ -582,7 +583,7 @@ class C3HarnessTests(unittest.TestCase):
             root = Path(temporary); harness = self._bare(root); target = root / "target"; target.mkdir(); process = _Process(7)
             channels = (root / "worker-channel" / "a1", root / "worker-channel-responses" / "a1")
             with patch.object(c3.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
-                cleanup = harness._reject_unregistered_assignment("a1", process, None, None, root / "missing-worktree", "c3/target/a1", target, channels, (), "terminal handle")
+                cleanup = harness._reject_unregistered_assignment("a1", cast(Any, process), None, None, root / "missing-worktree", "c3/target/a1", target, channels, (), "terminal handle")
             self.assertTrue(cleanup["launcher_reaped"])
             harness.workers = {"a1":process}; harness.assignments = {"a1":{"identity":None,"controller_identity":None,"worktree":root,"seed":{},"invocation":{"output_paths":{}},"status_identity":{}}}
             with patch.object(c3, "_protected_seed_snapshot", side_effect=AdmissionError("synthetic")):

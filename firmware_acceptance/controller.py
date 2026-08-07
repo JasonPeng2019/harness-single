@@ -18,9 +18,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from orchestrator_harness.models import ProcessInfo
 from orchestrator_harness.processes import process_snapshot
-from orchestrator_harness.resource_locks import ResourceClaims, ResourceLockError
+from orchestrator_harness.resource_locks import ResourceClaims
 from harness_common.process_identity import exact_process_identity
 from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256, reject_linked_path, validate_delegated_authorization
 
@@ -395,7 +394,6 @@ class FirmwareAcceptanceController:
         rule = self.broker.policy["methods"].get(call["method"])
         if not isinstance(rule, dict) or session["state"] not in rule["allowed_from"]: raise AdmissionError("method is not allowed from current session state")
         expected = rule.get("next")
-        plan_parameters = None
         if "next_by_mode" in rule:
             values = call["arguments"]
             mode = "all_null" if all(value is None for value in values.values()) else "populated"
@@ -663,7 +661,7 @@ class FirmwareAcceptanceController:
             try: process.wait(timeout=self.io_timeout); cleanup["natural_eof"] = True
             except subprocess.TimeoutExpired:
                 before = self.identity_provider(process.pid)
-                if before != session["open"]["server_process_identity"]: raise AdmissionError("child identity changed before termination")
+                if before != session["open"]["server_process_identity"]: raise AdmissionError("child identity changed before termination") from None
                 process.terminate(); process.wait(timeout=self.io_timeout)
             if self.identity_provider(process.pid) == session["open"]["server_process_identity"]: raise AdmissionError("exact child remains after reap")
             cleanup["exact_reaped"] = True
@@ -740,7 +738,7 @@ class FirmwareAcceptanceController:
             proposal = {**proposal, "claim": claim}
             raw_sha = _write_new(resolved, proposal)
         except BaseException:
-            if claims.release_all(): raise AdmissionError("resource claim release failed")
+            if claims.release_all(): raise AdmissionError("resource claim release failed") from None
             raise
         self._live_claims, self._live_claim, self._proposal_binding = claims, claim, (resolved, raw_sha)
         return {**proposal, "path": str(resolved), "raw_sha256": raw_sha}

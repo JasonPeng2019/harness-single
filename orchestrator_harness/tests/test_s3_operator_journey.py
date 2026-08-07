@@ -104,7 +104,14 @@ class S3OperatorJourneyTests(unittest.TestCase):
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
         recipe = (REPOSITORY_ROOT / "examples" / "dual-path-manager.example.md").read_text(encoding="utf-8")
         safeguard = (REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1").read_text(encoding="utf-8")
-        registry = json.loads((REPOSITORY_ROOT.parents[2] / "passed-tests.json").read_text(encoding="utf-8"))
+        registry_candidates = (
+            REPOSITORY_ROOT.parents[2] / "passed-tests.json",
+            REPOSITORY_ROOT.parents[0] / "plans" / "general-coding-harness" / "runtime" / "firmware-v2" / "passed-tests.json",
+        )
+        registry_path = next((path for path in registry_candidates if path.is_file()), None)
+        self.assertIsNotNone(registry_path)
+        assert registry_path is not None
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
 
         for text in (quick_start, recipe):
             self.assertIn("scan --no-write", text)

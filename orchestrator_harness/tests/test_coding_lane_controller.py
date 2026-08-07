@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
@@ -187,7 +188,7 @@ class CodingLaneControllerTests(unittest.TestCase):
         lock_root = self.runtime_root / "coding-resource-locks"
         published: list[dict[str, object]] = []
         original_atomic_json = controller._atomic_json
-        original_popen = controller.subprocess.Popen
+        original_popen: Any = controller.subprocess.Popen
 
         def record(path: Path, value: dict[str, object]) -> None:
             published.append(dict(value)); original_atomic_json(path, value)

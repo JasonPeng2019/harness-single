@@ -126,6 +126,11 @@ def _process_identity(value: Any, pid: int) -> bool:
             and isinstance(value.get("created_utc"),str) and bool(value["created_utc"]))
 
 
+def _distinct_controller_identity(launcher_identity: dict[str, Any] | None,
+                                  controller_identity: dict[str, Any] | None) -> dict[str, Any] | None:
+    return None if launcher_identity is not None and controller_identity == launcher_identity else controller_identity
+
+
 def _controller_observation(snapshot: Any, launcher_identity: dict[str, Any], launcher_pid: int,
                             status: dict[str, Any], status_bytes: bytes, status_path: Path,
                             invocation_path: Path, controller_before: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -367,7 +372,7 @@ class C3Harness:
                 prior = json.loads(claim.read_text(encoding="utf-8"))
                 response = _safe_child(self.response_root, request_id + ".json")
                 if prior.get("request_sha256") == raw_sha and response.is_file(): return {**json.loads(response.read_text(encoding="utf-8")),"path":str(response),"raw_sha256":_sha(response)}
-                raise AdmissionError("request replay or request-id collision")
+                raise AdmissionError("request replay or request-id collision") from None
             if self.admission_closed and request["kind"] != "shutdown": raise AdmissionError("harness admission is closed")
             result = self._dispatch(request["kind"], request["payload"])
             self._status("HEARTBEAT", request_id=request_id, outcome="ACCEPTED")
@@ -398,6 +403,7 @@ class C3Harness:
 
     def _reject_unregistered_assignment(self, aid: str, proc: subprocess.Popen[Any] | None, identity: dict[str, Any] | None, controller_identity: dict[str, Any] | None, worktree: Path, branch: str, target: Path, channels: tuple[Path, ...], handles: tuple[Any | None, ...], reason: str, *, persist_evidence: bool = True) -> dict[str, Any]:
         """Close unpublished ownership transactionally; never signal an identity-unknown PID."""
+        controller_identity = _distinct_controller_identity(identity, controller_identity)
         cleanup: dict[str, Any] = {"schema":"firmware-c3-prestart-rejection/v1", "assignment_id":aid, "reason":reason, "launcher_identity":identity, "controller_identity":controller_identity, "handles_closed":True, "launcher_reaped":proc is None, "controller_reaped":controller_identity is None, "process_reaped":proc is None and controller_identity is None, "worktree_removed":False, "branch_removed":False, "channels_removed":False}
         for handle in handles:
             if handle is not None:
@@ -528,7 +534,7 @@ class C3Harness:
         except Exception as exc:
             cleanup = self._reject_unregistered_assignment(aid, proc, identity, controller_identity, worktree, branch, target, (inbox, response_root), (out_handle, err_handle), str(exc))
             if cleanup["outcome"] != "REAPED" and proc is not None:
-                self._require_recovery(aid, proc, identity, controller_identity, worktree, branch, (inbox, response_root), cleanup)
+                self._require_recovery(aid, proc, identity, _distinct_controller_identity(identity, controller_identity), worktree, branch, (inbox, response_root), cleanup)
             if started_publication and cleanup["outcome"] == "REAPED":
                 cleanup_path = _safe_child(self.root,"assignments",aid + ".PRESTART_REJECTED.json")
                 _atomic_append(self.registry_path, {"schema":"firmware-c3-worker-lifecycle/v1","state":"TERMINAL","assignment_id":aid,"launcher_identity":identity,"controller_identity":controller_identity,"rejected":True,"reaped":True,"prestart_cleanup":{"path":str(cleanup_path),"sha256":_sha(cleanup_path)}})

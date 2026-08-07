@@ -202,8 +202,12 @@ class FirmwareAcceptanceKitTests(unittest.TestCase):
             value = {"schema_version":"delegated-hardware-authorization-v1","issuance_source":"goal.md Section 11 USER_HARDWARE_AUTHORIZATION_V1","canonical_user_scope_sha256":canonical_sha256(_USER_ISSUED_SCOPE),"user_issued_scope":_USER_ISSUED_SCOPE,"derived_bindings":{"c1_lock_id":"C1","operative_goal_sha256":"goal","stable_fixtures":fixtures,"destructive_exclusions":_USER_ISSUED_SCOPE["prohibited_action_classes"],"rf_limits":{"ble":_USER_ISSUED_SCOPE["limits"]["ble"],"lora":_USER_ISSUED_SCOPE["limits"]["lora"]},"mcp_server_pin":ref("pin"),"mcp_method_policy":{"path":str(policy),"sha256":__import__("hashlib").sha256(policy.read_bytes()).hexdigest()},"governing_documents":governing}}
             artifact = root / "delegated.json"; artifact.write_text(__import__("json").dumps(value), encoding="utf-8"); reference = {"path":str(artifact),"sha256":__import__("hashlib").sha256(artifact.read_bytes()).hexdigest()}
             self.assertEqual(value, validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker", Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest))
-            for mutation in (lambda: value.__setitem__("extra", True), lambda: value.__setitem__("canonical_user_scope_sha256", "0" * 64), lambda: value["derived_bindings"].pop("rf_limits")):
-                mutated = __import__("json").loads(__import__("json").dumps(value)); mutation(); artifact.write_text(__import__("json").dumps(value), encoding="utf-8"); reference["sha256"] = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+            for mutation in ("extra", "scope", "rf_limits"):
+                mutated = __import__("json").loads(__import__("json").dumps(value))
+                if mutation == "extra": value["extra"] = True
+                elif mutation == "scope": value["canonical_user_scope_sha256"] = "0" * 64
+                else: value["derived_bindings"].pop("rf_limits")
+                artifact.write_text(__import__("json").dumps(value), encoding="utf-8"); reference["sha256"] = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
                 with self.assertRaises(AdmissionError): validate_delegated_authorization(reference, policy_path=policy, manifest=AcceptanceBroker(root / "broker" / str(len(str(value))), Path("firmware_acceptance/seed"), policy, Path("firmware_acceptance/LANE_TEMPLATES.json")).manifest)
                 value = mutated
 

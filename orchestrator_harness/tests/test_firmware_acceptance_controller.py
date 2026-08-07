@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import firmware_acceptance.controller as controller_module
@@ -23,8 +24,10 @@ class _Input(io.BytesIO):
 
 class _Process:
     def __init__(self) -> None:
-        self.pid, self.stdin, self.stderr = 4242, _Input(), io.BytesIO()
-        self.stdout = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n')
+        self.pid = 4242
+        self.stdin: Any = _Input()
+        self.stderr: Any = io.BytesIO()
+        self.stdout: Any = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":{}}\n{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n')
         self.exit: int | None = None
         self.terminate_exits, self.wait_timeouts = True, 0
         self.terminated, self.killed = False, False
@@ -32,7 +35,7 @@ class _Process:
     def terminate(self) -> None: self.terminated = True; self.exit = 0 if self.terminate_exits else None
     def kill(self) -> None: self.killed = True; self.exit = -9
     def wait(self, timeout: float | None = None) -> int:
-        if self.wait_timeouts: self.wait_timeouts -= 1; raise subprocess.TimeoutExpired("fake", timeout)
+        if self.wait_timeouts: self.wait_timeouts -= 1; raise subprocess.TimeoutExpired("fake", timeout if timeout is not None else 0.0)
         self.exit = 0 if self.exit is None else self.exit; return self.exit
 
 
@@ -76,6 +79,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
 
     def _flow(self, root: Path, controller: FirmwareAcceptanceController, verifier: _Verifier) -> tuple[Path, Path, Path]:
         proposal_path = root / "broker" / "proposal.json"; proposal = controller.publish_proposal(proposal_path, {"call":self._call(root)})
+        assert controller._live_claims is not None
         self.assertTrue(controller._live_claims.held)  # O signs only after exact claim is live.
         self.assertFalse({"proposal_sha256","decision_sha256","authorization_sha256"} & set(proposal["call"]))
         decision_path = root / "broker" / "decision.json"
@@ -139,9 +143,9 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             board_id = "server-stm-a"
             null_plan = {"board_id":None,"hypothesis":None,"strategy":None,"hypothesis_made":None,"strategy_evaluated":None,"expected_fail_return":None,"expected_success_return":None,"max_calls":None,"max_calls_buffer":None,"action_parameters":None,"user_permission":None}
             setup_args = self._setup_plan_arguments(board_id)
-            action_args = {"board_id":board_id, **setup_args["action_parameters"]}
-            route = {"display_name":"STM-A","route":"setup","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_setup-plan"}},"plan_initialization_call":{"tool":"board_setup-plan","arguments":null_plan}}
-            validate_route = {"display_name":"STM-A","route":"validate","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_validate"}},"next_call":{"tool":"board_validate","arguments":{"board_id":board_id,"probe_id":"probe-1"}}}
+            action_args = {"board_id":board_id, **cast(dict[str, object], setup_args["action_parameters"])}
+            route: dict[str, Any] = {"display_name":"STM-A","route":"setup","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_setup-plan"}},"plan_initialization_call":{"tool":"board_setup-plan","arguments":null_plan}}
+            validate_route: dict[str, Any] = {"display_name":"STM-A","route":"validate","board_id":board_id,"load_call":{"tool":"load_setup_tool","arguments":{"board_id":board_id,"tool_name":"board_validate"}},"next_call":{"tool":"board_validate","arguments":{"board_id":board_id,"probe_id":"probe-1"}}}
             payloads = [
                 {"status":"setup_names_required", "connection_assignments":{"STM-A":"wired"}},
                 {"status":"setup_routes_ready", "routes":[route]},
@@ -171,7 +175,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             )
             final: dict[str, object] | None = None
             for call_id, method, arguments, next_state, action_class in calls:
-                final = self._execute_session_call(root, controller, verifier, opened, self._session_call(root, call_id=call_id, method=method, arguments=arguments, action_class=action_class), next_state)
+                final = self._execute_session_call(root, controller, verifier, opened, self._session_call(root, call_id=call_id, method=method, arguments=cast(dict[str, object], arguments), action_class=action_class), next_state)
             self.assertEqual("RETURNED", final["resulting_state"] if final else None)
             self.assertEqual(1, len(launches))
             terminal = controller.abort_session("test terminal")
@@ -224,6 +228,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             result = controller.session_execute_artifacts(*paths, verifier)
             self.assertEqual("ROUTED", result["resulting_state"]); self.assertEqual(1, len(launches))
             with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "bad.json", {"session_id":opened["session_id"],"sequence_number":3,"prior_result":None,"current_state":"ROUTED","next_state":"ROUTED","call":call})
+            assert controller._session is not None
             controller._session["state"] = "OP_ACTION_READY"; controller._session["active_plan"] = {"method":"write_serial","parameters":{"text":"expected","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None}}
             action = self._call(root); action.update({"call_id":"action-2","method":"write_serial","method_version":1,"arguments":{"board_id":"STM-A","text":"altered","baudrate":None,"port":None,"append_newline":True,"timeout_seconds":1,"on_exit":None},"action_class":"uart_session_io"})
             with self.assertRaises(AdmissionError): controller.session_publish_proposal(root / "broker" / "paired-action.json", {"session_id":opened["session_id"],"sequence_number":2,"prior_result":{"path":result["path"],"sha256":result["raw_sha256"]},"current_state":"OP_ACTION_READY","next_state":"READY","call":action})
@@ -241,6 +246,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             overview = self._session_call(root, call_id="route-1", method="setup_overview", arguments={"board_names":["STM-A"],"connection_assignments":None}, action_class="probe_discovery_read")
             self._execute_session_call(root, controller, verifier, opened, overview, "ROUTED")
             # READY is the prerequisite established by the separately tested setup/validation state graph.
+            assert controller._session is not None
             controller._session["state"] = "READY"
             call = self._session_call(root, call_id="disconnect-1", method="disconnect", arguments={"board_id":"server-stm-a"})
             proposal, decision, authorization = self._session_artifacts(root, controller, verifier, {"session_id":opened["session_id"],"sequence_number":2,"prior_result":controller._session["prior_result"],"current_state":"READY","next_state":"RETURNED","call":call})
@@ -273,7 +279,7 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             def close(self) -> None: pass
         with tempfile.TemporaryDirectory() as temporary:
             root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims); paths = self._flow(root, controller, verifier)
-            original = controller_module._StdioTransport
+            original: Any = controller_module._StdioTransport
             def transport(process: _Process, *args: object) -> _StdioTransport:
                 value = original(process, *args); stderr_log = value.stderr_log; self.assertIsNotNone(stderr_log); assert stderr_log is not None; self.assertFalse(stderr_log.closed); stderr_log.close(); value.stderr_log = FailingSink(); process.stderr = io.BytesIO(b"stderr"); value._stderr(); return value
             with patch.object(controller_module, "_StdioTransport", transport), self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
@@ -363,7 +369,9 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
                 elif mutation == "replay":
                     value = json.loads(authorization.read_text()); value["one_shot_id"] = "other"; authorization.write_text(json.dumps(value), encoding="utf-8")
                 elif mutation == "deny": value["decision"] = "deny"
-                elif mutation == "owner": controller._live_claim["owner"] = {"pid":2}
+                elif mutation == "owner":
+                    assert controller._live_claim is not None
+                    controller._live_claim["owner"] = {"pid":2}
                 if mutation not in ("replay", "owner"): decision.write_text(json.dumps(value, sort_keys=True, separators=(",",":")), encoding="utf-8")
                 with self.assertRaises(AdmissionError): controller.execute_artifacts(proposal, decision, authorization, verifier)
                 self.assertEqual([], launches); self.assertFalse(claims[0].live)
@@ -373,11 +381,11 @@ class FirmwareAcceptanceControllerTests(unittest.TestCase):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root, launches, claims, verifier = Path(temporary), [], [], _Verifier(); controller = self._controller(root, launches, claims)
                 paths = self._flow(root, controller, verifier)
-                original_record, original_config, original_admit = controller.broker.record, controller.broker.controller_config, controller.broker.admit
+                original_record = controller.broker.record
                 if failure == "record": controller.broker.record = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("record"))  # type: ignore[method-assign]
                 elif failure == "config": controller.broker.controller_config = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("config"))  # type: ignore[method-assign]
                 elif failure == "result":
-                    controller.broker.record = lambda stage, *args, **kwargs: (_ for _ in ()).throw(AdmissionError("result")) if stage == "result" else original_record(stage, *args, **kwargs)  # type: ignore[method-assign]
+                    controller.broker.record = lambda stage, *args, _original_record=original_record, **kwargs: (_ for _ in ()).throw(AdmissionError("result")) if stage == "result" else _original_record(stage, *args, **kwargs)  # type: ignore[method-assign]
                 else: controller.broker.admit = lambda *args, **kwargs: (_ for _ in ()).throw(AdmissionError("admit"))  # type: ignore[method-assign]
                 with self.assertRaises(AdmissionError): controller.execute_artifacts(*paths, verifier)
                 self.assertFalse(claims[0].live); self.assertIsNone(controller._live_claims)
