@@ -433,7 +433,7 @@ class FirmwareAcceptanceController:
         proposal, proposal_sha = self._read_bound(proposal_path, {"schema","session_id","session_open_path","session_open_sha256","sequence_number","prior_result","current_state","next_state","call","claim","plan_label"})
         if session["pending_proposal"] != (proposal_path.resolve(), proposal_sha) or session["pending_call_id"] != proposal["call"]["call_id"]:
             raise AdmissionError("session execution proposal is not the pending proposal")
-        decision, decision_sha = self._read_bound(decision_path, _DECISION_KEYS)
+        decision, decision_sha = self._read_external_bound(decision_path, _DECISION_KEYS)
         self._validate_decision(proposal_path, proposal_sha, proposal, decision, verifier)
         if self.clock() >= decision["expires_monotonic"]: raise AdmissionError("approval expired before authorization")
         authorization = {"schema":"firmware-derived-authorization/v2", "proposal_path":str(proposal_path.resolve()), "proposal_sha256":proposal_sha, "decision_path":str(decision_path.resolve()), "decision_sha256":decision_sha, "launch_intent":self.topology["launch"] if self.topology else proposal["call"]["topology_key_release"], "orchestrator_identity":decision["orchestrator_identity"], "topology_key_release":decision["topology_key_release"], "c1_reference":proposal["call"]["c1_reference"], "delegated_reference":proposal["call"]["delegated_reference"], "call":proposal["call"], "claim":proposal["claim"], "expires_monotonic":decision["expires_monotonic"], "one_shot_id":proposal["call"]["call_id"], "revoked":False}
@@ -453,7 +453,7 @@ class FirmwareAcceptanceController:
         proposal, proposal_sha = self._read_bound(proposal_path, {"schema","session_id","session_open_path","session_open_sha256","sequence_number","prior_result","current_state","next_state","call","claim","plan_label"})
         if session["pending_proposal"] != (proposal_path.resolve(), proposal_sha) or session["pending_call_id"] != proposal["call"]["call_id"]:
             self.abort_session("proposal was not the one pending call"); raise AdmissionError("session execution proposal is not the pending proposal")
-        decision, decision_sha = self._read_bound(decision_path, _DECISION_KEYS)
+        decision, decision_sha = self._read_external_bound(decision_path, _DECISION_KEYS)
         if decision.get("proposal_path") != str(proposal_path.resolve()) or decision.get("proposal_sha256") != proposal_sha or decision.get("call") != proposal["call"] or decision.get("claim") != session["claim"]:
             self.abort_session("decision binding mismatch"); raise AdmissionError("session decision does not bind the exact proposal")
         if not verifier.verify(canonical_decision_payload(decision), decision.get("signature",""), decision.get("public_key","")) or decision.get("decision") != "approve" or self.clock() >= decision.get("expires_monotonic", -1):
@@ -917,6 +917,10 @@ class FirmwareAcceptanceController:
 
     def _read_bound(self, path: Path, keys: set[str]) -> tuple[dict[str, Any], str]:
         value = self._load_artifact(path, keys)
+        return value, hashlib.sha256(path.resolve().read_bytes()).hexdigest()
+
+    def _read_external_bound(self, path: Path, keys: set[str]) -> tuple[dict[str, Any], str]:
+        value = self._load_external(path, keys)
         return value, hashlib.sha256(path.resolve().read_bytes()).hexdigest()
 
     def _require_live_claim(self, proposal_path: Path, proposal_sha: str, proposal: dict[str, Any]) -> None:
