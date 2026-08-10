@@ -34,10 +34,7 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertIs(snapshot.process_for(11), index[11])
         self.assertTrue(snapshot.parent_matches(11, 10))
         self.assertFalse(snapshot.parent_matches(11, 1))
-        self.assertIsNone(
-            ProcessSnapshot(False, snapshot.processes, ("partial",), "linux-proc")
-            .parent_matches(99, 10)
-        )
+        self.assertIsNone(ProcessSnapshot(False, snapshot.processes, ("partial",), "linux-proc").parent_matches(99, 10))
 
     def test_windows_known_pid_query_does_not_use_full_inventory(self) -> None:
         captured = {}
