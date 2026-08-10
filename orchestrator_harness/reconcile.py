@@ -35,7 +35,7 @@ def _canonical(value: Any) -> str:
 
 def _controller_role(controller: ControllerRecord) -> str:
     status = controller.status.value
-    doer = status.get("doer")
+    doer = status.get("role", status.get("doer"))
     if isinstance(doer, str) and doer.strip():
         return doer.strip()
     thread = status.get("thread_id")
@@ -46,7 +46,7 @@ def _controller_role(controller: ControllerRecord) -> str:
 
 def _lane_id(run: RunRecords, controller: ControllerRecord) -> str:
     status = controller.status.value
-    declared = status.get("declared_lane_id")
+    declared = status.get("lane_id", status.get("declared_lane_id"))
     if isinstance(declared, str) and declared.strip():
         return declared.strip()
     doer = _controller_role(controller)
@@ -57,7 +57,7 @@ def _lane_id(run: RunRecords, controller: ControllerRecord) -> str:
 def _attempt_group_id(run: RunRecords, controller: ControllerRecord) -> str:
     """Identify persistent attempts before choosing the public lane label."""
     status = controller.status.value
-    thread_id = status.get("thread_id")
+    thread_id = status.get("provider_session_id", status.get("session_id", status.get("thread_id")))
     task = str(status.get("task") or run.run_root.name.split("_", 1)[0])
     if isinstance(thread_id, str) and thread_id.strip():
         return f"thread:{run.run_root.name}:{task}:{thread_id.strip()}"
@@ -100,7 +100,7 @@ def _controller_observation(
     raw = controller.status.value
     started = parse_utc(raw.get("started_utc"))
     controller_started = parse_utc(raw.get("controller_started_utc"))
-    codex_started = parse_utc(raw.get("codex_started_utc"))
+    codex_started = parse_utc(raw.get("provider_started_utc") or raw.get("codex_started_utc"))
     controller_pid_value = raw.get("controller_pid")
     try:
         controller_pid = (
@@ -108,7 +108,7 @@ def _controller_observation(
         )
     except (TypeError, ValueError):
         controller_pid = None
-    codex_pid_value = raw.get("codex_pid")
+    codex_pid_value = raw.get("provider_pid") or raw.get("codex_pid")
     try:
         codex_pid = int(codex_pid_value) if codex_pid_value is not None else None
     except (TypeError, ValueError):
@@ -157,7 +157,7 @@ def _controller_observation(
         else:
             operational = "STALE_STATUS"
             reason = "resource-wait declaration contradicts controller identity"
-    elif declared in {"running", "running_codex"}:
+    elif declared in {"running", "running_codex", "running_provider"}:
         if terminal:
             operational = "STALE_STATUS"
             reason = f"terminal JSONL event {terminal} contradicts declared running"
@@ -185,6 +185,9 @@ def _controller_observation(
     elif declared in {
         "exited",
         "codex_exited",
+        "provider_exited",
+        "provider_failed",
+        "provider_cancelled",
         "controller_interrupted",
         "controller_failed",
         "coordination_failed",
@@ -245,6 +248,7 @@ def _controller_observation(
         "task": str(raw.get("task") or ""),
         "phase": str(raw.get("phase") or ""),
         "thread_id": raw.get("thread_id"),
+        "session_id": raw.get("session_id", raw.get("provider_session_id", raw.get("thread_id"))),
         "started_utc": iso_utc(started),
         "ended_utc": raw.get("ended_utc"),
         "controller_pid": controller_pid,
@@ -261,11 +265,28 @@ def _controller_observation(
             codex_process.created_utc if codex_process else None
         ),
         "codex_started_utc": iso_utc(codex_started),
+        "provider_id": raw.get("provider_id", "codex"),
+        "provider_pid": codex_pid,
+        "provider_identity": codex_identity,
+        "provider_reason": codex_reason,
+        "provider_created_utc": iso_utc(
+            codex_process.created_utc if codex_process else None
+        ),
+        "provider_started_utc": iso_utc(codex_started),
+        "provider_session_id": raw.get("provider_session_id", raw.get("session_id", raw.get("thread_id"))),
         "parent_state": parent_state,
         "parent_reason": parent_reason,
         "terminal_event": terminal,
         "invocation_schema": raw.get("invocation_schema"),
         "worker_invocation_id": raw.get("worker_invocation_id"),
+        "lane_id": raw.get("lane_id", raw.get("declared_lane_id")),
+        "cohort_id": raw.get("cohort_id"),
+        "workflow": raw.get("workflow"),
+        "task_card": raw.get("task_card"),
+        "prompt_bundle": raw.get("prompt_bundle"),
+        "prompt_bundle_sha256": raw.get("prompt_bundle_sha256"),
+        "prompt_content_sha256": raw.get("prompt_content_sha256", raw.get("prompt_sha256")),
+        "terminal_acceptance_state": raw.get("terminal_acceptance_state"),
         "repository": raw.get("repository"),
         "declared_resources": list(raw.get("resources", []))
         if isinstance(raw.get("resources"), list)
@@ -1239,9 +1260,14 @@ def reconcile(
                 lane["invalid_result"] = dict(run.invalid_result)
             if owns_result:
                 assert run.result is not None
-                lane["operational_state"] = "TERMINAL_RESULT"
+                lane["operational_state"] = (
+                    "RESULT_ACCEPTANCE_PENDING"
+                    if run.result_acceptance_state == "PENDING"
+                    else "TERMINAL_RESULT"
+                )
                 lane["result_path"] = str(run.result.path)
                 lane["result_sha256"] = run.result.stable.sha256
+                lane["result_acceptance_state"] = run.result_acceptance_state
                 lane["result_observed_utc"] = iso_utc(
                     datetime.fromtimestamp(
                         run.result.stable.mtime_ns / 1_000_000_000, tz=timezone.utc
@@ -1376,7 +1402,10 @@ def reconcile(
     active_coding = [
         lane for lane in lanes
         if _lane_is_active_or_unknown(lane)
-        and lane.get("invocation_schema") == "orchestrator-coding-invocation/v1"
+        and lane.get("invocation_schema") in {
+            "orchestrator-coding-invocation/v1",
+            "orchestrator-worker-invocation/v1",
+        }
         and isinstance(lane.get("repository"), dict)
     ]
     for field, kind in (("worktree_root", "DUPLICATE_CODING_WORKTREE"), ("branch", "DUPLICATE_CODING_BRANCH")):

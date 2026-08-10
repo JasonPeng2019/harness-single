@@ -256,25 +256,34 @@ def _creation_matches(value: object, actual: object) -> bool:
 def _trustworthy_live_status(raw: Mapping[str, Any], snapshot: ProcessSnapshot) -> bool:
     if (
         raw.get("schema") != "orchestrator-lane-controller/v1"
-        or raw.get("invocation_schema") != "orchestrator-coding-invocation/v1"
-        or str(raw.get("state", "")).upper() != "RUNNING_CODEX"
+        or raw.get("invocation_schema") not in {
+            "orchestrator-coding-invocation/v1",
+            "orchestrator-worker-invocation/v1",
+        }
+        or str(raw.get("state", "")).upper() not in {"RUNNING_CODEX", "RUNNING_PROVIDER"}
         or not snapshot.complete
     ):
         return False
     controller_pid = raw.get("controller_pid")
-    codex_pid = raw.get("codex_pid")
+    provider_pid = raw.get("provider_pid") or raw.get("codex_pid")
     if not isinstance(controller_pid, int) or isinstance(controller_pid, bool):
         return False
-    if not isinstance(codex_pid, int) or isinstance(codex_pid, bool):
+    if not isinstance(provider_pid, int) or isinstance(provider_pid, bool):
         return False
     controller = snapshot.by_pid.get(controller_pid)
-    codex = snapshot.by_pid.get(codex_pid)
+    provider = snapshot.by_pid.get(provider_pid)
     return bool(
         controller is not None
-        and codex is not None
-        and codex.ppid == controller.pid
+        and provider is not None
+        and provider.ppid == controller.pid
         and _creation_matches(raw.get("controller_created_utc", raw.get("controller_started_utc")), controller)
-        and _creation_matches(raw.get("codex_created_utc", raw.get("codex_started_utc")), codex)
+        and _creation_matches(
+            raw.get("provider_created_utc")
+            or raw.get("codex_created_utc")
+            or raw.get("provider_started_utc")
+            or raw.get("codex_started_utc"),
+            provider,
+        )
     )
 
 
@@ -403,3 +412,34 @@ def invalid_result_evidence(path: Path, detail: str, *, sha256: str | None = Non
         "sha256": sha256,
         "detail": detail[:500],
     }
+
+
+def validate_task_result_repository(
+    value: Mapping[str, Any],
+    *,
+    card: Any,
+    declaration: GitDeclaration,
+    raw_bytes: bytes | None = None,
+) -> Any:
+    """Apply the existing branch/tip/cleanliness gate to a canonical result."""
+
+    from .task import validate_task_result
+
+    result = validate_task_result(value, card=card, raw_bytes=raw_bytes)
+    identity = inspect_repository(declaration)
+    if result.branch != identity.branch:
+        raise GitSafetyError("task result branch does not match the declared branch")
+    if result.commit != identity.head_commit:
+        raise GitSafetyError("task result commit does not equal the current branch tip")
+    dirty = _git(
+        declaration.worktree_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        ".",
+    )
+    if dirty:
+        raise GitSafetyError("task result requires a clean project worktree (ignored runtime state is excluded)")
+    return result

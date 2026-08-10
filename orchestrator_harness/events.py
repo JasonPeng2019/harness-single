@@ -10,6 +10,7 @@ from .stable_io import canonical_json
 
 PROCESS_EVENT_TYPES = {
     "RUNNING_CODEX": "CONTROLLER_ACTIVE",
+    "RUNNING_PROVIDER": "CONTROLLER_ACTIVE",
     "WAITING_RESOURCE": "LANE_WAITING_RESOURCE",
     "STALE_STATUS": "STALE_STATUS",
     "PROCESS_STATE_UNKNOWN": "PROCESS_STATE_UNKNOWN",
@@ -78,6 +79,10 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             "codex_pid": lane.get("codex_pid"),
             "controller_started_utc": lane.get("controller_started_utc"),
             "codex_started_utc": lane.get("codex_started_utc"),
+            "provider_id": lane.get("provider_id", "codex"),
+            "provider_pid": lane.get("provider_pid", lane.get("codex_pid")),
+            "provider_started_utc": lane.get("provider_started_utc", lane.get("codex_started_utc")),
+            "provider_session_id": lane.get("provider_session_id", lane.get("session_id", lane.get("thread_id"))),
             "invocation_schema": lane.get("invocation_schema"),
             "worker_invocation_id": lane.get("worker_invocation_id"),
             "repository": lane.get("repository"),
@@ -85,13 +90,17 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             "held_resource_claims": lane.get("held_resource_claims", []),
             "result_validation": lane.get("result_validation"),
             "result_valid": lane.get("result_valid"),
+            "result_acceptance_state": lane.get("result_acceptance_state"),
             "coordination_failure": lane.get("coordination_failure"),
         }
         identity = f"lane:{lane_id}:process"
         conditions[identity] = _condition(identity, kind, severity, data)
         coordination_failure = lane.get("coordination_failure")
         if (
-            lane.get("invocation_schema") == "orchestrator-coding-invocation/v1"
+            lane.get("invocation_schema") in {
+                "orchestrator-coding-invocation/v1",
+                "orchestrator-worker-invocation/v1",
+            }
             and (
                 lane.get("declared_state") == "coordination_failed"
                 or isinstance(coordination_failure, dict)
@@ -176,6 +185,19 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
                     "lane_id": lane_id,
                     "result_path": lane.get("result_path"),
                     "result_sha256": lane.get("result_sha256"),
+                },
+            )
+        if lane.get("operational_state") == "RESULT_ACCEPTANCE_PENDING":
+            identity = f"lane:{lane_id}:result-acceptance"
+            conditions[identity] = _condition(
+                identity,
+                "RESULT_ACCEPTANCE_PENDING",
+                "info",
+                {
+                    "lane_id": lane_id,
+                    "result_path": lane.get("result_path"),
+                    "result_sha256": lane.get("result_sha256"),
+                    "result_acceptance_state": lane.get("result_acceptance_state", "PENDING"),
                 },
             )
         if lane.get("provider_wait"):
