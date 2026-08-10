@@ -19,7 +19,7 @@ from .git_safety import (
 from .models import ObservationError, StableBytes
 from .models import parse_utc
 from .stable_io import read_stable, read_tail_stable
-from .task import TaskValidationError, TaskCard, validate_task_result
+from .task import TaskValidationError, read_task_advancement, task_card_from_identity, validate_task_result
 from .provider import ProviderAdapterError, provider_adapter
 
 
@@ -584,15 +584,14 @@ def _validate_task_result_cached(
     raw_card = coding_status.status.value.get("task_card")
     if not isinstance(raw_card, Mapping):
         raise TaskValidationError("canonical status is missing task_card identity")
-    card = TaskCard(
-        card_id=str(raw_card.get("id")),
-        lane_id=str(coding_status.status.value.get("declared_lane_id")),
-        worker_invocation_id=str(coding_status.status.value.get("worker_invocation_id")),
-        cohort_id=str(coding_status.status.value.get("cohort_id")),
-        revision=str(raw_card.get("revision")),
-        content_sha256=str(raw_card.get("sha256")),
-        completion_review_owner=str(coding_status.status.value.get("completion_review_owner", "ROOT-IM")),
-        raw=dict(raw_card),
+    card = task_card_from_identity(
+        card_id=raw_card.get("id"),
+        lane_id=coding_status.status.value.get("declared_lane_id"),
+        worker_invocation_id=coding_status.status.value.get("worker_invocation_id"),
+        cohort_id=coding_status.status.value.get("cohort_id"),
+        revision=raw_card.get("revision"),
+        content_sha256=raw_card.get("sha256"),
+        completion_review_owner=coding_status.status.value.get("completion_review_owner", "ROOT-IM"),
     )
     prompt_bundle_sha = coding_status.status.value.get("prompt_bundle_sha256")
     prompt_content_sha = coding_status.status.value.get("prompt_content_sha256")
@@ -613,10 +612,12 @@ def _validate_task_result_cached(
         raise TaskValidationError("canonical result prompt bundle identity does not match status")
     if candidate.value.get("prompt_content_sha256") != prompt_content_sha:
         raise TaskValidationError("canonical result prompt content identity does not match status")
-    # An acceptance state written by a worker is not sufficient evidence.  The
-    # controller/discovery surface intentionally reports pending until a
-    # separately bound orchestrator acceptance record is supplied.
-    return "PENDING" if result.acceptance_state in {"PENDING", "ACCEPTED"} else result.acceptance_state
+    advancement = read_task_advancement(
+        coding_status.workspace,
+        card=card,
+        result=result,
+    )
+    return advancement.state
 
 
 def discover_run(

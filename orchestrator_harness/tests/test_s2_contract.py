@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from orchestrator_harness.invocation import (
 )
 from orchestrator_harness.lane_controller import load_invocation
 import orchestrator_harness.lane_controller as controller
+from orchestrator_harness.discovery import discover_run
 from orchestrator_harness.profile import RuntimeProfile, build_child_environment
 from orchestrator_harness.prompt_bundle import (
     bundle_from_record,
@@ -30,11 +32,14 @@ from orchestrator_harness.task import (
     TASK_RESULT_SCHEMA,
     advance_task,
     record_sha256,
+    read_task_advancement,
+    TaskValidationError,
     validate_completion_review,
     validate_orchestrator_acceptance,
     validate_task_card,
     validate_task_result,
 )
+from orchestrator_harness.tests.support import SuiteFixture
 
 
 class S2ContractTests(unittest.TestCase):
@@ -148,6 +153,7 @@ class S2ContractTests(unittest.TestCase):
                 "worker_invocation_id": card.worker_invocation_id,
                 "cohort_id": card.cohort_id,
                 "revision": card.revision,
+                "task_card_sha256": card.content_sha256,
                 "branch": "lane-1",
                 "commit": "a" * 40,
                 "outcome": "PASS",
@@ -194,6 +200,90 @@ class S2ContractTests(unittest.TestCase):
             advanced = advance_task(card, result, review=review, acceptance=acceptance)
             self.assertEqual("ACCEPTED", advanced.state)
             self.assertTrue(advanced.terminal)
+
+    def test_fixed_task_advancement_chain_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            card_raw = {
+                "schema": TASK_CARD_SCHEMA,
+                "card_id": "card-chain",
+                "lane_id": "lane-chain",
+                "stage_cohort_id": "cohort-chain",
+                "worker_invocation_id": "worker-chain",
+                "objective": "chain",
+                "revision": "r1",
+            }
+            card = validate_task_card(card_raw)
+            result_raw = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "task_card_sha256": card.content_sha256,
+                "branch": "lane-chain",
+                "commit": "b" * 40,
+                "outcome": "PASS",
+                "summary": "chain",
+                "checks": [{"name": "chain", "outcome": "PASS"}],
+            }
+            result_bytes = (json.dumps(result_raw, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            result = validate_task_result(result_raw, card=card, raw_bytes=result_bytes)
+            pending = read_task_advancement(workspace, card=card, result=result)
+            self.assertEqual("PENDING", pending.state)
+
+            review = {
+                "schema": COMPLETION_REVIEW_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "result_sha256": result.content_sha256,
+                "owner": card.completion_review_owner,
+                "verdict": "PASS",
+                "evidence": ["test://chain"],
+            }
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_sha = hashlib.sha256(review_bytes).hexdigest()
+            acceptance = {
+                "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "card_sha256": card.content_sha256,
+                "result_sha256": result.content_sha256,
+                "completion_review_sha256": review_sha,
+                "accepted_commit": result.commit,
+                "accepted_by": "ROOT-IM",
+                "verdict": "ACCEPTED",
+            }
+            (workspace / "COMPLETION_REVIEW.json").write_bytes(review_bytes)
+            self.assertRaises(TaskValidationError, read_task_advancement, workspace, card=card, result=result)
+            (workspace / "ORCHESTRATOR_ACCEPTANCE.json").write_text("not-json", encoding="utf-8")
+            with self.assertRaises(TaskValidationError):
+                read_task_advancement(workspace, card=card, result=result)
+
+            for field, bad_value in (
+                ("card_sha256", "c" * 64),
+                ("result_sha256", "d" * 64),
+                ("completion_review_sha256", "e" * 64),
+                ("accepted_commit", "f" * 40),
+            ):
+                case = workspace / field
+                case.mkdir()
+                (case / "COMPLETION_REVIEW.json").write_bytes(review_bytes)
+                invalid_acceptance = dict(acceptance)
+                invalid_acceptance[field] = bad_value
+                (case / "ORCHESTRATOR_ACCEPTANCE.json").write_text(
+                    json.dumps(invalid_acceptance, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(TaskValidationError):
+                    read_task_advancement(case, card=card, result=result)
 
     def test_claude_adapter_and_profile_use_only_synthetic_provider_facts(self) -> None:
         adapter = ClaudeCodeProviderAdapter()
@@ -310,6 +400,74 @@ class S2ContractTests(unittest.TestCase):
         with self.assertRaises(InvocationValidationError):
             adapt_legacy_firmware(mixed)
 
+    def test_coding_v1_closed_contract_and_alias_matrix(self) -> None:
+        coding = {
+            "schema": "orchestrator-coding-invocation/v1",
+            "action": "start",
+            "run_root": "C:/run",
+            "runtime_root": "C:/runtime",
+            "prompt_path": "C:/run/prompt.md",
+            "prompt_sha256": "a" * 64,
+            "worker_invocation_id": "worker-1",
+            "lane_id": "lane-1",
+            "task": "coding-task",
+            "phase": "implementation",
+            "event_log_path": "C:/runtime/events.jsonl",
+            "output_paths": {
+                "status": "C:/run/.agent-workspace/status.json",
+                "jsonl": "C:/run/.agent-workspace/provider.jsonl",
+                "stderr": "C:/run/.agent-workspace/stderr.log",
+                "last_message": "C:/run/.agent-workspace/last-message",
+            },
+            "codex": {
+                "model": "codex-test",
+                "reasoning_effort": "medium",
+                "service_tier": "priority",
+                "sandbox": "workspace-write",
+                "approval_policy": "never",
+            },
+        }
+        aliases = (
+            ("codex", "codex_settings"),
+            ("codex", "model_settings"),
+            ("event_log_path", "event_log"),
+            ("event_log_path", "lane_event_log"),
+            ("lane_id", "declared_lane_id"),
+            ("resources", "exclusive_resources"),
+            ("repository", "git"),
+            ("resume_identity", "resume"),
+        )
+        for original, alias in aliases:
+            variant = dict(coding)
+            if original in {"codex", "event_log_path"}:
+                variant[alias] = variant.pop(original)
+            elif original == "lane_id":
+                variant[alias] = variant.pop(original)
+            elif original == "resources":
+                variant[alias] = []
+            elif original == "repository":
+                variant[alias] = {"worktree_root": "C:/run"}
+            else:
+                variant[alias] = {"thread_id": "thread-1"}
+            adapted = adapt_coding_v1(variant)
+            self.assertEqual("codex", adapted.provider_id)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for field in ("provider", "profile", "prompt_bundle", "workflow", "task_card", "cohort_id", "unknown_field"):
+                invocation = root / f"{field}.json"
+                invalid = dict(coding)
+                invalid[field] = {}
+                invocation.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(controller.InvocationError):
+                    controller.load_invocation(invocation)
+                self.assertFalse((root / ".agent-workspace").exists())
+
+        ambiguous = dict(coding)
+        ambiguous["codex_settings"] = dict(coding["codex"])
+        with self.assertRaises(InvocationValidationError):
+            adapt_coding_v1(ambiguous)
+
     def test_controller_fake_claude_start_resume_failure_and_wrong_session(self) -> None:
         fake_source = """
 import json, sys
@@ -335,6 +493,7 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
                 "worker_invocation_id": card["worker_invocation_id"],
                 "cohort_id": card["stage_cohort_id"],
                 "revision": card["revision"],
+                "task_card_sha256": record_sha256(card),
                 "branch": "synthetic",
                 "commit": "a" * 40,
                 "outcome": "PASS",
@@ -384,6 +543,144 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
                 (failure_root / "run" / ".agent-workspace" / "worker_controller.status.json").read_text(encoding="utf-8")
             )
             self.assertEqual("FAILED", failure_status["provider_terminal_outcome"])
+
+    def test_controller_acceptance_chain_blocks_resume_before_fake_provider(self) -> None:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'session-accepted'}), flush=True)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session-accepted'}), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "provider-launches.txt"
+            fake = root / "fake_claude.py"
+            fake.write_text(fake_source, encoding="utf-8")
+            raw, card = self._canonical(root)
+            raw["provider"] = {
+                **raw["provider"],  # type: ignore[arg-type]
+                "command": [sys.executable, str(fake), str(marker)],
+            }
+            bundle = raw["prompt_bundle"]  # type: ignore[assignment]
+            result = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "task_card_sha256": record_sha256(card),
+                "branch": "synthetic",
+                "commit": "a" * 40,
+                "outcome": "PASS",
+                "summary": "synthetic provider completed",
+                "checks": [{"name": "fake-provider", "outcome": "PASS"}],
+                "prompt_bundle_sha256": bundle["bundle_sha256"],
+                "prompt_content_sha256": bundle["final_sha256"],
+            }
+            invocation_path = root / "run" / ".agent-workspace" / "start.invocation.json"
+            invocation_path.write_text(json.dumps(raw), encoding="utf-8")
+            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(invocation_path)]))
+            workspace = root / "run" / ".agent-workspace"
+            self.assertEqual("PENDING", json.loads((workspace / "worker_controller.status.json").read_text())["terminal_acceptance_state"])
+            fixture = SuiteFixture.create()
+            try:
+                pending = discover_run(root / "run", workspace, fixture.config)
+                self.assertEqual("PENDING", pending.result_acceptance_state)
+            finally:
+                fixture.close()
+
+            result_bytes = (workspace / "RESULT.json").read_bytes()
+            result_sha = hashlib.sha256(result_bytes).hexdigest()
+            review = {
+                "schema": COMPLETION_REVIEW_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "result_sha256": result_sha,
+                "owner": "ROOT-IM",
+                "verdict": "PASS",
+                "evidence": ["test://s2-controller"],
+            }
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_sha = hashlib.sha256(review_bytes).hexdigest()
+            acceptance = {
+                "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "card_sha256": record_sha256(card),
+                "result_sha256": result_sha,
+                "completion_review_sha256": review_sha,
+                "accepted_commit": "a" * 40,
+                "accepted_by": "ROOT-IM",
+                "verdict": "ACCEPTED",
+            }
+            (workspace / "COMPLETION_REVIEW.json").write_bytes(review_bytes)
+            (workspace / "ORCHESTRATOR_ACCEPTANCE.json").write_text(
+                json.dumps(acceptance, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            fixture = SuiteFixture.create()
+            try:
+                accepted = discover_run(root / "run", workspace, fixture.config)
+                self.assertEqual("ACCEPTED", accepted.result_acceptance_state)
+            finally:
+                fixture.close()
+
+            resume = dict(raw)
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-accepted"}
+            resume_path = workspace / "resume-accepted.invocation.json"
+            resume_path.write_text(json.dumps(resume), encoding="utf-8")
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            self.assertEqual(2, controller.main([str(resume_path)]))
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            status = json.loads((workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
+            self.assertEqual("ACCEPTED", status["terminal_acceptance_state"])
+            self.assertEqual("ACCEPTED", status["resume_identity"]["terminal_acceptance_state"])
+            self.assertEqual(
+                acceptance["accepted_commit"],
+                status["resume_identity"]["acceptance_identity"]["accepted_commit"],
+            )
+
+    def test_controller_result_gate_rejects_wrong_task_card_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card = self._canonical(root)
+            invocation_path = root / "run" / ".agent-workspace" / "gate.invocation.json"
+            invocation_path.write_text(json.dumps(raw), encoding="utf-8")
+            invocation = controller.load_invocation(invocation_path)
+            bundle = raw["prompt_bundle"]  # type: ignore[assignment]
+            result = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "task_card_sha256": "0" * 64,
+                "branch": "synthetic",
+                "commit": "a" * 40,
+                "outcome": "PASS",
+                "summary": "wrong card digest",
+                "checks": [],
+                "prompt_bundle_sha256": bundle["bundle_sha256"],
+                "prompt_content_sha256": bundle["final_sha256"],
+            }
+            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
+            evidence, valid, task_result = controller._canonical_result_validation(invocation)
+            self.assertFalse(valid)
+            self.assertIsNone(task_result)
+            self.assertIn("task card content identity", evidence["detail"])
 
 
 if __name__ == "__main__":

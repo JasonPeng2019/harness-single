@@ -33,9 +33,11 @@ from .git_safety import (
 )
 from .invocation import (
     CANONICAL_INVOCATION_SCHEMA,
+    CODING_V1_FIRMWARE_ONLY_FIELDS,
     CanonicalInvocation,
     InvocationValidationError,
     parse_canonical_invocation,
+    validate_coding_v1_fields,
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
@@ -49,7 +51,13 @@ from .provider import (
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .resume import ResumeAdmissionError, require_resume_admission
-from .task import TaskValidationError, validate_task_card, validate_task_result
+from .task import (
+    TaskResult,
+    TaskValidationError,
+    read_task_advancement,
+    task_card_from_identity,
+    validate_task_result,
+)
 
 
 class InvocationError(ValueError):
@@ -61,13 +69,7 @@ CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 # These keys are route discriminators, rather than optional aliases.  Silently
 # ignoring one on the other route would make a hand-written mixed invocation
 # appear valid while dropping its safety contract.
-_FIRMWARE_ONLY_FIELDS = frozenset({
-    "policy_sha256",
-    "leases",
-    "board_tokens",
-    "mcp_servers",
-    "server_snapshot",
-})
+_FIRMWARE_ONLY_FIELDS = CODING_V1_FIRMWARE_ONLY_FIELDS
 _CODING_ONLY_FIELDS = frozenset({
     "worker_invocation_id",
     "runtime_root",
@@ -395,6 +397,13 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
 
 
 def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
+    # This must remain the first coding-v1 operation: the shared closed
+    # contract rejects mixed/canonical/unknown fields before path resolution,
+    # workspace creation, or event-log mutation.
+    try:
+        validate_coding_v1_fields(raw)
+    except InvocationValidationError as exc:
+        raise InvocationError(str(exc)) from exc
     _reject_foreign_fields(raw, route="coding", fields=_FIRMWARE_ONLY_FIELDS)
     _reject_ambiguous_coding_aliases(raw)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
@@ -769,13 +778,13 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
         return invalid_result_evidence(path, str(exc), sha256=sha256), False
 
 
-def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool]:
+def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool, TaskResult | None]:
     """Validate canonical result shape while leaving semantic acceptance pending."""
 
     assert invocation.canonical is not None
     path = invocation.workspace / "RESULT.json"
     if not path.exists():
-        return {"state": "MISSING", "path": str(path), "acceptance_state": "PENDING"}, True
+        return {"state": "MISSING", "path": str(path), "acceptance_state": "PENDING"}, True, None
     raw_bytes: bytes | None = None
     try:
         raw_bytes = path.read_bytes()
@@ -784,17 +793,13 @@ def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any]
         value = json.loads(raw_bytes.decode("utf-8-sig"))
         if not isinstance(value, Mapping):
             raise TaskValidationError("canonical task result root must be an object")
-        card = validate_task_card(
-            {
-                "schema": "orchestrator-task-card/v1",
-                "card_id": invocation.canonical.task_card_id,
-                "lane_id": invocation.canonical.lane_id,
-                "stage_cohort_id": invocation.canonical.cohort_id,
-                "worker_invocation_id": invocation.canonical.worker_invocation_id,
-                "objective": invocation.canonical.task,
-                "revision": invocation.canonical.task_card_revision,
-                "completion_review_owner": "ROOT-IM",
-            }
+        card = task_card_from_identity(
+            card_id=invocation.canonical.task_card_id,
+            lane_id=invocation.canonical.lane_id,
+            worker_invocation_id=invocation.canonical.worker_invocation_id,
+            cohort_id=invocation.canonical.cohort_id,
+            revision=invocation.canonical.task_card_revision,
+            content_sha256=invocation.canonical.task_card_sha256,
         )
         if invocation.repository is not None:
             result = validate_task_result_repository(
@@ -818,9 +823,9 @@ def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any]
             "prompt_content_sha256": invocation.canonical.prompt_content_sha256,
             "commit": result.commit,
             "acceptance_state": "PENDING",
-        }, True
+        }, True, result
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TaskValidationError, GitSafetyError) as exc:
-        return invalid_result_evidence(path, str(exc), sha256=hashlib.sha256(raw_bytes).hexdigest() if raw_bytes is not None else None), False
+        return invalid_result_evidence(path, str(exc), sha256=hashlib.sha256(raw_bytes).hexdigest() if raw_bytes is not None else None), False, None
 
 
 def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> ProviderLaunchSpec:
@@ -886,6 +891,41 @@ def run(invocation: Invocation) -> int:
             if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
                 raise InvocationError("resume requires the persisted provider session ID")
             if invocation.canonical is not None:
+                # Re-read the exact result and the fixed manager-owned chain
+                # before any provider argv is built.  A valid acceptance is
+                # terminal; a present invalid/partial chain fails closed.
+                result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+                if not result_valid:
+                    detail = result_validation.get("detail", "canonical task result is invalid")
+                    raise InvocationError(f"canonical resume requires a valid task result: {detail}")
+                if task_result is not None:
+                    try:
+                        advancement = read_task_advancement(
+                            invocation.workspace,
+                            card=task_result.card,
+                            result=task_result,
+                        )
+                    except TaskValidationError as exc:
+                        raise InvocationError(f"canonical resume task advancement rejected: {exc}") from exc
+                    if advancement.state == "ACCEPTED":
+                        acceptance_identity = advancement.acceptance_identity
+                        if acceptance_identity is None:
+                            raise InvocationError("canonical resume acceptance is missing its identity")
+                        updated_status = dict(prior_status)
+                        updated_status["terminal_acceptance_state"] = "ACCEPTED"
+                        updated_status["task_advancement_state"] = "ACCEPTED"
+                        updated_status["acceptance_identity"] = acceptance_identity
+                        persisted_resume_identity = updated_status.get("resume_identity")
+                        if not isinstance(persisted_resume_identity, Mapping):
+                            raise InvocationError("canonical resume requires persisted resume_identity")
+                        accepted_resume_identity = dict(persisted_resume_identity)
+                        accepted_resume_identity["terminal_acceptance_state"] = "ACCEPTED"
+                        accepted_resume_identity["acceptance_identity"] = acceptance_identity
+                        updated_status["resume_identity"] = accepted_resume_identity
+                        _atomic_json(invocation.status_path, updated_status)
+                        raise InvocationError(
+                            "canonical task is already accepted; resume rejected before provider launch"
+                        )
                 requested_identity = invocation.canonical.identity(
                     session_id=thread,
                     starting_commit=starting_commit,
@@ -1163,10 +1203,47 @@ def run(invocation: Invocation) -> int:
             return 1
         result_valid = True
         if invocation.canonical is not None:
-            result_validation, result_valid = _canonical_result_validation(invocation)
+            result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+            advancement = None
+            if result_valid and task_result is not None:
+                try:
+                    advancement = read_task_advancement(
+                        invocation.workspace,
+                        card=task_result.card,
+                        result=task_result,
+                    )
+                except TaskValidationError as exc:
+                    result_validation = {
+                        "state": "ADVANCEMENT_INVALID",
+                        "path": str(invocation.workspace),
+                        "detail": str(exc),
+                        "acceptance_state": "PENDING",
+                    }
+                    result_valid = False
             state["result_validation"] = result_validation
             state["result_valid"] = result_valid
-            state["terminal_acceptance_state"] = result_validation.get("acceptance_state", "PENDING")
+            state["task_advancement_state"] = advancement.state if advancement is not None else "PENDING"
+            state["terminal_acceptance_state"] = "PENDING"
+            if advancement is not None:
+                result_validation["acceptance_state"] = advancement.state
+            if advancement is not None and advancement.state == "ACCEPTED":
+                acceptance_identity = advancement.acceptance_identity
+                if acceptance_identity is None:
+                    result_validation = {
+                        "state": "ADVANCEMENT_INVALID",
+                        "path": str(invocation.workspace),
+                        "detail": "accepted task advancement has no acceptance identity",
+                        "acceptance_state": "PENDING",
+                    }
+                    state["result_validation"] = result_validation
+                    state["result_valid"] = False
+                else:
+                    state["terminal_acceptance_state"] = "ACCEPTED"
+                    state["acceptance_identity"] = acceptance_identity
+                    resume_identity = dict(state.get("resume_identity") or {})
+                    resume_identity["terminal_acceptance_state"] = "ACCEPTED"
+                    resume_identity["acceptance_identity"] = acceptance_identity
+                    state["resume_identity"] = resume_identity
         elif invocation.repository is not None:
             result_validation, result_valid = _coding_result_validation(invocation)
             state["result_validation"] = result_validation

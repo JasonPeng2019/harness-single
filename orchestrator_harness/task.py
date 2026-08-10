@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -18,6 +19,8 @@ TASK_CARD_SCHEMA = "orchestrator-task-card/v1"
 TASK_RESULT_SCHEMA = "orchestrator-task-result/v1"
 COMPLETION_REVIEW_SCHEMA = "orchestrator-completion-review/v1"
 ORCHESTRATOR_ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
+COMPLETION_REVIEW_FILENAME = "COMPLETION_REVIEW.json"
+ORCHESTRATOR_ACCEPTANCE_FILENAME = "ORCHESTRATOR_ACCEPTANCE.json"
 _HEX_COMMIT = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _DIGEST = re.compile(r"^[0-9a-fA-F]{64}$")
 _TASK_CARD_ALLOWED = {
@@ -119,6 +122,52 @@ class TaskCard:
         }
 
 
+def task_card_from_identity(
+    *,
+    card_id: object,
+    lane_id: object,
+    worker_invocation_id: object,
+    cohort_id: object,
+    revision: object,
+    content_sha256: object,
+    completion_review_owner: object = "ROOT-IM",
+) -> TaskCard:
+    """Build a card identity without hashing a synthetic replacement card.
+
+    Controller and discovery status records carry the manager-declared card
+    digest, not the full card bytes.  This adapter keeps that exact digest
+    bound to result/review validation instead of manufacturing a different
+    content hash from a partial local record.
+    """
+
+    card_id_text = _text(card_id, "task card.card_id")
+    lane_id_text = _text(lane_id, "task card.lane_id")
+    worker_text = _text(worker_invocation_id, "task card.worker_invocation_id")
+    cohort_text = _text(cohort_id, "task card.stage_cohort_id")
+    revision_text = _text(revision, "task card.revision")
+    content_digest = _digest(content_sha256, "task card.content_sha256")
+    owner_text = _text(completion_review_owner, "task card.completion_review_owner")
+    return TaskCard(
+        card_id_text,
+        lane_id_text,
+        worker_text,
+        cohort_text,
+        revision_text,
+        content_digest,
+        owner_text,
+        {
+            "schema": TASK_CARD_SCHEMA,
+            "card_id": card_id_text,
+            "lane_id": lane_id_text,
+            "stage_cohort_id": cohort_text,
+            "worker_invocation_id": worker_text,
+            "revision": revision_text,
+            "content_sha256": content_digest,
+            "completion_review_owner": owner_text,
+        },
+    )
+
+
 def validate_task_card(value: Mapping[str, Any], *, raw_bytes: bytes | None = None) -> TaskCard:
     if not isinstance(value, Mapping):
         raise TaskValidationError("task card must be an object")
@@ -179,6 +228,7 @@ def validate_task_result(
         "worker_invocation_id",
         "cohort_id",
         "revision",
+        "task_card_sha256",
         "branch",
         "commit",
         "outcome",
@@ -198,6 +248,8 @@ def validate_task_result(
     }
     if any(value.get(key) != expected for key, expected in expected_identity.items()):
         raise TaskValidationError("task result task/card identity does not match")
+    if _digest(value.get("task_card_sha256"), "task result.task_card_sha256") != card.content_sha256:
+        raise TaskValidationError("task result task card content identity does not match")
     branch = _text(value.get("branch"), "task result.branch")
     commit = _text(value.get("commit"), "task result.commit").lower()
     if _HEX_COMMIT.fullmatch(commit) is None:
@@ -363,6 +415,43 @@ class TaskAdvancement:
     acceptance_sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class TaskAdvancementEvidence:
+    """The validated fixed-workspace advancement chain."""
+
+    advancement: TaskAdvancement
+    review: CompletionReview | None
+    acceptance: OrchestratorAcceptance | None
+
+    @property
+    def state(self) -> str:
+        return "PENDING" if self.advancement.state == "ACCEPTANCE_PENDING" else self.advancement.state
+
+    @property
+    def terminal(self) -> bool:
+        return self.advancement.terminal
+
+    @property
+    def acceptance_identity(self) -> dict[str, str] | None:
+        if self.acceptance is None:
+            return None
+        return {
+            "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+            "card_id": self.acceptance.card.card_id,
+            "lane_id": self.acceptance.card.lane_id,
+            "worker_invocation_id": self.acceptance.card.worker_invocation_id,
+            "cohort_id": self.acceptance.card.cohort_id,
+            "revision": self.acceptance.card.revision,
+            "card_sha256": self.acceptance.card.content_sha256,
+            "result_sha256": self.acceptance.result_sha256,
+            "completion_review_sha256": self.acceptance.review_sha256,
+            "accepted_commit": self.acceptance.accepted_commit,
+            "accepted_by": self.acceptance.accepted_by,
+            "verdict": self.acceptance.verdict,
+            "content_sha256": self.acceptance.content_sha256,
+        }
+
+
 def advance_task(
     card: TaskCard,
     result: TaskResult,
@@ -395,6 +484,70 @@ def advance_task(
     )
 
 
+def _read_fixed_artifact(workspace: Path, filename: str) -> tuple[Mapping[str, Any], bytes] | None:
+    path = workspace / filename
+    if path.is_symlink():
+        raise TaskValidationError(f"task advancement artifact {filename} must be a regular file")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise TaskValidationError(f"task advancement artifact {filename} must be a regular file")
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
+        raise TaskValidationError(f"cannot read task advancement artifact {filename}: {exc}") from exc
+    if len(raw_bytes) > 1024 * 1024:
+        raise TaskValidationError(f"task advancement artifact {filename} exceeds the 1 MiB limit")
+    try:
+        value = json.loads(raw_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TaskValidationError(f"task advancement artifact {filename} is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise TaskValidationError(f"task advancement artifact {filename} must contain an object")
+    return value, raw_bytes
+
+
+def read_task_advancement(
+    workspace: Path,
+    *,
+    card: TaskCard,
+    result: TaskResult,
+) -> TaskAdvancementEvidence:
+    """Validate one manager-owned card -> result -> review -> acceptance chain.
+
+    The two artifact names are deliberately fixed.  Both absent is the only
+    PENDING case; a partial or malformed publication is an actionable error.
+    """
+
+    review_artifact = _read_fixed_artifact(workspace, COMPLETION_REVIEW_FILENAME)
+    acceptance_artifact = _read_fixed_artifact(workspace, ORCHESTRATOR_ACCEPTANCE_FILENAME)
+    if review_artifact is None and acceptance_artifact is None:
+        advancement = advance_task(card, result)
+        return TaskAdvancementEvidence(advancement, None, None)
+    if review_artifact is None or acceptance_artifact is None:
+        missing = COMPLETION_REVIEW_FILENAME if review_artifact is None else ORCHESTRATOR_ACCEPTANCE_FILENAME
+        raise TaskValidationError(
+            f"task advancement chain is incomplete: {missing} is missing; publish both fixed artifacts together"
+        )
+    review_value, review_bytes = review_artifact
+    acceptance_value, acceptance_bytes = acceptance_artifact
+    review = validate_completion_review(
+        review_value,
+        card=card,
+        result=result,
+        raw_bytes=review_bytes,
+    )
+    acceptance = validate_orchestrator_acceptance(
+        acceptance_value,
+        card=card,
+        result=result,
+        review=review,
+        raw_bytes=acceptance_bytes,
+    )
+    advancement = advance_task(card, result, review=review, acceptance=acceptance)
+    return TaskAdvancementEvidence(advancement, review, acceptance)
+
+
 validate_task_record = validate_task_result
 validate_completion_review_record = validate_completion_review
 validate_acceptance_record = validate_orchestrator_acceptance
@@ -403,12 +556,15 @@ TaskRecord = TaskResult
 
 __all__ = [
     "COMPLETION_REVIEW_SCHEMA",
+    "COMPLETION_REVIEW_FILENAME",
     "ORCHESTRATOR_ACCEPTANCE_SCHEMA",
+    "ORCHESTRATOR_ACCEPTANCE_FILENAME",
     "TASK_CARD_SCHEMA",
     "TASK_RESULT_SCHEMA",
     "CompletionReview",
     "OrchestratorAcceptance",
     "TaskAdvancement",
+    "TaskAdvancementEvidence",
     "TaskCard",
     "TaskResult",
     "TaskRecord",
@@ -416,6 +572,8 @@ __all__ = [
     "advance_task",
     "canonical_record",
     "record_sha256",
+    "read_task_advancement",
+    "task_card_from_identity",
     "validate_completion_review",
     "validate_completion_review_record",
     "validate_acceptance_record",

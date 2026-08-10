@@ -20,9 +20,102 @@ from .stable_io import canonical_json
 CANONICAL_INVOCATION_SCHEMA = "orchestrator-worker-invocation/v1"
 CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 
+# This is the single public top-level coding-v1 contract.  Keep the aliases
+# here, rather than in either consumer, so adapters cannot silently diverge.
+CODING_V1_CANONICAL_ONLY_FIELDS = frozenset({
+    "provider",
+    "profile",
+    "prompt_bundle",
+    "workflow",
+    "task_card",
+    "cohort_id",
+})
+CODING_V1_FIRMWARE_ONLY_FIELDS = frozenset({
+    "policy_sha256",
+    "leases",
+    "board_tokens",
+    "mcp_servers",
+    "server_snapshot",
+})
+CODING_V1_ALIAS_GROUPS = (
+    ("codex", "codex_settings", "model_settings"),
+    ("repository", "git"),
+    ("event_log_path", "event_log", "lane_event_log"),
+    ("resume_identity", "resume"),
+)
+CODING_V1_ALLOWED_FIELDS = frozenset({
+    "schema",
+    "action",
+    "run_root",
+    "runtime_root",
+    "prompt_path",
+    "prompt_sha256",
+    "output_paths",
+    "event_log_path",
+    "event_log",
+    "lane_event_log",
+    "worker_invocation_id",
+    "lane_id",
+    "declared_lane_id",
+    "task",
+    "phase",
+    "repository",
+    "git",
+    "resources",
+    "exclusive_resources",
+    "resource_lock_root",
+    "codex",
+    "codex_settings",
+    "model_settings",
+    "codex_command",
+    "config_overrides",
+    "resume_thread_id",
+    "resume_identity",
+    "resume",
+    "label",
+    "doer",
+    "finding_gate",
+    "child_environment_isolation",
+})
+
 
 class InvocationValidationError(ValueError):
     """Raised when an invocation cannot be adapted without ambiguity."""
+
+
+def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
+    """Validate coding-v1's closed top-level shape before any filesystem work."""
+
+    if not isinstance(raw, Mapping):
+        raise InvocationValidationError("coding v1 invocation must be an object")
+    if raw.get("schema") != CODING_INVOCATION_SCHEMA:
+        raise InvocationValidationError("record is not coding v1")
+    canonical = sorted(CODING_V1_CANONICAL_ONLY_FIELDS & set(raw), key=str)
+    if canonical:
+        raise InvocationValidationError(
+            "coding v1 record contains canonical-only fields: " + ", ".join(map(str, canonical))
+        )
+    firmware = sorted(CODING_V1_FIRMWARE_ONLY_FIELDS & set(raw), key=str)
+    if firmware:
+        raise InvocationValidationError(
+            "coding v1 record contains fields reserved for the other route (firmware-only): "
+            + ", ".join(map(str, firmware))
+        )
+    unknown = sorted(set(raw) - CODING_V1_ALLOWED_FIELDS, key=str)
+    if unknown:
+        raise InvocationValidationError(
+            "coding v1 record contains unknown top-level fields: " + ", ".join(map(str, unknown))
+        )
+    for aliases in CODING_V1_ALIAS_GROUPS:
+        present = [alias for alias in aliases if alias in raw]
+        if len(present) > 1:
+            raise InvocationValidationError(
+                "coding v1 contains ambiguous aliases: " + ", ".join(present)
+            )
+    if "lane_id" in raw and "declared_lane_id" in raw and raw["lane_id"] != raw["declared_lane_id"]:
+        raise InvocationValidationError("coding v1 lane_id and declared_lane_id conflict")
+    if "resources" in raw and "exclusive_resources" in raw and raw["resources"] != raw["exclusive_resources"]:
+        raise InvocationValidationError("coding v1 resources and exclusive_resources conflict")
 
 
 _LEGACY_FIELDS = frozenset(
@@ -408,19 +501,7 @@ def _legacy_bundle_record(
 def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> CanonicalInvocation:
     """Adapt coding v1 without accepting firmware-only fields."""
 
-    if raw.get("schema") != CODING_INVOCATION_SCHEMA:
-        raise InvocationValidationError("record is not coding v1")
-    if set(raw) & {"policy_sha256", "leases", "board_tokens", "mcp_servers", "server_snapshot"}:
-        raise InvocationValidationError("coding v1 record contains firmware-only fields")
-    for aliases, name in (
-        (("codex", "codex_settings", "model_settings"), "provider settings"),
-        (("repository", "git"), "repository"),
-        (("event_log_path", "event_log", "lane_event_log"), "event log"),
-        (("resume_identity", "resume"), "resume identity"),
-    ):
-        present = [alias for alias in aliases if alias in raw]
-        if len(present) > 1:
-            raise InvocationValidationError(f"coding v1 contains ambiguous {name} aliases")
+    validate_coding_v1_fields(raw)
     settings = raw.get("codex", raw.get("codex_settings", raw.get("model_settings")))
     if not isinstance(settings, Mapping):
         raise InvocationValidationError("coding v1 provider settings are missing")
@@ -451,6 +532,20 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
         raise InvocationValidationError("coding v1 output_paths are missing")
     output_paths = {key: Path(_text(output.get(key), f"output_paths.{key}")) for key in ("status", "jsonl", "stderr", "last_message")}
     repository = raw.get("repository", raw.get("git"))
+    requested_thread = _text(raw.get("resume_thread_id"), "resume_thread_id") if raw.get("resume_thread_id") is not None else None
+    resume_identity = raw.get("resume_identity", raw.get("resume"))
+    if resume_identity is not None:
+        if not isinstance(resume_identity, Mapping):
+            raise InvocationValidationError("resume_identity must be an object")
+        identity_worker = resume_identity.get("worker_invocation_id")
+        if identity_worker is not None and identity_worker != worker_id:
+            raise InvocationValidationError("resume identity worker_invocation_id mismatch")
+        identity_thread = resume_identity.get("thread_id")
+        if identity_thread is not None:
+            identity_thread_text = _text(identity_thread, "resume_identity.thread_id")
+            if requested_thread is not None and requested_thread != identity_thread_text:
+                raise InvocationValidationError("conflicting requested resume thread IDs")
+            requested_thread = requested_thread or identity_thread_text
     return CanonicalInvocation(
         CANONICAL_INVOCATION_SCHEMA,
         _text(raw.get("action"), "action").lower(),
@@ -474,7 +569,7 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
         Path(_text(raw.get("event_log_path", raw.get("event_log", raw.get("lane_event_log"))), "event_log_path")),
         tuple(profile["resources"]),
         dict(repository) if isinstance(repository, Mapping) else None,
-        _text(raw.get("resume_thread_id"), "resume_thread_id") if raw.get("resume_thread_id") is not None else None,
+        requested_thread,
         _text(raw.get("label", worker_id), "label"),
         _text(raw.get("task", card_id), "task"),
         _text(raw.get("phase", "implementation"), "phase"),
@@ -585,6 +680,10 @@ __all__ = [
     "CANONICAL_INVOCATION_SCHEMA",
     "CODING_INVOCATION_SCHEMA",
     "CanonicalInvocation",
+    "CODING_V1_ALLOWED_FIELDS",
+    "CODING_V1_ALIAS_GROUPS",
+    "CODING_V1_CANONICAL_ONLY_FIELDS",
+    "CODING_V1_FIRMWARE_ONLY_FIELDS",
     "WorkerInvocation",
     "InvocationValidationError",
     "adapt_coding_v1",
@@ -592,4 +691,5 @@ __all__ = [
     "adapt_legacy_firmware",
     "parse_invocation",
     "parse_canonical_invocation",
+    "validate_coding_v1_fields",
 ]

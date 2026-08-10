@@ -2,6 +2,7 @@ from __future__ import annotations
 # pyright: reportImplicitRelativeImport=false
 
 import os
+import json
 import unittest
 from unittest.mock import patch
 
@@ -145,6 +146,53 @@ class DiscoveryTests(unittest.TestCase):
             dirty = discover_run(run_root, workspace, self.fixture.config)
             self.assertIsNone(dirty.result)
             self.assertEqual(3, validate.call_count)
+
+    def test_canonical_result_task_card_digest_is_checked_at_discovery_boundary(self) -> None:
+        workspace = self.fixture.workspace("S2_digest")
+        status = workspace / "worker_controller.status.json"
+        card_digest = "a" * 64
+        write_json(
+            status,
+            {
+                "schema": "orchestrator-lane-controller/v1",
+                "invocation_schema": "orchestrator-worker-invocation/v1",
+                "state": "PROVIDER_EXITED",
+                "declared_lane_id": "lane-digest",
+                "worker_invocation_id": "worker-digest",
+                "cohort_id": "cohort-digest",
+                "completion_review_owner": "ROOT-IM",
+                "task_card": {
+                    "id": "card-digest",
+                    "revision": "r1",
+                    "sha256": card_digest,
+                },
+            },
+        )
+        result = {
+            "schema": "orchestrator-task-result/v1",
+            "card_id": "card-digest",
+            "lane_id": "lane-digest",
+            "worker_invocation_id": "worker-digest",
+            "cohort_id": "cohort-digest",
+            "revision": "r1",
+            "task_card_sha256": card_digest,
+            "branch": "lane-digest",
+            "commit": "b" * 40,
+            "outcome": "PASS",
+            "summary": "digest",
+            "checks": [{"name": "digest", "outcome": "PASS"}],
+        }
+        result_path = workspace / "RESULT.json"
+        write_json(result_path, result)
+        first = discover_run(workspace.parent, workspace, self.fixture.config)
+        self.assertEqual("PENDING", first.result_acceptance_state)
+        result["task_card_sha256"] = "c" * 64
+        write_json(result_path, result)
+        _clear_observation_caches()
+        invalid = discover_run(workspace.parent, workspace, self.fixture.config)
+        self.assertIsNone(invalid.result)
+        self.assertIsNotNone(invalid.invalid_result)
+        self.assertIn("task card content identity", json.dumps(invalid.invalid_result))
 
 
 if __name__ == "__main__":
