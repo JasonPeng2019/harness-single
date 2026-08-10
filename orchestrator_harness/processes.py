@@ -5,7 +5,7 @@ import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 
 from .models import ProcessInfo, ProcessQuery, ProcessSnapshot, parse_utc
 
@@ -186,6 +186,14 @@ def _linux_boot_time() -> datetime:
     raise RuntimeError("/proc/stat has no btime")
 
 
+def _linux_clock_ticks() -> int:
+    sysconf = getattr(os, "sysconf", None)
+    if not callable(sysconf):
+        raise RuntimeError("os.sysconf is unavailable")
+    read_sysconf = cast(Callable[[str], int], sysconf)
+    return int(read_sysconf("SC_CLK_TCK"))
+
+
 def _linux_process_query(
     pid: int,
     *,
@@ -196,7 +204,7 @@ def _linux_process_query(
         return ProcessQuery(True, None, ("PID is invalid",))
     try:
         boot = boot or _linux_boot_time()
-        ticks = ticks or int(os.sysconf("SC_CLK_TCK"))
+        ticks = ticks or _linux_clock_ticks()
         entry = Path("/proc") / str(pid)
         stat_text = (entry / "stat").read_text(encoding="ascii")
         close = stat_text.rfind(")")
@@ -245,7 +253,7 @@ def linux_process_snapshot() -> ProcessSnapshot:
     processes: list[ProcessInfo] = []
     try:
         boot = _linux_boot_time()
-        ticks = int(os.sysconf("SC_CLK_TCK"))
+        ticks = _linux_clock_ticks()
     except Exception as exc:
         return ProcessSnapshot(False, (), (f"/proc setup failed: {exc}",), "linux-proc")
     for entry in Path("/proc").iterdir():
