@@ -845,6 +845,61 @@ class ReconcileTests(unittest.TestCase):
 
         self.assertEqual("MCP_RUNNING", observed["operational_state"])
 
+    def test_versioned_mcp_processes_container_covers_live_and_exited(self) -> None:
+        self.fixture.status()
+        timestamp = NOW.isoformat().replace("+00:00", "Z")
+        for name, pid, snapshot, expected_operational, expected_process in (
+            (
+                "live",
+                301,
+                self._snapshot_with_process(301, NOW),
+                "MCP_RUNNING",
+                "live",
+            ),
+            (
+                "exited",
+                999,
+                self.fixture.process_snapshot(),
+                "MCP_EXITED",
+                "absent",
+            ),
+        ):
+            with self.subTest(name=name):
+                observed = self._mcp_observation(
+                    {
+                        "schema": "mcp-lifetime/v1",
+                        "server_name": "versioned-plural-mcp",
+                        "mcp_processes": [
+                            {"pid": pid, "created_utc": timestamp}
+                        ],
+                    },
+                    snapshot,
+                )
+                self.assertEqual(expected_operational, observed["operational_state"])
+                self.assertEqual(expected_process, observed["processes"][0]["state"])
+
+    def test_unreadable_declared_mcp_record_blocks_terminal_release_and_preserves_error(self) -> None:
+        status = self.fixture.status(state="exited")
+        value = json.loads(status.read_text(encoding="utf-8"))
+        value["record_paths"] = {"mcp": ["declared/missing-mcp.json"]}
+        write_json(status, value)
+
+        observed = self.observe(ProcessSnapshot(True, (), (), "fake"))
+        lane = observed["lanes"][0]
+        self.assertEqual("EXITED", lane["process_state"])
+        self.assertFalse(lane["resource_release_possible"])
+        self.assertIn(
+            "declared helper/MCP record observation is incomplete",
+            lane["resource_ambiguity"],
+        )
+        self.assertTrue(
+            any(
+                item["code"] == "MCP_READ_ERROR"
+                and item["path"].endswith("declared\\missing-mcp.json")
+                for item in observed["observation_errors"]
+            )
+        )
+
     def test_partial_multi_pid_lifetime_is_ambiguous_not_relay_ready(self) -> None:
         self.fixture.status()
         path, value = self._request()

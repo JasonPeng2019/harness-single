@@ -1,6 +1,7 @@
 from __future__ import annotations
 # pyright: reportImplicitRelativeImport=false
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -82,7 +83,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(2, read.call_count)
             self.assertNotEqual(first.stable.sha256, changed.stable.sha256)
 
-    def test_unchanged_coding_result_uses_git_fingerprint_cache_and_can_revalidate(self) -> None:
+    def test_poisoned_git_environment_clean_then_dirty_invalidates_cached_coding_result(self) -> None:
         run_root = self.fixture.workspace().parent
         repository = TemporaryGitRepository.create(run_root)
         (run_root / ".gitignore").write_text(".agent-workspace/\n", encoding="utf-8")
@@ -114,10 +115,20 @@ class DiscoveryTests(unittest.TestCase):
                 "checks": [],
             },
         )
+        _clear_observation_caches()
         with patch(
             "orchestrator_harness.discovery.validate_coding_result",
             wraps=validate_coding_result,
-        ) as validate:
+        ) as validate, patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(run_root / "poisoned-git"),
+                "GIT_COMMON_DIR": str(run_root / "poisoned-common"),
+                "GIT_INDEX_FILE": str(run_root / "poisoned-index"),
+                "GIT_WORK_TREE": str(run_root / "poisoned-worktree"),
+            },
+            clear=False,
+        ):
             self.assertIsNotNone(discover_run(run_root, workspace, self.fixture.config).result)
             self.assertIsNotNone(discover_run(run_root, workspace, self.fixture.config).result)
             self.assertEqual(1, validate.call_count)

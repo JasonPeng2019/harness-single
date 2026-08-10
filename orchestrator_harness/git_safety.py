@@ -42,6 +42,27 @@ _MAX_STATUS_BYTES = 256 * 1024
 _MAX_WORKTREES = 256
 _MAX_JSON_CANDIDATES_PER_WORKTREE = 256
 _MAX_FINDINGS_BYTES = 256 * 1024
+_GIT_INSPECTION_ENV_KEYS = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "SYSTEMDRIVE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+)
+
+
+def _git_inspection_env() -> dict[str, str]:
+    env = {
+        key: os.environ[key]
+        for key in _GIT_INSPECTION_ENV_KEYS
+        if key in os.environ
+    }
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+    return env
 
 
 def validate_findings(path: Path, *, lane_id: str, worker_invocation_id: str, role: str, commit: str, outcome: str) -> dict[str, Any]:
@@ -154,19 +175,7 @@ def declaration_from_status(raw: Mapping[str, Any], run_root: Path) -> GitDeclar
 
 
 def _git(cwd: Path, *args: str, allow_failure: bool = False) -> str | None:
-    preserved = (
-        "PATH",
-        "PATHEXT",
-        "SYSTEMROOT",
-        "WINDIR",
-        "COMSPEC",
-        "SYSTEMDRIVE",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-    )
-    env = {key: os.environ[key] for key in preserved if key in os.environ}
-    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+    env = _git_inspection_env()
     try:
         completed = subprocess.run(
             ["git", "-C", str(cwd), *args],

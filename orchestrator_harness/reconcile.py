@@ -20,6 +20,13 @@ from .models import (
 
 
 _WINDOWS_DATE_MILLISECONDS = re.compile(r"^/Date\((-?\d+)\)/$")
+_MAX_DECLARED_PROCESS_LIST = 32
+_RESOURCE_OBSERVATION_ERROR_CODES = {
+    "RECORD_PATH_ERROR",
+    "RECORD_MANIFEST_READ_ERROR",
+    "HELPER_READ_ERROR",
+    "MCP_READ_ERROR",
+}
 
 
 def _canonical(value: Any) -> str:
@@ -366,6 +373,22 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
             if field in item:
                 add_process(item, f"{role}.{field}", field=field)
 
+    def add_process_list(item: object, field: str, role: str) -> None:
+        if not isinstance(item, dict):
+            return
+        processes = item.get(field)
+        if not isinstance(processes, list) or len(processes) > _MAX_DECLARED_PROCESS_LIST:
+            return
+        for index, child in enumerate(processes):
+            if isinstance(child, dict):
+                declared_role = child.get("role")
+                suffix = (
+                    str(declared_role).strip()
+                    if isinstance(declared_role, str) and declared_role.strip()
+                    else str(index)
+                )
+                add_direct_fields(child, f"{role}.{field}[{suffix}]")
+
     def add_container(item: object, role: str) -> None:
         if not isinstance(item, dict):
             return
@@ -382,17 +405,8 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
             child = item.get(child_name)
             if isinstance(child, dict):
                 add_direct_fields(child, f"{role}.{child_name}")
-        processes = item.get("processes")
-        if isinstance(processes, list):
-            for index, child in enumerate(processes):
-                if isinstance(child, dict):
-                    declared_role = child.get("role")
-                    suffix = (
-                        str(declared_role).strip()
-                        if isinstance(declared_role, str) and declared_role.strip()
-                        else str(index)
-                    )
-                    add_direct_fields(child, f"{role}.processes[{suffix}]")
+        add_process_list(item, "processes", role)
+        add_process_list(item, "mcp_processes", role)
 
     if not isinstance(value, dict):
         return found
@@ -409,6 +423,11 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
         add_container(
             {"processes": processes}, f"{prefix + '.' if prefix else ''}processes"
         )
+    add_process_list(
+        value,
+        "mcp_processes",
+        f"{prefix + '.' if prefix else ''}mcp_processes",
+    )
     for container_name in ("live_lifetime", "lifetime_binding"):
         container = value.get(container_name)
         if isinstance(container, dict):
@@ -1093,6 +1112,12 @@ def _request_belongs_to_lane(request: dict[str, Any], lane: dict[str, Any]) -> b
     return _record_belongs_to_lane(request, lane)
 
 
+def _has_unresolved_record_observation(run: RunRecords) -> bool:
+    return any(
+        error.code in _RESOURCE_OBSERVATION_ERROR_CODES for error in run.errors
+    )
+
+
 def reconcile(
     runs: tuple[RunRecords, ...],
     snapshot: ProcessSnapshot,
@@ -1254,6 +1279,8 @@ def reconcile(
             ):
                 lane["operational_state"] = "WAITING_RELAY"
             resources, ambiguity = _resource_set(lane, matching_requests)
+            if _has_unresolved_record_observation(run):
+                ambiguity.append("declared helper/MCP record observation is incomplete")
             declared_mcp_values = lane.get("mcp_servers")
             if not isinstance(declared_mcp_values, (list, tuple, set, frozenset)):
                 declared_mcp_values = []

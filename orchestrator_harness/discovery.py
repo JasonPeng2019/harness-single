@@ -12,6 +12,7 @@ from .git_safety import (
     GitSafetyError,
     declaration_from_status,
     invalid_result_evidence,
+    _git_inspection_env,
     validate_coding_result,
 )
 from .models import ObservationError, StableBytes
@@ -507,6 +508,7 @@ def _git_state_fingerprint(worktree: Path) -> tuple[str, ...]:
                 errors="replace",
                 check=False,
                 timeout=10,
+                env=_git_inspection_env(),
                 shell=False,
             )
             outputs.append(
