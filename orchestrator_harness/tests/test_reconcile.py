@@ -10,6 +10,7 @@ from typing import Any
 
 from orchestrator_harness.discovery import discover_suite
 from orchestrator_harness.events import conditions_from_snapshot
+from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
 from orchestrator_harness.notifications import select_actionable
 from orchestrator_harness.reconcile import _lane_is_active_or_unknown, reconcile
 from orchestrator_harness.tests.support import NOW, SuiteFixture, write_json
@@ -56,6 +57,29 @@ class ReconcileTests(unittest.TestCase):
         observed = self.observe(self.fixture.process_snapshot(complete=False))
         self.assertEqual(
             "PROCESS_STATE_UNKNOWN", observed["lanes"][0]["operational_state"]
+        )
+
+    def test_partial_linux_inventory_uses_observed_identity_but_not_absence(self) -> None:
+        self.fixture.status()
+        base = self.fixture.process_snapshot()
+        partial_live = ProcessSnapshot(
+            False,
+            base.processes,
+            ("one proc entry disappeared",),
+            "linux-proc",
+        )
+        observed = self.observe(partial_live)
+        self.assertEqual("RUNNING_CODEX", observed["lanes"][0]["operational_state"])
+
+        missing_child = ProcessSnapshot(
+            False,
+            (ProcessInfo(101, 1, "python", "controller", NOW),),
+            ("one proc entry disappeared",),
+            "linux-proc",
+        )
+        unknown = self.observe(missing_child)
+        self.assertEqual(
+            "PROCESS_STATE_UNKNOWN", unknown["lanes"][0]["operational_state"]
         )
 
     def test_missing_creation_time_is_unknown(self) -> None:
@@ -398,6 +422,20 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual([], observed["mcps"])
 
+    def test_request_facts_are_orthogonal_and_summary_is_derived(self) -> None:
+        self.fixture.status()
+        path, value = self._request()
+        value["live_lifetime"]["metadata"] = {
+            "pid": 999,
+            "created_utc": NOW.isoformat().replace("+00:00", "Z"),
+        }
+        write_json(path, value)
+        request = self.observe(self.fixture.process_snapshot())["requests"][0]
+        self.assertEqual("LIVE", request["request_facts"]["lifetime_state"])
+        self.assertEqual("ABSENT", request["request_facts"]["relay_state"])
+        self.assertEqual(request["operational_state"], request["operator_summary"])
+        self.assertEqual([101], [item["pid"] for item in request["processes"]])
+
     def test_unscoped_request_is_not_lane_owned(self) -> None:
         self.fixture.status()
         path, value = self._request()
@@ -738,7 +776,7 @@ class ReconcileTests(unittest.TestCase):
 
         while_reused = self._mcp_observation(record, reused_parent)
         self.assertEqual("MCP_EXITED", while_reused["operational_state"])
-        self.assertIn("unknown", {item["state"] for item in while_reused["processes"]})
+        self.assertEqual({"absent"}, {item["state"] for item in while_reused["processes"]})
 
     def test_exact_pid_absent_after_cleanup_stays_terminal_when_pid_is_reused(self) -> None:
         record = {

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from .config import HarnessConfig
+from .config import HarnessConfig, path_identity
 from .git_safety import (
     GitSafetyError,
     declaration_from_status,
@@ -64,9 +64,59 @@ class RunRecords:
     errors: tuple[ObservationError, ...]
 
 
+_HELPER_RECORD_NAMES = {"helper_process.json", "live-context.json"}
+_MCP_RECORD_NAMES = {"mcp_process.json", "mcp_processes.json", "mcp-lifetime.json"}
+_RECORD_MANIFEST_NAMES = (
+    "record-manifest.json",
+    "record_manifest.json",
+    "observation-manifest.json",
+)
+_RECORD_CACHE_MAX = 4096
+_JSON_RECORD_CACHE: dict[tuple[Any, ...], JsonRecord] = {}
+_TERMINAL_EVENT_CACHE: dict[tuple[Any, ...], tuple[str | None, int | None]] = {}
+_RESULT_VALIDATION_CACHE: dict[tuple[Any, ...], tuple[bool, Any]] = {}
+
+
+def _clear_observation_caches() -> None:
+    """Clear process-local observation caches; intended for bounded tests."""
+
+    _JSON_RECORD_CACHE.clear()
+    _TERMINAL_EVENT_CACHE.clear()
+    _RESULT_VALIDATION_CACHE.clear()
+
+
+def _file_signature(path: Path) -> tuple[tuple[int, int], int, int] | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (int(info.st_dev), int(info.st_ino)), int(info.st_size), int(info.st_mtime_ns)
+
+
+def _cache_put(cache: dict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any) -> None:
+    if len(cache) >= _RECORD_CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
 def _json_record(
     path: Path, config: HarnessConfig, *, check_sidecar: bool = False
 ) -> JsonRecord:
+    sidecar = Path(str(path) + ".sha256")
+    file_signature = _file_signature(path)
+    if file_signature is None:
+        raise FileNotFoundError(path)
+    sidecar_signature = _file_signature(sidecar) if check_sidecar else None
+    cache_key = (
+        path_identity(path),
+        file_signature,
+        check_sidecar,
+        sidecar_signature,
+        config.max_json_bytes,
+    )
+    cached = _JSON_RECORD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     stable = read_stable(
         path,
         max_bytes=config.max_json_bytes,
@@ -78,7 +128,6 @@ def _json_record(
         raise ValueError("JSON root must be an object")
     sidecar_sha = None
     sidecar_matches = None
-    sidecar = Path(str(path) + ".sha256")
     if check_sidecar and sidecar.exists():
         sidecar_stable = read_stable(
             sidecar,
@@ -90,10 +139,19 @@ def _json_record(
         token = text.split()[0].lower() if text else ""
         sidecar_sha = token if len(token) == 64 else None
         sidecar_matches = sidecar_sha == stable.sha256
-    return JsonRecord(path, stable, value, sidecar_sha, sidecar_matches)
+    record = JsonRecord(path, stable, value, sidecar_sha, sidecar_matches)
+    _cache_put(_JSON_RECORD_CACHE, cache_key, record)
+    return record
 
 
 def _terminal_event(path: Path, config: HarnessConfig) -> tuple[str | None, int | None]:
+    signature = _file_signature(path)
+    if signature is None:
+        raise FileNotFoundError(path)
+    cache_key = (path_identity(path), signature, config.max_jsonl_tail_bytes)
+    cached = _TERMINAL_EVENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     stable = read_tail_stable(
         path,
         max_bytes=config.max_jsonl_tail_bytes,
@@ -109,7 +167,9 @@ def _terminal_event(path: Path, config: HarnessConfig) -> tuple[str | None, int 
         kind = item.get("type") if isinstance(item, dict) else None
         if kind in {"turn.completed", "turn.failed", "turn.cancelled"}:
             terminal = str(kind)
-    return terminal, stable.mtime_ns
+    result = (terminal, stable.mtime_ns)
+    _cache_put(_TERMINAL_EVENT_CACHE, cache_key, result)
+    return result
 
 
 def _looks_like_relay(path: Path, value: dict[str, Any]) -> bool:
@@ -229,10 +289,285 @@ def _manager_root_records(
     return records, errors
 
 
+def _relative_to_root(path: Path, root: Path) -> tuple[str, ...]:
+    try:
+        return path.resolve(strict=False).relative_to(root.resolve(strict=False)).parts
+    except ValueError as exc:
+        raise ValueError("declared record path escapes its workspace") from exc
+
+
+def _declared_record_path(value: object, workspace: Path) -> Path:
+    if isinstance(value, Path):
+        candidate = value
+    elif isinstance(value, str) and value.strip():
+        candidate = Path(value.strip())
+    else:
+        raise ValueError("record path must be a non-empty string")
+    if not candidate.is_absolute():
+        if ".." in candidate.parts:
+            raise ValueError("record path may not contain '..'")
+        candidate = workspace / candidate
+    resolved = candidate.resolve(strict=False)
+    relative = _relative_to_root(resolved, workspace)
+    current = workspace.resolve(strict=False)
+    for part in relative:
+        current = current / part
+        if current.exists() and _is_reparse_or_link(current):
+            raise ValueError("record path contains a link or reparse point")
+    return resolved
+
+
+def _declared_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    return []
+
+
+def _manifest_declarations(value: Mapping[str, Any]) -> list[tuple[str, str]]:
+    schema = value.get("schema")
+    if schema not in (None, "orchestrator-record-manifest/v1"):
+        raise ValueError("unsupported record manifest schema")
+    declarations: list[tuple[str, str]] = []
+    for kind, keys in (
+        ("helper", ("helper_paths", "helper_records", "helpers")),
+        ("mcp", ("mcp_paths", "mcp_records", "mcps")),
+        ("unknown", ("paths", "record_paths", "records")),
+    ):
+        for key in keys:
+            items = value.get(key)
+            if isinstance(items, Mapping) and key in {"records", "record_paths"}:
+                for path, declared_kind in items.items():
+                    declarations.append((str(path), str(declared_kind)))
+                break
+            if key == "records" and isinstance(items, list):
+                break
+            if items is not None and not (
+                isinstance(items, str)
+                or isinstance(items, list)
+                and all(isinstance(item, str) for item in items)
+            ):
+                raise ValueError(f"manifest {key} must contain record paths")
+            for path in _declared_values(items):
+                declarations.append((path, kind))
+            if items is not None:
+                break
+    records = value.get("records")
+    if isinstance(records, list):
+        for item in records:
+            if not isinstance(item, Mapping):
+                raise ValueError("manifest records must be objects")
+            path = item.get("path") or item.get("record_path")
+            kind = item.get("kind") or item.get("record_kind") or "unknown"
+            if not isinstance(path, str) or not isinstance(kind, str):
+                raise ValueError("manifest record path/kind is invalid")
+            declarations.append((path, kind))
+    return declarations
+
+
+def _status_record_declarations(
+    controllers: list[ControllerRecord],
+) -> tuple[list[tuple[object, str]], list[object]]:
+    records: list[tuple[object, str]] = []
+    manifests: list[object] = []
+    for controller in controllers:
+        raw = controller.status.value
+        for key in ("record_manifest", "observation_manifest"):
+            if key in raw:
+                manifests.extend(_declared_values(raw[key]))
+        for key in ("record_manifests", "observation_manifests"):
+            if key in raw:
+                manifests.extend(_declared_values(raw[key]))
+        for key in ("record_paths", "observation_paths"):
+            value = raw.get(key)
+            if isinstance(value, Mapping):
+                for kind, paths in value.items():
+                    for path in _declared_values(paths):
+                        records.append((path, str(kind)))
+            else:
+                for path in _declared_values(value):
+                    records.append((path, "unknown"))
+    return records, manifests
+
+
+def _record_kind(path: Path, value: Mapping[str, Any], declared: set[str]) -> str:
+    normalized = {item.strip().lower().replace("_", "-") for item in declared}
+    if "helper" in normalized and "mcp" not in normalized:
+        return "helper"
+    if "mcp" in normalized and "helper" not in normalized:
+        return "mcp"
+    if path.name.lower() in _HELPER_RECORD_NAMES:
+        return "helper"
+    if path.name.lower() in _MCP_RECORD_NAMES:
+        return "mcp"
+    kind = value.get("record_kind") or value.get("kind")
+    if isinstance(kind, str) and kind.strip().lower().replace("_", "-") in {
+        "helper",
+        "helper-process",
+    }:
+        return "helper"
+    if isinstance(kind, str) and "mcp" in kind.strip().lower():
+        return "mcp"
+    schema = str(value.get("schema") or "").lower()
+    if "mcp" in schema or any(
+        key in value for key in ("mcp_server", "mcp_name", "mcp_process", "mcp_processes")
+    ):
+        return "mcp"
+    return "helper"
+
+
+def _declared_lifetime_records(
+    workspace: Path,
+    config: HarnessConfig,
+    controllers: list[ControllerRecord],
+) -> tuple[dict[str, tuple[Path, set[str]]], list[ObservationError]]:
+    declarations: dict[str, tuple[Path, set[str]]] = {}
+    errors: list[ObservationError] = []
+
+    def add(value: object, kind: str, *, source: object = workspace) -> None:
+        try:
+            path = _declared_record_path(value, workspace)
+        except (OSError, ValueError) as exc:
+            errors.append(ObservationError(str(source), "RECORD_PATH_ERROR", str(exc)))
+            return
+        key = path_identity(path)
+        if key not in declarations:
+            declarations[key] = (path, set())
+        declarations[key][1].add(kind)
+
+    for name in sorted(_HELPER_RECORD_NAMES):
+        path = workspace / name
+        if path.exists() or path.is_symlink():
+            add(str(path), "helper")
+    for name in sorted(_MCP_RECORD_NAMES):
+        path = workspace / name
+        if path.exists() or path.is_symlink():
+            add(str(path), "mcp")
+    for path in config.record_paths:
+        add(path, "unknown", source="config.record_paths")
+    status_records, status_manifests = _status_record_declarations(controllers)
+    for path, kind in status_records:
+        add(path, kind, source="controller record_paths")
+
+    manifest_values: list[object] = [
+        *config.record_manifests,
+        *status_manifests,
+        *[workspace / name for name in _RECORD_MANIFEST_NAMES],
+    ]
+    seen_manifests: set[str] = set()
+    for value in manifest_values:
+        try:
+            manifest_path = _declared_record_path(value, workspace)
+        except (OSError, ValueError) as exc:
+            errors.append(
+                ObservationError(str(value), "RECORD_MANIFEST_READ_ERROR", str(exc))
+            )
+            continue
+        manifest_key = path_identity(manifest_path)
+        if manifest_key in seen_manifests:
+            continue
+        seen_manifests.add(manifest_key)
+        try:
+            manifest = _json_record(manifest_path, config).value
+            for path, kind in _manifest_declarations(manifest):
+                add(path, kind, source=str(manifest_path))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            # Optional conventional manifests are silent when absent.  A
+            # declared manifest remains an explicit observation error.
+            if manifest_path.exists() or value not in {
+                workspace / name for name in _RECORD_MANIFEST_NAMES
+            }:
+                errors.append(
+                    ObservationError(
+                        str(manifest_path), "RECORD_MANIFEST_READ_ERROR", str(exc)
+                    )
+                )
+    return declarations, errors
+
+
+def _git_state_fingerprint(worktree: Path) -> tuple[str, ...]:
+    """Capture only the Git state that can affect result acceptance."""
+
+    outputs: list[str] = []
+    for args in (
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        ("symbolic-ref", "--quiet", "--short", "HEAD"),
+        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "--git-common-dir"),
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."),
+    ):
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(worktree), *args],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=10,
+                shell=False,
+            )
+            outputs.append(
+                f"{completed.returncode}:"
+                f"{completed.stdout if completed.returncode == 0 else completed.stderr}"
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            outputs.append(f"error:{exc}")
+    return tuple(outputs)
+
+
+def _validate_coding_result_cached(
+    candidate: JsonRecord,
+    *,
+    coding_status: ControllerRecord,
+    run_root: Path,
+    revalidate: bool,
+) -> None:
+    declaration = declaration_from_status(coding_status.status.value, run_root)
+    git_fingerprint = _git_state_fingerprint(declaration.worktree_root)
+    key = (
+        path_identity(candidate.path),
+        candidate.stable.file_id,
+        candidate.stable.size,
+        candidate.stable.mtime_ns,
+        candidate.stable.sha256,
+        git_fingerprint,
+        coding_status.status.value.get("declared_lane_id"),
+        coding_status.status.value.get("worker_invocation_id"),
+        declaration.common_dir,
+        declaration.worktree_root,
+        declaration.branch,
+        declaration.base_commit,
+    )
+    if not revalidate:
+        cached = _RESULT_VALIDATION_CACHE.get(key)
+        if cached is not None:
+            valid, value = cached
+            if valid:
+                return
+            raise GitSafetyError(str(value))
+    try:
+        validate_coding_result(
+            candidate.value,
+            lane_id=str(coding_status.status.value["declared_lane_id"]),
+            worker_invocation_id=str(coding_status.status.value["worker_invocation_id"]),
+            declaration=declaration,
+        )
+    except (GitSafetyError, OSError, ValueError) as exc:
+        _RESULT_VALIDATION_CACHE[key] = (False, str(exc))
+        raise
+    _RESULT_VALIDATION_CACHE[key] = (True, None)
+
+
 def discover_run(
     run_root: Path,
     workspace: Path,
     config: HarnessConfig,
+    *,
+    revalidate_results: bool = False,
+    revalidate: bool = False,
 ) -> RunRecords:
     errors: list[ObservationError] = []
     controllers: list[ControllerRecord] = []
@@ -320,28 +655,30 @@ def discover_run(
     errors.extend(manager_relay_errors)
 
     helper_records: list[JsonRecord] = []
-    helper_names = {"helper_process.json", "live-context.json"}
     mcp_records: list[JsonRecord] = []
-    mcp_names = {"mcp_process.json", "mcp_processes.json", "mcp-lifetime.json"}
-    record_names = helper_names | mcp_names
-    recursive_candidates = sorted(
-        Path(root) / name
-        for root, directories, files in os.walk(workspace)
-        for names in (directories, files)
-        for name in names
-        if name in record_names
+    declared_records, record_errors = _declared_lifetime_records(
+        workspace, config, controllers
     )
-    for path in recursive_candidates:
-        if path.name in helper_names:
-            try:
-                helper_records.append(_json_record(path, config))
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                errors.append(ObservationError(str(path), "HELPER_READ_ERROR", str(exc)))
-        if path.name in mcp_names:
-            try:
-                mcp_records.append(_json_record(path, config))
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                errors.append(ObservationError(str(path), "MCP_READ_ERROR", str(exc)))
+    errors.extend(record_errors)
+    for path, declared_kinds in sorted(
+        declared_records.values(), key=lambda item: path_identity(item[0])
+    ):
+        try:
+            record = _json_record(path, config)
+            kind = _record_kind(path, record.value, declared_kinds)
+            if kind == "mcp":
+                mcp_records.append(record)
+            else:
+                helper_records.append(record)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            kind = _record_kind(path, {}, declared_kinds)
+            errors.append(
+                ObservationError(
+                    str(path),
+                    "MCP_READ_ERROR" if kind == "mcp" else "HELPER_READ_ERROR",
+                    str(exc),
+                )
+            )
 
     checkpoint = None
     checkpoint_path = workspace / "PARALLEL_CHECKPOINT.md"
@@ -378,6 +715,7 @@ def discover_run(
     ]
     coding_route = bool(coding_controllers) and not firmware_controllers
     coding_owner: ControllerRecord | None = None
+    candidate: JsonRecord | None = None
     if result_path.exists():
         try:
             candidate = _json_record(result_path, config)
@@ -405,13 +743,11 @@ def discover_run(
                     raise GitSafetyError(
                         "coding result does not match a current coding lane and worker invocation"
                     )
-                coding_status = coding_owner.status.value
-                declaration = declaration_from_status(coding_status, run_root)
-                validate_coding_result(
-                    candidate.value,
-                    lane_id=str(coding_status["declared_lane_id"]),
-                    worker_invocation_id=str(coding_status["worker_invocation_id"]),
-                    declaration=declaration,
+                _validate_coding_result_cached(
+                    candidate,
+                    coding_status=coding_owner,
+                    run_root=run_root,
+                    revalidate=revalidate_results or revalidate,
                 )
                 result = candidate
                 result_status_path = coding_owner.status.path
@@ -434,17 +770,18 @@ def discover_run(
                 ObservationError(str(result_path), code, str(exc)[:500])
             )
             if coding_route:
-                sha256 = None
-                try:
-                    stable = read_stable(
-                        result_path,
-                        max_bytes=config.max_json_bytes,
-                        retries=config.stable_read_retries,
-                        delay_seconds=config.stable_read_delay_seconds,
-                    )
-                    sha256 = stable.sha256
-                except OSError:
-                    pass
+                sha256 = candidate.stable.sha256 if candidate is not None else None
+                if sha256 is None:
+                    try:
+                        stable = read_stable(
+                            result_path,
+                            max_bytes=config.max_json_bytes,
+                            retries=config.stable_read_retries,
+                            delay_seconds=config.stable_read_delay_seconds,
+                        )
+                        sha256 = stable.sha256
+                    except OSError:
+                        pass
                 invalid_result = invalid_result_evidence(result_path, str(exc), sha256=sha256)
                 invalid_result_status_path = (
                     coding_owner.status.path if coding_owner is not None else None
@@ -497,15 +834,29 @@ def discover_run(
     )
 
 
-def discover_suite(config: HarnessConfig) -> tuple[RunRecords, ...]:
+def discover_suite(
+    config: HarnessConfig,
+    *,
+    revalidate_results: bool = False,
+    revalidate: bool = False,
+) -> tuple[RunRecords, ...]:
     roots: dict[str, Path] = {}
     for pattern in config.run_globs:
         for candidate in config.suite_root.glob(pattern):
             if candidate.is_dir():
-                roots[str(candidate.resolve()).lower()] = candidate.resolve()
+                resolved = candidate.resolve()
+                roots[path_identity(resolved)] = resolved
     runs = []
-    for run_root in sorted(roots.values(), key=lambda item: str(item).lower()):
+    for run_root in sorted(roots.values(), key=path_identity):
         workspace = run_root / config.workspace_relpath
         if workspace.is_dir():
-            runs.append(discover_run(run_root, workspace, config))
+            runs.append(
+                discover_run(
+                    run_root,
+                    workspace,
+                    config,
+                    revalidate_results=revalidate_results,
+                    revalidate=revalidate,
+                )
+            )
     return tuple(runs)

@@ -7,9 +7,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import HarnessConfig
+from .config import HarnessConfig, path_identity, same_path
 from .discovery import ControllerRecord, JsonRecord, RunRecords
-from .models import ProcessInfo, ProcessSnapshot, iso_utc, parse_utc
+from .models import (
+    ProcessInfo,
+    ProcessSnapshot,
+    RequestFacts,
+    iso_utc,
+    jsonable,
+    parse_utc,
+)
 
 
 _WINDOWS_DATE_MILLISECONDS = re.compile(r"^/Date\((-?\d+)\)/$")
@@ -57,12 +64,14 @@ def _process_identity(
     expected_started: datetime | None,
     tolerance_seconds: int,
 ) -> tuple[str, ProcessInfo | None, str]:
-    if not snapshot.complete:
-        return "unknown", None, "process snapshot incomplete"
     if not pid or pid <= 0:
         return "unknown", None, "PID absent from observation"
-    process = snapshot.by_pid.get(pid)
+    process = snapshot.process_for(pid)
+    if not snapshot.complete and snapshot.provider != "linux-proc":
+        return "unknown", process, "process snapshot is incomplete"
     if process is None:
+        if not snapshot.complete:
+            return "unknown", None, f"PID {pid} is not observed in a partial snapshot"
         return "absent", None, f"PID {pid} is absent"
     if process.created_utc is None or expected_started is None:
         return "unknown", process, "creation time cannot be compared"
@@ -132,10 +141,7 @@ def _controller_observation(
     declared = str(raw.get("state") or "unknown").lower()
     terminal = controller.terminal_event
     if declared == "waiting_resource":
-        if not snapshot.complete:
-            operational = "PROCESS_STATE_UNKNOWN"
-            reason = "resource wait cannot be reconciled without complete process inventory"
-        elif controller_identity == "live":
+        if controller_identity == "live":
             operational = "WAITING_RESOURCE"
             reason = "controller is waiting before Codex launch"
         elif controller_identity == "unknown":
@@ -144,9 +150,6 @@ def _controller_observation(
         else:
             operational = "STALE_STATUS"
             reason = "resource-wait declaration contradicts controller identity"
-    elif not snapshot.complete:
-        operational = "PROCESS_STATE_UNKNOWN"
-        reason = "process provider is incomplete"
     elif declared in {"running", "running_codex"}:
         if terminal:
             operational = "STALE_STATUS"
@@ -331,29 +334,85 @@ def _local_creation_utc(value: dict[str, Any]) -> datetime | None:
 
 
 def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
+    """Read only declared process shapes, with schema-less legacy compatibility."""
+
     found: list[dict[str, Any]] = []
-    if isinstance(value, dict):
-        local_start = _local_creation_utc(value)
-        for key, item in value.items():
-            key_text = str(key)
-            path = f"{prefix}.{key_text}" if prefix else key_text
-            lower = key_text.lower()
-            if (
-                (lower == "pid" or lower.endswith("_pid"))
-                and isinstance(item, int)
-                and not isinstance(item, bool)
-            ):
-                found.append(
-                    {
-                        "pid": item,
-                        "role": path,
-                        "expected_started_utc": iso_utc(local_start),
-                    }
-                )
-            found.extend(_local_pid_identities(item, path))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            found.extend(_local_pid_identities(item, f"{prefix}[{index}]"))
+    seen: set[tuple[int, str, str | None]] = set()
+
+    def add_process(item: object, role: str, *, field: str = "pid") -> None:
+        if not isinstance(item, dict):
+            return
+        pid = item.get(field)
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return
+        expected = iso_utc(_local_creation_utc(item))
+        key = (pid, role, expected)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(
+            {
+                "pid": pid,
+                "role": role,
+                "expected_started_utc": expected,
+            }
+        )
+
+    def add_direct_fields(item: object, role: str) -> None:
+        if not isinstance(item, dict):
+            return
+        add_process(item, role)
+        for field in ("launcher_pid", "server_pid", "provider_pid", "helper_pid"):
+            if field in item:
+                add_process(item, f"{role}.{field}", field=field)
+
+    def add_container(item: object, role: str) -> None:
+        if not isinstance(item, dict):
+            return
+        add_direct_fields(item, role)
+        for child_name in (
+            "process",
+            "launcher",
+            "server",
+            "provider",
+            "required_helper",
+            "helper_process",
+            "mcp_process",
+        ):
+            child = item.get(child_name)
+            if isinstance(child, dict):
+                add_direct_fields(child, f"{role}.{child_name}")
+        processes = item.get("processes")
+        if isinstance(processes, list):
+            for index, child in enumerate(processes):
+                if isinstance(child, dict):
+                    declared_role = child.get("role")
+                    suffix = (
+                        str(declared_role).strip()
+                        if isinstance(declared_role, str) and declared_role.strip()
+                        else str(index)
+                    )
+                    add_direct_fields(child, f"{role}.processes[{suffix}]")
+
+    if not isinstance(value, dict):
+        return found
+
+    # Schema-less helper and MCP records historically use a direct ``pid``;
+    # the field is accepted only at this record boundary.
+    add_direct_fields(value, prefix or "record")
+    for field in ("process", "mcp_process", "helper_process"):
+        child = value.get(field)
+        if isinstance(child, dict):
+            add_direct_fields(child, f"{prefix + '.' if prefix else ''}{field}")
+    processes = value.get("processes")
+    if isinstance(processes, list):
+        add_container(
+            {"processes": processes}, f"{prefix + '.' if prefix else ''}processes"
+        )
+    for container_name in ("live_lifetime", "lifetime_binding"):
+        container = value.get(container_name)
+        if isinstance(container, dict):
+            add_container(container, f"{prefix + '.' if prefix else ''}{container_name}")
     return found
 
 
@@ -400,11 +459,13 @@ def _record_lifetime_observations(
                     ),
                 }
             )
-        if not snapshot.complete or not states:
+        if not states:
             operational = unknown_state
-        elif all(state == "live" for state in states):
+        elif all(state == "live" for state in states) and (
+            snapshot.complete or snapshot.provider == "linux-proc"
+        ):
             operational = running_state
-        elif all(state in {"absent", "mismatch"} for state in states):
+        elif snapshot.complete and all(state in {"absent", "mismatch"} for state in states):
             operational = exited_state
         else:
             operational = unknown_state
@@ -606,13 +667,13 @@ def _relay_state(
     candidates = list(run.relays)
     if explicit is not None:
         candidates.sort(
-            key=lambda item: 0 if item.path.resolve(strict=False) == explicit else 1
-    )
+            key=lambda item: 0 if same_path(item.path, explicit) else 1
+        )
     saw_candidate = False
     candidate_observed_utc: str | None = None
     candidate_sha256: str | None = None
     for relay in candidates:
-        if explicit is not None and relay.path.resolve(strict=False) == explicit:
+        if explicit is not None and same_path(relay.path, explicit):
             saw_candidate = True
             candidate_observed_utc = iso_utc(
                 datetime.fromtimestamp(relay.stable.mtime_ns / 1_000_000_000, tz=timezone.utc)
@@ -754,7 +815,7 @@ def _normalized_resource_values(
                 root = Path(item)
                 if not root.is_absolute():
                     root = run_root / root
-                normalized = str(root.resolve(strict=False)).replace("\\", "/").lower()
+                normalized = path_identity(root)
                 resources.add(f"root:{key.lower()}:{normalized}")
     for run_id in _nested_values(value, {"run_id"}):
         resources.add(f"producer-lifetime:{run_id}")
@@ -795,11 +856,13 @@ def _request_observation(
                 "actual_created_utc": iso_utc(process.created_utc if process else None),
             }
         )
-    if not snapshot.complete:
-        lifetime = "UNKNOWN"
-    elif states and all(state == "live" for state in states):
+    if states and all(state == "live" for state in states) and (
+        snapshot.complete or snapshot.provider == "linux-proc"
+    ):
         lifetime = "LIVE"
-    elif states and all(state in {"absent", "mismatch"} for state in states):
+    elif snapshot.complete and states and all(
+        state in {"absent", "mismatch"} for state in states
+    ):
         lifetime = "ABSENT"
     else:
         lifetime = "UNKNOWN"
@@ -837,28 +900,29 @@ def _request_observation(
     else:
         expiry_bucket = "OK"
 
-    if relay_state == "BOUND_EXPIRED":
-        # An exact historical approval is an answered fact, not an authority to
-        # execute after its lease.  Keep it visible without reopening the request.
-        operational = "RELAYED_EXPIRED"
-    elif mcp_declared and not explicit_mcp:
-        operational = "REQUEST_AMBIGUOUS"
-    elif request.sidecar_matches is False:
-        operational = "REQUEST_AMBIGUOUS"
-    elif relay_state == "BOUND" and lifetime == "LIVE":
-        operational = "RELAYED"
-    elif relay_state == "BOUND" and lifetime == "ABSENT":
-        operational = "RELAYED_INACTIVE"
-    elif relay_state == "BOUND":
-        operational = "RELAYED_AMBIGUOUS"
-    elif relay_state == "UNBOUND":
-        operational = "RELAY_UNBOUND"
-    elif lifetime == "LIVE":
-        operational = "RELAY_READY"
-    elif lifetime == "ABSENT":
-        operational = "REQUEST_STALE"
-    else:
-        operational = "REQUEST_AMBIGUOUS"
+    facts = RequestFacts(
+        lifetime_state=lifetime,
+        relay_state=relay_state,
+        mcp_lifetime_state=(
+            "PROVEN" if explicit_mcp else "UNPROVEN" if mcp_declared else "NOT_DECLARED"
+        ),
+        expiry_bucket=expiry_bucket,
+        mcp_declared=mcp_declared,
+        explicit_mcp_lifetime=explicit_mcp,
+        sidecar_matches=request.sidecar_matches,
+        process_states=tuple(states),
+        resource_ambiguity=tuple(resource_ambiguity),
+    )
+    # Keep this as a derived operator summary.  The individual facts remain
+    # visible and are not collapsed into an actionability decision.
+    operational = facts.operator_summary
+    manager_actionable = operational in {
+        "RELAY_READY",
+        "RELAY_UNBOUND",
+        "REQUEST_AMBIGUOUS",
+    } and (
+        lifetime == "LIVE" or (lifetime == "UNKNOWN" and expiry_bucket != "EXPIRED")
+    )
 
     return {
         "path": str(request.path),
@@ -882,6 +946,8 @@ def _request_observation(
         "mcp_lifetime_state": (
             "PROVEN" if explicit_mcp else "UNPROVEN" if mcp_declared else "NOT_DECLARED"
         ),
+        "request_facts": jsonable(facts),
+        "operator_summary": operational,
         "lifetime_state": lifetime,
         "processes": reconciled,
         "relay_state": relay_state,
@@ -890,12 +956,7 @@ def _request_observation(
         "relay_observed_utc": relay_observed_utc,
         "relay_sha256": relay_sha256,
         "operational_state": operational,
-        "manager_actionable": operational
-        in {"RELAY_READY", "RELAY_UNBOUND", "REQUEST_AMBIGUOUS"}
-        and (
-            lifetime == "LIVE"
-            or (lifetime == "UNKNOWN" and expiry_bucket != "EXPIRED")
-        ),
+        "manager_actionable": manager_actionable,
         "resources": resources,
         "resource_ambiguity": resource_ambiguity,
         "sidecar_sha256": request.sidecar_sha256,
@@ -915,7 +976,7 @@ def _signal_request_match(raw: dict[str, Any], request: dict[str, Any], run: Run
         path = Path(candidate)
         if not path.is_absolute():
             path = run.run_root / path
-        if path.resolve(strict=False) == request_path:
+        if same_path(path, request_path):
             return True
     return False
 
@@ -1300,7 +1361,7 @@ def reconcile(
                 common = repository.get("common_dir")
                 key = f"{common}::{value}" if isinstance(common, str) and isinstance(value, str) else ""
             else:
-                key = str(Path(value).resolve(strict=False)).casefold() if isinstance(value, str) and value else ""
+                key = path_identity(value) if isinstance(value, str) and value else ""
             if key:
                 groups[key].append(lane["lane_id"])
         for key, lane_ids in groups.items():

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from orchestrator_harness.cli import _store
-from orchestrator_harness.config import ConfigError, load_config
+from orchestrator_harness.config import ConfigError, load_config, path_identity, same_path
 from orchestrator_harness.stable_io import (
     PathSafetyError,
     SafeOutput,
@@ -25,6 +25,29 @@ class ConfigAndStoreTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def test_path_identity_uses_platform_case_and_separator_rules(self) -> None:
+        left = self.fixture.suite_root / "Runs" / "lane"
+        right = self.fixture.suite_root / "Runs" / "lane" / "."
+        self.assertEqual(path_identity(left), path_identity(right))
+        if os.name == "nt":
+            self.assertTrue(same_path(str(left).upper(), str(left).lower()))
+        else:
+            self.assertNotEqual(path_identity(str(left).upper()), path_identity(str(left).lower()))
+
+    def test_config_accepts_bounded_record_declarations(self) -> None:
+        write_json(
+            self.fixture.config_path,
+            {
+                "suite_root": str(self.fixture.suite_root),
+                "run_globs": ["runs/*"],
+                "record_paths": ["nested/helper.json"],
+                "record_manifests": ["record-manifest.json"],
+            },
+        )
+        config = load_config(self.fixture.config_path, harness_root=self.fixture.harness_root)
+        self.assertEqual(("nested/helper.json",), config.record_paths)
+        self.assertEqual(("record-manifest.json",), config.record_manifests)
 
     def test_config_rejects_parent_glob(self) -> None:
         write_json(

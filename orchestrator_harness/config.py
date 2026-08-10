@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,17 @@ from typing import Any
 
 class ConfigError(ValueError):
     pass
+
+
+def path_identity(path: str | Path) -> str:
+    """Return a platform-native, normalized identity for a filesystem path."""
+
+    resolved = Path(path).resolve(strict=False)
+    return os.path.normcase(os.path.normpath(str(resolved)))
+
+
+def same_path(left: str | Path, right: str | Path) -> bool:
+    return path_identity(left) == path_identity(right)
 
 
 @dataclass(frozen=True)
@@ -33,6 +45,8 @@ class HarnessConfig:
     attention_logging_enabled: bool
     attention_epoch_id: str
     attention_sprint_lifetime_seconds: float | None = None
+    record_paths: tuple[str, ...] = ()
+    record_manifests: tuple[str, ...] = ()
 
     @property
     def forbidden_output_roots(self) -> tuple[Path, ...]:
@@ -51,6 +65,31 @@ def _number(raw: dict[str, Any], key: str, default: float, *, minimum: float) ->
     if result < minimum:
         raise ConfigError(f"{key} must be >= {minimum}")
     return result
+
+
+def _declared_relative_paths(
+    raw: dict[str, Any], key: str, aliases: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    value: object = raw.get(key)
+    if value is None:
+        for alias in aliases:
+            if alias in raw:
+                value = raw[alias]
+                break
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or Path(item).is_absolute()
+            or ".." in Path(item).parts
+            for item in value
+        )
+    ):
+        raise ConfigError(f"{key} must be a list of safe relative paths")
+    return tuple(item.strip() for item in value)
 
 
 def load_config(
@@ -91,6 +130,13 @@ def load_config(
         or ".." in Path(workspace).parts
     ):
         raise ConfigError("workspace_relpath must be a safe relative path")
+
+    record_paths = _declared_relative_paths(
+        raw, "record_paths", ("observation_paths",)
+    )
+    record_manifests = _declared_relative_paths(
+        raw, "record_manifests", ("record_manifest_paths",)
+    )
 
     output_value = raw.get("output_dir", ".state")
     if not isinstance(output_value, str) or not output_value:
@@ -172,4 +218,6 @@ def load_config(
         attention_logging_enabled=attention_enabled,
         attention_epoch_id=attention_epoch,
         attention_sprint_lifetime_seconds=sprint_lifetime,
+        record_paths=record_paths,
+        record_manifests=record_manifests,
     )
