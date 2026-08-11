@@ -443,3 +443,14 @@ def validate_task_result_repository(
     if dirty:
         raise GitSafetyError("task result requires a clean project worktree (ignored runtime state is excluded)")
     return result
+
+
+# S4 public lifecycle spellings live in one focused module but are re-exported
+# here because Git identity is the ownership boundary callers already use.
+from .lane_lifecycle import (  # noqa: E402
+    allocate_immutable_source_view,
+    allocate_immutable_view,
+    allocate_source_view,
+    retire_lane,
+    retire_terminal_lane,
+)

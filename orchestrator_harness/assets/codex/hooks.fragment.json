@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "id": "orchestrator-harness-post-tool-use",
+        "type": "command",
+        "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py"
+      }
+    ],
+    "Stop": [
+      {
+        "id": "orchestrator-harness-stop",
+        "type": "command",
+        "command": "python .codex/hooks/orchestrator_harness_stop.py"
+      }
+    ]
+  }
+}

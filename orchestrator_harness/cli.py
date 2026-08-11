@@ -15,6 +15,15 @@ from .active_management import (
     acknowledge_management_event,
     transition_active_management,
 )
+from .codex_adapter import (
+    CodexAdapterError,
+    check_codex_adapter,
+    install_codex_adapter,
+    run_codex_hook,
+    synthetic_wake_self_test,
+    uninstall_codex_adapter,
+    upgrade_codex_adapter,
+)
 from .config import ConfigError, HarnessConfig, load_config
 from .discovery import discover_suite
 from .events import diff_conditions
@@ -33,6 +42,10 @@ from .processes import process_snapshot
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput, canonical_json
 from .watcher_integration import acknowledge_watcher_event, merge_watcher_conditions
+from .lane_lifecycle import (
+    allocate_immutable_source_view,
+    retire_terminal_lane,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -687,7 +700,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="accepted for symmetry; scan never writes",
     )
     watch = subparsers.add_parser(
-        "watch", help="run a bounded event watch or a foreground managed watcher"
+        "watch", help="run a bounded diagnostic event watch"
     )
     mode = watch.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="perform one event diff")
@@ -696,17 +709,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--until-actionable", action="store_true", help="wait until manager review is needed"
-    )
-    mode.add_argument(
-        "--managed",
-        action="store_true",
-        help="run one foreground watcher that re-arms after each exact acknowledgement",
-    )
-    watch.add_argument(
-        "lifecycle",
-        nargs="?",
-        choices=("stop", "heartbeat"),
-        help="managed lifecycle action: `watch stop` or `watch heartbeat`",
     )
     watch.add_argument("--timeout", type=float, default=None)
     watch.add_argument("--no-write", action="store_true")
@@ -731,9 +733,56 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="required file below evidence-root; may be supplied more than once",
     )
-    subparsers.add_parser(
-        "heartbeat", help="renew the foreground managed watcher heartbeat"
+    adapter = subparsers.add_parser(
+        "adapter", help="install or inspect a project-local host adapter"
     )
+    adapter_modes = adapter.add_subparsers(dest="adapter_action", required=True)
+    for action in ("install", "check", "upgrade", "uninstall", "self-test"):
+        command = adapter_modes.add_parser(action)
+        command.add_argument("--host", default="codex")
+        command.add_argument("--project-root", required=True, type=Path)
+        if action == "self-test":
+            command.add_argument("--queue-root", type=Path)
+    hook = adapter_modes.add_parser("hook")
+    hook.add_argument("--host", default="codex")
+    hook.add_argument("--boundary", choices=("post_tool_use", "stop"), required=True)
+
+    def add_view_commands(parent: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+        view = parent.add_parser("view", help="allocate an exact-revision immutable source view")
+        view_modes = view.add_subparsers(dest="view_action", required=True)
+        allocate = view_modes.add_parser("allocate")
+        allocate.add_argument("--source-root", required=True, type=Path)
+        allocate.add_argument("--revision", required=True)
+        allocate.add_argument("--view-root", required=True, type=Path)
+        allocate.add_argument("--result-root", required=True, type=Path)
+        allocate.add_argument("--cache-root", required=True, type=Path)
+        allocate.add_argument("--view-id", default="immutable-view")
+
+    add_view_commands(subparsers)
+    source = subparsers.add_parser("source", help="source-view lifecycle aliases")
+    source_modes = source.add_subparsers(dest="source_action", required=True)
+    source_allocate = source_modes.add_parser("allocate")
+    source_allocate.add_argument("--source-root", required=True, type=Path)
+    source_allocate.add_argument("--revision", required=True)
+    source_allocate.add_argument("--view-root", required=True, type=Path)
+    source_allocate.add_argument("--result-root", required=True, type=Path)
+    source_allocate.add_argument("--cache-root", required=True, type=Path)
+    source_allocate.add_argument("--view-id", default="immutable-view")
+
+    lane = subparsers.add_parser("lane", help="terminal lane lifecycle operations")
+    lane_modes = lane.add_subparsers(dest="lane_action", required=True)
+    retire = lane_modes.add_parser("retire")
+    retire.add_argument("--lane-root", required=True, type=Path)
+    retire.add_argument("--archive-root", required=True, type=Path)
+    retire.add_argument("--lane-id", required=True)
+    retire.add_argument("--retained-revision", required=True)
+    retire.add_argument("--task-ref", type=Path)
+    retire.add_argument("--result-ref", type=Path)
+    retire.add_argument("--findings-ref", type=Path)
+    retire.add_argument("--acceptance-ref", type=Path)
+    retire.add_argument("--transcript-ref", type=Path)
+    retire.add_argument("--dependency-ref", type=Path)
+    retire.add_argument("--unmerged-work-proved", action="store_true")
     return parser
 
 
@@ -741,6 +790,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "adapter":
+            if args.host != "codex":
+                raise CodexAdapterError("only the implemented codex host supports installation")
+            if args.adapter_action == "install":
+                _print_json(install_codex_adapter(args.project_root))
+                return EXIT_OK
+            if args.adapter_action == "check":
+                _print_json(check_codex_adapter(args.project_root))
+                return EXIT_OK
+            if args.adapter_action == "upgrade":
+                _print_json(upgrade_codex_adapter(args.project_root))
+                return EXIT_OK
+            if args.adapter_action == "uninstall":
+                _print_json(uninstall_codex_adapter(args.project_root))
+                return EXIT_OK
+            if args.adapter_action == "self-test":
+                _print_json(synthetic_wake_self_test(args.project_root, queue_root=args.queue_root))
+                return EXIT_OK
+            _print_json(run_codex_hook(args.boundary))
+            return EXIT_OK
+        if args.command in {"view", "source"}:
+            action = args.view_action if args.command == "view" else args.source_action
+            if action != "allocate":
+                raise ValueError("source lifecycle requires allocate")
+            result = allocate_immutable_source_view(
+                args.source_root,
+                revision=args.revision,
+                view_root=args.view_root,
+                result_root=args.result_root,
+                cache_root=args.cache_root,
+                view_id=args.view_id,
+            )
+            _print_json(result.as_record())
+            return EXIT_OK
+        if args.command == "lane":
+            if args.lane_action != "retire":
+                raise ValueError("lane lifecycle requires retire")
+            result = retire_terminal_lane(
+                args.lane_root,
+                args.archive_root,
+                lane_id=args.lane_id,
+                retained_revision=args.retained_revision,
+                task_ref=args.task_ref,
+                result_ref=args.result_ref,
+                findings_ref=args.findings_ref,
+                acceptance_ref=args.acceptance_ref,
+                transcript_ref=args.transcript_ref,
+                dependency_ref=args.dependency_ref,
+                process_snapshot=process_snapshot(),
+                live_processes=(),
+                unmerged_work_proof=args.unmerged_work_proved,
+            )
+            _print_json(result.as_record())
+            return EXIT_OK if result.outcome == "CLOSED" else EXIT_ERROR
         if args.command == "handoff-preflight":
             result = preflight_handoff(
                 task_card_path=args.task_card,
@@ -758,28 +861,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return scan_command(config)
         if args.command == "ack":
             return ack_command(config, event_id=args.event_id)
-        if args.command == "heartbeat":
-            return heartbeat_command(config)
-        if args.lifecycle in {"stop", "heartbeat"}:
-            if args.once or args.until_event or args.until_actionable or args.managed:
-                raise ValueError("watch lifecycle actions cannot be combined with a watch mode")
-            if args.lifecycle == "stop":
-                return stop_command(config)
-            return heartbeat_command(config)
-        if not (args.once or args.until_event or args.until_actionable or args.managed):
-            raise ValueError("watch requires one mode: --once, --until-event, --until-actionable, or --managed")
+        if not (args.once or args.until_event or args.until_actionable):
+            raise ValueError("watch requires one mode: --once, --until-event, or --until-actionable")
         if args.once:
             return watch_once(config, no_write=args.no_write)[0]
         if args.until_actionable:
             if args.no_write:
                 raise ValueError("--until-actionable requires writable harness output")
             return watch_until_actionable(config, timeout_seconds=args.timeout, manager_session_id=args.manager_session_id, manager_invocation_id=args.manager_invocation_id)
-        if args.managed:
-            if args.no_write:
-                raise ValueError("--managed requires writable harness output")
-            if args.timeout is not None:
-                raise ValueError("--managed does not accept --timeout")
-            return watch_managed(config)
         return watch_until_event(
             config,
             no_write=args.no_write,

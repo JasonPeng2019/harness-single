@@ -186,7 +186,7 @@ class PreparedOutputTransaction:
                 return True
         return False
 
-    def _validate_components(self, target: Path) -> Path:
+    def _validate_components(self, target: Path, *, allow_prepared_parent: bool = False) -> Path:
         lexical = Path(os.path.abspath(str(target)))
         if self._has_ads(lexical):
             raise PathSafetyError(f"alternate data stream syntax rejected: {target}")
@@ -195,7 +195,7 @@ class PreparedOutputTransaction:
         if allowed is None:
             raise PathSafetyError(f"output escapes permitted roots: {target}")
         root_resolved = self.root.resolve(strict=False)
-        if not self._inside(resolved, root_resolved) and resolved != root_resolved:
+        if not allow_prepared_parent and not self._inside(resolved, root_resolved) and resolved != root_resolved:
             raise PathSafetyError(f"output escapes prepared root: {target}")
         for forbidden in self.forbidden_roots:
             if self._inside(resolved, forbidden) or (
@@ -226,7 +226,7 @@ class PreparedOutputTransaction:
             current = current / part
             if not current.exists():
                 current.mkdir()
-            self._validate_components(current)
+            self._validate_components(current, allow_prepared_parent=True)
         info = self.root.stat()
         self._root_identity = (info.st_dev, info.st_ino)
         self._admitted.add(_path_key(self.root))

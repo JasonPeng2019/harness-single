@@ -1,0 +1,18 @@
+{
+  "schema": "orchestrator-codex-adapter/v1",
+  "adapter": "codex",
+  "adapter_version": "codex-v1",
+  "package_revision": "codex-assets-v1",
+  "files": [
+    {
+      "destination": ".codex/hooks/orchestrator_harness_post_tool_use.py",
+      "resource": "orchestrator_harness_post_tool_use.py",
+      "sha256": "bfcfb4d7cdac51fabfe961bd08aa534beaae1564a324a37bace92b2731808592"
+    },
+    {
+      "destination": ".codex/hooks/orchestrator_harness_stop.py",
+      "resource": "orchestrator_harness_stop.py",
+      "sha256": "c575b7f78f01dbef1782a140d1a7dcbf857b0400362b7ee72d0f8834f5297244"
+    }
+  ]
+}

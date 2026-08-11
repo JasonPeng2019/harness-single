@@ -46,7 +46,6 @@ EVENT_DISPOSITION_OBSERVED = "OBSERVED_STATE"
 EVENT_DISPOSITION_SUPERSEDED = "SUPERSESSION"
 
 _WAKING_EVENT_TYPES = frozenset({
-    "HARNESS_WATCHER_ALERT",
     "RELAY_READY",
     "REQUEST_AMBIGUOUS",
     "RELAY_UNBOUND",
@@ -131,6 +130,7 @@ _OBSERVED_EVENT_TYPES = frozenset({
     "MANAGER_WAKE_DELIVERED",
     "MANAGER_WAKE_FAILED",
     "FORMAL_REVIEW_BASELINE_ADVANCED",
+    "HARNESS_WATCHER_ALERT",
 })
 
 EVENT_DISPOSITIONS: dict[str, str] = {
@@ -324,6 +324,7 @@ class ManagerEventRouter:
         manager_thread_id: str | None = None,
         registration_id: str | None = None,
         manager_invocation_id: str | None = None,
+        registration_generation: int | None = None,
         binding: Mapping[str, Any] | None = None,
         now: Any = None,
     ) -> None:
@@ -334,6 +335,14 @@ class ManagerEventRouter:
         manager_thread_id = manager_thread_id or supplied.get("manager_thread_id") or supplied.get("thread_id")
         registration_id = registration_id or supplied.get("registration_id")
         manager_invocation_id = manager_invocation_id or supplied.get("manager_invocation_id") or supplied.get("invocation_id")
+        if registration_generation is None:
+            registration_generation = supplied.get("registration_generation", 1)
+        if (
+            not isinstance(registration_generation, int)
+            or isinstance(registration_generation, bool)
+            or registration_generation < 0
+        ):
+            raise ManagerBindingError("registration_generation must be a non-negative integer")
         run_text = _nonempty_text(run_id, "run_id")
         session_text = _nonempty_text(manager_session_id, "manager_session_id")
         thread_text = _nonempty_text(manager_thread_id, "manager_thread_id")
@@ -358,6 +367,7 @@ class ManagerEventRouter:
             run_text, queue_text, session_text, thread_text, registration_text,
             provisional["manager_invocation_id"],
         )
+        self.registration_generation = registration_generation
         self.root = Path(root).absolute()
         self._now = now
         self._transaction = PreparedOutputTransaction(self.root, allowed_roots=(self.root.parent,))
@@ -406,7 +416,10 @@ class ManagerEventRouter:
         return iso_utc(datetime.now().astimezone()) or ""
 
     def _binding_record(self) -> dict[str, Any]:
-        return self.binding.as_record()
+        return {
+            **self.binding.as_record(),
+            "registration_generation": self.registration_generation,
+        }
 
     def _assert_binding(self, record: Mapping[str, Any]) -> None:
         expected = self._binding_record()
@@ -419,6 +432,8 @@ class ManagerEventRouter:
                 raise ManagerBindingError(f"manager binding mismatch in {field}")
         if "manager_invocation_id" in record and record.get("manager_invocation_id") != expected.get("manager_invocation_id"):
             raise ManagerBindingError("manager binding mismatch in manager_invocation_id")
+        if "registration_generation" in record and record.get("registration_generation") != expected.get("registration_generation"):
+            raise ManagerBindingError("manager binding mismatch in registration_generation")
 
     def _read_json(self, path: Path, *, schema: str) -> dict[str, Any] | None:
         if not path.exists():

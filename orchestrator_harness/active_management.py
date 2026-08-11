@@ -1,8 +1,8 @@
-"""Pure active-management projections for the managed watcher.
+"""Pure active-lane timer and status projections.
 
 This module only derives advisory conditions from a reconciled snapshot.  It neither
 observes files/processes nor persists history, which keeps its decisions repeatable for
-the managed-watch lifecycle that consumes it.
+the native manager/coordinator boundary that consumes it.
 """
 
 from __future__ import annotations
@@ -416,7 +416,7 @@ def transition_active_management(
     *,
     observed_at: datetime,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Advance policy history and return advisory management conditions.
+    """Advance timer history and return advisory manager conditions.
 
     Callers persist the returned history atomically with their own watcher state.  This
     transition intentionally has no I/O and does not acknowledge notifications.

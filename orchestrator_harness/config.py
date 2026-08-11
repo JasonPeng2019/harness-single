@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,13 @@ class HarnessConfig:
     attention_sprint_lifetime_seconds: float | None = None
     record_paths: tuple[str, ...] = ()
     record_manifests: tuple[str, ...] = ()
+    legacy_config_diagnostics: tuple[str, ...] = ()
+
+    @property
+    def migration_diagnostics(self) -> tuple[str, ...]:
+        """Explicit diagnostics for removed policy keys, never live settings."""
+
+        return self.legacy_config_diagnostics
 
     @property
     def forbidden_output_roots(self) -> tuple[Path, ...]:
@@ -62,9 +70,20 @@ def _number(raw: dict[str, Any], key: str, default: float, *, minimum: float) ->
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{key} must be numeric")
     result = float(value)
+    if not math.isfinite(result):
+        raise ConfigError(f"{key} must be finite")
     if result < minimum:
         raise ConfigError(f"{key} must be >= {minimum}")
     return result
+
+
+def _integer(raw: dict[str, Any], key: str, default: int, *, minimum: int) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{key} must be an integer")
+    if value < minimum:
+        raise ConfigError(f"{key} must be >= {minimum}")
+    return value
 
 
 def _declared_relative_paths(
@@ -145,12 +164,12 @@ def load_config(
     if not output.is_absolute():
         output = root / output
 
-    warning = int(_number(raw, "request_warning_seconds", 120, minimum=1))
-    critical = int(_number(raw, "request_critical_seconds", 30, minimum=0))
+    warning = _integer(raw, "request_warning_seconds", 120, minimum=1)
+    critical = _integer(raw, "request_critical_seconds", 30, minimum=0)
     if critical >= warning:
         raise ConfigError("request_critical_seconds must be less than warning")
 
-    process_tolerance = _number(raw, "process_start_tolerance_seconds", 2, minimum=0)
+    process_tolerance = _integer(raw, "process_start_tolerance_seconds", 2, minimum=0)
     if process_tolerance > 2:
         raise ConfigError("process_start_tolerance_seconds must be <= 2")
 
@@ -192,6 +211,21 @@ def load_config(
         except AttentionSprintError as exc:
             raise ConfigError(str(exc)) from exc
 
+    max_json_bytes = _integer(raw, "max_json_bytes", 4_000_000, minimum=1024)
+    max_jsonl_tail_bytes = _integer(raw, "max_jsonl_tail_bytes", 512_000, minimum=1024)
+    stable_read_retries = _integer(raw, "stable_read_retries", 4, minimum=1)
+    removed_keys = (
+        "manager_heartbeat_timeout_seconds",
+        "attention_logging_enabled",
+        "attention_epoch_id",
+        "attention_sprint_lifetime_seconds",
+    )
+    legacy_diagnostics = tuple(
+        f"legacy configuration key {key!r} is retained only for read compatibility and has no S4 runtime effect"
+        for key in removed_keys
+        if key in raw
+    )
+
     return HarnessConfig(
         config_path=config_path,
         harness_root=root,
@@ -203,12 +237,10 @@ def load_config(
         watch_timeout_seconds=_number(raw, "watch_timeout_seconds", 60.0, minimum=0.1),
         request_warning_seconds=warning,
         request_critical_seconds=critical,
-        process_start_tolerance_seconds=int(process_tolerance),
-        max_json_bytes=int(_number(raw, "max_json_bytes", 4_000_000, minimum=1024)),
-        max_jsonl_tail_bytes=int(
-            _number(raw, "max_jsonl_tail_bytes", 512_000, minimum=1024)
-        ),
-        stable_read_retries=int(_number(raw, "stable_read_retries", 4, minimum=1)),
+        process_start_tolerance_seconds=process_tolerance,
+        max_json_bytes=max_json_bytes,
+        max_jsonl_tail_bytes=max_jsonl_tail_bytes,
+        stable_read_retries=stable_read_retries,
         stable_read_delay_seconds=_number(
             raw, "stable_read_delay_seconds", 0.03, minimum=0
         ),
@@ -220,4 +252,5 @@ def load_config(
         attention_sprint_lifetime_seconds=sprint_lifetime,
         record_paths=record_paths,
         record_manifests=record_manifests,
+        legacy_config_diagnostics=legacy_diagnostics,
     )

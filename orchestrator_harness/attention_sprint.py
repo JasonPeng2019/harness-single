@@ -1,9 +1,9 @@
-"""Fail-closed host-only attention-sprint boundary and evidence helpers.
+"""Read-only legacy evidence helpers for removed attention-sprint settings.
 
-These helpers create metadata only; they never renew a heartbeat or describe
-manager activity.  Sprint launchers must call ``validate_sprint_boundary``
-before they start a managed watcher and ``validate_sprint_finalize`` before
-accepting the sprint.
+S4 no longer starts or renews an attention sprint.  The compatibility
+validators remain importable only so historical evidence/config readers fail
+closed with explicit diagnostics; they create no runtime, heartbeat, timeline,
+or integrity state.
 """
 from __future__ import annotations
 
