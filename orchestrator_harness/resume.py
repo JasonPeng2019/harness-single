@@ -20,6 +20,7 @@ _IDENTITY_FIELDS = (
     "lane_id",
     "worker_invocation_id",
     "provider_id",
+    "provider_launch_sha256",
     "session_id",
     "repository",
     "prompt_bundle_sha256",

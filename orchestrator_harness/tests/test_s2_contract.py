@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator_harness.invocation import (
     CANONICAL_INVOCATION_SCHEMA,
@@ -552,14 +555,14 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             }
             invocation_path = root / "run" / ".agent-workspace" / "start.invocation.json"
             invocation_path.write_text(json.dumps(raw), encoding="utf-8")
-            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
             self.assertEqual(0, controller.main([str(invocation_path)]))
+            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
             status_path = root / "run" / ".agent-workspace" / "worker_controller.status.json"
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertEqual("PROVIDER_EXITED", status["state"])
             self.assertEqual("claude-code", status["provider_id"])
             self.assertEqual("session-1", status["provider_session_id"])
-            self.assertEqual("SHAPE_VALID", status["result_validation"]["state"])
+            self.assertEqual("MISSING", status["result_validation"]["state"])
             self.assertEqual("PENDING", status["terminal_acceptance_state"])
             self.assertTrue((root / "run" / ".agent-workspace" / "worker_provider.jsonl").is_file())
 
@@ -631,9 +634,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             }
             invocation_path = root / "run" / ".agent-workspace" / "start.invocation.json"
             invocation_path.write_text(json.dumps(raw), encoding="utf-8")
-            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
             self.assertEqual(0, controller.main([str(invocation_path)]))
             workspace = root / "run" / ".agent-workspace"
+            (workspace / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
             self.assertEqual("PENDING", json.loads((workspace / "worker_controller.status.json").read_text())["terminal_acceptance_state"])
             pending_status_bytes = (workspace / "worker_controller.status.json").read_bytes()
             pending_start = workspace / "start-pending.invocation.json"
@@ -735,6 +738,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 status["resume_identity"]["acceptance_identity"]["accepted_commit"],
             )
 
+            event_log = root / "runtime" / "events.jsonl"
+            event_bytes = event_log.read_bytes()
+            status_path = workspace / "worker_controller.status.json"
+            status_path.unlink()
+            missing_status_path = workspace / "start-missing-status.invocation.json"
+            missing_status_path.write_text(json.dumps(start), encoding="utf-8")
+            self.assertEqual(2, controller.main([str(missing_status_path)]))
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            self.assertFalse(status_path.exists())
+            self.assertEqual(event_bytes, event_log.read_bytes())
+
     def test_controller_result_gate_rejects_wrong_task_card_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -765,6 +779,394 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             self.assertIsNone(task_result)
             self.assertIn("task card content identity", evidence["detail"])
 
+
+    def test_canonical_no_status_fixed_artifacts_are_occupied(self) -> None:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'fresh-session'}), flush=True)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-session'}), flush=True)
+"""
+        cases = ("result-only", "partial", "malformed", "different", "fresh")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                fake = root / "fake_claude.py"
+                fake.write_text(fake_source, encoding="utf-8")
+                marker = root / "launches.txt"
+                raw, card = self._canonical(root)
+                raw["provider"] = {
+                    **raw["provider"],  # type: ignore[arg-type]
+                    "command": [sys.executable, str(fake), str(marker)],
+                }
+                bundle = raw["prompt_bundle"]  # type: ignore[assignment]
+                result = {
+                    "schema": TASK_RESULT_SCHEMA,
+                    "card_id": card["card_id"],
+                    "lane_id": card["lane_id"],
+                    "worker_invocation_id": card["worker_invocation_id"],
+                    "cohort_id": card["stage_cohort_id"],
+                    "revision": card["revision"],
+                    "task_card_sha256": record_sha256(card),
+                    "branch": "synthetic",
+                    "commit": "a" * 40,
+                    "outcome": "PASS",
+                    "summary": "synthetic result",
+                    "checks": [{"name": "fake", "outcome": "PASS"}],
+                    "prompt_bundle_sha256": bundle["bundle_sha256"],
+                    "prompt_content_sha256": bundle["final_sha256"],
+                }
+                workspace = root / "run" / ".agent-workspace"
+                if case == "malformed":
+                    (workspace / "RESULT.json").write_text("not-json", encoding="utf-8")
+                elif case != "fresh":
+                    if case == "different":
+                        result["card_id"] = "different-card"
+                    (workspace / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
+                    if case == "partial":
+                        (workspace / COMPLETION_REVIEW_FILENAME).write_text("not-json", encoding="utf-8")
+                if case == "fresh":
+                    workspace.rmdir()
+                event_parent = root / "runtime" / "missing-events"
+                raw["event_log_path"] = str(event_parent / "events.jsonl")
+                invocation_path = root / f"{case}.invocation.json"
+                invocation_path.write_text(json.dumps(raw), encoding="utf-8")
+                status_path = workspace / "worker_controller.status.json"
+                if case == "fresh":
+                    self.assertEqual(0, controller.main([str(invocation_path)]))
+                    self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+                    self.assertTrue(status_path.is_file())
+                    self.assertTrue((event_parent / "events.jsonl").is_file())
+                else:
+                    self.assertEqual(2, controller.main([str(invocation_path)]))
+                    self.assertFalse(marker.exists())
+                    self.assertFalse(status_path.exists())
+                    self.assertFalse(event_parent.exists())
+
+    def test_canonical_provider_launch_identity_is_immutable_before_adapter(self) -> None:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'provider-session'}), flush=True)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provider-session'}), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = root / "fake_claude.py"
+            fake.write_text(fake_source, encoding="utf-8")
+            marker = root / "launches.txt"
+            raw, _ = self._canonical(root)
+            raw["provider"] = {
+                **raw["provider"],  # type: ignore[arg-type]
+                "command": [sys.executable, str(fake), str(marker)],
+            }
+            start_path = root / "start.invocation.json"
+            start_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(start_path)]))
+            workspace = root / "run" / ".agent-workspace"
+            status_path = workspace / "worker_controller.status.json"
+            status_before = status_path.read_bytes()
+            persisted_identity = json.loads(status_before)["resume_identity"]
+            self.assertEqual(64, len(persisted_identity["provider_launch_sha256"]))
+            self.assertNotIn("provider_options", persisted_identity)
+            self.assertNotIn("provider_launch_record", persisted_identity)
+
+            changes = {
+                "command": [sys.executable, str(fake), str(marker), "changed"],
+                "permission_mode": "acceptEdits",
+                "allowed_tools": ["Read", "Write"],
+                "mcp_config": {"mcpServers": {"synthetic": {"command": ["synthetic"]}}},
+                "config_overrides": ["changed=true"],
+                "reasoning_effort": "high",
+                "service_tier": "standard",
+                "sandbox": "read-only",
+                "approval_policy": "on-request",
+            }
+            for field, changed_value in changes.items():
+                with self.subTest(field=field):
+                    resume = json.loads(json.dumps(raw))
+                    resume["action"] = "resume"
+                    resume["resume"] = {"session_id": "provider-session"}
+                    resume["provider"][field] = changed_value
+                    resume_path = root / f"resume-{field}.invocation.json"
+                    resume_path.write_text(json.dumps(resume), encoding="utf-8")
+                    with patch.object(controller, "provider_adapter", side_effect=AssertionError("adapter must not be called")):
+                        with self.assertRaises(controller.InvocationError):
+                            controller.run(controller.load_invocation(resume_path))
+                    self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+                    self.assertEqual(status_before, status_path.read_bytes())
+
+            unchanged = json.loads(json.dumps(raw))
+            unchanged["action"] = "resume"
+            unchanged["resume"] = {"session_id": "provider-session"}
+            unchanged_path = root / "resume-unchanged.invocation.json"
+            unchanged_path.write_text(json.dumps(unchanged), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(unchanged_path)]))
+            self.assertEqual(2, marker.read_text(encoding="utf-8").count("launch"))
+
+    def test_canonical_workspace_symlink_is_rejected_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, _ = self._canonical(root)
+            workspace = root / "run" / ".agent-workspace"
+            workspace.rmdir()
+            external = root / "external-workspace"
+            external.mkdir()
+            try:
+                os.symlink(str(external), str(workspace), target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                if os.name != "nt":
+                    self.skipTest(f"directory symlink is unavailable: {exc}")
+                junction = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/c",
+                        f'mklink /J "{workspace}" "{external}"',
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if junction.returncode != 0:
+                    self.skipTest(f"directory symlink/junction is unavailable: {junction.stderr.strip()}")
+            event_parent = root / "runtime" / "external-events"
+            raw["event_log_path"] = str(event_parent / "events.jsonl")
+            invocation_path = root / "symlink.invocation.json"
+            invocation_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(controller.InvocationError, "direct child"):
+                controller.load_invocation(invocation_path)
+            self.assertEqual([], list(external.iterdir()))
+            self.assertFalse(event_parent.exists())
+
+    def test_canonical_rejected_preflight_does_not_create_event_parent(self) -> None:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'mutation-session'}), flush=True)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutation-session'}), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = root / "fake_claude.py"
+            fake.write_text(fake_source, encoding="utf-8")
+            marker = root / "launches.txt"
+            raw, card = self._canonical(root)
+            raw["provider"] = {
+                **raw["provider"],  # type: ignore[arg-type]
+                "command": [sys.executable, str(fake), str(marker)],
+            }
+            start_path = root / "start.invocation.json"
+            start_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(start_path)]))
+            workspace = root / "run" / ".agent-workspace"
+            bundle = raw["prompt_bundle"]  # type: ignore[assignment]
+            result = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "task_card_sha256": record_sha256(card),
+                "branch": "synthetic",
+                "commit": "a" * 40,
+                "outcome": "PASS",
+                "summary": "synthetic result",
+                "checks": [{"name": "fake", "outcome": "PASS"}],
+                "prompt_bundle_sha256": bundle["bundle_sha256"],
+                "prompt_content_sha256": bundle["final_sha256"],
+            }
+            result_bytes = json.dumps(result).encode("utf-8")
+            (workspace / "RESULT.json").write_bytes(result_bytes)
+            status_path = workspace / "worker_controller.status.json"
+
+            def candidate(name: str, *, action: str = "start") -> Path:
+                value = json.loads(json.dumps(raw))
+                value["action"] = action
+                if action == "resume":
+                    value["resume"] = {"session_id": "mutation-session"}
+                value["event_log_path"] = str(root / "runtime" / name / "events.jsonl")
+                path = root / f"{name}.invocation.json"
+                path.write_text(json.dumps(value), encoding="utf-8")
+                return path
+
+            pending_status = status_path.read_bytes()
+            self.assertEqual(2, controller.main([str(candidate("pending-start"))]))
+            self.assertFalse((root / "runtime" / "pending-start").exists())
+            self.assertEqual(pending_status, status_path.read_bytes())
+
+            different = json.loads(json.dumps(raw))
+            different["task_card"]["revision"] = "different"
+            different["event_log_path"] = str(root / "runtime" / "different-task" / "events.jsonl")
+            different_path = root / "different-task.invocation.json"
+            different_path.write_text(json.dumps(different), encoding="utf-8")
+            self.assertEqual(2, controller.main([str(different_path)]))
+            self.assertFalse((root / "runtime" / "different-task").exists())
+
+            (workspace / COMPLETION_REVIEW_FILENAME).write_text("not-json", encoding="utf-8")
+            self.assertEqual(2, controller.main([str(candidate("malformed-chain"))]))
+            self.assertFalse((root / "runtime" / "malformed-chain").exists())
+            (workspace / COMPLETION_REVIEW_FILENAME).unlink()
+
+            result_sha = hashlib.sha256(result_bytes).hexdigest()
+            review = {
+                "schema": COMPLETION_REVIEW_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "result_sha256": result_sha,
+                "owner": "ROOT-IM",
+                "verdict": "PASS",
+                "evidence": ["test://mutation"],
+            }
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            acceptance = {
+                "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "card_sha256": record_sha256(card),
+                "result_sha256": result_sha,
+                "completion_review_sha256": hashlib.sha256(review_bytes).hexdigest(),
+                "accepted_commit": "a" * 40,
+                "accepted_by": "ROOT-IM",
+                "verdict": "ACCEPTED",
+            }
+            (workspace / COMPLETION_REVIEW_FILENAME).write_bytes(review_bytes)
+            (workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).write_text(
+                json.dumps(acceptance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            self.assertEqual(2, controller.main([str(candidate("accepted-start"))]))
+            self.assertFalse((root / "runtime" / "accepted-start").exists())
+            self.assertEqual(2, controller.main([str(candidate("accepted-resume", action="resume"))]))
+            self.assertFalse((root / "runtime" / "accepted-resume").exists())
+
+            fresh_root = root / "fresh"
+            fresh_raw, _ = self._canonical(fresh_root)
+            fresh_marker = root / "fresh-launches.txt"
+            fresh_raw["provider"] = {
+                **fresh_raw["provider"],  # type: ignore[arg-type]
+                "command": [sys.executable, str(fake), str(fresh_marker)],
+            }
+            fresh_event_parent = fresh_root / "runtime" / "fresh-events"
+            fresh_raw["event_log_path"] = str(fresh_event_parent / "events.jsonl")
+            fresh_path = root / "fresh.invocation.json"
+            fresh_path.write_text(json.dumps(fresh_raw), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(fresh_path)]))
+            self.assertTrue((fresh_event_parent / "events.jsonl").is_file())
+
+    def test_file_backed_declared_content_hashes_preserve_raw_chain_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card_raw = self._canonical(root)
+            card = validate_task_card(card_raw)  # type: ignore[arg-type]
+            bundle = raw["prompt_bundle"]  # type: ignore[assignment]
+            result = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "task_card_sha256": card.content_sha256,
+                "branch": "synthetic",
+                "commit": "a" * 40,
+                "outcome": "PASS",
+                "summary": "declared result",
+                "checks": [{"name": "digest", "outcome": "PASS"}],
+                "prompt_bundle_sha256": bundle["bundle_sha256"],
+                "prompt_content_sha256": bundle["final_sha256"],
+            }
+            result["content_sha256"] = record_sha256(result)
+            result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            result_record = validate_task_result(result, card=card, raw_bytes=result_bytes)
+            self.assertEqual(hashlib.sha256(result_bytes).hexdigest(), result_record.content_sha256)
+
+            review = {
+                "schema": COMPLETION_REVIEW_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "result_sha256": result_record.content_sha256,
+                "owner": card.completion_review_owner,
+                "verdict": "PASS",
+                "evidence": ["test://declared"],
+            }
+            review["content_sha256"] = record_sha256(review)
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_record = validate_completion_review(review, card=card, result=result_record, raw_bytes=review_bytes)
+            self.assertEqual(hashlib.sha256(review_bytes).hexdigest(), review_record.content_sha256)
+
+            acceptance = {
+                "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+                "card_id": card.card_id,
+                "lane_id": card.lane_id,
+                "worker_invocation_id": card.worker_invocation_id,
+                "cohort_id": card.cohort_id,
+                "revision": card.revision,
+                "card_sha256": card.content_sha256,
+                "result_sha256": result_record.content_sha256,
+                "completion_review_sha256": review_record.content_sha256,
+                "accepted_commit": result_record.commit,
+                "accepted_by": "ROOT-IM",
+                "verdict": "ACCEPTED",
+            }
+            acceptance["content_sha256"] = record_sha256(acceptance)
+            acceptance_bytes = (json.dumps(acceptance, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            acceptance_record = validate_orchestrator_acceptance(
+                acceptance,
+                card=card,
+                result=result_record,
+                review=review_record,
+                raw_bytes=acceptance_bytes,
+            )
+            self.assertEqual(hashlib.sha256(acceptance_bytes).hexdigest(), acceptance_record.content_sha256)
+
+            workspace = root / "chain-workspace"
+            workspace.mkdir()
+            (workspace / "RESULT.json").write_bytes(result_bytes)
+            (workspace / COMPLETION_REVIEW_FILENAME).write_bytes(review_bytes)
+            (workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).write_bytes(acceptance_bytes)
+            advancement = read_task_advancement(workspace, card=card, result=result_record)
+            self.assertEqual("ACCEPTED", advancement.state)
+            self.assertEqual(hashlib.sha256(review_bytes).hexdigest(), advancement.review.content_sha256)  # type: ignore[union-attr]
+            self.assertEqual(hashlib.sha256(acceptance_bytes).hexdigest(), advancement.acceptance.content_sha256)  # type: ignore[union-attr]
+
+            for original, validator, kwargs in (
+                (result, validate_task_result, {"card": card}),
+                (review, validate_completion_review, {"card": card, "result": result_record}),
+                (acceptance, validate_orchestrator_acceptance, {"card": card, "result": result_record, "review": review_record}),
+            ):
+                with self.subTest(record=original["schema"]):
+                    wrong_declaration = dict(original)
+                    wrong_declaration["content_sha256"] = "0" * 64
+                    wrong_bytes = (json.dumps(wrong_declaration, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    with self.assertRaises(TaskValidationError):
+                        validator(wrong_declaration, raw_bytes=wrong_bytes, **kwargs)
+                    tampered = dict(original)
+                    if original["schema"] == TASK_RESULT_SCHEMA:
+                        tampered["summary"] = "tampered"
+                    elif original["schema"] == COMPLETION_REVIEW_SCHEMA:
+                        tampered["evidence"] = ["tampered"]
+                    else:
+                        tampered["accepted_by"] = "tampered"
+                    tampered_bytes = (json.dumps(tampered, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    with self.assertRaises(TaskValidationError):
+                        validator(tampered, raw_bytes=tampered_bytes, **kwargs)
 
 if __name__ == "__main__":
     unittest.main()

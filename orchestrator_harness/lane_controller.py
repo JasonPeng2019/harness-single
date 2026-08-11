@@ -541,6 +541,8 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         if not run_root.is_dir() or not runtime_root.is_dir():
             raise InvocationValidationError("canonical run_root and runtime_root must be directories")
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
+        if workspace.parent != run_root:
+            raise InvocationValidationError("canonical workspace must be a direct child of run_root")
         def rooted(value: Path, base: Path) -> str:
             return str(value if value.is_absolute() else base / value)
         output_paths = {
@@ -551,8 +553,6 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         if output_paths["status"].parent != workspace or output_paths["status"].suffix != ".json":
             raise InvocationValidationError("canonical status must be a direct *.json file under .agent-workspace")
         event_log = _safe_path(rooted(canonical.event_log_path, runtime_root), root=runtime_root, name="event_log_path")
-        workspace.mkdir(exist_ok=True)
-        event_log.parent.mkdir(parents=True, exist_ok=True)
         bundle = bundle_from_record(canonical.prompt_bundle, run_root=run_root)
         if not bundle.final_bytes:
             raise InvocationValidationError("canonical prompt bundle is empty")
@@ -823,6 +823,7 @@ def _canonical_prior_identity_check(
         "task_card_revision",
         "task_card_sha256",
         "provider_id",
+        "provider_launch_sha256",
         "session_id",
         "repository",
         "prompt_bundle_sha256",
@@ -916,16 +917,25 @@ def _canonical_prior_task_preflight(
 ) -> None:
     """Admit only a fresh canonical task or a validated continuation."""
 
-    if prior_status is None:
-        return
-    _canonical_prior_identity_check(
-        invocation,
-        prior_status,
-        prior_status_path=prior_status_path,
-        thread=thread,
-        starting_commit=starting_commit,
-        git_identity=git_identity,
+    fixed_artifact_paths = (
+        invocation.workspace / "RESULT.json",
+        invocation.workspace / COMPLETION_REVIEW_FILENAME,
+        invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME,
     )
+    fixed_artifacts_present = any(
+        path.exists() or path.is_symlink() for path in fixed_artifact_paths
+    )
+    if prior_status is None and not fixed_artifacts_present:
+        return
+    if prior_status is not None:
+        _canonical_prior_identity_check(
+            invocation,
+            prior_status,
+            prior_status_path=prior_status_path,
+            thread=thread,
+            starting_commit=starting_commit,
+            git_identity=git_identity,
+        )
     result_validation, result_valid, task_result = _canonical_result_validation(invocation)
     if not result_valid:
         detail = result_validation.get("detail", "canonical task result is invalid")
@@ -951,11 +961,13 @@ def _canonical_prior_task_preflight(
             "canonical task advancement artifacts exist without a valid RESULT.json"
         )
 
-    claimed_terminal = any(
+    claimed_terminal = prior_status is not None and any(
         prior_status.get(field) == "ACCEPTED"
         for field in ("terminal_acceptance_state", "task_advancement_state")
     )
-    persisted_resume_identity = prior_status.get("resume_identity")
+    persisted_resume_identity = (
+        prior_status.get("resume_identity") if prior_status is not None else None
+    )
     if isinstance(persisted_resume_identity, Mapping):
         claimed_terminal = claimed_terminal or any(
             persisted_resume_identity.get(field) == "ACCEPTED"
@@ -969,15 +981,20 @@ def _canonical_prior_task_preflight(
         acceptance_identity = advancement.acceptance_identity
         if acceptance_identity is None:
             raise InvocationError("canonical task acceptance is missing its identity")
-        _persist_canonical_acceptance(
-            prior_status_path,
-            prior_status,
-            acceptance_identity,
-        )
+        if prior_status is not None:
+            _persist_canonical_acceptance(
+                prior_status_path,
+                prior_status,
+                acceptance_identity,
+            )
         raise InvocationError(
             f"canonical task is already accepted; {invocation.action} rejected before provider launch"
         )
     if invocation.action == "start":
+        if prior_status is None:
+            raise InvocationError(
+                "canonical task has retained fixed artifacts; action:start rejected before provider launch"
+            )
         raise InvocationError(
             "canonical task already has persisted work; action:start rejected; use action:resume"
         )
@@ -1272,6 +1289,12 @@ def run(invocation: Invocation) -> int:
         argv = adapter.build_argv(_provider_launch_spec(invocation, thread))
     except ProviderAdapterError as exc:
         raise InvocationError(str(exc)) from exc
+    if invocation.canonical is not None:
+        try:
+            invocation.workspace.mkdir(exist_ok=True)
+            invocation.event_log.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InvocationError(f"cannot create canonical launch parents: {exc}") from exc
     legacy_status_names = invocation.canonical is None
     running_state = "RUNNING_CODEX" if legacy_status_names else "RUNNING_PROVIDER"
     exited_state = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"

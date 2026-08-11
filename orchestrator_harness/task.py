@@ -66,9 +66,21 @@ def _content_sha256(value: Mapping[str, Any], raw_bytes: bytes | None) -> str:
     if raw_bytes is not None:
         return hashlib.sha256(raw_bytes).hexdigest()
     if "content_sha256" in value:
-        without_self_hash = {key: item for key, item in value.items() if key != "content_sha256"}
-        return record_sha256(without_self_hash)
+        return record_sha256(_without_declared_content_hash(value))
     return record_sha256(value)
+
+
+def _without_declared_content_hash(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "content_sha256"}
+
+
+def _validate_declared_content_hash(value: Mapping[str, Any], name: str) -> None:
+    if "content_sha256" not in value:
+        return
+    declared = _digest(value.get("content_sha256"), f"{name}.content_sha256")
+    canonical = record_sha256(_without_declared_content_hash(value))
+    if declared != canonical:
+        raise TaskValidationError(f"{name} content hash does not match canonical content")
 
 
 def _text(value: object, name: str) -> str:
@@ -272,9 +284,8 @@ def validate_task_result(
         _digest(value.get("prompt_bundle_sha256"), "task result.prompt_bundle_sha256")
     if "prompt_content_sha256" in value:
         _digest(value.get("prompt_content_sha256"), "task result.prompt_content_sha256")
+    _validate_declared_content_hash(value, "task result")
     actual_hash = _content_sha256(value, raw_bytes)
-    if "content_sha256" in value and _digest(value.get("content_sha256"), "task result.content_sha256") != actual_hash:
-        raise TaskValidationError("task result content hash does not match bytes")
     acceptance_state = value.get("acceptance_state", "PENDING")
     if acceptance_state not in {"PENDING", "ACCEPTED", "REJECTED"}:
         raise TaskValidationError("task result.acceptance_state is invalid")
@@ -331,9 +342,8 @@ def validate_completion_review(
     if verdict not in {"PASS", "FAIL", "BLOCKED"}:
         raise TaskValidationError("completion review.verdict is invalid")
     evidence = tuple(_strings(value.get("evidence"), "completion review.evidence"))
+    _validate_declared_content_hash(value, "completion review")
     actual_hash = _content_sha256(value, raw_bytes)
-    if "content_sha256" in value and _digest(value.get("content_sha256"), "completion review.content_sha256") != actual_hash:
-        raise TaskValidationError("completion review content hash does not match bytes")
     return CompletionReview(card, result.content_sha256, owner, str(verdict), evidence, actual_hash)
 
 
@@ -399,9 +409,8 @@ def validate_orchestrator_acceptance(
     verdict = value.get("verdict")
     if verdict not in {"ACCEPTED", "REJECTED"}:
         raise TaskValidationError("orchestrator acceptance.verdict is invalid")
+    _validate_declared_content_hash(value, "orchestrator acceptance")
     actual_hash = _content_sha256(value, raw_bytes)
-    if "content_sha256" in value and _digest(value.get("content_sha256"), "orchestrator acceptance.content_sha256") != actual_hash:
-        raise TaskValidationError("orchestrator acceptance content hash does not match bytes")
     return OrchestratorAcceptance(card, result.content_sha256, expected_review_sha, accepted_commit, accepted_by, str(verdict), actual_hash)
 
 

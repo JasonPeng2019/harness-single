@@ -243,6 +243,31 @@ class CanonicalInvocation:
     def prompt_content_sha256(self) -> str:
         return str(self.prompt_bundle.get("final_sha256"))
 
+    def provider_launch_record(self) -> dict[str, Any]:
+        """Return the validated, effective provider settings used for launch."""
+
+        options = dict(self.provider_options)
+        return {
+            "provider_id": self.provider_id,
+            "model": self.provider_model,
+            "command": list(options.get("command", [self.provider_id])),
+            "reasoning_effort": options.get("reasoning_effort", "medium"),
+            "service_tier": options.get("service_tier", "priority"),
+            "permission_mode": options.get("permission_mode"),
+            "allowed_tools": list(options.get("allowed_tools", [])),
+            "disallowed_tools": list(options.get("disallowed_tools", [])),
+            "mcp_config": options.get("mcp_config"),
+            "config_overrides": list(options.get("config_overrides", [])),
+            "sandbox": options.get("sandbox", "workspace-write"),
+            "approval_policy": options.get("approval_policy", "never"),
+        }
+
+    @property
+    def provider_launch_sha256(self) -> str:
+        return hashlib.sha256(
+            canonical_json(self.provider_launch_record()).encode("utf-8")
+        ).hexdigest()
+
     def identity(self, *, session_id: str | None = None, starting_commit: str | None = None) -> dict[str, Any]:
         repository = dict(self.repository or {})
         if starting_commit is not None:
@@ -258,6 +283,7 @@ class CanonicalInvocation:
             "task_card_revision": self.task_card_revision,
             "task_card_sha256": self.task_card_sha256,
             "provider_id": self.provider_id,
+            "provider_launch_sha256": self.provider_launch_sha256,
             "session_id": session_id or self.requested_session_id,
             "repository": repository,
             "prompt_bundle_sha256": self.prompt_bundle_sha256,
