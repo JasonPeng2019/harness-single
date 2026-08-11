@@ -223,6 +223,7 @@ class CanonicalInvocation:
     phase: str
     legacy_route: str | None = None
     legacy_policy_sha256: str | None = None
+    resume_admission_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.schema != CANONICAL_INVOCATION_SCHEMA:
@@ -297,6 +298,7 @@ class CanonicalInvocation:
             "repository": repository,
             "prompt_bundle_sha256": self.prompt_bundle_sha256,
             "prompt_content_sha256": self.prompt_content_sha256,
+            "resources": list(self.resources),
             "terminal_acceptance_state": "PENDING",
         }
 
@@ -330,6 +332,8 @@ class CanonicalInvocation:
             record["repository"] = dict(self.repository)
         if self.requested_session_id is not None:
             record["resume"] = {"session_id": self.requested_session_id}
+        if self.resume_admission_path is not None:
+            record["resume_admission_path"] = str(self.resume_admission_path)
         return record
 
 
@@ -395,7 +399,7 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         "event_log_path",
         "resources",
     }
-    optional = {"repository", "resume", "label", "task", "phase"}
+    optional = {"repository", "resume", "resume_admission_path", "label", "task", "phase"}
     _closed(raw, required, optional, "canonical invocation")
     action = _text(raw.get("action"), "action").lower()
     if action not in {"start", "resume"}:
@@ -468,6 +472,11 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         requested_session_id = _text(resume.get("session_id"), "resume.session_id")
     elif "resume" in raw:
         raise InvocationValidationError("start invocation cannot contain resume")
+    resume_admission_path = (
+        Path(_text(raw.get("resume_admission_path"), "resume_admission_path"))
+        if "resume_admission_path" in raw
+        else None
+    )
     return CanonicalInvocation(
         schema=CANONICAL_INVOCATION_SCHEMA,
         action=action,
@@ -495,6 +504,7 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         label=_text(raw.get("label", raw.get("worker_invocation_id")), "label"),
         task=_text(raw.get("task", task_card.get("id")), "task"),
         phase=_text(raw.get("phase", "implementation"), "phase"),
+        resume_admission_path=resume_admission_path,
     )
 
 

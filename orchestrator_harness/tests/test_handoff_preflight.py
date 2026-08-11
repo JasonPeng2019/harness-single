@@ -162,6 +162,115 @@ class HandoffPreflightTests(unittest.TestCase):
         self.assertEqual(PASS, result["disposition"])
         self.assertEqual([], result["failed_predicates"])
 
+    def test_candidate_preflight_binds_the_single_amendment_review(self) -> None:
+        task_hash = hashlib.sha256(self.task_card_path.read_bytes()).hexdigest()
+        prompt_hash = hashlib.sha256(self.prompt_path.read_bytes()).hexdigest()
+        review_path = self.root / "RESUME_ADMISSION.json"
+        review = {
+            "schema": "orchestrator-resume-amendment-review/v1",
+            "run_id": "run-1",
+            "stage_id": "S3",
+            "lane_id": "S3.P",
+            "recorded_utc": "2026-01-01T00:00:00Z",
+            "recorded_by": "ROOT-IM",
+            "disposition": "NO_CONTINUATION_REQUIRED",
+            "job_state": "UNACCEPTED",
+            "same_job_identity": {
+                "card_id": "card-1",
+                "stage_cohort_id": "cohort-1",
+                "worker_invocation_id": "worker-1",
+                "lane_id": "S3.P",
+                "task_kind": "focused_implementation",
+                "provider_session_id": "session-1",
+                "repository_common_dir": str(self.root / "common"),
+                "worktree_root": str(self.worktree),
+                "branch": self.repository.branch,
+                "original_base_commit": self.starting_commit,
+                "continuation_start_commit": self.starting_commit,
+                "exclusive_resources": [],
+            },
+            "reviewed_pairs": {
+                name: {
+                    "old_path": str(path),
+                    "old_sha256": digest,
+                    "new_path": str(path),
+                    "new_sha256": digest,
+                    "diff": {
+                        "command": f"git diff --no-index -- {path} {path}",
+                        "working_directory": str(self.root),
+                        "exit_code": 1,
+                        "stdout_encoding": "utf-8",
+                        "stdout_sha256": "a" * 64,
+                        "stdout_bytes": 0,
+                        "stderr_sha256": "b" * 64,
+                        "stderr_bytes": 0,
+                    },
+                }
+                for name, path, digest in (
+                    ("task_card", self.task_card_path, task_hash),
+                    ("prompt", self.prompt_path, prompt_hash),
+                )
+            },
+            "semantic_impact": {
+                "classification": "HARMLESS",
+                "rationale": "The exact reviewed pair has no semantic change.",
+                "affected_scope": ["none"],
+                "preserved_credit": ["all prior checks"],
+            },
+            "route": {
+                "kind": "EXACT_REVIEWED_PAIR",
+                "resume_same_worker": True,
+                "resume_same_provider_session": True,
+                "reopen_accepted_tasks": False,
+                "rerun_only_affected_checks": True,
+                "require_fresh_affected_review": False,
+            },
+        }
+        write_json(review_path, review)
+        review_hash = hashlib.sha256(review_path.read_bytes()).hexdigest()
+        dependency_map = cast(dict[str, object], json.loads(self.dependency_map_path.read_text(encoding="utf-8")))
+        dependency_map["amendment"] = {
+            "review_path": str(review_path),
+            "review_sha256": review_hash,
+            "disposition": "NO_CONTINUATION_REQUIRED",
+            "requested_identity": {
+                "task_card_id": "card-1",
+                "lane_id": "S3.P",
+                "worker_invocation_id": "worker-1",
+                "task_card_sha256": task_hash,
+                "prompt_content_sha256": prompt_hash,
+            },
+            "persisted_identity": {
+                "task_card_id": "card-1",
+                "lane_id": "S3.P",
+                "worker_invocation_id": "worker-1",
+                "task_card_sha256": task_hash,
+                "prompt_content_sha256": prompt_hash,
+            },
+            "job_identity": {
+                "card_id": "card-1",
+                "stage_cohort_id": "cohort-1",
+                "worker_invocation_id": "worker-1",
+                "lane_id": "S3.P",
+                "task_kind": "focused_implementation",
+                "provider_session_id": "session-1",
+                "repository_common_dir": str(self.root / "common"),
+                "worktree_root": str(self.worktree),
+                "branch": self.repository.branch,
+                "original_base_commit": self.starting_commit,
+                "continuation_start_commit": self.starting_commit,
+                "exclusive_resources": [],
+            },
+        }
+        write_json(self.dependency_map_path, dependency_map)
+        result = self.preflight()
+        self.assertEqual(PASS, result["disposition"])
+        dependency_map["amendment"]["review_sha256"] = "0" * 64  # type: ignore[index]
+        write_json(self.dependency_map_path, dependency_map)
+        mismatched = self.preflight()
+        self.assertEqual(REPORT_ONLY_ERROR, mismatched["disposition"])
+        self.assertIn("RESUME_AMENDMENT_IDENTITY", _failed_predicates(mismatched))
+
     def test_malformed_or_identity_mismatched_result_is_report_only(self) -> None:
         _ = self.result_path.write_text("{", encoding="utf-8")
         malformed = self.preflight()

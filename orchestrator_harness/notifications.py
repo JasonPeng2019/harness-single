@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import iso_utc, parse_utc
-from .stable_io import PreparedOutputTransaction, canonical_json, read_stable
+from .stable_io import (
+    PathKeyedAppendLock,
+    PreparedOutputTransaction,
+    _append_jsonl_locked,
+    _jsonl_bytes,
+    canonical_json,
+    read_stable,
+)
 
 
 _TRANSITION_ONLY_TYPES = {
@@ -264,18 +271,31 @@ _FACT_KEYS = frozenset({
 
 
 def _typed_facts(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy only small typed routing facts; never copy logs, output, or content."""
+    """Copy typed routing facts, validating list members like scalar facts.
+
+    The list cardinality is intentionally not capped here.  Recordability is
+    enforced against the manager journal's actual read limit immediately
+    before append, so this boundary does not invent a smaller adversarial-input
+    limit than the durable protocol itself.
+    """
+
+    def scalar(value: object, key: str) -> object:
+        if isinstance(value, str):
+            if len(value) > 4096:
+                raise ManagerRecordError(f"routing fact {key} is too large")
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ManagerRecordError(f"routing fact {key} must be finite")
+        return value
+
     result: dict[str, Any] = {}
     for key in sorted(_FACT_KEYS):
         value = data.get(key)
         if value is None:
             continue
         if isinstance(value, (str, int, float, bool)):
-            if isinstance(value, str) and len(value) > 4096:
-                raise ManagerRecordError(f"routing fact {key} is too large")
-            result[key] = value
-        elif isinstance(value, list) and len(value) <= 100 and all(isinstance(item, (str, int, float, bool)) for item in value):
-            result[key] = list(value)
+            result[key] = scalar(value, key)
+        elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+            result[key] = [scalar(item, key) for item in value]
     return result
 
 
@@ -283,6 +303,9 @@ class ManagerEventRouter:
     """The sole writer for one exact manager binding's durable event channel."""
 
     _MAX_RECORD_BYTES = 2_000_000
+    # This is the existing bound consumed by _queue_records/read_stable.  It
+    # is the recordability boundary, rather than a new per-fact heuristic.
+    _QUEUE_READ_MAX_BYTES = 20_000_000
     def __init__(
         self,
         root: Path,
@@ -468,7 +491,7 @@ class ManagerEventRouter:
             return []
         self._transaction.revalidate(self.queue_path)
         try:
-            data = read_stable(self.queue_path, max_bytes=20_000_000, retries=3, delay_seconds=0.01).data
+            data = read_stable(self.queue_path, max_bytes=self._QUEUE_READ_MAX_BYTES, retries=3, delay_seconds=0.01).data
         except OSError as exc:
             raise ManagerRecordError(f"cannot read QUEUE.jsonl: {exc}") from exc
         records: list[dict[str, Any]] = []
@@ -613,7 +636,7 @@ class ManagerEventRouter:
         revision = current_wake.get("wake_revision", 0) if current_wake else 0
         state = self._state_for_ledger(wake_revision=revision)
         self._transaction.atomic_json(self.state_path, state)
-        if publish_wake and state["events"] and revision == 0:
+        if publish_wake and state["events"]:
             self._publish_wake()
             state = self._state_for_ledger(wake_revision=self.wake_revision)
             self._transaction.atomic_json(self.state_path, state)
@@ -777,7 +800,57 @@ class ManagerEventRouter:
         return float(defaults.get(decision.event_type, 3))
 
     def _append_journal(self, records: list[dict[str, Any]]) -> None:
-        self._transaction.append_jsonl(self.queue_path, records)
+        if not records:
+            return
+        data = _jsonl_bytes(records)
+        with PathKeyedAppendLock(self.queue_path):
+            self._append_journal_locked(data)
+
+    def _append_journal_locked(self, data: bytes) -> None:
+        """Append after the caller has entered the queue's path-keyed lock."""
+        self._transaction.revalidate(self.queue_path)
+        current_size = self.queue_path.stat().st_size if self.queue_path.exists() else 0
+        if current_size + len(data) > self._QUEUE_READ_MAX_BYTES:
+            raise ManagerRecordError(
+                "manager queue append exceeds the journal reader recordability limit"
+            )
+        _append_jsonl_locked(self.queue_path, data)
+
+    def _supersede_pending_locked(
+        self,
+        event_id: str,
+        *,
+        superseded_by: str,
+        identity: str | None,
+        event_type: str | None = None,
+        source_type: str | None = None,
+    ) -> None:
+        """Validate one pending condition and append its supersession atomically."""
+        pending, acknowledged, superseded, _, next_journal = self._ledger()
+        events = {
+            record["event_id"]: record
+            for record in self._queue_records()
+            if record.get("record_kind") == "EVENT"
+        }
+        target = events.get(event_id)
+        if target is None:
+            raise ManagerRecordError("supersession references an unknown event")
+        if event_id in acknowledged:
+            raise ManagerRecordError("supersession references an acknowledged event")
+        if event_id in superseded:
+            raise ManagerRecordError("supersession references an already-superseded event")
+        if not any(item.get("event_id") == event_id for item in pending):
+            raise ManagerRecordError("supersession reference is not pending")
+        if identity is None:
+            raise ManagerRecordError("supersession requires the condition identity")
+        if target.get("identity") != identity:
+            raise ManagerRecordError("supersession condition identity does not match")
+        if event_type is not None and target.get("event_type") != event_type:
+            raise ManagerRecordError("supersession condition type does not match")
+        if source_type is not None and target.get("source_type") != source_type:
+            raise ManagerRecordError("supersession condition source type does not match")
+        record = self._supersession_record(event_id, superseded_by, next_journal)
+        self._append_journal_locked(_jsonl_bytes([record]))
 
     def _supersession_record(self, old_event_id: str, new_event_id: str, journal_seq: int) -> dict[str, Any]:
         return {
@@ -819,8 +892,14 @@ class ManagerEventRouter:
             self._validate_input_binding(event)
         decision = self.classify(event)
         timestamp = observed_at or (self._now() if callable(self._now) else datetime.now().astimezone())
-        state = self.load_state()
+        if decision.disposition == EVENT_DISPOSITION_WAKING:
+            data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+            # Validate all whitelisted members before any cache repair or
+            # other publication.  _event_record repeats this pure validation
+            # while constructing the durable record.
+            _typed_facts(data)
         if decision.disposition == EVENT_DISPOSITION_OBSERVED:
+            state = self.load_state()
             observed = {
                 decision.identity: {
                     "source_type": decision.source_type,
@@ -835,10 +914,25 @@ class ManagerEventRouter:
         if decision.disposition == EVENT_DISPOSITION_SUPERSEDED:
             data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
             old_id = data.get("cleared_event_id") or data.get("supersedes_event_id")
-            if isinstance(old_id, str) and old_id:
-                _, _, _, _, next_journal = self._ledger()
-                self._append_journal([self._supersession_record(old_id, decision.event_id or decision.identity, next_journal)])
-                self.rebuild_state(publish_wake=False)
+            if not isinstance(old_id, str) or not old_id:
+                raise ManagerRecordError("condition clear has no superseded event ID")
+            cleared_type = data.get("cleared_type")
+            if not isinstance(cleared_type, str) or not cleared_type.strip():
+                raise ManagerRecordError("condition clear has no cleared event type")
+            cleared_source_type = data.get("cleared_source_type")
+            if cleared_source_type is not None and (
+                not isinstance(cleared_source_type, str) or not cleared_source_type.strip()
+            ):
+                raise ManagerRecordError("condition clear has an invalid cleared source type")
+            with PathKeyedAppendLock(self.queue_path):
+                self._supersede_pending_locked(
+                    old_id,
+                    superseded_by=decision.event_id or decision.identity,
+                    identity=decision.identity,
+                    event_type=cleared_type,
+                    source_type=cleared_source_type,
+                )
+            self.rebuild_state(publish_wake=False)
             return None
         pending, acknowledged, superseded, next_admission, next_journal = self._ledger()
         del pending
@@ -849,6 +943,7 @@ class ManagerEventRouter:
                     return prior
         selected_priority = self._priority_for(event, decision, priority, snapshot, timestamp)
         if selected_priority is None:
+            state = self.load_state()
             observed = {
                 decision.identity: {
                     "source_type": decision.source_type,
@@ -896,8 +991,9 @@ class ManagerEventRouter:
             journal_records.append(self._supersession_record(old_id, event_id, journal))
         # This append is the crash-consistency boundary: queue first, cache and
         # payload-free wake second.
+        prior_wake_revision = self.wake_revision
         self._append_journal(journal_records)
-        state_after_queue = self._state_for_ledger(wake_revision=state.get("wake_revision", 0))
+        state_after_queue = self._state_for_ledger(wake_revision=prior_wake_revision)
         self._transaction.atomic_json(self.state_path, state_after_queue)
         wake = self._publish_wake()
         self._transaction.atomic_json(self.state_path, self._state_for_ledger(wake_revision=wake["wake_revision"]))
@@ -949,13 +1045,25 @@ class ManagerEventRouter:
     acknowledge_event = acknowledge
     ack = acknowledge
 
-    def supersede(self, event_id: str, *, superseded_by: str | None = None) -> bool:
+    def supersede(
+        self,
+        event_id: str,
+        *,
+        superseded_by: str | None = None,
+        identity: str | None = None,
+        event_type: str | None = None,
+        source_type: str | None = None,
+    ) -> bool:
         event_id = _nonempty_text(event_id, "event_id")
         replacement = _nonempty_text(superseded_by, "superseded_by") if superseded_by is not None else "explicit-supersession"
-        _, _, superseded, _, next_journal = self._ledger()
-        if event_id in superseded:
-            return True
-        self._append_journal([self._supersession_record(event_id, replacement, next_journal)])
+        with PathKeyedAppendLock(self.queue_path):
+            self._supersede_pending_locked(
+                event_id,
+                superseded_by=replacement,
+                identity=identity,
+                event_type=event_type,
+                source_type=source_type,
+            )
         self.rebuild_state(publish_wake=False)
         return True
 
@@ -1016,7 +1124,7 @@ class ManagerEventRouter:
         if not self.delivery_path.exists():
             return []
         self._transaction.revalidate(self.delivery_path)
-        data = read_stable(self.delivery_path, max_bytes=20_000_000, retries=3, delay_seconds=0.01).data
+        data = read_stable(self.delivery_path, max_bytes=self._QUEUE_READ_MAX_BYTES, retries=3, delay_seconds=0.01).data
         result: list[dict[str, Any]] = []
         common_fields = set(self._binding_record()) | {
             "schema", "delivery_id", "wake_revision", "event_ids", "outcome", "delivered_utc",

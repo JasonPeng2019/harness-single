@@ -105,6 +105,112 @@ class S3ContractTests(unittest.TestCase):
             self.assertTrue(recovered.acknowledge("event-1"))
             self.assertEqual([], recovered.pending_events())
 
+    def test_repair_recordability_rejects_oversized_whitelisted_list_before_append(self) -> None:
+        """S3-REPAIR-QUEUE-RECORDABILITY: list members cannot poison the journal."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "manager"
+            router = self.router(root)
+            state_before = (root / "STATE.json").read_bytes()
+            wake_before = (root / "WAKE.json").read_bytes()
+            oversized = "x" * 20_000_000
+            with self.assertRaises(ManagerRecordError):
+                router.admit(self.event(
+                    "RESOURCE_CONFLICT",
+                    "oversized-list",
+                    "resource:recordability",
+                    resource="recordability",
+                    resources=[oversized],
+                ))
+            self.assertEqual(b"", (root / "QUEUE.jsonl").read_bytes())
+            self.assertEqual(state_before, (root / "STATE.json").read_bytes())
+            self.assertEqual(wake_before, (root / "WAKE.json").read_bytes())
+            aggregate = ["x" * 4096 for _ in range(5000)]
+            with self.assertRaises(ManagerRecordError):
+                router.admit(self.event(
+                    "RESOURCE_CONFLICT",
+                    "aggregate-list",
+                    "resource:recordability",
+                    resource="recordability",
+                    resources=aggregate,
+                ))
+            self.assertEqual(b"", (root / "QUEUE.jsonl").read_bytes())
+            self.assertEqual(state_before, (root / "STATE.json").read_bytes())
+            self.assertEqual(wake_before, (root / "WAKE.json").read_bytes())
+
+    def test_repair_supersession_requires_existing_pending_same_condition(self) -> None:
+        """S3-REPAIR-EXACT-SUPERSESSION: invalid references do not mutate the journal."""
+        with tempfile.TemporaryDirectory() as raw:
+            router = self.router(Path(raw) / "manager")
+            first = router.admit(self.event(
+                "RESOURCE_CONFLICT", "condition-a", "resource:a", resource="a"
+            ))
+            second = router.admit(self.event(
+                "RESOURCE_CONFLICT", "condition-b", "resource:b", resource="b"
+            ))
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            before = (router.queue_path).read_bytes()
+            with self.assertRaises(ManagerRecordError):
+                router.admit(self.event(
+                    "CONDITION_CLEARED",
+                    "clear-a",
+                    "resource:a",
+                    cleared_event_id="condition-b",
+                ))
+            self.assertEqual(before, router.queue_path.read_bytes())
+            with self.assertRaises(ManagerRecordError):
+                router.supersede("unknown-event")
+
+            router.admit(self.event(
+                "CONDITION_CLEARED",
+                "clear-a",
+                "resource:a",
+                cleared_event_id="condition-a",
+                cleared_type="RESOURCE_CONFLICT",
+            ))
+            self.assertEqual(["condition-b"], [item["event_id"] for item in router.pending_events()])
+            router.acknowledge("condition-b")
+            after_acknowledged = router.queue_path.read_bytes()
+            with self.assertRaises(ManagerRecordError):
+                router.supersede("condition-b", identity="resource:b")
+            self.assertEqual(after_acknowledged, router.queue_path.read_bytes())
+            before_already_superseded = router.queue_path.read_bytes()
+            with self.assertRaises(ManagerRecordError):
+                router.admit(self.event(
+                    "CONDITION_CLEARED",
+                    "clear-a-replay",
+                    "resource:a",
+                    cleared_event_id="condition-a",
+                    cleared_type="RESOURCE_CONFLICT",
+                ))
+            self.assertEqual(before_already_superseded, router.queue_path.read_bytes())
+
+            router.admit(self.event("RESOURCE_CONFLICT", "condition-c", "resource:c", resource="c"))
+            self.assertTrue(
+                router.supersede(
+                    "condition-c",
+                    identity="resource:c",
+                    event_type="RESOURCE_CONFLICT",
+                    source_type="RESOURCE_CONFLICT",
+                )
+            )
+            self.assertNotIn("condition-c", {item["event_id"] for item in router.pending_events()})
+
+    def test_repair_restart_republishes_later_lost_wake(self) -> None:
+        """S3-REPAIR-LATER-WAKE: a nonzero old edge does not hide a new obligation."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "manager"
+            router = self.router(root)
+            router.admit(self.event("RESOURCE_CONFLICT", "event-a", "resource:a", resource="a"))
+            self.assertEqual(1, router.wake_revision)
+            with mock.patch.object(router, "_publish_wake", side_effect=OSError("lost revision 2")):
+                with self.assertRaises(OSError):
+                    router.admit(self.event("RESOURCE_CONFLICT", "event-b", "resource:b", resource="b"))
+            self.assertEqual(1, router.wake_revision)
+            recovered = self.router(root)
+            self.assertGreater(recovered.wake_revision, 1)
+            self.assertIn("event-b", {item["event_id"] for item in recovered.pending_events()})
+
     def test_wiring_is_exhaustive_and_timers_are_manager_events(self) -> None:
         self.assertIn("MANAGER_REVIEW_DUE", CURRENT_EVENT_DISPOSITIONS)
         self.assertIn("LANE_NO_PROGRESS", CURRENT_EVENT_DISPOSITIONS)
