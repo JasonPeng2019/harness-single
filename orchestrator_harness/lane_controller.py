@@ -52,6 +52,8 @@ from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .resume import ResumeAdmissionError, require_resume_admission
 from .task import (
+    COMPLETION_REVIEW_FILENAME,
+    ORCHESTRATOR_ACCEPTANCE_FILENAME,
     TaskResult,
     TaskValidationError,
     read_task_advancement,
@@ -154,6 +156,35 @@ def _safe_path(value: object, *, root: Path, name: str, must_exist: bool = False
     if must_exist and not candidate.is_file():
         raise InvocationError(f"{name} is not an existing regular file")
     return candidate
+
+
+def _canonical_output_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _validate_canonical_output_paths(
+    output_paths: Mapping[str, Path], *, workspace: Path,
+) -> None:
+    """Reject canonical output aliases before any workspace/output mutation."""
+
+    path_keys = {key: _canonical_output_path_key(path) for key, path in output_paths.items()}
+    if len(set(path_keys.values())) != len(path_keys):
+        raise InvocationValidationError("canonical output paths must be pairwise distinct")
+
+    reserved_paths = {
+        _canonical_output_path_key(workspace / "RESULT.json"): "RESULT.json",
+        _canonical_output_path_key(workspace / COMPLETION_REVIEW_FILENAME): COMPLETION_REVIEW_FILENAME,
+        _canonical_output_path_key(workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME): ORCHESTRATOR_ACCEPTANCE_FILENAME,
+    }
+    collisions = sorted(
+        f"{key}={reserved_paths[path_key]}"
+        for key, path_key in path_keys.items()
+        if path_key in reserved_paths
+    )
+    if collisions:
+        raise InvocationValidationError(
+            "canonical output paths are reserved task artifacts: " + ", ".join(collisions)
+        )
 
 
 def _string(raw: dict[str, Any], key: str) -> str:
@@ -510,16 +541,17 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         if not run_root.is_dir() or not runtime_root.is_dir():
             raise InvocationValidationError("canonical run_root and runtime_root must be directories")
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
-        workspace.mkdir(exist_ok=True)
         def rooted(value: Path, base: Path) -> str:
             return str(value if value.is_absolute() else base / value)
         output_paths = {
             key: _safe_path(rooted(value, workspace), root=workspace, name=f"output_paths.{key}")
             for key, value in canonical.output_paths.items()
         }
+        _validate_canonical_output_paths(output_paths, workspace=workspace)
         if output_paths["status"].parent != workspace or output_paths["status"].suffix != ".json":
             raise InvocationValidationError("canonical status must be a direct *.json file under .agent-workspace")
         event_log = _safe_path(rooted(canonical.event_log_path, runtime_root), root=runtime_root, name="event_log_path")
+        workspace.mkdir(exist_ok=True)
         event_log.parent.mkdir(parents=True, exist_ok=True)
         bundle = bundle_from_record(canonical.prompt_bundle, run_root=run_root)
         if not bundle.final_bytes:
@@ -699,6 +731,258 @@ def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str, Any]] | None:
+    """Find the one persisted controller status owned by this canonical workspace."""
+
+    workspace = invocation.workspace
+    if not workspace.is_dir():
+        return None
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        paths = sorted(workspace.glob("*.json"), key=lambda path: path.name)
+    except OSError as exc:
+        raise InvocationError(f"cannot inspect canonical workspace status: {exc}") from exc
+    for path in paths:
+        if path.name.startswith("."):
+            continue
+        if path == invocation.status_path:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise InvocationError(f"canonical persisted status is invalid: {exc}") from exc
+            if not isinstance(value, dict):
+                raise InvocationError("canonical persisted status must be an object")
+        else:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+        if value.get("schema") == "orchestrator-lane-controller/v1":
+            candidates.append((path, value))
+    if len(candidates) > 1:
+        raise InvocationError("canonical workspace contains multiple persisted controller statuses")
+    return candidates[0] if candidates else None
+
+
+def _canonical_repository_identity(value: object, *, include_starting_commit: bool) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if not include_starting_commit and key_text == "starting_commit":
+            continue
+        if key_text in {"common_dir", "worktree_root"} and isinstance(item, str):
+            normalized[key_text] = os.path.normcase(os.path.abspath(item))
+        elif key_text in {"base_commit", "starting_commit"} and isinstance(item, str):
+            normalized[key_text] = item.lower()
+        else:
+            normalized[key_text] = item
+    return normalized
+
+
+def _canonical_prior_identity_check(
+    invocation: Invocation,
+    prior_status: Mapping[str, Any],
+    *,
+    prior_status_path: Path,
+    thread: str | None,
+    starting_commit: str | None,
+    git_identity: Any,
+) -> None:
+    assert invocation.canonical is not None
+    if prior_status_path != invocation.status_path:
+        raise InvocationError(
+            "canonical workspace already has a persisted status at a different path"
+        )
+
+    canonical = invocation.canonical
+    expected_identity = canonical.identity(
+        session_id=thread if invocation.action == "resume" else None,
+        starting_commit=starting_commit if invocation.action == "resume" else None,
+    )
+    if git_identity is not None:
+        expected_identity["repository"] = repository_status(
+            git_identity,
+            starting_commit=starting_commit if invocation.action == "resume" else None,
+        )
+    persisted_identity = prior_status.get("resume_identity")
+    if not isinstance(persisted_identity, Mapping):
+        raise InvocationError("canonical persisted status has no resume_identity")
+
+    identity_fields = (
+        "schema",
+        "lane_id",
+        "worker_invocation_id",
+        "cohort_id",
+        "workflow_id",
+        "workflow_version",
+        "task_card_id",
+        "task_card_revision",
+        "task_card_sha256",
+        "provider_id",
+        "session_id",
+        "repository",
+        "prompt_bundle_sha256",
+        "prompt_content_sha256",
+    )
+    for field in identity_fields:
+        if invocation.action == "start" and field == "session_id":
+            continue
+        if field not in persisted_identity or field not in expected_identity:
+            raise InvocationError(f"canonical persisted status identity is missing {field}")
+        persisted_value = persisted_identity[field]
+        expected_value = expected_identity[field]
+        if field == "repository":
+            include_starting_commit = invocation.action == "resume"
+            persisted_value = _canonical_repository_identity(
+                persisted_value, include_starting_commit=include_starting_commit
+            )
+            expected_value = _canonical_repository_identity(
+                expected_value, include_starting_commit=include_starting_commit
+            )
+        if persisted_value != expected_value:
+            raise InvocationError("canonical prior task identity does not match persisted status")
+
+    expected_status_identity = {
+        "invocation_schema": canonical.schema,
+        "worker_invocation_id": canonical.worker_invocation_id,
+        "cohort_id": canonical.cohort_id,
+        "workflow": {"id": canonical.workflow_id, "version": canonical.workflow_version},
+        "task_card": {
+            "id": canonical.task_card_id,
+            "revision": canonical.task_card_revision,
+            "sha256": canonical.task_card_sha256,
+        },
+        "doer": canonical.role,
+        "task": canonical.task,
+        "phase": canonical.phase,
+        "provider_id": canonical.provider_id,
+        "prompt_bundle_sha256": canonical.prompt_bundle_sha256,
+        "prompt_content_sha256": canonical.prompt_content_sha256,
+        "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
+    }
+    for field, expected in expected_status_identity.items():
+        if field not in prior_status or prior_status[field] != expected:
+            raise InvocationError("canonical prior task identity does not match persisted status")
+    if git_identity is not None:
+        include_starting_commit = invocation.action == "resume"
+        persisted_repository = _canonical_repository_identity(
+            prior_status.get("repository"), include_starting_commit=include_starting_commit
+        )
+        expected_repository = _canonical_repository_identity(
+            expected_identity["repository"], include_starting_commit=include_starting_commit
+        )
+        if persisted_repository != expected_repository:
+            raise InvocationError("canonical prior task repository identity does not match persisted status")
+
+
+def _canonical_acceptance_status(
+    status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated_status = dict(status)
+    updated_status["terminal_acceptance_state"] = "ACCEPTED"
+    updated_status["task_advancement_state"] = "ACCEPTED"
+    updated_status["acceptance_identity"] = dict(acceptance_identity)
+    persisted_resume_identity = updated_status.get("resume_identity")
+    if not isinstance(persisted_resume_identity, Mapping):
+        raise InvocationError("canonical accepted task requires persisted resume_identity")
+    accepted_resume_identity = dict(persisted_resume_identity)
+    accepted_resume_identity["terminal_acceptance_state"] = "ACCEPTED"
+    accepted_resume_identity["task_advancement_state"] = "ACCEPTED"
+    accepted_resume_identity["acceptance_identity"] = dict(acceptance_identity)
+    updated_status["resume_identity"] = accepted_resume_identity
+    return updated_status
+
+
+def _persist_canonical_acceptance(
+    path: Path, status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated_status = _canonical_acceptance_status(status, acceptance_identity)
+    _atomic_json(path, updated_status)
+    return updated_status
+
+
+def _canonical_prior_task_preflight(
+    invocation: Invocation,
+    prior_status: Mapping[str, Any] | None,
+    *,
+    prior_status_path: Path,
+    thread: str | None,
+    starting_commit: str | None,
+    git_identity: Any,
+) -> None:
+    """Admit only a fresh canonical task or a validated continuation."""
+
+    if prior_status is None:
+        return
+    _canonical_prior_identity_check(
+        invocation,
+        prior_status,
+        prior_status_path=prior_status_path,
+        thread=thread,
+        starting_commit=starting_commit,
+        git_identity=git_identity,
+    )
+    result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+    if not result_valid:
+        detail = result_validation.get("detail", "canonical task result is invalid")
+        raise InvocationError(f"canonical {invocation.action} requires a valid task result: {detail}")
+
+    advancement = None
+    if task_result is not None:
+        try:
+            advancement = read_task_advancement(
+                invocation.workspace,
+                card=task_result.card,
+                result=task_result,
+            )
+        except TaskValidationError as exc:
+            raise InvocationError(
+                f"canonical {invocation.action} task advancement rejected: {exc}"
+            ) from exc
+    elif (
+        (invocation.workspace / COMPLETION_REVIEW_FILENAME).exists()
+        or (invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).exists()
+    ):
+        raise InvocationError(
+            "canonical task advancement artifacts exist without a valid RESULT.json"
+        )
+
+    claimed_terminal = any(
+        prior_status.get(field) == "ACCEPTED"
+        for field in ("terminal_acceptance_state", "task_advancement_state")
+    )
+    persisted_resume_identity = prior_status.get("resume_identity")
+    if isinstance(persisted_resume_identity, Mapping):
+        claimed_terminal = claimed_terminal or any(
+            persisted_resume_identity.get(field) == "ACCEPTED"
+            for field in ("terminal_acceptance_state", "task_advancement_state")
+        )
+    if claimed_terminal and (advancement is None or advancement.state != "ACCEPTED"):
+        raise InvocationError(
+            "canonical persisted status claims acceptance without an accepted task advancement chain"
+        )
+    if advancement is not None and advancement.state == "ACCEPTED":
+        acceptance_identity = advancement.acceptance_identity
+        if acceptance_identity is None:
+            raise InvocationError("canonical task acceptance is missing its identity")
+        _persist_canonical_acceptance(
+            prior_status_path,
+            prior_status,
+            acceptance_identity,
+        )
+        raise InvocationError(
+            f"canonical task is already accepted; {invocation.action} rejected before provider launch"
+        )
+    if invocation.action == "start":
+        raise InvocationError(
+            "canonical task already has persisted work; action:start rejected; use action:resume"
+        )
+
+
 def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
     value: dict[str, Any] = {
         "utc": _utc(),
@@ -862,7 +1146,14 @@ def run(invocation: Invocation) -> int:
     prompt = invocation.prompt_bytes
     if not prompt:
         raise InvocationError("prompt is empty")
-    prior_status = _read_prior_status(invocation)
+    prior_status_path = invocation.status_path
+    if invocation.canonical is not None:
+        canonical_prior = _read_canonical_prior_status(invocation)
+        prior_status = canonical_prior[1] if canonical_prior is not None else None
+        if canonical_prior is not None:
+            prior_status_path = canonical_prior[0]
+    else:
+        prior_status = _read_prior_status(invocation)
     prior_thread_value = prior_status.get("thread_id") if prior_status else None
     prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
     starting_commit = None
@@ -891,41 +1182,15 @@ def run(invocation: Invocation) -> int:
             if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
                 raise InvocationError("resume requires the persisted provider session ID")
             if invocation.canonical is not None:
-                # Re-read the exact result and the fixed manager-owned chain
-                # before any provider argv is built.  A valid acceptance is
-                # terminal; a present invalid/partial chain fails closed.
-                result_validation, result_valid, task_result = _canonical_result_validation(invocation)
-                if not result_valid:
-                    detail = result_validation.get("detail", "canonical task result is invalid")
-                    raise InvocationError(f"canonical resume requires a valid task result: {detail}")
-                if task_result is not None:
-                    try:
-                        advancement = read_task_advancement(
-                            invocation.workspace,
-                            card=task_result.card,
-                            result=task_result,
-                        )
-                    except TaskValidationError as exc:
-                        raise InvocationError(f"canonical resume task advancement rejected: {exc}") from exc
-                    if advancement.state == "ACCEPTED":
-                        acceptance_identity = advancement.acceptance_identity
-                        if acceptance_identity is None:
-                            raise InvocationError("canonical resume acceptance is missing its identity")
-                        updated_status = dict(prior_status)
-                        updated_status["terminal_acceptance_state"] = "ACCEPTED"
-                        updated_status["task_advancement_state"] = "ACCEPTED"
-                        updated_status["acceptance_identity"] = acceptance_identity
-                        persisted_resume_identity = updated_status.get("resume_identity")
-                        if not isinstance(persisted_resume_identity, Mapping):
-                            raise InvocationError("canonical resume requires persisted resume_identity")
-                        accepted_resume_identity = dict(persisted_resume_identity)
-                        accepted_resume_identity["terminal_acceptance_state"] = "ACCEPTED"
-                        accepted_resume_identity["acceptance_identity"] = acceptance_identity
-                        updated_status["resume_identity"] = accepted_resume_identity
-                        _atomic_json(invocation.status_path, updated_status)
-                        raise InvocationError(
-                            "canonical task is already accepted; resume rejected before provider launch"
-                        )
+                _canonical_prior_task_preflight(
+                    invocation,
+                    prior_status,
+                    prior_status_path=prior_status_path,
+                    thread=thread,
+                    starting_commit=starting_commit,
+                    git_identity=git_identity,
+                )
+            if invocation.canonical is not None:
                 requested_identity = invocation.canonical.identity(
                     session_id=thread,
                     starting_commit=starting_commit,
@@ -976,6 +1241,15 @@ def run(invocation: Invocation) -> int:
         thread = None
         if git_identity is not None:
             starting_commit = git_identity.head_commit
+        if invocation.canonical is not None:
+            _canonical_prior_task_preflight(
+                invocation,
+                prior_status,
+                prior_status_path=prior_status_path,
+                thread=thread,
+                starting_commit=starting_commit,
+                git_identity=git_identity,
+            )
     if invocation.repository is not None:
         try:
             conflicts = active_declaration_conflicts(
@@ -1238,12 +1512,7 @@ def run(invocation: Invocation) -> int:
                     state["result_validation"] = result_validation
                     state["result_valid"] = False
                 else:
-                    state["terminal_acceptance_state"] = "ACCEPTED"
-                    state["acceptance_identity"] = acceptance_identity
-                    resume_identity = dict(state.get("resume_identity") or {})
-                    resume_identity["terminal_acceptance_state"] = "ACCEPTED"
-                    resume_identity["acceptance_identity"] = acceptance_identity
-                    state["resume_identity"] = resume_identity
+                    state = _canonical_acceptance_status(state, acceptance_identity)
         elif invocation.repository is not None:
             result_validation, result_valid = _coding_result_validation(invocation)
             state["result_validation"] = result_validation

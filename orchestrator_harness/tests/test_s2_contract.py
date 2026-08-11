@@ -26,7 +26,9 @@ from orchestrator_harness.prompt_bundle import (
 from orchestrator_harness.provider import ClaudeCodeProviderAdapter, ProviderLaunchSpec
 from orchestrator_harness.resume import make_resume_admission
 from orchestrator_harness.task import (
+    COMPLETION_REVIEW_FILENAME,
     COMPLETION_REVIEW_SCHEMA,
+    ORCHESTRATOR_ACCEPTANCE_FILENAME,
     ORCHESTRATOR_ACCEPTANCE_SCHEMA,
     TASK_CARD_SCHEMA,
     TASK_RESULT_SCHEMA,
@@ -200,6 +202,52 @@ class S2ContractTests(unittest.TestCase):
             advanced = advance_task(card, result, review=review, acceptance=acceptance)
             self.assertEqual("ACCEPTED", advanced.state)
             self.assertTrue(advanced.terminal)
+
+    def test_canonical_output_reservations_reject_before_workspace_mutation(self) -> None:
+        reserved_names = ("RESULT.json", COMPLETION_REVIEW_FILENAME, ORCHESTRATOR_ACCEPTANCE_FILENAME)
+        output_names = ("status", "jsonl", "stderr", "last_message")
+        pairs = (
+            ("status", "jsonl"),
+            ("status", "stderr"),
+            ("status", "last_message"),
+            ("jsonl", "stderr"),
+            ("jsonl", "last_message"),
+            ("stderr", "last_message"),
+        )
+
+        def assert_rejected(raw: dict[str, object], root: Path, label: str) -> None:
+            workspace = root / "run" / ".agent-workspace"
+            event_parent = root / "runtime" / "event-parent"
+            raw["event_log_path"] = str(event_parent / "events.jsonl")
+            invocation_path = root / f"{label}.invocation.json"
+            invocation_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertTrue(workspace.is_dir())
+            workspace.rmdir()
+            with self.assertRaises(controller.InvocationError):
+                load_invocation(invocation_path)
+            self.assertFalse(workspace.exists())
+            self.assertFalse(event_parent.exists())
+
+        for reserved_name in reserved_names:
+            for output_name in output_names:
+                with self.subTest(reserved_name=reserved_name, output_name=output_name):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        raw, _ = self._canonical(root)
+                        output_paths = dict(raw["output_paths"])  # type: ignore[arg-type]
+                        output_paths[output_name] = str(root / "run" / ".agent-workspace" / reserved_name)
+                        raw["output_paths"] = output_paths
+                        assert_rejected(raw, root, f"reserved-{output_name}")
+
+        for first, second in pairs:
+            with self.subTest(first=first, second=second):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    raw, _ = self._canonical(root)
+                    output_paths = dict(raw["output_paths"])  # type: ignore[arg-type]
+                    output_paths[second] = output_paths[first]
+                    raw["output_paths"] = output_paths
+                    assert_rejected(raw, root, f"duplicate-{first}-{second}")
 
     def test_fixed_task_advancement_chain_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -544,7 +592,7 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             )
             self.assertEqual("FAILED", failure_status["provider_terminal_outcome"])
 
-    def test_controller_acceptance_chain_blocks_resume_before_fake_provider(self) -> None:
+    def test_controller_acceptance_chain_blocks_start_and_resume_before_fake_provider(self) -> None:
         fake_source = """
 import json, sys
 from pathlib import Path
@@ -587,6 +635,23 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             self.assertEqual(0, controller.main([str(invocation_path)]))
             workspace = root / "run" / ".agent-workspace"
             self.assertEqual("PENDING", json.loads((workspace / "worker_controller.status.json").read_text())["terminal_acceptance_state"])
+            pending_status_bytes = (workspace / "worker_controller.status.json").read_bytes()
+            pending_start = workspace / "start-pending.invocation.json"
+            pending_start.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(controller.InvocationError, "action:start.*resume"):
+                controller.run(controller.load_invocation(pending_start))
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            self.assertEqual(pending_status_bytes, (workspace / "worker_controller.status.json").read_bytes())
+
+            different_card = dict(raw)
+            different_card["task_card"] = {**different_card["task_card"], "revision": "different"}  # type: ignore[arg-type]
+            different_path = workspace / "start-different-card.invocation.json"
+            different_path.write_text(json.dumps(different_card), encoding="utf-8")
+            with self.assertRaisesRegex(controller.InvocationError, "identity does not match"):
+                controller.run(controller.load_invocation(different_path))
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            self.assertEqual(pending_status_bytes, (workspace / "worker_controller.status.json").read_bytes())
+
             fixture = SuiteFixture.create()
             try:
                 pending = discover_run(root / "run", workspace, fixture.config)
@@ -636,6 +701,22 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             finally:
                 fixture.close()
 
+            start = dict(raw)
+            start_path = workspace / "start-accepted.invocation.json"
+            start_path.write_text(json.dumps(start), encoding="utf-8")
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            self.assertEqual(2, controller.main([str(start_path)]))
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+            status = json.loads((workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
+            self.assertEqual("ACCEPTED", status["terminal_acceptance_state"])
+            self.assertEqual("ACCEPTED", status["task_advancement_state"])
+            self.assertEqual("ACCEPTED", status["resume_identity"]["terminal_acceptance_state"])
+            self.assertEqual("ACCEPTED", status["resume_identity"]["task_advancement_state"])
+            self.assertEqual(
+                acceptance["accepted_commit"],
+                status["resume_identity"]["acceptance_identity"]["accepted_commit"],
+            )
+
             resume = dict(raw)
             resume["action"] = "resume"
             resume["resume"] = {"session_id": "session-accepted"}
@@ -647,6 +728,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             status = json.loads((workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
             self.assertEqual("ACCEPTED", status["terminal_acceptance_state"])
             self.assertEqual("ACCEPTED", status["resume_identity"]["terminal_acceptance_state"])
+            self.assertEqual("ACCEPTED", status["task_advancement_state"])
+            self.assertEqual("ACCEPTED", status["resume_identity"]["task_advancement_state"])
             self.assertEqual(
                 acceptance["accepted_commit"],
                 status["resume_identity"]["acceptance_identity"]["accepted_commit"],
