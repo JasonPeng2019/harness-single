@@ -910,6 +910,113 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
             self.assertEqual(0, controller.main([str(unchanged_path)]))
             self.assertEqual(2, marker.read_text(encoding="utf-8").count("launch"))
 
+    def test_canonical_codex_last_message_path_change_rejects_before_adapter(self) -> None:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.buffer.read()
+print(json.dumps({'type': 'thread.started', 'thread_id': 'provider-session'}), flush=True)
+print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = root / "fake_codex.py"
+            fake.write_text(fake_source, encoding="utf-8")
+            marker = root / "launches.txt"
+            raw, _ = self._canonical(root)
+            raw["provider"] = {
+                **raw["provider"],  # type: ignore[arg-type]
+                "id": "codex",
+                "command": [sys.executable, str(fake), str(marker)],
+            }
+            raw["profile"] = {
+                **raw["profile"],  # type: ignore[arg-type]
+                "provider": "codex",
+            }
+            start_path = root / "start.invocation.json"
+            start_path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(0, controller.main([str(start_path)]))
+
+            workspace = root / "run" / ".agent-workspace"
+            status_path = workspace / "worker_controller.status.json"
+            event_path = root / "runtime" / "events.jsonl"
+            resource_root = root / "runtime" / "canonical-resource-locks"
+            status_before = status_path.read_bytes()
+            event_before = event_path.read_bytes()
+            resources_before = sorted(
+                str(path.relative_to(resource_root)) for path in resource_root.rglob("*")
+            )
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "provider-session"}
+            resume["output_paths"]["last_message"] = str(workspace / "worker.last-message.changed")
+            resume_path = root / "changed-last-message.invocation.json"
+            resume_path.write_text(json.dumps(resume), encoding="utf-8")
+            with (
+                patch.object(controller, "provider_adapter") as provider_factory,
+                patch.object(controller, "ResourceClaims", wraps=controller.ResourceClaims) as resource_factory,
+            ):
+                provider_factory.return_value.build_argv.side_effect = AssertionError(
+                    "adapter build_argv must not be called"
+                )
+                with self.assertRaisesRegex(controller.InvocationError, "prior task identity"):
+                    controller.run(controller.load_invocation(resume_path))
+                provider_factory.assert_not_called()
+                provider_factory.return_value.build_argv.assert_not_called()
+                resource_factory.assert_not_called()
+
+            self.assertEqual(status_before, status_path.read_bytes())
+            self.assertEqual(event_before, event_path.read_bytes())
+            self.assertEqual(
+                resources_before,
+                sorted(str(path.relative_to(resource_root)) for path in resource_root.rglob("*")),
+            )
+            self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+
+    def test_canonical_codex_equivalent_last_message_spellings_share_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, _ = self._canonical(root)
+            raw["provider"] = {
+                **raw["provider"],  # type: ignore[arg-type]
+                "id": "codex",
+            }
+            raw["profile"] = {
+                **raw["profile"],  # type: ignore[arg-type]
+                "provider": "codex",
+            }
+            equivalent = json.loads(json.dumps(raw))
+            workspace = root / "run" / ".agent-workspace"
+            equivalent["output_paths"]["last_message"] = str(
+                workspace / "." / "nested" / ".." / "worker.last-message"
+            )
+            first_path = root / "first.invocation.json"
+            second_path = root / "equivalent.invocation.json"
+            first_path.write_text(json.dumps(raw), encoding="utf-8")
+            second_path.write_text(json.dumps(equivalent), encoding="utf-8")
+            first = load_invocation(first_path).canonical
+            second = load_invocation(second_path).canonical
+            assert first is not None
+            assert second is not None
+            self.assertEqual(first.provider_launch_sha256, second.provider_launch_sha256)
+
+    def test_canonical_unconsumed_last_message_path_does_not_change_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, _ = self._canonical(root)
+            changed = json.loads(json.dumps(raw))
+            workspace = root / "run" / ".agent-workspace"
+            changed["output_paths"]["last_message"] = str(workspace / "worker.last-message.changed")
+            first = parse_canonical_invocation(raw)
+            second = parse_canonical_invocation(changed)
+            self.assertEqual("claude-code", first.provider_id)
+            self.assertEqual(first.provider_launch_sha256, second.provider_launch_sha256)
+            self.assertNotIn("last_message_path", first.provider_launch_record())
+
     def test_canonical_workspace_symlink_is_rejected_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

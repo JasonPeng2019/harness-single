@@ -8,6 +8,7 @@ schemas are never silently merged with the canonical record.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -247,7 +248,7 @@ class CanonicalInvocation:
         """Return the validated, effective provider settings used for launch."""
 
         options = dict(self.provider_options)
-        return {
+        record: dict[str, Any] = {
             "provider_id": self.provider_id,
             "model": self.provider_model,
             "command": list(options.get("command", [self.provider_id])),
@@ -261,6 +262,14 @@ class CanonicalInvocation:
             "sandbox": options.get("sandbox", "workspace-write"),
             "approval_policy": options.get("approval_policy", "never"),
         }
+        if self.provider_id == "codex":
+            workspace = self.run_root.expanduser().resolve(strict=False) / ".agent-workspace"
+            last_message = self.output_paths["last_message"]
+            effective_path = last_message if last_message.is_absolute() else workspace / last_message
+            record["last_message_path"] = os.path.normcase(
+                str(effective_path.expanduser().resolve(strict=False))
+            )
+        return record
 
     @property
     def provider_launch_sha256(self) -> str:
