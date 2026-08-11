@@ -85,14 +85,19 @@ retirement derives it from live Git state without a caller-selected runtime
 path. Resume loads the admitted generation before publishing resumed status
 and compare-and-swap updates the same owner. The controller establishes an
 OS-backed provider process boundary and durably arms every resource claim before
-launch. It records complete zero/one/many helper
+launch. The returned Popen handle is the authoritative postlaunch fact on
+every exception, interrupt, and finalization route; a process-nonnull route
+must clean up and retain unless the explicit final release proof succeeds. It
+records complete zero/one/many helper
 evidence; Linux uses subreaper adoption plus group/session, descendant, and
 exact retained-identity inventory, while unsupported or incomplete inventory
 is nonterminal. Termination waits, re-inventories, and reaps the complete
 boundary, then takes a separate final empty inventory before releasing claims;
 unresolved exact identities remain claim blockers across controller exit. The
 Windows Job inventory rejects assigned/list count mismatches before accepting
-zero or member evidence. Retirement validates admission and freshly
+zero or member evidence. Job member slots are read only from a valid returned
+byte extent, and oversized or nonconverging count responses fail incomplete
+under a bounded retry policy. Retirement validates admission and freshly
 observes the complete ownership boundary twice, then copies and validates
 task/result/findings/acceptance/transcript/dependency/process evidence and
 content hashes before normal `git worktree remove`. Dirty, live, ambiguous,

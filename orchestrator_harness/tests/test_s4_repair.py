@@ -47,7 +47,7 @@ from orchestrator_harness.notifications import ManagerEventRouter
 from orchestrator_harness.models import ProcessBoundaryInventory, ProcessInfo, ProcessSnapshot, iso_utc
 from orchestrator_harness.process_supervisor import CleanupResult, ProcessBoundary, ProcessSupervisor
 from orchestrator_harness.processes import process_group_inventory, targeted_process_query
-from orchestrator_harness.resource_locks import ResourceClaims, _owner_state
+from orchestrator_harness.resource_locks import ResourceClaims, ResourceLockError, _owner_state
 from orchestrator_harness.stable_io import AppendLockError, PathKeyedAppendLock, SafeOutput
 from orchestrator_harness import codex_adapter, lane_lifecycle
 
@@ -202,6 +202,8 @@ class S4RepairRegressionTests(unittest.TestCase):
         final_inventory_error: BaseException | None = None,
         attach_error: BaseException | None = None,
         arm_failures: list[str] | None = None,
+        post_popen_error: BaseException | None = None,
+        captured_exception: dict[str, BaseException] | None = None,
     ) -> tuple[int, ResourceClaims, list[None], list[None], MagicMock]:
         """Drive lane_controller.run with a disposable production-shaped boundary."""
 
@@ -319,14 +321,24 @@ class S4RepairRegressionTests(unittest.TestCase):
                 return claims
 
             popen = MagicMock(return_value=process)
+            identity_results: list[object] = [
+                owner,
+                post_popen_error if post_popen_error is not None else child_identity,
+            ]
             with (
-                patch.object(lane_controller, "_identity", side_effect=[owner, child_identity]),
+                patch.object(lane_controller, "_identity", side_effect=identity_results),
                 patch.object(lane_controller, "ResourceClaims", side_effect=claims_factory),
                 patch.object(lane_controller.subprocess, "Popen", popen),
                 patch.object(lane_controller.ProcessBoundary, "prepare", return_value=boundary),
                 patch.object(lane_controller, "ProcessSupervisor", return_value=supervisor),
             ):
-                result = lane_controller.run(invocation)
+                try:
+                    result = lane_controller.run(invocation)
+                except BaseException as exc:
+                    if captured_exception is None:
+                        raise
+                    captured_exception["exception"] = exc
+                    result = 1
             self.assertEqual(1, len(captured))
             return result, captured[0], release_calls, retain_calls, popen
         finally:
@@ -1005,6 +1017,147 @@ class S4RepairRegressionTests(unittest.TestCase):
         )
         self.assertEqual({11, 12, 13}, {item["pid"] for item in record["members"]})
         self.assertEqual({11, 12, 13}, {item["pid"] for item in record["live_members"]})
+
+    def test_FC40_post_popen_keyboard_interrupt_is_postlaunch_and_fail_closed(self) -> None:
+        final = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("post-Popen synthetic final inventory incomplete",),
+            source="synthetic-final",
+        )
+        result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+            final,
+            post_popen_error=KeyboardInterrupt(),
+        )
+        self.assertEqual(130, result)
+        self.assertEqual(1, popen.call_count)
+        self.assertEqual([], releases)
+        self.assertTrue(retains)
+        self.assertTrue(claims.held)
+
+    def test_FC41_post_popen_exception_routes_and_uncaught_baseexception_retain(self) -> None:
+        final = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("post-Popen synthetic final inventory incomplete",),
+            source="synthetic-final",
+        )
+        for error in (RuntimeError("ordinary post-Popen failure"), ResourceLockError("post-Popen lock failure")):
+            with self.subTest(error=type(error).__name__):
+                result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+                    final,
+                    post_popen_error=error,
+                )
+                self.assertEqual(1, result)
+                self.assertEqual(1, popen.call_count)
+                self.assertEqual([], releases)
+                self.assertTrue(retains)
+                self.assertTrue(claims.held)
+        captured: dict[str, BaseException] = {}
+        result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+            final,
+            post_popen_error=BaseException("uncaught post-Popen failure"),
+            captured_exception=captured,
+        )
+        self.assertEqual(1, result)
+        self.assertIsInstance(captured.get("exception"), BaseException)
+        self.assertEqual(1, popen.call_count)
+        self.assertEqual([], releases)
+        self.assertTrue(retains)
+        self.assertTrue(claims.held)
+
+    def test_FC42_windows_job_equal_counts_require_returned_pid_bytes(self) -> None:
+        from ctypes import wintypes
+
+        for returned_mode in ("header-only", "beyond-allocation"):
+            with self.subTest(returned_mode=returned_mode):
+                calls = 0
+
+                def query(
+                    _handle: object,
+                    _info_class: int,
+                    buffer: object,
+                    size: int,
+                    returned: object,
+                ) -> bool:
+                    nonlocal calls
+                    calls += 1
+                    payload = (1).to_bytes(4, "little") + (1).to_bytes(4, "little")
+                    ctypes.memmove(buffer, payload, len(payload))
+                    returned._obj.value = 8 if returned_mode == "header-only" else size + 1  # type: ignore[attr-defined]
+                    return True
+
+                boundary = ProcessBoundary(kind="windows-job", identity="job:repair")
+                boundary._job_handle = object()
+                with patch(
+                    "orchestrator_harness.process_supervisor._windows_job_api",
+                    return_value=(None, None, None, query, None, None, None, wintypes),
+                ):
+                    observed = boundary.inventory()
+                self.assertFalse(observed.complete)
+                self.assertTrue(any("returned" in error or "truncated" in error for error in observed.errors))
+                self.assertEqual(1, calls)
+
+    def test_FC43_windows_job_retry_policy_is_bounded_for_oversized_and_changing_counts(self) -> None:
+        from ctypes import wintypes
+
+        calls = 0
+
+        def oversized_query(
+            _handle: object,
+            _info_class: int,
+            buffer: object,
+            _size: int,
+            returned: object,
+        ) -> bool:
+            nonlocal calls
+            calls += 1
+            payload = (65537).to_bytes(4, "little") + (65537).to_bytes(4, "little")
+            ctypes.memmove(buffer, payload, len(payload))
+            returned._obj.value = len(payload)  # type: ignore[attr-defined]
+            return True
+
+        boundary = ProcessBoundary(kind="windows-job", identity="job:repair")
+        boundary._job_handle = object()
+        with patch(
+            "orchestrator_harness.process_supervisor._windows_job_api",
+            return_value=(None, None, None, oversized_query, None, None, None, wintypes),
+        ):
+            observed = boundary.inventory()
+        self.assertFalse(observed.complete)
+        self.assertLessEqual(calls, 8)
+        self.assertTrue(any("supported" in error or "capacity" in error for error in observed.errors))
+
+        changing_calls = 0
+        changing = iter(((1, 0), (4, 2), (8, 4), (16, 8), (32, 16), (64, 32), (128, 64), (256, 128)))
+
+        def changing_query(
+            _handle: object,
+            _info_class: int,
+            buffer: object,
+            _size: int,
+            returned: object,
+        ) -> bool:
+            nonlocal changing_calls
+            changing_calls += 1
+            assigned, listed = next(changing, (512, 256))
+            payload = assigned.to_bytes(4, "little") + listed.to_bytes(4, "little")
+            ctypes.memmove(buffer, payload, len(payload))
+            returned._obj.value = 8 + ctypes.sizeof(ctypes.c_void_p) * listed  # type: ignore[attr-defined]
+            return True
+
+        boundary = ProcessBoundary(kind="windows-job", identity="job:repair-changing")
+        boundary._job_handle = object()
+        with patch(
+            "orchestrator_harness.process_supervisor._windows_job_api",
+            return_value=(None, None, None, changing_query, None, None, None, wintypes),
+        ):
+            observed = boundary.inventory()
+        self.assertFalse(observed.complete)
+        self.assertLessEqual(changing_calls, 8)
+        self.assertTrue(any("inconsistent" in error or "retry" in error for error in observed.errors))
 
     def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

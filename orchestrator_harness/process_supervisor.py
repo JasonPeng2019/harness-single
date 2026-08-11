@@ -222,39 +222,78 @@ class ProcessBoundary:
         if self.kind == "windows-job":
             try:
                 _, _, _, query, _, _, _, wintypes = _windows_job_api()
+                pointer_size = ctypes.sizeof(ctypes.c_void_p)
+                max_capacity = 65536
+                max_attempts = 8
                 capacity = 64
-                count_mismatch_retries = 0
-                while capacity <= 65536:
-                    size = 8 + ctypes.sizeof(ctypes.c_void_p) * capacity
+
+                def incomplete(error: str, *, source: str = "job-object") -> ProcessBoundaryInventory:
+                    self._inventory_errors.append(error)
+                    result = ProcessBoundaryInventory(
+                        False,
+                        self.kind,
+                        self.identity,
+                        errors=(error,),
+                        source=source,
+                    )
+                    self._last_inventory = result
+                    return result
+
+                for attempt in range(max_attempts):
+                    if capacity <= 0 or capacity > max_capacity:
+                        return incomplete(
+                            f"Job process-list capacity {capacity} exceeds supported capacity {max_capacity}"
+                        )
+                    size = 8 + pointer_size * capacity
                     buffer = ctypes.create_string_buffer(size)
                     returned = wintypes.DWORD()
                     if query(self._job_handle, 3, buffer, size, ctypes.byref(returned)):
-                        if returned.value < 8:
-                            error = f"Job process-list response is truncated ({returned.value} bytes)"
-                            self._inventory_errors.append(error)
-                            result = ProcessBoundaryInventory(False, self.kind, self.identity, errors=(error,), source="job-object")
-                            self._last_inventory = result
-                            return result
+                        returned_size = int(returned.value)
+                        if returned_size < 8 or returned_size > size:
+                            return incomplete(
+                                "Job process-list returned byte extent "
+                                f"{returned_size} outside allocated range [8, {size}]"
+                            )
                         assigned_count = int.from_bytes(buffer.raw[0:4], "little")
                         ids_count = int.from_bytes(buffer.raw[4:8], "little")
+                        if assigned_count > max_capacity or ids_count > max_capacity:
+                            return incomplete(
+                                "Job process-list count exceeds supported capacity "
+                                f"{max_capacity}: assigned={assigned_count}, listed={ids_count}"
+                            )
                         if ids_count > capacity:
-                            capacity = min(65536, ids_count + 16)
+                            next_capacity = min(max_capacity, max(capacity * 2, ids_count + 16))
+                            if next_capacity <= capacity:
+                                return incomplete(
+                                    "Job process-list declared count cannot grow capacity "
+                                    f"from {capacity}: listed={ids_count}"
+                                )
+                            capacity = next_capacity
                             continue
                         if assigned_count != ids_count:
-                            count_mismatch_retries += 1
-                            if count_mismatch_retries < 3 and capacity < 65536:
-                                capacity = min(65536, max(capacity * 2, assigned_count + 16, ids_count + 16))
+                            if attempt + 1 < max_attempts:
+                                next_capacity = min(
+                                    max_capacity,
+                                    max(capacity * 2, assigned_count + 16, ids_count + 16),
+                                )
+                                if next_capacity <= capacity:
+                                    return incomplete(
+                                        "Job process-list counts are inconsistent and retry "
+                                        f"capacity cannot grow: assigned={assigned_count}, listed={ids_count}"
+                                    )
+                                capacity = next_capacity
                                 time.sleep(0.01)
                                 continue
-                            error = (
-                                "Job process-list counts are inconsistent: "
+                            return incomplete(
+                                "Job process-list counts are inconsistent after bounded retries: "
                                 f"assigned={assigned_count}, listed={ids_count}"
                             )
-                            self._inventory_errors.append(error)
-                            result = ProcessBoundaryInventory(False, self.kind, self.identity, errors=(error,), source="job-object+CIM")
-                            self._last_inventory = result
-                            return result
-                        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+                        required_bytes = 8 + pointer_size * ids_count
+                        if required_bytes > returned_size:
+                            return incomplete(
+                                "Job process-list returned bytes are truncated before all "
+                                f"{ids_count} PID slots ({returned_size} < {required_bytes})"
+                            )
                         pids = [
                             int.from_bytes(buffer.raw[8 + index * pointer_size:8 + (index + 1) * pointer_size], "little")
                             for index in range(ids_count)
@@ -318,12 +357,23 @@ class ProcessBoundary:
                         if self._inventory_errors:
                             return ProcessBoundaryInventory(False, self.kind, self.identity, tuple(sorted(members, key=lambda item: item.pid)), self.history, tuple(self._inventory_errors), "job-object+CIM")
                         return ProcessBoundaryInventory(True, self.kind, self.identity, tuple(sorted(members, key=lambda item: item.pid)), self.history, (), "job-object+CIM")
-                    if ctypes.get_last_error() not in {24, 122}:  # insufficient buffer variants
-                        break
-                    capacity *= 2
-                error = f"QueryInformationJobObject failed ({ctypes.get_last_error()})"
-                self._inventory_errors.append(error)
-                return ProcessBoundaryInventory(False, self.kind, self.identity, errors=(error,), source="job-object")
+                    last_error = ctypes.get_last_error()
+                    if last_error in {24, 122} and attempt + 1 < max_attempts:
+                        next_capacity = min(max_capacity, capacity * 2)
+                        if next_capacity <= capacity:
+                            return incomplete(
+                                "Job process-list query needs a larger buffer but supported "
+                                f"capacity {max_capacity} cannot grow"
+                            )
+                        capacity = next_capacity
+                        continue
+                    return incomplete(
+                        "QueryInformationJobObject failed after bounded retries "
+                        f"({last_error})"
+                    )
+                return incomplete(
+                    f"Job process-list retry limit {max_attempts} reached without complete evidence"
+                )
             except ProcessBoundaryUnsupported as exc:
                 self._inventory_errors.append(str(exc))
                 return ProcessBoundaryInventory(False, self.kind, self.identity, errors=(str(exc),), source="job-object")

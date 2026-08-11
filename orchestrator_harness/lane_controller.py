@@ -1634,10 +1634,11 @@ def run(invocation: Invocation) -> int:
     child: ProcessInfo | None = None
     supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
-    provider_launched = False
     direct_child_reaped = False
     release_safe = False
     cleanup_result: CleanupResult | None = None
+    cleanup_attempted = False
+    final_boundary_recorded = False
 
     def _incomplete_boundary_record(error: str) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -1661,7 +1662,8 @@ def run(invocation: Invocation) -> int:
     def _record_final_boundary(cleanup_result: CleanupResult | None) -> Any:
         """Take the one explicit post-cleanup inventory used for release safety."""
 
-        nonlocal release_safe
+        nonlocal final_boundary_recorded, release_safe
+        final_boundary_recorded = True
         release_safe = False
         inventory: Any = None
         inventory_error: str | None = None
@@ -1701,7 +1703,7 @@ def run(invocation: Invocation) -> int:
             and not live_members
         )
         release_safe = bool(
-            provider_launched
+            process is not None
             and direct_child_reaped
             and cleanup_result is not None
             and cleanup_result.proved_reap
@@ -1712,7 +1714,7 @@ def run(invocation: Invocation) -> int:
         return inventory
 
     def _retain_unresolved_claims() -> list[str]:
-        if resource_claims is None or not provider_launched or release_safe:
+        if resource_claims is None or process is None or release_safe:
             return []
         boundary_evidence = state.get("process_boundary")
         retained_identities: list[dict[str, Any]] = []
@@ -1739,7 +1741,92 @@ def run(invocation: Invocation) -> int:
         # Before Popen there is no provider boundary to retain.  Once Popen
         # returns, this is the sole permission used by finally: the explicit
         # post-cleanup release proof above must have completed successfully.
-        return (not provider_launched) or release_safe
+        return process is None or release_safe
+
+    def _postlaunch_cleanup() -> dict[str, Any] | None:
+        """Attempt truthful cleanup for every process-nonnull failure route."""
+
+        nonlocal cleanup_attempted, cleanup_result, direct_child_reaped, supervisor
+        if process is None:
+            return None
+        if cleanup_attempted:
+            if not final_boundary_recorded:
+                _record_final_boundary(cleanup_result)
+            return None
+        cleanup_attempted = True
+        cleanup_evidence: dict[str, Any] | None = None
+        if supervisor is None:
+            try:
+                supervisor = ProcessSupervisor(
+                    process,
+                    child,
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                    observer=None,
+                    boundary=boundary,
+                )
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"supervisor construction failed: {type(exc).__name__}: {exc}"
+                )
+        if supervisor is not None and cleanup_result is None:
+            try:
+                cleanup_result = supervisor.cleanup()
+                direct_child_reaped = cleanup_result.final_reap
+                state["direct_child_reaped"] = direct_child_reaped
+                cleanup_evidence = cleanup_result.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"supervisor cleanup failed: {type(exc).__name__}: {exc}"
+                )
+        if supervisor is None:
+            if boundary is not None:
+                try:
+                    inventory = boundary.cleanup_owned(
+                        graceful_timeout_seconds=5.0,
+                        force_timeout_seconds=5.0,
+                    )
+                    state["process_boundary"] = boundary.to_record(inventory)
+                    cleanup_evidence = {
+                        "status": "BOUNDARY_FALLBACK",
+                        "boundary_complete": inventory.complete,
+                        "owned_boundary_empty": not inventory.processes,
+                        "errors": list(inventory.errors),
+                    }
+                except BaseException as exc:
+                    state.setdefault("postlaunch_cleanup_errors", []).append(
+                        f"boundary cleanup failed: {type(exc).__name__}: {exc}"
+                    )
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5.0)
+                else:
+                    process.wait(timeout=0)
+                direct_child_reaped = True
+                state["direct_child_reaped"] = True
+                cleanup_evidence = cleanup_evidence or {
+                    "status": "HANDLE_REAPED_WITHOUT_SUPERVISOR",
+                    "pid": getattr(process, "pid", None),
+                    "final_reap": True,
+                    "identity_verified": False,
+                    "identity_uncertain": True,
+                }
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"exact handle cleanup failed: {type(exc).__name__}: {exc}"
+                )
+        if not final_boundary_recorded:
+            _record_final_boundary(cleanup_result)
+        return cleanup_evidence
 
     try:
         if invocation.worker_invocation_id is not None and invocation.resources:
@@ -1806,7 +1893,6 @@ def run(invocation: Invocation) -> int:
                 env=child_env,
                 **boundary.popen_kwargs,
             )
-            provider_launched = True
             child = _identity(process.pid, parent=controller.pid)
             state.update({
                 "provider_pid": child.pid,
@@ -1890,6 +1976,7 @@ def run(invocation: Invocation) -> int:
         # facts.  ``cleanup`` performs a fresh inventory after any termination
         # request, targets escaped exact identities, and reaps adopted members
         # before it can prove the claim-release predicate.
+        cleanup_attempted = True
         cleanup_result = supervisor.cleanup()
         direct_child_reaped = cleanup_result.final_reap
         state["cleanup"] = cleanup_result.to_record()
@@ -2014,28 +2101,8 @@ def run(invocation: Invocation) -> int:
         ))
         return 1 if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid else exit_code
     except KeyboardInterrupt:
-        cleanup_evidence: dict[str, Any] | None = None
-        if provider_launched and process is not None and not direct_child_reaped:
-            if supervisor is None:
-                supervisor = ProcessSupervisor(
-                    process,
-                    child,
-                    graceful_timeout_seconds=5.0,
-                    force_timeout_seconds=5.0,
-                    observer=None,
-                    boundary=boundary,
-                )
-            cleanup_result = supervisor.cleanup()
-            direct_child_reaped = cleanup_result.final_reap
-            cleanup_evidence = cleanup_result.to_record()
-            state["direct_child_reaped"] = direct_child_reaped
-            if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
-                cleanup_evidence["terminate_wait_timed_out"] = True
-            if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
-                cleanup_evidence["kill_wait_timed_out"] = True
-        if provider_launched and not release_safe:
-            _record_final_boundary(cleanup_result)
-        if provider_launched and not release_safe:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
+        if process is not None and not release_safe:
             _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
@@ -2062,6 +2129,7 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
         return 130
     except ResourceLockError as exc:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
         retained_claims = resource_claims.held if resource_claims is not None else []
         state.update({
             "state": "COORDINATION_FAILED",
@@ -2069,6 +2137,7 @@ def run(invocation: Invocation) -> int:
             "error": str(exc),
             "coordination_failure": {
                 "error": str(exc),
+                "child_shutdown": cleanup_evidence,
                 "retained_claims": retained_claims,
             },
             "held_resource_claims": retained_claims,
@@ -2077,28 +2146,8 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
         return 1
     except Exception as exc:
-        cleanup_evidence = None
-        if provider_launched and process is not None and not direct_child_reaped:
-            if supervisor is None:
-                supervisor = ProcessSupervisor(
-                    process,
-                    child,
-                    graceful_timeout_seconds=5.0,
-                    force_timeout_seconds=5.0,
-                    observer=None,
-                    boundary=boundary,
-                )
-            cleanup_result = supervisor.cleanup()
-            direct_child_reaped = cleanup_result.final_reap
-            cleanup_evidence = cleanup_result.to_record()
-            state["direct_child_reaped"] = direct_child_reaped
-            if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
-                cleanup_evidence["terminate_wait_timed_out"] = True
-            if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
-                cleanup_evidence["kill_wait_timed_out"] = True
-        if provider_launched and not release_safe:
-            _record_final_boundary(cleanup_result)
-        if provider_launched and not release_safe:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
+        if process is not None and not release_safe:
             _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"
@@ -2126,6 +2175,8 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
     finally:
+        if process is not None and not final_boundary_recorded:
+            _postlaunch_cleanup()
         if resource_claims is not None:
             if _claims_can_release():
                 release_failures = resource_claims.release_all()
