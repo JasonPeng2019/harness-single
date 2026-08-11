@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,8 @@ from .provider import (
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .stable_io import append_jsonl_record
+from .lane_lifecycle import LaneLifecycleError, lifecycle_registry_path, write_lifecycle_registry_record
+from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
 from .resume import (
     ResumeAdmissionError,
     require_resume_admission,
@@ -123,16 +126,11 @@ def isolated_coding_child_environment(inherited: Mapping[str, str] | None = None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        with temporary.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        mutation_replace(path.parent, path.name, data, expected=capture_target(path.parent, path.name))
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise OSError(str(exc)) from exc
 
 
 def _append_event(path: Path, value: dict[str, Any]) -> None:
@@ -282,6 +280,8 @@ class Invocation:
     provider_options: Mapping[str, Any] = field(default_factory=dict)
     prompt_bundle: PromptBundle | None = None
     runtime_profile: RuntimeProfile | None = None
+    runtime_root: Path | None = None
+    invocation_path: Path | None = None
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -453,6 +453,8 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     runtime_root = Path(runtime_value).expanduser().resolve(strict=False)
     if not runtime_root.is_dir():
         raise InvocationError("runtime_root must be an existing directory")
+    if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
+        raise InvocationError("runtime_root must be separate from run_root")
     lock_value = raw.get("resource_lock_root", str(runtime_root / "coding-resource-locks"))
     resource_lock_root = _safe_path(
         lock_value, root=runtime_root, name="resource_lock_root"
@@ -540,6 +542,8 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         runtime_root = canonical.runtime_root.expanduser().resolve(strict=True)
         if not run_root.is_dir() or not runtime_root.is_dir():
             raise InvocationValidationError("canonical run_root and runtime_root must be directories")
+        if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
+            raise InvocationValidationError("canonical runtime_root must be separate from run_root")
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
         if workspace.parent != run_root:
             raise InvocationValidationError("canonical workspace must be a direct child of run_root")
@@ -655,12 +659,20 @@ def load_invocation(path: Path) -> Invocation:
     if schema is not None and (not isinstance(schema, str) or not schema):
         raise InvocationError("schema must be a non-empty string when supplied")
     if schema == CANONICAL_INVOCATION_SCHEMA:
-        return _load_canonical_invocation(raw)
-    if schema == CODING_INVOCATION_SCHEMA:
-        return _load_coding_invocation(raw)
-    if schema is None:
-        return _load_firmware_invocation(raw)
-    raise InvocationError(f"unsupported invocation schema: {schema}")
+        invocation = _load_canonical_invocation(raw)
+    elif schema == CODING_INVOCATION_SCHEMA:
+        invocation = _load_coding_invocation(raw)
+    elif schema is None:
+        invocation = _load_firmware_invocation(raw)
+    else:
+        raise InvocationError(f"unsupported invocation schema: {schema}")
+    object.__setattr__(invocation, "invocation_path", path.expanduser().resolve(strict=False))
+    runtime_value = raw.get("runtime_root")
+    if isinstance(runtime_value, str) and runtime_value:
+        object.__setattr__(invocation, "runtime_root", Path(runtime_value).expanduser().resolve(strict=False))
+    else:
+        object.__setattr__(invocation, "runtime_root", invocation.run_root.parent)
+    return invocation
 
 
 def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> ProcessInfo:
@@ -1468,8 +1480,15 @@ def run(invocation: Invocation) -> int:
             "config_overrides": invocation.config_overrides,
             "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": argv[:-1]},
     }
+    registry_runtime = invocation.runtime_root or invocation.run_root.parent
+    registry_generation = uuid.uuid4().hex
+    state["lifecycle_registry_generation"] = registry_generation
+    state["owned_helpers"] = []
     if git_identity is not None:
         repository = repository_status(git_identity, starting_commit=starting_commit)
+        expected_head = str(repository.get("actual_head") or git_identity.head_commit).lower()
+        branch_name = str(repository.get("branch") or git_identity.branch)
+        retained_ref = f"refs/heads/{branch_name}"
         state.update({
             "repository": repository,
             "repository_common_dir": repository["common_dir"],
@@ -1477,7 +1496,13 @@ def run(invocation: Invocation) -> int:
             "branch": repository["branch"],
             "base_commit": repository["base_commit"],
             "starting_commit": repository["starting_commit"],
+            "lifecycle_retained_ref": retained_ref,
+            "lifecycle_target_revision": expected_head,
         })
+        state["repository"]["expected_head"] = expected_head
+        state["lifecycle_registry_path"] = str(
+            lifecycle_registry_path(registry_runtime, invocation.lane_id)
+        )
         if invocation.canonical is not None:
             resume_identity = invocation.canonical.identity(
                 session_id=thread,
@@ -1489,6 +1514,37 @@ def run(invocation: Invocation) -> int:
                 "session_id": thread,
             }
             state["resume_identity"] = resume_identity
+
+    def _publish_registry() -> None:
+        if invocation.repository is None:
+            return
+        if invocation.invocation_path is None:
+            raise InvocationError("controller lifecycle registry requires its source invocation path")
+        worker_identity = None
+        provider_pid = state.get("provider_pid")
+        provider_created = state.get("provider_created_utc")
+        if isinstance(provider_pid, int) and isinstance(provider_created, str):
+            worker_identity = {"pid": provider_pid, "created_utc": provider_created}
+        write_lifecycle_registry_record(
+            registry_runtime,
+            lane_id=invocation.lane_id,
+            run_root=invocation.run_root,
+            invocation_path=invocation.invocation_path,
+            status_path=invocation.status_path,
+            invocation_schema=invocation.invocation_schema,
+            worker_invocation_id=invocation.worker_invocation_id or "",
+            generation=registry_generation,
+            state=str(state.get("state") or "LAUNCH_FAILED"),
+            repository=state["repository"],
+            controller=controller,
+            worker=worker_identity,
+            helpers=state.get("owned_helpers", []),
+            retained_ref=state.get("lifecycle_retained_ref"),
+            target_revision=state.get("lifecycle_target_revision"),
+        )
+
+    if invocation.repository is not None:
+        _publish_registry()
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     supervisor: ProcessSupervisor | None = None
@@ -1780,6 +1836,11 @@ def run(invocation: Invocation) -> int:
             try:
                 _atomic_json(invocation.status_path, state)
             except OSError:
+                pass
+        if invocation.repository is not None:
+            try:
+                _publish_registry()
+            except (InvocationError, LaneLifecycleError, OSError):
                 pass
 
 

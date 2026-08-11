@@ -34,6 +34,8 @@ from .processes import process_snapshot
 IMMUTABLE_VIEW_SCHEMA = "orchestrator-immutable-source-view/v1"
 LANE_ARCHIVE_SCHEMA = "orchestrator-lane-archive/v1"
 PROCESS_EVIDENCE_SCHEMA = "orchestrator-process-evidence/v1"
+LIFECYCLE_REGISTRY_SCHEMA = "orchestrator-lifecycle-registry/v1"
+_LIFECYCLE_REGISTRY_DIR = ".orchestrator-lifecycle-registry"
 _HEX_COMMIT = re.compile(r"^[0-9a-fA-F]{40}|[0-9a-fA-F]{64}$")
 _GIT_ENV_KEYS = (
     "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE",
@@ -210,6 +212,201 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> MutationReceipt:
         return mutation_replace(parent, path.name, data, expected=expected)
     except (MutationConflict, MutationUnsupported) as exc:
         raise LaneLifecycleError(str(exc)) from exc
+
+
+def _registry_lane_id(lane_id: object) -> str:
+    if (
+        not isinstance(lane_id, str)
+        or not lane_id.strip()
+        or Path(lane_id).is_absolute()
+        or ".." in Path(lane_id).parts
+        or Path(lane_id).name != lane_id
+    ):
+        raise LaneLifecycleError("lane_id is not a supported lifecycle coordinate")
+    return lane_id.strip()
+
+
+def lifecycle_registry_path(run_coordinate: str | Path, lane_id: str) -> Path:
+    """Derive the one fixed registry record from the harness run coordinate."""
+
+    runtime = _regular_directory(run_coordinate)
+    lane = _registry_lane_id(lane_id)
+    digest = hashlib.sha256(lane.encode("utf-8")).hexdigest()
+    return runtime / _LIFECYCLE_REGISTRY_DIR / digest / "LIFECYCLE.json"
+
+
+def _registry_digest(value: Mapping[str, Any]) -> str:
+    normalized = dict(value)
+    normalized["record_sha256"] = ""
+    return hashlib.sha256(
+        (json.dumps(normalized, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    ).hexdigest()
+
+
+def _registry_process_identity(value: object, *, name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, ProcessInfo):
+        if value.created_utc is None:
+            raise LaneLifecycleError(f"{name} has no creation identity")
+        return {"pid": value.pid, "created_utc": iso_utc(value.created_utc)}
+    if isinstance(value, Mapping):
+        if set(value) != {"pid", "created_utc"}:
+            raise LaneLifecycleError(f"{name} identity shape is not closed")
+        pid = value.get("pid")
+        created = parse_utc(value.get("created_utc"))
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or created is None:
+            raise LaneLifecycleError(f"{name} identity is invalid")
+        return {"pid": pid, "created_utc": iso_utc(created)}
+    raise LaneLifecycleError(f"{name} identity is unsupported")
+
+
+def write_lifecycle_registry_record(
+    run_coordinate: str | Path,
+    *,
+    lane_id: str,
+    run_root: str | Path,
+    invocation_path: str | Path,
+    status_path: str | Path,
+    invocation_schema: str | None,
+    worker_invocation_id: str,
+    generation: str,
+    state: str,
+    repository: Mapping[str, Any],
+    controller: object,
+    worker: object = None,
+    helpers: Sequence[object] = (),
+    retained_ref: str | None = None,
+    target_revision: str | None = None,
+) -> Path:
+    """Publish controller-owned lifecycle authority at the fixed coordinate.
+
+    The record is intentionally written outside the lane.  A caller can provide
+    archive evidence, but cannot select this record's path or supply its binding;
+    the coordinate is derived solely from the harness run root and lane ID.
+    """
+
+    lane = _registry_lane_id(lane_id)
+    runtime = _regular_directory(run_coordinate)
+    run = _regular_directory(run_root)
+    if _inside(runtime, run) or _inside(run, runtime):
+        raise LaneLifecycleError("lifecycle registry coordinate overlaps the retiring run")
+    invocation, invocation_bytes = _regular_file(invocation_path, name="invocation")
+    status_value = _lexical(status_path)
+    _reject_reparse_chain(status_value)
+    status_bytes: bytes | None = None
+    status: Mapping[str, Any] | None = None
+    if os.path.lexists(status_value):
+        status_path_checked, status_bytes = _regular_file(status_value, name="status")
+        del status_path_checked
+        try:
+            parsed_status = json.loads(status_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LaneLifecycleError("controller status is not valid JSON") from exc
+        if not isinstance(parsed_status, Mapping):
+            raise LaneLifecycleError("controller status must be an object")
+        status = parsed_status
+    if not isinstance(invocation_schema, (str, type(None))):
+        raise LaneLifecycleError("invocation schema is invalid")
+    if not isinstance(worker_invocation_id, str) or not worker_invocation_id.strip():
+        raise LaneLifecycleError("worker invocation identity is invalid")
+    if not isinstance(generation, str) or not generation.strip():
+        raise LaneLifecycleError("lifecycle registry generation is invalid")
+    required_repository = {"worktree_root", "common_dir", "branch", "expected_head"}
+    if not required_repository.issubset(repository):
+        raise LaneLifecycleError("controller repository binding is incomplete")
+    expected_head = repository.get("expected_head")
+    if not isinstance(expected_head, str) or _HEX_COMMIT.fullmatch(expected_head) is None:
+        raise LaneLifecycleError("controller expected HEAD is invalid")
+    branch = repository.get("branch")
+    common_dir = repository.get("common_dir")
+    worktree_root = repository.get("worktree_root")
+    if not all(isinstance(item, str) and item for item in (branch, common_dir, worktree_root)):
+        raise LaneLifecycleError("controller Git identity is incomplete")
+    retained = retained_ref or repository.get("retained_ref") or "HEAD"
+    target = target_revision or repository.get("target_revision") or expected_head
+    if not isinstance(retained, str) or not isinstance(target, str):
+        raise LaneLifecycleError("controller retirement claims are incomplete")
+    controller_identity = _registry_process_identity(controller, name="controller")
+    worker_identity = _registry_process_identity(worker, name="worker")
+    helper_records: list[dict[str, Any]] = []
+    helper_names: set[str] = set()
+    for index, item in enumerate(helpers):
+        name = f"helper-{index}"
+        identity = item
+        if isinstance(item, Mapping) and "identity" in item:
+            raw_name = item.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise LaneLifecycleError("helper name is invalid")
+            name = raw_name.strip()
+            identity = item.get("identity")
+        if name in helper_names:
+            raise LaneLifecycleError("owned helper collection is ambiguous")
+        helper_names.add(name)
+        normalized = _registry_process_identity(identity, name=name)
+        if normalized is None:
+            raise LaneLifecycleError("owned helper identity is missing")
+        helper_records.append({"name": name, **normalized})
+    helper_records.sort(key=lambda item: item["name"])
+    status_identity = {
+        "schema": status.get("schema") if status is not None else None,
+        "lane_id": status.get("lane_id") if status is not None else None,
+        "worker_invocation_id": status.get("worker_invocation_id") if status is not None else None,
+        "state": status.get("state") if status is not None else None,
+        "generation": status.get("lifecycle_registry_generation") if status is not None else None,
+    }
+    complete_states = {"CODEX_EXITED", "PROVIDER_EXITED"}
+    complete = (
+        worker_identity is not None
+        and state in complete_states
+        and status_bytes is not None
+        and status_identity["schema"] == "orchestrator-lane-controller/v1"
+        and status_identity["lane_id"] == lane
+        and status_identity["worker_invocation_id"] == worker_invocation_id
+        and status_identity["state"] == state
+        and status_identity["generation"] == generation
+    )
+    record: dict[str, Any] = {
+        "schema": LIFECYCLE_REGISTRY_SCHEMA,
+        "record_version": 1,
+        "record_sha256": "",
+        "authority": "controller-produced-fixed-coordinate",
+        "coordinate": {"runtime_root": str(runtime), "lane_id": lane},
+        "run": {
+            "run_root": str(run),
+            "lane_id": lane,
+            "worker_invocation_id": worker_invocation_id,
+            "invocation_schema": invocation_schema,
+            "invocation_path": str(invocation),
+            "invocation_sha256": hashlib.sha256(invocation_bytes).hexdigest(),
+            "status_path": str(status_value),
+            "status_sha256": hashlib.sha256(status_bytes).hexdigest() if status_bytes is not None else None,
+            "status_identity": status_identity,
+            "generation": generation,
+        },
+        "repository": {
+            "worktree_root": str(_lexical(worktree_root)),
+            "common_dir": str(_lexical(common_dir)),
+            "branch": branch,
+            "expected_head": expected_head.lower(),
+            "retained_ref": retained,
+            "target_revision": target.lower() if isinstance(target, str) else target,
+        },
+        "identities": {
+            "controller": controller_identity,
+            "worker": worker_identity,
+            "helpers": helper_records,
+        },
+        "lifecycle": {"state": state, "complete": complete, "helpers_complete": True},
+    }
+    record["record_sha256"] = _registry_digest(record)
+    path = lifecycle_registry_path(runtime, lane)
+    try:
+        ensure_directory_path(path.parent)
+        _atomic_json(path, record)
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise LaneLifecycleError(str(exc)) from exc
+    return path
 
 
 def _sha256(path: Path) -> str:
@@ -441,66 +638,163 @@ def _source_reference(value: object, *, name: str) -> tuple[dict[str, Any], byte
     }, data
 
 
-def _load_process_evidence(
-    value: object,
+def _load_lifecycle_registry(
+    run_coordinate: object,
     *,
     lane: Path,
-) -> tuple[dict[str, Any], bytes, dict[str, dict[str, Any]], dict[str, Any]]:
-    if not isinstance(value, (str, Path)):
-        raise ArchiveFailed("process evidence must be a persisted evidence file")
-    reference, data = _source_reference(value, name="process_evidence")
-    evidence_path = Path(reference["source_identity"]["path"])
+    lane_id: str,
+) -> tuple[
+    dict[str, Any],
+    bytes,
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+    bytes,
+]:
+    """Load only the fixed controller registry; never accept a caller file."""
+
     try:
-        _lexical(evidence_path).relative_to(_lexical(lane))
-    except ValueError as exc:
-        raise ArchiveFailed("process evidence is not lane-owned") from exc
+        registry_path = lifecycle_registry_path(run_coordinate, lane_id)
+    except LaneLifecycleError as exc:
+        raise ArchiveFailed(str(exc)) from exc
+    if _inside(registry_path, lane) or _is_reparse(registry_path) or not registry_path.is_file():
+        raise ArchiveFailed("fixed lifecycle registry record is missing or unsafe")
+    reference, data = _source_reference(registry_path, name="lifecycle_registry")
     try:
         raw = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ArchiveFailed("process evidence is malformed") from exc
-    required_shape = {"schema", "complete", "provider", "identities", "processes", "lane_binding"}
+        raise ArchiveFailed("fixed lifecycle registry record is malformed") from exc
+    if not isinstance(raw, dict):
+        raise ArchiveFailed("fixed lifecycle registry record is not an object")
+    required = {
+        "schema", "record_version", "record_sha256", "authority", "coordinate",
+        "run", "repository", "identities", "lifecycle",
+    }
     if (
-        not isinstance(raw, dict)
-        or set(raw) != required_shape
-        or raw.get("schema") != PROCESS_EVIDENCE_SCHEMA
-        or raw.get("complete") is not True
+        set(raw) != required
+        or raw.get("schema") != LIFECYCLE_REGISTRY_SCHEMA
+        or raw.get("record_version") != 1
+        or raw.get("authority") != "controller-produced-fixed-coordinate"
     ):
-        raise ArchiveFailed("process evidence is not a closed lane-owned record")
-    binding = raw.get("lane_binding")
-    if not isinstance(binding, Mapping):
-        raise ArchiveFailed("process evidence lacks its lane binding")
-    binding = dict(binding)
-    identities = raw.get("identities")
-    processes = raw.get("processes")
-    if not isinstance(identities, dict) or set(identities) != {"controller", "worker", "helper"}:
-        raise ArchiveFailed("process evidence lacks exact controller/worker/helper identities")
-    if not isinstance(processes, list) or len(processes) > 4096:
-        raise ArchiveFailed("process evidence snapshot is incomplete")
-    rows: list[ProcessInfo] = []
-    seen: set[int] = set()
-    for item in processes:
-        if not isinstance(item, Mapping) or set(item) != {"pid", "ppid", "name", "command_line", "created_utc"}:
-            raise ArchiveFailed("process evidence contains an incomplete process row")
-        pid, ppid = item.get("pid"), item.get("ppid")
-        created = parse_utc(item.get("created_utc"))
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not isinstance(ppid, int) or ppid < 0 or created is None or not isinstance(item.get("name"), str) or not isinstance(item.get("command_line"), str) or pid in seen:
-            raise ArchiveFailed("process evidence contains an invalid process identity")
-        seen.add(pid)
-        rows.append(ProcessInfo(pid, ppid, item["name"], item["command_line"], created))
-    normalized: dict[str, dict[str, Any]] = {}
-    role_pids: set[int] = set()
-    for role in ("controller", "worker", "helper"):
-        item = identities[role]
-        if not isinstance(item, Mapping) or set(item) != {"pid", "created_utc"}:
-            raise ArchiveFailed(f"persisted {role} identity is missing or ambiguous")
-        pid, created = item.get("pid"), parse_utc(item.get("created_utc"))
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or created is None:
-            raise ArchiveFailed(f"persisted {role} identity is invalid")
-        if pid in role_pids:
-            raise ArchiveFailed("persisted process identities are ambiguous")
-        role_pids.add(pid)
-        normalized[role] = {"pid": pid, "created_utc": iso_utc(created)}
-    return reference, data, normalized, binding
+        raise ArchiveFailed("fixed lifecycle registry record shape is invalid")
+    if raw.get("record_sha256") != _registry_digest(raw):
+        raise ArchiveFailed("fixed lifecycle registry record was modified")
+    coordinate = raw.get("coordinate")
+    run_record = raw.get("run")
+    repository = raw.get("repository")
+    identities_record = raw.get("identities")
+    lifecycle = raw.get("lifecycle")
+    if not isinstance(coordinate, Mapping) or not isinstance(run_record, Mapping) or not isinstance(repository, Mapping) or not isinstance(identities_record, Mapping) or not isinstance(lifecycle, Mapping):
+        raise ArchiveFailed("fixed lifecycle registry record has incomplete sections")
+    runtime = _regular_directory(run_coordinate)
+    if coordinate.get("runtime_root") != str(runtime) or coordinate.get("lane_id") != lane_id:
+        raise ArchiveFailed("fixed lifecycle registry coordinate is foreign")
+    if run_record.get("lane_id") != lane_id or run_record.get("run_root") != str(lane):
+        raise ArchiveFailed("fixed lifecycle registry run binding is foreign")
+    if not isinstance(run_record.get("worker_invocation_id"), str) or not run_record.get("worker_invocation_id"):
+        raise ArchiveFailed("fixed lifecycle registry invocation binding is incomplete")
+    if run_record.get("status_path") is None or run_record.get("invocation_path") is None:
+        raise ArchiveFailed("fixed lifecycle registry source bindings are incomplete")
+    status_path = _lexical(run_record["status_path"])
+    if not _inside(status_path, lane) or status_path.parent != lane / ".agent-workspace":
+        raise ArchiveFailed("fixed lifecycle registry status binding is foreign")
+    invocation_path = _lexical(run_record["invocation_path"])
+    invocation, invocation_bytes = _regular_file(invocation_path, name="invocation")
+    if hashlib.sha256(invocation_bytes).hexdigest() != run_record.get("invocation_sha256"):
+        raise ArchiveFailed("fixed lifecycle invocation bytes changed")
+    if not isinstance(run_record.get("status_sha256"), str):
+        raise ArchiveFailed("fixed lifecycle status was not finally persisted")
+    status_path_checked, status_bytes = _regular_file(status_path, name="status")
+    del status_path_checked
+    if hashlib.sha256(status_bytes).hexdigest() != run_record.get("status_sha256"):
+        raise ArchiveFailed("fixed lifecycle status bytes changed")
+    try:
+        status = json.loads(status_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArchiveFailed("fixed lifecycle status is malformed") from exc
+    if not isinstance(status, Mapping):
+        raise ArchiveFailed("fixed lifecycle status is not an object")
+    status_identity = run_record.get("status_identity")
+    if not isinstance(status_identity, Mapping) or any(
+        status.get(key) != status_identity.get(key)
+        for key in ("schema", "lane_id", "worker_invocation_id", "state")
+    ) or status_identity.get("generation") != run_record.get("generation") or status.get("lifecycle_registry_generation") != run_record.get("generation"):
+        raise ArchiveFailed("fixed lifecycle status identity does not match registry")
+    if status.get("invocation_schema") != run_record.get("invocation_schema"):
+        raise ArchiveFailed("fixed lifecycle invocation schema does not match registry")
+    if status.get("worktree_root") != repository.get("worktree_root") or status.get("repository_common_dir") != repository.get("common_dir") or status.get("branch") != repository.get("branch"):
+        raise ArchiveFailed("fixed lifecycle status Git identity does not match registry")
+    if lifecycle.get("complete") is not True or lifecycle.get("helpers_complete") is not True or lifecycle.get("state") not in {"CODEX_EXITED", "PROVIDER_EXITED"}:
+        raise ArchiveFailed("fixed lifecycle registry is incomplete or not terminal")
+    expected_repo = {"worktree_root", "common_dir", "branch", "expected_head", "retained_ref", "target_revision"}
+    if set(repository) != expected_repo:
+        raise ArchiveFailed("fixed lifecycle Git binding is not closed")
+    binding = {
+        "lane_id": lane_id,
+        "worktree": repository.get("worktree_root"),
+        "git_common_dir": repository.get("common_dir"),
+        "branch": repository.get("branch"),
+        "expected_head": repository.get("expected_head"),
+        "retained_ref": repository.get("retained_ref"),
+        "target_revision": repository.get("target_revision"),
+    }
+    if any(not isinstance(binding.get(key), str) or not binding.get(key) for key in binding):
+        raise ArchiveFailed("fixed lifecycle Git binding is incomplete")
+    controller = identities_record.get("controller")
+    worker = identities_record.get("worker")
+    helpers = identities_record.get("helpers")
+    if not isinstance(controller, Mapping) or not isinstance(worker, Mapping) or not isinstance(helpers, list):
+        raise ArchiveFailed("fixed lifecycle process collection is incomplete")
+    identity_map: dict[str, dict[str, Any]] = {}
+    for role, item in (("controller", controller), ("worker", worker)):
+        try:
+            normalized = _registry_process_identity(item, name=role)
+        except LaneLifecycleError as exc:
+            raise ArchiveFailed(str(exc)) from exc
+        if normalized is None:
+            raise ArchiveFailed(f"fixed lifecycle {role} identity is missing")
+        identity_map[role] = normalized
+    helper_records: list[dict[str, Any]] = []
+    helper_names: set[str] = set()
+    for item in helpers:
+        if not isinstance(item, Mapping) or set(item) != {"name", "pid", "created_utc"}:
+            raise ArchiveFailed("fixed lifecycle helper collection is ambiguous")
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name in helper_names:
+            raise ArchiveFailed("fixed lifecycle helper collection is ambiguous")
+        helper_names.add(name)
+        try:
+            normalized = _registry_process_identity(
+                {"pid": item.get("pid"), "created_utc": item.get("created_utc")},
+                name=name,
+            )
+        except LaneLifecycleError as exc:
+            raise ArchiveFailed(str(exc)) from exc
+        assert normalized is not None
+        identity_map[f"helper:{name}"] = normalized
+        helper_records.append({"name": name, **normalized})
+    process_bytes = (
+        json.dumps(
+            {
+                "schema": PROCESS_EVIDENCE_SCHEMA,
+                "complete": True,
+                "provider": "controller-registry",
+                "identities": {
+                    "controller": identity_map["controller"],
+                    "worker": identity_map["worker"],
+                    "helpers": helper_records,
+                },
+                "processes": [],
+                "lifecycle_registry": {
+                    "path": str(registry_path),
+                    "sha256": reference["sha256"],
+                },
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return raw, data, identity_map, binding, process_bytes
 
 
 def _process_proof(snapshot: ProcessSnapshot, identities: Mapping[str, Mapping[str, Any]]) -> tuple[bool, str, dict[str, Any]]:
@@ -555,6 +849,14 @@ class RetirementResult:
 
 def _visible_result(lane: Path, reason: str, *, archive: Path | None = None, revision: str | None = None) -> RetirementResult:
     return RetirementResult("VISIBLE", reason, lane, archive, retained_revision=revision, visible=True)
+
+
+def _after_initial_retirement_proof() -> None:
+    """Internal late seam before the final registry/Git/process proof."""
+
+
+def _before_git_close() -> None:
+    """Internal late seam immediately before the public Git close."""
 
 
 def _same_path(left: str | Path, right: str | Path) -> bool:
@@ -687,10 +989,7 @@ def retire_terminal_lane(
     archive_root: str | Path,
     *,
     lane_id: str,
-    retained_revision: str | None = None,
-    retained_ref: str | None = None,
-    target_revision: str | None = None,
-    process_evidence: str | Path,
+    run_coordinate: str | Path,
     task_ref: object = None,
     result_ref: object = None,
     findings_ref: object = None,
@@ -718,15 +1017,16 @@ def retire_terminal_lane(
         return _visible_result(lane, "ARCHIVE_EVIDENCE_INCOMPLETE")
     try:
         refs: dict[str, tuple[dict[str, Any], bytes]] = {name: _source_reference(value, name=name) for name, value in required.items()}
-        process_ref, process_bytes, identities, binding = _load_process_evidence(process_evidence, lane=lane)
-        if retained_revision is None:
-            retained_revision = binding.get("expected_head") if isinstance(binding.get("expected_head"), str) else None
-        if retained_ref is None:
-            retained_ref = binding.get("retained_ref") if isinstance(binding.get("retained_ref"), str) else None
-        if target_revision is None:
-            target_revision = binding.get("target_revision") if isinstance(binding.get("target_revision"), str) else None
-        if not isinstance(retained_revision, str) or not isinstance(retained_ref, str) or not isinstance(target_revision, str):
-            raise ArchiveFailed("lane-owned binding lacks exact retirement claims")
+        registry, registry_bytes, identities, binding, process_bytes = _load_lifecycle_registry(
+            run_coordinate,
+            lane=lane,
+            lane_id=lane_id,
+        )
+        registry_path = lifecycle_registry_path(run_coordinate, lane_id)
+        process_ref, _ = _source_reference(registry_path, name="process_evidence")
+        retained_revision = binding["expected_head"]
+        retained_ref = binding["retained_ref"]
+        target_revision = binding["target_revision"]
     except ArchiveFailed as exc:
         return _visible_result(lane, f"ARCHIVE_EVIDENCE_INCOMPLETE:{str(exc)[:160]}")
 
@@ -752,6 +1052,7 @@ def retire_terminal_lane(
     absent, live_reason, process_proof = _process_proof(fresh_process, identities)
     if not absent:
         return _visible_result(lane, live_reason, revision=actual_head)
+    _after_initial_retirement_proof()
 
     archive_dir = archive_base / lane_id
     if os.path.lexists(archive_dir):
@@ -781,6 +1082,11 @@ def retire_terminal_lane(
             "retained_ref_commit": git_state["retained_ref_commit"], "target_revision": git_state["target_revision"],
             "worktree": {"path": git_state["path"], "common_dir": git_state["common_dir"], "clean": True, "branch": git_state["branch"], "actual_head": git_state["actual_head"]},
             "lane_binding": dict(binding),
+            "lifecycle_registry": {
+                "path": str(lifecycle_registry_path(run_coordinate, lane_id)),
+                "sha256": hashlib.sha256(registry_bytes).hexdigest(),
+                "record": registry,
+            },
             "no_live_process_proof": {**process_proof, "state": live_reason},
             "no_unmerged_work_proof": {"target_revision": git_state["target_revision"], "ancestry_verified": True},
             "close_result": "PENDING", "discarded_cache_inventory": discarded,
@@ -818,16 +1124,27 @@ def retire_terminal_lane(
     admin_root = admin_roots[0]
 
     try:
+        _before_git_close()
+        final_registry, final_registry_bytes, final_identities, final_binding, _ = _load_lifecycle_registry(
+            run_coordinate,
+            lane=lane,
+            lane_id=lane_id,
+        )
+        if hashlib.sha256(final_registry_bytes).hexdigest() != hashlib.sha256(registry_bytes).hexdigest():
+            return _visible_result(lane, "PRE_CLOSE_LIFECYCLE_REGISTRY_CHANGED", archive=archive_path, revision=actual_head)
+        final_retained_revision = final_binding["expected_head"]
+        final_retained_ref = final_binding["retained_ref"]
+        final_target_revision = final_binding["target_revision"]
         final_state, final_git_reason = _validate_lane_binding(
             lane,
             lane_id=lane_id,
-            binding=binding,
-            retained_revision=retained_revision,
-            retained_ref=retained_ref,
-            target_revision=target_revision,
+            binding=final_binding,
+            retained_revision=final_retained_revision,
+            retained_ref=final_retained_ref,
+            target_revision=final_target_revision,
         )
         final_snapshot = process_snapshot()
-        final_absent, final_live_reason, final_process_proof = _process_proof(final_snapshot, identities)
+        final_absent, final_live_reason, final_process_proof = _process_proof(final_snapshot, final_identities)
     except Exception as exc:
         return _visible_result(lane, f"PRE_CLOSE_PROOF_UNKNOWN:{type(exc).__name__}", archive=archive_path, revision=actual_head)
     final_revision = str((final_state or {}).get("actual_head") or actual_head)
@@ -894,7 +1211,8 @@ def validate_lane_archive(path: str | Path) -> dict[str, Any]:
 
 __all__ = [
     "ArchiveFailed", "IMMUTABLE_VIEW_SCHEMA", "ImmutableSourceView", "ImmutableViewError",
-    "LANE_ARCHIVE_SCHEMA", "LaneLifecycleError", "RetirementBlocked", "RetirementResult",
+    "LANE_ARCHIVE_SCHEMA", "LIFECYCLE_REGISTRY_SCHEMA", "LaneLifecycleError", "RetirementBlocked", "RetirementResult",
     "allocate_immutable_source_view", "allocate_immutable_view", "allocate_source_view",
-    "archive_and_retire_terminal_lane", "retire_lane", "retire_terminal_lane", "validate_lane_archive",
+    "archive_and_retire_terminal_lane", "lifecycle_registry_path", "retire_lane", "retire_terminal_lane",
+    "validate_lane_archive", "write_lifecycle_registry_record",
 ]

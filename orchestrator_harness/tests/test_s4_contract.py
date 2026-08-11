@@ -33,6 +33,7 @@ from orchestrator_harness.lane_lifecycle import (
     allocate_immutable_source_view,
     retire_terminal_lane,
     validate_lane_archive,
+    write_lifecycle_registry_record,
 )
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
@@ -69,6 +70,57 @@ class S4ContractTests(unittest.TestCase):
             },
             "priority": priority,
         }
+
+    @staticmethod
+    def _publish_lifecycle_record(
+        root: Path,
+        lane: Path,
+        *,
+        lane_id: str,
+        revision: str,
+        retained_ref: str = "refs/heads/main",
+        target_revision: str | None = None,
+    ) -> Path:
+        runtime = root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        workspace = lane / ".agent-workspace"
+        workspace.mkdir(exist_ok=True)
+        invocation = root / f"{lane_id}-invocation.json"
+        invocation.write_text(json.dumps({"schema": "orchestrator-coding-invocation/v1", "lane_id": lane_id}) + "\n", encoding="utf-8")
+        common = Path(subprocess.run(["git", "-C", str(lane), "rev-parse", "--git-common-dir"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = (lane / common).resolve()
+        branch = subprocess.run(["git", "-C", str(lane), "symbolic-ref", "--short", "HEAD"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+        generation = f"generation-{lane_id}"
+        status = workspace / "status.json"
+        status.write_text(json.dumps({
+            "schema": "orchestrator-lane-controller/v1", "state": "PROVIDER_EXITED",
+            "lane_id": lane_id, "worker_invocation_id": f"worker-{lane_id}",
+            "invocation_schema": "orchestrator-coding-invocation/v1",
+            "lifecycle_registry_generation": generation,
+            "worktree_root": str(lane.resolve()), "repository_common_dir": str(common.resolve()),
+            "branch": branch,
+        }) + "\n", encoding="utf-8")
+        write_lifecycle_registry_record(
+            runtime,
+            lane_id=lane_id,
+            run_root=lane,
+            invocation_path=invocation,
+            status_path=status,
+            invocation_schema="orchestrator-coding-invocation/v1",
+            worker_invocation_id=f"worker-{lane_id}",
+            generation=generation,
+            state="PROVIDER_EXITED",
+            repository={
+                "worktree_root": str(lane.resolve()), "common_dir": str(common.resolve()),
+                "branch": branch, "expected_head": revision,
+                "retained_ref": retained_ref, "target_revision": target_revision or revision,
+            },
+            controller={"pid": 9201, "created_utc": "2000-01-01T00:00:00Z"},
+            worker={"pid": 9202, "created_utc": "2000-01-01T00:00:00Z"},
+            helpers=[], retained_ref=retained_ref, target_revision=target_revision or revision,
+        )
+        return runtime
 
     def test_S4_CODEX_INSTALL_WAKE_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -296,30 +348,9 @@ class S4ContractTests(unittest.TestCase):
             if not exclude.is_absolute():
                 exclude = lane / exclude
             exclude.write_text(".agent-workspace/\n", encoding="utf-8")
-            process_evidence = lane_workspace / "process.json"
-            common_dir = Path(git(lane, "rev-parse", "--git-common-dir"))
-            if not common_dir.is_absolute():
-                common_dir = lane / common_dir
-            process_evidence.write_text(json.dumps({
-                "schema": "orchestrator-process-evidence/v1",
-                "complete": True,
-                "provider": "synthetic",
-                "identities": {
-                    "controller": {"pid": 9001, "created_utc": "2000-01-01T00:00:00Z"},
-                    "worker": {"pid": 9002, "created_utc": "2000-01-01T00:00:00Z"},
-                    "helper": {"pid": 9003, "created_utc": "2000-01-01T00:00:00Z"},
-                },
-                "processes": [],
-                "lane_binding": {
-                    "lane_id": "S4.P",
-                    "worktree": str(lane.resolve()),
-                    "git_common_dir": str(common_dir.resolve()),
-                    "branch": git(lane, "symbolic-ref", "--short", "HEAD"),
-                    "expected_head": revision,
-                    "retained_ref": "refs/heads/main",
-                    "target_revision": revision,
-                },
-            }) + "\n", encoding="utf-8")
+            runtime = self._publish_lifecycle_record(
+                root, lane, lane_id="S4.P", revision=revision,
+            )
             with patch(
                 "orchestrator_harness.lane_lifecycle.process_snapshot",
                 return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
@@ -328,10 +359,7 @@ class S4ContractTests(unittest.TestCase):
                     lane,
                     root / "archive",
                     lane_id="S4.P",
-                    retained_revision=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                    process_evidence=process_evidence,
+                    run_coordinate=runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -343,9 +371,7 @@ class S4ContractTests(unittest.TestCase):
             git(main, "worktree", "add", "-b", "s4-dirty", str(dirty), "HEAD")
             (dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
             blocked = retire_terminal_lane(
-                dirty, root / "archive-dirty", lane_id="dirty", retained_revision=revision,
-                retained_ref="refs/heads/main", target_revision=revision,
-                process_evidence=process_evidence,
+                dirty, root / "archive-dirty", lane_id="dirty", run_coordinate=runtime,
             )
             self.assertEqual("VISIBLE", blocked.outcome)
             self.assertTrue(dirty.exists())

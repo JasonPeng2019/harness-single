@@ -12,9 +12,11 @@ from .models import StableBytes
 from .mutation import (
     MutationConflict,
     MutationUnsupported,
+    AnchoredAppendFile,
     append_bytes as mutation_append,
     capture_target,
     ensure_directory_path,
+    open_append_file,
     rename as mutation_rename,
     replace as mutation_replace,
 )
@@ -52,13 +54,16 @@ class PathKeyedAppendLock:
         digest = hashlib.sha256(self.key.encode("utf-8")).hexdigest()
         self.lock_path = root / f".{self.path.name or 'append'}.{digest}.lock"
         self._handle: Any | None = None
+        self._anchored: AnchoredAppendFile | None = None
         self._windows_locked = False
 
     def __enter__(self) -> "PathKeyedAppendLock":
         handle: Any | None = None
+        anchored: AnchoredAppendFile | None = None
         try:
             ensure_directory_path(self.lock_path.parent)
-            handle = self.lock_path.open("a+b")
+            anchored = open_append_file(self.lock_path.parent, self.lock_path.name)
+            handle = anchored.handle
             if handle.tell() == 0:
                 handle.write(b"0")
                 handle.flush()
@@ -73,24 +78,30 @@ class PathKeyedAppendLock:
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             self._handle = handle
+            self._anchored = anchored
             return self
         except Exception as exc:
-            if handle is not None:
+            if anchored is not None:
                 if os.name == "nt" and self._windows_locked:
                     try:
                         import msvcrt
 
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        anchored.handle.seek(0)
+                        msvcrt.locking(anchored.handle.fileno(), msvcrt.LK_UNLCK, 1)
                     except Exception:
                         pass
+                anchored.close()
+            elif handle is not None:
                 handle.close()
             self._handle = None
+            self._anchored = None
             raise AppendLockError(f"cannot acquire append lock for {self.path}: {exc}") from exc
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         handle = self._handle
+        anchored = self._anchored
         self._handle = None
+        self._anchored = None
         if handle is None:
             return
         try:
@@ -104,7 +115,10 @@ class PathKeyedAppendLock:
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            handle.close()
+            if anchored is not None:
+                anchored.close()
+            else:
+                handle.close()
 
 
 def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:

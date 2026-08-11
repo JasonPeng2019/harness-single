@@ -3,9 +3,10 @@
 The public callers provide a verified root, a single relative destination, and
 the target state they authorized.  This module owns the last-use proof and the
 temporary/replace/delete mechanics.  A pathname check is never treated as an
-atomic boundary: POSIX uses directory descriptors and ``*at`` operations;
-Windows holds no-delete directory handles opened with
-``FILE_FLAG_OPEN_REPARSE_POINT`` and refuses a directory it cannot anchor.
+atomic boundary: POSIX returns typed ``MutationUnsupported`` because a movable
+directory descriptor cannot prove root containment through use; Windows holds
+no-delete directory handles opened with ``FILE_FLAG_OPEN_REPARSE_POINT`` and
+uses handle-bound target operations.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
-import shutil
 import stat
 import tempfile
 import uuid
@@ -62,6 +62,14 @@ class MutationReceipt:
 
 def _before_commit() -> None:
     """Internal adversarial seam; production callers cannot select it."""
+
+
+def _after_anchor() -> None:
+    """Internal seam immediately after the root/parent capability is acquired."""
+
+
+def _after_target_proof() -> None:
+    """Internal seam immediately after the final expected-target proof."""
 
 
 def _lexical(value: str | Path) -> Path:
@@ -184,18 +192,252 @@ def _require_expected(path: Path, expected: TargetState) -> TargetState:
     return actual
 
 
+def _require_supported_root_boundary() -> None:
+    """Reject POSIX descriptor-relative writes whose root can be relocated.
+
+    A POSIX directory descriptor protects name lookup from symlink traversal, but
+    it does not pin the directory to its admitted pathname/root relationship:
+    the directory can be renamed outside the admitted root while the descriptor
+    remains usable.  This package has no portable kernel primitive that proves
+    both facts through the write, so POSIX mutations fail closed before opening
+    a temporary, lock, payload, or destructive target.
+    """
+
+    if os.name != "nt":
+        raise MutationUnsupported(
+            "POSIX mutation backend cannot prove root containment through use"
+        )
+
+
+def _windows_file_handle(
+    path: Path,
+    *,
+    access: int,
+    share: int,
+    creation: int | None = None,
+) -> tuple[object, tuple[int, int]]:
+    if os.name != "nt":
+        raise MutationUnsupported("Windows file backend is unavailable")
+    handle = _CreateFileW(
+        str(path),
+        access,
+        share,
+        None,
+        _OPEN_EXISTING if creation is None else creation,
+        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, _INVALID_HANDLE_VALUE):
+        error = ctypes.get_last_error()
+        raise MutationUnsupported(f"Windows file handle unavailable ({error}): {path}")
+    info = _ByHandleFileInformation()
+    if not _GetFileInformationByHandle(handle, ctypes.byref(info)):
+        error = ctypes.get_last_error()
+        _CloseHandle(handle)
+        raise MutationUnsupported(f"Windows file identity unavailable ({error}): {path}")
+    if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        _CloseHandle(handle)
+        raise MutationConflict(f"Windows target is a reparse point: {path}")
+    if info.dwFileAttributes & 0x00000010:
+        _CloseHandle(handle)
+        raise MutationConflict(f"Windows target is a directory, not a regular file: {path}")
+    file_id = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+    return handle, (int(info.dwVolumeSerialNumber), file_id)
+
+
+def _windows_directory_handle(path: Path, expected: TargetState) -> object:
+    if os.name != "nt":
+        raise MutationUnsupported("Windows directory backend is unavailable")
+    handle = _CreateFileW(
+        str(path),
+        _GENERIC_READ | _DELETE | _FILE_LIST_DIRECTORY,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, _INVALID_HANDLE_VALUE):
+        error = ctypes.get_last_error()
+        raise MutationUnsupported(f"Windows directory delete handle unavailable ({error}): {path}")
+    try:
+        info = _ByHandleFileInformation()
+        if not _GetFileInformationByHandle(handle, ctypes.byref(info)):
+            error = ctypes.get_last_error()
+            raise MutationUnsupported(f"Windows directory identity unavailable ({error}): {path}")
+        if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise MutationConflict(f"Windows directory is a reparse point: {path}")
+        if not (info.dwFileAttributes & 0x00000010):
+            raise MutationConflict(f"Windows target is not a directory: {path}")
+        actual_info = path.stat()
+        if expected.identity != _identity(actual_info):
+            raise MutationConflict(f"mutation directory changed while acquiring its handle: {path}")
+        return handle
+    except Exception:
+        _CloseHandle(handle)
+        raise
+
+
+def _windows_mark_handle_deleted(handle: object, path: Path) -> None:
+    disposition = _FileDispositionInfo(True)
+    if not _SetFileInformationByHandle(
+        handle,
+        _FILE_DISPOSITION_INFO,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        error = ctypes.get_last_error()
+        raise MutationUnsupported(f"Windows handle-bound delete unavailable ({error}): {path}")
+
+
+def _windows_remove_directory(path: Path, expected: TargetState) -> None:
+    """Recursively remove one exact directory while its delete handle is held."""
+
+    handle = _windows_directory_handle(path, expected)
+    try:
+        children = sorted(list(os.scandir(path)), key=lambda item: item.name)
+        for entry in children:
+            child = path / entry.name
+            if _is_reparse(child):
+                raise MutationConflict(f"refusing recursive cleanup through a reparse point: {child}")
+            child_state = _capture_path(child, include_content=True)
+            if not child_state.present:
+                continue
+            if child_state.kind == "directory":
+                _windows_remove_directory(child, child_state)
+            else:
+                _windows_delete_existing(child, child_state)
+        with os.scandir(path) as remaining:
+            if next(remaining, None) is not None:
+                raise MutationConflict(f"directory changed during handle-bound cleanup: {path}")
+        _windows_mark_handle_deleted(handle, path)
+    finally:
+        _CloseHandle(handle)
+
+
+def _windows_open_existing_for_update(path: Path, expected: TargetState) -> object:
+    """Open an existing file exclusively enough to prevent a target swap/write."""
+
+    handle, _ = _windows_file_handle(
+        path,
+        access=_GENERIC_READ | _GENERIC_WRITE,
+        share=_FILE_SHARE_READ,
+    )
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+        handle = None
+        file_handle = os.fdopen(descriptor, "r+b", closefd=True)
+        file_handle.seek(0)
+        content = file_handle.read()
+        info = path.stat()
+        actual = TargetState(
+            True,
+            "file",
+            _identity(info),
+            hashlib.sha256(content).hexdigest(),
+            len(content),
+            content,
+        )
+        if not _same_state(actual, expected):
+            file_handle.close()
+            raise MutationConflict(f"mutation target changed while acquiring its handle: {path}")
+        return file_handle
+    finally:
+        if handle is not None:
+            _CloseHandle(handle)
+
+
+def _windows_delete_existing(path: Path, expected: TargetState) -> None:
+    """Mark the exact opened target for deletion, without a pathname unlink."""
+
+    handle, _ = _windows_file_handle(
+        path,
+        access=_GENERIC_READ | _DELETE,
+        share=_FILE_SHARE_READ,
+    )
+    try:
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+        handle = None
+        file_handle = os.fdopen(descriptor, "rb", closefd=True)
+        content = file_handle.read()
+        info = path.stat()
+        actual = TargetState(
+            True,
+            "file",
+            _identity(info),
+            hashlib.sha256(content).hexdigest(),
+            len(content),
+            content,
+        )
+        if not _same_state(actual, expected):
+            file_handle.close()
+            raise MutationConflict(f"mutation target changed while acquiring delete handle: {path}")
+        disposition = _FileDispositionInfo(True)
+        if not _SetFileInformationByHandle(
+            msvcrt.get_osfhandle(file_handle.fileno()),
+            _FILE_DISPOSITION_INFO,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            error = ctypes.get_last_error()
+            file_handle.close()
+            raise MutationUnsupported(f"Windows handle-bound delete unavailable ({error}): {path}")
+        file_handle.close()
+    finally:
+        if handle is not None:
+            _CloseHandle(handle)
+
+
+class AnchoredAppendFile:
+    """A file handle whose parent/root capability remains held until close."""
+
+    def __init__(self, handle: object, anchor: "_DirectoryAnchor") -> None:
+        self.handle = handle
+        self.anchor = anchor
+
+    def __enter__(self) -> "AnchoredAppendFile":
+        return self
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.handle, name)
+
+    def close(self) -> None:
+        try:
+            self.handle.close()
+        finally:
+            self.anchor.close()
+
+    def __enter_file__(self) -> object:
+        return self.handle
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
 if os.name == "nt":
     import ctypes.wintypes as _wintypes
 
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _DELETE = 0x00010000
     _FILE_LIST_DIRECTORY = 0x0001
     _FILE_READ_ATTRIBUTES = 0x0080
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
     _OPEN_EXISTING = 3
+    _OPEN_ALWAYS = 4
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _MOVEFILE_FAIL_IF_EXISTS = 0x00000001
+    _MOVEFILE_WRITE_THROUGH = 0x00000008
 
     class _ByHandleFileInformation(ctypes.Structure):
         _fields_ = [
@@ -229,6 +471,22 @@ if os.name == "nt":
     _CloseHandle = _kernel32.CloseHandle
     _CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
     _CloseHandle.restype = ctypes.wintypes.BOOL
+    _SetFileInformationByHandle = _kernel32.SetFileInformationByHandle
+    _SetFileInformationByHandle.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+    ]
+    _SetFileInformationByHandle.restype = ctypes.wintypes.BOOL
+    _MoveFileExW = _kernel32.MoveFileExW
+    _MoveFileExW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR, ctypes.wintypes.DWORD]
+    _MoveFileExW.restype = ctypes.wintypes.BOOL
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.wintypes.BOOL)]
+
+    _FILE_DISPOSITION_INFO = 4
 
 
 class _DirectoryAnchor:
@@ -373,6 +631,51 @@ class _DirectoryAnchor:
         self.parent_fd = None
 
 
+def open_append_file(root: str | Path, relative: str | Path) -> AnchoredAppendFile:
+    """Open/create an append destination while retaining its root capability."""
+
+    _require_supported_root_boundary()
+    root_path = _lexical(root)
+    rel = _relative(root_path, relative)
+    parent, name = _validate_chain(root_path, rel)
+    target = root_path / rel
+    anchor = _DirectoryAnchor(root_path, parent)
+    handed_off = False
+    _before_commit()
+    try:
+        anchor.__enter__()
+        _after_anchor()
+        anchor.assert_stable()
+        if os.name == "nt":
+            handle, _ = _windows_file_handle(
+                target,
+                access=_GENERIC_READ | _GENERIC_WRITE,
+                share=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                creation=_OPEN_ALWAYS,
+            )
+            try:
+                import msvcrt
+
+                descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+                handle = None
+                file_handle = os.fdopen(descriptor, "a+b", closefd=True)
+            finally:
+                if handle is not None:
+                    _CloseHandle(handle)
+        else:  # pragma: no cover - guarded by _require_supported_root_boundary
+            raise MutationUnsupported("POSIX append boundary is unsupported")
+        anchor.assert_stable()
+        handed_off = True
+        return AnchoredAppendFile(file_handle, anchor)
+    except MutationError:
+        raise
+    except OSError as exc:
+        raise MutationConflict(f"anchored append open failed: {target}") from exc
+    finally:
+        if not handed_off:
+            anchor.close()
+
+
 def _new_temp(anchor: _DirectoryAnchor, name: str) -> tuple[int, Path]:
     """Create the temporary entry through the captured parent when possible."""
 
@@ -408,6 +711,7 @@ def replace(
     *,
     expected: TargetState | None = None,
 ) -> MutationReceipt:
+    _require_supported_root_boundary()
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
     parent, name = _validate_chain(root_path, rel)
@@ -418,8 +722,37 @@ def replace(
     _before_commit()
     try:
         with anchor:
+            _after_anchor()
             anchor.assert_stable()
             _require_expected(target, authorized)
+            _after_target_proof()
+            _require_expected(target, authorized)
+            if authorized.present and authorized.kind != "file":
+                raise MutationConflict(f"mutation replacement target is not a regular file: {target}")
+            if os.name == "nt" and authorized.present:
+                with _windows_open_existing_for_update(target, authorized) as handle:
+                    handle.seek(0)
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    handle.truncate()
+                    handle.seek(0)
+                    written = handle.read()
+                    if written != data:
+                        raise MutationConflict(f"handle-bound replacement could not verify bytes: {target}")
+                anchor.assert_stable()
+                resulting = _capture_path(target, include_content=True)
+                expected_result = TargetState(
+                    True,
+                    "file",
+                    authorized.identity,
+                    hashlib.sha256(data).hexdigest(),
+                    len(data),
+                    data,
+                )
+                if not _same_state(resulting, expected_result):
+                    raise MutationConflict("handle-bound replacement identity or bytes could not be verified")
+                return MutationReceipt("replace", str(root_path), str(parent), str(target), authorized, resulting)
             descriptor, raw_name = _new_temp(anchor, name)
             raw_path = Path(raw_name)
             temporary = raw_path if raw_path.is_absolute() else anchor.parent / raw_path
@@ -429,12 +762,25 @@ def replace(
                 os.fsync(handle.fileno())
             anchor.assert_stable()
             _require_expected(target, authorized)
+            _after_target_proof()
+            _require_expected(target, authorized)
             if _is_reparse(temporary) or not temporary.is_file():
                 raise MutationConflict("mutation temporary is not a regular file")
-            if os.name != "nt" and anchor.parent_fd is not None:
-                os.replace(temporary.name, name, src_dir_fd=anchor.parent_fd, dst_dir_fd=anchor.parent_fd)
+            if os.name != "nt" and anchor.parent_fd is not None:  # pragma: no cover - unsupported above
+                os.link(
+                    temporary.name,
+                    name,
+                    src_dir_fd=anchor.parent_fd,
+                    dst_dir_fd=anchor.parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(temporary.name, dir_fd=anchor.parent_fd)
             else:
-                os.replace(temporary, target)
+                try:
+                    os.link(temporary, target)
+                except FileExistsError as exc:
+                    raise MutationConflict(f"mutation target appeared during no-replace publication: {target}") from exc
+                temporary.unlink(missing_ok=True)
             temporary = None
             anchor.assert_stable()
             resulting = _capture_path(target, include_content=True)
@@ -470,6 +816,7 @@ def delete(
     *,
     expected: TargetState | None = None,
 ) -> MutationReceipt:
+    _require_supported_root_boundary()
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
     parent, name = _validate_chain(root_path, rel)
@@ -478,13 +825,18 @@ def delete(
     anchor = _DirectoryAnchor(root_path, parent)
     _before_commit()
     with anchor:
+        _after_anchor()
         anchor.assert_stable()
         _require_expected(target, authorized)
+        _after_target_proof()
+        _require_expected(target, authorized)
         if authorized.present:
-            if os.name != "nt" and anchor.parent_fd is not None:
+            if os.name == "nt":
+                _windows_delete_existing(target, authorized)
+            elif anchor.parent_fd is not None:  # pragma: no cover - unsupported above
                 os.unlink(name, dir_fd=anchor.parent_fd)
-            else:
-                target.unlink()
+            else:  # pragma: no cover - unsupported above
+                raise MutationUnsupported("anchored delete requires a supported parent capability")
         anchor.assert_stable()
         resulting = _capture_path(target, include_content=True)
         if resulting.present:
@@ -502,6 +854,7 @@ def ensure_directory_path(path: str | Path) -> Path:
         if not target.is_dir() or _is_reparse(target):
             raise MutationConflict(f"directory target is unsafe: {target}")
         return target
+    _require_supported_root_boundary()
     missing: list[Path] = []
     current = target
     while not current.exists():
@@ -517,6 +870,7 @@ def ensure_directory_path(path: str | Path) -> Path:
         anchor = _DirectoryAnchor(current, current)
         _before_commit()
         with anchor:
+            _after_anchor()
             anchor.assert_stable()
             try:
                 if os.name != "nt" and anchor.parent_fd is not None:
@@ -533,14 +887,16 @@ def ensure_directory_path(path: str | Path) -> Path:
 
 
 def make_temporary_directory(root: str | Path, *, prefix: str) -> Path:
+    _require_supported_root_boundary()
     root_path = _lexical(root)
     if not root_path.is_dir() or _is_reparse(root_path):
         raise MutationConflict(f"temporary root is unsafe: {root_path}")
     anchor = _DirectoryAnchor(root_path, root_path)
     _before_commit()
     with anchor:
+        _after_anchor()
         anchor.assert_stable()
-        if os.name != "nt" and anchor.parent_fd is not None:
+        if os.name != "nt" and anchor.parent_fd is not None:  # pragma: no cover - unsupported above
             path = None
             for _ in range(32):
                 candidate = f"{prefix}{uuid.uuid4().hex}"
@@ -553,7 +909,17 @@ def make_temporary_directory(root: str | Path, *, prefix: str) -> Path:
             if path is None:
                 raise MutationUnsupported("could not allocate an anchored temporary directory")
         else:
-            path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root_path)))
+            path = None
+            for _ in range(32):
+                candidate = root_path / f"{prefix}{uuid.uuid4().hex}"
+                try:
+                    candidate.mkdir()
+                except FileExistsError:
+                    continue
+                path = candidate
+                break
+            if path is None:
+                raise MutationUnsupported("could not allocate an anchored temporary directory")
         anchor.assert_stable()
         if _is_reparse(path) or not path.is_dir():
             raise MutationConflict(f"temporary directory is unsafe: {path}")
@@ -568,6 +934,7 @@ def rename(
     expected_source: TargetState | None = None,
     expected_target: TargetState | None = None,
 ) -> MutationReceipt:
+    _require_supported_root_boundary()
     root_path = _lexical(root)
     source_rel = _relative(root_path, source)
     target_rel = _relative(root_path, target)
@@ -582,13 +949,25 @@ def rename(
     anchor = _DirectoryAnchor(root_path, parent)
     _before_commit()
     with anchor:
+        _after_anchor()
         anchor.assert_stable()
         _require_expected(source_path, source_state)
         _require_expected(target_path, target_state)
-        if os.name != "nt" and anchor.parent_fd is not None:
-            os.replace(source_name, target_name, src_dir_fd=anchor.parent_fd, dst_dir_fd=anchor.parent_fd)
+        _after_target_proof()
+        _require_expected(source_path, source_state)
+        _require_expected(target_path, target_state)
+        if os.name != "nt" and anchor.parent_fd is not None:  # pragma: no cover - unsupported above
+            os.rename(source_name, target_name, src_dir_fd=anchor.parent_fd, dst_dir_fd=anchor.parent_fd)
         else:
-            os.replace(source_path, target_path)
+            if target_state.present:
+                raise MutationUnsupported("Windows rename cannot prove an existing target through use")
+            if not _MoveFileExW(
+                str(source_path),
+                str(target_path),
+                _MOVEFILE_FAIL_IF_EXISTS | _MOVEFILE_WRITE_THROUGH,
+            ):
+                error = ctypes.get_last_error()
+                raise MutationConflict(f"handle-bound no-replace rename failed ({error}): {target_path}")
         anchor.assert_stable()
         resulting = _capture_path(target_path, include_content=False)
         if not resulting.present or resulting.identity != source_state.identity:
@@ -602,6 +981,7 @@ def remove_tree(
     *,
     expected: TargetState | None = None,
 ) -> None:
+    _require_supported_root_boundary()
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
     parent, _ = _validate_chain(root_path, rel)
@@ -612,9 +992,15 @@ def remove_tree(
     anchor = _DirectoryAnchor(root_path, parent)
     _before_commit()
     with anchor:
+        _after_anchor()
         anchor.assert_stable()
         _require_expected(target, authorized)
-        shutil.rmtree(target)
+        _after_target_proof()
+        _require_expected(target, authorized)
+        if os.name == "nt":
+            _windows_remove_directory(target, authorized)
+        else:  # pragma: no cover - unsupported above
+            raise MutationUnsupported("recursive directory removal requires a supported directory capability")
         anchor.assert_stable()
         if _capture_path(target, include_content=False).present:
             raise MutationConflict(f"directory cleanup did not remove {target}")
@@ -623,31 +1009,19 @@ def remove_tree(
 def append_bytes(root: str | Path, relative: str | Path, data: bytes) -> TargetState:
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
-    parent, name = _validate_chain(root_path, rel)
     target = root_path / rel
-    anchor = _DirectoryAnchor(root_path, parent)
-    _before_commit()
-    with anchor:
-        anchor.assert_stable()
-        if target.exists() and (_is_reparse(target) or not target.is_file()):
-            raise MutationConflict(f"append target is unsafe: {target}")
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if os.name != "nt" and anchor.parent_fd is not None:
-            descriptor = os.open(name, flags, 0o600, dir_fd=anchor.parent_fd)
-        else:
-            descriptor = os.open(target, flags, 0o600)
-        try:
-            with os.fdopen(descriptor, "ab", closefd=True) as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-        finally:
-            descriptor = -1
-        anchor.assert_stable()
+    anchored = open_append_file(root_path, rel)
+    try:
+        handle = anchored.handle
+        handle.seek(0, os.SEEK_END)
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+        anchored.anchor.assert_stable()
         state = _capture_path(target, include_content=True)
         return state
+    finally:
+        anchored.close()
 
 
 __all__ = [
@@ -655,12 +1029,14 @@ __all__ = [
     "MutationError",
     "MutationReceipt",
     "MutationUnsupported",
+    "AnchoredAppendFile",
     "TargetState",
     "append_bytes",
     "capture_target",
     "delete",
     "ensure_directory_path",
     "make_temporary_directory",
+    "open_append_file",
     "remove_tree",
     "rename",
     "replace",

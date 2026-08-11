@@ -31,12 +31,14 @@ from orchestrator_harness.host_adapters import (
 from orchestrator_harness.lane_lifecycle import (
     ImmutableViewError,
     allocate_immutable_source_view,
+    lifecycle_registry_path,
     retire_terminal_lane,
     validate_lane_archive,
+    write_lifecycle_registry_record,
 )
 from orchestrator_harness.notifications import ManagerEventRouter
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
-from orchestrator_harness.stable_io import SafeOutput
+from orchestrator_harness.stable_io import AppendLockError, PathKeyedAppendLock, SafeOutput
 from orchestrator_harness import codex_adapter, lane_lifecycle
 
 
@@ -174,6 +176,80 @@ class S4RepairRegressionTests(unittest.TestCase):
             exclude.write_text(existing + ".agent-workspace/\n", encoding="utf-8")
         return workspace / "process.json"
 
+    @classmethod
+    def _lifecycle_record(
+        cls,
+        root: Path,
+        lane: Path,
+        *,
+        lane_id: str,
+        expected_head: str,
+        retained_ref: str,
+        target_revision: str,
+        identities: dict[str, dict[str, object]] | None = None,
+        helpers: list[dict[str, object]] | None = None,
+        state: str = "PROVIDER_EXITED",
+        worktree: Path | None = None,
+    ) -> Path:
+        runtime = root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        workspace = lane / ".agent-workspace"
+        workspace.mkdir(exist_ok=True)
+        cls._lane_process_path(lane)
+        invocation = root / f"{lane_id.replace(':', '-')}-invocation.json"
+        invocation.write_text(json.dumps({
+            "schema": "orchestrator-coding-invocation/v1",
+            "lane_id": lane_id,
+            "worker_invocation_id": f"worker-{lane_id}",
+        }) + "\n", encoding="utf-8")
+        status = workspace / "status.json"
+        bound_worktree = worktree or lane
+        common = Path(cls._git(bound_worktree, "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = (bound_worktree / common).resolve()
+        branch = cls._git(bound_worktree, "symbolic-ref", "--short", "HEAD")
+        generation = f"generation-{lane_id}"
+        status.write_text(json.dumps({
+            "schema": "orchestrator-lane-controller/v1",
+            "state": state,
+            "lane_id": lane_id,
+            "worker_invocation_id": f"worker-{lane_id}",
+            "invocation_schema": "orchestrator-coding-invocation/v1",
+            "lifecycle_registry_generation": generation,
+            "worktree_root": str(bound_worktree.resolve()),
+            "repository_common_dir": str(common.resolve()),
+            "branch": branch,
+        }) + "\n", encoding="utf-8")
+        values = identities or {
+            "controller": {"pid": 9101, "created_utc": "2000-01-01T00:00:00Z"},
+            "worker": {"pid": 9102, "created_utc": "2000-01-01T00:00:00Z"},
+        }
+        write_lifecycle_registry_record(
+            runtime,
+            lane_id=lane_id,
+            run_root=lane,
+            invocation_path=invocation,
+            status_path=status,
+            invocation_schema="orchestrator-coding-invocation/v1",
+            worker_invocation_id=f"worker-{lane_id}",
+            generation=generation,
+            state=state,
+            repository={
+                "worktree_root": str((worktree or lane).resolve()),
+                "common_dir": str(common.resolve()),
+                "branch": branch,
+                "expected_head": expected_head,
+                "retained_ref": retained_ref,
+                "target_revision": target_revision,
+            },
+            controller=values["controller"],
+            worker=values["worker"],
+            helpers=helpers or [],
+            retained_ref=retained_ref,
+            target_revision=target_revision,
+        )
+        return runtime
+
     def test_FC1_closed_manifest_rejects_foreign_prior_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -260,6 +336,255 @@ class S4RepairRegressionTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(b"user-after-authorization\n", target.read_bytes())
 
+    def test_FC16_caller_selected_lane_record_cannot_authorize_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            forged = self._lane_process_path(lane)
+            self._process_evidence(
+                forged,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="repair",
+                    expected_head=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                ),
+            )
+            runtime = root / "runtime"
+            runtime.mkdir()
+            result = retire_terminal_lane(
+                lane,
+                root / "archive",
+                lane_id="repair",
+                run_coordinate=runtime,
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertTrue(lane.exists())
+            del main
+
+    def test_FC17_missing_foreign_or_modified_fixed_record_stays_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            missing = retire_terminal_lane(
+                lane, root / "archive-missing", lane_id="missing", run_coordinate=runtime,
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", missing.outcome)
+            self._lifecycle_record(
+                root, lane, lane_id="modified", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+            )
+            registry = lifecycle_registry_path(runtime, "modified")
+            value = json.loads(registry.read_text(encoding="utf-8"))
+            value["repository"]["branch"] = "forged-branch"
+            registry.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            modified = retire_terminal_lane(
+                lane, root / "archive-modified", lane_id="modified", run_coordinate=runtime,
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", modified.outcome)
+            self.assertTrue(lane.exists())
+            del main
+
+    def test_FC18_registry_change_after_initial_proof_keeps_lane_and_archive_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="changed", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+            )
+            registry = lifecycle_registry_path(runtime, "changed")
+            changed = False
+
+            def mutate_after_initial_proof() -> None:
+                nonlocal changed
+                value = json.loads(registry.read_text(encoding="utf-8"))
+                value["lifecycle"]["state"] = "PROVIDER_EXITED"
+                value["record_sha256"] = "forged-after-proof"
+                registry.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                changed = True
+
+            with patch.object(lane_lifecycle, "_after_initial_retirement_proof", side_effect=mutate_after_initial_proof):
+                with patch.object(
+                    lane_lifecycle,
+                    "process_snapshot",
+                    return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
+                ):
+                    result = retire_terminal_lane(
+                        lane, root / "archive", lane_id="changed", run_coordinate=runtime,
+                        task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                        acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                    )
+            self.assertTrue(changed)
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertTrue(lane.exists())
+            self.assertIsNotNone(result.archive_path)
+            self.assertEqual("PENDING", validate_lane_archive(result.archive_path)["close_result"])
+            del main
+
+    def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="helpers", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+                helpers=[
+                    {"name": "helper-a", "identity": {"pid": 9301, "created_utc": "2000-01-01T00:00:00Z"}},
+                    {"name": "helper-b", "identity": {"pid": 9302, "created_utc": "2000-01-01T00:00:00Z"}},
+                ],
+            )
+            value = json.loads(lifecycle_registry_path(runtime, "helpers").read_text(encoding="utf-8"))
+            self.assertEqual(["helper-a", "helper-b"], [item["name"] for item in value["identities"]["helpers"]])
+            with patch.object(
+                lane_lifecycle,
+                "process_snapshot",
+                return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
+            ):
+                result = retire_terminal_lane(
+                    lane, root / "archive", lane_id="helpers", run_coordinate=runtime,
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
+            self.assertEqual("CLOSED", result.outcome)
+            del main
+
+    def test_FC19_post_final_target_proof_never_overwrites_new_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            hooks = project / ".codex" / "hooks"
+            hooks.mkdir(parents=True)
+            target = hooks / "late-target.txt"
+            target.write_bytes(b"authorized-before\n")
+            guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
+
+            def change_after_final_proof() -> None:
+                target.write_bytes(b"user-after-final-proof\n")
+
+            with patch(
+                "orchestrator_harness.mutation._after_target_proof",
+                side_effect=change_after_final_proof,
+                create=True,
+            ):
+                with self.assertRaises(CodexInstallConflict):
+                    guard.atomic_replace(target.relative_to(project), b"must-not-win\n")
+            self.assertEqual(b"user-after-final-proof\n", target.read_bytes())
+
+    def test_FC19_post_final_target_proof_never_deletes_new_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            hooks = project / ".codex" / "hooks"
+            hooks.mkdir(parents=True)
+            target = hooks / "late-delete.txt"
+            target.write_bytes(b"authorized-before\n")
+            guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
+
+            def change_after_final_proof() -> None:
+                target.write_bytes(b"user-after-final-proof\n")
+
+            with patch(
+                "orchestrator_harness.mutation._after_target_proof",
+                side_effect=change_after_final_proof,
+                create=True,
+            ):
+                with self.assertRaises(CodexInstallConflict):
+                    guard.delete(Path(".codex/hooks/late-delete.txt"))
+            self.assertEqual(b"user-after-final-proof\n", target.read_bytes())
+
+    def test_FC20_post_anchor_parent_relocation_never_writes_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            hooks = project / ".codex" / "hooks"
+            hooks.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            moved = outside / "original-hooks"
+            guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
+
+            def relocate_after_anchor() -> None:
+                hooks.rename(moved)
+                result = subprocess.run(
+                    ["cmd.exe", "/c", "mklink", "/J", str(hooks), str(outside)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    raise AssertionError(f"junction fixture failed: {result.stderr}")
+
+            try:
+                with patch(
+                    "orchestrator_harness.mutation._after_anchor",
+                    side_effect=relocate_after_anchor,
+                    create=True,
+                ):
+                    with self.assertRaises(CodexInstallConflict):
+                        guard.atomic_replace(Path(".codex/hooks/outside.txt"), b"must-stay-inside\n")
+                self.assertFalse((outside / "outside.txt").exists())
+                self.assertTrue(project.exists())
+            finally:
+                if hooks.exists() or os.path.lexists(hooks):
+                    hooks.rmdir()
+                if moved.exists():
+                    moved.rename(hooks)
+
+    def test_FC21_append_lock_substitution_never_creates_lock_or_payload_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            target = project / "events.jsonl"
+            lock_root = project / "locks"
+            lock_root.mkdir()
+            moved = outside / "original-locks"
+
+            def substitute_lock_root() -> None:
+                lock_root.rename(moved)
+                result = subprocess.run(
+                    ["cmd.exe", "/c", "mklink", "/J", str(lock_root), str(outside)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    raise AssertionError(f"junction fixture failed: {result.stderr}")
+
+            try:
+                lock = PathKeyedAppendLock(target, lock_root=lock_root)
+                with patch(
+                    "orchestrator_harness.mutation._after_anchor",
+                    side_effect=substitute_lock_root,
+                    create=True,
+                ):
+                    with self.assertRaises(AppendLockError):
+                        with lock:
+                            target.write_bytes(b"must-not-bypass\n")
+                self.assertFalse(any(outside.glob("*.lock")))
+                self.assertFalse((outside / "events.jsonl").exists())
+            finally:
+                if lock_root.exists() or os.path.lexists(lock_root):
+                    lock_root.rmdir()
+                if moved.exists():
+                    moved.rename(lock_root)
+
     def test_FC11_parent_reparse_swap_has_no_outside_write(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -322,14 +647,15 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=authorized,
                 ),
             )
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="repair", expected_head=authorized,
+                retained_ref="refs/heads/main", target_revision=authorized,
+            )
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="repair",
-                retained_revision=authorized,
-                retained_ref="refs/heads/main",
-                target_revision=authorized,
-                process_evidence=process,
+                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -356,14 +682,16 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="repair", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+                worktree=foreign,
+            )
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="repair",
-                retained_revision=revision,
-                retained_ref="refs/heads/main",
-                target_revision=revision,
-                process_evidence=process,
+                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -394,6 +722,12 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="live", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+                identities={"controller": identities["controller"], "worker": identities["worker"]},
+                helpers=[{"name": "helper", "identity": identities["helper"]}],
+            )
             provider = MagicMock(return_value=ProcessSnapshot(
                 complete=True,
                 processes=tuple(
@@ -413,10 +747,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                     lane,
                     root / "archive",
                     lane_id="live",
-                    retained_revision=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                    process_evidence=process,
+                    run_coordinate=runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -547,14 +878,15 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="repair", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+            )
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="repair",
-                retained_revision=revision,
-                retained_ref="refs/heads/main",
-                target_revision=revision,
-                process_evidence=process,
+                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -580,14 +912,15 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            runtime = self._lifecycle_record(
+                root, lane, lane_id="unretained", expected_head=revision,
+                retained_ref="refs/heads/does-not-exist", target_revision=revision,
+            )
             blocked = retire_terminal_lane(
                 lane,
                 root / "archive-unretained",
                 lane_id="unretained",
-                retained_revision=revision,
-                retained_ref="refs/heads/does-not-exist",
-                target_revision=revision,
-                process_evidence=process,
+                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -597,10 +930,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                 lane,
                 root / "archive-incomplete",
                 lane_id="incomplete",
-                retained_revision=revision,
-                retained_ref="refs/heads/main",
-                target_revision=revision,
-                process_evidence=process,
+                run_coordinate=runtime,
                 task_ref=None, result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -627,6 +957,13 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            live_runtime = self._lifecycle_record(
+                root, lane, lane_id="live", expected_head=revision,
+                retained_ref="refs/heads/main", target_revision=revision,
+                identities={"controller": {"pid": live_pids[0], "created_utc": current_created},
+                            "worker": {"pid": live_pids[1], "created_utc": current_created}},
+                helpers=[{"name": "helper", "identity": {"pid": live_pids[2], "created_utc": current_created}}],
+            )
             with patch.object(
                 lane_lifecycle,
                 "process_snapshot",
@@ -644,10 +981,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                     lane,
                     root / "archive-live",
                     lane_id="live",
-                    retained_revision=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                    process_evidence=live_evidence,
+                    run_coordinate=live_runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -667,14 +1001,15 @@ class S4RepairRegressionTests(unittest.TestCase):
                     target_revision=revision,
                 ),
             )
+            unmerged_runtime = self._lifecycle_record(
+                root, lane, lane_id="unmerged", expected_head=lane_revision,
+                retained_ref="HEAD", target_revision=revision,
+            )
             unmerged = retire_terminal_lane(
                 lane,
                 root / "archive-unmerged",
                 lane_id="unmerged",
-                retained_revision=lane_revision,
-                retained_ref="HEAD",
-                target_revision=revision,
-                process_evidence=process,
+                run_coordinate=unmerged_runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )

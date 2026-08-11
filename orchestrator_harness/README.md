@@ -71,18 +71,18 @@ Terminal retirement is archive-first:
 
 ```powershell
 python -m orchestrator_harness lane retire --lane-root <linked-worktree> `
-  --archive-root <archive> --lane-id <lane> --retained-revision <full-commit> `
-  --retained-ref <ref> --target-revision <full-commit> `
-  --process-evidence <complete-process-snapshot.json> `
+  --archive-root <archive> --lane-id <lane> --run-coordinate <run-root> `
   --task-ref <task.json> --result-ref <result.json> --findings-ref <findings.json> `
   --acceptance-ref <acceptance.json> --transcript-ref <transcript.json> `
   --dependency-ref <dependency.json>
 ```
 
-The archive copies and validates task/result/findings/acceptance/transcript/
-dependency/process evidence and content hashes before normal `git worktree
-remove`. Dirty, live, ambiguous, unretained, unmerged, or archive-failed lanes
-remain visible.
+The controller owns one fixed lifecycle record derived from the run coordinate
+and lane ID outside the retiring worktree. Retirement validates that record,
+freshly observes every persisted process identity twice, then copies and
+validates task/result/findings/acceptance/transcript/dependency/process evidence
+and content hashes before normal `git worktree remove`. Dirty, live, ambiguous,
+unretained, unmerged, or archive-failed lanes remain visible.
 
 ## Configuration migration
 

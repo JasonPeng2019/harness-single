@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
+from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.tests.support import TemporaryGitRepository
 
 
@@ -166,6 +167,18 @@ class CodingLaneControllerTests(unittest.TestCase):
         events = [json.loads(line) for line in (self.runtime_root / "events" / "controller.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(["CODEX_STARTED", "CODEX_EXITED"], [event["event"] for event in events])
         self.assertTrue(all(event["worker_invocation_id"] == "worker-1" for event in events))
+
+    def test_start_publishes_fixed_controller_lifecycle_registry(self) -> None:
+        path, _ = self.invocation()
+        self.assertEqual(0, controller.main([str(path)]))
+        registry_path = lifecycle_registry_path(self.runtime_root, "coding:worker-1")
+        record = json.loads(registry_path.read_text(encoding="utf-8"))
+        self.assertEqual("orchestrator-lifecycle-registry/v1", record["schema"])
+        self.assertEqual("controller-produced-fixed-coordinate", record["authority"])
+        self.assertTrue(record["lifecycle"]["complete"])
+        self.assertEqual([], record["identities"]["helpers"])
+        self.assertEqual("worker-1", record["run"]["worker_invocation_id"])
+        self.assertEqual(str(self.run_root.resolve()), record["repository"]["worktree_root"])
 
     def test_start_without_thread_is_failure_and_resume_identity_mismatches_are_rejected(self) -> None:
         path, raw = self.invocation()
