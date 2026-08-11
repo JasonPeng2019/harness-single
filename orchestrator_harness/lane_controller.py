@@ -732,6 +732,7 @@ def _is_launcher_descendant(
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
     identity: ProcessInfo | None = None,
+    boundary: ProcessBoundary | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Compatibility shim around the shared exact supervisor."""
     supervisor = ProcessSupervisor(
@@ -740,6 +741,7 @@ def _shutdown_exact_child(
         graceful_timeout_seconds=timeout_seconds,
         force_timeout_seconds=timeout_seconds,
         observer=None,
+        boundary=boundary,
     )
     result = supervisor.cleanup()
     evidence = result.to_record()
@@ -1528,6 +1530,8 @@ def run(invocation: Invocation) -> int:
     state["owned_helpers"] = []
     state["process_boundary"] = None
     state["helpers_complete"] = False
+    state["direct_child_reaped"] = False
+    state["resource_claim_release_safe"] = False
     admission: _LifecycleAdmission | None = None
     boundary: ProcessBoundary | None = None
     if git_identity is not None:
@@ -1630,10 +1634,85 @@ def run(invocation: Invocation) -> int:
     child: ProcessInfo | None = None
     supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
-    child_exit_confirmed = True
+    provider_launched = False
+    direct_child_reaped = False
+    release_safe = False
+    cleanup_result: CleanupResult | None = None
+
+    def _incomplete_boundary_record(error: str) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "schema": "orchestrator-process-boundary/v1",
+            "kind": boundary.kind if boundary is not None else "none",
+            "identity": boundary.identity if boundary is not None else None,
+            "complete": False,
+            "inventory_source": "controller",
+            "errors": [error],
+            "members": [],
+            "live_members": [],
+        }
+        if boundary is not None:
+            record.update({
+                "root_pid": getattr(boundary, "_root_pid", None),
+                "group_id": getattr(boundary, "_group_id", None),
+                "session_id": getattr(boundary, "_session_id", None),
+            })
+        return record
+
+    def _record_final_boundary(cleanup_result: CleanupResult | None) -> Any:
+        """Take the one explicit post-cleanup inventory used for release safety."""
+
+        nonlocal release_safe
+        release_safe = False
+        inventory: Any = None
+        inventory_error: str | None = None
+        try:
+            if supervisor is not None:
+                inventory = supervisor.boundary_inventory()
+            elif boundary is not None:
+                inventory = boundary.inventory()
+            else:
+                inventory_error = "owned process boundary is unavailable"
+        except BaseException as exc:
+            inventory_error = f"final boundary inventory failed: {type(exc).__name__}: {exc}"
+        if inventory_error is not None or inventory is None:
+            state["process_boundary"] = _incomplete_boundary_record(inventory_error or "final boundary inventory was unavailable")
+            state["owned_boundary_empty"] = False
+            state["helpers_complete"] = False
+            state["resource_claim_release_safe"] = False
+            return None
+        complete = bool(getattr(inventory, "complete", False))
+        live_members = tuple(getattr(inventory, "processes", ()) or ())
+        try:
+            state["process_boundary"] = (
+                boundary.to_record(inventory) if boundary is not None
+                else _incomplete_boundary_record("no controller-owned process boundary is attached")
+            )
+        except BaseException as exc:
+            state["process_boundary"] = _incomplete_boundary_record(
+                f"final boundary evidence serialization failed: {type(exc).__name__}: {exc}"
+            )
+            complete = False
+            live_members = ()
+        state["owned_boundary_empty"] = complete and not live_members
+        state["helpers_complete"] = bool(
+            cleanup_result is not None
+            and cleanup_result.proved_reap
+            and complete
+            and not live_members
+        )
+        release_safe = bool(
+            provider_launched
+            and direct_child_reaped
+            and cleanup_result is not None
+            and cleanup_result.proved_reap
+            and complete
+            and not live_members
+        )
+        state["resource_claim_release_safe"] = release_safe
+        return inventory
 
     def _retain_unresolved_claims() -> list[str]:
-        if resource_claims is None or child_exit_confirmed:
+        if resource_claims is None or not provider_launched or release_safe:
             return []
         boundary_evidence = state.get("process_boundary")
         retained_identities: list[dict[str, Any]] = []
@@ -1644,7 +1723,7 @@ def run(invocation: Invocation) -> int:
             boundary_value = dict(boundary_evidence)
         else:
             boundary_value = {"complete": False, "errors": ["owned boundary evidence was not published"]}
-        if not state.get("direct_child_reaped"):
+        if not direct_child_reaped:
             boundary_value["complete"] = False
         failures = resource_claims.retain_boundary(
             boundary=boundary_value,
@@ -1655,6 +1734,12 @@ def run(invocation: Invocation) -> int:
         if failures:
             state["resource_retention_errors"] = failures
         return failures
+
+    def _claims_can_release() -> bool:
+        # Before Popen there is no provider boundary to retain.  Once Popen
+        # returns, this is the sole permission used by finally: the explicit
+        # post-cleanup release proof above must have completed successfully.
+        return (not provider_launched) or release_safe
 
     try:
         if invocation.worker_invocation_id is not None and invocation.resources:
@@ -1681,6 +1766,21 @@ def run(invocation: Invocation) -> int:
                 "waiting_resource_claim": None,
                 "resource_claim_findings": list(resource_claims.findings),
             })
+        if resource_claims is not None:
+            arming_failures = resource_claims.arm_boundary()
+            state.update({
+                "held_resource_claims": resource_claims.held,
+                "resource_claim_findings": list(resource_claims.findings),
+            })
+            if arming_failures:
+                state.update({
+                    "state": "LAUNCH_FAILED",
+                    "ended_utc": _utc(),
+                    "error": "cannot durably arm every resource claim before provider launch",
+                    "resource_arming_errors": arming_failures,
+                })
+                _atomic_json(invocation.status_path, state)
+                return 1
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             child_env = None
             if invocation.child_environment_isolation:
@@ -1706,10 +1806,16 @@ def run(invocation: Invocation) -> int:
                 env=child_env,
                 **boundary.popen_kwargs,
             )
-            child_exit_confirmed = False
+            provider_launched = True
             child = _identity(process.pid, parent=controller.pid)
-            boundary.attach(process, child)
-            state["process_boundary"] = boundary.to_record(boundary.inventory())
+            state.update({
+                "provider_pid": child.pid,
+                "provider_started_utc": iso_utc(child.created_utc),
+                "provider_created_utc": iso_utc(child.created_utc),
+                "codex_pid": child.pid,
+                "codex_started_utc": iso_utc(child.created_utc),
+                "codex_created_utc": iso_utc(child.created_utc),
+            })
             # The captured OS boundary is established before the provider is
             # resumed.  The shared supervisor owns every later exact cleanup,
             # inventory, and final-reap stage.
@@ -1720,14 +1826,14 @@ def run(invocation: Invocation) -> int:
                 observer=None,
                 boundary=boundary,
             )
+            # The supervisor is bound before attach can partially establish or
+            # reject the OS boundary, so every post-Popen exception retains a
+            # shared cleanup owner rather than falling back to direct-child
+            # evidence alone.
+            boundary.attach(process, child)
+            state["process_boundary"] = boundary.to_record(boundary.inventory())
             state.update({
                 "state": running_state,
-                "provider_pid": child.pid,
-                "provider_started_utc": iso_utc(child.created_utc),
-                "provider_created_utc": iso_utc(child.created_utc),
-                "codex_pid": child.pid,
-                "codex_started_utc": iso_utc(child.created_utc),
-                "codex_created_utc": iso_utc(child.created_utc),
             })
             _atomic_json(invocation.status_path, state)
             _append_event(invocation.event_log, _event(
@@ -1785,12 +1891,24 @@ def run(invocation: Invocation) -> int:
         # request, targets escaped exact identities, and reaps adopted members
         # before it can prove the claim-release predicate.
         cleanup_result = supervisor.cleanup()
-        child_exit_confirmed = cleanup_result.proved_reap
-        boundary_inventory = supervisor.boundary_inventory()
+        direct_child_reaped = cleanup_result.final_reap
         state["cleanup"] = cleanup_result.to_record()
-        state["direct_child_reaped"] = cleanup_result.final_reap
-        state["owned_boundary_empty"] = cleanup_result.owned_boundary_empty
-        state["process_boundary"] = boundary.to_record(boundary_inventory) if boundary is not None else None
+        state["direct_child_reaped"] = direct_child_reaped
+        boundary_inventory = _record_final_boundary(cleanup_result)
+        if boundary_inventory is None:
+            state.update({
+                "state": "CONTROLLER_FAILED",
+                "ended_utc": _utc(),
+                "error": "final owned process boundary inventory failed",
+                "boundary_failure": {
+                    "complete": False,
+                    "live_helpers": [],
+                    "errors": list((state.get("process_boundary") or {}).get("errors", [])),
+                    "cleanup": cleanup_result.to_record(),
+                },
+            })
+            _atomic_json(invocation.status_path, state)
+            return 1
         observed_by_pid = {item.pid: item for item in boundary_inventory.observed_processes}
         owned_helpers: list[dict[str, Any]] = []
         for item in boundary_inventory.observed_processes:
@@ -1808,8 +1926,7 @@ def run(invocation: Invocation) -> int:
                 "identity": {"pid": item.pid, "created_utc": iso_utc(item.created_utc)},
             })
         state["owned_helpers"] = owned_helpers
-        state["helpers_complete"] = cleanup_result.proved_reap and boundary_inventory.complete and not boundary_inventory.processes
-        if not cleanup_result.proved_reap or not boundary_inventory.complete or boundary_inventory.processes:
+        if not release_safe:
             state.update({
                 "state": "CONTROLLER_FAILED",
                 "ended_utc": _utc(),
@@ -1898,22 +2015,27 @@ def run(invocation: Invocation) -> int:
         return 1 if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid else exit_code
     except KeyboardInterrupt:
         cleanup_evidence: dict[str, Any] | None = None
-        if process is not None and not child_exit_confirmed:
+        if provider_launched and process is not None and not direct_child_reaped:
             if supervisor is None:
-                direct_reaped, cleanup_evidence = _shutdown_exact_child(process, identity=child)
-                child_exit_confirmed = direct_reaped and (boundary is None or invocation.repository is None)
-                if boundary is not None:
-                    state["direct_child_reaped"] = direct_reaped
-                    state["process_boundary"] = boundary.to_record(boundary.inventory())
-            else:
-                cleanup: CleanupResult = supervisor.cleanup()
-                child_exit_confirmed = cleanup.proved_reap
-                cleanup_evidence = cleanup.to_record()
-                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["terminate_wait_timed_out"] = True
-                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["kill_wait_timed_out"] = True
-        if not child_exit_confirmed:
+                supervisor = ProcessSupervisor(
+                    process,
+                    child,
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                    observer=None,
+                    boundary=boundary,
+                )
+            cleanup_result = supervisor.cleanup()
+            direct_child_reaped = cleanup_result.final_reap
+            cleanup_evidence = cleanup_result.to_record()
+            state["direct_child_reaped"] = direct_child_reaped
+            if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
+                cleanup_evidence["terminate_wait_timed_out"] = True
+            if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
+                cleanup_evidence["kill_wait_timed_out"] = True
+        if provider_launched and not release_safe:
+            _record_final_boundary(cleanup_result)
+        if provider_launched and not release_safe:
             _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
@@ -1956,22 +2078,27 @@ def run(invocation: Invocation) -> int:
         return 1
     except Exception as exc:
         cleanup_evidence = None
-        if process is not None and not child_exit_confirmed:
+        if provider_launched and process is not None and not direct_child_reaped:
             if supervisor is None:
-                direct_reaped, cleanup_evidence = _shutdown_exact_child(process, identity=child)
-                child_exit_confirmed = direct_reaped and (boundary is None or invocation.repository is None)
-                if boundary is not None:
-                    state["direct_child_reaped"] = direct_reaped
-                    state["process_boundary"] = boundary.to_record(boundary.inventory())
-            else:
-                cleanup: CleanupResult = supervisor.cleanup()
-                child_exit_confirmed = cleanup.proved_reap
-                cleanup_evidence = cleanup.to_record()
-                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["terminate_wait_timed_out"] = True
-                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["kill_wait_timed_out"] = True
-        if not child_exit_confirmed:
+                supervisor = ProcessSupervisor(
+                    process,
+                    child,
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                    observer=None,
+                    boundary=boundary,
+                )
+            cleanup_result = supervisor.cleanup()
+            direct_child_reaped = cleanup_result.final_reap
+            cleanup_evidence = cleanup_result.to_record()
+            state["direct_child_reaped"] = direct_child_reaped
+            if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
+                cleanup_evidence["terminate_wait_timed_out"] = True
+            if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
+                cleanup_evidence["kill_wait_timed_out"] = True
+        if provider_launched and not release_safe:
+            _record_final_boundary(cleanup_result)
+        if provider_launched and not release_safe:
             _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"
@@ -2000,7 +2127,7 @@ def run(invocation: Invocation) -> int:
         return 1
     finally:
         if resource_claims is not None:
-            if child_exit_confirmed:
+            if _claims_can_release():
                 release_failures = resource_claims.release_all()
                 state["held_resource_claims"] = resource_claims.held
                 state["waiting_resource_claim"] = None

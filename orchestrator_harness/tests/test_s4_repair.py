@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ctypes
+import io
 import importlib
 import os
 import pkgutil
@@ -12,6 +14,7 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 from unittest.mock import MagicMock, patch
 
 import orchestrator_harness.lane_controller as lane_controller
@@ -41,8 +44,8 @@ from orchestrator_harness.lane_lifecycle import (
     validate_lane_archive,
 )
 from orchestrator_harness.notifications import ManagerEventRouter
-from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
-from orchestrator_harness.process_supervisor import ProcessBoundary, ProcessSupervisor
+from orchestrator_harness.models import ProcessBoundaryInventory, ProcessInfo, ProcessSnapshot, iso_utc
+from orchestrator_harness.process_supervisor import CleanupResult, ProcessBoundary, ProcessSupervisor
 from orchestrator_harness.processes import process_group_inventory, targeted_process_query
 from orchestrator_harness.resource_locks import ResourceClaims, _owner_state
 from orchestrator_harness.stable_io import AppendLockError, PathKeyedAppendLock, SafeOutput
@@ -191,6 +194,143 @@ class S4RepairRegressionTests(unittest.TestCase):
         if lane_controller.main([str(invocation)]) != expected_code:
             raise AssertionError(f"synthetic production controller returned an unexpected code (wanted {expected_code})")
         return lifecycle_registry_path(lane, lane_id, f"worker-{lane_id}")
+
+    def _run_synthetic_controller_boundary(
+        self,
+        final_inventory: ProcessBoundaryInventory | None,
+        *,
+        final_inventory_error: BaseException | None = None,
+        attach_error: BaseException | None = None,
+        arm_failures: list[str] | None = None,
+    ) -> tuple[int, ResourceClaims, list[None], list[None], MagicMock]:
+        """Drive lane_controller.run with a disposable production-shaped boundary."""
+
+        from orchestrator_harness.tests.test_controller_lock_cleanup import ControllerLockCleanupTests
+
+        case = ControllerLockCleanupTests("test_unproven_child_shutdown_retains_owned_claim")
+        case.setUp()
+        try:
+            invocation = case.invocation()
+            owner = ProcessInfo(101, 1, "controller", "controller", datetime(2026, 8, 11, tzinfo=timezone.utc))
+            child_identity = ProcessInfo(202, 101, "codex", "codex", datetime(2026, 8, 11, 0, 0, 1, tzinfo=timezone.utc))
+
+            class SyntheticProcess:
+                pid = child_identity.pid
+
+                def __init__(self) -> None:
+                    self.stdin = io.BytesIO()
+                    self.stdout = io.BytesIO()
+                    self.stderr = io.BytesIO()
+
+            process = SyntheticProcess()
+
+            class SyntheticBoundary:
+                kind = "synthetic-boundary"
+                identity = "synthetic-boundary:1"
+
+                def __init__(self) -> None:
+                    self.popen_kwargs: dict[str, object] = {}
+
+                def attach(self, _process: object, _identity: ProcessInfo) -> None:
+                    if attach_error is not None:
+                        raise attach_error
+
+                def inventory(self) -> ProcessBoundaryInventory:
+                    return ProcessBoundaryInventory(True, self.kind, self.identity, source="synthetic")
+
+                def to_record(self, inventory: ProcessBoundaryInventory) -> dict[str, object]:
+                    def item_record(item: ProcessInfo) -> dict[str, object]:
+                        return {"pid": item.pid, "created_utc": iso_utc(item.created_utc), "name": item.name}
+
+                    return {
+                        "schema": "orchestrator-process-boundary/v1",
+                        "kind": self.kind,
+                        "identity": self.identity,
+                        "complete": inventory.complete,
+                        "inventory_source": inventory.source,
+                        "errors": list(inventory.errors),
+                        "members": [item_record(item) for item in inventory.observed_processes],
+                        "live_members": [item_record(item) for item in inventory.processes],
+                    }
+
+                def close(self) -> None:
+                    return None
+
+            boundary = SyntheticBoundary()
+            cleanup = CleanupResult(
+                pid=child_identity.pid,
+                expected_created_utc=iso_utc(child_identity.created_utc),
+                status="REAPED",
+                stages=("FINAL_REAP", "BOUNDARY_EMPTY"),
+                final_reap=True,
+                cleanup_confirmed=True,
+                identity_verified=True,
+                exit_code=0,
+                reaped_after="synthetic",
+                owned_boundary_empty=True,
+                boundary_complete=True,
+                boundary_cleanup="boundary-empty",
+            )
+
+            class SyntheticSupervisor:
+                def wait_for_exit(self) -> int:
+                    return 0
+
+                def cleanup(self) -> CleanupResult:
+                    return cleanup
+
+                def boundary_inventory(self) -> ProcessBoundaryInventory:
+                    if final_inventory_error is not None:
+                        raise final_inventory_error
+                    assert final_inventory is not None
+                    return final_inventory
+
+            supervisor = SyntheticSupervisor()
+            captured: list[ResourceClaims] = []
+            release_calls: list[None] = []
+            retain_calls: list[None] = []
+
+            def claims_factory(
+                root: Path, lane_id: str, worker_id: str, process_info: ProcessInfo,
+            ) -> ResourceClaims:
+                claims = ResourceClaims(
+                    root,
+                    lane_id,
+                    worker_id,
+                    process_info,
+                    identity_provider=lambda pid: {"pid": pid, "created_utc": f"identity:{pid}"},
+                )
+                original_release = claims.release_all
+                original_retain = claims.retain_boundary
+
+                def release() -> list[str]:
+                    release_calls.append(None)
+                    return original_release()
+
+                def retain(*, boundary: Mapping[str, object] | None, identities: list[Mapping[str, object]]) -> list[str]:
+                    retain_calls.append(None)
+                    return original_retain(boundary=boundary, identities=identities)
+
+                claims.release_all = release
+                claims.retain_boundary = retain  # type: ignore[method-assign]
+                if arm_failures is not None:
+                    claims.arm_boundary = lambda: list(arm_failures)  # type: ignore[method-assign]
+                captured.append(claims)
+                return claims
+
+            popen = MagicMock(return_value=process)
+            with (
+                patch.object(lane_controller, "_identity", side_effect=[owner, child_identity]),
+                patch.object(lane_controller, "ResourceClaims", side_effect=claims_factory),
+                patch.object(lane_controller.subprocess, "Popen", popen),
+                patch.object(lane_controller.ProcessBoundary, "prepare", return_value=boundary),
+                patch.object(lane_controller, "ProcessSupervisor", return_value=supervisor),
+            ):
+                result = lane_controller.run(invocation)
+            self.assertEqual(1, len(captured))
+            return result, captured[0], release_calls, retain_calls, popen
+        finally:
+            case.tearDown()
 
     def test_FC1_closed_manifest_rejects_foreign_prior_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -691,6 +831,180 @@ class S4RepairRegressionTests(unittest.TestCase):
             self.assertEqual(["resource"], [item["resource"] for item in contender.held])
             self.assertTrue(any(item.get("state") == "PROVEN_STALE" for item in contender.findings))
             self.assertEqual([], contender.release_all())
+
+    def test_FC33_final_live_reinventory_revokes_release_and_retains_claim(self) -> None:
+        helper = ProcessInfo(
+            303, 202, "helper", "helper", datetime(2026, 8, 11, 0, 0, 2, tzinfo=timezone.utc)
+        )
+        final = ProcessBoundaryInventory(
+            True,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            (helper,),
+            (helper,),
+            source="synthetic-final",
+        )
+        result, claims, releases, retains, _ = self._run_synthetic_controller_boundary(final)
+        self.assertEqual(1, result)
+        self.assertEqual([], releases)
+        self.assertTrue(retains)
+        self.assertTrue(claims.held)
+        self.assertEqual([303], [item["pid"] for item in claims.held[0]["retained_processes"]])
+
+    def test_FC34_final_incomplete_reinventory_revokes_release_and_retains_claim(self) -> None:
+        final = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("synthetic final snapshot incomplete",),
+            source="synthetic-final",
+        )
+        result, claims, releases, retains, _ = self._run_synthetic_controller_boundary(final)
+        self.assertEqual(1, result)
+        self.assertEqual([], releases)
+        self.assertTrue(retains)
+        self.assertFalse(claims.held[0]["retained_boundary"]["complete"])
+        thrown_result, thrown_claims, thrown_releases, thrown_retains, _ = self._run_synthetic_controller_boundary(
+            None,
+            final_inventory_error=RuntimeError("synthetic final inventory error"),
+        )
+        self.assertEqual(1, thrown_result)
+        self.assertEqual([], thrown_releases)
+        self.assertTrue(thrown_retains)
+        self.assertFalse(thrown_claims.held[0]["retained_boundary"]["complete"])
+
+    def test_FC35_failed_retention_preserves_armed_claim_against_contender(self) -> None:
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        active: dict[int, dict[str, object]] = {
+            101: {"pid": 101, "created_utc": "identity:101"},
+            303: {"pid": 303, "created_utc": "identity:303"},
+        }
+        owner = ProcessInfo(101, 1, "controller", "controller", now)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            claims = ResourceClaims(
+                root,
+                "lane",
+                "worker",
+                owner,
+                process_provider=lambda: ProcessSnapshot(True, (), (), "synthetic"),
+                identity_provider=lambda pid: active.get(pid),
+            )
+            claims.acquire_all(["resource"], on_wait=lambda wait: self.fail(str(wait)))
+            self.assertEqual([], claims.arm_boundary())
+            with patch("orchestrator_harness.resource_locks.mutation_replace", side_effect=OSError("synthetic retention write failure")):
+                self.assertEqual(
+                    ["resource"],
+                    claims.retain_boundary(
+                        boundary={"complete": False, "errors": ["uncertain"]},
+                        identities=[],
+                    ),
+                )
+            active.pop(101)
+            contender = ResourceClaims(
+                root,
+                "lane",
+                "contender",
+                ProcessInfo(303, 1, "controller", "controller", now),
+                process_provider=lambda: ProcessSnapshot(True, (), (), "synthetic"),
+                identity_provider=lambda pid: active.get(pid),
+            )
+            waits: list[dict[str, object]] = []
+
+            class WaitAbort(Exception):
+                pass
+
+            with patch("orchestrator_harness.resource_locks.time.sleep", side_effect=WaitAbort()):
+                with self.assertRaises(WaitAbort):
+                    contender.acquire_all(["resource"], on_wait=waits.append)
+            self.assertEqual("INVENTORY_UNKNOWN", waits[0]["state"])
+            self.assertTrue(claims.held[0]["boundary_may_exist"])
+
+    def test_FC36_prelaunch_arming_failure_forbids_provider_popen(self) -> None:
+        empty = ProcessBoundaryInventory(True, "synthetic-boundary", "synthetic-boundary:1", source="synthetic")
+        result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+            empty,
+            arm_failures=["resource"],
+        )
+        self.assertEqual(1, result)
+        self.assertEqual(0, popen.call_count)
+        self.assertEqual([None], releases)
+        self.assertEqual([], retains)
+        self.assertEqual([], claims.held)
+
+    def test_FC37_windows_job_assigned_and_list_mismatch_is_incomplete(self) -> None:
+        from ctypes import wintypes
+
+        for assigned, listed in ((1, 0), (4, 2)):
+            with self.subTest(assigned=assigned, listed=listed):
+                calls = 0
+
+                def query(
+                    _handle: object,
+                    _info_class: int,
+                    buffer: object,
+                    _size: int,
+                    returned: object,
+                    *,
+                    assigned_value: int = assigned,
+                    listed_value: int = listed,
+                ) -> bool:
+                    nonlocal calls
+                    calls += 1
+                    payload = assigned_value.to_bytes(4, "little") + listed_value.to_bytes(4, "little")
+                    ctypes.memmove(buffer, payload, len(payload))
+                    returned._obj.value = len(payload)  # type: ignore[attr-defined]
+                    return True
+
+                boundary = ProcessBoundary(kind="windows-job", identity="job:repair")
+                boundary._job_handle = object()
+                with patch(
+                    "orchestrator_harness.process_supervisor._windows_job_api",
+                    return_value=(None, None, None, query, None, None, None, wintypes),
+                ):
+                    observed = boundary.inventory()
+                self.assertFalse(observed.complete)
+                self.assertTrue(any("assigned=" in error and "listed=" in error for error in observed.errors))
+                self.assertGreaterEqual(calls, 1)
+
+    def test_FC38_no_repository_attach_failure_never_uses_direct_reap_for_release(self) -> None:
+        incomplete = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("attach left boundary partial",),
+            source="synthetic-final",
+        )
+        result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+            incomplete,
+            attach_error=lane_controller.ProcessBoundaryUnsupported("synthetic attach failure"),
+        )
+        self.assertEqual(1, result)
+        self.assertEqual(1, popen.call_count)
+        self.assertEqual([], releases)
+        self.assertTrue(retains)
+        self.assertTrue(claims.held)
+
+    def test_FC39_launcher_filter_is_presentation_only(self) -> None:
+        root = ProcessInfo(10, 1, "provider", "python provider.py", datetime(2026, 8, 11, tzinfo=timezone.utc))
+        same_tail = ProcessInfo(11, 10, "launcher", "python provider.py", datetime(2026, 8, 11, 0, 0, 1, tzinfo=timezone.utc))
+        empty_command = ProcessInfo(12, 10, "launcher", "", datetime(2026, 8, 11, 0, 0, 2, tzinfo=timezone.utc))
+        real_helper = ProcessInfo(13, 11, "helper", "python helper.py", datetime(2026, 8, 11, 0, 0, 3, tzinfo=timezone.utc))
+        self.assertTrue(lane_controller._is_launcher_descendant(same_tail, root, provider_root_pid=root.pid))
+        self.assertTrue(lane_controller._is_launcher_descendant(empty_command, root, provider_root_pid=root.pid))
+        boundary = ProcessBoundary(kind="synthetic-boundary", identity="synthetic-boundary:1")
+        record = boundary.to_record(
+            ProcessBoundaryInventory(
+                True,
+                boundary.kind,
+                boundary.identity,
+                (same_tail, empty_command, real_helper),
+                (same_tail, empty_command, real_helper),
+                source="synthetic-authoritative",
+            )
+        )
+        self.assertEqual({11, 12, 13}, {item["pid"] for item in record["members"]})
+        self.assertEqual({11, 12, 13}, {item["pid"] for item in record["live_members"]})
 
     def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

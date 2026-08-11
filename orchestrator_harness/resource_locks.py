@@ -19,6 +19,7 @@ from .mutation import MutationConflict, MutationUnsupported, capture_target, rep
 from .processes import process_snapshot
 
 CLAIM_SCHEMA = "orchestrator-coding-resource-claim/v1"
+BOUNDARY_ARMED_STATE = "MAY_EXIST_INCOMPLETE"
 Claim = dict[str, object]
 IdentityProvider = Callable[[int], Mapping[str, object] | None]
 
@@ -170,6 +171,8 @@ def _retained_state(
     processes: ProcessSnapshot,
     identity_provider: IdentityProvider,
 ) -> tuple[str, str]:
+    if claim.get("boundary_may_exist") is True or claim.get("boundary_state") == BOUNDARY_ARMED_STATE:
+        return "INVENTORY_UNKNOWN", "provider boundary may exist but retained evidence is not complete"
     retained_boundary = claim.get("retained_boundary")
     retained = claim.get("retained_processes", [])
     if retained_boundary is None:
@@ -294,6 +297,8 @@ class ResourceClaims:
             "worker_invocation_id": self.worker_invocation_id,
             "owner": dict(self._owner),
             "created_utc": iso_utc(self.controller.created_utc),
+            "boundary_state": "NOT_ARMED",
+            "boundary_may_exist": False,
         }
 
     def _create(self, resource: str) -> Claim | None:
@@ -350,6 +355,48 @@ class ResourceClaims:
                 failures.append(resource)
         return sorted(failures)
 
+    def arm_boundary(self) -> list[str]:
+        """Durably mark every held claim fail-closed before provider launch.
+
+        The transition is an exact-byte CAS for each claim.  Once any claim
+        contains the armed marker, a later controller disappearance cannot be
+        interpreted as proof that an unobserved provider boundary is absent.
+        """
+
+        failures: list[str] = []
+        for resource in sorted(self._held, reverse=True):
+            expected = self._held.get(resource)
+            if expected is None:
+                continue
+            path = self.root / claim_filename(resource)
+            if not _claim_path_is_unambiguous(path):
+                failures.append(resource)
+                continue
+            try:
+                with _kernel_resource_lock(path):
+                    if not _claim_path_is_unambiguous(path):
+                        failures.append(resource)
+                        continue
+                    current, error, current_bytes = _read_claim_evidence(path)
+                    comparable = {key: value for key, value in expected.items() if key != "path"}
+                    if error is not None or current is None or current_bytes is None or current != comparable:
+                        failures.append(resource)
+                        continue
+                    updated = dict(current)
+                    updated["boundary_state"] = BOUNDARY_ARMED_STATE
+                    updated["boundary_may_exist"] = True
+                    data = _claim_bytes(updated)
+                    expected_target = capture_target(path.parent, path.name)
+                    if expected_target.kind != "file" or expected_target.content_sha256 != hashlib.sha256(current_bytes).hexdigest():
+                        failures.append(resource)
+                        continue
+                    mutation_replace(path.parent, path.name, data, expected=expected_target)
+                    updated["path"] = str(path)
+                    self._held[resource] = updated
+            except (MutationConflict, MutationUnsupported, OSError):
+                failures.append(resource)
+        return sorted(failures)
+
     def retain_boundary(
         self,
         *,
@@ -392,6 +439,8 @@ class ResourceClaims:
                     updated = dict(current)
                     updated["retained_processes"] = retained
                     updated["retained_boundary"] = dict(boundary or {"complete": False, "errors": ["boundary evidence unavailable"]})
+                    updated["boundary_state"] = "RETAINED"
+                    updated["boundary_may_exist"] = False
                     data = _claim_bytes(updated)
                     expected_target = capture_target(path.parent, path.name)
                     if expected_target.kind != "file" or expected_target.content_sha256 != hashlib.sha256(current_bytes).hexdigest():

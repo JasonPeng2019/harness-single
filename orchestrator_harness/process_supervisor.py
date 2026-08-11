@@ -223,15 +223,37 @@ class ProcessBoundary:
             try:
                 _, _, _, query, _, _, _, wintypes = _windows_job_api()
                 capacity = 64
+                count_mismatch_retries = 0
                 while capacity <= 65536:
                     size = 8 + ctypes.sizeof(ctypes.c_void_p) * capacity
                     buffer = ctypes.create_string_buffer(size)
                     returned = wintypes.DWORD()
                     if query(self._job_handle, 3, buffer, size, ctypes.byref(returned)):
+                        if returned.value < 8:
+                            error = f"Job process-list response is truncated ({returned.value} bytes)"
+                            self._inventory_errors.append(error)
+                            result = ProcessBoundaryInventory(False, self.kind, self.identity, errors=(error,), source="job-object")
+                            self._last_inventory = result
+                            return result
+                        assigned_count = int.from_bytes(buffer.raw[0:4], "little")
                         ids_count = int.from_bytes(buffer.raw[4:8], "little")
                         if ids_count > capacity:
-                            capacity = ids_count + 16
+                            capacity = min(65536, ids_count + 16)
                             continue
+                        if assigned_count != ids_count:
+                            count_mismatch_retries += 1
+                            if count_mismatch_retries < 3 and capacity < 65536:
+                                capacity = min(65536, max(capacity * 2, assigned_count + 16, ids_count + 16))
+                                time.sleep(0.01)
+                                continue
+                            error = (
+                                "Job process-list counts are inconsistent: "
+                                f"assigned={assigned_count}, listed={ids_count}"
+                            )
+                            self._inventory_errors.append(error)
+                            result = ProcessBoundaryInventory(False, self.kind, self.identity, errors=(error,), source="job-object+CIM")
+                            self._last_inventory = result
+                            return result
                         pointer_size = ctypes.sizeof(ctypes.c_void_p)
                         pids = [
                             int.from_bytes(buffer.raw[8 + index * pointer_size:8 + (index + 1) * pointer_size], "little")
@@ -270,14 +292,14 @@ class ProcessBoundary:
                                     changed = True
                         members: list[ProcessInfo] = []
                         errors: list[str] = []
-                        history_pids = {item.pid for item in self.history}
+                        history_by_pid = {item.pid: item for item in self.history}
                         for pid in sorted(member_pids):
                             item = by_pid.get(pid)
                             if item is None and os.name == "nt":
                                 direct = windows_process_query(pid)
                                 item = direct.process if direct.complete else None
                             if item is None or item.created_utc is None:
-                                if item is None and pid in history_pids:
+                                if item is None and pid in history_by_pid and history_by_pid[pid].created_utc is not None:
                                     # A job can retain a recently reaped PID
                                     # for one query.  It is safe to classify
                                     # that member absent only after this
