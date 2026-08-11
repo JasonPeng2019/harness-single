@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, cast
 
-from .models import ProcessInfo, ProcessQuery, ProcessSnapshot, parse_utc
+from .models import ProcessBoundaryInventory, ProcessInfo, ProcessQuery, ProcessSnapshot, parse_utc
 
 
 WINDOWS_CIM_SCRIPT = r"""
@@ -212,12 +213,25 @@ def _linux_process_query(
         if close < 0 or len(fields) <= 19:
             raise ValueError("/proc stat record is incomplete")
         ppid = int(fields[1])
+        process_group_id = int(fields[2])
+        session_id = int(fields[3])
         start_ticks = int(fields[19])
         name = stat_text[stat_text.find("(") + 1 : close]
         raw_cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ").strip()
         command = raw_cmd.decode("utf-8", errors="replace")
         created = boot + timedelta(seconds=start_ticks / ticks)
-        return ProcessQuery(True, ProcessInfo(pid, ppid, name, command, created))
+        return ProcessQuery(
+            True,
+            ProcessInfo(
+                pid,
+                ppid,
+                name,
+                command,
+                created,
+                process_group_id=process_group_id,
+                session_id=session_id,
+            ),
+        )
     except (FileNotFoundError, ProcessLookupError):
         return ProcessQuery(True, None)
     except PermissionError as exc:
@@ -291,3 +305,51 @@ def process_snapshot() -> ProcessSnapshot:
     if Path("/proc").is_dir():
         return linux_process_snapshot()
     return ProcessSnapshot(False, (), ("unsupported process platform",), "unsupported")
+
+
+def process_group_inventory(
+    process_group_id: int,
+    *,
+    snapshot_provider: Callable[[], ProcessSnapshot] = process_snapshot,
+    boundary_identity: str | None = None,
+) -> ProcessBoundaryInventory:
+    """Return a complete Linux process-group inventory or an explicit refusal."""
+
+    if not isinstance(process_group_id, int) or isinstance(process_group_id, bool) or process_group_id <= 0:
+        return ProcessBoundaryInventory(
+            False, "linux-process-group", boundary_identity, errors=("process group identity is invalid",), source="/proc"
+        )
+    snapshot = snapshot_provider()
+    for _ in range(2):
+        if isinstance(snapshot, ProcessSnapshot) and snapshot.complete:
+            break
+        time.sleep(0.01)
+        snapshot = snapshot_provider()
+    if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
+        return ProcessBoundaryInventory(
+            False,
+            "linux-process-group",
+            boundary_identity or f"pgid:{process_group_id}",
+            errors=tuple(getattr(snapshot, "errors", ("process snapshot is incomplete",))),
+            source="/proc",
+        )
+    members = tuple(
+        item for item in snapshot.processes
+        if item.process_group_id == process_group_id
+    )
+    if any(item.created_utc is None for item in members):
+        return ProcessBoundaryInventory(
+            False,
+            "linux-process-group",
+            boundary_identity or f"pgid:{process_group_id}",
+            processes=members,
+            errors=("a process-group member lacks a creation identity",),
+            source="/proc",
+        )
+    return ProcessBoundaryInventory(
+        True,
+        "linux-process-group",
+        boundary_identity or f"pgid:{process_group_id}",
+        processes=tuple(sorted(members, key=lambda item: item.pid)),
+        source="/proc",
+    )

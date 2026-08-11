@@ -53,6 +53,39 @@ class ProcessInfo:
     name: str
     command_line: str
     created_utc: datetime | None
+    process_group_id: int | None = None
+    session_id: int | None = None
+    boundary_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ProcessBoundaryInventory:
+    """One complete or explicitly incomplete ownership-boundary observation."""
+
+    complete: bool
+    boundary_kind: str
+    boundary_identity: str | None
+    processes: tuple[ProcessInfo, ...] = ()
+    observed_processes: tuple[ProcessInfo, ...] = ()
+    errors: tuple[str, ...] = ()
+    source: str = "unknown"
+    cleanup: str | None = None
+
+    @property
+    def live_processes(self) -> tuple[ProcessInfo, ...]:
+        return self.processes
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "complete": self.complete,
+            "boundary_kind": self.boundary_kind,
+            "boundary_identity": self.boundary_identity,
+            "processes": [jsonable(item) for item in self.processes],
+            "observed_processes": [jsonable(item) for item in self.observed_processes],
+            "errors": list(self.errors),
+            "source": self.source,
+            "cleanup": self.cleanup,
+        }
 
 
 @dataclass(frozen=True)

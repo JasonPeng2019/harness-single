@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib
 import os
 import pkgutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import orchestrator_harness.lane_controller as lane_controller
 
 from orchestrator_harness.codex_adapter import (
     CODEX_ADAPTER_VERSION,
@@ -34,7 +38,6 @@ from orchestrator_harness.lane_lifecycle import (
     lifecycle_registry_path,
     retire_terminal_lane,
     validate_lane_archive,
-    write_lifecycle_registry_record,
 )
 from orchestrator_harness.notifications import ManagerEventRouter
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
@@ -91,54 +94,6 @@ class S4RepairRegressionTests(unittest.TestCase):
             },
         }
 
-    @staticmethod
-    def _process_evidence(
-        path: Path,
-        *,
-        processes: list[dict[str, object]] | None = None,
-        identities: dict[str, dict[str, object]] | None = None,
-        binding: dict[str, object] | None = None,
-        provider: str = "synthetic",
-    ) -> None:
-        persisted = identities or {
-            "controller": {"pid": 9001, "created_utc": "2000-01-01T00:00:00Z"},
-            "worker": {"pid": 9002, "created_utc": "2000-01-01T00:00:00Z"},
-            "helper": {"pid": 9003, "created_utc": "2000-01-01T00:00:00Z"},
-        }
-        evidence: dict[str, object] = {
-            "schema": "orchestrator-process-evidence/v1",
-            "complete": True,
-            "provider": provider,
-            "identities": persisted,
-            "processes": processes or [],
-        }
-        if binding is not None:
-            evidence["lane_binding"] = binding
-        path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
-
-    @classmethod
-    def _lane_binding(
-        cls,
-        lane: Path,
-        *,
-        lane_id: str,
-        expected_head: str,
-        retained_ref: str,
-        target_revision: str,
-    ) -> dict[str, object]:
-        common = Path(cls._git(lane, "rev-parse", "--git-common-dir"))
-        if not common.is_absolute():
-            common = (lane / common).resolve()
-        return {
-            "lane_id": lane_id,
-            "worktree": str(lane.resolve()),
-            "git_common_dir": str(common.resolve()),
-            "branch": cls._git(lane, "symbolic-ref", "--short", "HEAD"),
-            "expected_head": expected_head,
-            "retained_ref": retained_ref,
-            "target_revision": target_revision,
-        }
-
     @classmethod
     def _git_fixture(cls, root: Path) -> tuple[Path, Path, str]:
         main = root / "main"
@@ -165,18 +120,6 @@ class S4RepairRegressionTests(unittest.TestCase):
         return refs
 
     @classmethod
-    def _lane_process_path(cls, lane: Path) -> Path:
-        workspace = lane / ".agent-workspace"
-        workspace.mkdir(exist_ok=True)
-        exclude = Path(cls._git(lane, "rev-parse", "--git-path", "info/exclude"))
-        if not exclude.is_absolute():
-            exclude = lane / exclude
-        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if ".agent-workspace/" not in existing:
-            exclude.write_text(existing + ".agent-workspace/\n", encoding="utf-8")
-        return workspace / "process.json"
-
-    @classmethod
     def _lifecycle_record(
         cls,
         root: Path,
@@ -190,65 +133,60 @@ class S4RepairRegressionTests(unittest.TestCase):
         helpers: list[dict[str, object]] | None = None,
         state: str = "PROVIDER_EXITED",
         worktree: Path | None = None,
+        expected_code: int = 0,
     ) -> Path:
-        runtime = root / "runtime"
-        runtime.mkdir(exist_ok=True)
+        """Create lifecycle authority through the real controller path."""
+
         workspace = lane / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
-        cls._lane_process_path(lane)
-        invocation = root / f"{lane_id.replace(':', '-')}-invocation.json"
-        invocation.write_text(json.dumps({
-            "schema": "orchestrator-coding-invocation/v1",
-            "lane_id": lane_id,
-            "worker_invocation_id": f"worker-{lane_id}",
-        }) + "\n", encoding="utf-8")
-        status = workspace / "status.json"
-        bound_worktree = worktree or lane
-        common = Path(cls._git(bound_worktree, "rev-parse", "--git-common-dir"))
+        bound_worktree = lane
+        common = Path(cls._git(lane, "rev-parse", "--git-common-dir"))
         if not common.is_absolute():
-            common = (bound_worktree / common).resolve()
-        branch = cls._git(bound_worktree, "symbolic-ref", "--short", "HEAD")
-        generation = f"generation-{lane_id}"
-        status.write_text(json.dumps({
-            "schema": "orchestrator-lane-controller/v1",
-            "state": state,
-            "lane_id": lane_id,
-            "worker_invocation_id": f"worker-{lane_id}",
-            "invocation_schema": "orchestrator-coding-invocation/v1",
-            "lifecycle_registry_generation": generation,
-            "worktree_root": str(bound_worktree.resolve()),
-            "repository_common_dir": str(common.resolve()),
-            "branch": branch,
-        }) + "\n", encoding="utf-8")
-        values = identities or {
-            "controller": {"pid": 9101, "created_utc": "2000-01-01T00:00:00Z"},
-            "worker": {"pid": 9102, "created_utc": "2000-01-01T00:00:00Z"},
-        }
-        write_lifecycle_registry_record(
-            runtime,
-            lane_id=lane_id,
-            run_root=lane,
-            invocation_path=invocation,
-            status_path=status,
-            invocation_schema="orchestrator-coding-invocation/v1",
-            worker_invocation_id=f"worker-{lane_id}",
-            generation=generation,
-            state=state,
-            repository={
-                "worktree_root": str((worktree or lane).resolve()),
-                "common_dir": str(common.resolve()),
-                "branch": branch,
-                "expected_head": expected_head,
-                "retained_ref": retained_ref,
-                "target_revision": target_revision,
-            },
-            controller=values["controller"],
-            worker=values["worker"],
-            helpers=helpers or [],
-            retained_ref=retained_ref,
-            target_revision=target_revision,
+            common = (lane / common).resolve()
+        branch = cls._git(lane, "symbolic-ref", "--short", "HEAD")
+        exclude = Path(cls._git(lane, "rev-parse", "--git-path", "info/exclude"))
+        if not exclude.is_absolute():
+            exclude = lane / exclude
+        existing_exclude = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ".agent-workspace/" not in existing_exclude:
+            exclude.write_text(existing_exclude + ".agent-workspace/\n", encoding="utf-8")
+        prompt = workspace / "repair-004-prompt.md"
+        prompt.write_text("synthetic production lifecycle prompt\n", encoding="utf-8")
+        fake = root / f"fake-provider-{lane_id.replace(':', '-')}.py"
+        helper_count = len(helpers or [])
+        fake.write_text(
+            "import json,sys,subprocess,time\n"
+            "sys.stdin.read()\n"
+            f"helpers=[subprocess.Popen([sys.executable,'-c','import time; time.sleep(2.0)']) for _ in range({helper_count})]\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'synthetic-lifecycle-thread'}), flush=True)\n"
+            "time.sleep(2.5)\n"
+            "[helper.wait() for helper in helpers]\n"
+            "print(json.dumps({'type':'turn.completed'}), flush=True)\n",
+            encoding="utf-8",
         )
-        return runtime
+        runtime = root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        invocation = root / f"{lane_id.replace(':', '-')}-invocation.json"
+        status = workspace / "controller.status.json"
+        value = {
+            "schema": lane_controller.CODING_INVOCATION_SCHEMA,
+            "action": "start", "run_root": str(lane), "runtime_root": str(runtime),
+            "event_log_path": str(runtime / "events" / f"{lane_id.replace(':', '-')}.jsonl"),
+            "worker_invocation_id": f"worker-{lane_id}", "lane_id": lane_id,
+            "task": "synthetic lifecycle", "phase": "repair",
+            "prompt_path": str(prompt), "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            "output_paths": {
+                "status": str(status), "jsonl": str(workspace / "controller.jsonl"),
+                "stderr": str(workspace / "controller.stderr.log"), "last_message": str(workspace / "last-message.txt"),
+            },
+            "exclusive_resources": [],
+            "repository": {"common_dir": str(common.resolve()), "worktree_root": str(lane.resolve()), "branch": branch, "base_commit": expected_head},
+            "codex": {"model": "synthetic", "reasoning_effort": "medium", "service_tier": "priority", "command": [sys.executable, str(fake)], "config_overrides": [], "sandbox": "workspace-write", "approval_policy": "never"},
+        }
+        invocation.write_text(json.dumps(value), encoding="utf-8")
+        if lane_controller.main([str(invocation)]) != expected_code:
+            raise AssertionError(f"synthetic production controller returned an unexpected code (wanted {expected_code})")
+        return lifecycle_registry_path(lane, lane_id, f"worker-{lane_id}")
 
     def test_FC1_closed_manifest_rejects_foreign_prior_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -341,27 +279,24 @@ class S4RepairRegressionTests(unittest.TestCase):
             root = Path(raw)
             main, lane, revision = self._git_fixture(root)
             refs = self._archive_refs(root)
-            forged = self._lane_process_path(lane)
-            self._process_evidence(
-                forged,
-                binding=self._lane_binding(
+            foreign_runtime = root / "foreign-runtime"
+            foreign_runtime.mkdir()
+            (foreign_runtime / "LIFECYCLE.json").write_text(
+                json.dumps({"record_sha256": "recomputed-foreign-record", "lane_id": "repair"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                lane_lifecycle,
+                "process_snapshot",
+                return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
+            ):
+                result = retire_terminal_lane(
                     lane,
+                    root / "archive",
                     lane_id="repair",
-                    expected_head=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                ),
-            )
-            runtime = root / "runtime"
-            runtime.mkdir()
-            result = retire_terminal_lane(
-                lane,
-                root / "archive",
-                lane_id="repair",
-                run_coordinate=runtime,
-                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
-            )
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
             self.assertEqual("VISIBLE", result.outcome)
             self.assertTrue(lane.exists())
             del main
@@ -374,7 +309,7 @@ class S4RepairRegressionTests(unittest.TestCase):
             runtime = root / "runtime"
             runtime.mkdir()
             missing = retire_terminal_lane(
-                lane, root / "archive-missing", lane_id="missing", run_coordinate=runtime,
+                lane, root / "archive-missing", lane_id="missing",
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -383,12 +318,13 @@ class S4RepairRegressionTests(unittest.TestCase):
                 root, lane, lane_id="modified", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
             )
-            registry = lifecycle_registry_path(runtime, "modified")
+            registry = lifecycle_registry_path(lane, "modified", "worker-modified")
             value = json.loads(registry.read_text(encoding="utf-8"))
             value["repository"]["branch"] = "forged-branch"
+            value["record_sha256"] = lane_lifecycle._registry_digest(value)
             registry.write_text(json.dumps(value) + "\n", encoding="utf-8")
             modified = retire_terminal_lane(
-                lane, root / "archive-modified", lane_id="modified", run_coordinate=runtime,
+                lane, root / "archive-modified", lane_id="modified",
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -405,7 +341,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                 root, lane, lane_id="changed", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
             )
-            registry = lifecycle_registry_path(runtime, "changed")
+            registry = lifecycle_registry_path(lane, "changed", "worker-changed")
             changed = False
 
             def mutate_after_initial_proof() -> None:
@@ -423,7 +359,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                     return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
                 ):
                     result = retire_terminal_lane(
-                        lane, root / "archive", lane_id="changed", run_coordinate=runtime,
+                        lane, root / "archive", lane_id="changed",
                         task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                         acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                     )
@@ -432,6 +368,97 @@ class S4RepairRegressionTests(unittest.TestCase):
             self.assertTrue(lane.exists())
             self.assertIsNotNone(result.archive_path)
             self.assertEqual("PENDING", validate_lane_archive(result.archive_path)["close_result"])
+            del main
+
+    def test_FC23_foreign_runtime_forgery_is_ignored_by_canonical_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            foreign = root / "foreign-runtime" / "anything"
+            foreign.mkdir(parents=True)
+            (foreign / "LIFECYCLE.json").write_text(json.dumps({
+                "schema": "orchestrator-lifecycle-registry/v1",
+                "authority": "controller-admitted-canonical-coordinate",
+                "record_sha256": "recomputed-but-not-authority",
+                "repository": {"worktree_root": str(lane), "expected_head": revision},
+                "identities": {"controller": {"pid": 999991, "created_utc": "2000-01-01T00:00:00Z"}, "worker": {"pid": 999992, "created_utc": "2000-01-01T00:00:00Z"}, "helpers": []},
+                "lifecycle": {"state": "PROVIDER_EXITED", "complete": True, "helpers_complete": True},
+            }) + "\n", encoding="utf-8")
+            result = retire_terminal_lane(
+                lane, root / "archive", lane_id="repair",
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertTrue(lane.exists())
+            del main
+
+    def test_FC24_retirement_has_no_redirect_parameter_and_controller_rejects_reused_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            import inspect
+            self.assertNotIn("run_coordinate", inspect.signature(retire_terminal_lane).parameters)
+            self._lifecycle_record(root, lane, lane_id="reuse", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision)
+            second = self._lifecycle_record(root, lane, lane_id="reuse", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision, expected_code=2)
+            self.assertTrue(second.is_file())
+            del main
+
+    def test_FC25_controller_publishes_real_one_and_multiple_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            one = root / "one"
+            many = root / "many"
+            self._git(main, "worktree", "add", "-b", "one-lane", str(one), "HEAD")
+            self._git(main, "worktree", "add", "-b", "many-lane", str(many), "HEAD")
+            one_path = self._lifecycle_record(root, one, lane_id="one", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision, helpers=[{"name": "synthetic-one"}])
+            many_path = self._lifecycle_record(root, many, lane_id="many", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision, helpers=[{"name": "synthetic-one"}, {"name": "synthetic-two"}])
+            one_record = json.loads(one_path.read_text(encoding="utf-8"))
+            many_record = json.loads(many_path.read_text(encoding="utf-8"))
+            self.assertEqual(1, len(one_record["identities"]["helpers"]))
+            self.assertEqual(2, len(many_record["identities"]["helpers"]))
+            self.assertTrue(one_record["boundary"]["complete"] and many_record["boundary"]["complete"])
+            self._git(main, "worktree", "remove", str(one))
+            self._git(main, "worktree", "remove", str(many))
+            del lane
+
+    def test_FC26_new_boundary_helper_after_first_proof_keeps_archive_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            registry_path = self._lifecycle_record(root, lane, lane_id="late-helper", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision)
+            record = json.loads(registry_path.read_text(encoding="utf-8"))
+            empty = ProcessSnapshot(True, (), (), "synthetic-test")
+            new_helper = ProcessInfo(999993, int(record["identities"]["worker"]["pid"]), "helper", "synthetic late helper", datetime(2026, 1, 1, tzinfo=timezone.utc), boundary_id=record["boundary"]["identity"])
+            with patch.object(lane_lifecycle, "process_snapshot", side_effect=[empty, ProcessSnapshot(True, (new_helper,), (), "synthetic-test")]):
+                result = retire_terminal_lane(
+                    lane, root / "archive", lane_id="late-helper",
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertIsNotNone(result.archive_path)
+            self.assertEqual("PENDING", validate_lane_archive(result.archive_path)["close_result"])
+            self.assertTrue(lane.exists())
+            del main
+
+    def test_FC27_final_publication_and_boundary_unsupported_are_controller_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            with patch.object(lane_controller, "_update_lifecycle_registry", side_effect=lane_controller.LaneLifecycleError("synthetic final publication failure")):
+                path = self._lifecycle_record(root, lane, lane_id="publication-failure", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision, expected_code=2)
+            failed = json.loads(path.read_text(encoding="utf-8"))
+            self.assertFalse(failed["lifecycle"]["complete"])
+            self.assertFalse(failed["lifecycle"]["helpers_complete"])
+            with patch.object(lane_controller.ProcessBoundary, "prepare", side_effect=lane_controller.ProcessBoundaryUnsupported("synthetic unsupported boundary")):
+                unsupported = self._lifecycle_record(root, lane, lane_id="unsupported-boundary", expected_head=revision, retained_ref="refs/heads/main", target_revision=revision, expected_code=1)
+            unsupported_record = json.loads(unsupported.read_text(encoding="utf-8"))
+            self.assertFalse(unsupported_record["lifecycle"]["complete"])
+            self.assertTrue(lane.exists())
             del main
 
     def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
@@ -447,15 +474,18 @@ class S4RepairRegressionTests(unittest.TestCase):
                     {"name": "helper-b", "identity": {"pid": 9302, "created_utc": "2000-01-01T00:00:00Z"}},
                 ],
             )
-            value = json.loads(lifecycle_registry_path(runtime, "helpers").read_text(encoding="utf-8"))
-            self.assertEqual(["helper-a", "helper-b"], [item["name"] for item in value["identities"]["helpers"]])
+            value = json.loads(lifecycle_registry_path(lane, "helpers", "worker-helpers").read_text(encoding="utf-8"))
+            self.assertEqual(2, len(value["identities"]["helpers"]))
+            self.assertTrue(all(item["pid"] > 0 and item["created_utc"] for item in value["identities"]["helpers"]))
+            self.assertTrue(value["boundary"]["complete"])
+            self.assertEqual("job-object+CIM" if os.name == "nt" else "/proc", value["boundary"]["inventory_source"])
             with patch.object(
                 lane_lifecycle,
                 "process_snapshot",
                 return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
             ):
                 result = retire_terminal_lane(
-                    lane, root / "archive", lane_id="helpers", run_coordinate=runtime,
+                    lane, root / "archive", lane_id="helpers",
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -630,32 +660,20 @@ class S4RepairRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             main, lane, authorized = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            self._lifecycle_record(
+                root, lane, lane_id="repair", expected_head=authorized,
+                retained_ref="refs/heads/main", target_revision=authorized,
+            )
             (lane / "changed-after-auth.txt").write_text("changed\n", encoding="utf-8")
             self._git(lane, "add", ".")
             self._git(lane, "commit", "-m", "change after authorization")
             actual_head = self._git(lane, "rev-parse", "HEAD")
             self.assertNotEqual(authorized, actual_head)
-            refs = self._archive_refs(root)
-            process = self._lane_process_path(lane)
-            self._process_evidence(
-                process,
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="repair",
-                    expected_head=authorized,
-                    retained_ref="refs/heads/main",
-                    target_revision=authorized,
-                ),
-            )
-            runtime = self._lifecycle_record(
-                root, lane, lane_id="repair", expected_head=authorized,
-                retained_ref="refs/heads/main", target_revision=authorized,
-            )
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="repair",
-                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -671,27 +689,19 @@ class S4RepairRegressionTests(unittest.TestCase):
             foreign = root / "foreign"
             self._git(main, "worktree", "add", "-b", "foreign-lane", str(foreign), "HEAD")
             refs = self._archive_refs(root)
-            process = self._lane_process_path(lane)
-            self._process_evidence(
-                process,
-                binding=self._lane_binding(
-                    foreign,
-                    lane_id="foreign",
-                    expected_head=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                ),
-            )
-            runtime = self._lifecycle_record(
+            registry = self._lifecycle_record(
                 root, lane, lane_id="repair", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
                 worktree=foreign,
             )
+            value = json.loads(registry.read_text(encoding="utf-8"))
+            value["repository"]["worktree_root"] = str(foreign.resolve())
+            value["record_sha256"] = lane_lifecycle._registry_digest(value)
+            registry.write_text(json.dumps(value) + "\n", encoding="utf-8")
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="repair",
-                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -705,41 +715,21 @@ class S4RepairRegressionTests(unittest.TestCase):
             root = Path(raw)
             main, lane, revision = self._git_fixture(root)
             refs = self._archive_refs(root)
-            process = self._lane_process_path(lane)
-            created = datetime(2000, 1, 1, tzinfo=timezone.utc)
-            identities = {
-                role: {"pid": 9000 + index, "created_utc": "2000-01-01T00:00:00Z"}
-                for index, role in enumerate(("controller", "worker", "helper"))
-            }
-            self._process_evidence(
-                process,
-                identities=identities,
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="live",
-                    expected_head=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                ),
-            )
             runtime = self._lifecycle_record(
                 root, lane, lane_id="live", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
-                identities={"controller": identities["controller"], "worker": identities["worker"]},
-                helpers=[{"name": "helper", "identity": identities["helper"]}],
             )
+            live_record = json.loads(runtime.read_text(encoding="utf-8"))
+            live_created = datetime.fromisoformat(live_record["identities"]["controller"]["created_utc"].replace("Z", "+00:00"))
             provider = MagicMock(return_value=ProcessSnapshot(
                 complete=True,
-                processes=tuple(
-                    ProcessInfo(
-                        pid=9000 + index,
-                        ppid=1,
-                        name="python",
-                        command_line="synthetic live process",
-                        created_utc=created,
-                    )
-                    for index in range(3)
-                ),
+                processes=(ProcessInfo(
+                    pid=live_record["identities"]["controller"]["pid"],
+                    ppid=1,
+                    name="python",
+                    command_line="synthetic live controller",
+                    created_utc=live_created,
+                ),),
                 provider="synthetic-test",
             ))
             with patch.object(lane_lifecycle, "process_snapshot", provider, create=True):
@@ -747,7 +737,6 @@ class S4RepairRegressionTests(unittest.TestCase):
                     lane,
                     root / "archive",
                     lane_id="live",
-                    run_coordinate=runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -867,31 +856,24 @@ class S4RepairRegressionTests(unittest.TestCase):
                 exclude = lane / exclude
             exclude.write_text(".agent-workspace/\n", encoding="utf-8")
             refs = self._archive_refs(lane_evidence_root)
-            process = lane_evidence_root / "evidence" / "process.json"
-            self._process_evidence(
-                process,
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="repair",
-                    expected_head=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                ),
-            )
-            runtime = self._lifecycle_record(
+            self._lifecycle_record(
                 root, lane, lane_id="repair", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
             )
-            result = retire_terminal_lane(
-                lane,
-                root / "archive",
-                lane_id="repair",
-                run_coordinate=runtime,
-                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
-            )
+            with patch.object(
+                lane_lifecycle,
+                "process_snapshot",
+                return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
+            ):
+                result = retire_terminal_lane(
+                    lane,
+                    root / "archive",
+                    lane_id="repair",
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
             self.assertEqual("CLOSED", result.outcome)
-            for path in [*refs, process]:
+            for path in refs:
                 path.unlink(missing_ok=True)
             self.assertEqual("repair", validate_lane_archive(result.archive_path)["lane_id"])
             del main
@@ -901,26 +883,18 @@ class S4RepairRegressionTests(unittest.TestCase):
             root = Path(raw)
             main, lane, revision = self._git_fixture(root)
             refs = self._archive_refs(root)
-            process = self._lane_process_path(lane)
-            self._process_evidence(
-                process,
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="unretained",
-                    expected_head=revision,
-                    retained_ref="refs/heads/does-not-exist",
-                    target_revision=revision,
-                ),
-            )
-            runtime = self._lifecycle_record(
+            unretained_registry = self._lifecycle_record(
                 root, lane, lane_id="unretained", expected_head=revision,
                 retained_ref="refs/heads/does-not-exist", target_revision=revision,
             )
+            unretained_record = json.loads(unretained_registry.read_text(encoding="utf-8"))
+            unretained_record["repository"]["retained_ref"] = "refs/heads/does-not-exist"
+            unretained_record["record_sha256"] = lane_lifecycle._registry_digest(unretained_record)
+            unretained_registry.write_text(json.dumps(unretained_record) + "\n", encoding="utf-8")
             blocked = retire_terminal_lane(
                 lane,
                 root / "archive-unretained",
                 lane_id="unretained",
-                run_coordinate=runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
@@ -930,49 +904,24 @@ class S4RepairRegressionTests(unittest.TestCase):
                 lane,
                 root / "archive-incomplete",
                 lane_id="incomplete",
-                run_coordinate=runtime,
                 task_ref=None, result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )
             self.assertEqual("VISIBLE", incomplete.outcome)
             self.assertTrue(lane.exists())
-            current_created = "2026-01-01T00:00:00Z"
-            live_pids = (os.getpid(), os.getpid() + 1, os.getpid() + 2)
-            live_evidence = self._lane_process_path(lane).with_name("live-process.json")
-            self._process_evidence(
-                live_evidence,
-                identities={
-                    role: {"pid": pid, "created_utc": current_created}
-                    for role, pid in zip(("controller", "worker", "helper"), live_pids)
-                },
-                processes=[
-                    {"pid": pid, "ppid": 1, "name": "python", "command_line": "synthetic repair test", "created_utc": current_created}
-                    for pid in live_pids
-                ],
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="live",
-                    expected_head=revision,
-                    retained_ref="refs/heads/main",
-                    target_revision=revision,
-                ),
-            )
             live_runtime = self._lifecycle_record(
                 root, lane, lane_id="live", expected_head=revision,
                 retained_ref="refs/heads/main", target_revision=revision,
-                identities={"controller": {"pid": live_pids[0], "created_utc": current_created},
-                            "worker": {"pid": live_pids[1], "created_utc": current_created}},
-                helpers=[{"name": "helper", "identity": {"pid": live_pids[2], "created_utc": current_created}}],
             )
+            live_record = json.loads(live_runtime.read_text(encoding="utf-8"))
+            live_controller = live_record["identities"]["controller"]
+            live_created = datetime.fromisoformat(live_controller["created_utc"].replace("Z", "+00:00"))
             with patch.object(
                 lane_lifecycle,
                 "process_snapshot",
                 return_value=ProcessSnapshot(
                     True,
-                    tuple(
-                        ProcessInfo(pid, 1, "python", "synthetic repair test", datetime(2026, 1, 1, tzinfo=timezone.utc))
-                        for pid in live_pids
-                    ),
+                    (ProcessInfo(live_controller["pid"], 1, "python", "synthetic live controller", live_created),),
                     (),
                     "synthetic-test",
                 ),
@@ -981,7 +930,6 @@ class S4RepairRegressionTests(unittest.TestCase):
                     lane,
                     root / "archive-live",
                     lane_id="live",
-                    run_coordinate=live_runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -991,25 +939,18 @@ class S4RepairRegressionTests(unittest.TestCase):
             self._git(lane, "add", ".")
             self._git(lane, "commit", "-m", "unmerged")
             lane_revision = self._git(lane, "rev-parse", "HEAD")
-            self._process_evidence(
-                process,
-                binding=self._lane_binding(
-                    lane,
-                    lane_id="unmerged",
-                    expected_head=lane_revision,
-                    retained_ref="HEAD",
-                    target_revision=revision,
-                ),
-            )
-            unmerged_runtime = self._lifecycle_record(
+            unmerged_registry = self._lifecycle_record(
                 root, lane, lane_id="unmerged", expected_head=lane_revision,
                 retained_ref="HEAD", target_revision=revision,
             )
+            unmerged_record = json.loads(unmerged_registry.read_text(encoding="utf-8"))
+            unmerged_record["repository"]["target_revision"] = revision
+            unmerged_record["record_sha256"] = lane_lifecycle._registry_digest(unmerged_record)
+            unmerged_registry.write_text(json.dumps(unmerged_record) + "\n", encoding="utf-8")
             unmerged = retire_terminal_lane(
                 lane,
                 root / "archive-unmerged",
                 lane_id="unmerged",
-                run_coordinate=unmerged_runtime,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
             )

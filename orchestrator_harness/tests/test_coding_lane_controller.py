@@ -171,14 +171,15 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_start_publishes_fixed_controller_lifecycle_registry(self) -> None:
         path, _ = self.invocation()
         self.assertEqual(0, controller.main([str(path)]))
-        registry_path = lifecycle_registry_path(self.runtime_root, "coding:worker-1")
+        registry_path = lifecycle_registry_path(self.run_root, "coding:worker-1", "worker-1")
         record = json.loads(registry_path.read_text(encoding="utf-8"))
         self.assertEqual("orchestrator-lifecycle-registry/v1", record["schema"])
-        self.assertEqual("controller-produced-fixed-coordinate", record["authority"])
+        self.assertEqual("controller-admitted-canonical-coordinate", record["authority"])
         self.assertTrue(record["lifecycle"]["complete"])
         self.assertEqual([], record["identities"]["helpers"])
         self.assertEqual("worker-1", record["run"]["worker_invocation_id"])
         self.assertEqual(str(self.run_root.resolve()), record["repository"]["worktree_root"])
+        self.assertEqual(record["coordinate"]["common_dir"], record["repository"]["common_dir"])
 
     def test_start_without_thread_is_failure_and_resume_identity_mismatches_are_rejected(self) -> None:
         path, raw = self.invocation()
@@ -209,13 +210,16 @@ class CodingLaneControllerTests(unittest.TestCase):
         def launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
             command = args[0] if args else None
             if isinstance(command, list) and command[:2] == [sys.executable, str(self.fake)]:
-                self.assertFalse(status_path.exists())
+                self.assertTrue(status_path.exists())
                 self.assertTrue(any(lock_root.iterdir()))
             return original_popen(*args, **kwargs)
 
         with patch.object(controller, "_atomic_json", side_effect=record), patch.object(controller.subprocess, "Popen", side_effect=launch):
             self.assertEqual(0, controller.main([str(path)]))
-        self.assertEqual("RUNNING_CODEX", published[0]["state"])
+        self.assertTrue(any(item["state"] == "RUNNING_CODEX" for item in published))
+        first_registry = lifecycle_registry_path(self.run_root, "coding:worker-1", "worker-1")
+        first_registry.unlink()
+        first_registry.parent.rmdir()
 
         path, _ = self.invocation(worker_id="worker-popen-failure")
         def fail_codex_launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:

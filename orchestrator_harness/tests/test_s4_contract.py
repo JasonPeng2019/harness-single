@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -8,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import orchestrator_harness.lane_controller as lane_controller
 
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
@@ -31,9 +34,9 @@ from orchestrator_harness.host_adapters import (
 from orchestrator_harness.lane_lifecycle import (
     ImmutableViewError,
     allocate_immutable_source_view,
+    lifecycle_registry_path,
     retire_terminal_lane,
     validate_lane_archive,
-    write_lifecycle_registry_record,
 )
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
@@ -81,46 +84,67 @@ class S4ContractTests(unittest.TestCase):
         retained_ref: str = "refs/heads/main",
         target_revision: str | None = None,
     ) -> Path:
-        runtime = root / "runtime"
-        runtime.mkdir(exist_ok=True)
+        """Use the real coding controller admission/publication path."""
+
         workspace = lane / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
-        invocation = root / f"{lane_id}-invocation.json"
-        invocation.write_text(json.dumps({"schema": "orchestrator-coding-invocation/v1", "lane_id": lane_id}) + "\n", encoding="utf-8")
         common = Path(subprocess.run(["git", "-C", str(lane), "rev-parse", "--git-common-dir"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
         if not common.is_absolute():
             common = (lane / common).resolve()
         branch = subprocess.run(["git", "-C", str(lane), "symbolic-ref", "--short", "HEAD"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
-        generation = f"generation-{lane_id}"
-        status = workspace / "status.json"
-        status.write_text(json.dumps({
-            "schema": "orchestrator-lane-controller/v1", "state": "PROVIDER_EXITED",
-            "lane_id": lane_id, "worker_invocation_id": f"worker-{lane_id}",
-            "invocation_schema": "orchestrator-coding-invocation/v1",
-            "lifecycle_registry_generation": generation,
-            "worktree_root": str(lane.resolve()), "repository_common_dir": str(common.resolve()),
-            "branch": branch,
-        }) + "\n", encoding="utf-8")
-        write_lifecycle_registry_record(
-            runtime,
-            lane_id=lane_id,
-            run_root=lane,
-            invocation_path=invocation,
-            status_path=status,
-            invocation_schema="orchestrator-coding-invocation/v1",
-            worker_invocation_id=f"worker-{lane_id}",
-            generation=generation,
-            state="PROVIDER_EXITED",
-            repository={
-                "worktree_root": str(lane.resolve()), "common_dir": str(common.resolve()),
-                "branch": branch, "expected_head": revision,
-                "retained_ref": retained_ref, "target_revision": target_revision or revision,
-            },
-            controller={"pid": 9201, "created_utc": "2000-01-01T00:00:00Z"},
-            worker={"pid": 9202, "created_utc": "2000-01-01T00:00:00Z"},
-            helpers=[], retained_ref=retained_ref, target_revision=target_revision or revision,
+        exclude = Path(subprocess.run(["git", "-C", str(lane), "rev-parse", "--git-path", "info/exclude"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
+        if not exclude.is_absolute():
+            exclude = lane / exclude
+        existing_exclude = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ".agent-workspace/" not in existing_exclude:
+            exclude.write_text(existing_exclude + ".agent-workspace/\n", encoding="utf-8")
+        prompt = workspace / "repair-004-prompt.md"
+        prompt.write_text("synthetic production lifecycle prompt\n", encoding="utf-8")
+        fake = root / "fake-provider.py"
+        fake.write_text(
+            "import json,sys\n"
+            "sys.stdin.read()\n"
+            "print(json.dumps({'type':'thread.started','thread_id':'synthetic-lifecycle-thread'}), flush=True)\n"
+            "print(json.dumps({'type':'turn.completed'}), flush=True)\n",
+            encoding="utf-8",
         )
-        return runtime
+        runtime = root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        invocation = root / f"{lane_id.replace(':', '-')}-invocation.json"
+        status = workspace / "controller.status.json"
+        value = {
+            "schema": lane_controller.CODING_INVOCATION_SCHEMA,
+            "action": "start",
+            "run_root": str(lane),
+            "runtime_root": str(runtime),
+            "event_log_path": str(runtime / "events" / "controller.jsonl"),
+            "worker_invocation_id": f"worker-{lane_id}",
+            "lane_id": lane_id,
+            "task": "synthetic lifecycle",
+            "phase": "repair",
+            "prompt_path": str(prompt),
+            "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            "output_paths": {
+                "status": str(status),
+                "jsonl": str(workspace / "controller.jsonl"),
+                "stderr": str(workspace / "controller.stderr.log"),
+                "last_message": str(workspace / "last-message.txt"),
+            },
+            "exclusive_resources": [],
+            "repository": {
+                "common_dir": str(common.resolve()), "worktree_root": str(lane.resolve()),
+                "branch": branch, "base_commit": revision,
+            },
+            "codex": {
+                "model": "synthetic", "reasoning_effort": "medium", "service_tier": "priority",
+                "command": [sys.executable, str(fake)], "config_overrides": [],
+                "sandbox": "workspace-write", "approval_policy": "never",
+            },
+        }
+        invocation.write_text(json.dumps(value), encoding="utf-8")
+        if lane_controller.main([str(invocation)]) != 0:
+            raise AssertionError("synthetic production controller did not complete")
+        return lifecycle_registry_path(lane, lane_id, f"worker-{lane_id}")
 
     def test_S4_CODEX_INSTALL_WAKE_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -348,7 +372,7 @@ class S4ContractTests(unittest.TestCase):
             if not exclude.is_absolute():
                 exclude = lane / exclude
             exclude.write_text(".agent-workspace/\n", encoding="utf-8")
-            runtime = self._publish_lifecycle_record(
+            self._publish_lifecycle_record(
                 root, lane, lane_id="S4.P", revision=revision,
             )
             with patch(
@@ -359,7 +383,6 @@ class S4ContractTests(unittest.TestCase):
                     lane,
                     root / "archive",
                     lane_id="S4.P",
-                    run_coordinate=runtime,
                     task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                     acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
                 )
@@ -371,7 +394,7 @@ class S4ContractTests(unittest.TestCase):
             git(main, "worktree", "add", "-b", "s4-dirty", str(dirty), "HEAD")
             (dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
             blocked = retire_terminal_lane(
-                dirty, root / "archive-dirty", lane_id="dirty", run_coordinate=runtime,
+                dirty, root / "archive-dirty", lane_id="dirty",
             )
             self.assertEqual("VISIBLE", blocked.outcome)
             self.assertTrue(dirty.exists())

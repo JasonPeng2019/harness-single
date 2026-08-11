@@ -42,7 +42,7 @@ from .invocation import (
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
-from .process_supervisor import CleanupResult, ProcessSupervisor
+from .process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryUnsupported, ProcessSupervisor
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     ProviderAdapterError,
@@ -53,7 +53,7 @@ from .provider import (
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .stable_io import append_jsonl_record
-from .lane_lifecycle import LaneLifecycleError, lifecycle_registry_path, write_lifecycle_registry_record
+from .lane_lifecycle import LaneLifecycleError, _LifecycleAdmission, _admit_lifecycle_registry, _update_lifecycle_registry
 from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
 from .resume import (
     ResumeAdmissionError,
@@ -1480,10 +1480,13 @@ def run(invocation: Invocation) -> int:
             "config_overrides": invocation.config_overrides,
             "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": argv[:-1]},
     }
-    registry_runtime = invocation.runtime_root or invocation.run_root.parent
     registry_generation = uuid.uuid4().hex
     state["lifecycle_registry_generation"] = registry_generation
     state["owned_helpers"] = []
+    state["process_boundary"] = None
+    state["helpers_complete"] = False
+    admission: _LifecycleAdmission | None = None
+    boundary: ProcessBoundary | None = None
     if git_identity is not None:
         repository = repository_status(git_identity, starting_commit=starting_commit)
         expected_head = str(repository.get("actual_head") or git_identity.head_commit).lower()
@@ -1500,9 +1503,10 @@ def run(invocation: Invocation) -> int:
             "lifecycle_target_revision": expected_head,
         })
         state["repository"]["expected_head"] = expected_head
-        state["lifecycle_registry_path"] = str(
-            lifecycle_registry_path(registry_runtime, invocation.lane_id)
-        )
+        state["repository"]["starting_head"] = str(
+            repository.get("starting_head") or repository.get("starting_commit") or expected_head
+        ).lower()
+        state["lifecycle_registry_path"] = "canonical-common-git-coordinate"
         if invocation.canonical is not None:
             resume_identity = invocation.canonical.identity(
                 session_id=thread,
@@ -1516,6 +1520,7 @@ def run(invocation: Invocation) -> int:
             state["resume_identity"] = resume_identity
 
     def _publish_registry() -> None:
+        nonlocal admission
         if invocation.repository is None:
             return
         if invocation.invocation_path is None:
@@ -1525,28 +1530,52 @@ def run(invocation: Invocation) -> int:
         provider_created = state.get("provider_created_utc")
         if isinstance(provider_pid, int) and isinstance(provider_created, str):
             worker_identity = {"pid": provider_pid, "created_utc": provider_created}
-        write_lifecycle_registry_record(
-            registry_runtime,
-            lane_id=invocation.lane_id,
-            run_root=invocation.run_root,
-            invocation_path=invocation.invocation_path,
-            status_path=invocation.status_path,
-            invocation_schema=invocation.invocation_schema,
-            worker_invocation_id=invocation.worker_invocation_id or "",
-            generation=registry_generation,
-            state=str(state.get("state") or "LAUNCH_FAILED"),
-            repository=state["repository"],
-            controller=controller,
-            worker=worker_identity,
-            helpers=state.get("owned_helpers", []),
-            retained_ref=state.get("lifecycle_retained_ref"),
-            target_revision=state.get("lifecycle_target_revision"),
-        )
+        if admission is None:
+            admission = _admit_lifecycle_registry(
+                invocation.run_root,
+                lane_id=invocation.lane_id,
+                run_root=invocation.run_root,
+                invocation_path=invocation.invocation_path,
+                status_path=invocation.status_path,
+                invocation_schema=invocation.invocation_schema,
+                worker_invocation_id=invocation.worker_invocation_id or "",
+                generation=registry_generation,
+                state=str(state.get("state") or "LAUNCH_FAILED"),
+                repository=state["repository"],
+                controller=controller,
+                worker=worker_identity,
+                helpers=state.get("owned_helpers", []),
+                boundary=state.get("process_boundary"),
+                retained_ref=state.get("lifecycle_retained_ref"),
+                target_revision=state.get("lifecycle_target_revision"),
+                resume=invocation.action == "resume",
+            )
+        else:
+            admission = _update_lifecycle_registry(
+                admission,
+                lane_id=invocation.lane_id,
+                run_root=invocation.run_root,
+                invocation_path=invocation.invocation_path,
+                status_path=invocation.status_path,
+                invocation_schema=invocation.invocation_schema,
+                worker_invocation_id=invocation.worker_invocation_id or "",
+                generation=admission.generation,
+                state=str(state.get("state") or "LAUNCH_FAILED"),
+                repository=state["repository"],
+                controller=controller,
+                worker=worker_identity,
+                helpers=state.get("owned_helpers", []),
+                boundary=state.get("process_boundary"),
+                retained_ref=state.get("lifecycle_retained_ref"),
+                target_revision=state.get("lifecycle_target_revision"),
+            )
 
     if invocation.repository is not None:
+        _atomic_json(invocation.status_path, state)
         _publish_registry()
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
+    child: ProcessInfo | None = None
     supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
     child_exit_confirmed = True
@@ -1590,17 +1619,29 @@ def run(invocation: Invocation) -> int:
                 else:
                     child_env, cleared = isolated_coding_child_environment()
                     state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
-            process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
+            boundary = ProcessBoundary.prepare()
+            process = subprocess.Popen(
+                argv,
+                cwd=invocation.run_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                **boundary.popen_kwargs,
+            )
             child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
-            # The captured handle is the ownership boundary.  The controller
-            # has already established the exact creation identity; the shared
-            # supervisor owns every later graceful/force/final-reap stage.
+            boundary.attach(process, child)
+            state["process_boundary"] = boundary.to_record(boundary.inventory())
+            # The captured OS boundary is established before the provider is
+            # resumed.  The shared supervisor owns every later exact cleanup,
+            # inventory, and final-reap stage.
             supervisor = ProcessSupervisor(
                 process,
                 child,
                 parent_pid=controller.pid,
                 observer=None,
+                boundary=boundary,
             )
             state.update({
                 "state": running_state,
@@ -1661,6 +1702,35 @@ def run(invocation: Invocation) -> int:
             child_exit_confirmed = True
             out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
+        if supervisor is None:
+            raise ProcessBoundaryUnsupported("provider completed without an ownership boundary")
+        boundary_inventory = supervisor.boundary_inventory()
+        state["process_boundary"] = boundary.to_record(boundary_inventory) if boundary is not None else None
+        state["owned_helpers"] = [
+            {
+                "name": f"helper-{item.pid}",
+                "identity": {"pid": item.pid, "created_utc": iso_utc(item.created_utc)},
+            }
+            for item in boundary_inventory.observed_processes
+            if item.pid != state.get("provider_pid") and item.created_utc is not None
+        ]
+        state["helpers_complete"] = boundary_inventory.complete and not boundary_inventory.processes
+        if not boundary_inventory.complete or boundary_inventory.processes:
+            cleanup_boundary = supervisor.terminate_owned_boundary()
+            state["process_boundary"] = boundary.to_record(boundary_inventory) if boundary is not None else state.get("process_boundary")
+            state.update({
+                "state": "CONTROLLER_FAILED",
+                "ended_utc": _utc(),
+                "error": "owned process boundary is incomplete or still contains live helpers",
+                "boundary_failure": {
+                    "complete": boundary_inventory.complete,
+                    "live_helpers": [item.pid for item in boundary_inventory.processes],
+                    "errors": list(boundary_inventory.errors),
+                    "cleanup": cleanup_boundary,
+                },
+            })
+            _atomic_json(invocation.status_path, state)
+            return 1
         thread_identity_error = state.get("thread_identity_error")
         if isinstance(thread_identity_error, str):
             state.update({
@@ -1738,7 +1808,7 @@ def run(invocation: Invocation) -> int:
         cleanup_evidence: dict[str, Any] | None = None
         if process is not None and not child_exit_confirmed:
             if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process, identity=child)
             else:
                 cleanup: CleanupResult = supervisor.cleanup()
                 child_exit_confirmed = cleanup.proved_reap
@@ -1791,7 +1861,7 @@ def run(invocation: Invocation) -> int:
         cleanup_evidence = None
         if process is not None and not child_exit_confirmed:
             if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process, identity=child)
             else:
                 cleanup: CleanupResult = supervisor.cleanup()
                 child_exit_confirmed = cleanup.proved_reap
@@ -1840,8 +1910,27 @@ def run(invocation: Invocation) -> int:
         if invocation.repository is not None:
             try:
                 _publish_registry()
-            except (InvocationError, LaneLifecycleError, OSError):
-                pass
+            except Exception as exc:
+                state.update({
+                    "state": "CONTROLLER_FAILED",
+                    "ended_utc": state.get("ended_utc") or _utc(),
+                    "error": f"final lifecycle registry publication failed: {exc}",
+                    "lifecycle_publication_failure": {
+                        "type": type(exc).__name__,
+                        "detail": str(exc),
+                        "terminal_authority": False,
+                    },
+                    "helpers_complete": False,
+                })
+                try:
+                    _atomic_json(invocation.status_path, state)
+                except Exception:
+                    pass
+                if boundary is not None:
+                    boundary.close()
+                raise InvocationError(f"final lifecycle registry publication failed: {exc}") from exc
+        if boundary is not None:
+            boundary.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1850,7 +1939,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return run(load_invocation(args.invocation))
-    except InvocationError as exc:
+    except (InvocationError, LaneLifecycleError, ProcessBoundaryUnsupported) as exc:
         print(f"lane-controller invocation error: {exc}", file=sys.stderr)
         return 2
 
