@@ -16,7 +16,13 @@ from .host_adapters import (
     HostProfile,
     ManagerEventAck,
 )
-from .codex_adapter import CodexAdapter, SyntheticCodexTransport
+from .codex_adapter import (
+    CodexAdapter,
+    SyntheticCodexTransport,
+    activate_codex_binding,
+    bind_codex_project,
+    run_installed_codex_hook,
+)
 from .lane_lifecycle import ImmutableSourceView, RetirementResult
 
 __all__ = [
@@ -32,6 +38,8 @@ __all__ = [
     "RuntimeProfile",
     "AdapterCapabilities",
     "CodexAdapter",
+    "activate_codex_binding",
+    "bind_codex_project",
     "DeliveryCoordinator",
     "DeliveryNotice",
     "DeliveryReceipt",
@@ -41,6 +49,7 @@ __all__ = [
     "ImmutableSourceView",
     "ManagerEventAck",
     "RetirementResult",
+    "run_installed_codex_hook",
     "SyntheticCodexTransport",
 ]
 __version__ = "0.1.0"

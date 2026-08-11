@@ -12,14 +12,14 @@ Use a fresh ignored configuration and runtime root for each epoch:
 ```powershell
 python -m orchestrator_harness --config local-config/harness.json scan --no-write
 python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60
-python -m orchestrator_harness --config local-config/harness.json ack --event-id <top-level-event-id>
 ```
 
 `scan`, `watch --once`, `watch --until-event`, and `watch --until-actionable`
 are diagnostic/public waits. They do not start a foreground managed watcher,
 renew a heartbeat, or create a second notification queue. The native manager
 discovers work through its blocking wait and acknowledges the envelope's
-top-level `event_id`; a worker `data.signal_id` is not an acknowledgement ID.
+top-level `event_id` through the S3 manager API; a worker `data.signal_id` is
+not an acknowledgement ID.
 
 ## Codex adapter
 
@@ -36,9 +36,10 @@ python -m orchestrator_harness adapter uninstall --host codex --project-root <di
 
 The installer owns only the packaged project-local hook files, the managed hook
 entries, and its installation manifest. It validates the `.codex` shape before
-writing, uses same-directory atomic replacements, records prior bytes and
+writing, uses same-directory atomic replacements, records only closed managed
 content identities, refuses ambiguous ownership, and restores bounded changes
-on failure. Uninstall preserves a managed destination after user modification.
+on failure. Uninstall subtracts exact managed fragments/assets and preserves
+unrelated or modified user content.
 The manifest separately reports installed bytes, synthetic self-test status,
 project-layer trust, and hook review state; installation never silently grants
 project trust.
@@ -59,7 +60,7 @@ writable result and cache roots:
 
 ```powershell
 python -m orchestrator_harness view allocate --source-root <repo> --revision <full-commit> `
-  --view-root <view> --result-root <results> --cache-root <cache>
+  --retained-ref <ref> --view-root <view> --result-root <results> --cache-root <cache>
 ```
 
 The allocation publishes a ready record only after the exact revision and
@@ -71,21 +72,25 @@ Terminal retirement is archive-first:
 ```powershell
 python -m orchestrator_harness lane retire --lane-root <linked-worktree> `
   --archive-root <archive> --lane-id <lane> --retained-revision <full-commit> `
-  --unmerged-work-proved
+  --retained-ref <ref> --target-revision <full-commit> `
+  --process-evidence <complete-process-snapshot.json> `
+  --task-ref <task.json> --result-ref <result.json> --findings-ref <findings.json> `
+  --acceptance-ref <acceptance.json> --transcript-ref <transcript.json> `
+  --dependency-ref <dependency.json>
 ```
 
-The archive binds task/result/findings/acceptance/transcript/dependency
-references and content hashes before normal `git worktree remove`. Dirty,
-live, ambiguous, unretained, unmerged, or archive-failed lanes remain visible.
+The archive copies and validates task/result/findings/acceptance/transcript/
+dependency/process evidence and content hashes before normal `git worktree
+remove`. Dirty, live, ambiguous, unretained, unmerged, or archive-failed lanes
+remain visible.
 
 ## Configuration migration
 
-Retained configuration covers discovery, bounded reads, diagnostic waits, and
-active-lane review/no-progress timers. Integer counts and limits reject
-fractional values; durations must be finite. Removed heartbeat, attention-sprint,
-attention-timeline, and obsolete tolerance keys produce explicit migration
-diagnostics for compatibility readers and have no S4 runtime effect. They are
-not present in `config.example.json`.
+Retained configuration covers discovery, bounded reads, and diagnostic waits.
+Integer counts and limits reject fractional values; durations must be finite.
+Removed watcher, heartbeat, attention, review/no-progress, and obsolete
+tolerance keys produce explicit migration diagnostics for compatibility readers
+and have no S4 runtime effect. They are not present in `config.example.json`.
 
 ## Diagnostic watcher
 

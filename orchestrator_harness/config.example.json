@@ -7,8 +7,6 @@
   "output_dir": "../runtime/orchestrator-harness/example-epoch",
   "poll_interval_seconds": 1.0,
   "watch_timeout_seconds": 60.0,
-  "manager_review_interval_seconds": 300,
-  "lane_no_progress_seconds": 600,
   "request_warning_seconds": 120,
   "request_critical_seconds": 30,
   "process_start_tolerance_seconds": 2,

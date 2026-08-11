@@ -40,12 +40,6 @@ class HarnessConfig:
     max_jsonl_tail_bytes: int
     stable_read_retries: int
     stable_read_delay_seconds: float
-    manager_review_interval_seconds: float
-    lane_no_progress_seconds: float
-    manager_heartbeat_timeout_seconds: float
-    attention_logging_enabled: bool
-    attention_epoch_id: str
-    attention_sprint_lifetime_seconds: float | None = None
     record_paths: tuple[str, ...] = ()
     record_manifests: tuple[str, ...] = ()
     legacy_config_diagnostics: tuple[str, ...] = ()
@@ -173,44 +167,6 @@ def load_config(
     if process_tolerance > 2:
         raise ConfigError("process_start_tolerance_seconds must be <= 2")
 
-    manager_review_interval = _number(
-        raw, "manager_review_interval_seconds", 300, minimum=0
-    )
-    lane_no_progress = _number(raw, "lane_no_progress_seconds", 600, minimum=0)
-    manager_heartbeat_timeout = _number(
-        raw, "manager_heartbeat_timeout_seconds", 420, minimum=0
-    )
-    if manager_review_interval <= 0:
-        raise ConfigError("manager_review_interval_seconds must be positive")
-    if lane_no_progress <= 0:
-        raise ConfigError("lane_no_progress_seconds must be positive")
-    if manager_heartbeat_timeout <= 0:
-        raise ConfigError("manager_heartbeat_timeout_seconds must be positive")
-    attention_enabled = raw.get("attention_logging_enabled", False)
-    if not isinstance(attention_enabled, bool):
-        raise ConfigError("attention_logging_enabled must be boolean")
-    attention_epoch = raw.get("attention_epoch_id", f"harness-{config_path.stem}")
-    if not isinstance(attention_epoch, str) or not attention_epoch:
-        raise ConfigError("attention_epoch_id must be a non-empty string")
-
-    if manager_heartbeat_timeout <= manager_review_interval:
-        raise ConfigError(
-            "manager_heartbeat_timeout_seconds must be greater than "
-            "manager_review_interval_seconds"
-        )
-    sprint_lifetime = raw.get("attention_sprint_lifetime_seconds")
-    if sprint_lifetime is not None:
-        sprint_lifetime = _number(raw, "attention_sprint_lifetime_seconds", 0, minimum=0)
-        if sprint_lifetime <= 0:
-            raise ConfigError("attention_sprint_lifetime_seconds must be positive when provided")
-        # Loading a declared attention-sprint config is its launcher boundary:
-        # fail before any managed watcher can be started.
-        from .attention_sprint import AttentionSprintError, validate_sprint_boundary
-        try:
-            validate_sprint_boundary(epoch_id=attention_epoch, heartbeat_timeout_seconds=manager_heartbeat_timeout, formal_review_interval_seconds=manager_review_interval, bounded_lifetime_seconds=sprint_lifetime)
-        except AttentionSprintError as exc:
-            raise ConfigError(str(exc)) from exc
-
     max_json_bytes = _integer(raw, "max_json_bytes", 4_000_000, minimum=1024)
     max_jsonl_tail_bytes = _integer(raw, "max_jsonl_tail_bytes", 512_000, minimum=1024)
     stable_read_retries = _integer(raw, "stable_read_retries", 4, minimum=1)
@@ -219,6 +175,12 @@ def load_config(
         "attention_logging_enabled",
         "attention_epoch_id",
         "attention_sprint_lifetime_seconds",
+        "attention_tolerance_seconds",
+        "manager_review_interval_seconds",
+        "lane_no_progress_seconds",
+        "watcher_ack_policy",
+        "managed_runtime_path",
+        "pending_notification_path",
     )
     legacy_diagnostics = tuple(
         f"legacy configuration key {key!r} is retained only for read compatibility and has no S4 runtime effect"
@@ -244,12 +206,6 @@ def load_config(
         stable_read_delay_seconds=_number(
             raw, "stable_read_delay_seconds", 0.03, minimum=0
         ),
-        manager_review_interval_seconds=manager_review_interval,
-        lane_no_progress_seconds=lane_no_progress,
-        manager_heartbeat_timeout_seconds=manager_heartbeat_timeout,
-        attention_logging_enabled=attention_enabled,
-        attention_epoch_id=attention_epoch,
-        attention_sprint_lifetime_seconds=sprint_lifetime,
         record_paths=record_paths,
         record_manifests=record_manifests,
         legacy_config_diagnostics=legacy_diagnostics,

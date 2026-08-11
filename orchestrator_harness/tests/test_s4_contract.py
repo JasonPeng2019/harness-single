@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,7 @@ from pathlib import Path
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
     SyntheticCodexTransport,
+    activate_codex_binding,
     check_codex_adapter,
     create_codex_adapter,
     install_codex_adapter,
@@ -30,7 +33,6 @@ from orchestrator_harness.lane_lifecycle import (
     retire_terminal_lane,
     validate_lane_archive,
 )
-from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
 
 
@@ -77,12 +79,33 @@ class S4ContractTests(unittest.TestCase):
             install = install_codex_adapter(project)
             self.assertTrue(install["current"])
             self.assertEqual("unverified", install["project_trust"])
-            evidence = synthetic_wake_self_test(project, queue_root=root / "manager")
+            router = self._router(root / "manager", session="installed-session")
+            activate_codex_binding(project, router)
+            router.admit(self._event("installed-hook"))
+            hook = project / ".codex" / "hooks" / "orchestrator_harness_post_tool_use.py"
+            env = os.environ.copy()
+            repo_root = str(Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+            completed = subprocess.run(
+                [sys.executable, str(hook)],
+                cwd=project,
+                input='{"provider_payload":"ignored"}\n',
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual("orchestrator-codex-installed-hook/v1", evidence["schema"])
             self.assertEqual(DELIVERY_NOTICE_SCHEMA, evidence["notice"]["schema"])
             self.assertNotIn("event_id", evidence["notice"])
-            self.assertFalse(evidence["acknowledged_by_delivery"])
+            self.assertEqual("DELIVERED", evidence["receipt"]["outcome"])
+            self.assertFalse(evidence["acknowledged_by_hook"])
+            self.assertEqual(1, evidence["pending_count"])
+            self.assertEqual("PostToolUse", evidence["transport_calls"][0]["method"])
             self.assertEqual(b'{"unrelated":true}\n', unrelated.read_bytes())
-            self.assertEqual("passed", check_codex_adapter(project)["synthetic_self_test"])
+            self.assertEqual("owned", check_codex_adapter(project)["ownership"])
 
     def test_S4_CODEX_INSTALL_LIFECYCLE_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -97,11 +120,11 @@ class S4ContractTests(unittest.TestCase):
             self.assertTrue(first["current"])
             self.assertTrue(install_codex_adapter(project)["idempotent"])
             hooks.write_bytes(hooks.read_bytes() + b"\n")
-            with self.assertRaises(ValueError):
-                install_codex_adapter(project, upgrade=True)
+            upgraded = install_codex_adapter(project, upgrade=True)
+            self.assertTrue(upgraded["current"])
             result = uninstall_codex_adapter(project)
-            self.assertIn(".codex/hooks.json", result["preserved_modified"])
             self.assertIn(b"UserHook", hooks.read_bytes())
+            self.assertNotIn(".codex/hooks.json", result["preserved_modified"])
 
     def test_S4_NONPREEMPTIVE_DELIVERY_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -230,6 +253,7 @@ class S4ContractTests(unittest.TestCase):
             view = allocate_immutable_source_view(
                 source,
                 revision=revision,
+                retained_ref="HEAD",
                 view_root=root / "view",
                 result_root=root / "result",
                 cache_root=root / "cache",
@@ -264,15 +288,28 @@ class S4ContractTests(unittest.TestCase):
                 path = evidence / f"{name}.json"
                 path.write_text("{}\n", encoding="utf-8")
                 refs.append(path)
+            process_evidence = evidence / "process.json"
+            process_evidence.write_text(json.dumps({
+                "schema": "orchestrator-process-evidence/v1",
+                "complete": True,
+                "provider": "synthetic",
+                "identities": {
+                    "controller": {"pid": 9001, "created_utc": "2000-01-01T00:00:00Z"},
+                    "worker": {"pid": 9002, "created_utc": "2000-01-01T00:00:00Z"},
+                    "helper": {"pid": 9003, "created_utc": "2000-01-01T00:00:00Z"},
+                },
+                "processes": [],
+            }) + "\n", encoding="utf-8")
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
                 lane_id="S4.P",
                 retained_revision=revision,
+                retained_ref="refs/heads/main",
+                target_revision=revision,
+                process_evidence=process_evidence,
                 task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
                 acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
-                process_snapshot=ProcessSnapshot(True, ()), live_processes=(),
-                unmerged_work_proof=True,
             )
             self.assertEqual("CLOSED", result.outcome)
             self.assertFalse(lane.exists())
@@ -283,7 +320,8 @@ class S4ContractTests(unittest.TestCase):
             (dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
             blocked = retire_terminal_lane(
                 dirty, root / "archive-dirty", lane_id="dirty", retained_revision=revision,
-                process_snapshot=ProcessSnapshot(True, ()), unmerged_work_proof=True,
+                retained_ref="refs/heads/main", target_revision=revision,
+                process_evidence=process_evidence,
             )
             self.assertEqual("VISIBLE", blocked.outcome)
             self.assertTrue(dirty.exists())

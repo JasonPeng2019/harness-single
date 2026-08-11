@@ -44,17 +44,9 @@ def merge_watcher_conditions(snapshot: dict[str, Any]) -> dict[str, dict[str, An
     return conditions_from_snapshot(snapshot)
 
 
-def acknowledge_watcher_event(event_id: str) -> bool:
-    """Compatibility no-op: watcher evidence is not a manager acknowledgement."""
-
-    del event_id
-    return False
-
-
 __all__ = [
     "WATCHER_RECOVERY_SCHEMA",
     "WATCHER_RECOVERY_STATES",
-    "acknowledge_watcher_event",
     "merge_watcher_conditions",
     "watcher_recovery_projection",
 ]

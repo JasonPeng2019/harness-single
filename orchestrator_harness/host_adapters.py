@@ -43,6 +43,13 @@ _RECEIPT_OUTCOMES = {
     "DELIVERY_REJECTED",
     "DELIVERY_FAILED",
 }
+_SAFE_BOUNDARIES = {
+    "post_tool_use",
+    "tool_result",
+    "turn_completed",
+    "idle",
+    "finalization",
+}
 _RETRY_BACKOFF_SECONDS = (0.0, 0.25, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 
 
@@ -275,6 +282,8 @@ class DeliveryReceipt:
             _text(value, name)
         if self.outcome not in _RECEIPT_OUTCOMES:
             raise HostAdapterError(f"unsupported delivery receipt outcome: {self.outcome}")
+        if self.boundary not in _SAFE_BOUNDARIES:
+            raise HostAdapterError(f"unsupported delivery receipt boundary: {self.boundary}")
         _nonnegative_int(self.registration_generation, "registration_generation")
         _nonnegative_int(self.observed_queue_revision, "observed_queue_revision")
         if not isinstance(self.attempt, int) or isinstance(self.attempt, bool) or self.attempt < 1:
@@ -283,6 +292,42 @@ class DeliveryReceipt:
             _text(self.error_class, "error_class", limit=128)
         if parse_utc(self.delivered_utc) is None:
             raise HostAdapterError("receipt delivered_utc must be UTC")
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "DeliveryReceipt":
+        """Parse the closed transport-evidence shape without widening it."""
+
+        if value.get("schema") != DELIVERY_RECEIPT_SCHEMA:
+            raise HostAdapterError("invalid delivery receipt schema")
+        allowed = {
+            "schema", "receipt_id", "notice_id", "run_id", "queue_id",
+            "manager_session_id", "manager_thread_id", "registration_id",
+            "registration_generation", "observed_queue_revision", "boundary",
+            "outcome", "delivered_utc", "adapter_profile", "attempt",
+            "error_class",
+        }
+        if set(value) - allowed or "error_class" in value and value["error_class"] is None:
+            raise HostAdapterError("delivery receipt has an invalid closed shape")
+        required = allowed - {"schema", "error_class"}
+        if set(value) & required != required:
+            raise HostAdapterError("delivery receipt is missing a required coordinate")
+        return cls(
+            receipt_id=value["receipt_id"],
+            notice_id=value["notice_id"],
+            run_id=value["run_id"],
+            queue_id=value["queue_id"],
+            manager_session_id=value["manager_session_id"],
+            manager_thread_id=value["manager_thread_id"],
+            registration_id=value["registration_id"],
+            registration_generation=value["registration_generation"],
+            observed_queue_revision=value["observed_queue_revision"],
+            boundary=value["boundary"],
+            outcome=value["outcome"],
+            delivered_utc=value["delivered_utc"],
+            adapter_profile=value["adapter_profile"],
+            attempt=value["attempt"],
+            error_class=value.get("error_class"),
+        )
 
     def as_record(self) -> dict[str, Any]:
         record = {
@@ -599,9 +644,16 @@ class DeliveryCoordinator:
 
     def _state_or_register(self) -> dict[str, Any]:
         state = self.load_state()
+        self._assert_state_binding(state)
         if state.get("status") == "UNREGISTERED":
             return self.register()
-        self._assert_state_binding(state)
+        if state.get("status") == "RELEASED":
+            # A closed binding may be restored by the harness-owned boundary
+            # when a new durable S3 event arrives.  No manager poll or manual
+            # re-arm is involved; the queue itself is the wake authority.
+            if self.router.pending_events():
+                return self.register()
+            return state
         return state
 
     def _validate_wake(self, wake: Mapping[str, Any] | None) -> int:
@@ -783,15 +835,16 @@ class DeliveryCoordinator:
             receipt = self.adapter.deliver_notice(notice, boundary=boundary)
             if not isinstance(receipt, DeliveryReceipt):
                 raise HostAdapterError("adapter returned an invalid delivery receipt")
-            if receipt.notice_id != notice.notice_id or receipt.registration_generation != notice.registration_generation:
-                raise DeliveryBindingError("adapter receipt does not match the notice")
+            self._validate_receipt(receipt, notice, state=state, boundary=boundary)
         except Exception as exc:
             receipt = self._receipt(
                 notice,
                 boundary=boundary,
-                outcome="DELIVERY_FAILED" if attempt < self.max_attempts else "DELIVERY_DEGRADED",
+                outcome="DELIVERY_REJECTED" if isinstance(exc, DeliveryBindingError) else (
+                    "DELIVERY_FAILED" if attempt < self.max_attempts else "DELIVERY_DEGRADED"
+                ),
                 attempt=attempt,
-                error_class=type(exc).__name__,
+                error_class=("RECEIPT_BINDING_MISMATCH" if isinstance(exc, DeliveryBindingError) else type(exc).__name__),
             )
         # S3's delivery journal is transport evidence.  Passing an empty event
         # list is intentional: no transport receipt can acknowledge queue work.
@@ -843,6 +896,61 @@ class DeliveryCoordinator:
             raise DeliveryBindingError("notice adapter profile mismatch")
         if notice.registration_generation != expected.get("registration_generation") or notice.registration_generation != state.get("registration_generation"):
             raise DeliveryBindingError("notice registration generation mismatch")
+
+    def _validate_receipt(
+        self,
+        receipt: DeliveryReceipt,
+        notice: DeliveryNotice,
+        *,
+        state: Mapping[str, Any],
+        boundary: str,
+    ) -> None:
+        """Validate every transport coordinate before successful journaling.
+
+        A HostAdapter is an untrusted boundary even when it is implemented by
+        this package.  A receipt with only a matching notice ID is not evidence
+        for this queue; every binding, revision, boundary, outcome, and
+        timestamp must agree before S3 receives a successful delivery record.
+        """
+
+        if not isinstance(receipt, DeliveryReceipt):
+            raise DeliveryBindingError("adapter receipt is not a DeliveryReceipt")
+        expected = self.binding_identity
+        coordinates = (
+            ("notice_id", receipt.notice_id, notice.notice_id),
+            ("run_id", receipt.run_id, notice.run_id),
+            ("queue_id", receipt.queue_id, notice.queue_id),
+            ("manager_session_id", receipt.manager_session_id, notice.manager_session_id),
+            ("manager_thread_id", receipt.manager_thread_id, notice.manager_thread_id),
+            ("registration_id", receipt.registration_id, notice.registration_id),
+            ("registration_generation", receipt.registration_generation, notice.registration_generation),
+            ("observed_queue_revision", receipt.observed_queue_revision, notice.observed_queue_revision),
+            ("adapter_profile", receipt.adapter_profile, notice.adapter_profile),
+            ("boundary", receipt.boundary, boundary),
+        )
+        for name, actual, expected_value in coordinates:
+            if actual != expected_value:
+                raise DeliveryBindingError(f"adapter receipt mismatch in {name}")
+        if receipt.registration_generation != expected.get("registration_generation"):
+            raise DeliveryBindingError("adapter receipt registration generation is stale")
+        if receipt.run_id != expected.get("run_id"):
+            raise DeliveryBindingError("adapter receipt run binding is stale")
+        if receipt.queue_id != expected.get("queue_id"):
+            raise DeliveryBindingError("adapter receipt queue binding is stale")
+        if receipt.manager_session_id != expected.get("manager_session_id"):
+            raise DeliveryBindingError("adapter receipt manager session is stale")
+        if receipt.manager_thread_id != expected.get("manager_thread_id"):
+            raise DeliveryBindingError("adapter receipt manager thread is stale")
+        if receipt.registration_id != expected.get("registration_id"):
+            raise DeliveryBindingError("adapter receipt registration ID is stale")
+        if receipt.observed_queue_revision > self.router.wake_revision:
+            raise DeliveryBindingError("adapter receipt references an unpublished wake revision")
+        if not isinstance(state.get("registration_generation"), int) or receipt.registration_generation != state["registration_generation"]:
+            raise DeliveryBindingError("adapter receipt state generation is stale")
+        if receipt.outcome != "DELIVERED":
+            raise DeliveryBindingError("successful journal requires a delivered receipt")
+        if parse_utc(receipt.delivered_utc) is None:
+            raise DeliveryBindingError("adapter receipt timestamp is invalid")
 
     def acknowledge_event(self, event_id: str, *, action: str = "ACKNOWLEDGED") -> ManagerEventAck:
         if isinstance(event_id, DeliveryReceipt):
