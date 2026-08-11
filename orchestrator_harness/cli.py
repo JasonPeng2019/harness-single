@@ -6,21 +6,33 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
-from .active_management import acknowledge_management_event, transition_active_management
+from .active_management import (
+    acknowledge_management_event,
+    transition_active_management,
+)
 from .config import ConfigError, HarnessConfig, load_config
 from .discovery import discover_suite
 from .events import diff_conditions
+from .handoff_preflight import exit_code as handoff_preflight_exit_code
+from .handoff_preflight import preflight_handoff
 from .models import ProcessInfo, ProcessSnapshot, parse_utc, utc_now
-from .notifications import _manager_signal_ineligibility_reason, _priority, admit_deferred_handoffs, coalesce_mutable_handoffs, preempt_pending_with_higher_priority, select_actionable_with_deferred
-from .watcher_integration import acknowledge_watcher_event, merge_watcher_conditions
+from .notifications import (
+    _manager_signal_ineligibility_reason,
+    _priority,
+    admit_deferred_handoffs,
+    coalesce_mutable_handoffs,
+    preempt_pending_with_higher_priority,
+    select_actionable_with_deferred,
+)
 from .processes import process_snapshot
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput, canonical_json
-
+from .watcher_integration import acknowledge_watcher_event, merge_watcher_conditions
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -702,6 +714,23 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--manager-invocation-id")
     ack = subparsers.add_parser("ack", help="acknowledge one pending manager notification")
     ack.add_argument("--event-id", required=True)
+    preflight = subparsers.add_parser(
+        "handoff-preflight",
+        help="read-only structural admission check for one completed coding handoff",
+    )
+    preflight.add_argument("--task-card", required=True, type=Path)
+    preflight.add_argument("--invocation", required=True, type=Path)
+    preflight.add_argument("--result", required=True, type=Path)
+    preflight.add_argument("--dependency-map", required=True, type=Path)
+    preflight.add_argument("--worktree", required=True, type=Path)
+    preflight.add_argument("--evidence-root", required=True, type=Path)
+    preflight.add_argument(
+        "--required-evidence",
+        action="append",
+        default=[],
+        type=Path,
+        help="required file below evidence-root; may be supplied more than once",
+    )
     subparsers.add_parser(
         "heartbeat", help="renew the foreground managed watcher heartbeat"
     )
@@ -712,6 +741,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "handoff-preflight":
+            result = preflight_handoff(
+                task_card_path=args.task_card,
+                invocation_path=args.invocation,
+                result_path=args.result,
+                dependency_map_path=args.dependency_map,
+                worktree=args.worktree,
+                evidence_root=args.evidence_root,
+                required_evidence=args.required_evidence,
+            )
+            _print_json(result)
+            return handoff_preflight_exit_code(result)
         config = load_config(args.config)
         if args.command == "scan":
             return scan_command(config)
