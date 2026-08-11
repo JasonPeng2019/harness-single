@@ -41,6 +41,7 @@ from .invocation import (
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
+from .process_supervisor import CleanupResult, ProcessSupervisor
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     ProviderAdapterError,
@@ -50,6 +51,7 @@ from .provider import (
 )
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
+from .stable_io import append_jsonl_record
 from .resume import ResumeAdmissionError, require_resume_admission
 from .task import (
     COMPLETION_REVIEW_FILENAME,
@@ -131,12 +133,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _append_event(path: Path, value: dict[str, Any]) -> None:
-    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "ab", closefd=True) as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    append_jsonl_record(path, value)
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -671,54 +668,25 @@ def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> P
 
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
+    identity: ProcessInfo | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Bound shutdown to the captured Popen handle and prove that it was reaped."""
-    evidence: dict[str, Any] = {
-        "provider_pid": process.pid,
-        "codex_pid": process.pid,
-        "cleanup_confirmed": False,
-        "terminate_attempted": False,
-        "kill_attempted": False,
-    }
-
-    def reap(stage: str, timeout: float) -> bool:
-        try:
-            evidence["exit_code"] = process.wait(timeout=timeout)
-            evidence["reaped_after"] = stage
-            evidence["cleanup_confirmed"] = True
-            return True
-        except subprocess.TimeoutExpired:
-            evidence[f"{stage}_wait_timed_out"] = True
-        except BaseException as exc:
-            evidence[f"{stage}_wait_error"] = f"{type(exc).__name__}: {exc}"
-        return False
-
-    try:
-        already_exited = process.poll()
-    except BaseException as exc:
-        evidence["initial_poll_error"] = f"{type(exc).__name__}: {exc}"
-    else:
-        if already_exited is not None and reap("observed_exit", 0):
-            return True, evidence
-
-    evidence["terminate_attempted"] = True
-    try:
-        process.terminate()
-    except BaseException as exc:
-        evidence["terminate_error"] = f"{type(exc).__name__}: {exc}"
-    if reap("terminate", timeout_seconds):
-        return True, evidence
-
-    evidence["kill_attempted"] = True
-    try:
-        process.kill()
-    except BaseException as exc:
-        evidence["kill_error"] = f"{type(exc).__name__}: {exc}"
-    if reap("kill", timeout_seconds):
-        return True, evidence
-
-    evidence["error"] = "exact provider child exit and reap could not be proven"
-    return False, evidence
+    """Compatibility shim around the shared exact supervisor."""
+    supervisor = ProcessSupervisor(
+        process,
+        identity,
+        graceful_timeout_seconds=timeout_seconds,
+        force_timeout_seconds=timeout_seconds,
+        observer=None,
+    )
+    result = supervisor.cleanup()
+    evidence = result.to_record()
+    if "GRACEFUL_WAIT_TIMEOUT" in result.stages:
+        evidence["terminate_wait_timed_out"] = True
+    if "FINAL_REAP_TIMEOUT" in result.stages:
+        evidence["kill_wait_timed_out"] = True
+    if result.errors:
+        evidence["error"] = "; ".join(result.errors)
+    return result.proved_reap, evidence
 
 
 def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
@@ -1378,6 +1346,7 @@ def run(invocation: Invocation) -> int:
             state["resume_identity"] = resume_identity
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
+    supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
     child_exit_confirmed = True
     try:
@@ -1423,6 +1392,15 @@ def run(invocation: Invocation) -> int:
             process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
             child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
+            # The captured handle is the ownership boundary.  The controller
+            # has already established the exact creation identity; the shared
+            # supervisor owns every later graceful/force/final-reap stage.
+            supervisor = ProcessSupervisor(
+                process,
+                child,
+                parent_pid=controller.pid,
+                observer=None,
+            )
             state.update({
                 "state": running_state,
                 "provider_pid": child.pid,
@@ -1477,7 +1455,8 @@ def run(invocation: Invocation) -> int:
             out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
             err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
             out_thread.start(); err_thread.start()
-            exit_code = process.wait()
+            assert supervisor is not None
+            exit_code = supervisor.wait_for_exit()
             child_exit_confirmed = True
             out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
@@ -1557,7 +1536,16 @@ def run(invocation: Invocation) -> int:
     except KeyboardInterrupt:
         cleanup_evidence: dict[str, Any] | None = None
         if process is not None and not child_exit_confirmed:
-            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            if supervisor is None:
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            else:
+                cleanup: CleanupResult = supervisor.cleanup()
+                child_exit_confirmed = cleanup.proved_reap
+                cleanup_evidence = cleanup.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
@@ -1601,7 +1589,16 @@ def run(invocation: Invocation) -> int:
     except Exception as exc:
         cleanup_evidence = None
         if process is not None and not child_exit_confirmed:
-            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            if supervisor is None:
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            else:
+                cleanup: CleanupResult = supervisor.cleanup()
+                child_exit_confirmed = cleanup.proved_reap
+                cleanup_evidence = cleanup.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"
