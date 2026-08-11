@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,6 +196,84 @@ class S3ContractTests(unittest.TestCase):
                 )
             )
             self.assertNotIn("condition-c", {item["event_id"] for item in router.pending_events()})
+
+    def test_repair_unknown_source_identity_is_exact_for_automatic_and_clear(self) -> None:
+        """S3-R2-SOURCE: future source identity survives routing and clear."""
+        with tempfile.TemporaryDirectory() as raw:
+            router = self.router(Path(raw) / "manager")
+            first = router.admit(self.event("FUTURE_A", "future-a", "future:shared"))
+            second = router.admit(self.event("FUTURE_B", "future-b", "future:shared"))
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertEqual(
+                {"future-a", "future-b"},
+                {item["event_id"] for item in router.pending_events()},
+            )
+
+            router.admit(self.event(
+                "CONDITION_CLEARED",
+                "clear-future-a",
+                "future:shared",
+                cleared_event_id="future-a",
+                cleared_type="FUTURE_A",
+            ))
+            self.assertEqual(
+                ["future-b"],
+                [item["event_id"] for item in router.pending_events()],
+            )
+
+    def test_repair_concurrent_router_admissions_serialize_sequence_allocation(self) -> None:
+        """S3-R2-LOCK: public admissions cannot share a journal sequence."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "manager"
+            first_router = self.router(root, session="shared-session")
+            second_router = self.router(root, session="shared-session")
+            barrier = threading.Barrier(2)
+            errors: list[BaseException] = []
+
+            def gate(router: ManagerEventRouter) -> None:
+                original = router._ledger
+                reached = False
+
+                def wrapped() -> tuple[list[dict[str, object]], set[str], dict[str, str], int, int]:
+                    nonlocal reached
+                    if not reached:
+                        reached = True
+                        try:
+                            barrier.wait(timeout=1.0)
+                        except threading.BrokenBarrierError:
+                            pass
+                    return original()
+
+                router._ledger = wrapped  # type: ignore[method-assign]
+
+            gate(first_router)
+            gate(second_router)
+
+            def admit(router: ManagerEventRouter, event_id: str, identity: str) -> None:
+                try:
+                    router.admit(self.event("RESOURCE_CONFLICT", event_id, identity, resource=identity))
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=admit, args=(first_router, "concurrent-a", "resource:a")),
+                threading.Thread(target=admit, args=(second_router, "concurrent-b", "resource:b")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5.0)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual([], errors)
+
+            records = first_router.read_queue()
+            events = [record for record in records if record["record_kind"] == "EVENT"]
+            self.assertEqual({"concurrent-a", "concurrent-b"}, {record["event_id"] for record in events})
+            self.assertEqual(
+                list(range(1, len(records) + 1)),
+                [record["journal_seq"] for record in records],
+            )
 
     def test_repair_restart_republishes_later_lost_wake(self) -> None:
         """S3-REPAIR-LATER-WAKE: a nonzero old edge does not hide a new obligation."""

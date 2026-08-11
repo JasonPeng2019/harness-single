@@ -74,11 +74,11 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _json_object(path: Path) -> tuple[dict[str, object], str]:
+def _json_object(path: Path, *, max_bytes: int | None = 2 * 1024 * 1024) -> tuple[dict[str, object], str]:
     if path.is_symlink() or not path.is_file():
         raise ValueError("path is not a regular non-symlink file")
     data = path.read_bytes()
-    if len(data) > 2 * 1024 * 1024:
+    if max_bytes is not None and len(data) > max_bytes:
         raise ValueError("artifact exceeds 2 MiB")
     decoded = cast(object, json.loads(data.decode("utf-8")))
     if not isinstance(decoded, dict):
@@ -263,7 +263,7 @@ def _check_amendment_identity(
         return
     review_path = Path(review_path_value).expanduser().resolve(strict=False)
     try:
-        review, actual_hash = _json_object(review_path)
+        review, actual_hash = _json_object(review_path, max_bytes=None)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         failures.append(
             _failure("RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc))

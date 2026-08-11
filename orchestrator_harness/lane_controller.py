@@ -1176,8 +1176,6 @@ def _read_canonical_resume_amendment(invocation: Invocation) -> Mapping[str, Any
         raise InvocationError("RESUME_ADMISSION.json is not a regular file")
     try:
         raw = path.read_bytes()
-        if len(raw) > 2 * 1024 * 1024:
-            raise InvocationError("RESUME_ADMISSION.json exceeds the controller limit")
         value = json.loads(raw.decode("utf-8"))
     except InvocationError:
         raise

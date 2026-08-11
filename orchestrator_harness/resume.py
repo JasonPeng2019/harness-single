@@ -109,10 +109,18 @@ def _review_digest(value: object, name: str) -> str:
     return text
 
 
-def _review_path_digest(value: object, name: str) -> str:
+def _review_file_path(value: object, name: str) -> Path:
     path = Path(_review_text(value, name))
-    if path.is_symlink() or not path.is_file():
+    if not path.is_absolute():
+        raise ValueError(f"{name} must be absolute")
+    normalized = path.expanduser().resolve(strict=False)
+    if path.is_symlink() or not normalized.is_file():
         raise ValueError(f"{name} is not an existing regular file")
+    return normalized
+
+
+def _review_path_digest(value: object, name: str) -> str:
+    path = _review_file_path(value, name)
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as exc:
@@ -120,7 +128,7 @@ def _review_path_digest(value: object, name: str) -> str:
 
 
 def _review_card_payload(path_value: object, name: str) -> Mapping[str, Any]:
-    path = Path(_review_text(path_value, name))
+    path = _review_file_path(path_value, name)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -133,9 +141,11 @@ def _review_card_payload(path_value: object, name: str) -> Mapping[str, Any]:
 def _validate_review_diff_command(
     diff: Mapping[str, Any], *, old_path: object, new_path: object, name: str
 ) -> None:
-    working_directory = Path(
-        _review_text(diff["working_directory"], f"{name}.working_directory")
-    )
+    working_directory_text = _review_text(diff["working_directory"], f"{name}.working_directory")
+    working_directory = Path(working_directory_text)
+    if not working_directory.is_absolute():
+        raise ValueError(f"{name}.working_directory must be absolute")
+    working_directory = working_directory.expanduser().resolve(strict=False)
     if not working_directory.is_dir():
         raise ValueError(f"{name}.working_directory is not an existing directory")
     command = _review_text(diff["command"], f"{name}.command")
@@ -146,14 +156,16 @@ def _validate_review_diff_command(
     parts = [part.strip('"') for part in parts]
     if len(parts) != 6 or parts[:4] != ["git", "diff", "--no-index", "--"]:
         raise ValueError(f"{name}.command is not the closed no-index diff form")
+    old_normalized = _review_file_path(old_path, f"{name}.old_path")
+    new_normalized = _review_file_path(new_path, f"{name}.new_path")
     for argument, expected, label in (
-        (parts[4], old_path, "old_path"),
-        (parts[5], new_path, "new_path"),
+        (parts[4], old_normalized, "old_path"),
+        (parts[5], new_normalized, "new_path"),
     ):
         candidate = Path(argument)
         if not candidate.is_absolute():
             candidate = working_directory / candidate
-        if candidate.resolve(strict=False) != Path(_review_text(expected, label)).resolve(strict=False):
+        if candidate.expanduser().resolve(strict=False) != expected:
             raise ValueError(f"{name}.command {label} does not match the reviewed path")
 
 

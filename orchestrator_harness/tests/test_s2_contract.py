@@ -27,7 +27,11 @@ from orchestrator_harness.prompt_bundle import (
     prompt_bundle_record_from_paths,
 )
 from orchestrator_harness.provider import ClaudeCodeProviderAdapter, ProviderLaunchSpec
-from orchestrator_harness.resume import RESUME_AMENDMENT_REVIEW_SCHEMA, make_resume_admission
+from orchestrator_harness.resume import (
+    RESUME_AMENDMENT_REVIEW_SCHEMA,
+    make_resume_admission,
+    validate_resume_amendment_review,
+)
 from orchestrator_harness.task import (
     COMPLETION_REVIEW_FILENAME,
     COMPLETION_REVIEW_SCHEMA,
@@ -464,6 +468,87 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 with self.assertRaisesRegex(controller.InvocationError, "accepted task"):
                     controller.run(controller.load_invocation(resume_path))
             self.assertEqual(accepted_before, status_path.read_bytes())
+
+    def test_canonical_resume_admits_valid_large_root_review_without_local_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            persisted_identity = persisted["resume_identity"]
+            old_card = workspace / "large-card-old.json"
+            new_card = workspace / "large-card-new.json"
+            self._write_canonical_json(old_card, card)
+            changed_card = dict(card)
+            changed_card["owner"] = "ROOT-IM"
+            new_card_hash = self._write_canonical_json(new_card, changed_card)
+            old_prompt = workspace / "large-prompt-old.md"
+            new_prompt = workspace / "large-prompt-new.md"
+            old_prompt.write_bytes(b"workflow\ntask\n")
+            new_prompt.write_bytes(old_prompt.read_bytes())
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-1"}
+            resume["task_card"] = {**resume["task_card"], "sha256": new_card_hash}
+            review = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            review["semantic_impact"]["rationale"] = "x" * (2 * 1024 * 1024)  # type: ignore[index]
+            review_path = workspace / "RESUME_ADMISSION.json"
+            review_path.write_text(json.dumps(review), encoding="utf-8")
+            self.assertGreater(review_path.stat().st_size, 2 * 1024 * 1024)
+            resume_path = root / "resume-large-review.invocation.json"
+            resume_path.write_text(json.dumps(resume), encoding="utf-8")
+
+            self.assertEqual(0, controller.main([str(resume_path)]))
+            self.assertEqual(2, (root / "launches.txt").read_text(encoding="utf-8").count("launch"))
+
+    def test_review_pair_paths_require_absolute_identity_before_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            persisted_identity = persisted["resume_identity"]
+            old_card = workspace / "path-card-old.json"
+            new_card = workspace / "path-card-new.json"
+            self._write_canonical_json(old_card, card)
+            changed_card = dict(card)
+            changed_card["owner"] = "ROOT-IM"
+            new_card_hash = self._write_canonical_json(new_card, changed_card)
+            old_prompt = workspace / "path-prompt-old.md"
+            new_prompt = workspace / "path-prompt-new.md"
+            old_prompt.write_bytes(b"workflow\ntask\n")
+            new_prompt.write_bytes(old_prompt.read_bytes())
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-1"}
+            resume["task_card"] = {**resume["task_card"], "sha256": new_card_hash}
+            review = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            for name, pair in review["reviewed_pairs"].items():  # type: ignore[union-attr]
+                pair["old_path"] = f"relative-{name}-old"
+                pair["new_path"] = f"relative-{name}-new"
+                pair["diff"]["command"] = f"git diff --no-index -- {pair['old_path']} {pair['new_path']}"
+            requested = dict(persisted_identity)
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                validate_resume_amendment_review(
+                    review,
+                    requested,
+                    persisted_identity,
+                    expected_job_identity=review["same_job_identity"],
+                )
 
     def test_canonical_output_reservations_reject_before_workspace_mutation(self) -> None:
         reserved_names = ("RESULT.json", COMPLETION_REVIEW_FILENAME, ORCHESTRATOR_ACCEPTANCE_FILENAME)

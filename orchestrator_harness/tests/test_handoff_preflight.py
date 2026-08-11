@@ -226,7 +226,9 @@ class HandoffPreflightTests(unittest.TestCase):
                 "require_fresh_affected_review": False,
             },
         }
+        review["semantic_impact"]["rationale"] = "x" * (2 * 1024 * 1024)  # type: ignore[index]
         write_json(review_path, review)
+        self.assertGreater(review_path.stat().st_size, 2 * 1024 * 1024)
         review_hash = hashlib.sha256(review_path.read_bytes()).hexdigest()
         dependency_map = cast(dict[str, object], json.loads(self.dependency_map_path.read_text(encoding="utf-8")))
         dependency_map["amendment"] = {

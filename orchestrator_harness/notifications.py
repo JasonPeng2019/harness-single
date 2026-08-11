@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from .models import iso_utc, parse_utc
 from .stable_io import (
@@ -299,6 +300,12 @@ def _typed_facts(data: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _routed_event_type(source_type: str) -> str:
+    """Return the routed type without discarding unknown source identity."""
+
+    return source_type if source_type in EVENT_DISPOSITIONS else "OBSERVATION_UNCERTAIN"
+
+
 class ManagerEventRouter:
     """The sole writer for one exact manager binding's durable event channel."""
 
@@ -306,6 +313,7 @@ class ManagerEventRouter:
     # This is the existing bound consumed by _queue_records/read_stable.  It
     # is the recordability boundary, rather than a new per-fact heuristic.
     _QUEUE_READ_MAX_BYTES = 20_000_000
+
     def __init__(
         self,
         root: Path,
@@ -627,8 +635,8 @@ class ManagerEventRouter:
             "observed": merged_observed,
         }
 
-    def rebuild_state(self, *, publish_wake: bool = True) -> dict[str, Any]:
-        """Rebuild the cache solely from the append-only queue journal."""
+    def _rebuild_state_locked(self, *, publish_wake: bool = True) -> dict[str, Any]:
+        """Rebuild state from the ledger while the queue mutation lock is held."""
         try:
             current_wake = self._read_json(self.wake_path, schema=MANAGER_WAKE_SCHEMA)
         except ManagerRecordError:
@@ -642,19 +650,29 @@ class ManagerEventRouter:
             self._transaction.atomic_json(self.state_path, state)
         return state
 
-    def load_state(self) -> dict[str, Any]:
+    def rebuild_state(self, *, publish_wake: bool = True) -> dict[str, Any]:
+        """Rebuild the cache solely from the append-only queue journal."""
+
+        with self._queue_mutation():
+            return self._rebuild_state_locked(publish_wake=publish_wake)
+
+    def _load_state_locked(self) -> dict[str, Any]:
         try:
             state = self._read_json(self.state_path, schema=MANAGER_STATE_SCHEMA)
         except ManagerRecordError:
             state = None
         if state is None:
-            return self.rebuild_state()
+            return self._rebuild_state_locked()
         # A valid but stale cache is still rebuilt; queue remains authoritative.
         rebuilt = self._state_for_ledger(wake_revision=state.get("wake_revision", 0))
         if canonical_json(rebuilt) != canonical_json(state):
             self._transaction.atomic_json(self.state_path, rebuilt)
             state = rebuilt
         return state
+
+    def load_state(self) -> dict[str, Any]:
+        with self._queue_mutation():
+            return self._load_state_locked()
 
     @property
     def wake_revision(self) -> int:
@@ -688,7 +706,14 @@ class ManagerEventRouter:
         identity_text = _nonempty_text(identity, "event.identity")
         disposition = EVENT_DISPOSITIONS.get(source_type)
         if disposition is None:
-            return ManagerRouteDecision(EVENT_DISPOSITION_WAKING, source_type, "OBSERVATION_UNCERTAIN", source_event_id, identity_text, "unknown source type")
+            return ManagerRouteDecision(
+                EVENT_DISPOSITION_WAKING,
+                source_type,
+                _routed_event_type(source_type),
+                source_event_id,
+                identity_text,
+                "unknown source type",
+            )
         if data.get("manager_actionable") is False or data.get("actionable") is False:
             return ManagerRouteDecision(EVENT_DISPOSITION_OBSERVED, source_type, source_type, source_event_id, identity_text, "source marked non-actionable")
         if disposition == EVENT_DISPOSITION_SUPERSEDED:
@@ -803,8 +828,15 @@ class ManagerEventRouter:
         if not records:
             return
         data = _jsonl_bytes(records)
-        with PathKeyedAppendLock(self.queue_path):
+        with self._queue_mutation():
             self._append_journal_locked(data)
+
+    @contextmanager
+    def _queue_mutation(self) -> Iterator[None]:
+        """Own one queue mutation transaction from snapshot through append."""
+
+        with PathKeyedAppendLock(self.queue_path):
+            yield
 
     def _append_journal_locked(self, data: bytes) -> None:
         """Append after the caller has entered the queue's path-keyed lock."""
@@ -843,11 +875,15 @@ class ManagerEventRouter:
             raise ManagerRecordError("supersession reference is not pending")
         if identity is None:
             raise ManagerRecordError("supersession requires the condition identity")
+        if event_type is None or not event_type.strip():
+            raise ManagerRecordError("supersession requires the condition event type")
+        if source_type is None or not source_type.strip():
+            raise ManagerRecordError("supersession requires the condition source type")
         if target.get("identity") != identity:
             raise ManagerRecordError("supersession condition identity does not match")
-        if event_type is not None and target.get("event_type") != event_type:
+        if target.get("event_type") != event_type:
             raise ManagerRecordError("supersession condition type does not match")
-        if source_type is not None and target.get("source_type") != source_type:
+        if target.get("source_type") != source_type:
             raise ManagerRecordError("supersession condition source type does not match")
         record = self._supersession_record(event_id, superseded_by, next_journal)
         self._append_journal_locked(_jsonl_bytes([record]))
@@ -875,6 +911,17 @@ class ManagerEventRouter:
             "acknowledged_utc": self._timestamp(),
         }
 
+    def _publish_queue_state_locked(self, *, publish_wake: bool) -> dict[str, Any]:
+        """Publish queue-derived state and wake while the mutation lock is held."""
+
+        state = self._state_for_ledger(wake_revision=self.wake_revision)
+        self._transaction.atomic_json(self.state_path, state)
+        if publish_wake and state["events"]:
+            wake = self._publish_wake()
+            state = self._state_for_ledger(wake_revision=wake["wake_revision"])
+            self._transaction.atomic_json(self.state_path, state)
+        return state
+
     def admit(
         self,
         event: Mapping[str, Any],
@@ -899,17 +946,21 @@ class ManagerEventRouter:
             # while constructing the durable record.
             _typed_facts(data)
         if decision.disposition == EVENT_DISPOSITION_OBSERVED:
-            state = self.load_state()
-            observed = {
-                decision.identity: {
-                    "source_type": decision.source_type,
-                    "event_type": decision.event_type,
-                    "event_id": decision.event_id,
-                    "observed_utc": iso_utc(timestamp),
-                    "reason": decision.reason,
+            with self._queue_mutation():
+                state = self._load_state_locked()
+                observed = {
+                    decision.identity: {
+                        "source_type": decision.source_type,
+                        "event_type": decision.event_type,
+                        "event_id": decision.event_id,
+                        "observed_utc": iso_utc(timestamp),
+                        "reason": decision.reason,
+                    }
                 }
-            }
-            self._transaction.atomic_json(self.state_path, self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)))
+                self._transaction.atomic_json(
+                    self.state_path,
+                    self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)),
+                )
             return None
         if decision.disposition == EVENT_DISPOSITION_SUPERSEDED:
             data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
@@ -920,84 +971,87 @@ class ManagerEventRouter:
             if not isinstance(cleared_type, str) or not cleared_type.strip():
                 raise ManagerRecordError("condition clear has no cleared event type")
             cleared_source_type = data.get("cleared_source_type")
-            if cleared_source_type is not None and (
-                not isinstance(cleared_source_type, str) or not cleared_source_type.strip()
+            if cleared_source_type is None:
+                cleared_source_type = cleared_type
+            if (
+                not isinstance(cleared_source_type, str)
+                or not cleared_source_type.strip()
+                or cleared_source_type != cleared_type
             ):
-                raise ManagerRecordError("condition clear has an invalid cleared source type")
-            with PathKeyedAppendLock(self.queue_path):
+                raise ManagerRecordError("condition clear source type does not match cleared type")
+            with self._queue_mutation():
                 self._supersede_pending_locked(
                     old_id,
                     superseded_by=decision.event_id or decision.identity,
                     identity=decision.identity,
-                    event_type=cleared_type,
+                    event_type=_routed_event_type(cleared_source_type),
                     source_type=cleared_source_type,
                 )
-            self.rebuild_state(publish_wake=False)
+                self._publish_queue_state_locked(publish_wake=False)
             return None
-        pending, acknowledged, superseded, next_admission, next_journal = self._ledger()
-        del pending
-        existing_records = self._queue_records()
-        if decision.event_id is not None:
-            for prior in existing_records:
-                if prior.get("record_kind") == "EVENT" and prior.get("event_id") == decision.event_id:
-                    return prior
         selected_priority = self._priority_for(event, decision, priority, snapshot, timestamp)
         if selected_priority is None:
-            state = self.load_state()
-            observed = {
-                decision.identity: {
-                    "source_type": decision.source_type,
-                    "event_type": decision.event_type,
-                    "event_id": decision.event_id,
-                    "observed_utc": iso_utc(timestamp),
-                    "reason": "source failed current liveness or actionability checks",
+            with self._queue_mutation():
+                state = self._load_state_locked()
+                observed = {
+                    decision.identity: {
+                        "source_type": decision.source_type,
+                        "event_type": decision.event_type,
+                        "event_id": decision.event_id,
+                        "observed_utc": iso_utc(timestamp),
+                        "reason": "source failed current liveness or actionability checks",
+                    }
                 }
-            }
-            self._transaction.atomic_json(
-                self.state_path,
-                self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)),
-            )
+                self._transaction.atomic_json(
+                    self.state_path,
+                    self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)),
+                )
             return None
-        record = self._event_record(
-            event, decision, admission_seq=next_admission, journal_seq=next_journal,
-            priority=selected_priority, payload_ref=payload_ref, observed_at=timestamp,
-        )
-        event_id = record["event_id"]
-        for prior in existing_records:
-            if prior.get("record_kind") == "EVENT" and prior.get("event_id") == event_id:
+        with self._queue_mutation():
+            _pending, acknowledged, superseded, next_admission, next_journal = self._ledger()
+            existing_records = self._queue_records()
+            if decision.event_id is not None:
+                for prior in existing_records:
+                    if prior.get("record_kind") == "EVENT" and prior.get("event_id") == decision.event_id:
+                        return prior
+            record = self._event_record(
+                event, decision, admission_seq=next_admission, journal_seq=next_journal,
+                priority=selected_priority, payload_ref=payload_ref, observed_at=timestamp,
+            )
+            event_id = record["event_id"]
+            for prior in existing_records:
+                if prior.get("record_kind") == "EVENT" and prior.get("event_id") == event_id:
+                    if (
+                        prior.get("event_type") != record.get("event_type")
+                        or prior.get("source_type") != record.get("source_type")
+                        or prior.get("identity") != record.get("identity")
+                        or prior.get("facts") != record.get("facts")
+                        or prior.get("payload_ref") != record.get("payload_ref")
+                    ):
+                        raise ManagerRecordError("event ID collision for manager binding")
+                    return prior
+            supersede_ids: list[str] = []
+            for prior in existing_records:
                 if (
-                    prior.get("event_type") != record.get("event_type")
-                    or prior.get("identity") != record.get("identity")
-                    or prior.get("facts") != record.get("facts")
-                    or prior.get("payload_ref") != record.get("payload_ref")
+                    prior.get("record_kind") == "EVENT"
+                    and prior.get("event_type") == record["event_type"]
+                    and prior.get("source_type") == record["source_type"]
+                    and prior.get("identity") == record["identity"]
+                    and prior.get("event_id") != event_id
+                    and prior.get("event_id") not in acknowledged
+                    and prior.get("event_id") not in superseded
                 ):
-                    raise ManagerRecordError("event ID collision for manager binding")
-                return prior
-        supersede_ids: list[str] = []
-        for prior in existing_records:
-            if (
-                prior.get("record_kind") == "EVENT"
-                and prior.get("event_type") == record["event_type"]
-                and prior.get("identity") == record["identity"]
-                and prior.get("event_id") != event_id
-                and prior.get("event_id") not in acknowledged
-                and prior.get("event_id") not in superseded
-            ):
-                supersede_ids.append(str(prior["event_id"]))
-        journal = next_journal
-        journal_records = [record]
-        for old_id in sorted(set(supersede_ids)):
-            journal += 1
-            journal_records.append(self._supersession_record(old_id, event_id, journal))
-        # This append is the crash-consistency boundary: queue first, cache and
-        # payload-free wake second.
-        prior_wake_revision = self.wake_revision
-        self._append_journal(journal_records)
-        state_after_queue = self._state_for_ledger(wake_revision=prior_wake_revision)
-        self._transaction.atomic_json(self.state_path, state_after_queue)
-        wake = self._publish_wake()
-        self._transaction.atomic_json(self.state_path, self._state_for_ledger(wake_revision=wake["wake_revision"]))
-        return record
+                    supersede_ids.append(str(prior["event_id"]))
+            journal = next_journal
+            journal_records = [record]
+            for old_id in sorted(set(supersede_ids)):
+                journal += 1
+                journal_records.append(self._supersession_record(old_id, event_id, journal))
+            # This append is the crash-consistency boundary: queue first, cache
+            # and payload-free wake second, all under the same queue lock.
+            self._append_journal_locked(_jsonl_bytes(journal_records))
+            self._publish_queue_state_locked(publish_wake=True)
+            return record
 
     # Names used by producers and by deterministic fixtures are intentionally
     # aliases of the same admission boundary.
@@ -1027,19 +1081,15 @@ class ManagerEventRouter:
             self.validate_binding(binding)
         if action != "ACKNOWLEDGED":
             raise ManagerRoutingError("only ACKNOWLEDGED is an event action")
-        pending = self.pending_events()
-        if not any(item.get("event_id") == event_id for item in pending):
-            _, acknowledged, _, _, _ = self._ledger()
-            if event_id in acknowledged:
-                return True
-            raise ManagerRoutingError("event ID is not pending for this exact manager binding")
-        _, _, _, next_admission, next_journal = self._ledger()
-        del next_admission
-        self._append_journal([self._ack_record(event_id, next_journal, action=action)])
-        state = self.rebuild_state(publish_wake=False)
-        if state["events"]:
-            wake = self._publish_wake()
-            self._transaction.atomic_json(self.state_path, self._state_for_ledger(wake_revision=wake["wake_revision"]))
+        with self._queue_mutation():
+            pending, acknowledged, _, _, next_journal = self._ledger()
+            if not any(item.get("event_id") == event_id for item in pending):
+                if event_id in acknowledged:
+                    return True
+                raise ManagerRoutingError("event ID is not pending for this exact manager binding")
+            self._append_journal_locked(_jsonl_bytes([self._ack_record(event_id, next_journal, action=action)]))
+            state = self._publish_queue_state_locked(publish_wake=True)
+            del state
         return True
 
     acknowledge_event = acknowledge
@@ -1056,7 +1106,7 @@ class ManagerEventRouter:
     ) -> bool:
         event_id = _nonempty_text(event_id, "event_id")
         replacement = _nonempty_text(superseded_by, "superseded_by") if superseded_by is not None else "explicit-supersession"
-        with PathKeyedAppendLock(self.queue_path):
+        with self._queue_mutation():
             self._supersede_pending_locked(
                 event_id,
                 superseded_by=replacement,
@@ -1064,7 +1114,7 @@ class ManagerEventRouter:
                 event_type=event_type,
                 source_type=source_type,
             )
-        self.rebuild_state(publish_wake=False)
+            self._publish_queue_state_locked(publish_wake=False)
         return True
 
     def record_delivery(
