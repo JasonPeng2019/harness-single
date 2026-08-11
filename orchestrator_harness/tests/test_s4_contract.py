@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
@@ -33,6 +34,7 @@ from orchestrator_harness.lane_lifecycle import (
     retire_terminal_lane,
     validate_lane_archive,
 )
+from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
 
 
@@ -288,7 +290,16 @@ class S4ContractTests(unittest.TestCase):
                 path = evidence / f"{name}.json"
                 path.write_text("{}\n", encoding="utf-8")
                 refs.append(path)
-            process_evidence = evidence / "process.json"
+            lane_workspace = lane / ".agent-workspace"
+            lane_workspace.mkdir()
+            exclude = Path(git(lane, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = lane / exclude
+            exclude.write_text(".agent-workspace/\n", encoding="utf-8")
+            process_evidence = lane_workspace / "process.json"
+            common_dir = Path(git(lane, "rev-parse", "--git-common-dir"))
+            if not common_dir.is_absolute():
+                common_dir = lane / common_dir
             process_evidence.write_text(json.dumps({
                 "schema": "orchestrator-process-evidence/v1",
                 "complete": True,
@@ -299,18 +310,31 @@ class S4ContractTests(unittest.TestCase):
                     "helper": {"pid": 9003, "created_utc": "2000-01-01T00:00:00Z"},
                 },
                 "processes": [],
+                "lane_binding": {
+                    "lane_id": "S4.P",
+                    "worktree": str(lane.resolve()),
+                    "git_common_dir": str(common_dir.resolve()),
+                    "branch": git(lane, "symbolic-ref", "--short", "HEAD"),
+                    "expected_head": revision,
+                    "retained_ref": "refs/heads/main",
+                    "target_revision": revision,
+                },
             }) + "\n", encoding="utf-8")
-            result = retire_terminal_lane(
-                lane,
-                root / "archive",
-                lane_id="S4.P",
-                retained_revision=revision,
-                retained_ref="refs/heads/main",
-                target_revision=revision,
-                process_evidence=process_evidence,
-                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
-            )
+            with patch(
+                "orchestrator_harness.lane_lifecycle.process_snapshot",
+                return_value=ProcessSnapshot(True, (), (), "synthetic-test"),
+            ):
+                result = retire_terminal_lane(
+                    lane,
+                    root / "archive",
+                    lane_id="S4.P",
+                    retained_revision=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                    process_evidence=process_evidence,
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
             self.assertEqual("CLOSED", result.outcome)
             self.assertFalse(lane.exists())
             self.assertEqual("orchestrator-lane-archive/v1", validate_lane_archive(result.archive_path)["schema"])

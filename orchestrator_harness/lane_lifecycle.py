@@ -7,16 +7,28 @@ import io
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import tarfile
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .models import ProcessInfo, ProcessSnapshot, iso_utc, parse_utc, utc_now
+from .mutation import (
+    MutationConflict,
+    MutationReceipt,
+    MutationUnsupported,
+    TargetState,
+    capture_target,
+    delete as mutation_delete,
+    ensure_directory_path,
+    make_temporary_directory,
+    remove_tree,
+    rename as mutation_rename,
+    replace as mutation_replace,
+)
+from .processes import process_snapshot
 
 
 IMMUTABLE_VIEW_SCHEMA = "orchestrator-immutable-source-view/v1"
@@ -100,9 +112,10 @@ def _regular_directory(path: str | Path, *, create: bool = False) -> Path:
     value = _lexical(path)
     _reject_reparse_chain(value)
     if create and not value.exists():
-        parent = value.parent
-        _regular_directory(parent, create=True)
-        value.mkdir()
+        try:
+            ensure_directory_path(value)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise LaneLifecycleError(str(exc)) from exc
     if not value.is_dir() or _is_reparse(value):
         raise LaneLifecycleError(f"expected a regular directory: {value}")
     return value
@@ -187,30 +200,16 @@ def _set_read_only(root: Path) -> None:
     root.chmod(stat.S_IREAD | stat.S_IEXEC)
 
 
-def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> MutationReceipt:
     parent = path.parent
     if not parent.is_dir() or _is_reparse(parent):
         raise LaneLifecycleError(f"publication parent is unsafe: {parent}")
-    parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
-    temporary: Path | None = None
     try:
-        descriptor, raw_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(parent))
-        temporary = Path(raw_name)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write((json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        if (parent.stat().st_dev, parent.stat().st_ino) != parent_identity or _is_reparse(parent):
-            raise LaneLifecycleError("publication parent identity changed")
-        os.replace(temporary, path)
-        temporary = None
-    finally:
-        if temporary is not None:
-            try:
-                if (parent.stat().st_dev, parent.stat().st_ino) == parent_identity and not _is_reparse(parent):
-                    temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+        data = (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        expected = capture_target(parent, path.name)
+        return mutation_replace(parent, path.name, data, expected=expected)
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise LaneLifecycleError(str(exc)) from exc
 
 
 def _sha256(path: Path) -> str:
@@ -306,9 +305,14 @@ def allocate_immutable_source_view(
     ready = result / "VIEW_READY.json"
     if manifest.exists() or ready.exists():
         raise ImmutableViewError("result root already contains an allocation record")
-    view.mkdir()
+    try:
+        ensure_directory_path(view)
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise ImmutableViewError(str(exc)) from exc
     view_identity = (view.stat().st_dev, view.stat().st_ino)
     admitted = False
+    manifest_receipt: MutationReceipt | None = None
+    ready_receipt: MutationReceipt | None = None
     try:
         _assert_retained(source, commit, retained_ref, retained_commit)
         archive = _git(source, "archive", "--format=tar", commit, check=True)
@@ -322,17 +326,28 @@ def allocate_immutable_source_view(
                 if not _inside(destination.absolute(), view.absolute()):
                     raise ImmutableViewError("source archive member escapes the view")
                 if member.isdir():
-                    destination.mkdir(parents=True, exist_ok=True)
+                    try:
+                        ensure_directory_path(destination)
+                    except (MutationConflict, MutationUnsupported) as exc:
+                        raise ImmutableViewError(str(exc)) from exc
                     continue
                 handle = tar.extractfile(member)
                 if handle is None:
                     raise ImmutableViewError(f"source archive member cannot be read: {member.name}")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                _reject_reparse_chain(destination.parent)
-                if _is_reparse(destination.parent):
-                    raise ImmutableViewError("source view extraction encountered an indirection")
+                try:
+                    ensure_directory_path(destination.parent)
+                except (MutationConflict, MutationUnsupported) as exc:
+                    raise ImmutableViewError(str(exc)) from exc
                 data = handle.read()
-                destination.write_bytes(data)
+                try:
+                    mutation_replace(
+                        view,
+                        Path(member.name),
+                        data,
+                        expected=capture_target(view, Path(member.name)),
+                    )
+                except (MutationConflict, MutationUnsupported) as exc:
+                    raise ImmutableViewError(str(exc)) from exc
                 member_hashes[member.name] = hashlib.sha256(data).hexdigest()
         _set_read_only(view)
         _assert_retained(source, commit, retained_ref, retained_commit)
@@ -352,10 +367,10 @@ def allocate_immutable_source_view(
         }
         # The manifest is final before READY is published.  READY binds the
         # exact bytes of this final ready:true document.
-        _atomic_json(manifest, record)
+        manifest_receipt = _atomic_json(manifest, record)
         _assert_retained(source, commit, retained_ref, retained_commit)
         manifest_hash = _sha256(manifest)
-        _atomic_json(ready, {
+        ready_receipt = _atomic_json(ready, {
             "schema": IMMUTABLE_VIEW_SCHEMA, "view_id": view_id,
             "retained_commit": commit, "retained_ref": retained_ref,
             "manifest_sha256": manifest_hash, "admitted_utc": iso_utc(utc_now()),
@@ -366,8 +381,20 @@ def allocate_immutable_source_view(
         admitted = True
         return ImmutableSourceView(view_id, source, view, result, cache, commit, manifest, ready, True, member_hashes)
     except Exception:
-        ready.unlink(missing_ok=True)
-        manifest.unlink(missing_ok=True)
+        try:
+            if ready_receipt is not None:
+                mutation_delete(result, ready.name, expected=ready_receipt.resulting)
+            else:
+                mutation_delete(result, ready.name, expected=TargetState.absent())
+        except (MutationConflict, MutationUnsupported):
+            pass
+        try:
+            if manifest_receipt is not None:
+                mutation_delete(result, manifest.name, expected=manifest_receipt.resulting)
+            else:
+                mutation_delete(result, manifest.name, expected=TargetState.absent())
+        except (MutationConflict, MutationUnsupported):
+            pass
         if not admitted:
             try:
                 if view.exists() and not _is_reparse(view) and (view.stat().st_dev, view.stat().st_ino) == view_identity:
@@ -381,8 +408,12 @@ def allocate_immutable_source_view(
                         except OSError:
                             pass
                     view.chmod(stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
-                    shutil.rmtree(view)
-            except OSError:
+                    remove_tree(
+                        view.parent,
+                        view.name,
+                        expected=TargetState(True, "directory", view_identity, None, None),
+                    )
+            except (OSError, MutationConflict, MutationUnsupported):
                 pass
         raise
 
@@ -410,16 +441,35 @@ def _source_reference(value: object, *, name: str) -> tuple[dict[str, Any], byte
     }, data
 
 
-def _load_process_evidence(value: object) -> tuple[dict[str, Any], bytes, ProcessSnapshot, dict[str, dict[str, Any]]]:
+def _load_process_evidence(
+    value: object,
+    *,
+    lane: Path,
+) -> tuple[dict[str, Any], bytes, dict[str, dict[str, Any]], dict[str, Any]]:
     if not isinstance(value, (str, Path)):
         raise ArchiveFailed("process evidence must be a persisted evidence file")
     reference, data = _source_reference(value, name="process_evidence")
+    evidence_path = Path(reference["source_identity"]["path"])
+    try:
+        _lexical(evidence_path).relative_to(_lexical(lane))
+    except ValueError as exc:
+        raise ArchiveFailed("process evidence is not lane-owned") from exc
     try:
         raw = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ArchiveFailed("process evidence is malformed") from exc
-    if not isinstance(raw, dict) or raw.get("schema") != PROCESS_EVIDENCE_SCHEMA or raw.get("complete") is not True:
-        raise ArchiveFailed("process evidence is not a complete admitted snapshot")
+    required_shape = {"schema", "complete", "provider", "identities", "processes", "lane_binding"}
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != required_shape
+        or raw.get("schema") != PROCESS_EVIDENCE_SCHEMA
+        or raw.get("complete") is not True
+    ):
+        raise ArchiveFailed("process evidence is not a closed lane-owned record")
+    binding = raw.get("lane_binding")
+    if not isinstance(binding, Mapping):
+        raise ArchiveFailed("process evidence lacks its lane binding")
+    binding = dict(binding)
     identities = raw.get("identities")
     processes = raw.get("processes")
     if not isinstance(identities, dict) or set(identities) != {"controller", "worker", "helper"}:
@@ -450,10 +500,19 @@ def _load_process_evidence(value: object) -> tuple[dict[str, Any], bytes, Proces
             raise ArchiveFailed("persisted process identities are ambiguous")
         role_pids.add(pid)
         normalized[role] = {"pid": pid, "created_utc": iso_utc(created)}
-    return reference, data, ProcessSnapshot(True, tuple(rows), provider=str(raw.get("provider", "persisted"))), normalized
+    return reference, data, normalized, binding
 
 
 def _process_proof(snapshot: ProcessSnapshot, identities: Mapping[str, Mapping[str, Any]]) -> tuple[bool, str, dict[str, Any]]:
+    if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete or not snapshot.provider or snapshot.provider in {"unknown", "persisted"}:
+        return False, "PROCESS_SNAPSHOT_INCOMPLETE", {
+            "complete": bool(getattr(snapshot, "complete", False)),
+            "provider": str(getattr(snapshot, "provider", "unknown")),
+            "errors": list(getattr(snapshot, "errors", ())),
+            "states": {},
+        }
+    if len(snapshot.by_pid) != len(snapshot.processes):
+        return False, "PROCESS_SNAPSHOT_AMBIGUOUS", {"complete": True, "provider": snapshot.provider, "states": {}}
     states: dict[str, str] = {}
     for role, identity in identities.items():
         pid = identity["pid"]
@@ -468,10 +527,10 @@ def _process_proof(snapshot: ProcessSnapshot, identities: Mapping[str, Mapping[s
         else:
             states[role] = "LIVE"
     if "AMBIGUOUS" in states.values():
-        return False, "LIVE_USE_AMBIGUOUS", {"complete": True, "states": states}
+        return False, "LIVE_USE_AMBIGUOUS", {"complete": True, "provider": snapshot.provider, "states": states}
     if "LIVE" in states.values():
-        return False, "LIVE_USE_PROVEN", {"complete": True, "states": states}
-    return True, "NO_LIVE_USE_PROVED", {"complete": True, "states": states}
+        return False, "LIVE_USE_PROVEN", {"complete": True, "provider": snapshot.provider, "states": states}
+    return True, "NO_LIVE_USE_PROVED", {"complete": True, "provider": snapshot.provider, "states": states}
 
 
 @dataclass(frozen=True)
@@ -498,6 +557,104 @@ def _visible_result(lane: Path, reason: str, *, archive: Path | None = None, rev
     return RetirementResult("VISIBLE", reason, lane, archive, retained_revision=revision, visible=True)
 
 
+def _same_path(left: str | Path, right: str | Path) -> bool:
+    return os.path.normcase(str(_lexical(left))) == os.path.normcase(str(_lexical(right)))
+
+
+def _registered_worktree_matches(lane: Path) -> bool:
+    blocks = [block for block in _git_text(lane, "worktree", "list", "--porcelain").split("\n\n") if block.strip()]
+    matches = []
+    for block in blocks:
+        candidate = next(
+            (line[len("worktree "):].strip() for line in block.splitlines() if line.startswith("worktree ")),
+            None,
+        )
+        if candidate is not None and _same_path(candidate, lane):
+            matches.append(candidate)
+    return len(matches) == 1
+
+
+def _common_directory(lane: Path) -> Path:
+    raw = Path(_git_text(lane, "rev-parse", "--git-common-dir"))
+    return _lexical(raw if raw.is_absolute() else lane / raw)
+
+
+def _validate_lane_binding(
+    lane: Path,
+    *,
+    lane_id: str,
+    binding: Mapping[str, Any],
+    retained_revision: str | None = None,
+    retained_ref: str | None = None,
+    target_revision: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    required = {
+        "lane_id", "worktree", "git_common_dir", "branch", "expected_head", "retained_ref", "target_revision",
+    }
+    if set(binding) != required:
+        return None, "LANE_BINDING_SHAPE_INVALID"
+    if binding.get("lane_id") != lane_id or not _same_path(str(binding.get("worktree")), lane):
+        return None, "LANE_BINDING_FOREIGN_WORKTREE"
+    if not isinstance(binding.get("branch"), str) or not isinstance(binding.get("git_common_dir"), str):
+        return None, "LANE_BINDING_IDENTITY_INVALID"
+    try:
+        actual_common = _common_directory(lane)
+    except LaneLifecycleError as exc:
+        return None, f"GIT_STATE_UNKNOWN:{type(exc).__name__}"
+    if not _same_path(str(binding["git_common_dir"]), actual_common):
+        return None, "LANE_BINDING_FOREIGN_COMMON_DIR"
+    if binding.get("retained_ref") != retained_ref or binding.get("target_revision") != target_revision:
+        return None, "LANE_BINDING_CLAIM_MISMATCH"
+    if not isinstance(binding.get("expected_head"), str):
+        return None, "LANE_BINDING_EXPECTED_HEAD_INVALID"
+    try:
+        expected_head = _exact_revision(lane, binding["expected_head"], name="binding expected_head")
+        target = _exact_revision(lane, binding["target_revision"], name="binding target_revision")
+        caller_retained = _exact_revision(lane, retained_revision, name="retained_revision claim")
+        caller_target = _exact_revision(lane, target_revision, name="target_revision claim")
+    except LaneLifecycleError as exc:
+        return None, f"LANE_BINDING_REVISION_INVALID:{type(exc).__name__}"
+    if caller_retained.lower() != expected_head.lower() or caller_target.lower() != target.lower():
+        return None, "LANE_BINDING_CLAIM_MISMATCH"
+    branch = _git(lane, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch.returncode != 0 or not branch.stdout.strip():
+        return None, "AMBIGUOUS_BRANCH"
+    branch_name = branch.stdout.decode("utf-8", errors="replace").strip()
+    if binding["branch"] != branch_name:
+        return None, "LANE_BINDING_BRANCH_MISMATCH"
+    if not _registered_worktree_matches(lane):
+        return None, "LANE_BINDING_WORKTREE_NOT_REGISTERED"
+    actual_head = _git_text(lane, "rev-parse", "--verify", "HEAD^{commit}").lower()
+    state: dict[str, Any] = {
+        "path": str(lane),
+        "common_dir": str(actual_common),
+        "branch": branch_name,
+        "actual_head": actual_head,
+        "expected_head": expected_head,
+        "retained_ref": retained_ref,
+        "target_revision": target,
+    }
+    if actual_head != expected_head.lower():
+        return state, "ACTUAL_HEAD_CHANGED_AFTER_AUTHORIZATION"
+    status = _git(lane, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status.returncode != 0:
+        return state, "GIT_STATE_UNKNOWN:STATUS_FAILED"
+    state["clean"] = not bool(status.stdout)
+    if status.stdout:
+        return state, "DIRTY_WORKTREE"
+    try:
+        retained_ref_commit = _git_text(lane, "rev-parse", "--verify", f"{_safe_ref(retained_ref, name='retained_ref')}^{{commit}}").lower()
+    except LaneLifecycleError as exc:
+        return state, f"RETAINED_REF_UNKNOWN:{type(exc).__name__}"
+    state["retained_ref_commit"] = retained_ref_commit
+    if _git(lane, "merge-base", "--is-ancestor", actual_head, retained_ref).returncode != 0:
+        return state, "RETAINED_REVISION_UNPROVEN"
+    if _git(lane, "merge-base", "--is-ancestor", actual_head, target).returncode != 0:
+        return state, "UNMERGED_WORK_PRESENT"
+    state["ancestry_verified"] = True
+    return state, None
+
+
 def _archive_digest(value: Mapping[str, Any]) -> str:
     normalized = dict(value)
     normalized["archive_content_sha256"] = ""
@@ -508,23 +665,17 @@ def _copy_member(stage: Path, name: str, data: bytes) -> dict[str, Any]:
     if not _safe_member(name):
         raise ArchiveFailed(f"unsafe archive member name: {name}")
     destination = stage / name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    _reject_reparse_chain(destination.parent)
-    if _is_reparse(destination.parent):
-        raise ArchiveFailed("archive staging parent became a reparse point")
-    temporary: Path | None = None
     try:
-        fd, raw_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
-        temporary = Path(raw_name)
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        ensure_directory_path(destination.parent)
+        relative = destination.relative_to(stage)
+        mutation_replace(
+            stage,
+            relative,
+            data,
+            expected=capture_target(stage, relative),
+        )
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise ArchiveFailed(str(exc)) from exc
     digest = hashlib.sha256(data).hexdigest()
     if not destination.is_file() or _sha256(destination) != digest or destination.stat().st_size != len(data):
         raise ArchiveFailed(f"archive member validation failed: {name}")
@@ -536,9 +687,9 @@ def retire_terminal_lane(
     archive_root: str | Path,
     *,
     lane_id: str,
-    retained_revision: str,
-    retained_ref: str,
-    target_revision: str,
+    retained_revision: str | None = None,
+    retained_ref: str | None = None,
+    target_revision: str | None = None,
     process_evidence: str | Path,
     task_ref: object = None,
     result_ref: object = None,
@@ -559,44 +710,58 @@ def retire_terminal_lane(
         return _visible_result(lane, "ARCHIVE_ROOT_OVERLAPS_LANE")
     if not isinstance(lane_id, str) or not lane_id.strip() or Path(lane_id).is_absolute() or ".." in Path(lane_id).parts or Path(lane_id).name != lane_id:
         return _visible_result(lane, "LANE_ID_INVALID")
-    try:
-        actual_head = _exact_revision(lane, retained_revision, name="retained_revision")
-        target = _exact_revision(lane, target_revision, name="target_revision")
-        ref = _safe_ref(retained_ref, name="retained_ref")
-        retained_ref_commit = _git_text(lane, "rev-parse", "--verify", f"{ref}^{{commit}}").lower()
-        if _git(lane, "merge-base", "--is-ancestor", actual_head, ref).returncode != 0:
-            return _visible_result(lane, "RETAINED_REVISION_UNPROVEN", revision=actual_head)
-        if _git(lane, "merge-base", "--is-ancestor", actual_head, target).returncode != 0:
-            return _visible_result(lane, "UNMERGED_WORK_PRESENT", revision=actual_head)
-        status = _git(lane, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-        if status.returncode != 0 or status.stdout:
-            return _visible_result(lane, "DIRTY_WORKTREE", revision=actual_head)
-        branch = _git(lane, "symbolic-ref", "--quiet", "--short", "HEAD")
-        if branch.returncode != 0 or not branch.stdout.strip():
-            return _visible_result(lane, "AMBIGUOUS_BRANCH", revision=actual_head)
-    except LaneLifecycleError as exc:
-        return _visible_result(lane, f"GIT_STATE_UNKNOWN:{type(exc).__name__}", revision=retained_revision)
-
     required = {
         "task": task_ref, "result": result_ref, "findings": findings_ref,
         "acceptance": acceptance_ref, "transcript": transcript_ref, "dependency": dependency_ref,
     }
     if any(value is None for value in required.values()):
-        return _visible_result(lane, "ARCHIVE_EVIDENCE_INCOMPLETE", revision=actual_head)
+        return _visible_result(lane, "ARCHIVE_EVIDENCE_INCOMPLETE")
     try:
         refs: dict[str, tuple[dict[str, Any], bytes]] = {name: _source_reference(value, name=name) for name, value in required.items()}
-        process_ref, process_bytes, process_snapshot, identities = _load_process_evidence(process_evidence)
-        absent, live_reason, process_proof = _process_proof(process_snapshot, identities)
-        if not absent:
-            return _visible_result(lane, live_reason, revision=actual_head)
+        process_ref, process_bytes, identities, binding = _load_process_evidence(process_evidence, lane=lane)
+        if retained_revision is None:
+            retained_revision = binding.get("expected_head") if isinstance(binding.get("expected_head"), str) else None
+        if retained_ref is None:
+            retained_ref = binding.get("retained_ref") if isinstance(binding.get("retained_ref"), str) else None
+        if target_revision is None:
+            target_revision = binding.get("target_revision") if isinstance(binding.get("target_revision"), str) else None
+        if not isinstance(retained_revision, str) or not isinstance(retained_ref, str) or not isinstance(target_revision, str):
+            raise ArchiveFailed("lane-owned binding lacks exact retirement claims")
     except ArchiveFailed as exc:
-        return _visible_result(lane, f"ARCHIVE_EVIDENCE_INCOMPLETE:{str(exc)[:160]}", revision=actual_head)
+        return _visible_result(lane, f"ARCHIVE_EVIDENCE_INCOMPLETE:{str(exc)[:160]}")
+
+    try:
+        git_state, git_reason = _validate_lane_binding(
+            lane,
+            lane_id=lane_id,
+            binding=binding,
+            retained_revision=retained_revision,
+            retained_ref=retained_ref,
+            target_revision=target_revision,
+        )
+    except LaneLifecycleError as exc:
+        return _visible_result(lane, f"GIT_STATE_UNKNOWN:{type(exc).__name__}", revision=retained_revision)
+    actual_head = str((git_state or {}).get("actual_head") or retained_revision)
+    if git_reason is not None:
+        return _visible_result(lane, git_reason, revision=actual_head)
+
+    try:
+        fresh_process = process_snapshot()
+    except Exception as exc:
+        return _visible_result(lane, f"PROCESS_SNAPSHOT_UNKNOWN:{type(exc).__name__}", revision=actual_head)
+    absent, live_reason, process_proof = _process_proof(fresh_process, identities)
+    if not absent:
+        return _visible_result(lane, live_reason, revision=actual_head)
 
     archive_dir = archive_base / lane_id
     if os.path.lexists(archive_dir):
         return _visible_result(lane, "ARCHIVE_ALREADY_EXISTS", archive=archive_dir / "LANE_ARCHIVE.json", revision=actual_head)
-    staging = Path(tempfile.mkdtemp(prefix=f".{lane_id}.staging-", dir=str(archive_base)))
+    try:
+        staging = make_temporary_directory(archive_base, prefix=f".{lane_id}.staging-")
+    except (MutationConflict, MutationUnsupported) as exc:
+        return _visible_result(lane, f"ARCHIVE_FAILED:{type(exc).__name__}", revision=actual_head)
     archive_path = staging / "LANE_ARCHIVE.json"
+    staging_state = capture_target(archive_base, staging.name)
     try:
         archive_refs: dict[str, dict[str, Any]] = {}
         for name, (reference, data) in refs.items():
@@ -612,47 +777,78 @@ def retire_terminal_lane(
             "transcript": archive_refs["transcript"], "dependency": archive_refs["dependency"],
             "process_evidence": archive_refs["process_evidence"], "references": archive_refs,
             "content_identities": {name: item["sha256"] for name, item in archive_refs.items()},
-            "retained_revision": actual_head, "retained_ref": ref,
-            "retained_ref_commit": retained_ref_commit, "target_revision": target,
-            "worktree": {"path": str(lane), "clean": True, "branch": branch.stdout.decode("utf-8", errors="replace").strip()},
+            "retained_revision": git_state["actual_head"], "retained_ref": git_state["retained_ref"],
+            "retained_ref_commit": git_state["retained_ref_commit"], "target_revision": git_state["target_revision"],
+            "worktree": {"path": git_state["path"], "common_dir": git_state["common_dir"], "clean": True, "branch": git_state["branch"], "actual_head": git_state["actual_head"]},
+            "lane_binding": dict(binding),
             "no_live_process_proof": {**process_proof, "state": live_reason},
-            "no_unmerged_work_proof": {"target_revision": target, "ancestry_verified": True},
+            "no_unmerged_work_proof": {"target_revision": git_state["target_revision"], "ancestry_verified": True},
             "close_result": "PENDING", "discarded_cache_inventory": discarded,
             "archive_content_sha256": "",
         }
         archive["archive_content_sha256"] = _archive_digest(archive)
         _atomic_json(archive_path, archive)
         validate_lane_archive(archive_path)
-        os.replace(staging, archive_dir)
+        mutation_rename(
+            archive_base,
+            staging.name,
+            archive_dir.name,
+            expected_source=staging_state,
+            expected_target=TargetState.absent(),
+        )
         staging = archive_dir
         archive_path = archive_dir / "LANE_ARCHIVE.json"
         validate_lane_archive(archive_path)
     except Exception as exc:
         try:
-            if staging.exists() and not _is_reparse(staging):
-                shutil.rmtree(staging)
-        except OSError:
+            if staging.parent == archive_base and staging.exists() and not _is_reparse(staging):
+                remove_tree(archive_base, staging.name, expected=staging_state)
+        except (OSError, MutationConflict, MutationUnsupported):
             pass
         return _visible_result(lane, f"ARCHIVE_FAILED:{type(exc).__name__}", revision=actual_head)
 
-    blocks = _git_text(lane, "worktree", "list", "--porcelain").split("\n\n")
-    admin_root: Path | None = None
+    blocks = [block for block in _git_text(lane, "worktree", "list", "--porcelain").split("\n\n") if block.strip()]
+    admin_roots: list[Path] = []
     for block in blocks:
         candidate = next((line[len("worktree "):] for line in block.splitlines() if line.startswith("worktree ")), None)
-        if candidate is not None and _lexical(candidate) != lane:
-            admin_root = _lexical(candidate)
-            break
-    if admin_root is None:
+        if candidate is not None and not _same_path(candidate, lane):
+            admin_roots.append(_lexical(candidate))
+    if len(admin_roots) != 1:
         return _visible_result(lane, "NO_GIT_ADMIN_WORKTREE", archive=archive_path, revision=actual_head)
+    admin_root = admin_roots[0]
+
+    try:
+        final_state, final_git_reason = _validate_lane_binding(
+            lane,
+            lane_id=lane_id,
+            binding=binding,
+            retained_revision=retained_revision,
+            retained_ref=retained_ref,
+            target_revision=target_revision,
+        )
+        final_snapshot = process_snapshot()
+        final_absent, final_live_reason, final_process_proof = _process_proof(final_snapshot, identities)
+    except Exception as exc:
+        return _visible_result(lane, f"PRE_CLOSE_PROOF_UNKNOWN:{type(exc).__name__}", archive=archive_path, revision=actual_head)
+    final_revision = str((final_state or {}).get("actual_head") or actual_head)
+    if final_git_reason is not None:
+        return _visible_result(lane, f"PRE_CLOSE_{final_git_reason}", archive=archive_path, revision=final_revision)
+    if not final_absent:
+        return _visible_result(lane, f"PRE_CLOSE_{final_live_reason}", archive=archive_path, revision=final_revision)
+
     removal = _git(admin_root, "worktree", "remove", str(lane))
     if removal.returncode != 0:
         detail = removal.stderr.decode("utf-8", errors="replace").strip()[:300]
-        return _visible_result(lane, f"ARCHIVE_SUCCEEDED_CLOSE_FAILED:{detail or 'git worktree remove failed'}", archive=archive_path, revision=actual_head)
+        return _visible_result(lane, f"ARCHIVE_SUCCEEDED_CLOSE_FAILED:{detail or 'git worktree remove failed'}", archive=archive_path, revision=final_revision)
     archive_digest = _sha256(archive_path)
     try:
         closed = json.loads(archive_path.read_text(encoding="utf-8"))
         if not isinstance(closed, dict):
             raise ArchiveFailed("archive changed shape after Git close")
+        closed["pre_close_proof"] = {
+            "git": final_state,
+            "process": {**final_process_proof, "state": final_live_reason},
+        }
         closed["close_result"] = "CLOSED"
         closed["closed_utc"] = iso_utc(utc_now())
         closed["archive_content_sha256"] = ""
@@ -662,8 +858,8 @@ def retire_terminal_lane(
     except Exception as exc:
         # Git close is already proven.  Preserve the self-contained PENDING
         # archive and report closed metadata uncertainty honestly.
-        return RetirementResult("CLOSED_UNCERTAIN", f"ARCHIVE_CLOSE_RESULT_FAILED:{type(exc).__name__}", lane, archive_path, archive_digest, actual_head, True, False)
-    return RetirementResult("CLOSED", "ARCHIVED_AND_CLOSED", lane, archive_path, _sha256(archive_path), actual_head, True, False)
+        return RetirementResult("CLOSED_UNCERTAIN", f"ARCHIVE_CLOSE_RESULT_FAILED:{type(exc).__name__}", lane, archive_path, archive_digest, final_revision, True, False)
+    return RetirementResult("CLOSED", "ARCHIVED_AND_CLOSED", lane, archive_path, _sha256(archive_path), final_revision, True, False)
 
 
 retire_lane = retire_terminal_lane

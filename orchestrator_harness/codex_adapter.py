@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import stat
-import tempfile
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -35,6 +34,16 @@ from .host_adapters import (
     UnsupportedHostAdapterError,
 )
 from .models import iso_utc, parse_utc, utc_now
+from .mutation import (
+    MutationConflict,
+    MutationReceipt,
+    MutationUnsupported,
+    TargetState,
+    capture_target,
+    delete as mutation_delete,
+    ensure_directory_path,
+    replace as mutation_replace,
+)
 from .notifications import ManagerEventRouter
 from .stable_io import canonical_json
 
@@ -369,6 +378,7 @@ class _ProjectMutationGuard:
         if not project.is_dir() or _is_reparse(project):
             raise CodexAdapterError("project-root must be an existing regular directory")
         self._project_identity = _identity(project)
+        self._last_receipts: dict[str, MutationReceipt] = {}
         if prepare_codex:
             self.ensure_directory(Path(".codex"))
             self.ensure_directory(Path(".codex") / "hooks")
@@ -420,86 +430,96 @@ class _ProjectMutationGuard:
         candidate = Path(relative)
         if candidate.is_absolute() or ".." in candidate.parts:
             raise CodexAdapterError("project directory is not project-relative")
-        current = self.project
-        for part in candidate.parts:
-            self._check_project_identity()
-            next_path = current / part
-            if os.path.lexists(next_path):
-                if _is_reparse(next_path) or not next_path.is_dir():
-                    raise CodexInstallConflict(f"project directory is not a safe regular directory: {next_path}")
-            else:
-                parent_identity = _identity(current)
-                next_path.mkdir()
-                if _identity(current) != parent_identity or _is_reparse(next_path):
-                    raise CodexInstallConflict(f"project directory changed during creation: {current}")
-            current = next_path
         self._check_project_identity()
-        return current
+        try:
+            result = ensure_directory_path(self.project / candidate)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexInstallConflict(str(exc)) from exc
+        self._check_project_identity()
+        return result
+
+    def _relative(self, relative_or_path: str | Path) -> Path:
+        candidate = Path(relative_or_path)
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.relative_to(self.project)
+            except ValueError as exc:
+                raise CodexAdapterError("installer destination is outside the project") from exc
+        if not candidate.parts or ".." in candidate.parts:
+            raise CodexAdapterError("installer destination is not project-relative")
+        return candidate
+
+    def snapshot(self, relative_or_path: str | Path) -> TargetState:
+        relative = self._relative(relative_or_path)
+        self._check_project_identity()
+        try:
+            state = capture_target(self.project, relative)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexInstallConflict(str(exc)) from exc
+        if state.present and state.kind != "file":
+            raise CodexInstallConflict(f"managed destination is not a regular file: {self.project / relative}")
+        self._check_project_identity()
+        return state
 
     def read(self, relative_or_path: str | Path) -> bytes | None:
-        path = self.path(relative_or_path)
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
+        relative = self._relative(relative_or_path)
+        state = self.snapshot(relative)
+        if not state.present:
             return None
-        if stat.S_ISLNK(info.st_mode) or _is_reparse(path) or not stat.S_ISREG(info.st_mode):
-            raise CodexInstallConflict(f"managed destination is not a regular file: {path}")
-        if info.st_size > _MAX_MANIFEST_BYTES:
-            raise CodexInstallConflict(f"managed destination is oversized: {path}")
-        self._check_project_identity()
-        return path.read_bytes()
+        if state.size is not None and state.size > _MAX_MANIFEST_BYTES:
+            raise CodexInstallConflict(f"managed destination is oversized: {self.project / relative}")
+        return state.content
 
-    def atomic_replace(self, relative_or_path: str | Path, data: bytes) -> None:
-        path = self.path(relative_or_path, require_parent=True)
-        parent = path.parent
-        parent_identity = _identity(parent)
-        temporary: Path | None = None
+    def atomic_replace(
+        self,
+        relative_or_path: str | Path,
+        data: bytes,
+        *,
+        expected: TargetState | None = None,
+    ) -> MutationReceipt:
+        relative = self._relative(relative_or_path)
+        self.path(relative, require_parent=True)
+        authorized = expected if expected is not None else self.snapshot(relative)
         try:
-            descriptor, raw_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
-            )
-            temporary = Path(raw_name)
-            with os.fdopen(descriptor, "wb", closefd=True) as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            self.path(relative_or_path, require_parent=True)
-            if _identity(parent) != parent_identity:
-                raise CodexInstallConflict("project mutation parent identity changed before replace")
-            os.replace(temporary, path)
-            temporary = None
-            self.path(relative_or_path, require_parent=True)
-        finally:
-            if temporary is not None and temporary.exists():
-                # If the parent was substituted, leave the temporary in the
-                # original bounded directory rather than following a new path.
-                try:
-                    if _identity(parent) == parent_identity and not _is_reparse(parent):
-                        temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-    def delete(self, relative_or_path: str | Path) -> None:
-        path = self.path(relative_or_path, require_parent=True)
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return
-        if stat.S_ISLNK(info.st_mode) or _is_reparse(path) or not stat.S_ISREG(info.st_mode):
-            raise CodexInstallConflict(f"refusing to delete an unsafe project path: {path}")
-        parent = path.parent
-        parent_identity = _identity(parent)
-        self.path(relative_or_path, require_parent=True)
-        if _identity(parent) != parent_identity:
-            raise CodexInstallConflict("project mutation parent identity changed before delete")
-        path.unlink()
+            receipt = mutation_replace(self.project, relative, data, expected=authorized)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexInstallConflict(str(exc)) from exc
+        self._last_receipts[relative.as_posix()] = receipt
         self._check_project_identity()
+        return receipt
+
+    def delete(
+        self,
+        relative_or_path: str | Path,
+        *,
+        expected: TargetState | None = None,
+    ) -> MutationReceipt:
+        relative = self._relative(relative_or_path)
+        self.path(relative, require_parent=True)
+        authorized = expected if expected is not None else self.snapshot(relative)
+        try:
+            receipt = mutation_delete(self.project, relative, expected=authorized)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexInstallConflict(str(exc)) from exc
+        self._last_receipts[relative.as_posix()] = receipt
+        self._check_project_identity()
+        return receipt
 
     def restore(self, relative_or_path: str | Path, data: bytes | None) -> None:
+        relative = self._relative(relative_or_path)
+        prior = self._last_receipts.get(relative.as_posix())
+        current = self.snapshot(relative)
+        if prior is None:
+            if (data is None and not current.present) or (data is not None and current.content == data):
+                return
+            raise CodexInstallConflict(f"rollback target changed outside this transaction: {relative}")
+        expected = prior.resulting
         if data is None:
-            self.delete(relative_or_path)
+            if not expected.present:
+                return
+            self.delete(relative, expected=expected)
         else:
-            self.atomic_replace(relative_or_path, data)
+            self.atomic_replace(relative, data, expected=expected)
 
 
 def _project_guard(value: str | Path, *, prepare_codex: bool = False) -> _ProjectMutationGuard:
@@ -886,16 +906,17 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
                 raise CodexInstallConflict(f"unmanaged hook destination already exists: {relative}")
 
     target_relatives = [*packaged, HOOKS_RELATIVE, INSTALL_MANIFEST_RELATIVE]
-    originals = {relative: guard.read(relative) for relative in target_relatives}
+    original_states = {relative: guard.snapshot(relative) for relative in target_relatives}
+    originals = {relative: state.content for relative, state in original_states.items()}
     changed: list[str] = []
     try:
         for relative, data in packaged.items():
             if originals[relative] != data:
-                guard.atomic_replace(relative, data)
+                guard.atomic_replace(relative, data, expected=original_states[relative])
                 changed.append(str(relative))
         hooks_data = _merge_hooks(originals[HOOKS_RELATIVE])
         if originals[HOOKS_RELATIVE] != hooks_data:
-            guard.atomic_replace(HOOKS_RELATIVE, hooks_data)
+            guard.atomic_replace(HOOKS_RELATIVE, hooks_data, expected=original_states[HOOKS_RELATIVE])
             changed.append(HOOKS_RELATIVE.as_posix())
         expected_fragment = _managed_hook_fragment()
         managed_assets = {relative.as_posix(): _hash(value) for relative, value in packaged.items()}
@@ -925,7 +946,11 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
             "installed_utc": iso_utc(utc_now()),
         }
         manifest["manifest_content_sha256"] = _manifest_content_digest(manifest)
-        guard.atomic_replace(INSTALL_MANIFEST_RELATIVE, _json_bytes(manifest))
+        guard.atomic_replace(
+            INSTALL_MANIFEST_RELATIVE,
+            _json_bytes(manifest),
+            expected=original_states[INSTALL_MANIFEST_RELATIVE],
+        )
         changed.append(INSTALL_MANIFEST_RELATIVE.as_posix())
     except Exception as exc:
         rollback_errors: list[str] = []
@@ -970,12 +995,16 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     expected_assets = ({path.as_posix(): _hash(data) for path, data in packaged.items()} if revision == CODEX_PACKAGE_REVISION else _legacy_asset_hashes())
     removed: list[str] = []
     preserved: list[str] = []
-    originals = {relative: guard.read(relative) for relative in [*packaged, HOOKS_RELATIVE, INSTALL_MANIFEST_RELATIVE, CODEX_BINDING_RELATIVE]}
+    original_states = {
+        relative: guard.snapshot(relative)
+        for relative in [*packaged, HOOKS_RELATIVE, INSTALL_MANIFEST_RELATIVE, CODEX_BINDING_RELATIVE]
+    }
+    originals = {relative: state.content for relative, state in original_states.items()}
     try:
         for relative, data in packaged.items():
             expected = expected_assets.get(relative.as_posix())
             if _hash(originals[relative]) == expected:
-                guard.delete(relative)
+                guard.delete(relative, expected=original_states[relative])
                 removed.append(relative.as_posix())
             elif originals[relative] is not None:
                 preserved.append(relative.as_posix())
@@ -985,9 +1014,13 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
                 parsed, _, _ = _hook_state(hooks_data)
                 no_unrelated = set(parsed) == {"hooks"} and all(not parsed["hooks"].get(name, []) for name in parsed["hooks"])
                 if no_unrelated and manifest.get("hooks_preexisting") is False:
-                    guard.delete(HOOKS_RELATIVE)
+                    guard.delete(HOOKS_RELATIVE, expected=original_states[HOOKS_RELATIVE])
                 else:
-                    guard.atomic_replace(HOOKS_RELATIVE, hooks_data)
+                    guard.atomic_replace(
+                        HOOKS_RELATIVE,
+                        hooks_data,
+                        expected=original_states[HOOKS_RELATIVE],
+                    )
             removed.append(HOOKS_RELATIVE.as_posix())
         if hook_conflicts:
             preserved.append(HOOKS_RELATIVE.as_posix())
@@ -995,13 +1028,13 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
             try:
                 binding = _load_binding_for_hook(project, guard)
                 if binding.get("schema") == CODEX_BINDING_SCHEMA and binding.get("project_root") == str(project):
-                    guard.delete(CODEX_BINDING_RELATIVE)
+                    guard.delete(CODEX_BINDING_RELATIVE, expected=original_states[CODEX_BINDING_RELATIVE])
                     removed.append(CODEX_BINDING_RELATIVE.as_posix())
                 else:
                     preserved.append(CODEX_BINDING_RELATIVE.as_posix())
             except (CodexAdapterError, OSError):
                 preserved.append(CODEX_BINDING_RELATIVE.as_posix())
-        guard.delete(INSTALL_MANIFEST_RELATIVE)
+        guard.delete(INSTALL_MANIFEST_RELATIVE, expected=original_states[INSTALL_MANIFEST_RELATIVE])
         removed.append(INSTALL_MANIFEST_RELATIVE.as_posix())
     except Exception as exc:
         rollback_errors: list[str] = []
@@ -1157,11 +1190,11 @@ def activate_codex_binding(
     queue = _external_directory(router.root, name="manager queue root")
     root = _lexical_path(coordinator_root) if coordinator_root is not None else queue / "codex-coordinator"
     if not root.exists():
-        parent = _external_directory(root.parent, name="coordinator parent")
-        parent_identity = _identity(parent)
-        root.mkdir()
-        if _identity(parent) != parent_identity or _is_reparse(parent):
-            raise CodexAdapterError("coordinator parent identity changed")
+        _external_directory(root.parent, name="coordinator parent")
+        try:
+            ensure_directory_path(root)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexAdapterError(str(exc)) from exc
     if _is_reparse(root) or not root.is_dir():
         raise CodexAdapterError("coordinator root is not safe")
     transport = InstalledCodexHookTransport()
@@ -1183,7 +1216,11 @@ def activate_codex_binding(
         if prior_value != record:
             raise CodexInstallConflict("Codex binding record is stale or cross-bound")
     else:
-        guard.atomic_replace(CODEX_BINDING_RELATIVE, _json_bytes(record))
+        guard.atomic_replace(
+            CODEX_BINDING_RELATIVE,
+            _json_bytes(record),
+            expected=guard.snapshot(CODEX_BINDING_RELATIVE),
+        )
     return {"schema": CODEX_BINDING_SCHEMA, "binding": record, "state": coordinator.load_state()}
 
 

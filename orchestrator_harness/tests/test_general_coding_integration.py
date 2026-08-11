@@ -96,12 +96,12 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
                         result_record["commit"],
                     )
 
-            notification = _read_json(
-                root / "runtime" / "manager-epoch" / "pending-notification.json"
-            )
             event_id = result["acknowledged_event_id"]
             self.assertIsInstance(event_id, str)
-            self.assertIn(event_id, notification["acknowledged_event_ids"])
+            self.assertEqual(0, result["s3_queue_pending_after_ack"])
+            queue_root = Path(result["s3_queue_root"])
+            self.assertTrue((queue_root / "QUEUE.jsonl").is_file())
+            self.assertTrue((queue_root / "STATE.json").is_file())
             self.assertEqual([], list((root / "runtime" / "coding-resource-locks").glob("*.json")))
         finally:
             shutil.rmtree(root, onerror=_remove_readonly)

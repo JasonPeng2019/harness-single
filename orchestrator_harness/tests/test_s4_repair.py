@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
+import pkgutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from orchestrator_harness.codex_adapter import (
     CODEX_ADAPTER_VERSION,
@@ -32,6 +35,7 @@ from orchestrator_harness.lane_lifecycle import (
     validate_lane_archive,
 )
 from orchestrator_harness.notifications import ManagerEventRouter
+from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
 from orchestrator_harness.stable_io import SafeOutput
 from orchestrator_harness import codex_adapter, lane_lifecycle
 
@@ -91,19 +95,47 @@ class S4RepairRegressionTests(unittest.TestCase):
         *,
         processes: list[dict[str, object]] | None = None,
         identities: dict[str, dict[str, object]] | None = None,
+        binding: dict[str, object] | None = None,
+        provider: str = "synthetic",
     ) -> None:
         persisted = identities or {
             "controller": {"pid": 9001, "created_utc": "2000-01-01T00:00:00Z"},
             "worker": {"pid": 9002, "created_utc": "2000-01-01T00:00:00Z"},
             "helper": {"pid": 9003, "created_utc": "2000-01-01T00:00:00Z"},
         }
-        path.write_text(json.dumps({
+        evidence: dict[str, object] = {
             "schema": "orchestrator-process-evidence/v1",
             "complete": True,
-            "provider": "synthetic",
+            "provider": provider,
             "identities": persisted,
             "processes": processes or [],
-        }) + "\n", encoding="utf-8")
+        }
+        if binding is not None:
+            evidence["lane_binding"] = binding
+        path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+
+    @classmethod
+    def _lane_binding(
+        cls,
+        lane: Path,
+        *,
+        lane_id: str,
+        expected_head: str,
+        retained_ref: str,
+        target_revision: str,
+    ) -> dict[str, object]:
+        common = Path(cls._git(lane, "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = (lane / common).resolve()
+        return {
+            "lane_id": lane_id,
+            "worktree": str(lane.resolve()),
+            "git_common_dir": str(common.resolve()),
+            "branch": cls._git(lane, "symbolic-ref", "--short", "HEAD"),
+            "expected_head": expected_head,
+            "retained_ref": retained_ref,
+            "target_revision": target_revision,
+        }
 
     @classmethod
     def _git_fixture(cls, root: Path) -> tuple[Path, Path, str]:
@@ -129,6 +161,18 @@ class S4RepairRegressionTests(unittest.TestCase):
             path.write_text(json.dumps({"name": name}) + "\n", encoding="utf-8")
             refs.append(path)
         return refs
+
+    @classmethod
+    def _lane_process_path(cls, lane: Path) -> Path:
+        workspace = lane / ".agent-workspace"
+        workspace.mkdir(exist_ok=True)
+        exclude = Path(cls._git(lane, "rev-parse", "--git-path", "info/exclude"))
+        if not exclude.is_absolute():
+            exclude = lane / exclude
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ".agent-workspace/" not in existing:
+            exclude.write_text(existing + ".agent-workspace/\n", encoding="utf-8")
+        return workspace / "process.json"
 
     def test_FC1_closed_manifest_rejects_foreign_prior_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -170,7 +214,6 @@ class S4RepairRegressionTests(unittest.TestCase):
             outside = root / "outside"
             outside.mkdir()
             guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
-            original_mkstemp = tempfile.mkstemp
             moved = outside / "original-hooks"
             swapped = False
 
@@ -180,10 +223,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     hooks.rename(moved)
                     hooks.mkdir()
                     swapped = True
-                return original_mkstemp(*args, **kwargs)
 
             try:
-                with patch("orchestrator_harness.codex_adapter.tempfile.mkstemp", side_effect=swap_parent):
+                with patch("orchestrator_harness.mutation._before_commit", side_effect=swap_parent):
                     with self.assertRaises(CodexInstallConflict):
                         guard.atomic_replace(Path(".codex/hooks/repair.txt"), b"bounded")
                 self.assertFalse((outside / "repair.txt").exists())
@@ -192,6 +234,209 @@ class S4RepairRegressionTests(unittest.TestCase):
                     child.unlink(missing_ok=True)
                 hooks.rmdir()
                 moved.rename(hooks)
+
+    def test_FC10_changed_target_after_authorization_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            hooks = project / ".codex" / "hooks"
+            hooks.mkdir(parents=True)
+            target = hooks / "repair.txt"
+            target.write_bytes(b"authorized-before\n")
+            guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
+            changed = False
+
+            def change_target():
+                nonlocal changed
+                target.write_bytes(b"user-after-authorization\n")
+                changed = True
+
+            with patch("orchestrator_harness.mutation._before_commit", side_effect=change_target):
+                with self.assertRaises(CodexInstallConflict):
+                    guard.atomic_replace(
+                        Path(".codex/hooks/repair.txt"),
+                        b"managed-after-authorization\n",
+                    )
+            self.assertTrue(changed)
+            self.assertEqual(b"user-after-authorization\n", target.read_bytes())
+
+    def test_FC11_parent_reparse_swap_has_no_outside_write(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            hooks = project / ".codex" / "hooks"
+            hooks.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_bytes(b"outside-user-bytes\n")
+            moved = outside / "original-hooks"
+            guard = codex_adapter._ProjectMutationGuard(project, prepare_codex=True)
+            swapped = False
+
+            def swap_parent() -> None:
+                nonlocal swapped
+                hooks.rename(moved)
+                result = subprocess.run(
+                    ["cmd.exe", "/c", "mklink", "/J", str(hooks), str(outside)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    raise AssertionError(f"junction fixture failed: {result.stderr}")
+                swapped = True
+
+            try:
+                with patch("orchestrator_harness.mutation._before_commit", side_effect=swap_parent, create=True):
+                    with self.assertRaises(CodexInstallConflict):
+                        guard.atomic_replace(Path(".codex/hooks/reparse.txt"), b"must stay inside\n")
+                self.assertTrue(swapped)
+                self.assertEqual(b"outside-user-bytes\n", sentinel.read_bytes())
+                self.assertEqual({"original-hooks", "sentinel.txt"}, {path.name for path in outside.glob("*")})
+                self.assertFalse((outside / "reparse.txt").exists())
+            finally:
+                if hooks.exists() or os.path.lexists(hooks):
+                    hooks.rmdir()
+                if moved.exists():
+                    moved.rename(hooks)
+
+    def test_FC12_changed_target_head_after_authorization_stays_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, authorized = self._git_fixture(root)
+            (lane / "changed-after-auth.txt").write_text("changed\n", encoding="utf-8")
+            self._git(lane, "add", ".")
+            self._git(lane, "commit", "-m", "change after authorization")
+            actual_head = self._git(lane, "rev-parse", "HEAD")
+            self.assertNotEqual(authorized, actual_head)
+            refs = self._archive_refs(root)
+            process = self._lane_process_path(lane)
+            self._process_evidence(
+                process,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="repair",
+                    expected_head=authorized,
+                    retained_ref="refs/heads/main",
+                    target_revision=authorized,
+                ),
+            )
+            result = retire_terminal_lane(
+                lane,
+                root / "archive",
+                lane_id="repair",
+                retained_revision=authorized,
+                retained_ref="refs/heads/main",
+                target_revision=authorized,
+                process_evidence=process,
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertTrue(lane.exists())
+            self.assertEqual(actual_head, self._git(lane, "rev-parse", "HEAD"))
+            del main
+
+    def test_FC13_foreign_worktree_binding_stays_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            foreign = root / "foreign"
+            self._git(main, "worktree", "add", "-b", "foreign-lane", str(foreign), "HEAD")
+            refs = self._archive_refs(root)
+            process = self._lane_process_path(lane)
+            self._process_evidence(
+                process,
+                binding=self._lane_binding(
+                    foreign,
+                    lane_id="foreign",
+                    expected_head=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                ),
+            )
+            result = retire_terminal_lane(
+                lane,
+                root / "archive",
+                lane_id="repair",
+                retained_revision=revision,
+                retained_ref="refs/heads/main",
+                target_revision=revision,
+                process_evidence=process,
+                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+            )
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertTrue(lane.exists())
+            self._git(main, "worktree", "remove", "--force", str(foreign))
+            del lane
+
+    def test_FC14_retirement_uses_fresh_complete_process_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            refs = self._archive_refs(root)
+            process = self._lane_process_path(lane)
+            created = datetime(2000, 1, 1, tzinfo=timezone.utc)
+            identities = {
+                role: {"pid": 9000 + index, "created_utc": "2000-01-01T00:00:00Z"}
+                for index, role in enumerate(("controller", "worker", "helper"))
+            }
+            self._process_evidence(
+                process,
+                identities=identities,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="live",
+                    expected_head=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                ),
+            )
+            provider = MagicMock(return_value=ProcessSnapshot(
+                complete=True,
+                processes=tuple(
+                    ProcessInfo(
+                        pid=9000 + index,
+                        ppid=1,
+                        name="python",
+                        command_line="synthetic live process",
+                        created_utc=created,
+                    )
+                    for index in range(3)
+                ),
+                provider="synthetic-test",
+            ))
+            with patch.object(lane_lifecycle, "process_snapshot", provider, create=True):
+                result = retire_terminal_lane(
+                    lane,
+                    root / "archive",
+                    lane_id="live",
+                    retained_revision=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                    process_evidence=process,
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
+            self.assertTrue(provider.called)
+            self.assertEqual("VISIBLE", result.outcome)
+            self.assertEqual("LIVE_USE_PROVEN", result.reason)
+            self.assertTrue(lane.exists())
+            del main
+
+    def test_FC15_retained_tests_import_without_removed_authority(self) -> None:
+        package = importlib.import_module("orchestrator_harness.tests")
+        failures: list[str] = []
+        for module in pkgutil.iter_modules(package.__path__, package.__name__ + "."):
+            if not module.name.rsplit(".", 1)[-1].startswith("test_"):
+                continue
+            try:
+                importlib.import_module(module.name)
+            except Exception as exc:  # pragma: no cover - failure detail is asserted below
+                failures.append(f"{module.name}: {type(exc).__name__}: {exc}")
+        self.assertEqual([], failures)
 
     def test_FC4_cross_bound_receipt_is_not_successfully_journaled(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -292,7 +537,16 @@ class S4RepairRegressionTests(unittest.TestCase):
             exclude.write_text(".agent-workspace/\n", encoding="utf-8")
             refs = self._archive_refs(lane_evidence_root)
             process = lane_evidence_root / "evidence" / "process.json"
-            self._process_evidence(process)
+            self._process_evidence(
+                process,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="repair",
+                    expected_head=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                ),
+            )
             result = retire_terminal_lane(
                 lane,
                 root / "archive",
@@ -315,8 +569,17 @@ class S4RepairRegressionTests(unittest.TestCase):
             root = Path(raw)
             main, lane, revision = self._git_fixture(root)
             refs = self._archive_refs(root)
-            process = root / "evidence" / "process.json"
-            self._process_evidence(process)
+            process = self._lane_process_path(lane)
+            self._process_evidence(
+                process,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="unretained",
+                    expected_head=revision,
+                    retained_ref="refs/heads/does-not-exist",
+                    target_revision=revision,
+                ),
+            )
             blocked = retire_terminal_lane(
                 lane,
                 root / "archive-unretained",
@@ -345,7 +608,7 @@ class S4RepairRegressionTests(unittest.TestCase):
             self.assertTrue(lane.exists())
             current_created = "2026-01-01T00:00:00Z"
             live_pids = (os.getpid(), os.getpid() + 1, os.getpid() + 2)
-            live_evidence = root / "evidence" / "live-process.json"
+            live_evidence = self._lane_process_path(lane).with_name("live-process.json")
             self._process_evidence(
                 live_evidence,
                 identities={
@@ -356,24 +619,54 @@ class S4RepairRegressionTests(unittest.TestCase):
                     {"pid": pid, "ppid": 1, "name": "python", "command_line": "synthetic repair test", "created_utc": current_created}
                     for pid in live_pids
                 ],
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="live",
+                    expected_head=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                ),
             )
-            live = retire_terminal_lane(
-                lane,
-                root / "archive-live",
-                lane_id="live",
-                retained_revision=revision,
-                retained_ref="refs/heads/main",
-                target_revision=revision,
-                process_evidence=live_evidence,
-                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
-            )
+            with patch.object(
+                lane_lifecycle,
+                "process_snapshot",
+                return_value=ProcessSnapshot(
+                    True,
+                    tuple(
+                        ProcessInfo(pid, 1, "python", "synthetic repair test", datetime(2026, 1, 1, tzinfo=timezone.utc))
+                        for pid in live_pids
+                    ),
+                    (),
+                    "synthetic-test",
+                ),
+            ):
+                live = retire_terminal_lane(
+                    lane,
+                    root / "archive-live",
+                    lane_id="live",
+                    retained_revision=revision,
+                    retained_ref="refs/heads/main",
+                    target_revision=revision,
+                    process_evidence=live_evidence,
+                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
+                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                )
             self.assertEqual("VISIBLE", live.outcome)
             self.assertEqual("LIVE_USE_PROVEN", live.reason)
             (lane / "unmerged.txt").write_text("unmerged\n", encoding="utf-8")
             self._git(lane, "add", ".")
             self._git(lane, "commit", "-m", "unmerged")
             lane_revision = self._git(lane, "rev-parse", "HEAD")
+            self._process_evidence(
+                process,
+                binding=self._lane_binding(
+                    lane,
+                    lane_id="unmerged",
+                    expected_head=lane_revision,
+                    retained_ref="HEAD",
+                    target_revision=revision,
+                ),
+            )
             unmerged = retire_terminal_lane(
                 lane,
                 root / "archive-unmerged",

@@ -259,9 +259,6 @@ def build_parser() -> argparse.ArgumentParser:
     retire.add_argument("--lane-root", required=True, type=Path)
     retire.add_argument("--archive-root", required=True, type=Path)
     retire.add_argument("--lane-id", required=True)
-    retire.add_argument("--retained-revision", required=True)
-    retire.add_argument("--retained-ref", required=True)
-    retire.add_argument("--target-revision", required=True)
     retire.add_argument("--process-evidence", required=True, type=Path)
     for name in ("task-ref", "result-ref", "findings-ref", "acceptance-ref", "transcript-ref", "dependency-ref"):
         retire.add_argument(f"--{name}", required=True, type=Path)
@@ -298,8 +295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "lane":
             result = retire_terminal_lane(
                 args.lane_root, args.archive_root, lane_id=args.lane_id,
-                retained_revision=args.retained_revision, retained_ref=args.retained_ref,
-                target_revision=args.target_revision, process_evidence=args.process_evidence,
+                process_evidence=args.process_evidence,
                 task_ref=args.task_ref, result_ref=args.result_ref, findings_ref=args.findings_ref,
                 acceptance_ref=args.acceptance_ref, transcript_ref=args.transcript_ref,
                 dependency_ref=args.dependency_ref,

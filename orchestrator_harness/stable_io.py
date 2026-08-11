@@ -4,12 +4,20 @@ import hashlib
 import json
 import os
 import stat
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .models import StableBytes
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    append_bytes as mutation_append,
+    capture_target,
+    ensure_directory_path,
+    rename as mutation_rename,
+    replace as mutation_replace,
+)
 
 
 class UnstableReadError(OSError):
@@ -49,7 +57,7 @@ class PathKeyedAppendLock:
     def __enter__(self) -> "PathKeyedAppendLock":
         handle: Any | None = None
         try:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_directory_path(self.lock_path.parent)
             handle = self.lock_path.open("a+b")
             if handle.tell() == 0:
                 handle.write(b"0")
@@ -104,15 +112,10 @@ def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:
 
 
 def _append_jsonl_locked(path: Path, data: bytes) -> None:
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        with os.fdopen(fd, "ab", closefd=True) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        # fdopen owns and closes the descriptor on every normal/error path.
-        pass
+        mutation_append(path.parent, path.name, data)
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise PathSafetyError(str(exc)) from exc
 
 
 def append_jsonl_records(
@@ -214,14 +217,15 @@ class PreparedOutputTransaction:
     def prepare(self) -> None:
         self._validate_components(self.root)
         allowed = next(root for root in self.allowed_roots if self._inside(self.root.resolve(strict=False), root))
-        current = allowed
-        current.mkdir(parents=True, exist_ok=True)
-        self._validate_components(current if current == self.root else self.root)
+        try:
+            ensure_directory_path(self.root)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise PathSafetyError(str(exc)) from exc
+        self._validate_components(self.root)
         relative = self.root.relative_to(allowed)
+        current = allowed
         for part in relative.parts:
             current = current / part
-            if not current.exists():
-                current.mkdir()
             self._validate_components(current, allow_prepared_parent=True)
         info = self.root.stat()
         self._root_identity = (info.st_dev, info.st_ino)
@@ -263,34 +267,37 @@ class PreparedOutputTransaction:
     def atomic_json(self, path: Path, value: Any) -> None:
         target = self._admit_for_write(path)
         data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        temporary = Path(temporary_name)
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            self.revalidate(target)
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+            relative = target.relative_to(self.root)
+            expected = capture_target(self.root, relative)
+            mutation_replace(self.root, relative, data, expected=expected)
+        except (MutationConflict, MutationUnsupported, ValueError) as exc:
+            raise PathSafetyError(str(exc)) from exc
 
     def write_bytes(self, path: Path, data: bytes) -> None:
         target = self._admit_for_write(path)
-        self.revalidate(target)
-        with target.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        self.revalidate(target)
+        try:
+            relative = target.relative_to(self.root)
+            expected = capture_target(self.root, relative)
+            mutation_replace(self.root, relative, data, expected=expected)
+        except (MutationConflict, MutationUnsupported, ValueError) as exc:
+            raise PathSafetyError(str(exc)) from exc
 
     def replace(self, source: Path, target: Path) -> None:
         source_path = self._admit_for_write(source)
         target_path = self._admit_for_write(target)
-        self.revalidate(source_path)
-        self.revalidate(target_path)
-        os.replace(source_path, target_path)
-        self.revalidate(target_path)
+        try:
+            source_relative = source_path.relative_to(self.root)
+            target_relative = target_path.relative_to(self.root)
+            mutation_rename(
+                self.root,
+                source_relative,
+                target_relative,
+                expected_source=capture_target(self.root, source_relative),
+                expected_target=capture_target(self.root, target_relative),
+            )
+        except (MutationConflict, MutationUnsupported, ValueError) as exc:
+            raise PathSafetyError(str(exc)) from exc
 
     def append_jsonl(self, path: Path, records: list[Mapping[str, Any]]) -> None:
         if not records:
@@ -298,9 +305,11 @@ class PreparedOutputTransaction:
         target = self._admit_for_write(path)
         data = _jsonl_bytes(records)
         with PathKeyedAppendLock(target):
-            self.revalidate(target)
-            _append_jsonl_locked(target, data)
-            self.revalidate(target)
+            try:
+                relative = target.relative_to(self.root)
+                mutation_append(self.root, relative, data)
+            except (MutationConflict, MutationUnsupported, ValueError) as exc:
+                raise PathSafetyError(str(exc)) from exc
 
 
 # Short names are kept as discoverable aliases for callers that think of the
@@ -483,14 +492,15 @@ class SafeOutput:
         self._prepared_transaction.prepare()
         self._validate_components(self.output_root)
         base = next(root for root in self.allowed_output_roots if _within(self.output_root.resolve(strict=False), root))
+        try:
+            ensure_directory_path(self.output_root)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise PathSafetyError(str(exc)) from exc
         current = base
-        current.mkdir(parents=True, exist_ok=True)
         self._validate_components(current)
         relative = self.output_root.relative_to(base)
         for part in relative.parts:
             current = current / part
-            if not current.exists():
-                current.mkdir()
             self._validate_components(current)
         for path in (self.snapshot_path, self.events_path):
             self._prepared_transaction.admit(path)
