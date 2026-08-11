@@ -926,8 +926,12 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
                 junction = subprocess.run(
                     [
                         "cmd.exe",
+                        "/d",
                         "/c",
-                        f'mklink /J "{workspace}" "{external}"',
+                        "mklink",
+                        "/J",
+                        str(workspace),
+                        str(external),
                     ],
                     capture_output=True,
                     text=True,
