@@ -24,6 +24,302 @@ class PathSafetyError(OSError):
     pass
 
 
+class AppendLockError(OSError):
+    """A shared append lock could not be established safely."""
+
+
+def _path_key(path: Path) -> str:
+    """Return one stable, case-normalized key for a path across processes."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+class PathKeyedAppendLock:
+    """One kernel-owned lock for one canonical JSONL destination.
+
+    The lock file is intentionally persistent.  Its contents are irrelevant; the
+    operating system releases the lock when the owning process dies, which is the
+    property a create-once marker cannot provide.
+    """
+
+    def __init__(self, path: Path, *, lock_root: Path | None = None) -> None:
+        self.path = Path(path).absolute()
+        self.key = _path_key(self.path)
+        root = Path(lock_root).absolute() if lock_root is not None else self.path.parent
+        digest = hashlib.sha256(self.key.encode("utf-8")).hexdigest()
+        self.lock_path = root / f".{self.path.name or 'append'}.{digest}.lock"
+        self._handle: Any | None = None
+        self._windows_locked = False
+
+    def __enter__(self) -> "PathKeyedAppendLock":
+        handle: Any | None = None
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self.lock_path.open("a+b")
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                self._windows_locked = True
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._handle = handle
+            return self
+        except Exception as exc:
+            if handle is not None:
+                if os.name == "nt" and self._windows_locked:
+                    try:
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                handle.close()
+            self._handle = None
+            raise AppendLockError(f"cannot acquire append lock for {self.path}: {exc}") from exc
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt" and self._windows_locked:
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            elif os.name != "nt":
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:
+    return b"".join((canonical_json(dict(record)) + "\n").encode("utf-8") for record in records)
+
+
+def _append_jsonl_locked(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "ab", closefd=True) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        # fdopen owns and closes the descriptor on every normal/error path.
+        pass
+
+
+def append_jsonl_records(
+    path: Path,
+    records: list[Mapping[str, Any]],
+    *,
+    lock_root: Path | None = None,
+) -> None:
+    """Append complete canonical records while holding the path-keyed OS lock."""
+    if not records:
+        return
+    target = Path(path).absolute()
+    data = _jsonl_bytes(records)
+    with PathKeyedAppendLock(target, lock_root=lock_root):
+        _append_jsonl_locked(target, data)
+
+
+def append_jsonl_record(
+    path: Path,
+    record: Mapping[str, Any],
+    *,
+    lock_root: Path | None = None,
+) -> None:
+    append_jsonl_records(path, [record], lock_root=lock_root)
+
+
+class PreparedOutputTransaction:
+    """A fixed output root with explicit dynamic-child admission.
+
+    Every mutation rechecks the fixed root and the complete path chain.  The
+    transaction deliberately has no discovery or provider authority; it only
+    provides safe local file publication.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        allowed_roots: tuple[Path, ...] = (),
+        forbidden_roots: tuple[Path, ...] = (),
+    ) -> None:
+        self.root = Path(root).absolute()
+        default_allowed = self.root.parent.resolve(strict=False)
+        self.allowed_roots = tuple(Path(item).resolve() for item in (allowed_roots or (default_allowed,)))
+        self.forbidden_roots = tuple(Path(item).resolve() for item in forbidden_roots)
+        self._root_identity: tuple[int, int] | None = None
+        self._admitted: set[str] = set()
+
+    @staticmethod
+    def _inside(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _has_ads(value: Path) -> bool:
+        drive = value.drive
+        for part in value.parts:
+            if part in {drive, value.anchor, "\\", "/"}:
+                continue
+            # A colon in a Windows component is an alternate data stream.  It
+            # is rejected on every platform so tests and portable records have
+            # one path identity rule.
+            if ":" in part:
+                return True
+        return False
+
+    def _validate_components(self, target: Path) -> Path:
+        lexical = Path(os.path.abspath(str(target)))
+        if self._has_ads(lexical):
+            raise PathSafetyError(f"alternate data stream syntax rejected: {target}")
+        resolved = lexical.resolve(strict=False)
+        allowed = next((root for root in self.allowed_roots if self._inside(resolved, root)), None)
+        if allowed is None:
+            raise PathSafetyError(f"output escapes permitted roots: {target}")
+        root_resolved = self.root.resolve(strict=False)
+        if not self._inside(resolved, root_resolved) and resolved != root_resolved:
+            raise PathSafetyError(f"output escapes prepared root: {target}")
+        for forbidden in self.forbidden_roots:
+            if self._inside(resolved, forbidden) or (
+                resolved == root_resolved and self._inside(forbidden, resolved)
+            ):
+                raise PathSafetyError(f"output overlaps observed root: {forbidden}")
+        current = allowed
+        if current.exists() and _is_reparse(current):
+            raise PathSafetyError(f"output root is a reparse point: {current}")
+        try:
+            relative = lexical.relative_to(allowed)
+        except ValueError as exc:
+            raise PathSafetyError(f"output path has ambiguous identity: {target}") from exc
+        for part in relative.parts:
+            current = current / part
+            if current.exists() and _is_reparse(current):
+                raise PathSafetyError(f"reparse output component rejected: {current}")
+        return lexical
+
+    def prepare(self) -> None:
+        self._validate_components(self.root)
+        allowed = next(root for root in self.allowed_roots if self._inside(self.root.resolve(strict=False), root))
+        current = allowed
+        current.mkdir(parents=True, exist_ok=True)
+        self._validate_components(current if current == self.root else self.root)
+        relative = self.root.relative_to(allowed)
+        for part in relative.parts:
+            current = current / part
+            if not current.exists():
+                current.mkdir()
+            self._validate_components(current)
+        info = self.root.stat()
+        self._root_identity = (info.st_dev, info.st_ino)
+        self._admitted.add(_path_key(self.root))
+
+    def revalidate(self, target: Path) -> Path:
+        if self._root_identity is None:
+            raise PathSafetyError("output root was not prepared")
+        lexical = self._validate_components(target)
+        info = self.root.stat()
+        if (info.st_dev, info.st_ino) != self._root_identity:
+            raise PathSafetyError("output root identity changed after validation")
+        return lexical
+
+    def admit(self, target: Path | str) -> Path:
+        path = Path(target)
+        if not path.is_absolute():
+            path = self.root / path
+        lexical = self.revalidate(path)
+        self._admitted.add(_path_key(lexical))
+        return lexical
+
+    def child(self, relative: str) -> Path:
+        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+            raise PathSafetyError("dynamic output child must be a relative path")
+        return self.admit(self.root / relative)
+
+    def _admit_for_write(self, path: Path) -> Path:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        lexical = self.revalidate(candidate)
+        if _path_key(lexical) not in self._admitted:
+            raise PathSafetyError(f"output child was not admitted before write: {lexical}")
+        if not lexical.parent.exists():
+            raise PathSafetyError(f"output parent does not exist: {lexical.parent}")
+        return lexical
+
+    def atomic_json(self, path: Path, value: Any) -> None:
+        target = self._admit_for_write(path)
+        data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.revalidate(target)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def write_bytes(self, path: Path, data: bytes) -> None:
+        target = self._admit_for_write(path)
+        self.revalidate(target)
+        with target.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.revalidate(target)
+
+    def replace(self, source: Path, target: Path) -> None:
+        source_path = self._admit_for_write(source)
+        target_path = self._admit_for_write(target)
+        self.revalidate(source_path)
+        self.revalidate(target_path)
+        os.replace(source_path, target_path)
+        self.revalidate(target_path)
+
+    def append_jsonl(self, path: Path, records: list[Mapping[str, Any]]) -> None:
+        if not records:
+            return
+        target = self._admit_for_write(path)
+        data = _jsonl_bytes(records)
+        with PathKeyedAppendLock(target):
+            self.revalidate(target)
+            _append_jsonl_locked(target, data)
+            self.revalidate(target)
+
+
+# Short names are kept as discoverable aliases for callers that think of the
+# object as a prepared root rather than a write transaction.
+PreparedOutput = PreparedOutputTransaction
+OutputTransaction = PreparedOutputTransaction
+PreparedOutputRoot = PreparedOutputTransaction
+
+
+def append_jsonl(path: Path, record_or_records: Mapping[str, Any] | list[Mapping[str, Any]], *, lock_root: Path | None = None) -> None:
+    """Compatibility spelling for the single shared append primitive."""
+    records = record_or_records if isinstance(record_or_records, list) else [record_or_records]
+    append_jsonl_records(path, records, lock_root=lock_root)
+
+
 class ManagedWatcherClaimError(OSError):
     """The output root is already owned by a live managed watcher."""
 
@@ -170,6 +466,11 @@ class SafeOutput:
         self.attention_epoch_id = attention_epoch_id
         self._root_identity: tuple[int, int] | None = None
         self._harness_identity = exact_process_identity(os.getpid())
+        self._prepared_transaction = PreparedOutputTransaction(
+            self.output_root,
+            allowed_roots=self.allowed_output_roots,
+            forbidden_roots=self.forbidden_roots,
+        )
 
     def _validate_components(self, target: Path) -> None:
         if _has_ads_syntax(target):
@@ -196,6 +497,7 @@ class SafeOutput:
                 raise PathSafetyError(f"reparse output component rejected: {current}")
 
     def prepare(self) -> None:
+        self._prepared_transaction.prepare()
         self._validate_components(self.output_root)
         base = next(root for root in self.allowed_output_roots if _within(self.output_root.resolve(strict=False), root))
         current = base
@@ -207,10 +509,20 @@ class SafeOutput:
             if not current.exists():
                 current.mkdir()
             self._validate_components(current)
+        for path in (
+            self.snapshot_path,
+            self.events_path,
+            self.attention_events_path,
+            self.pending_notification_path,
+            self.managed_runtime_path,
+            self.active_management_history_path,
+        ):
+            self._prepared_transaction.admit(path)
         info = self.output_root.stat()
         self._root_identity = (info.st_dev, info.st_ino)
 
     def _revalidate(self, target: Path) -> None:
+        self._prepared_transaction.revalidate(target)
         self._validate_components(target)
         if self._root_identity is None:
             raise PathSafetyError("output root was not prepared")
@@ -242,30 +554,21 @@ class SafeOutput:
         at = timestamp or utc_now()
         record = {"schema":"manager-attention-timeline/v1", "source_timestamp_utc":iso_utc(at), "epoch_id":self.attention_epoch_id, "event_id":event_id, "kind":kind, "recorder":"orchestrator_harness"}
         record.update(dict(metadata or {})); record["record_id"]=self._attention_record_id(canonical_json(record)); encoded=(canonical_json(record)+"\n").encode()
-        lock=self.attention_events_path.with_suffix(".lock"); self._revalidate(lock); lock.parent.mkdir(parents=True,exist_ok=True)
-        with lock.open("a+b") as handle:
-            if os.name == "nt":
-                import msvcrt
-                handle.write(b"0"); handle.flush(); msvcrt.locking(handle.fileno(),msvcrt.LK_LOCK,1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
-            try:
-                self._revalidate(self.attention_events_path)
-                if self.attention_events_path.exists():
-                    for line in self.attention_events_path.read_bytes().splitlines():
-                        try: existing=json.loads(line)
-                        except (UnicodeDecodeError,json.JSONDecodeError): continue
-                        if existing.get("record_id")==record["record_id"]:
-                            if canonical_json(existing)!=canonical_json(record): raise PathSafetyError("attention record ID collision")
-                            return
-                self._revalidate(self.attention_events_path)
-                fd=os.open(self.attention_events_path,os.O_APPEND|os.O_CREAT|os.O_WRONLY,0o600)
-                try: os.write(fd,encoded); os.fsync(fd)
-                finally: os.close(fd)
-            finally:
-                if os.name == "nt": msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
-                else: fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
+        self._revalidate(self.attention_events_path)
+        with PathKeyedAppendLock(self.attention_events_path):
+            self._revalidate(self.attention_events_path)
+            if self.attention_events_path.exists():
+                for line in self.attention_events_path.read_bytes().splitlines():
+                    try:
+                        existing = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if existing.get("record_id") == record["record_id"]:
+                        if canonical_json(existing) != canonical_json(record):
+                            raise PathSafetyError("attention record ID collision")
+                        return
+            self._revalidate(self.attention_events_path)
+            _append_jsonl_locked(self.attention_events_path, encoded)
 
     @property
     def pending_notification_path(self) -> Path:
@@ -628,35 +931,13 @@ class SafeOutput:
 
     def atomic_json(self, path: Path, value: Any) -> None:
         self._revalidate(path)
-        data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            self._revalidate(path)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        self._prepared_transaction.atomic_json(path, value)
 
     def append_events(self, events: list[dict[str, Any]]) -> None:
         if not events:
             return
         self._revalidate(self.events_path)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        fd = os.open(self.events_path, flags, 0o600)
-        try:
-            with os.fdopen(fd, "ab", closefd=True) as handle:
-                for event in events:
-                    handle.write((canonical_json(event) + "\n").encode("utf-8"))
-                handle.flush()
-                os.fsync(handle.fileno())
-        finally:
-            pass
+        self._prepared_transaction.append_jsonl(self.events_path, events)
         if self.fail_after_event_append:
             raise RuntimeError("injected failure after event append")
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, Iterator, cast
 
 from harness_common.process_identity import exact_process_identity
 
@@ -22,6 +24,56 @@ IdentityProvider = Callable[[int], Mapping[str, object] | None]
 
 class ResourceLockError(RuntimeError):
     pass
+
+
+@contextmanager
+def _kernel_resource_lock(path: Path) -> Iterator[None]:
+    """Serialize one resource's reclaim/release transaction in the kernel."""
+    # Keep persistent kernel lock files outside the claim directory.  The
+    # claim directory therefore remains an exact inventory of owned claims,
+    # while a process crash still leaves a reusable inode whose OS lock has
+    # already been released by the kernel.
+    claim_root = path.parent.absolute()
+    lock_root = claim_root.parent / f".{claim_root.name}.resource-locks"
+    digest = hashlib.sha256(os.path.normcase(str(path.absolute())).encode("utf-8")).hexdigest()
+    lock_path = lock_root / f"{digest}.lock"
+    handle: Any | None = None
+    windows_locked = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            windows_locked = True
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if os.name == "nt" and windows_locked:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif os.name != "nt":
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+resource_reclaim_lock = _kernel_resource_lock
+ResourceReclaimLock = _kernel_resource_lock
 
 
 def claim_filename(resource: str) -> str:
@@ -73,6 +125,40 @@ def _read_claim(path: Path) -> tuple[Claim | None, str | None]:
     return claim, error
 
 
+def _claim_parent_is_unambiguous(path: Path) -> bool:
+    """Reject a substituted claim directory before any claim mutation."""
+    try:
+        parent = path.parent
+        lexical_parent = Path(os.path.abspath(str(parent)))
+        if parent.resolve(strict=True) != lexical_parent:
+            return False
+        root_info = parent.stat()
+        if not stat.S_ISDIR(root_info.st_mode):
+            return False
+        root_attributes = getattr(root_info, "st_file_attributes", 0)
+        if root_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _claim_path_is_unambiguous(path: Path) -> bool:
+    """Reject symlink/reparse/parent substitution before reclaim or release."""
+    try:
+        if not _claim_parent_is_unambiguous(path):
+            return False
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        attributes = getattr(info, "st_file_attributes", 0)
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return False
+        return stat.S_ISREG(info.st_mode)
+    except OSError:
+        return False
+
+
 def _exact_identity(pid: int) -> Mapping[str, object] | None:
     identity = exact_process_identity(pid)
     return cast(Mapping[str, object], identity) if identity is not None else None
@@ -94,7 +180,11 @@ def _owner_state(
         return "MALFORMED", "claim owner PID is invalid"
     process = processes.by_pid.get(pid)
     if process is None:
-        if identity_provider(pid) is not None:
+        try:
+            exact = identity_provider(pid)
+        except Exception:
+            return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
+        if exact is not None:
             return "OWNER_IDENTITY_UNKNOWN", "process inventory and exact identity provider contradict"
         return "PROVEN_STALE", f"complete process inventory proves owner PID {pid} absent"
     expected = typed_owner.get("created_utc")
@@ -104,7 +194,10 @@ def _owner_state(
     if expected != actual:
         return "OWNER_IDENTITY_REUSED", "owner PID exists with a different creation identity"
     expected_exact = typed_owner.get("creation_identity")
-    fresh = identity_provider(pid)
+    try:
+        fresh = identity_provider(pid)
+    except Exception:
+        return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
     fresh_exact = fresh.get("created_utc") if fresh is not None else None
     if not isinstance(fresh_exact, str):
         return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
@@ -158,18 +251,23 @@ class ResourceClaims:
     def _create(self, resource: str) -> Claim | None:
         claim = self._new_claim(resource)
         path = self.root / claim_filename(resource)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
+        if not _claim_parent_is_unambiguous(path):
             return None
-        try:
-            with os.fdopen(fd, "wb", closefd=True) as handle:
-                _ = handle.write(_claim_bytes(claim))
-                handle.flush()
-                _ = os.fsync(handle.fileno())
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
+        with _kernel_resource_lock(path):
+            if path.is_symlink() or path.exists():
+                return None
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                return None
+            try:
+                with os.fdopen(fd, "wb", closefd=True) as handle:
+                    _ = handle.write(_claim_bytes(claim))
+                    handle.flush()
+                    _ = os.fsync(handle.fileno())
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
         claim["path"] = str(path)
         self._held[resource] = claim
         return claim
@@ -179,15 +277,20 @@ class ResourceClaims:
         if expected is None:
             return False
         path = self.root / claim_filename(resource)
-        current, error = _read_claim(path)
-        if error is not None or current is None:
-            return False
-        comparable = {key: value for key, value in expected.items() if key != "path"}
-        if current != comparable:
+        if not _claim_path_is_unambiguous(path):
             return False
         try:
-            path.unlink()
-        except FileNotFoundError:
+            with _kernel_resource_lock(path):
+                if not _claim_path_is_unambiguous(path):
+                    return False
+                current, error = _read_claim(path)
+                if error is not None or current is None:
+                    return False
+                comparable = {key: value for key, value in expected.items() if key != "path"}
+                if current != comparable:
+                    return False
+                path.unlink()
+        except (FileNotFoundError, OSError):
             return False
         _ = self._held.pop(resource, None)
         return True
@@ -199,13 +302,6 @@ class ResourceClaims:
                 failures.append(resource)
         return sorted(failures)
 
-    def _release_reclaim_guard(self, path: Path, token: bytes) -> None:
-        try:
-            if path.read_bytes() == token:
-                path.unlink()
-        except OSError:
-            pass
-
     def _reclaim_stale(
         self,
         *,
@@ -214,59 +310,39 @@ class ResourceClaims:
         expected: Claim,
         expected_bytes: bytes,
     ) -> tuple[bool, str]:
-        guard = path.with_suffix(".reclaim")
-        token = _claim_bytes({"owner": dict(self._owner), "resource": resource})
-        try:
-            fd = os.open(guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
+        # A legacy marker is observed but never created or removed by S3.  The
+        # real serialization is the kernel-held per-resource lock below.
+        legacy_guard = path.with_suffix(".reclaim")
+        if legacy_guard.exists():
             return False, "another controller is revalidating the stale claim"
+        if not _claim_path_is_unambiguous(path):
+            return False, "claim path identity is ambiguous"
         try:
-            with os.fdopen(fd, "wb", closefd=True) as handle:
-                _ = handle.write(token)
-                handle.flush()
-                _ = os.fsync(handle.fileno())
-            current, error, current_bytes = _read_claim_evidence(path)
-            if (
-                error is not None
-                or current is None
-                or current != expected
-                or current_bytes != expected_bytes
-            ):
-                return False, "claim changed before stale reclaim"
-            state, reason = _owner_state(
-                current, self.process_provider(), self.identity_provider
-            )
-            if state != "PROVEN_STALE":
-                return False, f"stale reclaim revalidation changed to {state}: {reason}"
-            quarantine = self.root / (
-                f".{path.stem}.{self.controller.pid}.{time.time_ns()}.stale"
-            )
-            os.rename(path, quarantine)
-            quarantined, quarantine_error, quarantine_bytes = _read_claim_evidence(quarantine)
-            if (
-                quarantine_error is not None
-                or quarantined != expected
-                or quarantine_bytes != expected_bytes
-            ):
-                try:
-                    os.link(quarantine, path)
-                    quarantine.unlink()
-                except OSError as exc:
-                    raise ResourceLockError(
-                        f"stale quarantine identity changed and could not be restored: {exc}"
-                    ) from exc
-                return False, "stale quarantine identity changed; claim restored"
-            try:
-                quarantine.unlink()
-            except OSError as exc:
-                raise ResourceLockError(
-                    f"stale claim quarantined but quarantine cleanup failed: {exc}"
-                ) from exc
-            return True, reason
+            with _kernel_resource_lock(path):
+                # Every fact is re-read while the kernel lock is held.  A
+                # contender that replaced the file, or an owner that became
+                # live/reused/uncertain, therefore remains untouched.
+                if not _claim_path_is_unambiguous(path):
+                    return False, "claim path identity is ambiguous"
+                current, error, current_bytes = _read_claim_evidence(path)
+                if (
+                    error is not None
+                    or current is None
+                    or current != expected
+                    or current_bytes != expected_bytes
+                ):
+                    return False, "claim changed before stale reclaim"
+                state, reason = _owner_state(
+                    current, self.process_provider(), self.identity_provider
+                )
+                if state != "PROVEN_STALE":
+                    return False, f"stale reclaim revalidation changed to {state}: {reason}"
+                # Unlink only the exact bytes that were revalidated under the
+                # lock.  No reclaim marker or process-name operation is used.
+                path.unlink()
+                return True, reason
         except OSError as exc:
             return False, f"ownership-safe stale reclaim failed: {exc}"
-        finally:
-            self._release_reclaim_guard(guard, token)
 
     def acquire_all(
         self,

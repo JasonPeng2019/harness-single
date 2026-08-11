@@ -41,6 +41,7 @@ from .invocation import (
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
+from .process_supervisor import CleanupResult, ProcessSupervisor
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     ProviderAdapterError,
@@ -50,7 +51,11 @@ from .provider import (
 )
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
-from .resume import ResumeAdmissionError, require_resume_admission
+from .stable_io import append_jsonl_record
+from .resume import (
+    ResumeAdmissionError,
+    require_resume_admission,
+)
 from .task import (
     COMPLETION_REVIEW_FILENAME,
     ORCHESTRATOR_ACCEPTANCE_FILENAME,
@@ -131,12 +136,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _append_event(path: Path, value: dict[str, Any]) -> None:
-    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "ab", closefd=True) as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    append_jsonl_record(path, value)
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -543,6 +543,11 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
         if workspace.parent != run_root:
             raise InvocationValidationError("canonical workspace must be a direct child of run_root")
+        if canonical.resume_admission_path is not None:
+            review_path = canonical.resume_admission_path
+            if not review_path.is_absolute():
+                review_path = workspace / review_path
+            _safe_path(review_path, root=workspace, name="resume_admission_path")
         def rooted(value: Path, base: Path) -> str:
             return str(value if value.is_absolute() else base / value)
         output_paths = {
@@ -671,54 +676,25 @@ def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> P
 
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
+    identity: ProcessInfo | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Bound shutdown to the captured Popen handle and prove that it was reaped."""
-    evidence: dict[str, Any] = {
-        "provider_pid": process.pid,
-        "codex_pid": process.pid,
-        "cleanup_confirmed": False,
-        "terminate_attempted": False,
-        "kill_attempted": False,
-    }
-
-    def reap(stage: str, timeout: float) -> bool:
-        try:
-            evidence["exit_code"] = process.wait(timeout=timeout)
-            evidence["reaped_after"] = stage
-            evidence["cleanup_confirmed"] = True
-            return True
-        except subprocess.TimeoutExpired:
-            evidence[f"{stage}_wait_timed_out"] = True
-        except BaseException as exc:
-            evidence[f"{stage}_wait_error"] = f"{type(exc).__name__}: {exc}"
-        return False
-
-    try:
-        already_exited = process.poll()
-    except BaseException as exc:
-        evidence["initial_poll_error"] = f"{type(exc).__name__}: {exc}"
-    else:
-        if already_exited is not None and reap("observed_exit", 0):
-            return True, evidence
-
-    evidence["terminate_attempted"] = True
-    try:
-        process.terminate()
-    except BaseException as exc:
-        evidence["terminate_error"] = f"{type(exc).__name__}: {exc}"
-    if reap("terminate", timeout_seconds):
-        return True, evidence
-
-    evidence["kill_attempted"] = True
-    try:
-        process.kill()
-    except BaseException as exc:
-        evidence["kill_error"] = f"{type(exc).__name__}: {exc}"
-    if reap("kill", timeout_seconds):
-        return True, evidence
-
-    evidence["error"] = "exact provider child exit and reap could not be proven"
-    return False, evidence
+    """Compatibility shim around the shared exact supervisor."""
+    supervisor = ProcessSupervisor(
+        process,
+        identity,
+        graceful_timeout_seconds=timeout_seconds,
+        force_timeout_seconds=timeout_seconds,
+        observer=None,
+    )
+    result = supervisor.cleanup()
+    evidence = result.to_record()
+    if "GRACEFUL_WAIT_TIMEOUT" in result.stages:
+        evidence["terminate_wait_timed_out"] = True
+    if "FINAL_REAP_TIMEOUT" in result.stages:
+        evidence["kill_wait_timed_out"] = True
+    if result.errors:
+        evidence["error"] = "; ".join(result.errors)
+    return result.proved_reap, evidence
 
 
 def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
@@ -791,6 +767,7 @@ def _canonical_prior_identity_check(
     thread: str | None,
     starting_commit: str | None,
     git_identity: Any,
+    allowed_identity_fields: frozenset[str] = frozenset(),
 ) -> None:
     assert invocation.canonical is not None
     if prior_status_path != invocation.status_path:
@@ -828,6 +805,7 @@ def _canonical_prior_identity_check(
         "repository",
         "prompt_bundle_sha256",
         "prompt_content_sha256",
+        "resources",
     )
     for field in identity_fields:
         if invocation.action == "start" and field == "session_id":
@@ -844,7 +822,7 @@ def _canonical_prior_identity_check(
             expected_value = _canonical_repository_identity(
                 expected_value, include_starting_commit=include_starting_commit
             )
-        if persisted_value != expected_value:
+        if persisted_value != expected_value and field not in allowed_identity_fields:
             raise InvocationError("canonical prior task identity does not match persisted status")
 
     expected_status_identity = {
@@ -863,10 +841,25 @@ def _canonical_prior_identity_check(
         "provider_id": canonical.provider_id,
         "prompt_bundle_sha256": canonical.prompt_bundle_sha256,
         "prompt_content_sha256": canonical.prompt_content_sha256,
+        "resources": list(canonical.resources),
         "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
     }
     for field, expected in expected_status_identity.items():
-        if field not in prior_status or prior_status[field] != expected:
+        if field not in prior_status:
+            raise InvocationError("canonical prior task identity does not match persisted status")
+        if field == "task_card" and "task_card_sha256" in allowed_identity_fields:
+            persisted_card = prior_status.get(field)
+            if not isinstance(persisted_card, Mapping) or not isinstance(expected, Mapping):
+                raise InvocationError("canonical prior task identity does not match persisted status")
+            if any(
+                persisted_card.get(key) != expected.get(key)
+                for key in ("id", "revision")
+            ):
+                raise InvocationError("canonical prior task identity does not match persisted status")
+            continue
+        if field in {"prompt_bundle_sha256", "prompt_content_sha256"} and field in allowed_identity_fields:
+            continue
+        if prior_status[field] != expected:
             raise InvocationError("canonical prior task identity does not match persisted status")
     if git_identity is not None:
         include_starting_commit = invocation.action == "resume"
@@ -914,6 +907,7 @@ def _canonical_prior_task_preflight(
     thread: str | None,
     starting_commit: str | None,
     git_identity: Any,
+    allowed_identity_fields: frozenset[str] = frozenset(),
 ) -> None:
     """Admit only a fresh canonical task or a validated continuation."""
 
@@ -935,6 +929,7 @@ def _canonical_prior_task_preflight(
             thread=thread,
             starting_commit=starting_commit,
             git_identity=git_identity,
+            allowed_identity_fields=allowed_identity_fields,
         )
     result_validation, result_valid, task_result = _canonical_result_validation(invocation)
     if not result_valid:
@@ -1159,6 +1154,98 @@ def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> Pro
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
 
 
+def _canonical_resume_admission_path(invocation: Invocation) -> Path:
+    """Return the one confined ROOT review path for a canonical continuation."""
+    assert invocation.canonical is not None
+    candidate = invocation.canonical.resume_admission_path
+    path = candidate if candidate is not None else Path("RESUME_ADMISSION.json")
+    if not path.is_absolute():
+        path = invocation.workspace / path
+    path = path.expanduser().resolve(strict=False)
+    if not _inside(path, invocation.workspace):
+        raise InvocationError("resume amendment review escapes the canonical workspace")
+    return path
+
+
+def _read_canonical_resume_amendment(invocation: Invocation) -> Mapping[str, Any] | None:
+    """Read the optional confined review; missing means an unreviewed pair."""
+    path = _canonical_resume_admission_path(invocation)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise InvocationError("RESUME_ADMISSION.json is not a regular file")
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except InvocationError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvocationError(f"cannot read RESUME_ADMISSION.json: {exc}") from exc
+    if not isinstance(value, Mapping):
+        raise InvocationError("RESUME_ADMISSION.json must contain an object")
+    return value
+
+
+def _canonical_amendment_job_identity(
+    invocation: Invocation,
+    requested_identity: Mapping[str, Any],
+    persisted_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    requested_repository = requested_identity.get("repository")
+    persisted_repository = persisted_identity.get("repository")
+    repository = requested_repository if isinstance(requested_repository, Mapping) else {}
+    prior_repository = persisted_repository if isinstance(persisted_repository, Mapping) else {}
+    assert invocation.canonical is not None
+    expected = {
+        "card_id": requested_identity.get("task_card_id"),
+        "stage_cohort_id": requested_identity.get("cohort_id"),
+        "worker_invocation_id": requested_identity.get("worker_invocation_id"),
+        "lane_id": requested_identity.get("lane_id"),
+        "provider_session_id": requested_identity.get("session_id"),
+        "exclusive_resources": list(invocation.canonical.resources),
+    }
+    for field, value in (
+        ("repository_common_dir", repository.get("common_dir")),
+        ("worktree_root", repository.get("worktree_root")),
+        ("branch", repository.get("branch")),
+        ("original_base_commit", repository.get("base_commit")),
+        ("continuation_start_commit", prior_repository.get("starting_commit")),
+    ):
+        if value is not None:
+            expected[field] = value
+    return expected
+
+
+def _canonical_resume_claims_accepted(
+    invocation: Invocation, prior_status: Mapping[str, Any]
+) -> bool:
+    """Inspect acceptance artifacts without publishing or changing status."""
+    if any(
+        prior_status.get(field) == "ACCEPTED"
+        for field in ("terminal_acceptance_state", "task_advancement_state")
+    ):
+        return True
+    persisted = prior_status.get("resume_identity")
+    if isinstance(persisted, Mapping) and any(
+        persisted.get(field) == "ACCEPTED"
+        for field in ("terminal_acceptance_state", "task_advancement_state")
+    ):
+        return True
+    result_evidence, result_valid, task_result = _canonical_result_validation(invocation)
+    del result_evidence
+    if not result_valid or task_result is None:
+        return False
+    try:
+        advancement = read_task_advancement(
+            invocation.workspace,
+            card=task_result.card,
+            result=task_result,
+        )
+    except TaskValidationError:
+        return False
+    return advancement.state == "ACCEPTED"
+
+
 def run(invocation: Invocation) -> int:
     prompt = invocation.prompt_bytes
     if not prompt:
@@ -1198,8 +1285,26 @@ def run(invocation: Invocation) -> int:
             thread = invocation.requested_thread_id or prior_thread
             if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
                 raise InvocationError("resume requires the persisted provider session ID")
-            if invocation.canonical is not None:
-                _canonical_prior_task_preflight(
+            requested_identity = invocation.canonical.identity(
+                session_id=thread,
+                starting_commit=starting_commit,
+            )
+            requested_identity["live_identity"] = {
+                "provider_id": invocation.provider_id,
+                "session_id": thread,
+            }
+            persisted_identity = prior_status.get("resume_identity")
+            if not isinstance(persisted_identity, Mapping):
+                raise InvocationError("canonical resume requires persisted resume_identity")
+            raw_identity_fields = frozenset({
+                "task_card_sha256", "prompt_bundle_sha256", "prompt_content_sha256",
+            })
+            raw_identity_changed = any(
+                requested_identity.get(field) != persisted_identity.get(field)
+                for field in raw_identity_fields
+            )
+            if not raw_identity_changed:
+                _canonical_prior_identity_check(
                     invocation,
                     prior_status,
                     prior_status_path=prior_status_path,
@@ -1207,36 +1312,44 @@ def run(invocation: Invocation) -> int:
                     starting_commit=starting_commit,
                     git_identity=git_identity,
                 )
-            if invocation.canonical is not None:
-                requested_identity = invocation.canonical.identity(
-                    session_id=thread,
-                    starting_commit=starting_commit,
+            if _canonical_resume_claims_accepted(invocation, prior_status):
+                raise InvocationError(
+                    "canonical accepted task cannot be resumed or amended before provider launch"
                 )
-                requested_identity["live_identity"] = {
+            amendment_review = _read_canonical_resume_amendment(invocation)
+            live_identity = {
+                "live_identity": {
                     "provider_id": invocation.provider_id,
                     "session_id": thread,
-                }
-                persisted_identity = prior_status.get("resume_identity")
-                if not isinstance(persisted_identity, Mapping):
-                    raise InvocationError("canonical resume requires persisted resume_identity")
-                live_identity = {
-                    "live_identity": {
-                        "provider_id": invocation.provider_id,
-                        "session_id": thread,
-                    },
-                    "repository": (
-                        repository_status(git_identity, starting_commit=starting_commit)
-                        if git_identity is not None
-                        else requested_identity.get("repository")
+                },
+                "repository": (
+                    repository_status(git_identity, starting_commit=starting_commit)
+                    if git_identity is not None
+                    else requested_identity.get("repository")
+                ),
+            }
+            try:
+                admission = require_resume_admission(
+                    requested_identity,
+                    persisted_identity,
+                    live_identity,
+                    amendment_review=amendment_review,
+                    expected_job_identity=_canonical_amendment_job_identity(
+                        invocation, requested_identity, persisted_identity
                     ),
-                }
-                try:
-                    admission = require_resume_admission(
-                        requested_identity, persisted_identity, live_identity
-                    )
-                except ResumeAdmissionError as exc:
-                    raise InvocationError(str(exc)) from exc
-                resume_admission_record = admission.to_record()
+                )
+            except ResumeAdmissionError as exc:
+                raise InvocationError(str(exc)) from exc
+            _canonical_prior_task_preflight(
+                invocation,
+                prior_status,
+                prior_status_path=prior_status_path,
+                thread=thread,
+                starting_commit=starting_commit,
+                git_identity=git_identity,
+                allowed_identity_fields=(raw_identity_fields if raw_identity_changed else frozenset()),
+            )
+            resume_admission_record = admission.to_record()
         elif invocation.worker_invocation_id is not None:
             if prior_status is None:
                 raise InvocationError("coding resume requires persisted controller status")
@@ -1378,6 +1491,7 @@ def run(invocation: Invocation) -> int:
             state["resume_identity"] = resume_identity
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
+    supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
     child_exit_confirmed = True
     try:
@@ -1423,6 +1537,15 @@ def run(invocation: Invocation) -> int:
             process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
             child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
+            # The captured handle is the ownership boundary.  The controller
+            # has already established the exact creation identity; the shared
+            # supervisor owns every later graceful/force/final-reap stage.
+            supervisor = ProcessSupervisor(
+                process,
+                child,
+                parent_pid=controller.pid,
+                observer=None,
+            )
             state.update({
                 "state": running_state,
                 "provider_pid": child.pid,
@@ -1477,7 +1600,8 @@ def run(invocation: Invocation) -> int:
             out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
             err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
             out_thread.start(); err_thread.start()
-            exit_code = process.wait()
+            assert supervisor is not None
+            exit_code = supervisor.wait_for_exit()
             child_exit_confirmed = True
             out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
@@ -1557,7 +1681,16 @@ def run(invocation: Invocation) -> int:
     except KeyboardInterrupt:
         cleanup_evidence: dict[str, Any] | None = None
         if process is not None and not child_exit_confirmed:
-            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            if supervisor is None:
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            else:
+                cleanup: CleanupResult = supervisor.cleanup()
+                child_exit_confirmed = cleanup.proved_reap
+                cleanup_evidence = cleanup.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
@@ -1601,7 +1734,16 @@ def run(invocation: Invocation) -> int:
     except Exception as exc:
         cleanup_evidence = None
         if process is not None and not child_exit_confirmed:
-            child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            if supervisor is None:
+                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
+            else:
+                cleanup: CleanupResult = supervisor.cleanup()
+                child_exit_confirmed = cleanup.proved_reap
+                cleanup_evidence = cleanup.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"

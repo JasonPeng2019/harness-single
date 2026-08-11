@@ -27,7 +27,11 @@ from orchestrator_harness.prompt_bundle import (
     prompt_bundle_record_from_paths,
 )
 from orchestrator_harness.provider import ClaudeCodeProviderAdapter, ProviderLaunchSpec
-from orchestrator_harness.resume import make_resume_admission
+from orchestrator_harness.resume import (
+    RESUME_AMENDMENT_REVIEW_SCHEMA,
+    make_resume_admission,
+    validate_resume_amendment_review,
+)
 from orchestrator_harness.task import (
     COMPLETION_REVIEW_FILENAME,
     COMPLETION_REVIEW_SCHEMA,
@@ -108,6 +112,112 @@ class S2ContractTests(unittest.TestCase):
             "resources": ["resource-1"],
         }
         return value, card
+
+    @staticmethod
+    def _write_canonical_json(path: Path, value: dict[str, object]) -> str:
+        data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        path.write_bytes(data)
+        return hashlib.sha256(data).hexdigest()
+
+    def _start_fake_canonical(self, root: Path) -> tuple[dict[str, object], dict[str, object], Path, Path, Path]:
+        fake_source = """
+import json, sys
+from pathlib import Path
+marker = Path(sys.argv[1])
+marker.write_text(marker.read_text(encoding='utf-8') + 'launch\\n' if marker.exists() else 'launch\\n', encoding='utf-8')
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'session-1'}), flush=True)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session-1'}), flush=True)
+"""
+        fake = root / "fake_claude.py"
+        marker = root / "launches.txt"
+        fake.write_text(fake_source, encoding="utf-8")
+        raw, card = self._canonical(root)
+        raw["provider"] = {
+            **raw["provider"],  # type: ignore[arg-type]
+            "command": [sys.executable, str(fake), str(marker)],
+        }
+        start_path = root / "start.invocation.json"
+        start_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.assertEqual(0, controller.main([str(start_path)]))
+        workspace = root / "run" / ".agent-workspace"
+        status_path = workspace / "worker_controller.status.json"
+        event_path = root / "runtime" / "events.jsonl"
+        return raw, card, workspace, status_path, event_path
+
+    def _amendment_review(
+        self,
+        root: Path,
+        raw: dict[str, object],
+        *,
+        persisted: dict[str, object],
+        old_card: Path,
+        new_card: Path,
+        old_prompt: Path,
+        new_prompt: Path,
+        disposition: str = "NO_CONTINUATION_REQUIRED",
+        classification: str = "HARMLESS",
+    ) -> dict[str, object]:
+        def pair(old_path: Path, new_path: Path) -> dict[str, object]:
+            return {
+                "old_path": str(old_path),
+                "old_sha256": hashlib.sha256(old_path.read_bytes()).hexdigest(),
+                "new_path": str(new_path),
+                "new_sha256": hashlib.sha256(new_path.read_bytes()).hexdigest(),
+                "diff": {
+                    "command": f"git diff --no-index -- {old_path} {new_path}",
+                    "working_directory": str(root),
+                    "exit_code": 1,
+                    "stdout_encoding": "utf-8",
+                    "stdout_sha256": "a" * 64,
+                    "stdout_bytes": 1,
+                    "stderr_sha256": "b" * 64,
+                    "stderr_bytes": 0,
+                },
+            }
+
+        return {
+            "schema": RESUME_AMENDMENT_REVIEW_SCHEMA,
+            "run_id": "synthetic-run",
+            "stage_id": "S2",
+            "lane_id": raw["lane_id"],
+            "recorded_utc": "2026-01-01T00:00:00Z",
+            "recorded_by": "ROOT-IM",
+            "disposition": disposition,
+            "job_state": "UNACCEPTED",
+            "same_job_identity": {
+                "card_id": raw["task_card"]["id"],  # type: ignore[index]
+                "stage_cohort_id": raw["cohort_id"],
+                "worker_invocation_id": raw["worker_invocation_id"],
+                "lane_id": raw["lane_id"],
+                "task_kind": "focused_implementation",
+                "provider_session_id": "session-1",
+                "repository_common_dir": "synthetic-common-dir",
+                "worktree_root": str(root),
+                "branch": "synthetic-branch",
+                "original_base_commit": "0" * 40,
+                "continuation_start_commit": "0" * 40,
+                "exclusive_resources": list(raw["resources"]),
+            },
+            "reviewed_pairs": {
+                "task_card": pair(old_card, new_card),
+                "prompt": pair(old_prompt, new_prompt),
+            },
+            "semantic_impact": {
+                "classification": classification,
+                "rationale": "ROOT reviewed this exact pair for the focused controller test.",
+                "affected_scope": ["canonical resume identity"],
+                "preserved_credit": ["unaffected prior checks"],
+            },
+            "route": {
+                "kind": "EXACT_REVIEWED_PAIR",
+                "resume_same_worker": True,
+                "resume_same_provider_session": True,
+                "reopen_accepted_tasks": False,
+                "rerun_only_affected_checks": True,
+                "require_fresh_affected_review": False,
+            },
+        }
 
     def test_canonical_prompt_resume_and_task_advancement_are_content_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +315,240 @@ class S2ContractTests(unittest.TestCase):
             advanced = advance_task(card, result, review=review, acceptance=acceptance)
             self.assertEqual("ACCEPTED", advanced.state)
             self.assertTrue(advanced.terminal)
+
+    def test_canonical_resume_admits_exact_reviewed_card_and_prompt_amendments(self) -> None:
+        for amendment_kind in ("card", "prompt"):
+            with self.subTest(amendment_kind=amendment_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
+                persisted = json.loads(status_path.read_text(encoding="utf-8"))
+                persisted_identity = persisted["resume_identity"]
+
+                old_card = workspace / f"{amendment_kind}-card-old.json"
+                new_card = workspace / f"{amendment_kind}-card-new.json"
+                self._write_canonical_json(old_card, card)
+                changed_card = dict(card)
+                changed_card["owner"] = "ROOT-IM"
+                new_card_hash = self._write_canonical_json(new_card, changed_card)
+                old_prompt = workspace / f"{amendment_kind}-prompt-old.md"
+                new_prompt = workspace / f"{amendment_kind}-prompt-new.md"
+                old_prompt.write_bytes(b"workflow\ntask\n")
+                if amendment_kind == "card":
+                    new_prompt.write_bytes(old_prompt.read_bytes())
+                    requested_card_hash = new_card_hash
+                    requested_bundle = raw["prompt_bundle"]
+                else:
+                    new_prompt.write_bytes(b"workflow\ntask amended\n")
+                    components = raw["prompt_bundle"]["components"]  # type: ignore[index]
+                    prompt_a = Path(components[0]["path"])
+                    prompt_b = Path(components[1]["path"])
+                    prompt_b.write_bytes(b"task amended\n")
+                    requested_bundle = prompt_bundle_record_from_paths(
+                        workflow_id="workflow-1",
+                        task_card_id="card-1",
+                        profile_id="profile-1",
+                        paths=(("instructions", prompt_a), ("task", prompt_b)),
+                        run_root=root / "run",
+                    )
+                    requested_card_hash = raw["task_card"]["sha256"]
+                    requested_card_hash = str(requested_card_hash)
+                    requested_card_hash = requested_card_hash.lower()
+                resume = json.loads(json.dumps(raw))
+                resume["action"] = "resume"
+                resume["resume"] = {"session_id": "session-1"}
+                resume["task_card"] = {
+                    **resume["task_card"],
+                    "sha256": requested_card_hash if amendment_kind == "prompt" else new_card_hash,
+                }
+                resume["prompt_bundle"] = requested_bundle
+                review = self._amendment_review(
+                    root,
+                    resume,
+                    persisted=persisted_identity,
+                    old_card=old_card,
+                    new_card=new_card if amendment_kind == "card" else old_card,
+                    old_prompt=old_prompt,
+                    new_prompt=new_prompt,
+                )
+                review_path = workspace / "RESUME_ADMISSION.json"
+                review_path.write_text(json.dumps(review, indent=2), encoding="utf-8")
+                resume_path = root / f"resume-{amendment_kind}.invocation.json"
+                resume_path.write_text(json.dumps(resume), encoding="utf-8")
+
+                self.assertEqual(0, controller.main([str(resume_path)]))
+                self.assertEqual(2, (root / "launches.txt").read_text(encoding="utf-8").count("launch"))
+                admitted = json.loads(status_path.read_text(encoding="utf-8"))["resume_admission"]
+                self.assertTrue(admitted["admitted"])
+                self.assertEqual("NO_CONTINUATION_REQUIRED", admitted["amendment_review"]["disposition"])
+                self.assertEqual(resume["task_card"]["sha256"], json.loads(status_path.read_text(encoding="utf-8"))["resume_identity"]["task_card_sha256"])
+
+    def test_canonical_resume_amendment_rejects_unreviewed_material_wrong_pair_and_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card, workspace, status_path, event_path = self._start_fake_canonical(root)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            persisted_identity = persisted["resume_identity"]
+            old_card = workspace / "card-old.json"
+            new_card = workspace / "card-new.json"
+            wrong_card = workspace / "card-wrong.json"
+            self._write_canonical_json(old_card, card)
+            changed_card = dict(card)
+            changed_card["owner"] = "ROOT-IM"
+            new_hash = self._write_canonical_json(new_card, changed_card)
+            self._write_canonical_json(wrong_card, {**changed_card, "owner": "wrong"})
+            old_prompt = workspace / "prompt-old.md"
+            new_prompt = workspace / "prompt-new.md"
+            old_prompt.write_bytes(b"workflow\ntask\n")
+            new_prompt.write_bytes(old_prompt.read_bytes())
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-1"}
+            resume["task_card"] = {**resume["task_card"], "sha256": new_hash}
+            resume_path = root / "resume-amendment-control.json"
+            resume_path.write_text(json.dumps(resume), encoding="utf-8")
+            status_before = status_path.read_bytes()
+            event_before = event_path.read_bytes()
+
+            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
+                with self.assertRaisesRegex(controller.InvocationError, "resume amendment"):
+                    controller.run(controller.load_invocation(resume_path))
+            self.assertEqual(status_before, status_path.read_bytes())
+            self.assertEqual(event_before, event_path.read_bytes())
+
+            material = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+                disposition="CONTINUATION_REQUIRED",
+                classification="MATERIAL",
+            )
+            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(material), encoding="utf-8")
+            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
+                with self.assertRaisesRegex(controller.InvocationError, "scoped continuation"):
+                    controller.run(controller.load_invocation(resume_path))
+            self.assertEqual(status_before, status_path.read_bytes())
+            self.assertEqual(event_before, event_path.read_bytes())
+
+            wrong_pair = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=wrong_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(wrong_pair), encoding="utf-8")
+            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
+                with self.assertRaisesRegex(controller.InvocationError, "reviewed task-card new identity"):
+                    controller.run(controller.load_invocation(resume_path))
+            self.assertEqual(status_before, status_path.read_bytes())
+            self.assertEqual(event_before, event_path.read_bytes())
+
+            accepted = dict(persisted)
+            accepted["terminal_acceptance_state"] = "ACCEPTED"
+            accepted["resume_identity"] = {**persisted_identity, "terminal_acceptance_state": "ACCEPTED"}
+            status_path.write_text(json.dumps(accepted), encoding="utf-8")
+            accepted_before = status_path.read_bytes()
+            harmless = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(harmless), encoding="utf-8")
+            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
+                with self.assertRaisesRegex(controller.InvocationError, "accepted task"):
+                    controller.run(controller.load_invocation(resume_path))
+            self.assertEqual(accepted_before, status_path.read_bytes())
+
+    def test_canonical_resume_admits_valid_large_root_review_without_local_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            persisted_identity = persisted["resume_identity"]
+            old_card = workspace / "large-card-old.json"
+            new_card = workspace / "large-card-new.json"
+            self._write_canonical_json(old_card, card)
+            changed_card = dict(card)
+            changed_card["owner"] = "ROOT-IM"
+            new_card_hash = self._write_canonical_json(new_card, changed_card)
+            old_prompt = workspace / "large-prompt-old.md"
+            new_prompt = workspace / "large-prompt-new.md"
+            old_prompt.write_bytes(b"workflow\ntask\n")
+            new_prompt.write_bytes(old_prompt.read_bytes())
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-1"}
+            resume["task_card"] = {**resume["task_card"], "sha256": new_card_hash}
+            review = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            review["semantic_impact"]["rationale"] = "x" * (2 * 1024 * 1024)  # type: ignore[index]
+            review_path = workspace / "RESUME_ADMISSION.json"
+            review_path.write_text(json.dumps(review), encoding="utf-8")
+            self.assertGreater(review_path.stat().st_size, 2 * 1024 * 1024)
+            resume_path = root / "resume-large-review.invocation.json"
+            resume_path.write_text(json.dumps(resume), encoding="utf-8")
+
+            self.assertEqual(0, controller.main([str(resume_path)]))
+            self.assertEqual(2, (root / "launches.txt").read_text(encoding="utf-8").count("launch"))
+
+    def test_review_pair_paths_require_absolute_identity_before_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
+            persisted = json.loads(status_path.read_text(encoding="utf-8"))
+            persisted_identity = persisted["resume_identity"]
+            old_card = workspace / "path-card-old.json"
+            new_card = workspace / "path-card-new.json"
+            self._write_canonical_json(old_card, card)
+            changed_card = dict(card)
+            changed_card["owner"] = "ROOT-IM"
+            new_card_hash = self._write_canonical_json(new_card, changed_card)
+            old_prompt = workspace / "path-prompt-old.md"
+            new_prompt = workspace / "path-prompt-new.md"
+            old_prompt.write_bytes(b"workflow\ntask\n")
+            new_prompt.write_bytes(old_prompt.read_bytes())
+            resume = json.loads(json.dumps(raw))
+            resume["action"] = "resume"
+            resume["resume"] = {"session_id": "session-1"}
+            resume["task_card"] = {**resume["task_card"], "sha256": new_card_hash}
+            review = self._amendment_review(
+                root,
+                resume,
+                persisted=persisted_identity,
+                old_card=old_card,
+                new_card=new_card,
+                old_prompt=old_prompt,
+                new_prompt=new_prompt,
+            )
+            for name, pair in review["reviewed_pairs"].items():  # type: ignore[union-attr]
+                pair["old_path"] = f"relative-{name}-old"
+                pair["new_path"] = f"relative-{name}-new"
+                pair["diff"]["command"] = f"git diff --no-index -- {pair['old_path']} {pair['new_path']}"
+            requested = dict(persisted_identity)
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                validate_resume_amendment_review(
+                    review,
+                    requested,
+                    persisted_identity,
+                    expected_job_identity=review["same_job_identity"],
+                )
 
     def test_canonical_output_reservations_reject_before_workspace_mutation(self) -> None:
         reserved_names = ("RESULT.json", COMPLETION_REVIEW_FILENAME, ORCHESTRATOR_ACCEPTANCE_FILENAME)

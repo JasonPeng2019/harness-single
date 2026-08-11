@@ -18,6 +18,7 @@ from .git_safety import (
     inspect_repository,
     validate_coding_result,
 )
+from .resume import validate_resume_amendment_review
 
 PREFLIGHT_SCHEMA = "orchestrator-handoff-preflight-result/v1"
 PASS = "PASS"
@@ -73,11 +74,11 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _json_object(path: Path) -> tuple[dict[str, object], str]:
+def _json_object(path: Path, *, max_bytes: int | None = 2 * 1024 * 1024) -> tuple[dict[str, object], str]:
     if path.is_symlink() or not path.is_file():
         raise ValueError("path is not a regular non-symlink file")
     data = path.read_bytes()
-    if len(data) > 2 * 1024 * 1024:
+    if max_bytes is not None and len(data) > max_bytes:
         raise ValueError("artifact exceeds 2 MiB")
     decoded = cast(object, json.loads(data.decode("utf-8")))
     if not isinstance(decoded, dict):
@@ -228,6 +229,101 @@ def _check_invocation_files(
         )
 
 
+def _check_amendment_identity(
+    *,
+    invocation: Mapping[str, object],
+    task_artifact_sha256: str | None,
+    dependencies: Mapping[str, object],
+    failures: list[dict[str, str]],
+) -> None:
+    """Bind a candidate-only amendment record without admitting semantics."""
+    amendment = _mapping(dependencies.get("amendment"))
+    if amendment is None:
+        return
+    review_path_value = _text(amendment.get("review_path"))
+    review_hash = _text(amendment.get("review_sha256"))
+    requested = _mapping(amendment.get("requested_identity"))
+    persisted = _mapping(amendment.get("persisted_identity"))
+    job_identity = _mapping(amendment.get("job_identity"))
+    if (
+        review_path_value is None
+        or review_hash is None
+        or requested is None
+        or persisted is None
+        or job_identity is None
+    ):
+        failures.append(
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY",
+                REPORT_ONLY_ERROR,
+                "dependency_map",
+                "amendment review path/hash and identity records are required",
+            )
+        )
+        return
+    review_path = Path(review_path_value).expanduser().resolve(strict=False)
+    try:
+        review, actual_hash = _json_object(review_path, max_bytes=None)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        failures.append(
+            _failure("RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc))
+        )
+        return
+    if actual_hash != review_hash.lower():
+        failures.append(
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY",
+                REPORT_ONLY_ERROR,
+                "amendment",
+                "review file hash does not match dependency map",
+            )
+        )
+    pairs = _mapping(review.get("reviewed_pairs"))
+    card_pair = _mapping(pairs.get("task_card")) if pairs is not None else None
+    prompt_pair = _mapping(pairs.get("prompt")) if pairs is not None else None
+    prompt_hash = _text(invocation.get("prompt_sha256"))
+    if prompt_hash is None:
+        bundle = _mapping(invocation.get("prompt_bundle"))
+        prompt_hash = _text(bundle.get("final_sha256")) if bundle is not None else None
+    if (
+        task_artifact_sha256 is None
+        or card_pair is None
+        or _text(card_pair.get("new_sha256")) != task_artifact_sha256.lower()
+        or prompt_pair is None
+        or prompt_hash is None
+        or _text(prompt_pair.get("new_sha256")) != prompt_hash.lower()
+    ):
+        failures.append(
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY",
+                REPORT_ONLY_ERROR,
+                "amendment",
+                "reviewed new raw identity does not match supplied candidate artifacts",
+            )
+        )
+    declared_disposition = _text(amendment.get("disposition"))
+    if declared_disposition is not None and declared_disposition != _text(review.get("disposition")):
+        failures.append(
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY",
+                REPORT_ONLY_ERROR,
+                "amendment",
+                "dependency-map disposition does not match review",
+            )
+        )
+    try:
+        _ = validate_resume_amendment_review(
+            review,
+            requested,
+            persisted,
+            expected_job_identity=job_identity,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        failures.append(
+            _failure("RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc))
+        )
+
+
 def _load_artifacts(
     paths: Mapping[str, Path], failures: list[dict[str, str]]
 ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, str]]]:
@@ -339,6 +435,13 @@ def preflight_handoff(
     dependencies = loaded.get("dependency_map", {})
     if invocation and worktree.is_dir():
         _check_invocation_files(invocation, worktree, failures)
+    if invocation and task and dependencies:
+        _check_amendment_identity(
+            invocation=invocation,
+            task_artifact_sha256=artifacts.get("task_card", {}).get("sha256"),
+            dependencies=dependencies,
+            failures=failures,
+        )
 
     declaration: GitDeclaration | None = None
     identity: GitIdentity | None = None
