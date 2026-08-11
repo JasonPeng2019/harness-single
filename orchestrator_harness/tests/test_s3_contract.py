@@ -222,6 +222,48 @@ class S3ContractTests(unittest.TestCase):
                 [item["event_id"] for item in router.pending_events()],
             )
 
+    def test_repair_synthesized_unknown_source_ids_are_source_exact(self) -> None:
+        """S3-R3-001: omitted source IDs remain distinct across future types."""
+        with tempfile.TemporaryDirectory() as raw:
+            router = self.router(Path(raw) / "manager")
+            shared_data = {
+                "lane_id": "run-s3:lane-a",
+                "payload_ref": {
+                    "path": "future/payload.json",
+                    "sha256": "a" * 64,
+                },
+            }
+
+            def future_event(source_type: str) -> dict[str, object]:
+                return {
+                    "type": source_type,
+                    "identity": "future:shared",
+                    "data": dict(shared_data),
+                }
+
+            future_a = future_event("FUTURE_A")
+            first = router.admit(future_a)
+            repeat = router.admit(dict(future_a))
+            future_b = router.admit(future_event("FUTURE_B"))
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(repeat)
+            self.assertIsNotNone(future_b)
+            assert first is not None and repeat is not None and future_b is not None
+            self.assertEqual(first["event_id"], repeat["event_id"])
+            self.assertNotEqual(first["event_id"], future_b["event_id"])
+            self.assertEqual(2, len(router.pending_events()))
+
+            router.admit(self.event(
+                "CONDITION_CLEARED",
+                "clear-future-a-synthesized",
+                "future:shared",
+                cleared_event_id=first["event_id"],
+                cleared_type="FUTURE_A",
+            ))
+            pending = router.pending_events()
+            self.assertEqual([future_b["event_id"]], [item["event_id"] for item in pending])
+            self.assertEqual(["FUTURE_B"], [item["source_type"] for item in pending])
+
     def test_repair_concurrent_router_admissions_serialize_sequence_allocation(self) -> None:
         """S3-R2-LOCK: public admissions cannot share a journal sequence."""
         with tempfile.TemporaryDirectory() as raw:

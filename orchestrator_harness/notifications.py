@@ -760,6 +760,7 @@ class ManagerEventRouter:
             "binding_digest": self.binding.digest,
             "source_event_id": source_event_id,
             "event_type": decision.event_type,
+            "source_type": decision.source_type,
             "identity": decision.identity,
             "facts": facts,
             "payload_ref": reference,
