@@ -686,6 +686,49 @@ def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> P
     raise RuntimeError(f"cannot establish exact process identity for PID {pid}")
 
 
+def _command_tail(command_line: str) -> str:
+    """Return argv after the executable for launcher-chain comparison."""
+
+    value = command_line.strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        return " ".join(value[end + 1 :].split()) if end > 0 else ""
+    parts = value.split(None, 1)
+    return " ".join(parts[1].split()) if len(parts) == 2 else ""
+
+
+def _is_launcher_descendant(
+    item: ProcessInfo,
+    parent: ProcessInfo,
+    *,
+    provider_root_pid: int | None = None,
+) -> bool:
+    """Exclude an OS launcher re-exec without hiding a real helper root.
+
+    Some Windows Python launch shims expose an empty command line for the
+    first child below the Popen PID.  That one direct child is still part of
+    the provider launch chain; later descendants are inventoried as helpers.
+    """
+
+    return (
+        item.pid != parent.pid
+        and item.ppid == parent.pid
+        and (
+            (
+                bool(_command_tail(item.command_line))
+                and _command_tail(item.command_line) == _command_tail(parent.command_line)
+            )
+            or (
+                provider_root_pid is not None
+                and parent.pid == provider_root_pid
+                and not item.command_line.strip()
+            )
+        )
+    )
+
+
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
     identity: ProcessInfo | None = None,
@@ -1520,7 +1563,7 @@ def run(invocation: Invocation) -> int:
             state["resume_identity"] = resume_identity
 
     def _publish_registry() -> None:
-        nonlocal admission
+        nonlocal admission, registry_generation
         if invocation.repository is None:
             return
         if invocation.invocation_path is None:
@@ -1550,6 +1593,12 @@ def run(invocation: Invocation) -> int:
                 target_revision=state.get("lifecycle_target_revision"),
                 resume=invocation.action == "resume",
             )
+            # A resume is admitted from the fixed owner before its resumed
+            # status is published.  The owner generation is authoritative for
+            # every subsequent status, update, terminal record, and retire.
+            registry_generation = admission.generation
+            state["lifecycle_registry_generation"] = registry_generation
+            state["resume_admission"] = admission.record
         else:
             admission = _update_lifecycle_registry(
                 admission,
@@ -1571,14 +1620,42 @@ def run(invocation: Invocation) -> int:
             )
 
     if invocation.repository is not None:
-        _atomic_json(invocation.status_path, state)
+        # Admission must precede both initial and resumed status publication.
+        # This makes the fixed owner the first durable lifecycle authority and
+        # prevents a resumed status from advertising a fresh generation.
         _publish_registry()
+        _atomic_json(invocation.status_path, state)
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     child: ProcessInfo | None = None
     supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
     child_exit_confirmed = True
+
+    def _retain_unresolved_claims() -> list[str]:
+        if resource_claims is None or child_exit_confirmed:
+            return []
+        boundary_evidence = state.get("process_boundary")
+        retained_identities: list[dict[str, Any]] = []
+        if isinstance(boundary_evidence, Mapping):
+            raw_members = boundary_evidence.get("live_members")
+            if isinstance(raw_members, list):
+                retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+            boundary_value = dict(boundary_evidence)
+        else:
+            boundary_value = {"complete": False, "errors": ["owned boundary evidence was not published"]}
+        if not state.get("direct_child_reaped"):
+            boundary_value["complete"] = False
+        failures = resource_claims.retain_boundary(
+            boundary=boundary_value,
+            identities=retained_identities,
+        )
+        state["held_resource_claims"] = resource_claims.held
+        state["waiting_resource_claim"] = None
+        if failures:
+            state["resource_retention_errors"] = failures
+        return failures
+
     try:
         if invocation.worker_invocation_id is not None and invocation.resources:
             assert invocation.resource_lock_root is not None
@@ -1699,25 +1776,40 @@ def run(invocation: Invocation) -> int:
             out_thread.start(); err_thread.start()
             assert supervisor is not None
             exit_code = supervisor.wait_for_exit()
-            child_exit_confirmed = True
             out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
         if supervisor is None:
             raise ProcessBoundaryUnsupported("provider completed without an ownership boundary")
+        # Direct Popen reap and complete owned-boundary emptiness are separate
+        # facts.  ``cleanup`` performs a fresh inventory after any termination
+        # request, targets escaped exact identities, and reaps adopted members
+        # before it can prove the claim-release predicate.
+        cleanup_result = supervisor.cleanup()
+        child_exit_confirmed = cleanup_result.proved_reap
         boundary_inventory = supervisor.boundary_inventory()
+        state["cleanup"] = cleanup_result.to_record()
+        state["direct_child_reaped"] = cleanup_result.final_reap
+        state["owned_boundary_empty"] = cleanup_result.owned_boundary_empty
         state["process_boundary"] = boundary.to_record(boundary_inventory) if boundary is not None else None
-        state["owned_helpers"] = [
-            {
+        observed_by_pid = {item.pid: item for item in boundary_inventory.observed_processes}
+        owned_helpers: list[dict[str, Any]] = []
+        for item in boundary_inventory.observed_processes:
+            if item.pid == state.get("provider_pid") or item.created_utc is None:
+                continue
+            parent = observed_by_pid.get(item.ppid)
+            if parent is not None and _is_launcher_descendant(
+                item,
+                parent,
+                provider_root_pid=state.get("provider_pid"),
+            ):
+                continue
+            owned_helpers.append({
                 "name": f"helper-{item.pid}",
                 "identity": {"pid": item.pid, "created_utc": iso_utc(item.created_utc)},
-            }
-            for item in boundary_inventory.observed_processes
-            if item.pid != state.get("provider_pid") and item.created_utc is not None
-        ]
-        state["helpers_complete"] = boundary_inventory.complete and not boundary_inventory.processes
-        if not boundary_inventory.complete or boundary_inventory.processes:
-            cleanup_boundary = supervisor.terminate_owned_boundary()
-            state["process_boundary"] = boundary.to_record(boundary_inventory) if boundary is not None else state.get("process_boundary")
+            })
+        state["owned_helpers"] = owned_helpers
+        state["helpers_complete"] = cleanup_result.proved_reap and boundary_inventory.complete and not boundary_inventory.processes
+        if not cleanup_result.proved_reap or not boundary_inventory.complete or boundary_inventory.processes:
             state.update({
                 "state": "CONTROLLER_FAILED",
                 "ended_utc": _utc(),
@@ -1726,7 +1818,7 @@ def run(invocation: Invocation) -> int:
                     "complete": boundary_inventory.complete,
                     "live_helpers": [item.pid for item in boundary_inventory.processes],
                     "errors": list(boundary_inventory.errors),
-                    "cleanup": cleanup_boundary,
+                    "cleanup": cleanup_result.to_record(),
                 },
             })
             _atomic_json(invocation.status_path, state)
@@ -1808,7 +1900,11 @@ def run(invocation: Invocation) -> int:
         cleanup_evidence: dict[str, Any] | None = None
         if process is not None and not child_exit_confirmed:
             if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process, identity=child)
+                direct_reaped, cleanup_evidence = _shutdown_exact_child(process, identity=child)
+                child_exit_confirmed = direct_reaped and (boundary is None or invocation.repository is None)
+                if boundary is not None:
+                    state["direct_child_reaped"] = direct_reaped
+                    state["process_boundary"] = boundary.to_record(boundary.inventory())
             else:
                 cleanup: CleanupResult = supervisor.cleanup()
                 child_exit_confirmed = cleanup.proved_reap
@@ -1818,6 +1914,7 @@ def run(invocation: Invocation) -> int:
                 if "FINAL_REAP_TIMEOUT" in cleanup.stages:
                     cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
+            _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
             state.update({
@@ -1861,7 +1958,11 @@ def run(invocation: Invocation) -> int:
         cleanup_evidence = None
         if process is not None and not child_exit_confirmed:
             if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process, identity=child)
+                direct_reaped, cleanup_evidence = _shutdown_exact_child(process, identity=child)
+                child_exit_confirmed = direct_reaped and (boundary is None or invocation.repository is None)
+                if boundary is not None:
+                    state["direct_child_reaped"] = direct_reaped
+                    state["process_boundary"] = boundary.to_record(boundary.inventory())
             else:
                 cleanup: CleanupResult = supervisor.cleanup()
                 child_exit_confirmed = cleanup.proved_reap
@@ -1871,6 +1972,7 @@ def run(invocation: Invocation) -> int:
                 if "FINAL_REAP_TIMEOUT" in cleanup.stages:
                     cleanup_evidence["kill_wait_timed_out"] = True
         if not child_exit_confirmed:
+            _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"
             state.update({
@@ -1897,12 +1999,37 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
     finally:
-        if resource_claims is not None and child_exit_confirmed:
-            release_failures = resource_claims.release_all()
-            state["held_resource_claims"] = resource_claims.held
-            state["waiting_resource_claim"] = None
-            if release_failures:
-                state["resource_release_errors"] = release_failures
+        if resource_claims is not None:
+            if child_exit_confirmed:
+                release_failures = resource_claims.release_all()
+                state["held_resource_claims"] = resource_claims.held
+                state["waiting_resource_claim"] = None
+                if release_failures:
+                    state["resource_release_errors"] = release_failures
+            else:
+                boundary_evidence = state.get("process_boundary")
+                retained_identities: list[dict[str, Any]] = []
+                if isinstance(boundary_evidence, Mapping):
+                    raw_members = boundary_evidence.get("live_members")
+                    if isinstance(raw_members, list):
+                        retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+                if not isinstance(boundary_evidence, Mapping):
+                    boundary_evidence = {
+                        "complete": False,
+                        "errors": ["owned boundary evidence was not published"],
+                    }
+                else:
+                    boundary_evidence = dict(boundary_evidence)
+                    if not state.get("direct_child_reaped"):
+                        boundary_evidence["complete"] = False
+                retention_failures = resource_claims.retain_boundary(
+                    boundary=boundary_evidence,
+                    identities=retained_identities,
+                )
+                state["held_resource_claims"] = resource_claims.held
+                state["waiting_resource_claim"] = None
+                if retention_failures:
+                    state["resource_retention_errors"] = retention_failures
             try:
                 _atomic_json(invocation.status_path, state)
             except OSError:

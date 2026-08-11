@@ -16,6 +16,8 @@ from .processes import process_group_inventory, process_snapshot, targeted_proce
 
 PROCESS_CLEANUP_SCHEMA = "orchestrator-process-cleanup/v1"
 PROCESS_BOUNDARY_SCHEMA = "orchestrator-process-boundary/v1"
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
 
 
 class ProcessBoundaryUnsupported(RuntimeError):
@@ -53,6 +55,29 @@ def _windows_job_api() -> tuple[Any, ...]:
     return create, assign, set_info, query, terminate, close, resume, wintypes
 
 
+def _enable_linux_subreaper() -> None:
+    """Establish kernel adoption of orphaned provider descendants."""
+
+    if os.name != "posix" or not os.path.isdir("/proc"):
+        raise ProcessBoundaryUnsupported("Linux subreaper support is unavailable")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise ProcessBoundaryUnsupported(f"PR_SET_CHILD_SUBREAPER failed ({error})")
+        value = ctypes.c_ulong(0)
+        if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(value), 0, 0, 0) != 0 or value.value != 1:
+            error = ctypes.get_errno()
+            raise ProcessBoundaryUnsupported(f"PR_GET_CHILD_SUBREAPER did not confirm adoption ({error})")
+    except ProcessBoundaryUnsupported:
+        raise
+    except Exception as exc:
+        raise ProcessBoundaryUnsupported(f"Linux subreaper setup failed: {exc}") from exc
+
+
 class ProcessBoundary:
     """A controller-owned kernel/session boundary with complete inventory evidence."""
 
@@ -61,11 +86,17 @@ class ProcessBoundary:
         self.identity = identity
         self._job_handle: Any = None
         self._group_id: int | None = None
+        self._session_id: int | None = None
         self._root_pid: int | None = None
+        self._root_identity: ProcessInfo | None = None
+        self._baseline: ProcessSnapshot | None = None
         self._history: dict[tuple[int, str], ProcessInfo] = {}
         self._inventory_errors: list[str] = []
         self._closed = False
         self._cleanup_result: str | None = None
+        self._cleanup_stages: list[str] = []
+        self._cleanup_errors: list[str] = []
+        self._last_inventory: ProcessBoundaryInventory | None = None
 
     @classmethod
     def prepare(cls) -> "ProcessBoundary":
@@ -122,14 +153,26 @@ class ProcessBoundary:
                         pass
                 raise ProcessBoundaryUnsupported(f"Windows Job Object setup failed: {exc}") from exc
         if os.name == "posix" and os.path.isdir("/proc"):
-            return cls(kind="linux-process-group")
+            _enable_linux_subreaper()
+            boundary = cls(kind="linux-subreaper")
+            snapshot: ProcessSnapshot | None = None
+            for _ in range(3):
+                candidate = process_snapshot()
+                if candidate.complete:
+                    snapshot = candidate
+                    break
+                time.sleep(0.01)
+            if snapshot is None:
+                raise ProcessBoundaryUnsupported("complete Linux process baseline is unavailable")
+            boundary._baseline = snapshot
+            return boundary
         raise ProcessBoundaryUnsupported("no complete process boundary is supported on this host")
 
     @property
     def popen_kwargs(self) -> dict[str, Any]:
         if self.kind == "windows-job":
             return {"creationflags": 0x00000004}  # CREATE_SUSPENDED
-        if self.kind == "linux-process-group":
+        if self.kind in {"linux-process-group", "linux-subreaper"}:
             return {"start_new_session": True}
         raise ProcessBoundaryUnsupported("process boundary has no launch contract")
 
@@ -150,13 +193,17 @@ class ProcessBoundary:
             if status != 0:
                 raise ProcessBoundaryUnsupported(f"NtResumeProcess failed ({status})")
             self._root_pid = pid
-        elif self.kind == "linux-process-group":
+        elif self.kind in {"linux-process-group", "linux-subreaper"}:
             try:
                 self._group_id = os.getpgid(pid)
+                self._session_id = os.getsid(pid)
             except OSError as exc:
-                raise ProcessBoundaryUnsupported(f"process group identity unavailable: {exc}") from exc
-            self.identity = f"pgid:{self._group_id}"
+                raise ProcessBoundaryUnsupported(f"process group/session identity unavailable: {exc}") from exc
+            if self._session_id <= 0:
+                raise ProcessBoundaryUnsupported("provider session identity is invalid")
+            self.identity = f"subreaper:pgid:{self._group_id}:sid:{self._session_id}"
             self._root_pid = pid
+            self._root_identity = identity
         else:
             raise ProcessBoundaryUnsupported("unknown process boundary kind")
         self._record(identity)
@@ -181,7 +228,6 @@ class ProcessBoundary:
                     buffer = ctypes.create_string_buffer(size)
                     returned = wintypes.DWORD()
                     if query(self._job_handle, 3, buffer, size, ctypes.byref(returned)):
-                        count = int.from_bytes(buffer.raw[:4], "little")
                         ids_count = int.from_bytes(buffer.raw[4:8], "little")
                         if ids_count > capacity:
                             capacity = ids_count + 16
@@ -191,6 +237,19 @@ class ProcessBoundary:
                             int.from_bytes(buffer.raw[8 + index * pointer_size:8 + (index + 1) * pointer_size], "little")
                             for index in range(ids_count)
                         ]
+                        if ids_count == 0:
+                            empty = ProcessBoundaryInventory(
+                                not self._inventory_errors,
+                                self.kind,
+                                self.identity,
+                                (),
+                                self.history,
+                                tuple(self._inventory_errors),
+                                "job-object+CIM",
+                                self._cleanup_result,
+                            )
+                            self._last_inventory = empty
+                            return empty
                         snapshot = process_snapshot()
                         if not snapshot.complete:
                             self._inventory_errors.extend(snapshot.errors)
@@ -230,8 +289,8 @@ class ProcessBoundary:
                                 marked = ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
                                 members.append(marked)
                                 self._record(marked)
-                        if errors or count != ids_count:
-                            failure_errors = tuple(errors or ("job inventory count is inconsistent",))
+                        if errors:
+                            failure_errors = tuple(errors)
                             self._inventory_errors.extend(failure_errors)
                             return ProcessBoundaryInventory(False, self.kind, self.identity, tuple(members), self.history, failure_errors, "job-object+CIM")
                         if self._inventory_errors:
@@ -249,14 +308,35 @@ class ProcessBoundary:
             except Exception as exc:
                 self._inventory_errors.append(f"job inventory failed: {exc}")
                 return ProcessBoundaryInventory(False, self.kind, self.identity, errors=(f"job inventory failed: {exc}",), source="job-object")
-        if self.kind == "linux-process-group" and self._group_id is not None:
-            inventory = process_group_inventory(self._group_id, boundary_identity=self.identity)
-            for item in inventory.processes:
+        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
+            inventory = process_group_inventory(
+                self._group_id,
+                boundary_identity=self.identity,
+                session_id=self._session_id,
+                root_pid=self._root_pid,
+                root_identity=self._root_identity,
+                controller_pid=os.getpid(),
+                owned_history=self.history,
+            )
+            for item in inventory.observed_processes + inventory.processes:
                 marked = ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
                 self._record(marked)
             if inventory.errors:
                 self._inventory_errors.extend(inventory.errors)
-            return ProcessBoundaryInventory(inventory.complete and not self._inventory_errors, inventory.boundary_kind, inventory.boundary_identity, inventory.processes, self.history, tuple(self._inventory_errors) or inventory.errors, inventory.source, self._cleanup_result)
+            self._last_inventory = ProcessBoundaryInventory(
+                inventory.complete and not self._inventory_errors,
+                inventory.boundary_kind,
+                inventory.boundary_identity,
+                tuple(
+                    ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
+                    for item in inventory.processes
+                ),
+                self.history,
+                tuple(self._inventory_errors) or inventory.errors,
+                inventory.source,
+                self._cleanup_result,
+            )
+            return self._last_inventory
         return ProcessBoundaryInventory(False, self.kind, self.identity, errors=("boundary identity is unavailable",), source="controller")
 
     def terminate_owned(self) -> str:
@@ -274,7 +354,7 @@ class ProcessBoundary:
             except Exception as exc:
                 self._cleanup_result = f"job-termination-failed:{exc}"
             return self._cleanup_result
-        if self.kind == "linux-process-group" and self._group_id is not None:
+        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
             try:
                 os.killpg(self._group_id, signal.SIGTERM)
                 self._cleanup_result = "process-group-terminated"
@@ -285,6 +365,87 @@ class ProcessBoundary:
             return self._cleanup_result
         self._cleanup_result = "boundary-identity-unavailable"
         return self._cleanup_result
+
+    def _signal_exact_members(self, inventory: ProcessBoundaryInventory, signum: int) -> None:
+        """Signal only members whose current creation identity still matches."""
+
+        if os.name != "posix":
+            return
+        for item in inventory.processes:
+            if item.pid in {os.getpid(), self._root_pid} or item.created_utc is None:
+                continue
+            try:
+                query = targeted_process_query(item.pid)
+                if (
+                    not query.complete
+                    or query.process is None
+                    or query.process.created_utc != item.created_utc
+                ):
+                    continue
+                os.kill(item.pid, signum)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+
+    def _reap_adopted_members(self, inventory: ProcessBoundaryInventory) -> None:
+        """Reap exact adopted children without stealing the Popen wait."""
+
+        if os.name != "posix":
+            return
+        for item in inventory.processes:
+            if item.pid in {os.getpid(), self._root_pid} or item.ppid != os.getpid():
+                continue
+            try:
+                os.waitpid(item.pid, os.WNOHANG)
+            except (ChildProcessError, ProcessLookupError, PermissionError, OSError):
+                continue
+
+    def cleanup_owned(self, *, graceful_timeout_seconds: float, force_timeout_seconds: float) -> ProcessBoundaryInventory:
+        """Terminate, wait, re-inventory, and reap the complete boundary."""
+
+        inventory = self.inventory()
+        if inventory.complete and not inventory.processes:
+            self._cleanup_result = "boundary-empty"
+            self._cleanup_stages.append("EMPTY_BOUNDARY")
+            return inventory
+
+        self._cleanup_stages.append("BOUNDARY_STOP_REQUESTED")
+        self.terminate_owned()
+        if inventory.complete:
+            self._signal_exact_members(inventory, signal.SIGTERM)
+        deadline = time.monotonic() + max(0.0, graceful_timeout_seconds)
+        while True:
+            self._reap_adopted_members(inventory)
+            inventory = self.inventory()
+            if inventory.complete and not inventory.processes:
+                self._cleanup_result = "boundary-empty-after-graceful"
+                self._cleanup_stages.append("BOUNDARY_EMPTY_AFTER_GRACEFUL")
+                return inventory
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        self._cleanup_stages.append("BOUNDARY_FORCE_STOP_REQUESTED")
+        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
+            try:
+                os.killpg(self._group_id, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if inventory.complete:
+            self._signal_exact_members(inventory, signal.SIGKILL)
+        deadline = time.monotonic() + max(0.0, force_timeout_seconds)
+        while True:
+            self._reap_adopted_members(inventory)
+            inventory = self.inventory()
+            if inventory.complete and not inventory.processes:
+                self._cleanup_result = "boundary-empty-after-force"
+                self._cleanup_stages.append("BOUNDARY_EMPTY_AFTER_FORCE")
+                return inventory
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        self._cleanup_result = "boundary-incomplete" if not inventory.complete else "boundary-not-empty"
+        self._cleanup_stages.append("BOUNDARY_EMPTY_UNPROVEN")
+        return inventory
 
     def close(self) -> None:
         if self._closed:
@@ -309,6 +470,7 @@ class ProcessBoundary:
             "cleanup": observed.cleanup or self._cleanup_result,
             "root_pid": self._root_pid,
             "group_id": self._group_id,
+            "session_id": self._session_id,
             "members": [
                 {"pid": item.pid, "created_utc": iso_utc(item.created_utc), "name": item.name}
                 for item in observed.observed_processes
@@ -354,10 +516,20 @@ class CleanupResult:
     exit_code: int | None = None
     reaped_after: str | None = None
     errors: tuple[str, ...] = ()
+    owned_boundary_empty: bool = True
+    boundary_complete: bool = True
+    boundary_cleanup: str | None = None
+    boundary_errors: tuple[str, ...] = ()
 
     @property
     def proved_reap(self) -> bool:
-        return self.cleanup_confirmed and self.final_reap and not self.identity_uncertain
+        return (
+            self.cleanup_confirmed
+            and self.final_reap
+            and self.owned_boundary_empty
+            and self.boundary_complete
+            and not self.identity_uncertain
+        )
 
     def to_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -377,6 +549,10 @@ class CleanupResult:
             "exit_code": self.exit_code,
             "reaped_after": self.reaped_after,
             "errors": list(self.errors),
+            "owned_boundary_empty": self.owned_boundary_empty,
+            "boundary_complete": self.boundary_complete,
+            "boundary_cleanup": self.boundary_cleanup,
+            "boundary_errors": list(self.boundary_errors),
         }
         return record
 
@@ -396,6 +572,8 @@ class ProcessSupervisor:
     _reaped: bool = field(init=False, default=False, repr=False)
     _exit_code: int | None = field(init=False, default=None, repr=False)
     _result: CleanupResult | None = field(init=False, default=None, repr=False)
+    _boundary_checked: bool = field(init=False, default=False, repr=False)
+    _boundary_inventory: ProcessBoundaryInventory | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.graceful_timeout_seconds < 0:
@@ -463,6 +641,25 @@ class ProcessSupervisor:
         reaped_after: str | None,
         errors: list[str],
     ) -> CleanupResult:
+        owned_boundary_empty = True
+        boundary_complete = True
+        boundary_cleanup: str | None = None
+        boundary_errors: tuple[str, ...] = ()
+        if self.boundary is not None:
+            if not self._boundary_checked:
+                self._boundary_inventory = self.boundary.cleanup_owned(
+                    graceful_timeout_seconds=self.graceful_timeout_seconds,
+                    force_timeout_seconds=float(self.force_timeout_seconds or 0.0),
+                )
+                self._boundary_checked = True
+            boundary_inventory = self._boundary_inventory
+            if boundary_inventory is not None:
+                boundary_complete = boundary_inventory.complete
+                owned_boundary_empty = boundary_inventory.complete and not boundary_inventory.processes
+                boundary_cleanup = boundary_inventory.cleanup
+                boundary_errors = tuple(boundary_inventory.errors)
+                if boundary_errors:
+                    errors.extend(f"owned boundary: {item}" for item in boundary_errors)
         return CleanupResult(
             pid=self.pid,
             expected_created_utc=self.creation_identity,
@@ -471,12 +668,16 @@ class ProcessSupervisor:
             terminate_attempted=terminate_attempted,
             kill_attempted=kill_attempted,
             final_reap=final_reap,
-            cleanup_confirmed=final_reap and not identity_uncertain,
+            cleanup_confirmed=final_reap and owned_boundary_empty and boundary_complete and not identity_uncertain,
             identity_verified=identity_verified,
             identity_uncertain=identity_uncertain,
             exit_code=self._exit_code,
             reaped_after=reaped_after,
             errors=tuple(errors),
+            owned_boundary_empty=owned_boundary_empty,
+            boundary_complete=boundary_complete,
+            boundary_cleanup=boundary_cleanup,
+            boundary_errors=boundary_errors,
         )
 
     def wait_for_exit(self) -> int:

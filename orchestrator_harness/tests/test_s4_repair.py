@@ -8,6 +8,7 @@ import pkgutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +41,10 @@ from orchestrator_harness.lane_lifecycle import (
     validate_lane_archive,
 )
 from orchestrator_harness.notifications import ManagerEventRouter
-from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
+from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
+from orchestrator_harness.process_supervisor import ProcessBoundary, ProcessSupervisor
+from orchestrator_harness.processes import process_group_inventory, targeted_process_query
+from orchestrator_harness.resource_locks import ResourceClaims, _owner_state
 from orchestrator_harness.stable_io import AppendLockError, PathKeyedAppendLock, SafeOutput
 from orchestrator_harness import codex_adapter, lane_lifecycle
 
@@ -460,6 +464,233 @@ class S4RepairRegressionTests(unittest.TestCase):
             self.assertFalse(unsupported_record["lifecycle"]["complete"])
             self.assertTrue(lane.exists())
             del main
+
+    def test_FC28_distinct_workers_contend_on_one_fixed_production_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main, lane, revision = self._git_fixture(root)
+            workspace = lane / ".agent-workspace"
+            workspace.mkdir(exist_ok=True)
+            common = Path(self._git(lane, "rev-parse", "--git-common-dir"))
+            if not common.is_absolute():
+                common = (lane / common).resolve()
+            branch = self._git(lane, "symbolic-ref", "--short", "HEAD")
+            repository = {
+                "worktree_root": str(lane.resolve()),
+                "common_dir": str(common.resolve()),
+                "branch": branch,
+                "expected_head": revision,
+                "starting_head": revision,
+                "retained_ref": "refs/heads/main",
+                "target_revision": revision,
+            }
+            from orchestrator_harness.lane_lifecycle import _admit_lifecycle_registry
+
+            original = _admit_lifecycle_registry
+            barrier = threading.Barrier(2)
+            results: list[object] = []
+
+            def admitted(worker: str) -> None:
+                invocation = root / f"{worker}.invocation.json"
+                invocation.write_bytes(b"{}\n")
+                try:
+                    results.append(lane_lifecycle._admit_lifecycle_registry(
+                        lane,
+                        lane_id="fixed-owner",
+                        run_root=lane,
+                        invocation_path=invocation,
+                        status_path=workspace / f"{worker}.status.json",
+                        invocation_schema="orchestrator-coding-invocation/v1",
+                        worker_invocation_id=worker,
+                        generation=worker,
+                        state="RUNNING_CODEX",
+                        repository=repository,
+                        controller=ProcessInfo(1001 if worker == "worker-a" else 1002, 1, "controller", "controller", datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                    ))
+                except Exception as exc:
+                    results.append(exc)
+
+            with patch.object(lane_lifecycle, "_admit_lifecycle_registry", side_effect=lambda *args, **kwargs: (barrier.wait(timeout=10), original(*args, **kwargs))[1]):
+                first = threading.Thread(target=admitted, args=("worker-a",))
+                second = threading.Thread(target=admitted, args=("worker-b",))
+                first.start(); second.start(); first.join(15); second.join(15)
+            self.assertEqual(2, len(results))
+            self.assertEqual(1, sum(isinstance(item, object) and not isinstance(item, Exception) for item in results))
+            self.assertEqual(1, sum(isinstance(item, Exception) for item in results))
+            owner = lifecycle_registry_path(lane, "fixed-owner", "worker-a")
+            self.assertEqual(owner, lifecycle_registry_path(lane, "fixed-owner", "worker-b"))
+            self.assertTrue(owner.is_file())
+            self.assertFalse((owner.parent / "worker-a").exists())
+            self.assertFalse((owner.parent / "worker-b").exists())
+            del main
+
+    def test_FC29_production_start_then_resume_reuses_one_admitted_generation(self) -> None:
+        from orchestrator_harness.tests.test_coding_lane_controller import CodingLaneControllerTests
+
+        case = CodingLaneControllerTests("test_start_records_identity_events_and_configured_codex_argv")
+        case.setUp()
+        try:
+            start, _ = case.invocation(action="start", worker_id="worker-1")
+            self.assertEqual(0, lane_controller.main([str(start)]))
+            start_status = json.loads((case.workspace / "controller.status.json").read_text(encoding="utf-8"))
+            generation = start_status["lifecycle_registry_generation"]
+            resume, _ = case.invocation(action="resume", worker_id="worker-1")
+            self.assertEqual(0, lane_controller.main([str(resume)]))
+            resumed_status = json.loads((case.workspace / "controller.status.json").read_text(encoding="utf-8"))
+            record = json.loads(lifecycle_registry_path(case.run_root, "coding:worker-1", "worker-1").read_text(encoding="utf-8"))
+            self.assertEqual(generation, resumed_status["lifecycle_registry_generation"])
+            self.assertEqual(generation, record["run"]["generation"])
+            self.assertTrue(record["lifecycle"]["complete"])
+            self.assertTrue(record["lifecycle"]["helpers_complete"])
+            lane_lifecycle._load_canonical_lifecycle_registry(case.run_root, lane_id="coding:worker-1")
+        finally:
+            case.tearDown()
+
+    def test_FC30_linux_escape_and_adoption_inventory_is_not_group_only(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        root = ProcessInfo(10, 1, "provider", "provider", now, 10, 10)
+        child = ProcessInfo(11, 10, "helper", "helper", now, 10, 10)
+        adopted = ProcessInfo(11, 1, "helper", "helper", now, 99, 99)
+        first = process_group_inventory(
+            10,
+            session_id=10,
+            root_pid=10,
+            root_identity=root,
+            controller_pid=1,
+            owned_history=(root,),
+            snapshot_provider=lambda: ProcessSnapshot(True, (root, child), (), "synthetic-linux"),
+        )
+        second = process_group_inventory(
+            10,
+            session_id=10,
+            root_pid=10,
+            root_identity=root,
+            controller_pid=1,
+            owned_history=first.observed_processes,
+            snapshot_provider=lambda: ProcessSnapshot(True, (adopted,), (), "synthetic-linux"),
+        )
+        unobserved = process_group_inventory(
+            10,
+            session_id=10,
+            root_pid=10,
+            root_identity=root,
+            controller_pid=1,
+            owned_history=(root,),
+            snapshot_provider=lambda: ProcessSnapshot(True, (adopted,), (), "synthetic-linux"),
+        )
+        group_only = process_group_inventory(
+            10,
+            snapshot_provider=lambda: ProcessSnapshot(True, (), (), "synthetic-linux"),
+        )
+        self.assertTrue(first.complete and second.complete)
+        self.assertEqual([11], [item.pid for item in second.processes])
+        self.assertFalse(unobserved.complete)
+        self.assertFalse(group_only.complete)
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").is_dir(),
+        "real POSIX process-boundary oracle is not supported on this host",
+    )
+    def test_FC30_real_posix_subprocess_escape_is_owned_and_reaped(self) -> None:
+        boundary = ProcessBoundary.prepare()
+        helper_code = "import os,time; os.setsid(); time.sleep(30)"
+        provider_code = (
+            "import subprocess,sys,time\n"
+            f"subprocess.Popen([sys.executable, '-c', {helper_code!r}])\n"
+            "time.sleep(0.5)\n"
+        )
+        provider = subprocess.Popen(
+            [sys.executable, "-c", provider_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **boundary.popen_kwargs,
+        )
+        supervisor: ProcessSupervisor | None = None
+        cleanup_result = None
+        try:
+            query = targeted_process_query(provider.pid)
+            self.assertTrue(query.complete and query.process is not None)
+            assert query.process is not None
+            boundary.attach(provider, query.process)
+            supervisor = ProcessSupervisor(
+                provider,
+                query.process,
+                graceful_timeout_seconds=0.5,
+                force_timeout_seconds=0.5,
+                boundary=boundary,
+            )
+            self.assertEqual(0, supervisor.wait_for_exit())
+            observed = boundary.inventory()
+            self.assertTrue(observed.complete)
+            self.assertTrue(any(item.pid != provider.pid for item in observed.processes))
+            cleanup_result = supervisor.cleanup()
+            self.assertTrue(cleanup_result.proved_reap)
+            final = boundary.inventory()
+            self.assertTrue(final.complete and not final.processes)
+        finally:
+            if supervisor is not None and (cleanup_result is None or not cleanup_result.proved_reap):
+                try:
+                    supervisor.cleanup()
+                except Exception:
+                    boundary.terminate_owned()
+            if provider.poll() is None:
+                try:
+                    provider.kill()
+                    provider.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            boundary.close()
+
+    def test_FC31_retained_live_or_uncertain_helper_blocks_release_and_reclaim(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        helper_created = iso_utc(now)
+        owner = ProcessInfo(101, 1, "controller", "controller", now)
+        active: dict[int, dict[str, object]] = {
+            101: {"pid": 101, "created_utc": "controller-exact"},
+            202: {"pid": 202, "created_utc": helper_created},
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            claims = ResourceClaims(
+                Path(raw), "lane", "worker", owner,
+                process_provider=lambda: ProcessSnapshot(True, (), (), "synthetic"),
+                identity_provider=lambda pid: active.get(pid),
+            )
+            claims.acquire_all(["resource"], on_wait=lambda wait: self.fail(str(wait)))
+            self.assertEqual([], claims.retain_boundary(
+                boundary={"complete": True, "identity": "boundary"},
+                identities=[{"pid": 202, "created_utc": helper_created, "creation_identity": helper_created}],
+            ))
+            active.pop(101)
+            live = ProcessSnapshot(True, (ProcessInfo(202, 1, "helper", "helper", now),), (), "synthetic")
+            incomplete = ProcessSnapshot(False, (), ("query incomplete",), "synthetic")
+            self.assertEqual("RETAINED_PROCESS_LIVE", _owner_state(claims.held[0], live, lambda pid: active.get(pid))[0])
+            self.assertEqual("INVENTORY_UNKNOWN", _owner_state(claims.held[0], incomplete, lambda pid: active.get(pid))[0])
+
+    def test_FC32_exact_absence_reclaims_retained_claim_once(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        helper_created = iso_utc(now)
+        owner = ProcessInfo(101, 1, "controller", "controller", now)
+        active: dict[int, dict[str, object]] = {
+            101: {"pid": 101, "created_utc": "controller-exact"},
+            202: {"pid": 202, "created_utc": helper_created},
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            claims = ResourceClaims(root, "lane", "worker", owner, process_provider=lambda: ProcessSnapshot(True, (), (), "synthetic"), identity_provider=lambda pid: active.get(pid))
+            claims.acquire_all(["resource"], on_wait=lambda wait: self.fail(str(wait)))
+            claims.retain_boundary(boundary={"complete": True, "identity": "boundary"}, identities=[{"pid": 202, "created_utc": helper_created, "creation_identity": helper_created}])
+            active.pop(101); active.pop(202)
+            contender = ResourceClaims(
+                root, "lane", "contender", ProcessInfo(303, 1, "controller", "controller", now),
+                process_provider=lambda: ProcessSnapshot(True, (), (), "synthetic"),
+                identity_provider=lambda pid: active.get(pid) or ({"pid": 303, "created_utc": "contender-exact"} if pid == 303 else None),
+            )
+            waits: list[dict[str, object]] = []
+            contender.acquire_all(["resource"], on_wait=waits.append)
+            self.assertEqual(["resource"], [item["resource"] for item in contender.held])
+            self.assertTrue(any(item.get("state") == "PROVEN_STALE" for item in contender.findings))
+            self.assertEqual([], contender.release_all())
 
     def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

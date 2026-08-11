@@ -10,11 +10,12 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Sequence, cast
 
 from harness_common.process_identity import exact_process_identity
 
 from .models import ProcessInfo, ProcessSnapshot, iso_utc
+from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
 from .processes import process_snapshot
 
 CLAIM_SCHEMA = "orchestrator-coding-resource-claim/v1"
@@ -164,6 +165,53 @@ def _exact_identity(pid: int) -> Mapping[str, object] | None:
     return cast(Mapping[str, object], identity) if identity is not None else None
 
 
+def _retained_state(
+    claim: Mapping[str, object],
+    processes: ProcessSnapshot,
+    identity_provider: IdentityProvider,
+) -> tuple[str, str]:
+    retained_boundary = claim.get("retained_boundary")
+    retained = claim.get("retained_processes", [])
+    if retained_boundary is None:
+        return "PROVEN_STALE", "complete process inventory proves owner PID absent"
+    if not isinstance(retained_boundary, Mapping) or retained_boundary.get("complete") is not True:
+        return "INVENTORY_UNKNOWN", "retained owned-boundary evidence is incomplete"
+    if not isinstance(retained, list):
+        return "INVENTORY_UNKNOWN", "retained process identities are malformed"
+    for item in retained:
+        if not isinstance(item, Mapping):
+            return "INVENTORY_UNKNOWN", "retained process identity is malformed"
+        pid = item.get("pid")
+        expected_created = item.get("created_utc")
+        expected_exact = item.get("creation_identity")
+        if (
+            not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not isinstance(expected_created, str) or not expected_created
+            or not isinstance(expected_exact, str) or not expected_exact
+        ):
+            return "INVENTORY_UNKNOWN", "retained process identity is incomplete"
+        process = processes.by_pid.get(pid)
+        try:
+            fresh = identity_provider(pid)
+        except Exception:
+            return "RETAINED_IDENTITY_UNKNOWN", f"retained PID {pid} identity is unavailable"
+        fresh_created = fresh.get("created_utc") if fresh is not None else None
+        if process is not None:
+            actual_created = iso_utc(process.created_utc)
+            if actual_created != expected_created:
+                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} has a different creation identity"
+            if not isinstance(fresh_created, str):
+                return "RETAINED_IDENTITY_UNKNOWN", f"retained PID {pid} exact identity is unavailable"
+            if fresh_created != expected_exact:
+                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} exact identity changed"
+            return "RETAINED_PROCESS_LIVE", f"retained PID {pid} is still live"
+        if fresh is not None:
+            if fresh_created != expected_exact:
+                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} exact identity changed"
+            return "RETAINED_PROCESS_LIVE", f"retained PID {pid} is still live"
+    return "PROVEN_STALE", "owner and every retained process identity are absent"
+
+
 def _owner_state(
     claim: Mapping[str, object],
     processes: ProcessSnapshot,
@@ -186,7 +234,7 @@ def _owner_state(
             return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
         if exact is not None:
             return "OWNER_IDENTITY_UNKNOWN", "process inventory and exact identity provider contradict"
-        return "PROVEN_STALE", f"complete process inventory proves owner PID {pid} absent"
+        return _retained_state(claim, processes, identity_provider)
     expected = typed_owner.get("created_utc")
     actual = iso_utc(process.created_utc)
     if not isinstance(expected, str) or actual is None:
@@ -299,6 +347,60 @@ class ResourceClaims:
         failures: list[str] = []
         for resource in sorted(self._held, reverse=True):
             if not self._release_one(resource):
+                failures.append(resource)
+        return sorted(failures)
+
+    def retain_boundary(
+        self,
+        *,
+        boundary: Mapping[str, object] | None,
+        identities: Sequence[Mapping[str, object]],
+    ) -> list[str]:
+        """Persist exact unresolved boundary identities on every held claim."""
+
+        retained: list[Claim] = []
+        for item in identities:
+            pid = item.get("pid")
+            created = item.get("created_utc")
+            exact = item.get("creation_identity", created)
+            if (
+                not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or not isinstance(created, str) or not created
+                or not isinstance(exact, str) or not exact
+            ):
+                continue
+            retained.append({"pid": pid, "created_utc": created, "creation_identity": exact})
+        failures: list[str] = []
+        for resource in sorted(self._held, reverse=True):
+            expected = self._held.get(resource)
+            if expected is None:
+                continue
+            path = self.root / claim_filename(resource)
+            if not _claim_path_is_unambiguous(path):
+                failures.append(resource)
+                continue
+            try:
+                with _kernel_resource_lock(path):
+                    if not _claim_path_is_unambiguous(path):
+                        failures.append(resource)
+                        continue
+                    current, error, current_bytes = _read_claim_evidence(path)
+                    comparable = {key: value for key, value in expected.items() if key != "path"}
+                    if error is not None or current is None or current_bytes is None or current != comparable:
+                        failures.append(resource)
+                        continue
+                    updated = dict(current)
+                    updated["retained_processes"] = retained
+                    updated["retained_boundary"] = dict(boundary or {"complete": False, "errors": ["boundary evidence unavailable"]})
+                    data = _claim_bytes(updated)
+                    expected_target = capture_target(path.parent, path.name)
+                    if expected_target.kind != "file" or expected_target.content_sha256 != hashlib.sha256(current_bytes).hexdigest():
+                        failures.append(resource)
+                        continue
+                    mutation_replace(path.parent, path.name, data, expected=expected_target)
+                    updated["path"] = str(path)
+                    self._held[resource] = updated
+            except (MutationConflict, MutationUnsupported, OSError):
                 failures.append(resource)
         return sorted(failures)
 

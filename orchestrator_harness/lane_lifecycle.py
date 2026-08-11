@@ -288,16 +288,21 @@ def lifecycle_registry_root(lane_root: str | Path, lane_id: str) -> Path:
 def lifecycle_registry_path(
     lane_root: str | Path,
     lane_id: str,
-    worker_invocation_id: str,
+    worker_invocation_id: str | None = None,
 ) -> Path:
-    """Return the controller admission coordinate derived from live Git state."""
+    """Return the one lane-scoped controller admission coordinate.
 
-    if not isinstance(worker_invocation_id, str) or not worker_invocation_id.strip():
+    ``worker_invocation_id`` remains an ignored compatibility argument for
+    callers from the preceding repair.  It must never participate in the
+    coordinate: all legitimate workers for one canonical Git lane contend on
+    this exact owner file.
+    """
+
+    if worker_invocation_id is not None and (
+        not isinstance(worker_invocation_id, str) or not worker_invocation_id.strip()
+    ):
         raise LaneLifecycleError("worker invocation identity is invalid")
-    identity = _canonical_registry_identity(lane_root, lane_id)
-    seed = _registry_coordinate_seed(identity) + "\0" + worker_invocation_id.strip()
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    return lifecycle_registry_root(lane_root, lane_id) / digest / "LIFECYCLE.json"
+    return lifecycle_registry_root(lane_root, lane_id) / "LIFECYCLE.json"
 
 
 def _registry_digest(value: Mapping[str, Any]) -> str:
@@ -359,11 +364,12 @@ def _process_boundary_record(boundary: Mapping[str, Any] | None) -> dict[str, An
             "cleanup": None,
             "root_pid": None,
             "group_id": None,
+            "session_id": None,
             "members": [],
             "live_members": [],
         }
     value = dict(boundary)
-    required = {"schema", "kind", "identity", "complete", "inventory_source", "errors", "cleanup", "root_pid", "group_id", "members", "live_members"}
+    required = {"schema", "kind", "identity", "complete", "inventory_source", "errors", "cleanup", "root_pid", "group_id", "session_id", "members", "live_members"}
     if set(value) != required or value.get("schema") != "orchestrator-process-boundary/v1":
         raise LaneLifecycleError("controller process boundary evidence is not closed")
     if value.get("complete") is not True or not isinstance(value.get("kind"), str) or not value.get("kind") or not isinstance(value.get("inventory_source"), str) or not value.get("inventory_source"):
@@ -544,20 +550,10 @@ def _admit_lifecycle_registry(
         raise LaneLifecycleError("worker invocation identity is invalid")
     coordinate = {
         **coordinate,
-        "worker_invocation_id": worker_invocation_id.strip(),
-        "coordinate_hash": hashlib.sha256(
-            (_registry_coordinate_seed(coordinate) + "\0" + worker_invocation_id.strip()).encode("utf-8")
-        ).hexdigest(),
+        "coordinate_hash": hashlib.sha256(_registry_coordinate_seed(coordinate).encode("utf-8")).hexdigest(),
     }
-    path = lifecycle_registry_path(lane_root, lane_id, worker_invocation_id)
-    base = lifecycle_registry_root(lane_root, lane_id)
+    path = lifecycle_registry_path(lane_root, lane_id)
     if not resume:
-        try:
-            existing = [item for item in base.iterdir() if item.is_dir() and not _is_reparse(item)] if base.is_dir() else []
-        except OSError as exc:
-            raise LaneLifecycleError(f"cannot inspect canonical lifecycle admissions: {exc}") from exc
-        if existing or os.path.lexists(path):
-            raise LaneLifecycleError("unexpected canonical lifecycle admission already exists")
         record, data = _build_lifecycle_record(
             coordinate,
             lane_id=lane_id, run_root=run_root, invocation_path=invocation_path, status_path=status_path,
@@ -574,16 +570,49 @@ def _admit_lifecycle_registry(
 
     if not path.is_file() or _is_reparse(path):
         raise LaneLifecycleError("resume lifecycle admission is missing")
-    existing_bytes = path.read_bytes()
+    try:
+        existing_bytes = path.read_bytes()
+    except OSError as exc:
+        raise LaneLifecycleError("resume lifecycle admission cannot be read") from exc
     try:
         existing = json.loads(existing_bytes.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LaneLifecycleError("resume lifecycle admission is malformed") from exc
     if not isinstance(existing, dict) or existing.get("authority") != "controller-admitted-canonical-coordinate" or existing.get("coordinate") != coordinate:
         raise LaneLifecycleError("resume lifecycle admission is foreign")
-    if existing.get("run", {}).get("worker_invocation_id") != worker_invocation_id:
+    if existing.get("record_sha256") != _registry_digest(existing) or existing_bytes != _record_bytes(existing):
+        raise LaneLifecycleError("resume lifecycle admission integrity is invalid")
+    run_record = existing.get("run")
+    if not isinstance(run_record, Mapping):
+        raise LaneLifecycleError("resume lifecycle admission run binding is invalid")
+    if run_record.get("worker_invocation_id") != worker_invocation_id:
         raise LaneLifecycleError("resume lifecycle admission worker identity mismatch")
-    existing_generation = existing.get("run", {}).get("generation")
+    # Validate the admitted source bindings before allowing a continuation to
+    # publish a new status.  A legitimate resume may use a new invocation and
+    # status path; those are compare-and-swap updated into this same owner
+    # after the resumed status exists.
+    old_invocation_path = run_record.get("invocation_path")
+    if not isinstance(old_invocation_path, str):
+        raise LaneLifecycleError("resume lifecycle invocation binding is incomplete")
+    try:
+        _old_invocation, old_invocation_bytes = _regular_file(old_invocation_path, name="admitted invocation")
+    except (LaneLifecycleError, ArchiveFailed) as exc:
+        raise LaneLifecycleError(str(exc)) from exc
+    if run_record.get("invocation_sha256") != hashlib.sha256(old_invocation_bytes).hexdigest():
+        raise LaneLifecycleError("admitted invocation bytes changed")
+    old_status_path = run_record.get("status_path")
+    if not isinstance(old_status_path, str):
+        raise LaneLifecycleError("resume lifecycle status binding is incomplete")
+    old_status = _lexical(old_status_path)
+    _reject_reparse_chain(old_status)
+    if run_record.get("status_sha256") is not None:
+        try:
+            _, old_status_bytes = _regular_file(old_status, name="admitted status")
+        except (LaneLifecycleError, ArchiveFailed) as exc:
+            raise LaneLifecycleError(str(exc)) from exc
+        if run_record.get("status_sha256") != hashlib.sha256(old_status_bytes).hexdigest():
+            raise LaneLifecycleError("admitted status bytes changed")
+    existing_generation = run_record.get("generation")
     if not isinstance(existing_generation, str) or not existing_generation:
         raise LaneLifecycleError("resume lifecycle admission generation is missing")
     return _LifecycleAdmission(path, existing, existing_bytes, dict(coordinate), existing_generation, worker_invocation_id)
@@ -878,19 +907,15 @@ def _load_canonical_lifecycle_registry(
         root = lifecycle_registry_root(lane, lane_id)
     except LaneLifecycleError as exc:
         raise ArchiveFailed(str(exc)) from exc
-    if _inside(root, lane) or _is_reparse(root) or not root.is_dir():
+    # A normal non-worktree repository legitimately has its canonical Git
+    # common directory under the worktree's ``.git`` directory.  The
+    # coordinate is still derived from live Git identity; only indirections
+    # and missing roots are unsafe here.
+    if _is_reparse(root) or not root.is_dir():
         raise ArchiveFailed("canonical lifecycle registry root is missing or unsafe")
-    candidates: list[Path] = []
-    try:
-        for child in sorted(root.iterdir(), key=lambda item: item.name):
-            candidate = child / "LIFECYCLE.json"
-            if child.is_dir() and not _is_reparse(child) and candidate.is_file() and not _is_reparse(candidate):
-                candidates.append(candidate)
-    except OSError as exc:
-        raise ArchiveFailed("canonical lifecycle registry root cannot be enumerated") from exc
-    if len(candidates) != 1:
+    registry_path = lifecycle_registry_path(lane, lane_id)
+    if not registry_path.is_file() or _is_reparse(registry_path):
         raise ArchiveFailed("canonical lifecycle admission is missing or ambiguous")
-    registry_path = candidates[0]
     reference, data = _source_reference(registry_path, name="lifecycle_registry")
     try:
         raw = json.loads(data.decode("utf-8"))
@@ -928,12 +953,9 @@ def _load_canonical_lifecycle_registry(
         raise ArchiveFailed("canonical lifecycle worker identity is incomplete")
     expected_coordinate = {
         **actual_coordinate,
-        "worker_invocation_id": worker_id,
-        "coordinate_hash": hashlib.sha256(
-            (_registry_coordinate_seed(actual_coordinate) + "\0" + worker_id).encode("utf-8")
-        ).hexdigest(),
+        "coordinate_hash": hashlib.sha256(_registry_coordinate_seed(actual_coordinate).encode("utf-8")).hexdigest(),
     }
-    if dict(coordinate) != expected_coordinate or not _same_path(registry_path, lifecycle_registry_path(lane, lane_id, worker_id)):
+    if dict(coordinate) != expected_coordinate or not _same_path(registry_path, lifecycle_registry_path(lane, lane_id)):
         raise ArchiveFailed("canonical lifecycle coordinate is foreign")
     if run_record.get("lane_id") != lane_id or run_record.get("run_root") != str(lane):
         raise ArchiveFailed("canonical lifecycle run binding is foreign")
@@ -1057,7 +1079,16 @@ def _process_proof(
     known_pids = {item["pid"] for item in identities.values()}
     owned_parent_pids = set(known_pids)
     group_id = boundary.get("group_id")
+    session_id = boundary.get("session_id")
     boundary_id = boundary.get("identity")
+    boundary_identity_keys: set[tuple[int, str]] = set()
+    raw_members = boundary.get("members")
+    if not isinstance(raw_members, list):
+        return False, "PROCESS_BOUNDARY_MEMBERS_INCOMPLETE", {"complete": True, "provider": snapshot.provider, "states": {}, "boundary": dict(boundary)}
+    for item in raw_members:
+        if not isinstance(item, Mapping) or not isinstance(item.get("pid"), int) or not isinstance(item.get("created_utc"), str):
+            return False, "PROCESS_BOUNDARY_MEMBERS_AMBIGUOUS", {"complete": True, "provider": snapshot.provider, "states": {}, "boundary": dict(boundary)}
+        boundary_identity_keys.add((item["pid"], item["created_utc"]))
     changed = True
     while changed:
         changed = False
@@ -1066,6 +1097,8 @@ def _process_proof(
                 item.ppid in owned_parent_pids
                 or item.boundary_id == boundary_id
                 or (isinstance(group_id, int) and item.process_group_id == group_id)
+                or (isinstance(session_id, int) and item.session_id == session_id)
+                or (item.pid, iso_utc(item.created_utc) or "") in boundary_identity_keys
             ):
                 owned_parent_pids.add(item.pid)
                 changed = True
@@ -1073,6 +1106,8 @@ def _process_proof(
         belongs = (
             item.boundary_id == boundary_id
             or (isinstance(group_id, int) and item.process_group_id == group_id)
+            or (isinstance(session_id, int) and item.session_id == session_id)
+            or (item.pid, iso_utc(item.created_utc) or "") in boundary_identity_keys
             or item.pid in owned_parent_pids
         )
         if belongs and item.pid not in known_pids:
