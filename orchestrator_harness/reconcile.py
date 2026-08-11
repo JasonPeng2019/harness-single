@@ -1208,7 +1208,6 @@ def reconcile(
                     "deadline_utc": iso_utc(parse_utc(raw.get("deadline_utc"))),
                     **({"delivery_deadline_utc": iso_utc(parse_utc(raw["delivery_deadline_utc"]))} if "delivery_deadline_utc" in raw else {}),
                     **({"agent_blocked": raw["agent_blocked"]} if "agent_blocked" in raw else {}),
-                    **({"attention_epoch_id": raw["attention_epoch_id"]} if "attention_epoch_id" in raw else {}),
                     "lane_id": raw["lane_id"],
                     "task": raw.get("task"),
                     "phase": raw.get("phase"),

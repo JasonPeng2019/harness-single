@@ -245,11 +245,6 @@ def _manager_signal(path: Path, signals_root: Path, config: HarnessConfig) -> Ma
             raise ValueError("delivery_deadline_utc precedes created_utc")
     if "agent_blocked" in value and not isinstance(value["agent_blocked"], bool):
         raise ValueError("agent_blocked must be a boolean")
-    if "attention_epoch_id" in value and (
-        not isinstance(value["attention_epoch_id"], str)
-        or not value["attention_epoch_id"].strip()
-    ):
-        raise ValueError("attention_epoch_id must be a non-empty string")
     evidence = value.get("evidence_paths", [])
     if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
         raise ValueError("evidence_paths must be a list of strings")

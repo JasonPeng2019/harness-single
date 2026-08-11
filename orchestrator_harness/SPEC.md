@@ -8,6 +8,41 @@ firmware observation contract. Ordinary coding lanes use separate Git branches/w
 named resources. The persistent manager owns planning, split/merge ordering, launches, decisions,
 acceptance, promotion, and cleanup.
 
+## S4 host delivery and lifecycle boundary
+
+The S4 boundary adds one versioned capability-selected host interface. The
+Codex profile is implemented; future providers are contract fixtures only.
+Core delivery consumes the exact S3 manager binding (`run_id`, `queue_id`,
+manager session/thread, registration ID and generation) and never branches on
+provider names.
+
+The harness-owned `DeliveryCoordinator` persists registration and replay state
+beside, but does not duplicate, the S3 queue. A wake creates a bounded
+`DeliveryNotice` containing identity, queue revision, pending count, highest
+class/severity, timestamp, and adapter profile. It contains no event payload.
+`DeliveryReceipt` is transport evidence; only a separate manager action may
+create `ManagerEventAck` and call the S3 acknowledgement boundary. Wake
+attempts are at-least-once, coalesced, bounded-retry, and exact-binding.
+
+Codex command hooks are synchronous. PostToolUse and Stop are safe-boundary
+integration points, while a persistent coordinator owns the subscription and
+replay. App Server fixtures use `thread/inject_items`, `turn/completed`, and
+`turn/start` for idle continuation. Delivery never changes an active turn.
+Project trust and hook review are reported honestly rather than silently
+granted by installation.
+
+The diagnostic observer retains scan and blocking waits. Foreground managed
+watcher, heartbeat/re-arm, attention-sprint/timeline/integrity, and competing
+pending-notification policy are not S4 runtime behavior. Optional watcher
+recovery is only `open`, `acknowledged`, or `resolved`.
+
+Static work may allocate an exact full-commit read-only source view with
+separate writable result/cache roots. Terminal lanes use archive-first
+retirement: copied and hash-bound task/result/findings/acceptance/transcript/
+dependency/process evidence, retained revision, clean/no-live/no-unmerged proofs,
+and discarded cache inventory are validated before normal Git worktree close.
+Any failed proof leaves the terminal lane visible.
+
 The watcher is a monitor, not another manager. It must make crashes, stale state, permission
 requests, helper expiry, checkpoints, provider waits, results, duplicated controllers, and resource
 conflicts visible promptly. The main orchestrator remains the only authority that schedules work,
@@ -139,12 +174,9 @@ Provide:
 9. At-least-once crash consistency: append and flush/fsync events before advancing the persisted
    snapshot cursor. A crash may cause the same event ID to be emitted again but must not lose an
    event; consumers deduplicate by event ID.
-10. The managed actionable interface retains one durable pending notification until exact
-    acknowledgement. A newly actionable event may displace it only when the new event's admitted
-    priority is strictly higher. Persist the pending event's admitted priority; move a displaced
-    event to durable deferred state with its original admission facts; restore it after the urgent
-    event is acknowledged. Equal- and lower-priority events never preempt. Legacy state without a
-    stored rank may use current evidence only when that evidence establishes the rank; never guess.
+10. Diagnostic output never creates a pending-notification selector or acknowledgement state.
+    Current actionable delivery, coalescing, retry, and acknowledgement are owned exclusively by
+    the accepted S3 ManagerEventRouter binding and its separate manager action boundary.
 
 The watcher cannot revive an inactive conversation. The main orchestrator must remain in a bounded
 scheduling epoch and invoke the exit-on-event interface again after handling each event.

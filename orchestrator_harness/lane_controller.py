@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,7 @@ from .invocation import (
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
-from .process_supervisor import CleanupResult, ProcessSupervisor
+from .process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryUnsupported, ProcessSupervisor
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     ProviderAdapterError,
@@ -52,6 +53,8 @@ from .provider import (
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .stable_io import append_jsonl_record
+from .lane_lifecycle import LaneLifecycleError, _LifecycleAdmission, _admit_lifecycle_registry, _update_lifecycle_registry
+from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
 from .resume import (
     ResumeAdmissionError,
     require_resume_admission,
@@ -123,16 +126,11 @@ def isolated_coding_child_environment(inherited: Mapping[str, str] | None = None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        with temporary.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        mutation_replace(path.parent, path.name, data, expected=capture_target(path.parent, path.name))
+    except (MutationConflict, MutationUnsupported) as exc:
+        raise OSError(str(exc)) from exc
 
 
 def _append_event(path: Path, value: dict[str, Any]) -> None:
@@ -282,6 +280,8 @@ class Invocation:
     provider_options: Mapping[str, Any] = field(default_factory=dict)
     prompt_bundle: PromptBundle | None = None
     runtime_profile: RuntimeProfile | None = None
+    runtime_root: Path | None = None
+    invocation_path: Path | None = None
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -453,6 +453,8 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     runtime_root = Path(runtime_value).expanduser().resolve(strict=False)
     if not runtime_root.is_dir():
         raise InvocationError("runtime_root must be an existing directory")
+    if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
+        raise InvocationError("runtime_root must be separate from run_root")
     lock_value = raw.get("resource_lock_root", str(runtime_root / "coding-resource-locks"))
     resource_lock_root = _safe_path(
         lock_value, root=runtime_root, name="resource_lock_root"
@@ -540,6 +542,8 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         runtime_root = canonical.runtime_root.expanduser().resolve(strict=True)
         if not run_root.is_dir() or not runtime_root.is_dir():
             raise InvocationValidationError("canonical run_root and runtime_root must be directories")
+        if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
+            raise InvocationValidationError("canonical runtime_root must be separate from run_root")
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
         if workspace.parent != run_root:
             raise InvocationValidationError("canonical workspace must be a direct child of run_root")
@@ -655,12 +659,20 @@ def load_invocation(path: Path) -> Invocation:
     if schema is not None and (not isinstance(schema, str) or not schema):
         raise InvocationError("schema must be a non-empty string when supplied")
     if schema == CANONICAL_INVOCATION_SCHEMA:
-        return _load_canonical_invocation(raw)
-    if schema == CODING_INVOCATION_SCHEMA:
-        return _load_coding_invocation(raw)
-    if schema is None:
-        return _load_firmware_invocation(raw)
-    raise InvocationError(f"unsupported invocation schema: {schema}")
+        invocation = _load_canonical_invocation(raw)
+    elif schema == CODING_INVOCATION_SCHEMA:
+        invocation = _load_coding_invocation(raw)
+    elif schema is None:
+        invocation = _load_firmware_invocation(raw)
+    else:
+        raise InvocationError(f"unsupported invocation schema: {schema}")
+    object.__setattr__(invocation, "invocation_path", path.expanduser().resolve(strict=False))
+    runtime_value = raw.get("runtime_root")
+    if isinstance(runtime_value, str) and runtime_value:
+        object.__setattr__(invocation, "runtime_root", Path(runtime_value).expanduser().resolve(strict=False))
+    else:
+        object.__setattr__(invocation, "runtime_root", invocation.run_root.parent)
+    return invocation
 
 
 def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> ProcessInfo:
@@ -674,9 +686,53 @@ def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> P
     raise RuntimeError(f"cannot establish exact process identity for PID {pid}")
 
 
+def _command_tail(command_line: str) -> str:
+    """Return argv after the executable for launcher-chain comparison."""
+
+    value = command_line.strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        return " ".join(value[end + 1 :].split()) if end > 0 else ""
+    parts = value.split(None, 1)
+    return " ".join(parts[1].split()) if len(parts) == 2 else ""
+
+
+def _is_launcher_descendant(
+    item: ProcessInfo,
+    parent: ProcessInfo,
+    *,
+    provider_root_pid: int | None = None,
+) -> bool:
+    """Exclude an OS launcher re-exec without hiding a real helper root.
+
+    Some Windows Python launch shims expose an empty command line for the
+    first child below the Popen PID.  That one direct child is still part of
+    the provider launch chain; later descendants are inventoried as helpers.
+    """
+
+    return (
+        item.pid != parent.pid
+        and item.ppid == parent.pid
+        and (
+            (
+                bool(_command_tail(item.command_line))
+                and _command_tail(item.command_line) == _command_tail(parent.command_line)
+            )
+            or (
+                provider_root_pid is not None
+                and parent.pid == provider_root_pid
+                and not item.command_line.strip()
+            )
+        )
+    )
+
+
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
     identity: ProcessInfo | None = None,
+    boundary: ProcessBoundary | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Compatibility shim around the shared exact supervisor."""
     supervisor = ProcessSupervisor(
@@ -685,6 +741,7 @@ def _shutdown_exact_child(
         graceful_timeout_seconds=timeout_seconds,
         force_timeout_seconds=timeout_seconds,
         observer=None,
+        boundary=boundary,
     )
     result = supervisor.cleanup()
     evidence = result.to_record()
@@ -1468,8 +1525,20 @@ def run(invocation: Invocation) -> int:
             "config_overrides": invocation.config_overrides,
             "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": argv[:-1]},
     }
+    registry_generation = uuid.uuid4().hex
+    state["lifecycle_registry_generation"] = registry_generation
+    state["owned_helpers"] = []
+    state["process_boundary"] = None
+    state["helpers_complete"] = False
+    state["direct_child_reaped"] = False
+    state["resource_claim_release_safe"] = False
+    admission: _LifecycleAdmission | None = None
+    boundary: ProcessBoundary | None = None
     if git_identity is not None:
         repository = repository_status(git_identity, starting_commit=starting_commit)
+        expected_head = str(repository.get("actual_head") or git_identity.head_commit).lower()
+        branch_name = str(repository.get("branch") or git_identity.branch)
+        retained_ref = f"refs/heads/{branch_name}"
         state.update({
             "repository": repository,
             "repository_common_dir": repository["common_dir"],
@@ -1477,7 +1546,14 @@ def run(invocation: Invocation) -> int:
             "branch": repository["branch"],
             "base_commit": repository["base_commit"],
             "starting_commit": repository["starting_commit"],
+            "lifecycle_retained_ref": retained_ref,
+            "lifecycle_target_revision": expected_head,
         })
+        state["repository"]["expected_head"] = expected_head
+        state["repository"]["starting_head"] = str(
+            repository.get("starting_head") or repository.get("starting_commit") or expected_head
+        ).lower()
+        state["lifecycle_registry_path"] = "canonical-common-git-coordinate"
         if invocation.canonical is not None:
             resume_identity = invocation.canonical.identity(
                 session_id=thread,
@@ -1489,11 +1565,360 @@ def run(invocation: Invocation) -> int:
                 "session_id": thread,
             }
             state["resume_identity"] = resume_identity
+
+    def _publish_registry() -> None:
+        nonlocal admission, registry_generation
+        if invocation.repository is None:
+            return
+        if invocation.invocation_path is None:
+            raise InvocationError("controller lifecycle registry requires its source invocation path")
+        worker_identity = None
+        provider_pid = state.get("provider_pid")
+        provider_created = state.get("provider_created_utc")
+        if isinstance(provider_pid, int) and isinstance(provider_created, str):
+            worker_identity = {"pid": provider_pid, "created_utc": provider_created}
+        if admission is None:
+            admission = _admit_lifecycle_registry(
+                invocation.run_root,
+                lane_id=invocation.lane_id,
+                run_root=invocation.run_root,
+                invocation_path=invocation.invocation_path,
+                status_path=invocation.status_path,
+                invocation_schema=invocation.invocation_schema,
+                worker_invocation_id=invocation.worker_invocation_id or "",
+                generation=registry_generation,
+                state=str(state.get("state") or "LAUNCH_FAILED"),
+                repository=state["repository"],
+                controller=controller,
+                worker=worker_identity,
+                helpers=state.get("owned_helpers", []),
+                boundary=state.get("process_boundary"),
+                retained_ref=state.get("lifecycle_retained_ref"),
+                target_revision=state.get("lifecycle_target_revision"),
+                resume=invocation.action == "resume",
+            )
+            # A resume is admitted from the fixed owner before its resumed
+            # status is published.  The owner generation is authoritative for
+            # every subsequent status, update, terminal record, and retire.
+            registry_generation = admission.generation
+            state["lifecycle_registry_generation"] = registry_generation
+            state["resume_admission"] = admission.record
+        else:
+            admission = _update_lifecycle_registry(
+                admission,
+                lane_id=invocation.lane_id,
+                run_root=invocation.run_root,
+                invocation_path=invocation.invocation_path,
+                status_path=invocation.status_path,
+                invocation_schema=invocation.invocation_schema,
+                worker_invocation_id=invocation.worker_invocation_id or "",
+                generation=admission.generation,
+                state=str(state.get("state") or "LAUNCH_FAILED"),
+                repository=state["repository"],
+                controller=controller,
+                worker=worker_identity,
+                helpers=state.get("owned_helpers", []),
+                boundary=state.get("process_boundary"),
+                retained_ref=state.get("lifecycle_retained_ref"),
+                target_revision=state.get("lifecycle_target_revision"),
+            )
+
+    if invocation.repository is not None:
+        # Admission must precede both initial and resumed status publication.
+        # This makes the fixed owner the first durable lifecycle authority and
+        # prevents a resumed status from advertising a fresh generation.
+        _publish_registry()
+        _atomic_json(invocation.status_path, state)
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
+    child: ProcessInfo | None = None
     supervisor: ProcessSupervisor | None = None
     resource_claims: ResourceClaims | None = None
-    child_exit_confirmed = True
+    direct_child_reaped = False
+    release_safe = False
+    cleanup_result: CleanupResult | None = None
+    cleanup_attempted = False
+    direct_handle_cleanup_attempted = False
+    final_boundary_recorded = False
+
+    def _incomplete_boundary_record(error: str) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "schema": "orchestrator-process-boundary/v1",
+            "kind": boundary.kind if boundary is not None else "none",
+            "identity": boundary.identity if boundary is not None else None,
+            "complete": False,
+            "inventory_source": "controller",
+            "errors": [error],
+            "members": [],
+            "live_members": [],
+        }
+        if boundary is not None:
+            record.update({
+                "root_pid": getattr(boundary, "_root_pid", None),
+                "group_id": getattr(boundary, "_group_id", None),
+                "session_id": getattr(boundary, "_session_id", None),
+            })
+        return record
+
+    def _record_final_boundary(cleanup_result: CleanupResult | None) -> Any:
+        """Take the one explicit post-cleanup inventory used for release safety."""
+
+        nonlocal final_boundary_recorded, release_safe
+        final_boundary_recorded = True
+        release_safe = False
+        inventory: Any = None
+        inventory_error: str | None = None
+        try:
+            if supervisor is not None:
+                inventory = supervisor.boundary_inventory()
+            elif boundary is not None:
+                inventory = boundary.inventory()
+            else:
+                inventory_error = "owned process boundary is unavailable"
+        except BaseException as exc:
+            inventory_error = f"final boundary inventory failed: {type(exc).__name__}: {exc}"
+        if inventory_error is not None or inventory is None:
+            state["process_boundary"] = _incomplete_boundary_record(inventory_error or "final boundary inventory was unavailable")
+            state["owned_boundary_empty"] = False
+            state["helpers_complete"] = False
+            state["resource_claim_release_safe"] = False
+            return None
+        complete = bool(getattr(inventory, "complete", False))
+        live_members = tuple(getattr(inventory, "processes", ()) or ())
+        try:
+            state["process_boundary"] = (
+                boundary.to_record(inventory) if boundary is not None
+                else _incomplete_boundary_record("no controller-owned process boundary is attached")
+            )
+        except BaseException as exc:
+            state["process_boundary"] = _incomplete_boundary_record(
+                f"final boundary evidence serialization failed: {type(exc).__name__}: {exc}"
+            )
+            complete = False
+            live_members = ()
+        state["owned_boundary_empty"] = complete and not live_members
+        state["helpers_complete"] = bool(
+            cleanup_result is not None
+            and cleanup_result.proved_reap
+            and complete
+            and not live_members
+        )
+        release_safe = bool(
+            process is not None
+            and direct_child_reaped
+            and cleanup_result is not None
+            and cleanup_result.proved_reap
+            and complete
+            and not live_members
+        )
+        state["resource_claim_release_safe"] = release_safe
+        return inventory
+
+    def _retain_unresolved_claims() -> list[str]:
+        if resource_claims is None or process is None or release_safe:
+            return []
+        boundary_evidence = state.get("process_boundary")
+        retained_identities: list[dict[str, Any]] = []
+        if isinstance(boundary_evidence, Mapping):
+            raw_members = boundary_evidence.get("live_members")
+            if isinstance(raw_members, list):
+                retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+            boundary_value = dict(boundary_evidence)
+        else:
+            boundary_value = {"complete": False, "errors": ["owned boundary evidence was not published"]}
+        if not direct_child_reaped:
+            boundary_value["complete"] = False
+        failures = resource_claims.retain_boundary(
+            boundary=boundary_value,
+            identities=retained_identities,
+        )
+        state["held_resource_claims"] = resource_claims.held
+        state["waiting_resource_claim"] = None
+        if failures:
+            state["resource_retention_errors"] = failures
+        return failures
+
+    def _claims_can_release() -> bool:
+        # Before Popen there is no provider boundary to retain.  Once Popen
+        # returns, this is the sole permission used by finally: the explicit
+        # post-cleanup release proof above must have completed successfully.
+        return process is None or release_safe
+
+    def _direct_handle_cleanup() -> dict[str, Any]:
+        """Bounded cleanup for the exact Popen handle when identity is uncertain.
+
+        This is deliberately independent from the supervisor's evidence.  A
+        successful ``wait`` proves only that this handle was reaped; it does
+        not prove the child creation identity, the owned boundary, or claim
+        release safety.
+        """
+
+        nonlocal direct_handle_cleanup_attempted, direct_child_reaped
+        if direct_handle_cleanup_attempted:
+            previous = state.get("direct_handle_cleanup")
+            return dict(previous) if isinstance(previous, Mapping) else {
+                "status": "HANDLE_CLEANUP_ALREADY_ATTEMPTED",
+                "final_reap": direct_child_reaped,
+                "identity_verified": False,
+                "identity_uncertain": True,
+            }
+        direct_handle_cleanup_attempted = True
+        record: dict[str, Any] = {
+            "status": "HANDLE_CLEANUP",
+            "pid": getattr(process, "pid", None),
+            "stages": [],
+            "errors": [],
+            "final_reap": False,
+            "identity_verified": False,
+            "identity_uncertain": True,
+        }
+        stages = record["stages"]
+        errors = record["errors"]
+
+        def failed(stage: str, exc: BaseException) -> None:
+            assert isinstance(stages, list)
+            assert isinstance(errors, list)
+            stages.append(f"{stage}_FAILED")
+            errors.append(f"{stage.lower()} failed: {type(exc).__name__}: {exc}")
+
+        reaped = False
+        poll_value: object = None
+        poll_failed = False
+        try:
+            poll_value = process.poll()
+            assert isinstance(stages, list)
+            stages.append("POLL")
+        except BaseException as exc:
+            poll_failed = True
+            failed("POLL", exc)
+
+        if not poll_failed and poll_value is not None:
+            assert isinstance(stages, list)
+            stages.append("ALREADY_EXITED")
+            try:
+                process.wait(timeout=0)
+                stages.append("DIRECT_REAP")
+                reaped = True
+            except BaseException as exc:
+                failed("REAP", exc)
+        else:
+            assert isinstance(stages, list)
+            stages.append("TERMINATE_REQUESTED")
+            try:
+                process.terminate()
+            except BaseException as exc:
+                failed("TERMINATE", exc)
+            try:
+                process.wait(timeout=5.0)
+                stages.extend(("TERMINATE_WAIT", "DIRECT_REAP"))
+                reaped = True
+            except subprocess.TimeoutExpired as exc:
+                stages.append("TERMINATE_WAIT_TIMEOUT")
+                errors.append(f"terminate wait timed out: {type(exc).__name__}: {exc}")
+            except BaseException as exc:
+                failed("TERMINATE_WAIT", exc)
+            if not reaped:
+                stages.append("KILL_REQUESTED")
+                try:
+                    process.kill()
+                except BaseException as exc:
+                    failed("KILL", exc)
+                try:
+                    process.wait(timeout=5.0)
+                    stages.extend(("KILL_WAIT", "DIRECT_REAP"))
+                    reaped = True
+                except BaseException as exc:
+                    failed("KILL_WAIT", exc)
+
+        if reaped:
+            direct_child_reaped = True
+            state["direct_child_reaped"] = True
+            record["final_reap"] = True
+        state["direct_handle_cleanup"] = record
+        return record
+
+    def _postlaunch_cleanup() -> dict[str, Any] | None:
+        """Attempt truthful cleanup for every process-nonnull failure route."""
+
+        nonlocal cleanup_attempted, cleanup_result, direct_child_reaped, supervisor
+        if process is None:
+            return None
+        if cleanup_attempted:
+            if not final_boundary_recorded:
+                _record_final_boundary(cleanup_result)
+            return None
+        cleanup_attempted = True
+        cleanup_evidence: dict[str, Any] | None = None
+        if supervisor is None:
+            try:
+                supervisor = ProcessSupervisor(
+                    process,
+                    child,
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                    observer=None,
+                    boundary=boundary,
+                )
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"supervisor construction failed: {type(exc).__name__}: {exc}"
+                )
+        if supervisor is not None and cleanup_result is None:
+            try:
+                cleanup_result = supervisor.cleanup()
+                direct_child_reaped = cleanup_result.final_reap
+                state["direct_child_reaped"] = direct_child_reaped
+                cleanup_evidence = cleanup_result.to_record()
+                if "GRACEFUL_WAIT_TIMEOUT" in cleanup_result.stages:
+                    cleanup_evidence["terminate_wait_timed_out"] = True
+                if "FINAL_REAP_TIMEOUT" in cleanup_result.stages:
+                    cleanup_evidence["kill_wait_timed_out"] = True
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"supervisor cleanup failed: {type(exc).__name__}: {exc}"
+                )
+        if supervisor is None and boundary is not None:
+            try:
+                inventory = boundary.cleanup_owned(
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                )
+                state["process_boundary"] = boundary.to_record(inventory)
+                cleanup_evidence = {
+                    "status": "BOUNDARY_FALLBACK",
+                    "boundary_complete": inventory.complete,
+                    "owned_boundary_empty": not inventory.processes,
+                    "errors": list(inventory.errors),
+                }
+            except BaseException as exc:
+                state.setdefault("postlaunch_cleanup_errors", []).append(
+                    f"boundary cleanup failed: {type(exc).__name__}: {exc}"
+                )
+        if supervisor is None:
+            direct_evidence = _direct_handle_cleanup()
+            if cleanup_evidence is None:
+                cleanup_evidence = direct_evidence
+            else:
+                cleanup_evidence["direct_handle_cleanup"] = direct_evidence
+        elif cleanup_result is None:
+            # Construction or cleanup may have left a supervisor object but
+            # no truthful result.  The exact Popen handle remains the only
+            # bounded cleanup mechanism available in that case.
+            cleanup_evidence = cleanup_evidence or _direct_handle_cleanup()
+        elif not cleanup_result.final_reap:
+            # Identity-uncertain and otherwise unproven supervisor results
+            # require the same direct-handle attempt.  Its result is evidence
+            # only; _record_final_boundary still requires proved_reap.
+            cleanup_evidence = cleanup_evidence or cleanup_result.to_record()
+            direct_evidence = _direct_handle_cleanup()
+            if isinstance(cleanup_evidence, dict):
+                cleanup_evidence["direct_handle_cleanup"] = direct_evidence
+        if supervisor is not None and cleanup_result is not None and cleanup_result.final_reap:
+            state["direct_child_reaped"] = direct_child_reaped
+        if not final_boundary_recorded:
+            _record_final_boundary(cleanup_result)
+        return cleanup_evidence
+
     try:
         if invocation.worker_invocation_id is not None and invocation.resources:
             assert invocation.resource_lock_root is not None
@@ -1519,6 +1944,21 @@ def run(invocation: Invocation) -> int:
                 "waiting_resource_claim": None,
                 "resource_claim_findings": list(resource_claims.findings),
             })
+        if resource_claims is not None:
+            arming_failures = resource_claims.arm_boundary()
+            state.update({
+                "held_resource_claims": resource_claims.held,
+                "resource_claim_findings": list(resource_claims.findings),
+            })
+            if arming_failures:
+                state.update({
+                    "state": "LAUNCH_FAILED",
+                    "ended_utc": _utc(),
+                    "error": "cannot durably arm every resource claim before provider launch",
+                    "resource_arming_errors": arming_failures,
+                })
+                _atomic_json(invocation.status_path, state)
+                return 1
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             child_env = None
             if invocation.child_environment_isolation:
@@ -1534,26 +1974,43 @@ def run(invocation: Invocation) -> int:
                 else:
                     child_env, cleared = isolated_coding_child_environment()
                     state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
-            process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
-            child_exit_confirmed = False
-            child = _identity(process.pid, parent=controller.pid)
-            # The captured handle is the ownership boundary.  The controller
-            # has already established the exact creation identity; the shared
-            # supervisor owns every later graceful/force/final-reap stage.
-            supervisor = ProcessSupervisor(
-                process,
-                child,
-                parent_pid=controller.pid,
-                observer=None,
+            boundary = ProcessBoundary.prepare()
+            process = subprocess.Popen(
+                argv,
+                cwd=invocation.run_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                **boundary.popen_kwargs,
             )
+            child = _identity(process.pid, parent=controller.pid)
             state.update({
-                "state": running_state,
                 "provider_pid": child.pid,
                 "provider_started_utc": iso_utc(child.created_utc),
                 "provider_created_utc": iso_utc(child.created_utc),
                 "codex_pid": child.pid,
                 "codex_started_utc": iso_utc(child.created_utc),
                 "codex_created_utc": iso_utc(child.created_utc),
+            })
+            # The captured OS boundary is established before the provider is
+            # resumed.  The shared supervisor owns every later exact cleanup,
+            # inventory, and final-reap stage.
+            supervisor = ProcessSupervisor(
+                process,
+                child,
+                parent_pid=controller.pid,
+                observer=None,
+                boundary=boundary,
+            )
+            # The supervisor is bound before attach can partially establish or
+            # reject the OS boundary, so every post-Popen exception retains a
+            # shared cleanup owner rather than falling back to direct-child
+            # evidence alone.
+            boundary.attach(process, child)
+            state["process_boundary"] = boundary.to_record(boundary.inventory())
+            state.update({
+                "state": running_state,
             })
             _atomic_json(invocation.status_path, state)
             _append_event(invocation.event_log, _event(
@@ -1602,9 +2059,65 @@ def run(invocation: Invocation) -> int:
             out_thread.start(); err_thread.start()
             assert supervisor is not None
             exit_code = supervisor.wait_for_exit()
-            child_exit_confirmed = True
             out_thread.join(); err_thread.join()
             process.stdout.close(); process.stderr.close()
+        if supervisor is None:
+            raise ProcessBoundaryUnsupported("provider completed without an ownership boundary")
+        # Direct Popen reap and complete owned-boundary emptiness are separate
+        # facts.  ``cleanup`` performs a fresh inventory after any termination
+        # request, targets escaped exact identities, and reaps adopted members
+        # before it can prove the claim-release predicate.
+        cleanup_attempted = True
+        cleanup_result = supervisor.cleanup()
+        direct_child_reaped = cleanup_result.final_reap
+        state["cleanup"] = cleanup_result.to_record()
+        state["direct_child_reaped"] = direct_child_reaped
+        boundary_inventory = _record_final_boundary(cleanup_result)
+        if boundary_inventory is None:
+            state.update({
+                "state": "CONTROLLER_FAILED",
+                "ended_utc": _utc(),
+                "error": "final owned process boundary inventory failed",
+                "boundary_failure": {
+                    "complete": False,
+                    "live_helpers": [],
+                    "errors": list((state.get("process_boundary") or {}).get("errors", [])),
+                    "cleanup": cleanup_result.to_record(),
+                },
+            })
+            _atomic_json(invocation.status_path, state)
+            return 1
+        observed_by_pid = {item.pid: item for item in boundary_inventory.observed_processes}
+        owned_helpers: list[dict[str, Any]] = []
+        for item in boundary_inventory.observed_processes:
+            if item.pid == state.get("provider_pid") or item.created_utc is None:
+                continue
+            parent = observed_by_pid.get(item.ppid)
+            if parent is not None and _is_launcher_descendant(
+                item,
+                parent,
+                provider_root_pid=state.get("provider_pid"),
+            ):
+                continue
+            owned_helpers.append({
+                "name": f"helper-{item.pid}",
+                "identity": {"pid": item.pid, "created_utc": iso_utc(item.created_utc)},
+            })
+        state["owned_helpers"] = owned_helpers
+        if not release_safe:
+            state.update({
+                "state": "CONTROLLER_FAILED",
+                "ended_utc": _utc(),
+                "error": "owned process boundary is incomplete or still contains live helpers",
+                "boundary_failure": {
+                    "complete": boundary_inventory.complete,
+                    "live_helpers": [item.pid for item in boundary_inventory.processes],
+                    "errors": list(boundary_inventory.errors),
+                    "cleanup": cleanup_result.to_record(),
+                },
+            })
+            _atomic_json(invocation.status_path, state)
+            return 1
         thread_identity_error = state.get("thread_identity_error")
         if isinstance(thread_identity_error, str):
             state.update({
@@ -1679,19 +2192,9 @@ def run(invocation: Invocation) -> int:
         ))
         return 1 if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid else exit_code
     except KeyboardInterrupt:
-        cleanup_evidence: dict[str, Any] | None = None
-        if process is not None and not child_exit_confirmed:
-            if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
-            else:
-                cleanup: CleanupResult = supervisor.cleanup()
-                child_exit_confirmed = cleanup.proved_reap
-                cleanup_evidence = cleanup.to_record()
-                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["terminate_wait_timed_out"] = True
-                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["kill_wait_timed_out"] = True
-        if not child_exit_confirmed:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
+        if process is not None and not release_safe:
+            _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = "controller interrupted; exact provider child shutdown could not be proven"
             state.update({
@@ -1717,6 +2220,7 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
         return 130
     except ResourceLockError as exc:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
         retained_claims = resource_claims.held if resource_claims is not None else []
         state.update({
             "state": "COORDINATION_FAILED",
@@ -1724,6 +2228,7 @@ def run(invocation: Invocation) -> int:
             "error": str(exc),
             "coordination_failure": {
                 "error": str(exc),
+                "child_shutdown": cleanup_evidence,
                 "retained_claims": retained_claims,
             },
             "held_resource_claims": retained_claims,
@@ -1732,19 +2237,9 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
         return 1
     except Exception as exc:
-        cleanup_evidence = None
-        if process is not None and not child_exit_confirmed:
-            if supervisor is None:
-                child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
-            else:
-                cleanup: CleanupResult = supervisor.cleanup()
-                child_exit_confirmed = cleanup.proved_reap
-                cleanup_evidence = cleanup.to_record()
-                if "GRACEFUL_WAIT_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["terminate_wait_timed_out"] = True
-                if "FINAL_REAP_TIMEOUT" in cleanup.stages:
-                    cleanup_evidence["kill_wait_timed_out"] = True
-        if not child_exit_confirmed:
+        cleanup_evidence = _postlaunch_cleanup() if process is not None else None
+        if process is not None and not release_safe:
+            _ = _retain_unresolved_claims()
             retained_claims = resource_claims.held if resource_claims is not None else []
             error = f"{exc}; exact provider child shutdown could not be proven"
             state.update({
@@ -1771,16 +2266,67 @@ def run(invocation: Invocation) -> int:
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
     finally:
-        if resource_claims is not None and child_exit_confirmed:
-            release_failures = resource_claims.release_all()
-            state["held_resource_claims"] = resource_claims.held
-            state["waiting_resource_claim"] = None
-            if release_failures:
-                state["resource_release_errors"] = release_failures
+        if process is not None and not final_boundary_recorded:
+            _postlaunch_cleanup()
+        if resource_claims is not None:
+            if _claims_can_release():
+                release_failures = resource_claims.release_all()
+                state["held_resource_claims"] = resource_claims.held
+                state["waiting_resource_claim"] = None
+                if release_failures:
+                    state["resource_release_errors"] = release_failures
+            else:
+                boundary_evidence = state.get("process_boundary")
+                retained_identities: list[dict[str, Any]] = []
+                if isinstance(boundary_evidence, Mapping):
+                    raw_members = boundary_evidence.get("live_members")
+                    if isinstance(raw_members, list):
+                        retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+                if not isinstance(boundary_evidence, Mapping):
+                    boundary_evidence = {
+                        "complete": False,
+                        "errors": ["owned boundary evidence was not published"],
+                    }
+                else:
+                    boundary_evidence = dict(boundary_evidence)
+                    if not state.get("direct_child_reaped"):
+                        boundary_evidence["complete"] = False
+                retention_failures = resource_claims.retain_boundary(
+                    boundary=boundary_evidence,
+                    identities=retained_identities,
+                )
+                state["held_resource_claims"] = resource_claims.held
+                state["waiting_resource_claim"] = None
+                if retention_failures:
+                    state["resource_retention_errors"] = retention_failures
             try:
                 _atomic_json(invocation.status_path, state)
             except OSError:
                 pass
+        if invocation.repository is not None:
+            try:
+                _publish_registry()
+            except Exception as exc:
+                state.update({
+                    "state": "CONTROLLER_FAILED",
+                    "ended_utc": state.get("ended_utc") or _utc(),
+                    "error": f"final lifecycle registry publication failed: {exc}",
+                    "lifecycle_publication_failure": {
+                        "type": type(exc).__name__,
+                        "detail": str(exc),
+                        "terminal_authority": False,
+                    },
+                    "helpers_complete": False,
+                })
+                try:
+                    _atomic_json(invocation.status_path, state)
+                except Exception:
+                    pass
+                if boundary is not None:
+                    boundary.close()
+                raise InvocationError(f"final lifecycle registry publication failed: {exc}") from exc
+        if boundary is not None:
+            boundary.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1789,7 +2335,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return run(load_invocation(args.invocation))
-    except InvocationError as exc:
+    except (InvocationError, LaneLifecycleError, ProcessBoundaryUnsupported) as exc:
         print(f"lane-controller invocation error: {exc}", file=sys.stderr)
         return 2
 

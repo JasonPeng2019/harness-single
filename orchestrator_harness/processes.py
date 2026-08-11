@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, cast
+from typing import Callable, Sequence, cast
 
-from .models import ProcessInfo, ProcessQuery, ProcessSnapshot, parse_utc
+from .models import ProcessBoundaryInventory, ProcessInfo, ProcessQuery, ProcessSnapshot, iso_utc, parse_utc
 
 
 WINDOWS_CIM_SCRIPT = r"""
@@ -212,12 +213,25 @@ def _linux_process_query(
         if close < 0 or len(fields) <= 19:
             raise ValueError("/proc stat record is incomplete")
         ppid = int(fields[1])
+        process_group_id = int(fields[2])
+        session_id = int(fields[3])
         start_ticks = int(fields[19])
         name = stat_text[stat_text.find("(") + 1 : close]
         raw_cmd = (entry / "cmdline").read_bytes().replace(b"\0", b" ").strip()
         command = raw_cmd.decode("utf-8", errors="replace")
         created = boot + timedelta(seconds=start_ticks / ticks)
-        return ProcessQuery(True, ProcessInfo(pid, ppid, name, command, created))
+        return ProcessQuery(
+            True,
+            ProcessInfo(
+                pid,
+                ppid,
+                name,
+                command,
+                created,
+                process_group_id=process_group_id,
+                session_id=session_id,
+            ),
+        )
     except (FileNotFoundError, ProcessLookupError):
         return ProcessQuery(True, None)
     except PermissionError as exc:
@@ -291,3 +305,158 @@ def process_snapshot() -> ProcessSnapshot:
     if Path("/proc").is_dir():
         return linux_process_snapshot()
     return ProcessSnapshot(False, (), ("unsupported process platform",), "unsupported")
+
+
+def process_group_inventory(
+    process_group_id: int | None,
+    *,
+    snapshot_provider: Callable[[], ProcessSnapshot] = process_snapshot,
+    boundary_identity: str | None = None,
+    session_id: int | None = None,
+    root_pid: int | None = None,
+    root_identity: ProcessInfo | None = None,
+    controller_pid: int | None = None,
+    owned_history: Sequence[ProcessInfo] = (),
+) -> ProcessBoundaryInventory:
+    """Return a complete subreaper ownership inventory or refuse.
+
+    A process group is only one selector in the Linux boundary.  The
+    controller also supplies the provider root, session, controller PID, and
+    exact identities observed in earlier snapshots.  That history is what
+    makes a descendant that leaves its original group and is later adopted by
+    the subreaper remain owned.  Calling this function without that context is
+    deliberately incomplete: group-only emptiness is not terminal evidence.
+    """
+
+    valid_group = (
+        process_group_id is None
+        or (isinstance(process_group_id, int) and not isinstance(process_group_id, bool) and process_group_id > 0)
+    )
+    valid_session = (
+        session_id is None
+        or (isinstance(session_id, int) and not isinstance(session_id, bool) and session_id > 0)
+    )
+    valid_root = (
+        root_pid is None
+        or (isinstance(root_pid, int) and not isinstance(root_pid, bool) and root_pid > 0)
+    )
+    if not valid_group or not valid_session or not valid_root:
+        return ProcessBoundaryInventory(
+            False, "linux-subreaper", boundary_identity, errors=("process boundary identity is invalid",), source="/proc"
+        )
+    if root_pid is None or root_identity is None or root_identity.created_utc is None or (process_group_id is None and session_id is None):
+        return ProcessBoundaryInventory(
+            False,
+            "linux-subreaper",
+            boundary_identity,
+            errors=("complete descendant/adoption boundary identity is unavailable",),
+            source="/proc",
+        )
+    snapshot = snapshot_provider()
+    for _ in range(2):
+        if isinstance(snapshot, ProcessSnapshot) and snapshot.complete:
+            break
+        time.sleep(0.01)
+        snapshot = snapshot_provider()
+    if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
+        return ProcessBoundaryInventory(
+            False,
+            "linux-subreaper",
+            boundary_identity or f"pgid:{process_group_id}",
+            errors=tuple(getattr(snapshot, "errors", ("process snapshot is incomplete",))),
+            source="/proc",
+        )
+
+    by_pid = snapshot.by_pid
+    root_key = (root_identity.pid, iso_utc(root_identity.created_utc) or "")
+    known_by_key: dict[tuple[int, str], ProcessInfo] = {}
+    for item in tuple(owned_history) + (root_identity,):
+        if item.created_utc is not None:
+            known_by_key[(item.pid, iso_utc(item.created_utc) or "")] = item
+
+    errors: list[str] = []
+    current_root = by_pid.get(root_pid)
+    if current_root is not None and current_root.created_utc is None:
+        errors.append(f"provider root {root_pid} lacks a creation identity")
+    elif current_root is not None and (current_root.pid, iso_utc(current_root.created_utc) or "") != root_key:
+        errors.append(f"provider root {root_pid} creation identity was reused")
+
+    selected: dict[tuple[int, str], ProcessInfo] = {}
+
+    def select(item: ProcessInfo) -> None:
+        if item.created_utc is None:
+            errors.append(f"owned PID {item.pid} lacks a creation identity")
+            return
+        selected[(item.pid, iso_utc(item.created_utc) or "")] = item
+
+    for item in snapshot.processes:
+        if (
+            (process_group_id is not None and item.process_group_id == process_group_id)
+            or (session_id is not None and item.session_id == session_id)
+        ):
+            select(item)
+        if (item.pid, iso_utc(item.created_utc) or "") in known_by_key:
+            select(item)
+
+    # Descendant closure is calculated only through a currently observed
+    # parent identity.  A child seen for the first time after its parent has
+    # disappeared cannot be safely attributed, so it remains an explicit
+    # incomplete observation rather than being silently treated as unrelated.
+    changed = True
+    while changed:
+        changed = False
+        selected_pids = {item.pid for item in selected.values()}
+        for item in snapshot.processes:
+            if item.pid in selected_pids:
+                continue
+            if item.ppid not in selected_pids:
+                continue
+            parent = by_pid.get(item.ppid)
+            if parent is None or (parent.pid, iso_utc(parent.created_utc) or "") not in selected:
+                errors.append(f"descendant PID {item.pid} has no exact owned parent observation")
+                continue
+            before = len(selected)
+            select(item)
+            changed = len(selected) != before
+
+    if controller_pid is not None:
+        for item in snapshot.processes:
+            key = (item.pid, iso_utc(item.created_utc) or "")
+            if item.ppid != controller_pid:
+                continue
+            if key in known_by_key:
+                select(item)
+            else:
+                errors.append(f"adopted PID {item.pid} is outside the known ownership history")
+
+    # A process still claiming the provider root as parent after the root has
+    # disappeared must have been captured in history before adoption.  Refuse
+    # the snapshot if it was not, rather than losing a daemonizing child.
+    if current_root is None:
+        for item in snapshot.processes:
+            if item.ppid == root_pid and (item.pid, iso_utc(item.created_utc) or "") not in known_by_key:
+                errors.append(f"unobserved descendant PID {item.pid} cannot be attributed after root exit")
+
+    members = tuple(sorted(selected.values(), key=lambda item: item.pid))
+    observed: dict[tuple[int, str], ProcessInfo] = dict(known_by_key)
+    for item in members:
+        if item.created_utc is not None:
+            observed[(item.pid, iso_utc(item.created_utc) or "")] = item
+    if errors:
+        return ProcessBoundaryInventory(
+            False,
+            "linux-subreaper",
+            boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
+            processes=members,
+            observed_processes=tuple(sorted(observed.values(), key=lambda item: (item.pid, iso_utc(item.created_utc) or ""))),
+            errors=tuple(errors),
+            source="/proc",
+        )
+    return ProcessBoundaryInventory(
+        True,
+        "linux-subreaper",
+        boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
+        processes=members,
+        observed_processes=tuple(sorted(observed.values(), key=lambda item: (item.pid, iso_utc(item.created_utc) or ""))),
+        source="/proc",
+    )

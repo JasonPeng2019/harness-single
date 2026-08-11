@@ -5,6 +5,13 @@ description = "Durable event observation and lane control for parallel coding wo
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+orchestrator_harness = ["assets/codex/*.json", "assets/codex/*.py"]
+
 [tool.pyright]
 pythonVersion = "3.11"
 extraPaths = [".."]

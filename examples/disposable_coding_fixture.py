@@ -18,6 +18,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from orchestrator_harness.notifications import ManagerEventRouter
+
 FIXTURE_RESOURCE = "service:fixture-database"
 HARNESS_ROOT = Path(__file__).resolve().parent.parent
 
@@ -310,14 +312,9 @@ def run_fixture(root: Path) -> dict[str, object]:
             "output_dir": str(runtime / "manager-epoch"),
             "poll_interval_seconds": 0.05,
             "watch_timeout_seconds": 5,
-            "manager_review_interval_seconds": 300,
-            "lane_no_progress_seconds": 600,
-            "manager_heartbeat_timeout_seconds": 420,
             "request_warning_seconds": 120,
             "request_critical_seconds": 30,
             "process_start_tolerance_seconds": 2,
-            "attention_logging_enabled": False,
-            "attention_epoch_id": "disposable-coding-fixture",
         },
     )
     _harness(config, "watch", "--once")
@@ -382,17 +379,36 @@ def run_fixture(root: Path) -> dict[str, object]:
             "ordinary coding fixture unexpectedly required firmware records"
         )
 
-    delivered = _harness(config, "watch", "--until-actionable", "--timeout", "5")
-    event = json.loads(delivered.stdout.splitlines()[-1])
-    event_id = event.get("event_id")
-    if not isinstance(event_id, str) or event_id == "WATCH_TIMEOUT":
-        raise FixtureError("native wait did not return a durable actionable event")
-    acknowledged = json.loads(_harness(config, "ack", "--event-id", event_id).stdout)
-    if (
-        acknowledged.get("acknowledged") is not True
-        or acknowledged.get("event_id") != event_id
-    ):
-        raise FixtureError("exact event acknowledgement failed")
+    manager_queue = runtime / "manager-queue"
+    router = ManagerEventRouter(
+        manager_queue,
+        run_id="disposable-coding-fixture",
+        queue_id="coding-manager-queue",
+        manager_session_id="coding-manager-session",
+        manager_thread_id="coding-manager-thread",
+        manager_invocation_id="coding-manager-invocation",
+        registration_id="coding-manager-registration",
+    )
+    admitted = router.admit({
+        "event_id": "coding-manager-event",
+        "type": "MANAGER_SIGNAL",
+        "identity": "coding-fixture:manager-event",
+        "data": {
+            "signal_id": "coding-manager-event",
+            "lane_id": "coding-fixture",
+            "manager_actionable": True,
+            "severity": "warning",
+        },
+    })
+    if not isinstance(admitted, dict):
+        raise FixtureError("S3 manager event was not admitted")
+    event = router.next_event()
+    event_id = event.get("event_id") if isinstance(event, dict) else None
+    if not isinstance(event_id, str):
+        raise FixtureError("S3 manager queue did not expose its admitted event")
+    router.acknowledge(event_id, binding=router.registration)
+    if router.pending_events():
+        raise FixtureError("S3 manager event acknowledgement left queue work pending")
 
     _git(project, "worktree", "add", "-b", "integration/merge", str(merge), base_commit)
     _git(merge, "merge", "--no-edit", "lane/alpha")
@@ -423,6 +439,8 @@ def run_fixture(root: Path) -> dict[str, object]:
         "stale_result_rejected": True,
         "valid_results": ["alpha", "beta", "merge"],
         "acknowledged_event_id": event_id,
+        "s3_queue_pending_after_ack": len(router.pending_events()),
+        "s3_queue_root": str(manager_queue),
         "lane_event_count": event_count,
         "python_tests": "PASS" if tests.returncode == 0 else "FAIL",
         "resource_claims_remaining": 0,
