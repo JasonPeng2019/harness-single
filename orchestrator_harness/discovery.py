@@ -14,10 +14,13 @@ from .git_safety import (
     invalid_result_evidence,
     _git_inspection_env,
     validate_coding_result,
+    validate_task_result_repository,
 )
 from .models import ObservationError, StableBytes
 from .models import parse_utc
 from .stable_io import read_stable, read_tail_stable
+from .task import TaskValidationError, read_task_advancement, task_card_from_identity, validate_task_result
+from .provider import ProviderAdapterError, provider_adapter
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class RunRecords:
     invalid_result_status_path: Path | None
     manager_signals: tuple[ManagerSignalRecord, ...]
     errors: tuple[ObservationError, ...]
+    result_acceptance_state: str | None = None
 
 
 _HELPER_RECORD_NAMES = {"helper_process.json", "live-context.json"}
@@ -145,11 +149,16 @@ def _json_record(
     return record
 
 
-def _terminal_event(path: Path, config: HarnessConfig) -> tuple[str | None, int | None]:
+def _terminal_event(
+    path: Path,
+    config: HarnessConfig,
+    *,
+    provider_id: str = "codex",
+) -> tuple[str | None, int | None]:
     signature = _file_signature(path)
     if signature is None:
         raise FileNotFoundError(path)
-    cache_key = (path_identity(path), signature, config.max_jsonl_tail_bytes)
+    cache_key = (path_identity(path), signature, config.max_jsonl_tail_bytes, provider_id)
     cached = _TERMINAL_EVENT_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -159,15 +168,15 @@ def _terminal_event(path: Path, config: HarnessConfig) -> tuple[str | None, int 
         retries=config.stable_read_retries,
         delay_seconds=config.stable_read_delay_seconds,
     )
+    try:
+        adapter = provider_adapter(provider_id or "codex")
+    except ProviderAdapterError as exc:
+        raise ValueError(f"unsupported provider in transcript status: {provider_id}") from exc
     terminal = None
     for raw_line in stable.data.decode("utf-8", errors="replace").splitlines():
-        try:
-            item = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        kind = item.get("type") if isinstance(item, dict) else None
-        if kind in {"turn.completed", "turn.failed", "turn.cancelled"}:
-            terminal = str(kind)
+        event = adapter.parse_transcript_line((raw_line + "\n").encode("utf-8"))
+        if event is not None and event.is_terminal:
+            terminal = event.raw_type or event.kind
     result = (terminal, stable.mtime_ns)
     _cache_put(_TERMINAL_EVENT_CACHE, cache_key, result)
     return result
@@ -563,6 +572,54 @@ def _validate_coding_result_cached(
     _RESULT_VALIDATION_CACHE[key] = (True, None)
 
 
+def _validate_task_result_cached(
+    candidate: JsonRecord,
+    *,
+    coding_status: ControllerRecord,
+    run_root: Path,
+    revalidate: bool,
+) -> str:
+    """Validate canonical result shape and return its semantic advancement state."""
+
+    raw_card = coding_status.status.value.get("task_card")
+    if not isinstance(raw_card, Mapping):
+        raise TaskValidationError("canonical status is missing task_card identity")
+    card = task_card_from_identity(
+        card_id=raw_card.get("id"),
+        lane_id=coding_status.status.value.get("declared_lane_id"),
+        worker_invocation_id=coding_status.status.value.get("worker_invocation_id"),
+        cohort_id=coding_status.status.value.get("cohort_id"),
+        revision=raw_card.get("revision"),
+        content_sha256=raw_card.get("sha256"),
+        completion_review_owner=coding_status.status.value.get("completion_review_owner", "ROOT-IM"),
+    )
+    prompt_bundle_sha = coding_status.status.value.get("prompt_bundle_sha256")
+    prompt_content_sha = coding_status.status.value.get("prompt_content_sha256")
+    declaration = None
+    if isinstance(coding_status.status.value.get("repository"), Mapping):
+        declaration = declaration_from_status(coding_status.status.value, run_root)
+    result = (
+        validate_task_result_repository(
+            candidate.value,
+            card=card,
+            declaration=declaration,
+            raw_bytes=candidate.stable.data,
+        )
+        if declaration is not None
+        else validate_task_result(candidate.value, card=card, raw_bytes=candidate.stable.data)
+    )
+    if candidate.value.get("prompt_bundle_sha256") != prompt_bundle_sha:
+        raise TaskValidationError("canonical result prompt bundle identity does not match status")
+    if candidate.value.get("prompt_content_sha256") != prompt_content_sha:
+        raise TaskValidationError("canonical result prompt content identity does not match status")
+    advancement = read_task_advancement(
+        coding_status.workspace,
+        card=card,
+        result=result,
+    )
+    return advancement.state
+
+
 def discover_run(
     run_root: Path,
     workspace: Path,
@@ -582,7 +639,10 @@ def discover_run(
             if not conventional and not (
                 status.value.get("schema") == "orchestrator-lane-controller/v1"
                 and status.value.get("invocation_schema")
-                == "orchestrator-coding-invocation/v1"
+                in {
+                    "orchestrator-coding-invocation/v1",
+                    "orchestrator-worker-invocation/v1",
+                }
             ):
                 continue
             label = (
@@ -594,7 +654,14 @@ def discover_run(
                     or path.stem
                 )
             )
-            candidates = [
+            configured_jsonl = status.value.get("jsonl_path")
+            configured_path = Path(configured_jsonl).resolve(strict=False) if isinstance(configured_jsonl, str) else None
+            safe_configured = (
+                configured_path
+                if configured_path is not None and configured_path.parent == workspace
+                else None
+            )
+            candidates = ([safe_configured] if safe_configured is not None else []) + [
                 workspace / f"{label}_codex.jsonl",
                 workspace / "test_agent_codex.jsonl",
             ]
@@ -602,7 +669,11 @@ def discover_run(
             terminal = None
             terminal_mtime = None
             if jsonl:
-                terminal, terminal_mtime = _terminal_event(jsonl, config)
+                terminal, terminal_mtime = _terminal_event(
+                    jsonl,
+                    config,
+                    provider_id=str(status.value.get("provider_id") or "codex"),
+                )
             controllers.append(
                 ControllerRecord(
                     run_root,
@@ -703,12 +774,16 @@ def discover_run(
     result_status_path = None
     invalid_result = None
     invalid_result_status_path = None
+    result_acceptance_state: str | None = None
     result_path = workspace / "RESULT.json"
     coding_controllers = [
         item
         for item in controllers
         if item.status.value.get("invocation_schema")
-        == "orchestrator-coding-invocation/v1"
+        in {
+            "orchestrator-coding-invocation/v1",
+            "orchestrator-worker-invocation/v1",
+        }
     ]
     firmware_controllers = [
         item
@@ -745,12 +820,25 @@ def discover_run(
                     raise GitSafetyError(
                         "coding result does not match a current coding lane and worker invocation"
                     )
-                _validate_coding_result_cached(
-                    candidate,
-                    coding_status=coding_owner,
-                    run_root=run_root,
-                    revalidate=revalidate_results or revalidate,
-                )
+                if (
+                    candidate.value.get("schema") == "orchestrator-task-result/v1"
+                    or coding_owner.status.value.get("invocation_schema")
+                    == "orchestrator-worker-invocation/v1"
+                ):
+                    result_acceptance_state = _validate_task_result_cached(
+                        candidate,
+                        coding_status=coding_owner,
+                        run_root=run_root,
+                        revalidate=revalidate_results or revalidate,
+                    )
+                else:
+                    _validate_coding_result_cached(
+                        candidate,
+                        coding_status=coding_owner,
+                        run_root=run_root,
+                        revalidate=revalidate_results or revalidate,
+                    )
+                    result_acceptance_state = "ACCEPTED" if candidate.value.get("acceptance_state") == "ACCEPTED" else None
                 result = candidate
                 result_status_path = coding_owner.status.path
             else:
@@ -833,6 +921,7 @@ def discover_run(
         invalid_result_status_path=invalid_result_status_path,
         manager_signals=tuple(manager_signals),
         errors=tuple(errors),
+        result_acceptance_state=result_acceptance_state,
     )
 
 

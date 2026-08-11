@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,12 +27,39 @@ from .git_safety import (
     inspect_repository,
     invalid_result_evidence,
     repository_status,
+    validate_task_result_repository,
     validate_coding_result,
     validate_findings,
 )
+from .invocation import (
+    CANONICAL_INVOCATION_SCHEMA,
+    CODING_V1_FIRMWARE_ONLY_FIELDS,
+    CanonicalInvocation,
+    InvocationValidationError,
+    parse_canonical_invocation,
+    validate_coding_v1_fields,
+)
 from .models import ProcessInfo, iso_utc
+from .profile import ProfileError, RuntimeProfile, build_child_environment
+from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
+from .provider import (
+    ProviderAdapterError,
+    ProviderEvent,
+    ProviderLaunchSpec,
+    provider_adapter,
+)
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
+from .resume import ResumeAdmissionError, require_resume_admission
+from .task import (
+    COMPLETION_REVIEW_FILENAME,
+    ORCHESTRATOR_ACCEPTANCE_FILENAME,
+    TaskResult,
+    TaskValidationError,
+    read_task_advancement,
+    task_card_from_identity,
+    validate_task_result,
+)
 
 
 class InvocationError(ValueError):
@@ -44,13 +71,7 @@ CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 # These keys are route discriminators, rather than optional aliases.  Silently
 # ignoring one on the other route would make a hand-written mixed invocation
 # appear valid while dropping its safety contract.
-_FIRMWARE_ONLY_FIELDS = frozenset({
-    "policy_sha256",
-    "leases",
-    "board_tokens",
-    "mcp_servers",
-    "server_snapshot",
-})
+_FIRMWARE_ONLY_FIELDS = CODING_V1_FIRMWARE_ONLY_FIELDS
 _CODING_ONLY_FIELDS = frozenset({
     "worker_invocation_id",
     "runtime_root",
@@ -137,6 +158,35 @@ def _safe_path(value: object, *, root: Path, name: str, must_exist: bool = False
     return candidate
 
 
+def _canonical_output_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _validate_canonical_output_paths(
+    output_paths: Mapping[str, Path], *, workspace: Path,
+) -> None:
+    """Reject canonical output aliases before any workspace/output mutation."""
+
+    path_keys = {key: _canonical_output_path_key(path) for key, path in output_paths.items()}
+    if len(set(path_keys.values())) != len(path_keys):
+        raise InvocationValidationError("canonical output paths must be pairwise distinct")
+
+    reserved_paths = {
+        _canonical_output_path_key(workspace / "RESULT.json"): "RESULT.json",
+        _canonical_output_path_key(workspace / COMPLETION_REVIEW_FILENAME): COMPLETION_REVIEW_FILENAME,
+        _canonical_output_path_key(workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME): ORCHESTRATOR_ACCEPTANCE_FILENAME,
+    }
+    collisions = sorted(
+        f"{key}={reserved_paths[path_key]}"
+        for key, path_key in path_keys.items()
+        if path_key in reserved_paths
+    )
+    if collisions:
+        raise InvocationValidationError(
+            "canonical output paths are reserved task artifacts: " + ", ".join(collisions)
+        )
+
+
 def _string(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -172,6 +222,20 @@ def _reject_firmware_coding_model_settings(raw: Mapping[str, Any]) -> None:
         route="schema-less firmware model_settings",
         fields=_CODING_ONLY_MODEL_SETTINGS_FIELDS,
     )
+
+
+def _reject_ambiguous_coding_aliases(raw: Mapping[str, Any]) -> None:
+    for aliases, name in (
+        (("codex", "codex_settings", "model_settings"), "provider settings"),
+        (("repository", "git"), "repository"),
+        (("event_log_path", "event_log", "lane_event_log"), "event log"),
+        (("resume_identity", "resume"), "resume identity"),
+    ):
+        present = [alias for alias in aliases if alias in raw]
+        if len(present) > 1:
+            raise InvocationError(
+                f"coding invocation contains ambiguous {name} aliases: {', '.join(present)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -213,6 +277,11 @@ class Invocation:
     event_log: Path
     finding_gate: dict[str, str] | None = None
     child_environment_isolation: bool = False
+    canonical: CanonicalInvocation | None = None
+    provider_id: str = "codex"
+    provider_options: Mapping[str, Any] = field(default_factory=dict)
+    prompt_bundle: PromptBundle | None = None
+    runtime_profile: RuntimeProfile | None = None
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -359,7 +428,15 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
 
 
 def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
+    # This must remain the first coding-v1 operation: the shared closed
+    # contract rejects mixed/canonical/unknown fields before path resolution,
+    # workspace creation, or event-log mutation.
+    try:
+        validate_coding_v1_fields(raw)
+    except InvocationValidationError as exc:
+        raise InvocationError(str(exc)) from exc
     _reject_foreign_fields(raw, route="coding", fields=_FIRMWARE_ONLY_FIELDS)
+    _reject_ambiguous_coding_aliases(raw)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
     if (
         outputs["status"].parent != workspace
@@ -454,6 +531,114 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     )
 
 
+def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
+    """Load the strict provider-neutral route and its exact prompt bytes."""
+
+    try:
+        canonical = parse_canonical_invocation(raw)
+        run_root = canonical.run_root.expanduser().resolve(strict=True)
+        runtime_root = canonical.runtime_root.expanduser().resolve(strict=True)
+        if not run_root.is_dir() or not runtime_root.is_dir():
+            raise InvocationValidationError("canonical run_root and runtime_root must be directories")
+        workspace = (run_root / ".agent-workspace").resolve(strict=False)
+        if workspace.parent != run_root:
+            raise InvocationValidationError("canonical workspace must be a direct child of run_root")
+        def rooted(value: Path, base: Path) -> str:
+            return str(value if value.is_absolute() else base / value)
+        output_paths = {
+            key: _safe_path(rooted(value, workspace), root=workspace, name=f"output_paths.{key}")
+            for key, value in canonical.output_paths.items()
+        }
+        _validate_canonical_output_paths(output_paths, workspace=workspace)
+        if output_paths["status"].parent != workspace or output_paths["status"].suffix != ".json":
+            raise InvocationValidationError("canonical status must be a direct *.json file under .agent-workspace")
+        event_log = _safe_path(rooted(canonical.event_log_path, runtime_root), root=runtime_root, name="event_log_path")
+        bundle = bundle_from_record(canonical.prompt_bundle, run_root=run_root)
+        if not bundle.final_bytes:
+            raise InvocationValidationError("canonical prompt bundle is empty")
+        profile_record = dict(canonical.profile)
+        profile_record.setdefault("schema", "orchestrator-runtime-profile/v1")
+        profile = RuntimeProfile.from_mapping(profile_record)
+        if tuple(canonical.resources) != profile.resources:
+            raise InvocationValidationError("invocation resources must match profile resources")
+        repository = None
+        if canonical.repository is not None:
+            try:
+                repository = declaration_from_invocation(
+                    {"repository": dict(canonical.repository)}, run_root
+                )
+            except GitSafetyError as exc:
+                raise InvocationValidationError(str(exc)) from exc
+        provider_options = dict(canonical.provider_options)
+        command = provider_options.get("command", [canonical.provider_id])
+        command_list = _string_list(command, "provider.command")
+        overrides = _string_list(provider_options.get("config_overrides", []), "provider.config_overrides")
+        reasoning = provider_options.get("reasoning_effort", "medium")
+        tier = provider_options.get("service_tier", "priority")
+        permission_mode = provider_options.get("permission_mode")
+        sandbox = provider_options.get("sandbox", "workspace-write")
+        approval = provider_options.get("approval_policy", "never")
+        if not isinstance(reasoning, str) or not reasoning.strip() or not isinstance(tier, str) or not tier.strip():
+            raise InvocationValidationError("provider reasoning_effort and service_tier must be non-empty strings")
+        if not isinstance(sandbox, str) or sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+            raise InvocationValidationError("provider sandbox is invalid")
+        if not isinstance(approval, str) or approval not in {"untrusted", "on-failure", "on-request", "never"}:
+            raise InvocationValidationError("provider approval_policy is invalid")
+        allowed_tools = _string_list(provider_options.get("allowed_tools", []), "provider.allowed_tools")
+        disallowed_tools = _string_list(provider_options.get("disallowed_tools", []), "provider.disallowed_tools")
+        if permission_mode is not None and (not isinstance(permission_mode, str) or not permission_mode.strip()):
+            raise InvocationValidationError("provider.permission_mode must be a non-empty string")
+        component_path = bundle.components[0].path
+        if component_path is None:
+            raise InvocationValidationError("canonical prompt components must be path-bound")
+        return Invocation(
+            canonical.schema,
+            canonical.worker_invocation_id,
+            canonical.action,
+            run_root,
+            workspace,
+            component_path,
+            bundle.final_sha256,
+            bundle.final_bytes,
+            None,
+            None,
+            canonical.label,
+            canonical.role,
+            canonical.task,
+            canonical.phase,
+            canonical.lane_id,
+            [],
+            [],
+            [],
+            {},
+            list(canonical.resources),
+            runtime_root / "canonical-resource-locks",
+            canonical.provider_model,
+            str(reasoning).strip(),
+            str(tier).strip(),
+            command_list,
+            overrides,
+            sandbox,
+            approval,
+            canonical.requested_session_id,
+            repository,
+            output_paths["status"],
+            output_paths["jsonl"],
+            output_paths["stderr"],
+            output_paths["last_message"],
+            event_log,
+            None,
+            True,
+            canonical,
+            canonical.provider_id,
+            provider_options,
+            bundle,
+            profile,
+        )
+    except (InvocationValidationError, PromptBundleError, ProfileError, OSError) as exc:
+        raise InvocationError(str(exc)) from exc
+
+
 def load_invocation(path: Path) -> Invocation:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -464,6 +649,8 @@ def load_invocation(path: Path) -> Invocation:
     schema = raw.get("schema")
     if schema is not None and (not isinstance(schema, str) or not schema):
         raise InvocationError("schema must be a non-empty string when supplied")
+    if schema == CANONICAL_INVOCATION_SCHEMA:
+        return _load_canonical_invocation(raw)
     if schema == CODING_INVOCATION_SCHEMA:
         return _load_coding_invocation(raw)
     if schema is None:
@@ -482,25 +669,12 @@ def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> P
     raise RuntimeError(f"cannot establish exact process identity for PID {pid}")
 
 
-def _thread_id(line: bytes) -> str | None:
-    try:
-        value = json.loads(line.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(value, dict) or value.get("type") != "thread.started":
-        return None
-    for key in ("thread_id", "threadId"):
-        item = value.get(key)
-        if isinstance(item, str) and item:
-            return item
-    return None
-
-
 def _shutdown_exact_child(
     process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
 ) -> tuple[bool, dict[str, Any]]:
     """Bound shutdown to the captured Popen handle and prove that it was reaped."""
     evidence: dict[str, Any] = {
+        "provider_pid": process.pid,
         "codex_pid": process.pid,
         "cleanup_confirmed": False,
         "terminate_attempted": False,
@@ -543,7 +717,7 @@ def _shutdown_exact_child(
     if reap("kill", timeout_seconds):
         return True, evidence
 
-    evidence["error"] = "exact Codex child exit and reap could not be proven"
+    evidence["error"] = "exact provider child exit and reap could not be proven"
     return False, evidence
 
 
@@ -555,6 +729,275 @@ def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str, Any]] | None:
+    """Find the one persisted controller status owned by this canonical workspace."""
+
+    workspace = invocation.workspace
+    if not workspace.is_dir():
+        return None
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        paths = sorted(workspace.glob("*.json"), key=lambda path: path.name)
+    except OSError as exc:
+        raise InvocationError(f"cannot inspect canonical workspace status: {exc}") from exc
+    for path in paths:
+        if path.name.startswith("."):
+            continue
+        if path == invocation.status_path:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise InvocationError(f"canonical persisted status is invalid: {exc}") from exc
+            if not isinstance(value, dict):
+                raise InvocationError("canonical persisted status must be an object")
+        else:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+        if value.get("schema") == "orchestrator-lane-controller/v1":
+            candidates.append((path, value))
+    if len(candidates) > 1:
+        raise InvocationError("canonical workspace contains multiple persisted controller statuses")
+    return candidates[0] if candidates else None
+
+
+def _canonical_repository_identity(value: object, *, include_starting_commit: bool) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if not include_starting_commit and key_text == "starting_commit":
+            continue
+        if key_text in {"common_dir", "worktree_root"} and isinstance(item, str):
+            normalized[key_text] = os.path.normcase(os.path.abspath(item))
+        elif key_text in {"base_commit", "starting_commit"} and isinstance(item, str):
+            normalized[key_text] = item.lower()
+        else:
+            normalized[key_text] = item
+    return normalized
+
+
+def _canonical_prior_identity_check(
+    invocation: Invocation,
+    prior_status: Mapping[str, Any],
+    *,
+    prior_status_path: Path,
+    thread: str | None,
+    starting_commit: str | None,
+    git_identity: Any,
+) -> None:
+    assert invocation.canonical is not None
+    if prior_status_path != invocation.status_path:
+        raise InvocationError(
+            "canonical workspace already has a persisted status at a different path"
+        )
+
+    canonical = invocation.canonical
+    expected_identity = canonical.identity(
+        session_id=thread if invocation.action == "resume" else None,
+        starting_commit=starting_commit if invocation.action == "resume" else None,
+    )
+    if git_identity is not None:
+        expected_identity["repository"] = repository_status(
+            git_identity,
+            starting_commit=starting_commit if invocation.action == "resume" else None,
+        )
+    persisted_identity = prior_status.get("resume_identity")
+    if not isinstance(persisted_identity, Mapping):
+        raise InvocationError("canonical persisted status has no resume_identity")
+
+    identity_fields = (
+        "schema",
+        "lane_id",
+        "worker_invocation_id",
+        "cohort_id",
+        "workflow_id",
+        "workflow_version",
+        "task_card_id",
+        "task_card_revision",
+        "task_card_sha256",
+        "provider_id",
+        "provider_launch_sha256",
+        "session_id",
+        "repository",
+        "prompt_bundle_sha256",
+        "prompt_content_sha256",
+    )
+    for field in identity_fields:
+        if invocation.action == "start" and field == "session_id":
+            continue
+        if field not in persisted_identity or field not in expected_identity:
+            raise InvocationError(f"canonical persisted status identity is missing {field}")
+        persisted_value = persisted_identity[field]
+        expected_value = expected_identity[field]
+        if field == "repository":
+            include_starting_commit = invocation.action == "resume"
+            persisted_value = _canonical_repository_identity(
+                persisted_value, include_starting_commit=include_starting_commit
+            )
+            expected_value = _canonical_repository_identity(
+                expected_value, include_starting_commit=include_starting_commit
+            )
+        if persisted_value != expected_value:
+            raise InvocationError("canonical prior task identity does not match persisted status")
+
+    expected_status_identity = {
+        "invocation_schema": canonical.schema,
+        "worker_invocation_id": canonical.worker_invocation_id,
+        "cohort_id": canonical.cohort_id,
+        "workflow": {"id": canonical.workflow_id, "version": canonical.workflow_version},
+        "task_card": {
+            "id": canonical.task_card_id,
+            "revision": canonical.task_card_revision,
+            "sha256": canonical.task_card_sha256,
+        },
+        "doer": canonical.role,
+        "task": canonical.task,
+        "phase": canonical.phase,
+        "provider_id": canonical.provider_id,
+        "prompt_bundle_sha256": canonical.prompt_bundle_sha256,
+        "prompt_content_sha256": canonical.prompt_content_sha256,
+        "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
+    }
+    for field, expected in expected_status_identity.items():
+        if field not in prior_status or prior_status[field] != expected:
+            raise InvocationError("canonical prior task identity does not match persisted status")
+    if git_identity is not None:
+        include_starting_commit = invocation.action == "resume"
+        persisted_repository = _canonical_repository_identity(
+            prior_status.get("repository"), include_starting_commit=include_starting_commit
+        )
+        expected_repository = _canonical_repository_identity(
+            expected_identity["repository"], include_starting_commit=include_starting_commit
+        )
+        if persisted_repository != expected_repository:
+            raise InvocationError("canonical prior task repository identity does not match persisted status")
+
+
+def _canonical_acceptance_status(
+    status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated_status = dict(status)
+    updated_status["terminal_acceptance_state"] = "ACCEPTED"
+    updated_status["task_advancement_state"] = "ACCEPTED"
+    updated_status["acceptance_identity"] = dict(acceptance_identity)
+    persisted_resume_identity = updated_status.get("resume_identity")
+    if not isinstance(persisted_resume_identity, Mapping):
+        raise InvocationError("canonical accepted task requires persisted resume_identity")
+    accepted_resume_identity = dict(persisted_resume_identity)
+    accepted_resume_identity["terminal_acceptance_state"] = "ACCEPTED"
+    accepted_resume_identity["task_advancement_state"] = "ACCEPTED"
+    accepted_resume_identity["acceptance_identity"] = dict(acceptance_identity)
+    updated_status["resume_identity"] = accepted_resume_identity
+    return updated_status
+
+
+def _persist_canonical_acceptance(
+    path: Path, status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated_status = _canonical_acceptance_status(status, acceptance_identity)
+    _atomic_json(path, updated_status)
+    return updated_status
+
+
+def _canonical_prior_task_preflight(
+    invocation: Invocation,
+    prior_status: Mapping[str, Any] | None,
+    *,
+    prior_status_path: Path,
+    thread: str | None,
+    starting_commit: str | None,
+    git_identity: Any,
+) -> None:
+    """Admit only a fresh canonical task or a validated continuation."""
+
+    fixed_artifact_paths = (
+        invocation.workspace / "RESULT.json",
+        invocation.workspace / COMPLETION_REVIEW_FILENAME,
+        invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME,
+    )
+    fixed_artifacts_present = any(
+        path.exists() or path.is_symlink() for path in fixed_artifact_paths
+    )
+    if prior_status is None and not fixed_artifacts_present:
+        return
+    if prior_status is not None:
+        _canonical_prior_identity_check(
+            invocation,
+            prior_status,
+            prior_status_path=prior_status_path,
+            thread=thread,
+            starting_commit=starting_commit,
+            git_identity=git_identity,
+        )
+    result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+    if not result_valid:
+        detail = result_validation.get("detail", "canonical task result is invalid")
+        raise InvocationError(f"canonical {invocation.action} requires a valid task result: {detail}")
+
+    advancement = None
+    if task_result is not None:
+        try:
+            advancement = read_task_advancement(
+                invocation.workspace,
+                card=task_result.card,
+                result=task_result,
+            )
+        except TaskValidationError as exc:
+            raise InvocationError(
+                f"canonical {invocation.action} task advancement rejected: {exc}"
+            ) from exc
+    elif (
+        (invocation.workspace / COMPLETION_REVIEW_FILENAME).exists()
+        or (invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).exists()
+    ):
+        raise InvocationError(
+            "canonical task advancement artifacts exist without a valid RESULT.json"
+        )
+
+    claimed_terminal = prior_status is not None and any(
+        prior_status.get(field) == "ACCEPTED"
+        for field in ("terminal_acceptance_state", "task_advancement_state")
+    )
+    persisted_resume_identity = (
+        prior_status.get("resume_identity") if prior_status is not None else None
+    )
+    if isinstance(persisted_resume_identity, Mapping):
+        claimed_terminal = claimed_terminal or any(
+            persisted_resume_identity.get(field) == "ACCEPTED"
+            for field in ("terminal_acceptance_state", "task_advancement_state")
+        )
+    if claimed_terminal and (advancement is None or advancement.state != "ACCEPTED"):
+        raise InvocationError(
+            "canonical persisted status claims acceptance without an accepted task advancement chain"
+        )
+    if advancement is not None and advancement.state == "ACCEPTED":
+        acceptance_identity = advancement.acceptance_identity
+        if acceptance_identity is None:
+            raise InvocationError("canonical task acceptance is missing its identity")
+        if prior_status is not None:
+            _persist_canonical_acceptance(
+                prior_status_path,
+                prior_status,
+                acceptance_identity,
+            )
+        raise InvocationError(
+            f"canonical task is already accepted; {invocation.action} rejected before provider launch"
+        )
+    if invocation.action == "start":
+        if prior_status is None:
+            raise InvocationError(
+                "canonical task has retained fixed artifacts; action:start rejected before provider launch"
+            )
+        raise InvocationError(
+            "canonical task already has persisted work; action:start rejected; use action:resume"
+        )
 
 
 def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
@@ -636,11 +1079,98 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
         return invalid_result_evidence(path, str(exc), sha256=sha256), False
 
 
+def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool, TaskResult | None]:
+    """Validate canonical result shape while leaving semantic acceptance pending."""
+
+    assert invocation.canonical is not None
+    path = invocation.workspace / "RESULT.json"
+    if not path.exists():
+        return {"state": "MISSING", "path": str(path), "acceptance_state": "PENDING"}, True, None
+    raw_bytes: bytes | None = None
+    try:
+        raw_bytes = path.read_bytes()
+        if len(raw_bytes) > 1024 * 1024:
+            raise TaskValidationError("canonical task result exceeds the 1 MiB controller limit")
+        value = json.loads(raw_bytes.decode("utf-8-sig"))
+        if not isinstance(value, Mapping):
+            raise TaskValidationError("canonical task result root must be an object")
+        card = task_card_from_identity(
+            card_id=invocation.canonical.task_card_id,
+            lane_id=invocation.canonical.lane_id,
+            worker_invocation_id=invocation.canonical.worker_invocation_id,
+            cohort_id=invocation.canonical.cohort_id,
+            revision=invocation.canonical.task_card_revision,
+            content_sha256=invocation.canonical.task_card_sha256,
+        )
+        if invocation.repository is not None:
+            result = validate_task_result_repository(
+                value,
+                card=card,
+                declaration=invocation.repository,
+                raw_bytes=raw_bytes,
+            )
+        else:
+            result = validate_task_result(value, card=card, raw_bytes=raw_bytes)
+        if value.get("prompt_bundle_sha256") != invocation.canonical.prompt_bundle_sha256:
+            raise TaskValidationError("canonical task result prompt bundle identity does not match")
+        if value.get("prompt_content_sha256") != invocation.canonical.prompt_content_sha256:
+            raise TaskValidationError("canonical task result prompt content identity does not match")
+        return {
+            "state": "SHAPE_VALID",
+            "path": str(path),
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "result_sha256": result.content_sha256,
+            "prompt_bundle_sha256": invocation.canonical.prompt_bundle_sha256,
+            "prompt_content_sha256": invocation.canonical.prompt_content_sha256,
+            "commit": result.commit,
+            "acceptance_state": "PENDING",
+        }, True, result
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TaskValidationError, GitSafetyError) as exc:
+        return invalid_result_evidence(path, str(exc), sha256=hashlib.sha256(raw_bytes).hexdigest() if raw_bytes is not None else None), False, None
+
+
+def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> ProviderLaunchSpec:
+    options = dict(invocation.provider_options)
+    try:
+        return ProviderLaunchSpec(
+            action=invocation.action,
+            command=tuple(invocation.codex_command),
+            model=invocation.model,
+            reasoning_effort=invocation.reasoning_effort,
+            service_tier=invocation.service_tier,
+            session_id=session_id,
+            run_root=invocation.run_root,
+            last_message_path=invocation.last_message_path,
+            config_overrides=tuple(invocation.config_overrides),
+            sandbox=invocation.sandbox,
+            approval_policy=invocation.approval_policy,
+            worker_invocation_id=invocation.worker_invocation_id,
+            permission_mode=options.get("permission_mode") if isinstance(options.get("permission_mode"), str) else None,
+            allowed_tools=tuple(item for item in options.get("allowed_tools", []) if isinstance(item, str)),
+            disallowed_tools=tuple(item for item in options.get("disallowed_tools", []) if isinstance(item, str)),
+            mcp_config=(
+                options.get("mcp_config")
+                if isinstance(options.get("mcp_config"), (str, Mapping, list))
+                else None
+            ),
+            provider_options=options,
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
+
+
 def run(invocation: Invocation) -> int:
     prompt = invocation.prompt_bytes
     if not prompt:
         raise InvocationError("prompt is empty")
-    prior_status = _read_prior_status(invocation)
+    prior_status_path = invocation.status_path
+    if invocation.canonical is not None:
+        canonical_prior = _read_canonical_prior_status(invocation)
+        prior_status = canonical_prior[1] if canonical_prior is not None else None
+        if canonical_prior is not None:
+            prior_status_path = canonical_prior[0]
+    else:
+        prior_status = _read_prior_status(invocation)
     prior_thread_value = prior_status.get("thread_id") if prior_status else None
     prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
     starting_commit = None
@@ -650,8 +1180,64 @@ def run(invocation: Invocation) -> int:
             git_identity = inspect_repository(invocation.repository)
         except GitSafetyError as exc:
             raise InvocationError(str(exc)) from exc
+    resume_admission_record: dict[str, Any] | None = None
     if invocation.action == "resume":
-        if invocation.worker_invocation_id is not None:
+        if invocation.canonical is not None:
+            if prior_status is None:
+                raise InvocationError("canonical resume requires persisted controller status")
+            if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
+                raise InvocationError("resume worker_invocation_id does not match persisted status")
+            if prior_status.get("invocation_schema") != invocation.invocation_schema:
+                raise InvocationError("resume invocation schema does not match persisted status")
+            if prior_thread is None:
+                prior_thread_value = prior_status.get("provider_session_id", prior_status.get("session_id"))
+                prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
+            if prior_thread is None:
+                raise InvocationError("canonical resume requires a persisted provider session ID")
+            starting_commit = _persisted_repository(invocation, prior_status) if invocation.repository is not None else None
+            thread = invocation.requested_thread_id or prior_thread
+            if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
+                raise InvocationError("resume requires the persisted provider session ID")
+            if invocation.canonical is not None:
+                _canonical_prior_task_preflight(
+                    invocation,
+                    prior_status,
+                    prior_status_path=prior_status_path,
+                    thread=thread,
+                    starting_commit=starting_commit,
+                    git_identity=git_identity,
+                )
+            if invocation.canonical is not None:
+                requested_identity = invocation.canonical.identity(
+                    session_id=thread,
+                    starting_commit=starting_commit,
+                )
+                requested_identity["live_identity"] = {
+                    "provider_id": invocation.provider_id,
+                    "session_id": thread,
+                }
+                persisted_identity = prior_status.get("resume_identity")
+                if not isinstance(persisted_identity, Mapping):
+                    raise InvocationError("canonical resume requires persisted resume_identity")
+                live_identity = {
+                    "live_identity": {
+                        "provider_id": invocation.provider_id,
+                        "session_id": thread,
+                    },
+                    "repository": (
+                        repository_status(git_identity, starting_commit=starting_commit)
+                        if git_identity is not None
+                        else requested_identity.get("repository")
+                    ),
+                }
+                try:
+                    admission = require_resume_admission(
+                        requested_identity, persisted_identity, live_identity
+                    )
+                except ResumeAdmissionError as exc:
+                    raise InvocationError(str(exc)) from exc
+                resume_admission_record = admission.to_record()
+        elif invocation.worker_invocation_id is not None:
             if prior_status is None:
                 raise InvocationError("coding resume requires persisted controller status")
             if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
@@ -661,13 +1247,26 @@ def run(invocation: Invocation) -> int:
             if prior_thread is None:
                 raise InvocationError("coding resume requires a persisted lane thread ID")
             starting_commit = _persisted_repository(invocation, prior_status)
-        thread = invocation.requested_thread_id or prior_thread
-        if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
-            raise InvocationError("resume requires the persisted lane thread ID")
+            thread = invocation.requested_thread_id or prior_thread
+            if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
+                raise InvocationError("resume requires the persisted lane thread ID")
+        else:
+            thread = invocation.requested_thread_id or prior_thread
+            if not thread:
+                raise InvocationError("resume requires the persisted lane thread ID")
     else:
         thread = None
         if git_identity is not None:
             starting_commit = git_identity.head_commit
+        if invocation.canonical is not None:
+            _canonical_prior_task_preflight(
+                invocation,
+                prior_status,
+                prior_status_path=prior_status_path,
+                thread=thread,
+                starting_commit=starting_commit,
+                git_identity=git_identity,
+            )
     if invocation.repository is not None:
         try:
             conflicts = active_declaration_conflicts(
@@ -685,32 +1284,52 @@ def run(invocation: Invocation) -> int:
         if git_identity is None or launch_identity.head_commit != git_identity.head_commit:
             raise InvocationError("coding worktree HEAD changed during pre-launch validation")
     controller = _identity(os.getpid())
-    argv = [*invocation.codex_command, "exec"]
-    if invocation.action == "resume":
-        argv.extend(["resume", thread])  # type: ignore[arg-type]
-    argv.append("--dangerously-bypass-approvals-and-sandbox")
-    argv.extend([
-        "--ignore-user-config", "--skip-git-repo-check",
-        "-c", f'approval_policy="{invocation.approval_policy}"', "-m", invocation.model,
-        "-c", f'model_reasoning_effort="{invocation.reasoning_effort}"',
-        "-c", f'service_tier="{invocation.service_tier}"',
-    ])
-    if invocation.worker_invocation_id is None:
-        argv.extend(["-c", 'approvals_reviewer="user"'])
-    for override in invocation.config_overrides:
-        argv.extend(["-c", override])
-    argv.extend(["--json", "--output-last-message", str(invocation.last_message_path)])
-    if invocation.action == "start":
-        argv.extend(["--cd", str(invocation.run_root)])
-    argv.append("-")
+    try:
+        adapter = provider_adapter(invocation.provider_id)
+        argv = adapter.build_argv(_provider_launch_spec(invocation, thread))
+    except ProviderAdapterError as exc:
+        raise InvocationError(str(exc)) from exc
+    if invocation.canonical is not None:
+        try:
+            invocation.workspace.mkdir(exist_ok=True)
+            invocation.event_log.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InvocationError(f"cannot create canonical launch parents: {exc}") from exc
+    legacy_status_names = invocation.canonical is None
+    running_state = "RUNNING_CODEX" if legacy_status_names else "RUNNING_PROVIDER"
+    exited_state = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
+    started_event = "CODEX_STARTED" if legacy_status_names else "PROVIDER_STARTED"
+    exited_event = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
     state: dict[str, Any] = {
         "schema": "orchestrator-lane-controller/v1", "state": "LAUNCH_FAILED", "started_utc": _utc(),
         "invocation_schema": invocation.invocation_schema,
         "worker_invocation_id": invocation.worker_invocation_id,
         "controller_pid": controller.pid, "controller_started_utc": iso_utc(controller.created_utc),
-        "controller_created_utc": iso_utc(controller.created_utc), "codex_pid": None, "codex_started_utc": None,
+        "controller_created_utc": iso_utc(controller.created_utc),
+        "provider_id": invocation.provider_id,
+        "provider_pid": None,
+        "provider_started_utc": None,
+        "provider_created_utc": None,
+        "provider_session_id": thread,
+        "cohort_id": invocation.canonical.cohort_id if invocation.canonical is not None else None,
+        "workflow": (
+            {"id": invocation.canonical.workflow_id, "version": invocation.canonical.workflow_version}
+            if invocation.canonical is not None
+            else None
+        ),
+        "task_card": (
+            {
+                "id": invocation.canonical.task_card_id,
+                "revision": invocation.canonical.task_card_revision,
+                "sha256": invocation.canonical.task_card_sha256,
+            }
+            if invocation.canonical is not None
+            else None
+        ),
+        "completion_review_owner": "ROOT-IM" if invocation.canonical is not None else None,
+        "codex_pid": None, "codex_started_utc": None,
         "doer": invocation.doer, "task": invocation.task, "phase": invocation.phase,
-        "declared_lane_id": invocation.lane_id, "thread_id": thread, "leases": invocation.leases,
+        "declared_lane_id": invocation.lane_id, "lane_id": invocation.lane_id, "thread_id": thread, "session_id": thread, "leases": invocation.leases,
         "board_tokens": invocation.board_tokens, "mcp_servers": invocation.mcp_servers,
         "server_snapshot": invocation.server_snapshot, "resources": invocation.resources,
         "exclusive_resources": invocation.resources,
@@ -720,14 +1339,21 @@ def run(invocation: Invocation) -> int:
         "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path), "last_message_path": str(invocation.last_message_path),
         "prompt_path": str(invocation.prompt_path), "prompt_sha256": invocation.prompt_sha256,
+        "prompt_content_sha256": invocation.prompt_sha256,
+        "prompt_bundle": invocation.prompt_bundle.to_record() if invocation.prompt_bundle is not None else None,
+        "prompt_bundle_sha256": invocation.prompt_bundle.bundle_sha256 if invocation.prompt_bundle is not None else None,
         "policy_path": str(invocation.policy_path) if invocation.policy_path is not None else None,
         "policy_sha256": invocation.policy_sha256,
+        "resume_identity": invocation.canonical.identity(session_id=thread, starting_commit=starting_commit) if invocation.canonical is not None else None,
+        "resume_admission": resume_admission_record,
+        "terminal_acceptance_state": "PENDING" if invocation.canonical is not None else None,
+        "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
         "launcher_settings": {"model": invocation.model, "model_reasoning_effort": invocation.reasoning_effort,
             "service_tier": invocation.service_tier, "sandbox": invocation.sandbox,
             "approval_policy": invocation.approval_policy,
             "approvals_reviewer": "user" if invocation.worker_invocation_id is None else None,
             "config_overrides": invocation.config_overrides,
-            "jsonl": True, "ephemeral": False, "action": invocation.action, "argv": argv[:-1]},
+            "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": argv[:-1]},
     }
     if git_identity is not None:
         repository = repository_status(git_identity, starting_commit=starting_commit)
@@ -739,6 +1365,17 @@ def run(invocation: Invocation) -> int:
             "base_commit": repository["base_commit"],
             "starting_commit": repository["starting_commit"],
         })
+        if invocation.canonical is not None:
+            resume_identity = invocation.canonical.identity(
+                session_id=thread,
+                starting_commit=repository["starting_commit"],
+            )
+            resume_identity["repository"] = repository
+            resume_identity["live_identity"] = {
+                "provider_id": invocation.provider_id,
+                "session_id": thread,
+            }
+            state["resume_identity"] = resume_identity
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     resource_claims: ResourceClaims | None = None
@@ -771,33 +1408,71 @@ def run(invocation: Invocation) -> int:
         with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
             child_env = None
             if invocation.child_environment_isolation:
-                child_env, cleared = isolated_coding_child_environment()
-                state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
+                if invocation.runtime_profile is not None:
+                    child_env, cleared = build_child_environment(invocation.runtime_profile)
+                    state["child_environment_isolation"] = {
+                        "enabled": True,
+                        "profile_id": invocation.runtime_profile.profile_id,
+                        "provider_needs": list(invocation.runtime_profile.provider_needs),
+                        "workflow_grants": list(invocation.runtime_profile.workflow_grants),
+                        "cleared_variable_names": cleared,
+                    }
+                else:
+                    child_env, cleared = isolated_coding_child_environment()
+                    state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
             process = subprocess.Popen(argv, cwd=invocation.run_root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
             child_exit_confirmed = False
             child = _identity(process.pid, parent=controller.pid)
-            state.update({"state": "RUNNING_CODEX", "codex_pid": child.pid, "codex_started_utc": iso_utc(child.created_utc), "codex_created_utc": iso_utc(child.created_utc)})
+            state.update({
+                "state": running_state,
+                "provider_pid": child.pid,
+                "provider_started_utc": iso_utc(child.created_utc),
+                "provider_created_utc": iso_utc(child.created_utc),
+                "codex_pid": child.pid,
+                "codex_started_utc": iso_utc(child.created_utc),
+                "codex_created_utc": iso_utc(child.created_utc),
+            })
             _atomic_json(invocation.status_path, state)
             _append_event(invocation.event_log, _event(
-                invocation, "CODEX_STARTED", controller_pid=controller.pid, codex_pid=child.pid,
+                invocation,
+                started_event,
+                controller_pid=controller.pid,
+                provider_id=invocation.provider_id,
+                provider_pid=child.pid,
+                codex_pid=child.pid,
             ))
             assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-            process.stdin.write(prompt); process.stdin.close()
+            process.stdin.write(adapter.encode_prompt(prompt)); process.stdin.close()
+            provider_terminal_event: ProviderEvent | None = None
             def drain(source: Any, destination: Any, parse: bool) -> None:
-                nonlocal state
+                nonlocal state, provider_terminal_event
                 for line in iter(source.readline, b""):
                     destination.write(line); destination.flush(); os.fsync(destination.fileno())
                     if parse:
-                        found = _thread_id(line)
-                        if found:
+                        event = adapter.parse_transcript_line(line)
+                        if event is not None:
                             with lock:
-                                if invocation.action == "resume" and found != thread:
-                                    state["thread_identity_error"] = (
-                                        f"child thread.started identity {found!r} does not match "
-                                        f"validated resume thread {thread!r}"
-                                    )
-                                else:
-                                    state["thread_id"] = found
+                                if event.session_id:
+                                    expected_session = thread if invocation.action == "resume" else state.get("provider_session_id")
+                                    if expected_session and event.session_id != expected_session:
+                                        state["thread_identity_error"] = (
+                                            f"provider session identity {event.session_id!r} does not match "
+                                            f"validated resume session {expected_session!r}"
+                                        )
+                                    else:
+                                        state["provider_session_id"] = event.session_id
+                                        state["session_id"] = event.session_id
+                                        state["thread_id"] = event.session_id
+                                        if invocation.canonical is not None:
+                                            resume_identity = dict(state.get("resume_identity") or {})
+                                            resume_identity["session_id"] = event.session_id
+                                            resume_identity["live_identity"] = {
+                                                "provider_id": invocation.provider_id,
+                                                "session_id": event.session_id,
+                                            }
+                                            state["resume_identity"] = resume_identity
+                                if event.is_terminal:
+                                    provider_terminal_event = event
                                 _atomic_json(invocation.status_path, state)
             out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
             err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
@@ -818,30 +1493,74 @@ def run(invocation: Invocation) -> int:
                 thread_id=state.get("thread_id"),
             ))
             return 1
-        if invocation.action == "start" and not state.get("thread_id"):
-            state.update({"state": "LAUNCH_FAILED", "exit_code": exit_code, "ended_utc": _utc(), "error": "Codex exited without thread.started/thread_id; inspect stderr_path"})
+        if invocation.action == "start" and not state.get("provider_session_id"):
+            state.update({"state": "LAUNCH_FAILED", "exit_code": exit_code, "ended_utc": _utc(), "error": f"{invocation.provider_id} exited without a session initialization record; inspect stderr_path"})
             _atomic_json(invocation.status_path, state)
             _append_event(invocation.event_log, _event(invocation, "LAUNCH_FAILED", exit_code=exit_code))
             return 1
         result_valid = True
-        if invocation.repository is not None:
+        if invocation.canonical is not None:
+            result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+            advancement = None
+            if result_valid and task_result is not None:
+                try:
+                    advancement = read_task_advancement(
+                        invocation.workspace,
+                        card=task_result.card,
+                        result=task_result,
+                    )
+                except TaskValidationError as exc:
+                    result_validation = {
+                        "state": "ADVANCEMENT_INVALID",
+                        "path": str(invocation.workspace),
+                        "detail": str(exc),
+                        "acceptance_state": "PENDING",
+                    }
+                    result_valid = False
+            state["result_validation"] = result_validation
+            state["result_valid"] = result_valid
+            state["task_advancement_state"] = advancement.state if advancement is not None else "PENDING"
+            state["terminal_acceptance_state"] = "PENDING"
+            if advancement is not None:
+                result_validation["acceptance_state"] = advancement.state
+            if advancement is not None and advancement.state == "ACCEPTED":
+                acceptance_identity = advancement.acceptance_identity
+                if acceptance_identity is None:
+                    result_validation = {
+                        "state": "ADVANCEMENT_INVALID",
+                        "path": str(invocation.workspace),
+                        "detail": "accepted task advancement has no acceptance identity",
+                        "acceptance_state": "PENDING",
+                    }
+                    state["result_validation"] = result_validation
+                    state["result_valid"] = False
+                else:
+                    state = _canonical_acceptance_status(state, acceptance_identity)
+        elif invocation.repository is not None:
             result_validation, result_valid = _coding_result_validation(invocation)
             state["result_validation"] = result_validation
             state["result_valid"] = result_valid
-        state.update({"state": "CODEX_EXITED", "exit_code": exit_code, "ended_utc": _utc()})
+        terminal_outcome = adapter.terminal_outcome(provider_terminal_event, exit_code)
+        state.update({"state": exited_state, "provider_terminal_outcome": terminal_outcome, "exit_code": exit_code, "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(
-            invocation, "CODEX_EXITED", exit_code=exit_code, thread_id=state.get("thread_id"),
+            invocation,
+            exited_event,
+            provider_id=invocation.provider_id,
+            provider_terminal_outcome=terminal_outcome,
+            exit_code=exit_code,
+            thread_id=state.get("thread_id"),
+            session_id=state.get("provider_session_id"),
             result_validation=state.get("result_validation"),
         ))
-        return exit_code if result_valid else 1
+        return 1 if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid else exit_code
     except KeyboardInterrupt:
         cleanup_evidence: dict[str, Any] | None = None
         if process is not None and not child_exit_confirmed:
             child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
-            error = "controller interrupted; exact Codex child shutdown could not be proven"
+            error = "controller interrupted; exact provider child shutdown could not be proven"
             state.update({
                 "state": "COORDINATION_FAILED",
                 "ended_utc": _utc(),
@@ -885,7 +1604,7 @@ def run(invocation: Invocation) -> int:
             child_exit_confirmed, cleanup_evidence = _shutdown_exact_child(process)
         if not child_exit_confirmed:
             retained_claims = resource_claims.held if resource_claims is not None else []
-            error = f"{exc}; exact Codex child shutdown could not be proven"
+            error = f"{exc}; exact provider child shutdown could not be proven"
             state.update({
                 "state": "COORDINATION_FAILED",
                 "ended_utc": _utc(),
@@ -905,7 +1624,7 @@ def run(invocation: Invocation) -> int:
                 child_shutdown=cleanup_evidence, retained_claims=retained_claims,
             ))
             return 1
-        state.update({"state": "CONTROLLER_FAILED" if state.get("codex_pid") else "LAUNCH_FAILED", "ended_utc": _utc(), "error": str(exc)})
+        state.update({"state": "CONTROLLER_FAILED" if state.get("provider_pid", state.get("codex_pid")) else "LAUNCH_FAILED", "ended_utc": _utc(), "error": str(exc)})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
         return 1
