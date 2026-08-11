@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -204,6 +205,11 @@ class S4RepairRegressionTests(unittest.TestCase):
         arm_failures: list[str] | None = None,
         post_popen_error: BaseException | None = None,
         captured_exception: dict[str, BaseException] | None = None,
+        real_supervisor: bool = False,
+        poll_error: BaseException | None = None,
+        terminate_error: BaseException | None = None,
+        wait_plan: list[object] | None = None,
+        kill_error: BaseException | None = None,
     ) -> tuple[int, ResourceClaims, list[None], list[None], MagicMock]:
         """Drive lane_controller.run with a disposable production-shaped boundary."""
 
@@ -223,6 +229,35 @@ class S4RepairRegressionTests(unittest.TestCase):
                     self.stdin = io.BytesIO()
                     self.stdout = io.BytesIO()
                     self.stderr = io.BytesIO()
+                    self.calls: list[str] = []
+                    self.poll_error = poll_error
+                    self.terminate_error = terminate_error
+                    self.wait_plan = list(wait_plan or [])
+                    self.kill_error = kill_error
+
+                def poll(self) -> int | None:
+                    self.calls.append("poll")
+                    if self.poll_error is not None:
+                        raise self.poll_error
+                    return None
+
+                def terminate(self) -> None:
+                    self.calls.append("terminate")
+                    if self.terminate_error is not None:
+                        raise self.terminate_error
+
+                def wait(self, *, timeout: float | None = None) -> int:
+                    del timeout
+                    self.calls.append("wait")
+                    value = self.wait_plan.pop(0) if self.wait_plan else 0
+                    if isinstance(value, BaseException):
+                        raise value
+                    return int(value)
+
+                def kill(self) -> None:
+                    self.calls.append("kill")
+                    if self.kill_error is not None:
+                        raise self.kill_error
 
             process = SyntheticProcess()
 
@@ -232,13 +267,29 @@ class S4RepairRegressionTests(unittest.TestCase):
 
                 def __init__(self) -> None:
                     self.popen_kwargs: dict[str, object] = {}
+                    self.use_final_inventory = real_supervisor
 
                 def attach(self, _process: object, _identity: ProcessInfo) -> None:
                     if attach_error is not None:
                         raise attach_error
 
                 def inventory(self) -> ProcessBoundaryInventory:
+                    if self.use_final_inventory:
+                        if final_inventory_error is not None:
+                            raise final_inventory_error
+                        if final_inventory is None:
+                            return ProcessBoundaryInventory(
+                                False,
+                                self.kind,
+                                self.identity,
+                                errors=("synthetic final inventory unavailable",),
+                                source="synthetic-final",
+                            )
+                        return final_inventory
                     return ProcessBoundaryInventory(True, self.kind, self.identity, source="synthetic")
+
+                def cleanup_owned(self, **_kwargs: object) -> ProcessBoundaryInventory:
+                    return self.inventory()
 
                 def to_record(self, inventory: ProcessBoundaryInventory) -> dict[str, object]:
                     def item_record(item: ProcessInfo) -> dict[str, object]:
@@ -330,7 +381,11 @@ class S4RepairRegressionTests(unittest.TestCase):
                 patch.object(lane_controller, "ResourceClaims", side_effect=claims_factory),
                 patch.object(lane_controller.subprocess, "Popen", popen),
                 patch.object(lane_controller.ProcessBoundary, "prepare", return_value=boundary),
-                patch.object(lane_controller, "ProcessSupervisor", return_value=supervisor),
+                (
+                    nullcontext()
+                    if real_supervisor
+                    else patch.object(lane_controller, "ProcessSupervisor", return_value=supervisor)
+                ),
             ):
                 try:
                     result = lane_controller.run(invocation)
@@ -340,6 +395,11 @@ class S4RepairRegressionTests(unittest.TestCase):
                     captured_exception["exception"] = exc
                     result = 1
             self.assertEqual(1, len(captured))
+            captured[0]._test_status = (  # type: ignore[attr-defined]
+                json.loads(invocation.status_path.read_text(encoding="utf-8"))
+                if invocation.status_path.exists()
+                else {}
+            )
             return result, captured[0], release_calls, retain_calls, popen
         finally:
             case.tearDown()
@@ -1029,6 +1089,7 @@ class S4RepairRegressionTests(unittest.TestCase):
         result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
             final,
             post_popen_error=KeyboardInterrupt(),
+            real_supervisor=True,
         )
         self.assertEqual(130, result)
         self.assertEqual(1, popen.call_count)
@@ -1049,6 +1110,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                 result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
                     final,
                     post_popen_error=error,
+                    real_supervisor=True,
                 )
                 self.assertEqual(1, result)
                 self.assertEqual(1, popen.call_count)
@@ -1060,6 +1122,7 @@ class S4RepairRegressionTests(unittest.TestCase):
             final,
             post_popen_error=BaseException("uncaught post-Popen failure"),
             captured_exception=captured,
+            real_supervisor=True,
         )
         self.assertEqual(1, result)
         self.assertIsInstance(captured.get("exception"), BaseException)
@@ -1158,6 +1221,97 @@ class S4RepairRegressionTests(unittest.TestCase):
         self.assertFalse(observed.complete)
         self.assertLessEqual(changing_calls, 8)
         self.assertTrue(any("inconsistent" in error or "retry" in error for error in observed.errors))
+
+    def test_FC44_identity_uncertain_supervisor_still_runs_direct_handle_cleanup(self) -> None:
+        final = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("identity-seam final inventory is incomplete",),
+            source="synthetic-final",
+        )
+        failures: tuple[BaseException, ...] = (
+            KeyboardInterrupt(),
+            RuntimeError("ordinary identity failure"),
+            ResourceLockError("resource identity failure"),
+            BaseException("uncaught identity failure"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                captured: dict[str, BaseException] = {}
+                result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+                    final,
+                    post_popen_error=failure,
+                    captured_exception=captured if type(failure) is BaseException else None,
+                    real_supervisor=True,
+                )
+                self.assertEqual(130 if isinstance(failure, KeyboardInterrupt) else 1, result)
+                if type(failure) is BaseException:
+                    self.assertIsInstance(captured.get("exception"), BaseException)
+                process = popen.return_value
+                self.assertEqual(["poll", "terminate", "wait"], process.calls)
+                self.assertEqual([], releases)
+                self.assertTrue(retains)
+                self.assertTrue(claims.held)
+                status = claims._test_status  # type: ignore[attr-defined]
+                direct = status["direct_handle_cleanup"]
+                self.assertTrue(direct["final_reap"])
+                self.assertTrue(direct["identity_uncertain"])
+                self.assertFalse(status["resource_claim_release_safe"])
+
+    def test_FC45_identity_uncertain_handle_cleanup_is_bounded_and_truthful(self) -> None:
+        final = ProcessBoundaryInventory(
+            False,
+            "synthetic-boundary",
+            "synthetic-boundary:1",
+            errors=("identity-seam final inventory is incomplete",),
+            source="synthetic-final",
+        )
+        cases: tuple[tuple[str, dict[str, object], set[str]], ...] = (
+            (
+                "terminate-wait-timeout",
+                {"wait_plan": [subprocess.TimeoutExpired("codex", 5.0), 137]},
+                {"kill"},
+            ),
+            ("poll-failure", {"poll_error": RuntimeError("poll failed")}, set()),
+            ("terminate-failure", {"terminate_error": RuntimeError("terminate failed")}, set()),
+            (
+                "wait-failure",
+                {"wait_plan": [RuntimeError("wait failed"), 137]},
+                {"kill"},
+            ),
+            (
+                "kill-failure",
+                {
+                    "wait_plan": [subprocess.TimeoutExpired("codex", 5.0), RuntimeError("final wait failed")],
+                    "kill_error": RuntimeError("kill failed"),
+                },
+                {"kill"},
+            ),
+        )
+        for name, plan, required in cases:
+            with self.subTest(case=name):
+                result, claims, releases, retains, popen = self._run_synthetic_controller_boundary(
+                    final,
+                    post_popen_error=RuntimeError("identity lookup failed"),
+                    real_supervisor=True,
+                    **plan,
+                )
+                self.assertEqual(1, result)
+                process = popen.return_value
+                self.assertEqual(1, process.calls.count("poll"))
+                self.assertEqual(1, process.calls.count("terminate"))
+                self.assertLessEqual(process.calls.count("wait"), 2)
+                self.assertLessEqual(process.calls.count("kill"), 1)
+                self.assertTrue(required.issubset(process.calls))
+                self.assertEqual([], releases)
+                self.assertTrue(retains)
+                self.assertTrue(claims.held)
+                status = claims._test_status  # type: ignore[attr-defined]
+                direct = status["direct_handle_cleanup"]
+                self.assertTrue(direct["identity_uncertain"])
+                self.assertTrue(direct["errors"])
+                self.assertFalse(status["resource_claim_release_safe"])
 
     def test_FC22_controller_registry_binds_zero_one_and_multiple_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

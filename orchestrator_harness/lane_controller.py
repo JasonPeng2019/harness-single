@@ -1638,6 +1638,7 @@ def run(invocation: Invocation) -> int:
     release_safe = False
     cleanup_result: CleanupResult | None = None
     cleanup_attempted = False
+    direct_handle_cleanup_attempted = False
     final_boundary_recorded = False
 
     def _incomplete_boundary_record(error: str) -> dict[str, Any]:
@@ -1743,6 +1744,99 @@ def run(invocation: Invocation) -> int:
         # post-cleanup release proof above must have completed successfully.
         return process is None or release_safe
 
+    def _direct_handle_cleanup() -> dict[str, Any]:
+        """Bounded cleanup for the exact Popen handle when identity is uncertain.
+
+        This is deliberately independent from the supervisor's evidence.  A
+        successful ``wait`` proves only that this handle was reaped; it does
+        not prove the child creation identity, the owned boundary, or claim
+        release safety.
+        """
+
+        nonlocal direct_handle_cleanup_attempted, direct_child_reaped
+        if direct_handle_cleanup_attempted:
+            previous = state.get("direct_handle_cleanup")
+            return dict(previous) if isinstance(previous, Mapping) else {
+                "status": "HANDLE_CLEANUP_ALREADY_ATTEMPTED",
+                "final_reap": direct_child_reaped,
+                "identity_verified": False,
+                "identity_uncertain": True,
+            }
+        direct_handle_cleanup_attempted = True
+        record: dict[str, Any] = {
+            "status": "HANDLE_CLEANUP",
+            "pid": getattr(process, "pid", None),
+            "stages": [],
+            "errors": [],
+            "final_reap": False,
+            "identity_verified": False,
+            "identity_uncertain": True,
+        }
+        stages = record["stages"]
+        errors = record["errors"]
+
+        def failed(stage: str, exc: BaseException) -> None:
+            assert isinstance(stages, list)
+            assert isinstance(errors, list)
+            stages.append(f"{stage}_FAILED")
+            errors.append(f"{stage.lower()} failed: {type(exc).__name__}: {exc}")
+
+        reaped = False
+        poll_value: object = None
+        poll_failed = False
+        try:
+            poll_value = process.poll()
+            assert isinstance(stages, list)
+            stages.append("POLL")
+        except BaseException as exc:
+            poll_failed = True
+            failed("POLL", exc)
+
+        if not poll_failed and poll_value is not None:
+            assert isinstance(stages, list)
+            stages.append("ALREADY_EXITED")
+            try:
+                process.wait(timeout=0)
+                stages.append("DIRECT_REAP")
+                reaped = True
+            except BaseException as exc:
+                failed("REAP", exc)
+        else:
+            assert isinstance(stages, list)
+            stages.append("TERMINATE_REQUESTED")
+            try:
+                process.terminate()
+            except BaseException as exc:
+                failed("TERMINATE", exc)
+            try:
+                process.wait(timeout=5.0)
+                stages.extend(("TERMINATE_WAIT", "DIRECT_REAP"))
+                reaped = True
+            except subprocess.TimeoutExpired as exc:
+                stages.append("TERMINATE_WAIT_TIMEOUT")
+                errors.append(f"terminate wait timed out: {type(exc).__name__}: {exc}")
+            except BaseException as exc:
+                failed("TERMINATE_WAIT", exc)
+            if not reaped:
+                stages.append("KILL_REQUESTED")
+                try:
+                    process.kill()
+                except BaseException as exc:
+                    failed("KILL", exc)
+                try:
+                    process.wait(timeout=5.0)
+                    stages.extend(("KILL_WAIT", "DIRECT_REAP"))
+                    reaped = True
+                except BaseException as exc:
+                    failed("KILL_WAIT", exc)
+
+        if reaped:
+            direct_child_reaped = True
+            state["direct_child_reaped"] = True
+            record["final_reap"] = True
+        state["direct_handle_cleanup"] = record
+        return record
+
     def _postlaunch_cleanup() -> dict[str, Any] | None:
         """Attempt truthful cleanup for every process-nonnull failure route."""
 
@@ -1783,47 +1877,44 @@ def run(invocation: Invocation) -> int:
                 state.setdefault("postlaunch_cleanup_errors", []).append(
                     f"supervisor cleanup failed: {type(exc).__name__}: {exc}"
                 )
-        if supervisor is None:
-            if boundary is not None:
-                try:
-                    inventory = boundary.cleanup_owned(
-                        graceful_timeout_seconds=5.0,
-                        force_timeout_seconds=5.0,
-                    )
-                    state["process_boundary"] = boundary.to_record(inventory)
-                    cleanup_evidence = {
-                        "status": "BOUNDARY_FALLBACK",
-                        "boundary_complete": inventory.complete,
-                        "owned_boundary_empty": not inventory.processes,
-                        "errors": list(inventory.errors),
-                    }
-                except BaseException as exc:
-                    state.setdefault("postlaunch_cleanup_errors", []).append(
-                        f"boundary cleanup failed: {type(exc).__name__}: {exc}"
-                    )
+        if supervisor is None and boundary is not None:
             try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5.0)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5.0)
-                else:
-                    process.wait(timeout=0)
-                direct_child_reaped = True
-                state["direct_child_reaped"] = True
-                cleanup_evidence = cleanup_evidence or {
-                    "status": "HANDLE_REAPED_WITHOUT_SUPERVISOR",
-                    "pid": getattr(process, "pid", None),
-                    "final_reap": True,
-                    "identity_verified": False,
-                    "identity_uncertain": True,
+                inventory = boundary.cleanup_owned(
+                    graceful_timeout_seconds=5.0,
+                    force_timeout_seconds=5.0,
+                )
+                state["process_boundary"] = boundary.to_record(inventory)
+                cleanup_evidence = {
+                    "status": "BOUNDARY_FALLBACK",
+                    "boundary_complete": inventory.complete,
+                    "owned_boundary_empty": not inventory.processes,
+                    "errors": list(inventory.errors),
                 }
             except BaseException as exc:
                 state.setdefault("postlaunch_cleanup_errors", []).append(
-                    f"exact handle cleanup failed: {type(exc).__name__}: {exc}"
+                    f"boundary cleanup failed: {type(exc).__name__}: {exc}"
                 )
+        if supervisor is None:
+            direct_evidence = _direct_handle_cleanup()
+            if cleanup_evidence is None:
+                cleanup_evidence = direct_evidence
+            else:
+                cleanup_evidence["direct_handle_cleanup"] = direct_evidence
+        elif cleanup_result is None:
+            # Construction or cleanup may have left a supervisor object but
+            # no truthful result.  The exact Popen handle remains the only
+            # bounded cleanup mechanism available in that case.
+            cleanup_evidence = cleanup_evidence or _direct_handle_cleanup()
+        elif not cleanup_result.final_reap:
+            # Identity-uncertain and otherwise unproven supervisor results
+            # require the same direct-handle attempt.  Its result is evidence
+            # only; _record_final_boundary still requires proved_reap.
+            cleanup_evidence = cleanup_evidence or cleanup_result.to_record()
+            direct_evidence = _direct_handle_cleanup()
+            if isinstance(cleanup_evidence, dict):
+                cleanup_evidence["direct_handle_cleanup"] = direct_evidence
+        if supervisor is not None and cleanup_result is not None and cleanup_result.final_reap:
+            state["direct_child_reaped"] = direct_child_reaped
         if not final_boundary_recorded:
             _record_final_boundary(cleanup_result)
         return cleanup_evidence
