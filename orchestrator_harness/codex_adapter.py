@@ -329,22 +329,42 @@ def packaged_codex_assets() -> dict[Path, bytes]:
     for item in manifest["files"]:
         if not isinstance(item, Mapping):
             raise CodexAdapterError("packaged Codex asset entry is invalid")
-        relative = Path(str(item.get("destination", "")))
+        destination = item.get("destination")
+        relative = Path(destination) if isinstance(destination, str) else Path()
         resource_name = item.get("resource")
+        content_mode = item.get("content_mode")
+        resource_path = Path(resource_name) if isinstance(resource_name, str) else Path()
         if (
-            not str(relative)
+            not isinstance(destination, str)
+            or not destination
             or relative.is_absolute()
             or ".." in relative.parts
             or not isinstance(resource_name, str)
             or not resource_name
+            or resource_path.is_absolute()
+            or resource_path.anchor
+            or ".." in resource_path.parts
         ):
             raise CodexAdapterError("packaged Codex asset destination is unsafe")
+        if not isinstance(content_mode, str) or content_mode != "utf8-lf":
+            raise CodexAdapterError(f"packaged Codex asset content mode is unsupported: {relative}")
         data = _package_resource(resource_name)
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, AttributeError) as exc:
+            raise CodexAdapterError(f"packaged Codex asset is not valid UTF-8: {relative}") from exc
+        if "\ufeff" in text:
+            raise CodexAdapterError(f"packaged Codex asset contains an unsupported UTF-8 BOM: {relative}")
+        if any(char == "\r" and (index + 1 == len(text) or text[index + 1] != "\n") for index, char in enumerate(text)):
+            raise CodexAdapterError(f"packaged Codex asset contains a lone carriage return: {relative}")
+        canonical = text.replace("\r\n", "\n").encode("utf-8")
         expected = item.get("sha256")
-        actual = hashlib.sha256(data).hexdigest()
+        if not isinstance(expected, str):
+            raise CodexAdapterError(f"packaged Codex asset hash is missing or invalid: {relative}")
+        actual = hashlib.sha256(canonical).hexdigest()
         if expected != actual:
             raise CodexAdapterError(f"packaged Codex asset hash mismatch: {relative}")
-        assets[relative] = data
+        assets[relative] = canonical
     return assets
 
 

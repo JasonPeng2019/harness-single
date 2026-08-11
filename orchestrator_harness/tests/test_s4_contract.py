@@ -11,9 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as lane_controller
+from orchestrator_harness import codex_adapter
 
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
+    CodexAdapterError,
     SyntheticCodexTransport,
     activate_codex_binding,
     check_codex_adapter,
@@ -43,6 +45,108 @@ from orchestrator_harness.notifications import ManagerEventRouter
 
 
 class S4ContractTests(unittest.TestCase):
+    def test_S4_CODEX_PACKAGED_ASSET_CANONICALIZATION_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def crlf_resource(name: str) -> bytes:
+            data = original_resource(name)
+            if name == "orchestrator_harness_post_tool_use.py":
+                return data.replace(b"\n", b"\r\n")
+            if name == "orchestrator_harness_stop.py":
+                lines = data.splitlines(keepends=True)
+                return b"".join(
+                    line.replace(b"\n", b"\r\n") if index % 2 else line
+                    for index, line in enumerate(lines)
+                )
+            return data
+
+        with patch.object(codex_adapter, "_package_resource", side_effect=crlf_resource):
+            assets = codex_adapter.packaged_codex_assets()
+        for relative, resource in (
+            (Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), "orchestrator_harness_post_tool_use.py"),
+            (Path(".codex/hooks/orchestrator_harness_stop.py"), "orchestrator_harness_stop.py"),
+        ):
+            expected = original_resource(resource)
+            self.assertEqual(expected, assets[relative])
+            self.assertNotIn(b"\r\n", assets[relative])
+            self.assertNotIn(b"\r", assets[relative])
+
+    def test_S4_CODEX_PACKAGED_ASSET_INTEGRITY_REJECTS_NONCANONICAL_INPUT_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+        resource_name = "orchestrator_harness_post_tool_use.py"
+        original = original_resource(resource_name)
+
+        def expect_rejected(transform) -> None:
+            def substitute(name: str) -> bytes:
+                data = original_resource(name)
+                return transform(data) if name == resource_name else data
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+
+        with self.subTest(case="invalid-utf8"):
+            expect_rejected(lambda data: data + b"\xff")
+        with self.subTest(case="bom"):
+            expect_rejected(lambda data: b"\xef\xbb\xbf" + data)
+        with self.subTest(case="lone-carriage-return"):
+            expect_rejected(lambda data: data + b"\r")
+        with self.subTest(case="non-newline-mutation"):
+            self.assertIn(b"import", original)
+            expect_rejected(lambda data: data.replace(b"import", b"IMPORT", 1))
+
+    def test_S4_CODEX_PACKAGED_ASSET_MODE_is_closed_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def expect_rejected(mode_marker: object) -> None:
+            def substitute(name: str) -> bytes:
+                data = original_resource(name)
+                if name != "manifest.json":
+                    return data
+                manifest = json.loads(data.decode("utf-8"))
+                entry = manifest["files"][0]
+                if mode_marker is None:
+                    entry.pop("content_mode", None)
+                else:
+                    entry["content_mode"] = mode_marker
+                return json.dumps(manifest).encode("utf-8")
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+
+        for label, marker in (
+            ("missing", None),
+            ("non-string", 1),
+            ("unknown", "binary"),
+        ):
+            with self.subTest(case=label):
+                expect_rejected(marker)
+
+    def test_S4_CODEX_PACKAGED_ASSET_PATHS_REJECT_UNSAFE_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def expect_rejected(field: str, value: str) -> None:
+            def substitute(name: str) -> bytes:
+                data = original_resource(name)
+                if name != "manifest.json":
+                    return data
+                manifest = json.loads(data.decode("utf-8"))
+                manifest["files"][0][field] = value
+                return json.dumps(manifest).encode("utf-8")
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+
+        for field, value in (
+            ("destination", ""),
+            ("destination", "../escape.py"),
+            ("resource", "../escape.py"),
+        ):
+            with self.subTest(field=field, value=value):
+                expect_rejected(field, value)
+
     def _router(self, root: Path, *, session: str = "session-s4") -> ManagerEventRouter:
         return ManagerEventRouter(
             root,
