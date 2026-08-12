@@ -36,6 +36,14 @@ def _sandbox_arguments(arguments: list[str]) -> list[str]:
     return rewritten
 
 
+def _provider_argv(command: list[str], base: list[str]) -> list[str]:
+    """Build the pinned provider argv without changing its adapter action."""
+
+    if not command or command[0] != "exec":
+        raise RuntimeError("native Codex provider adapter must supply an exec action")
+    return [*base, "/opt/codex/bin/codex", *_sandbox_arguments(command)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Exec one controller-owned Codex provider child")
     parser.add_argument("--bwrap", required=True, type=Path)
@@ -48,9 +56,6 @@ def main() -> int:
     command = list(args.command)
     if command[:1] == ["--"]:
         command = command[1:]
-    if not command or command[0] != "exec":
-        raise RuntimeError("native Codex provider adapter must supply an exec action")
-    provider_arguments = _sandbox_arguments(command[1:])
     base = bwrap_base(
         args.bwrap,
         args.release,
@@ -58,14 +63,7 @@ def main() -> int:
         args.codex_home,
         args.proxy_url,
     )
-    os.execvp(
-        base[0],
-        [
-            *base,
-            "/opt/codex/bin/codex",
-            *provider_arguments,
-        ],
-    )
+    os.execvp(base[0], _provider_argv(command, base))
     raise AssertionError("provider exec returned")
 
 

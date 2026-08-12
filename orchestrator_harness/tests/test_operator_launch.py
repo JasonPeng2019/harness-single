@@ -7,10 +7,12 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from pathlib import Path
 
-from orchestrator_harness.operator_launch import launch_process
+from orchestrator_harness.operator_launch import detached_owner_snapshot, launch_process
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.models import iso_utc
 
@@ -23,6 +25,13 @@ class OperatorLaunchTests(unittest.TestCase):
                 return True
             time.sleep(.05)
         return False
+
+    def _wait_for_no_detached_owners(self) -> None:
+        for _ in range(100):
+            if not detached_owner_snapshot():
+                return
+            time.sleep(.05)
+        self.fail(f"detached reaper ownership did not drain: {detached_owner_snapshot()}")
 
     def test_invalid_and_existing_receipts_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -89,6 +98,41 @@ class OperatorLaunchTests(unittest.TestCase):
                         break
                     time.sleep(.05)
                 self.assertIsNone(process_snapshot().by_pid.get(data["pid"]))
+
+    def test_supported_reaper_waits_for_natural_exit_without_resource_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as raw, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            root = Path(raw)
+            result = launch_process(
+                receipt=root / "natural.json",
+                label="natural",
+                role="test",
+                cwd=root,
+                argv=[sys.executable, "-c", "import time; time.sleep(2)"],
+            )
+            self.assertTrue(detached_owner_snapshot())
+            self._wait_for_no_detached_owners()
+            self.assertEqual(0, len([item for item in caught if item.category is ResourceWarning]))
+            self.assertIsNone(process_snapshot().by_pid.get(result["pid"]))
+
+    def test_concurrent_detached_reapers_are_bounded_and_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def launch(index: int) -> dict[str, object]:
+                return launch_process(
+                    receipt=root / f"concurrent-{index}.json",
+                    label=f"concurrent-{index}",
+                    role="test",
+                    cwd=root,
+                    argv=[sys.executable, "-c", "import time; time.sleep(2)"],
+                )
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(launch, range(4)))
+            self.assertEqual(4, len({(item["pid"], item["created_utc"]) for item in results}))
+            self.assertLessEqual(len(detached_owner_snapshot()), 4)
+            self._wait_for_no_detached_owners()
 
 
 if __name__ == "__main__":

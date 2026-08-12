@@ -5,15 +5,18 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from .models import iso_utc
-from .processes import process_snapshot
+from .processes import targeted_process_query
 
 _RECEIPT_SCHEMA = "orchestrator-operator-launch/v1"
+_DETACHED_OWNERS_LOCK = threading.Lock()
+_DETACHED_OWNERS: dict[tuple[int, str], "_DetachedChildOwner"] = {}
 
 
 def _utc_now() -> datetime:
@@ -58,8 +61,8 @@ def _finalize(path: Path, receipt: dict[str, Any]) -> None:
 
 def _creation_identity(pid: int, *, attempts: int = 12, delay_seconds: float = 0.05) -> str | None:
     for _ in range(attempts):
-        snapshot = process_snapshot()
-        item = snapshot.by_pid.get(pid) if snapshot.complete else None
+        query = targeted_process_query(pid)
+        item = query.process if query.complete else None
         if item is not None and item.created_utc is not None:
             return iso_utc(item.created_utc)
         time.sleep(delay_seconds)
@@ -82,24 +85,97 @@ def _cleanup_exact_child(child: subprocess.Popen[str]) -> tuple[bool, str | None
         return False, str(exc)
 
 
-def _release_detached_child_handle(child: subprocess.Popen[str]) -> None:
-    """Release this launcher's ownership after the receipt is durable.
+class _DetachedChildOwner:
+    """Own one detached child until a supported public ``wait`` completes."""
 
-    The operator boundary intentionally does not wait for a successful child.
-    Keeping the local ``Popen`` object alive after that hand-off makes Python's
-    destructor report an ignored ``ResourceWarning`` (and leaks the Windows
-    process handle).  No pipe is used by this launcher, so closing the parent
-    bookkeeping handle cannot affect the detached child.
-    """
-    if os.name == "nt":
-        handle = getattr(child, "_handle", None)
-        close_handle = getattr(handle, "Close", None)
-        if callable(close_handle):
-            close_handle()
-        if hasattr(child, "_handle"):
-            child._handle = None
-    if hasattr(child, "_child_created"):
-        child._child_created = False
+    def __init__(self, child: subprocess.Popen[str], pid: int, created_utc: str) -> None:
+        self.child = child
+        self.pid = pid
+        self.created_utc = created_utc
+        self._condition = threading.Condition()
+        self._handed_off = False
+        self._cancelled = False
+        self._state = "waiting-for-handoff"
+        self.exit_code: int | None = None
+        self.error: str | None = None
+        self.finished = threading.Event()
+        self.thread = threading.Thread(
+            target=self._reap,
+            name=f"orchestrator-detached-reaper-{pid}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        key = (self.pid, self.created_utc)
+        with _DETACHED_OWNERS_LOCK:
+            if key in _DETACHED_OWNERS:
+                raise RuntimeError("detached child identity is already owned")
+            _DETACHED_OWNERS[key] = self
+        try:
+            self.thread.start()
+        except BaseException:
+            with _DETACHED_OWNERS_LOCK:
+                _DETACHED_OWNERS.pop(key, None)
+            raise
+
+    def handoff(self) -> None:
+        with self._condition:
+            if self._cancelled:
+                raise RuntimeError("detached child owner was already cancelled")
+            self._handed_off = True
+            self._condition.notify_all()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+    def join(self, timeout: float | None = None) -> bool:
+        if self.thread.ident is None:
+            return True
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "pid": self.pid,
+                "created_utc": self.created_utc,
+                "state": self._state,
+                "exit_code": self.exit_code,
+                "error": self.error,
+                "finished": self.finished.is_set(),
+            }
+
+    def _reap(self) -> None:
+        key = (self.pid, self.created_utc)
+        try:
+            with self._condition:
+                while not self._handed_off and not self._cancelled:
+                    self._condition.wait()
+                if self._cancelled:
+                    self._state = "cancelled"
+                    return
+                self._state = "reaping"
+            self.exit_code = self.child.wait()
+        except BaseException as exc:
+            self.error = str(exc)
+        finally:
+            with self._condition:
+                if self._state != "cancelled":
+                    self._state = "finished" if self.error is None else "failed"
+            with _DETACHED_OWNERS_LOCK:
+                if _DETACHED_OWNERS.get(key) is self:
+                    _DETACHED_OWNERS.pop(key, None)
+            self.finished.set()
+
+
+def detached_owner_snapshot() -> list[dict[str, Any]]:
+    """Return observable ownership state without exposing subprocess internals."""
+
+    with _DETACHED_OWNERS_LOCK:
+        owners = tuple(_DETACHED_OWNERS.values())
+    return [owner.snapshot() for owner in owners]
 
 
 def launch_process(
@@ -125,11 +201,14 @@ def launch_process(
     else:
         kwargs["start_new_session"] = True
     child: subprocess.Popen[str] | None = None
+    owner: _DetachedChildOwner | None = None
     try:
         child = subprocess.Popen(list(argv), **kwargs)
         created_utc = _creation_identity(child.pid)
         if created_utc is None or child.poll() is not None:
             raise RuntimeError("child identity could not be proved live")
+        owner = _DetachedChildOwner(child, child.pid, created_utc)
+        owner.start()
         result = {
             "schema": _RECEIPT_SCHEMA, "status": "launched", "label": label,
             "role": role, "argv": list(argv), "cwd": str(cwd_path), "pid": child.pid,
@@ -138,13 +217,18 @@ def launch_process(
             "expected_state_path": str(expected) if expected else None,
         }
         _finalize(receipt_path, result)
-        _release_detached_child_handle(child)
+        owner.handoff()
         return result
     except Exception as exc:
         cleanup_confirmed: bool | None = None
         cleanup_error: str | None = None
+        if owner is not None:
+            owner.cancel()
+            owner.join(timeout=1.0)
         if child is not None:
             cleanup_confirmed, cleanup_error = _cleanup_exact_child(child)
+        if owner is not None:
+            owner.join(timeout=1.0)
         failure = {
             "schema": _RECEIPT_SCHEMA, "status": "failed", "label": label,
             "role": role, "argv": list(argv), "cwd": str(cwd_path),

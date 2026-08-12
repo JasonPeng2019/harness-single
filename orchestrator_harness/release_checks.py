@@ -10,6 +10,7 @@ check contract remain unchanged.
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 REGISTRY_SCHEMA = "orchestrator-release-check-registry/v1"
@@ -63,12 +65,14 @@ PUBLIC_ROUTE_DEPENDENCIES = (
 
 REAL_AGENT_ROUTE_DEPENDENCIES = PUBLIC_ROUTE_DEPENDENCIES + (
     "orchestrator_harness/tests/real_agent_test.py",
+    "orchestrator_harness/tests/wsl_identity.py",
     "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
     "orchestrator_harness/tests/support/wsl_codex_provider.py",
     "orchestrator_harness/tests/support/wsl_public_route_entry.py",
     "orchestrator_harness/tests/support/wsl_guarded_entry.py",
     "orchestrator_harness/tests/support/cgroup_exec.py",
     "orchestrator_harness/tests/support/allowlist_connect_proxy.py",
+    "orchestrator_harness/install_wsl_codex.ps1",
 )
 
 
@@ -113,6 +117,31 @@ def _relative_path(value: str, name: str) -> str:
 
 
 @dataclass(frozen=True)
+class InputScope:
+    """A validated root-relative input scope for a broad release command."""
+
+    kind: str
+    path: str
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"file", "tree", "glob"}:
+            raise SelectionError(f"unsupported input scope kind: {self.kind}")
+        normalized = _relative_path(self.path, "input_scope.path")
+        if normalized != self.path.replace("\\", "/"):
+            raise SelectionError("input scope path must use normalized separators")
+        if not isinstance(self.required, bool):
+            raise SelectionError("input_scope.required must be boolean")
+        if self.kind == "glob" and not any(token in self.path for token in "*?["):
+            raise SelectionError("glob input scope must contain a wildcard")
+        if self.kind != "glob" and any(token in self.path for token in "*?["):
+            raise SelectionError("file/tree input scope cannot contain wildcards")
+
+    def to_record(self) -> dict[str, Any]:
+        return {"kind": self.kind, "path": self.path, "required": self.required}
+
+
+@dataclass(frozen=True)
 class CheckSpec:
     """A stable, fingerprinted check declaration."""
 
@@ -128,6 +157,7 @@ class CheckSpec:
     decisive: bool = False
     output_contract: str = CREDIT_SCHEMA
     producer: str = "S6.P"
+    input_scopes: tuple[InputScope, ...] = ()
 
     def __post_init__(self) -> None:
         _nonempty(self.stable_id, "stable_id")
@@ -141,6 +171,13 @@ class CheckSpec:
         _string_tuple(self.dependency_domains, f"{self.stable_id}.dependency_domains")
         for path in self.dependency_paths:
             _relative_path(path, f"{self.stable_id}.dependency_paths")
+        for scope in self.input_scopes:
+            if not isinstance(scope, InputScope):
+                raise SelectionError(f"{self.stable_id}.input_scopes must contain InputScope values")
+        if len({(scope.kind, scope.path.casefold()) for scope in self.input_scopes}) != len(
+            self.input_scopes
+        ):
+            raise SelectionError(f"{self.stable_id}.input_scopes must not be ambiguous")
         _string_tuple(
             self.external_requirements, f"{self.stable_id}.external_requirements"
         )
@@ -153,7 +190,7 @@ class CheckSpec:
         _nonempty(self.producer, f"{self.stable_id}.producer")
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "stable_id": self.stable_id,
             "name": self.name,
             "tier": self.tier,
@@ -167,6 +204,9 @@ class CheckSpec:
             "output_contract": self.output_contract,
             "producer": self.producer,
         }
+        if self.input_scopes:
+            record["input_scopes"] = [scope.to_record() for scope in self.input_scopes]
+        return record
 
     def consumes(self, changed_paths: set[str], changed_domains: set[str]) -> bool:
         if changed_domains.intersection(self.dependency_domains):
@@ -180,6 +220,8 @@ class CheckSpec:
             if normalized in declared:
                 return True
             if any(normalized.startswith(path + "/") for path in declared):
+                return True
+            if any(_scope_matches(scope, normalized) for scope in self.input_scopes):
                 return True
         return False
 
@@ -252,6 +294,129 @@ class SelectionDecision:
 
 def _python_test(module: str, test: str) -> tuple[str, ...]:
     return ("python", "-m", "unittest", "-v", f"{module}.{test}")
+
+
+_RUFF_INPUT_SCOPES = (
+    InputScope("glob", "**/*.py"),
+    InputScope("glob", "**/*.pyi", required=False),
+    InputScope("glob", "**/*.ipynb", required=False),
+    InputScope("file", "pyproject.toml", required=False),
+    InputScope("file", "ruff.toml", required=False),
+    InputScope("file", ".ruff.toml", required=False),
+    InputScope("file", "setup.cfg", required=False),
+    InputScope("file", "tox.ini", required=False),
+)
+_PYRIGHT_INPUT_SCOPES = (
+    InputScope("glob", "**/*.py"),
+    InputScope("glob", "**/*.pyi", required=False),
+    InputScope("file", "pyrightconfig.json", required=False),
+    InputScope("file", "pyproject.toml", required=False),
+    InputScope("file", ".codex/dev/basedpyright-baseline.json", required=False),
+)
+_COMPILE_INPUT_SCOPES = (
+    InputScope("glob", "orchestrator_harness/**/*.py"),
+    InputScope("glob", "harness_watcher_implementation/**/*.py"),
+    InputScope("glob", "firmware_acceptance/**/*.py"),
+)
+_ORCHESTRATOR_UNIT_INPUT_SCOPES = (
+    InputScope("glob", "orchestrator_harness/**/*.py"),
+    InputScope("glob", "harness_common/**/*.py"),
+)
+_WATCHER_UNIT_INPUT_SCOPES = (
+    InputScope("glob", "harness_watcher_implementation/**/*.py"),
+    InputScope("glob", "harness_common/**/*.py"),
+)
+_ATTENTION_INPUT_SCOPES = _WATCHER_UNIT_INPUT_SCOPES
+_SYNTHETIC_CLEANUP_INPUT_SCOPES = (
+    InputScope("glob", "orchestrator_harness/**/*.py"),
+    InputScope("glob", "harness_common/**/*.py"),
+)
+
+
+def _scope_matches(scope: InputScope, relative: str) -> bool:
+    normalized = _relative_path(relative, "scope_relative_path").casefold()
+    pattern = scope.path.casefold()
+    if scope.kind == "file":
+        return normalized == pattern
+    if scope.kind == "tree":
+        return normalized == pattern or normalized.startswith(pattern + "/")
+    if PurePosixPath(normalized).match(pattern):
+        return True
+    if pattern.startswith("**/"):
+        short = pattern[3:]
+        if PurePosixPath(normalized).match(short) or fnmatch.fnmatchcase(normalized, short):
+            return True
+    if "/**/" in pattern:
+        prefix, suffix = pattern.split("/**/", 1)
+        if normalized.startswith(prefix + "/") and fnmatch.fnmatchcase(
+            normalized[len(prefix) + 1 :], suffix
+        ):
+            return True
+    return fnmatch.fnmatchcase(normalized, pattern)
+
+
+def _tracked_paths(root: Path) -> tuple[str, ...]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SelectionError(f"cannot enumerate tracked input paths: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise SelectionError(f"cannot enumerate tracked input paths: {detail}")
+    try:
+        values = completed.stdout.decode("utf-8").split("\0")
+    except UnicodeDecodeError as exc:
+        raise SelectionError(f"tracked input paths are not UTF-8: {exc}") from exc
+    paths = tuple(sorted({_relative_path(value, "tracked_path") for value in values if value}))
+    return paths
+
+
+def _validated_input_path(root: Path, relative: str, *, scope: InputScope) -> Path:
+    candidate = root / Path(relative)
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise SelectionError(
+            f"{scope.kind} input scope escapes source root: {scope.path} -> {relative}"
+        ) from exc
+    if candidate.is_symlink() or not candidate.is_file():
+        raise SelectionError(
+            f"{scope.kind} input scope matched a non-regular file: {relative}"
+        )
+    return candidate
+
+
+def resolve_input_scope(spec: CheckSpec, root: str | Path) -> tuple[str, ...]:
+    """Resolve declared scopes to tracked, regular, root-relative files."""
+
+    root_path = Path(root).expanduser().resolve(strict=True)
+    tracked = _tracked_paths(root_path)
+    resolved: list[str] = []
+    for scope in spec.input_scopes:
+        if scope.kind == "tree":
+            directory = root_path / Path(scope.path)
+            if directory.is_symlink() or not directory.is_dir():
+                if scope.required:
+                    raise SelectionError(f"required input tree is unavailable: {scope.path}")
+                continue
+        matches = tuple(relative for relative in tracked if _scope_matches(scope, relative))
+        if scope.required and not matches:
+            raise SelectionError(f"required input scope matched no tracked files: {scope.path}")
+        for relative in matches:
+            _validated_input_path(root_path, relative, scope=scope)
+            resolved.append(relative)
+    if len(set(resolved)) != len(resolved):
+        # Overlapping scopes are allowed only when they describe the same
+        # input once; duplicate declarations are rejected in CheckSpec.
+        resolved = list(dict.fromkeys(resolved))
+    return tuple(sorted(set(resolved)))
 
 
 def _registry() -> tuple[CheckSpec, ...]:
@@ -350,6 +515,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             ("safeguard", "selector"),
             (
                 "tools/Invoke-CandidateSafeguard.ps1",
+                "tools/CandidateSafeguard.Core.psm1",
                 "orchestrator_harness/release_checks.py",
                 "orchestrator_harness/tests/test_s6_public_release.py",
             ),
@@ -396,6 +562,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "tools/Invoke-CandidateSafeguard.ps1",
             ),
             estimated_duration_seconds=15.0,
+            input_scopes=_RUFF_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.FORMAT",
@@ -408,6 +575,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "tools/Invoke-CandidateSafeguard.ps1",
             ),
             estimated_duration_seconds=15.0,
+            input_scopes=_RUFF_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.BASEDPYRIGHT",
@@ -420,6 +588,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "tools/Invoke-CandidateSafeguard.ps1",
             ),
             estimated_duration_seconds=30.0,
+            input_scopes=_PYRIGHT_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.COMPILE",
@@ -441,6 +610,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "firmware_acceptance/__init__.py",
             ),
             estimated_duration_seconds=10.0,
+            input_scopes=_COMPILE_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.ORCHESTRATOR-UNIT",
@@ -463,6 +633,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "orchestrator_harness/tests/test_coding_lane_controller.py",
             ),
             estimated_duration_seconds=120.0,
+            input_scopes=_ORCHESTRATOR_UNIT_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.WATCHER-UNIT",
@@ -485,6 +656,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "harness_watcher_implementation/tests/test_attention.py",
             ),
             estimated_duration_seconds=120.0,
+            input_scopes=_WATCHER_UNIT_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.ATTENTION",
@@ -497,6 +669,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "harness_watcher_implementation/tests/test_attention_practical_retention.py",
             ),
             estimated_duration_seconds=30.0,
+            input_scopes=_ATTENTION_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.SYNTHETIC-CLEANUP",
@@ -509,6 +682,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "orchestrator_harness/tests/support/wsl_cleanup_fixture_driver.py",
             ),
             estimated_duration_seconds=20.0,
+            input_scopes=_SYNTHETIC_CLEANUP_INPUT_SCOPES,
         ),
         CheckSpec(
             RELEASE_AGGREGATE_ID,
@@ -644,11 +818,11 @@ def _changed_path(root: Path, value: str) -> str:
     return _relative_path(text, "changed_path")
 
 
-def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
-    """Hash only the files explicitly declared by ``spec`` plus its contract."""
+def dependency_input_paths(spec: CheckSpec, root: str | Path) -> tuple[str, ...]:
+    """Return the exact direct plus scoped inputs used by a check fingerprint."""
 
     root_path = Path(root).expanduser().resolve(strict=True)
-    inputs: list[dict[str, Any]] = []
+    direct: list[str] = []
     for raw_path in spec.dependency_paths:
         relative = _relative_path(raw_path, f"{spec.stable_id}.dependency_path")
         path = (root_path / Path(relative)).resolve(strict=False)
@@ -662,6 +836,19 @@ def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
             raise SelectionError(
                 f"declared dependency is not a regular file: {relative}"
             )
+        direct.append(relative)
+    if not spec.input_scopes:
+        return tuple(direct)
+    return tuple(dict.fromkeys((*direct, *resolve_input_scope(spec, root_path))))
+
+
+def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
+    """Hash only declared direct files and validated scoped tracked inputs."""
+
+    root_path = Path(root).expanduser().resolve(strict=True)
+    inputs: list[dict[str, Any]] = []
+    for relative in dependency_input_paths(spec, root_path):
+        path = root_path / Path(relative)
         try:
             data = path.read_bytes()
         except OSError as exc:
@@ -982,6 +1169,7 @@ if __name__ == "__main__":
 __all__ = [
     "CHECK_REGISTRY",
     "CREDIT_SCHEMA",
+    "InputScope",
     "PUBLIC_ROUTE_DEPENDENCIES",
     "REAL_AGENT_ROUTE_DEPENDENCIES",
     "RELEASE_AGGREGATE_ID",
@@ -991,11 +1179,13 @@ __all__ = [
     "SelectionError",
     "SourceIdentity",
     "credit_record",
+    "dependency_input_paths",
     "dependency_fingerprint",
     "get_check",
     "main",
     "read_source_identity",
     "registry",
     "registry_record",
+    "resolve_input_scope",
     "select_checks",
 ]

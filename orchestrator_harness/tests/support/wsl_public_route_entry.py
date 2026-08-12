@@ -18,6 +18,16 @@ os.environ["PYTHONPATH"] = str(SOURCE_ROOT) + (
 from orchestrator_harness.public_launch import launch_lane_controller
 
 
+def _drop_to_workspace_owner() -> None:
+    """Keep the public controller and its Git view on the synthetic owner."""
+
+    if os.geteuid() != 0:
+        return
+    os.setgroups([])
+    os.setgid(65534)
+    os.setuid(65534)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch the native coding controller route")
     parser.add_argument("--invocation", required=True, type=Path)
@@ -25,6 +35,7 @@ def main() -> int:
     parser.add_argument("--cwd", required=True, type=Path)
     parser.add_argument("--status", required=True, type=Path)
     args = parser.parse_args()
+    _drop_to_workspace_owner()
     receipt = launch_lane_controller(
         args.invocation,
         receipt=args.receipt,

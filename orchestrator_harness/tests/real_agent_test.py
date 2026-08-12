@@ -84,9 +84,23 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    transcript = completed.stdout
-    (evidence / "wsl-driver.log").write_text(transcript, encoding="utf-8")
-    print(transcript, end="")
+    # The provider transcript is intentionally neither printed nor persisted:
+    # it may contain material that must not enter release evidence.  The
+    # driver writes structured, redacted evidence under its own control.
+    (evidence / "wsl-driver.log").write_text(
+        json.dumps(
+            {
+                "schema": "orchestrator-real-agent-wrapper/v1",
+                "returncode": completed.returncode,
+                "distro": args.distro,
+                "codex_root": args.codex_root,
+                "transcript_persisted": False,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     result_path = evidence / "REAL_AGENT_TEST_RESULT.json"
     if completed.returncode != 0:
         raise RuntimeError(

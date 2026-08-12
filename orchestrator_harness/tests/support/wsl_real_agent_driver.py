@@ -67,6 +67,19 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def chown_tree(root: Path, uid: int = NOBODY, gid: int = NOBODY) -> None:
+    """Give the isolated agent ownership without widening any mount boundary."""
+
+    if not root.is_dir():
+        raise RuntimeError(f"workspace ownership root is unavailable: {root}")
+    os.chown(root, uid, gid)
+    for directory, directories, files in os.walk(root):
+        for name in directories:
+            os.chown(Path(directory) / name, uid, gid)
+        for name in files:
+            os.chown(Path(directory) / name, uid, gid)
+
+
 def copy_harness_source(source_root: Path, destination: Path) -> Path:
     source = source_root / "orchestrator_harness"
 
@@ -543,6 +556,7 @@ def copy_evidence(temp_root: Path, evidence: Path, secrets: list[str]) -> None:
         "proxy-audit.jsonl",
         "process-ancestry.json",
         "cgroup-evidence.json",
+        "cgroup-before-route.json",
         "route-launch.log",
         "operator-receipt.json",
         "controller-status.json",
@@ -606,7 +620,12 @@ def main() -> int:
     from orchestrator_harness.cli import watch_once
     from orchestrator_harness.config import load_config
     from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
+    from orchestrator_harness.models import iso_utc
     from orchestrator_harness.processes import process_snapshot
+    from orchestrator_harness.tests.wsl_identity import (
+        provider_identity_matches,
+        validate_codex_identity,
+    )
 
     synthetic_suite = temp_root / "synthetic-suite"
     synthetic_run = synthetic_suite / "runs" / "HARNESS_REAL_AGENT"
@@ -656,25 +675,6 @@ def main() -> int:
     try:
         network = make_network_namespace(identifier, proxy_audit)
         proxy_url = f"http://{network['host_ip']}:{network['proxy_port']}"
-        base = bwrap_base(bwrap, release, synthetic_run, codex_home, proxy_url)
-        isolation = preflight(
-            network["name"], base, network["host_ip"], network["proxy_port"]
-        )
-        isolation.update(
-            {
-                "network_namespace": network["name"],
-                "allowed_endpoints": sorted(
-                    f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS
-                ),
-                "access_token_expiry_utc": access_expiry,
-                "refresh_token_present": False,
-                "id_token_present": "expired-format-only",
-                "expired_id_token_expiry_utc": expired_id_expiry,
-                "api_key_present": False,
-                "captured_utc": utc_now(),
-            }
-        )
-        atomic_json(temp_root / "isolation-preflight.json", isolation)
         status_path = agent_workspace / "real_agent_controller.status.json"
         receipt_path = agent_workspace / "real_agent_operator.receipt.json"
         prompt_path = agent_workspace / "real_agent_prompt.md"
@@ -700,6 +700,29 @@ def main() -> int:
         common_dir = run(
             ["git", "-C", str(synthetic_run), "rev-parse", "--git-common-dir"]
         ).stdout.strip()
+        # The synthetic repository is handed to the isolated provider only
+        # after its host-owned Git setup is complete.  This keeps Git's normal
+        # ownership checks intact while making the provider workspace writable.
+        chown_tree(synthetic_run)
+        base = bwrap_base(bwrap, release, synthetic_run, codex_home, proxy_url)
+        isolation = preflight(
+            network["name"], base, network["host_ip"], network["proxy_port"]
+        )
+        isolation.update(
+            {
+                "network_namespace": network["name"],
+                "allowed_endpoints": sorted(
+                    f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS
+                ),
+                "access_token_expiry_utc": access_expiry,
+                "refresh_token_present": False,
+                "id_token_present": "expired-format-only",
+                "expired_id_token_expiry_utc": expired_id_expiry,
+                "api_key_present": False,
+                "captured_utc": utc_now(),
+            }
+        )
+        atomic_json(temp_root / "isolation-preflight.json", isolation)
         provider_entry = (
             copied_root / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
         )
@@ -768,12 +791,17 @@ def main() -> int:
         }
         invocation_path = agent_workspace / "invocation.json"
         atomic_json(invocation_path, invocation)
-        for root, directories, files in os.walk(synthetic_run):
-            os.chown(root, NOBODY, NOBODY)
-            for name in directories:
-                os.chown(Path(root) / name, NOBODY, NOBODY)
-            for name in files:
-                os.chown(Path(root) / name, NOBODY, NOBODY)
+        chown_tree(synthetic_run)
+        atomic_json(
+            temp_root / "cgroup-before-route.json",
+            {
+                "path": str(cgroup),
+                "exists": cgroup.is_dir(),
+                "pids": sorted(cgroup_processes(cgroup)),
+            },
+        )
+        if not cgroup.is_dir():
+            raise RuntimeError("dedicated real-agent cgroup disappeared before public route launch")
 
         route_entry = (
             copied_root / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
@@ -781,14 +809,12 @@ def main() -> int:
         cgroup_launcher = copied_root / "orchestrator_harness" / "tests" / "support" / "cgroup_exec.py"
         route_completed = run(
             [
-                "ip",
-                "netns",
-                "exec",
-                network["name"],
                 "/usr/bin/python3",
                 str(cgroup_launcher),
                 "--cgroup",
                 str(cgroup),
+                "--network-namespace",
+                network["name"],
                 "--",
                 "/usr/bin/python3",
                 str(route_entry),
@@ -797,7 +823,7 @@ def main() -> int:
                 "--receipt",
                 str(receipt_path),
                 "--cwd",
-                str(copied_root),
+                str(synthetic_run),
                 "--status",
                 str(status_path),
             ],
@@ -828,8 +854,8 @@ def main() -> int:
                     candidate = None
                 if isinstance(candidate, dict):
                     status_value = candidate
-                    provider_pid = candidate.get("provider_pid") or candidate.get("codex_pid")
-                    provider_created = candidate.get("provider_created_utc") or candidate.get("codex_created_utc")
+                    provider_pid = candidate.get("provider_pid")
+                    provider_created = candidate.get("provider_created_utc")
                     snapshot = process_snapshot()
                     if (
                         isinstance(provider_pid, int)
@@ -839,17 +865,54 @@ def main() -> int:
                     ):
                         provider_observation = snapshot.by_pid.get(provider_pid)
                         if provider_observation is not None and provider_observation.created_utc is not None:
-                            process_evidence = {
-                                "controller_pid": controller_pid,
-                                "controller_created_utc": controller_created,
-                                "provider_pid": provider_pid,
-                                "provider_created_utc": provider_created,
-                                "provider_observed_created_utc": iso_utc(provider_observation.created_utc),
-                                "cgroup": str(cgroup),
-                                "cgroup_pids_at_capture": sorted(cgroup_processes(cgroup)),
-                                "pinned_codex_sha256": hashlib.sha256(pinned_codex.read_bytes()).hexdigest(),
-                            }
-                            atomic_json(temp_root / "process-ancestry.json", process_evidence)
+                            observed_provider_created = iso_utc(provider_observation.created_utc)
+                            if not provider_identity_matches(
+                                provider_pid,
+                                provider_created,
+                                provider_pid,
+                                observed_provider_created,
+                            ):
+                                raise RuntimeError(
+                                    "controller provider status does not match the observed process identity"
+                                )
+                            try:
+                                codex_pid, codex_chain = discover_codex(
+                                    cgroup, pinned_codex, provider_pid, timeout=0.75
+                                )
+                            except TimeoutError:
+                                codex_pid = None
+                                codex_chain = []
+                            if codex_pid is not None:
+                                observed_codex = proc_exe(codex_pid)
+                                validate_codex_identity(
+                                    codex_pid,
+                                    pinned_codex,
+                                    codex_chain,
+                                    provider_pid=provider_pid,
+                                    observed_executable=observed_codex,
+                                )
+                                codex_observation = snapshot.by_pid.get(codex_pid)
+                                if codex_observation is None or codex_observation.created_utc is None:
+                                    raise RuntimeError(
+                                        "actual Codex process disappeared before its creation identity was captured"
+                                    )
+                                process_evidence = {
+                                    "controller_pid": controller_pid,
+                                    "controller_created_utc": controller_created,
+                                    "provider_pid": provider_pid,
+                                    "provider_created_utc": provider_created,
+                                    "provider_observed_created_utc": observed_provider_created,
+                                    "provider_executable": str(proc_exe(provider_pid) or ""),
+                                    "codex_pid": codex_pid,
+                                    "codex_created_utc": iso_utc(codex_observation.created_utc),
+                                    "codex_executable": str(observed_codex or ""),
+                                    "codex_ancestry": codex_chain,
+                                    "pinned_codex": str(pinned_codex),
+                                    "pinned_codex_sha256": hashlib.sha256(pinned_codex.read_bytes()).hexdigest(),
+                                    "cgroup": str(cgroup),
+                                    "cgroup_pids_at_capture": sorted(cgroup_processes(cgroup)),
+                                }
+                                atomic_json(temp_root / "process-ancestry.json", process_evidence)
                     terminal = candidate.get("state") in {"CODEX_EXITED", "CONTROLLER_FAILED", "LAUNCH_FAILED"}
                     current = snapshot.by_pid.get(controller_pid) if snapshot.complete else None
                     live = current is not None and iso_utc(current.created_utc) == controller_created

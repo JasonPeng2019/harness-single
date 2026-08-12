@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -22,6 +25,10 @@ from orchestrator_harness.release_assets import (
     release_manifest,
 )
 from orchestrator_harness.tests.support import TemporaryGitRepository
+from orchestrator_harness.tests.wsl_identity import (
+    provider_identity_matches,
+    validate_codex_identity,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -188,14 +195,17 @@ class S6SelectorTests(unittest.TestCase):
             spec = self._custom_specs()[0]
             with patch.object(release_checks, "CHECK_REGISTRY", (spec,)):
                 origin = release_checks.credit_record(spec, repository.root)
-                (repository.root / "unrelated.txt").write_text("descendant\n", encoding="utf-8")
+                (repository.root / "unrelated.txt").write_text("descendant-1\n", encoding="utf-8")
                 repository.git("add", "unrelated.txt")
-                repository.git("commit", "-m", "unrelated descendant")
+                repository.git("commit", "-m", "unrelated descendant one")
+                (repository.root / "unrelated-two.txt").write_text("descendant-2\n", encoding="utf-8")
+                repository.git("add", "unrelated-two.txt")
+                repository.git("commit", "-m", "unrelated descendant two")
                 preserved = release_checks.select_checks(
                     "affected",
                     repository.root,
                     credits=[origin],
-                    changed_paths=["unrelated.txt"],
+                    changed_paths=["unrelated.txt", "unrelated-two.txt"],
                 )
                 self.assertEqual((), preserved.selected_ids)
                 self.assertEqual((spec.stable_id,), preserved.preserved_credit_ids)
@@ -227,6 +237,54 @@ class S6SelectorTests(unittest.TestCase):
                 self.assertIn(spec.stable_id, divergent.invalidated_credit_ids)
         finally:
             temporary.cleanup()
+
+    def test_release_scope_mutations_invalidate_the_broad_component_credit(self) -> None:
+        broad_specs = tuple(
+            spec
+            for spec in release_checks.registry()
+            if spec.stable_id.startswith("S6.RELEASE.")
+            and spec.stable_id != release_checks.RELEASE_AGGREGATE_ID
+        )
+        self.assertEqual(8, len(broad_specs))
+        for spec in broad_specs:
+            with self.subTest(stable_id=spec.stable_id):
+                scoped = release_checks.resolve_input_scope(spec, REPOSITORY_ROOT)
+                candidates = tuple(
+                    path for path in scoped if path not in spec.dependency_paths
+                )
+                self.assertTrue(candidates, spec.stable_id)
+                relative = candidates[0]
+                path = REPOSITORY_ROOT / Path(relative)
+                original = path.read_bytes()
+                try:
+                    with patch.object(release_checks, "CHECK_REGISTRY", (spec,)):
+                        credit = release_checks.credit_record(spec, REPOSITORY_ROOT)
+                        path.write_bytes(original + b"\n# audited release-scope mutation\n")
+                        decision = release_checks.select_checks(
+                            "release",
+                            REPOSITORY_ROOT,
+                            credits=[credit],
+                            changed_paths=[relative],
+                        )
+                    self.assertIn(spec.stable_id, decision.selected_ids)
+                    self.assertIn(spec.stable_id, decision.invalidated_credit_ids)
+                finally:
+                    path.write_bytes(original)
+
+    def test_scope_validation_rejects_escape_and_missing_required_inputs(self) -> None:
+        with self.assertRaises(release_checks.SelectionError):
+            release_checks.InputScope("file", "../outside.py")
+        spec = release_checks.CheckSpec(
+            "TEST.REQUIRED-SCOPE",
+            "required scope",
+            "release",
+            ("python", "-c", "pass"),
+            (),
+            (),
+            input_scopes=(release_checks.InputScope("file", "required.py"),),
+        )
+        with self.assertRaisesRegex(release_checks.SelectionError, "required input scope"):
+            release_checks.resolve_input_scope(spec, REPOSITORY_ROOT)
 
     def test_real_route_manifest_mutations_invalidate_public_consumers(self) -> None:
         specs = tuple(
@@ -310,6 +368,49 @@ class S6SelectorTests(unittest.TestCase):
 
 
 class S6LocalIsolationTests(unittest.TestCase):
+    def test_provider_wrapper_preserves_exec_action_and_adapter_flags(self) -> None:
+        support = REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support"
+        path = support / "wsl_codex_provider.py"
+        fake_driver = types.ModuleType("wsl_real_agent_driver")
+        fake_driver.bwrap_base = lambda *args: ["bwrap", "--die-with-parent"]
+        spec = importlib.util.spec_from_file_location("s6_wsl_codex_provider", path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"wsl_real_agent_driver": fake_driver}):
+            spec.loader.exec_module(module)
+        argv = module._provider_argv(
+            [
+                "exec",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--json",
+                "--cd",
+                "/host/workspace",
+                "--output-last-message",
+                "/host/message.txt",
+            ],
+            ["bwrap", "--die-with-parent"],
+        )
+        self.assertEqual(
+            [
+                "bwrap",
+                "--die-with-parent",
+                "/opt/codex/bin/codex",
+                "exec",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--json",
+                "--cd",
+                "/workspace",
+                "--output-last-message",
+                "/workspace/.agent-workspace/real_agent_last_message.txt",
+            ],
+            argv,
+        )
+        with self.assertRaisesRegex(RuntimeError, "exec action"):
+            module._provider_argv(["--json"], ["bwrap"])
+
     def test_real_agent_uses_native_public_route_and_native_evidence(self) -> None:
         driver = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_real_agent_driver.py"
@@ -317,6 +418,7 @@ class S6LocalIsolationTests(unittest.TestCase):
         route = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
         ).read_text(encoding="utf-8")
+        mutation = (REPOSITORY_ROOT / "orchestrator_harness" / "mutation.py").read_text(encoding="utf-8")
         provider = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
         ).read_text(encoding="utf-8")
@@ -330,8 +432,18 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertNotIn("subprocess.Popen(", driver)
         self.assertNotIn("synthetic_controller.status", driver)
         self.assertNotIn("/opt/codex/bin/codex", driver)
+        self.assertLess(driver.index("chown_tree(synthetic_run)"), driver.index("isolation = preflight("))
+        self.assertGreaterEqual(driver.count("chown_tree(synthetic_run)"), 2)
+        self.assertIn("provider_identity_matches", driver)
+        self.assertIn("discover_codex", driver)
+        self.assertIn("validate_codex_identity", driver)
+        self.assertIn("provider_observed_created_utc", driver)
+        self.assertIn("codex_ancestry", driver)
         self.assertIn("launch_lane_controller", route)
         self.assertIn("from orchestrator_harness.public_launch", route)
+        self.assertIn("_drop_to_workspace_owner", route)
+        self.assertNotIn("ORCH_HARNESS_POSIX_MUTATION_ROOTS", driver + route + mutation)
+        self.assertNotIn("safe.directory", driver + route)
         self.assertIn("os.execvp", provider)
         self.assertIn("/opt/codex/bin/codex", provider)
         self.assertNotIn("subprocess.Popen(", provider)
@@ -345,6 +457,48 @@ class S6LocalIsolationTests(unittest.TestCase):
             release_checks.get_check("S6.AFFECTED.REAL-AGENT").dependency_paths
         )
         self.assertTrue(set(release_checks.REAL_AGENT_ROUTE_DEPENDENCIES).issubset(real_dependencies))
+
+    def test_real_agent_identity_helpers_reject_mixed_or_unpinned_processes(self) -> None:
+        self.assertTrue(provider_identity_matches(11, "created", 11, "created"))
+        self.assertFalse(provider_identity_matches(11, "created", 12, "created"))
+        self.assertFalse(provider_identity_matches(11, "created", 11, "reused"))
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-codex-identity-") as raw:
+            root = Path(raw)
+            pinned = root / "codex"
+            other = root / "other-codex"
+            pinned.write_bytes(b"pinned")
+            other.write_bytes(b"different")
+            chain = [
+                {"pid": 11, "ppid": 22},
+                {"pid": 22, "ppid": 33},
+                {"pid": 33, "ppid": 0},
+            ]
+            validate_codex_identity(
+                11, pinned, chain, provider_pid=33, observed_executable=pinned
+            )
+            with self.assertRaisesRegex(RuntimeError, "pinned"):
+                validate_codex_identity(
+                    11, pinned, chain, provider_pid=33, observed_executable=other
+                )
+            with self.assertRaisesRegex(RuntimeError, "parent"):
+                validate_codex_identity(
+                    11,
+                    pinned,
+                    [{"pid": 11, "ppid": 99}, {"pid": 33, "ppid": 0}],
+                    provider_pid=33,
+                    observed_executable=pinned,
+                )
+
+    def test_wsl_installer_is_byte_exact_repeatable_and_pinned(self) -> None:
+        installer = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "install_wsl_codex.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ProcessStartInfo", installer)
+        self.assertIn("UTF8.GetBytes", installer)
+        self.assertIn("replace \"`r`n?\", \"`n\"", installer)
+        self.assertIn("requested %s", installer.lower())
+        self.assertIn("already installed", installer.lower())
+        self.assertNotIn("$script | wsl.exe", installer)
 
 
 class S6PublicJourneyTests(unittest.TestCase):
@@ -464,6 +618,9 @@ class S6SafeguardTests(unittest.TestCase):
         script = (
             REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
         ).read_text(encoding="utf-8")
+        core = (
+            REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("C:/Users/", script)
         self.assertIn("RepositoryRoot", script)
         self.assertIn("ExpectedTip", script)
@@ -473,10 +630,14 @@ class S6SafeguardTests(unittest.TestCase):
         self.assertIn("S6.RELEASE.ACCUMULATED-SAFEGUARD", script)
         self.assertNotIn("@{ Name = 'ruff'", script)
         self.assertIn("CreditFile", script)
-        self.assertIn("Assert-FinalIdentity", script)
+        self.assertIn("CandidateSafeguard.Core.psm1", script)
+        self.assertIn("Invoke-ReleaseChecks", script)
+        self.assertNotIn("Assert-FinalIdentity", script)
+        self.assertNotIn("SelectionFile", script)
+        self.assertNotIn("PythonExecutable", script)
         self.assertIn("--credit-file", script)
         self.assertIn("--git-common-dir", script)
-        self.assertIn("--untracked-files=all", script)
+        self.assertIn("--untracked-files=all", core)
 
     def test_non_candidate_branch_is_rejected_before_selector_or_checks(self) -> None:
         script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
@@ -499,94 +660,7 @@ class S6SafeguardTests(unittest.TestCase):
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("unexpected branch", completed.stderr)
 
-    def test_injected_selection_runs_once_propagates_failure_and_rejects_dirty_output(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-safeguard-") as raw:
-            root = Path(raw) / "candidate"
-            root.mkdir()
-            subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "safeguard@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "Safeguard Test"], check=True)
-            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
-            baseline.parent.mkdir(parents=True)
-            baseline.write_text("{}\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text(
-                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n',
-                encoding="utf-8",
-            )
-            (root / "tracked.txt").write_text("clean\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-m", "candidate"], check=True, capture_output=True)
-            identity = release_checks.read_source_identity(root).to_record()
-            selection = root.parent / "selection.json"
-            log = root.parent / "executor.log"
-            script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
-
-            def write_selection(code: str) -> None:
-                selection.write_text(
-                    json.dumps(
-                        {
-                            "schema": "orchestrator-check-selection/v1",
-                            "source": identity,
-                            "selected": [
-                                {
-                                    "stable_id": "TEST.SAFEGUARD",
-                                    "command": ["python", "-c", code],
-                                }
-                            ],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-
-            write_selection(
-                f"from pathlib import Path; p=Path(r'{str(log)}'); p.write_text(p.read_text()+'run\\n' if p.exists() else 'run\\n')"
-            )
-            completed = subprocess.run(
-                [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-SelectionFile", str(selection), "-Run",
-                ],
-                cwd=REPOSITORY_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
-            self.assertEqual("run\n", log.read_text(encoding="utf-8"))
-
-            write_selection("raise SystemExit(7)")
-            failed = subprocess.run(
-                [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-SelectionFile", str(selection), "-Run",
-                ],
-                cwd=REPOSITORY_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(0, failed.returncode)
-
-            write_selection(
-                f"from pathlib import Path; Path(r'{str(root / 'dirty.txt')}').write_text('dirty\\n')"
-            )
-            dirty = subprocess.run(
-                [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-SelectionFile", str(selection), "-Run",
-                ],
-                cwd=REPOSITORY_ROOT,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(0, dirty.returncode)
-            self.assertIn("dirty", (dirty.stdout + dirty.stderr).lower())
-
-    def test_credit_file_is_forwarded_to_native_selector_without_running_release_components(self) -> None:
+    def test_safeguard_rejects_injection_and_uses_native_credit_selection(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-selector-forward-") as raw:
             root = Path(raw) / "candidate"
             shutil.copytree(
@@ -610,20 +684,12 @@ class S6SafeguardTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "commit", "-m", "selector candidate"], check=True, capture_output=True)
             credit_file = Path(raw) / "credits.json"
             credit_file.write_text('{"credits": []}\n', encoding="utf-8")
-            log_file = Path(raw) / "selector-argv.log"
-            fake = Path(raw) / "python-selector.cmd"
-            fake.write_text(
-                "@echo off\n"
-                f'>>"{log_file}" echo %*\n'
-                "python %*\n",
-                encoding="utf-8",
-            )
             script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
             completed = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
                     "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-CreditFile", str(credit_file), "-PythonExecutable", str(fake),
+                    "-CreditFile", str(credit_file),
                 ],
                 cwd=REPOSITORY_ROOT,
                 capture_output=True,
@@ -631,11 +697,81 @@ class S6SafeguardTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
-            selector_argv = log_file.read_text(encoding="utf-8")
-            self.assertIn("--credit-file", selector_argv)
-            self.assertIn(str(credit_file), selector_argv)
-            self.assertIn("--expected-tip", selector_argv)
-            self.assertIn("S6.RELEASE.ACCUMULATED-SAFEGUARD", selector_argv)
+            self.assertIn("READY S6.RELEASE.", completed.stdout)
+            self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
+
+            injected = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
+                    "-SelectionFile", str(Path(raw) / "selection.json"),
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(0, injected.returncode)
+            self.assertIn("parameter", (injected.stdout + injected.stderr).lower())
+
+    def test_safeguard_stops_before_second_component_after_identity_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-safeguard-core-") as raw:
+            root = Path(raw) / "candidate"
+            repository = TemporaryGitRepository.create(root, branch="firmware/v2-candidate")
+            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
+            baseline.parent.mkdir(parents=True)
+            baseline.write_text("{}\n", encoding="utf-8")
+            pyright_config = root / "pyrightconfig.json"
+            pyright_config.write_text(
+                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n',
+                encoding="utf-8",
+            )
+            first = root / "first.ps1"
+            second = root / "second.ps1"
+            first.write_text(
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'first-ran.txt') -Value 'first'\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'second-ran.txt') -Value 'second'\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".")
+            repository.git("commit", "-m", "safeguard core fixture")
+            baseline_hash = hashlib.sha256(baseline.read_bytes()).hexdigest()
+            config_hash = hashlib.sha256(pyright_config.read_bytes()).hexdigest()
+            module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+            driver = Path(raw) / "invoke-core.ps1"
+            driver.write_text(
+                f"""Import-Module -Force '{module}'
+$checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.FIRST'; command = @('powershell', '-NoProfile', '-File', 'first.ps1') }},
+    [pscustomobject]@{{ stable_id = 'TEST.SECOND'; command = @('powershell', '-NoProfile', '-File', 'second.ps1') }}
+)
+try {{
+    Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+        -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+        -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+        -BaselineHash '{baseline_hash}' -ConfigHash '{config_hash}'
+    exit 0
+}} catch {{
+    Write-Error $_
+    exit 17
+}}
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(17, completed.returncode, completed.stdout + completed.stderr)
+            self.assertIn("dirty", (completed.stdout + completed.stderr).lower())
+            self.assertTrue((root / "first-ran.txt").is_file())
+            self.assertFalse((root / "second-ran.txt").exists())
 
 
 class S6DocumentationTests(unittest.TestCase):
