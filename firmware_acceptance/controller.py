@@ -15,7 +15,7 @@ import datetime as _datetime
 import math
 import uuid
 import re
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from orchestrator_harness.processes import process_snapshot
@@ -45,47 +45,6 @@ _REFERENCE_KEYS = {"path", "sha256"}
 _GOVERNING_KEYS = {"goal", "generalization_spec", "implementation_roadmap", "execution_plan", "execution_readiness"}
 _DECISION_KEYS = {"schema", "proposal_path", "proposal_sha256", "call", "claim", "decision", "rationale", "issued_utc", "issued_monotonic", "expires_monotonic", "topology_key_release", "orchestrator_identity", "public_key", "signature"}
 _AUTH_KEYS = {"schema", "proposal_path", "proposal_sha256", "decision_path", "decision_sha256", "launch_intent", "orchestrator_identity", "topology_key_release", "c1_reference", "delegated_reference", "call", "claim", "expires_monotonic", "one_shot_id", "revoked"}
-
-
-def _bind_capability_state_root(controller_root: Path, requested: Path | None) -> Path:
-    """Bind one disposable capability ledger below the controller-owned root."""
-
-    root = Path(controller_root).resolve()
-    reject_linked_path(root)
-    if not root.is_dir():
-        raise AdmissionError("controller capability root is unavailable")
-
-    if requested is None:
-        candidate = root / "capability-state"
-    else:
-        raw_text = os.fspath(requested)
-        if not isinstance(raw_text, str):
-            raise AdmissionError("capability state root must be a path")
-        windows = PureWindowsPath(raw_text)
-        if windows.is_reserved() or windows.drive and not windows.is_absolute():
-            raise AdmissionError("capability state root uses an alternate namespace")
-        if windows.anchor.startswith(("\\\\", "\\\\?\\", "\\\\.\\")):
-            raise AdmissionError("capability state root uses an alternate namespace")
-        raw = Path(raw_text)
-        if any(part in {".", ".."} for part in raw.parts):
-            raise AdmissionError("capability state root contains traversal")
-        if raw.root and not raw.drive:
-            raise AdmissionError("capability state root is rooted outside the controller")
-        candidate = raw if raw.is_absolute() else root / raw
-
-    reject_linked_path(candidate)
-    try:
-        resolved = candidate.resolve()
-    except OSError as exc:
-        raise AdmissionError("capability state root is unreadable") from exc
-    try:
-        relative = resolved.relative_to(root)
-    except ValueError as exc:
-        raise AdmissionError("capability state root escapes controller root") from exc
-    if not relative.parts:
-        raise AdmissionError("capability state root cannot be the controller root")
-    reject_linked_path(resolved)
-    return resolved
 
 
 class Ed25519Verifier(SignatureVerifier):
@@ -358,11 +317,10 @@ class FirmwareAcceptanceController:
         topology: dict[str, Any] | None = None,
         session_root_for: Callable[[dict[str, Any]], Path] | None = None,
         lane_root_for: Callable[[str], Path] | None = None,
-        state_root: Path | None = None,
     ) -> None:
         self.broker, self.launcher, self.clock, self.identity_provider = broker, launcher or _launch, clock, identity_provider
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
-        self._capability_state_root = _bind_capability_state_root(self.broker.root, state_root)
+        self._capability_state_root = _safe_child(self.broker.root, "capability-state")
         self._live_claims: Any | None = None
         self._live_claim: dict[str, Any] | None = None
         self._proposal_binding: tuple[Path, str] | None = None

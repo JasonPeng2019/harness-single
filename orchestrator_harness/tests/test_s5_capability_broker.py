@@ -34,7 +34,7 @@ from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import BOUNDARY_ARMED_STATE, ResourceClaims, claim_filename
 from firmware_acceptance.capability_adapter import FirmwareHardwareAdapter
 from firmware_acceptance.controller import FirmwareAcceptanceController, _process_identity
-from firmware_acceptance.kit import AcceptanceBroker, AdmissionError
+from firmware_acceptance.kit import AcceptanceBroker
 
 
 OWNER = {"pid": 321, "created_utc": "2026-01-01T00:00:00Z", "creation_identity": "fake:321"}
@@ -706,7 +706,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 Path("firmware_acceptance/MCP_METHOD_POLICY.json"),
                 Path("firmware_acceptance/LANE_TEMPLATES.json"),
             )
-            state_root = acceptance.root / "state-a"
             adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
             request = _request(request_id="controller-durable-request")
             approval = self._approval_for(request, adapter)
@@ -715,7 +714,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 acceptance,
                 clock=lambda: 10.0,
                 claims_factory=lambda lane, request_id: first_claims,
-                state_root=state_root,
             )
             first = first_controller.execute_capability_request(
                 request,
@@ -726,14 +724,14 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 identity_provider=lambda: dict(OWNER),
             )
             self.assertEqual("PASS", first["outcome"])
-            self.assertEqual(state_root.resolve(), first_controller.capability_state_root)
+            expected_state_root = (acceptance.root / "capability-state").resolve()
+            self.assertEqual(expected_state_root, first_controller.capability_state_root)
 
             second_claims = _Claims(root / "claims-2", [])
             second_controller = FirmwareAcceptanceController(
                 acceptance,
                 clock=lambda: 10.0,
                 claims_factory=lambda lane, request_id: second_claims,
-                state_root=state_root,
             )
             second = second_controller.execute_capability_request(
                 copy.deepcopy(request),
@@ -744,9 +742,17 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 identity_provider=lambda: dict(OWNER),
             )
             self.assertEqual(first, second)
+            self.assertEqual(expected_state_root, second_controller.capability_state_root)
             self.assertEqual(1, adapter.dispatch_calls)
             self.assertFalse(second_claims.held)
+            self.assertTrue(expected_state_root.is_dir())
 
+            with self.assertRaises(TypeError):
+                FirmwareAcceptanceController(acceptance, state_root=acceptance.root / "state-b")
+            self.assertFalse((acceptance.root / "state-b").exists())
+
+            support_calls = adapter.support_calls
+            observe_calls = adapter.observe_calls
             with self.assertRaises(TypeError):
                 second_controller.execute_capability_request(
                     copy.deepcopy(request),
@@ -759,22 +765,8 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 )
             self.assertEqual(1, adapter.dispatch_calls)
             self.assertFalse((acceptance.root / "state-b").exists())
-
-            with self.assertRaises(AdmissionError):
-                FirmwareAcceptanceController(acceptance, state_root=acceptance.root.parent / "escape")
-            with self.assertRaises(AdmissionError):
-                FirmwareAcceptanceController(acceptance, state_root=acceptance.root / ".." / "escape")
-            with self.assertRaises(AdmissionError):
-                FirmwareAcceptanceController(acceptance, state_root=Path("\\outside"))
-
-            linked = acceptance.root / "linked-state"
-            try:
-                linked.symlink_to(acceptance.root / "linked-target", target_is_directory=True)
-            except (OSError, NotImplementedError):
-                linked = None
-            if linked is not None:
-                with self.assertRaises(AdmissionError):
-                    FirmwareAcceptanceController(acceptance, state_root=linked)
+            self.assertEqual(support_calls, adapter.support_calls)
+            self.assertEqual(observe_calls, adapter.observe_calls)
 
     def test_S5_F8_exact_retry_reuses_terminal_result_and_changed_replay_denies(self) -> None:
         with TemporaryDirectory() as temporary:
