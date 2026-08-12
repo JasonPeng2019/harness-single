@@ -34,7 +34,7 @@ from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import BOUNDARY_ARMED_STATE, ResourceClaims, claim_filename
 from firmware_acceptance.capability_adapter import FirmwareHardwareAdapter
 from firmware_acceptance.controller import FirmwareAcceptanceController, _process_identity
-from firmware_acceptance.kit import AcceptanceBroker
+from firmware_acceptance.kit import AcceptanceBroker, AdmissionError
 
 
 OWNER = {"pid": 321, "created_utc": "2026-01-01T00:00:00Z", "creation_identity": "fake:321"}
@@ -697,6 +697,85 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual("PASS", result["outcome"])
             self.assertEqual(1, adapter.dispatch_calls)
 
+    def test_S5_R1_004_controller_binds_one_confined_state_root_for_retries(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            acceptance = AcceptanceBroker(
+                root / "broker",
+                Path("firmware_acceptance/seed"),
+                Path("firmware_acceptance/MCP_METHOD_POLICY.json"),
+                Path("firmware_acceptance/LANE_TEMPLATES.json"),
+            )
+            state_root = acceptance.root / "state-a"
+            adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
+            request = _request(request_id="controller-durable-request")
+            approval = self._approval_for(request, adapter)
+            first_claims = _Claims(root / "claims-1", [])
+            first_controller = FirmwareAcceptanceController(
+                acceptance,
+                clock=lambda: 10.0,
+                claims_factory=lambda lane, request_id: first_claims,
+                state_root=state_root,
+            )
+            first = first_controller.execute_capability_request(
+                request,
+                approval,
+                _Verifier(),
+                adapter=adapter,
+                policy_verifier=lambda *_: True,
+                identity_provider=lambda: dict(OWNER),
+            )
+            self.assertEqual("PASS", first["outcome"])
+            self.assertEqual(state_root.resolve(), first_controller.capability_state_root)
+
+            second_claims = _Claims(root / "claims-2", [])
+            second_controller = FirmwareAcceptanceController(
+                acceptance,
+                clock=lambda: 10.0,
+                claims_factory=lambda lane, request_id: second_claims,
+                state_root=state_root,
+            )
+            second = second_controller.execute_capability_request(
+                copy.deepcopy(request),
+                copy.deepcopy(approval),
+                _Verifier(),
+                adapter=adapter,
+                policy_verifier=lambda *_: True,
+                identity_provider=lambda: dict(OWNER),
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(1, adapter.dispatch_calls)
+            self.assertFalse(second_claims.held)
+
+            with self.assertRaises(TypeError):
+                second_controller.execute_capability_request(
+                    copy.deepcopy(request),
+                    copy.deepcopy(approval),
+                    _Verifier(),
+                    adapter=adapter,
+                    policy_verifier=lambda *_: True,
+                    identity_provider=lambda: dict(OWNER),
+                    state_root=acceptance.root / "state-b",
+                )
+            self.assertEqual(1, adapter.dispatch_calls)
+            self.assertFalse((acceptance.root / "state-b").exists())
+
+            with self.assertRaises(AdmissionError):
+                FirmwareAcceptanceController(acceptance, state_root=acceptance.root.parent / "escape")
+            with self.assertRaises(AdmissionError):
+                FirmwareAcceptanceController(acceptance, state_root=acceptance.root / ".." / "escape")
+            with self.assertRaises(AdmissionError):
+                FirmwareAcceptanceController(acceptance, state_root=Path("\\outside"))
+
+            linked = acceptance.root / "linked-state"
+            try:
+                linked.symlink_to(acceptance.root / "linked-target", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                linked = None
+            if linked is not None:
+                with self.assertRaises(AdmissionError):
+                    FirmwareAcceptanceController(acceptance, state_root=linked)
+
     def test_S5_F8_exact_retry_reuses_terminal_result_and_changed_replay_denies(self) -> None:
         with TemporaryDirectory() as temporary:
             adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
@@ -1018,7 +1097,11 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 self.assertNotIn("release", events)
 
     def test_S5_R1_006_recursive_public_authority_aliases_are_rejected(self) -> None:
-        aliases = ("endpoint", "mcp_server", "server", "connection", "server_config", "connection_token", "transport", "session", "handle", "credential")
+        aliases = (
+            "endpoint", "mcp_server", "server", "connection", "server_config", "connection_token",
+            "transport", "session", "handle", "credential", "api_key", "API-Key", "ApiKey", "apikey",
+            "authorization", "Authorization", "bearer", "Bearer", "private_key", "private-key", "PrivateKey",
+        )
         for alias in aliases:
             with self.subTest(alias=alias), TemporaryDirectory() as temporary:
                 adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
@@ -1031,6 +1114,10 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                     canonical_json_bytes({"outer": [{alias: "private"}]})
 
         class AliasSnapshotAdapter(FakeCapabilityAdapter):
+            def __init__(self, alias: str) -> None:
+                super().__init__({"synthetic": ("read",)})
+                self.alias = alias
+
             def observe(self, request):
                 base = super().observe(request)
                 return CapabilitySnapshot(
@@ -1041,18 +1128,20 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                     action=base.action,
                     resources=base.resources,
                     snapshot_id=base.snapshot_id,
-                    identity={"nested": {"mcp_server": "private"}},
+                    identity={"nested": [{self.alias: "private"}]},
                     resource_identities=dict(base.resource_identities),
                     capabilities=dict(base.capabilities),
                     adapter_identity=dict(base.adapter_identity),
                     observed_monotonic=base.observed_monotonic,
                 )
 
-        adapter = AliasSnapshotAdapter({"synthetic": ("read",)})
-        result = _broker(adapter, _Claims(Path("."), [])).execute(_request(), {})
-        self.assertEqual("DENIED", result.outcome)
-        self.assertEqual("SNAPSHOT_INVALID", result.record["denial"]["reason_code"])
         for alias in aliases:
+            with self.subTest(snapshot_fact=alias), TemporaryDirectory() as temporary:
+                adapter = AliasSnapshotAdapter(alias)
+                result = _broker(adapter, _Claims(Path(temporary), [])).execute(_request(), {})
+                self.assertEqual("DENIED", result.outcome)
+                self.assertEqual("SNAPSHOT_INVALID", result.record["denial"]["reason_code"])
+
             with self.subTest(public_fact=alias):
                 with self.assertRaises(CapabilityError):
                     AdapterResult(True, {"nested": [{alias: "private"}]}, {"status": "PASS"}, {"adapter_id": "fake", "adapter_version": "v1"})
@@ -1062,6 +1151,23 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                     CleanupEvidence(True, {"complete": True, "members": [], "live_members": []}, (), {"nested": {alias: "private"}})
                 with self.assertRaises(CapabilityError):
                     CapabilityDenied("TEST", "private fact", stage="test", details={"nested": {alias: "private"}})
+
+        parsed = CapabilityRequest.from_record(_request(), now_monotonic=0.0)
+        snapshot = FakeCapabilityAdapter({"synthetic": ("read",)}).observe(parsed)
+        for alias in aliases:
+            with self.subTest(approval_fact=alias):
+                approval = _approval(parsed, snapshot)
+                approval["arguments"] = {alias: [{"nested": "private"}]}
+                with self.assertRaises(CapabilityError):
+                    CapabilityApproval.from_record(approval)
+
+        public_approval = CapabilityApproval.from_record(_approval(parsed, snapshot))
+        self.assertTrue(_Verifier().verify(public_approval.signed_payload, public_approval.signature, public_approval.public_key))
+        self.assertEqual(public_approval.to_record(), json.loads(public_approval.signed_payload.decode("utf-8")) | {"signature": public_approval.signature})
+        self.assertEqual(
+            canonical_json_bytes({"keyboard": "ordinary", "monkey": "ordinary", "ordinary_key": "ordinary", "public_key": "typed-public"}),
+            canonical_json_bytes({"public_key": "typed-public", "ordinary_key": "ordinary", "monkey": "ordinary", "keyboard": "ordinary"}),
+        )
 
     def test_S5_R1_007_controller_pinned_pack_enforces_fixture_arguments_and_duration(self) -> None:
         with TemporaryDirectory() as temporary:
