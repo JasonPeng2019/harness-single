@@ -1,7 +1,7 @@
 {
   "schema": "orchestrator-check-selection-request/v1",
   "intent": "fast",
-  "root": "C:/absolute/path/to/project",
+  "root": "<repository-root>",
   "changed_paths": [],
   "changed_domains": [],
   "credits": []

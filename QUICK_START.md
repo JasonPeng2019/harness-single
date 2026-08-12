@@ -82,9 +82,10 @@ python -m orchestrator_harness.release_checks select --intent affected --root <r
 ```
 
 Credit is retained only for the same stable ID, exact declared dependency fingerprint, command,
-tier, output contract, and exact source root/branch/tip identity. Fast is local and does not select WSL or a
-real agent. Full/release may enumerate the accumulated safeguard, but its producer remains
-`MI-RELEASE-ASSURE`/ROOT-owned and is not run in an ordinary coding lane.
+tier, output contract, and exact source root/common-directory/branch identity; its recorded origin
+tip must be an ancestor of the current tip. A dependency or contract mutation invalidates that
+credit. Fast is local and does not select WSL or a real agent. Full/release may enumerate the
+accumulated component checks, but the aggregate safeguard remains ROOT-owned and is not run in an ordinary coding lane.
 
 ## 6. Merge and accept
 
@@ -208,8 +209,8 @@ $candidateRoot = "<candidate-root>"
 & (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -Run
 ```
 
-The first command prints its bound checks. The second runs Ruff, formatting, the retained
-non-expanded BasedPyright baseline, compilation, unit suites, attention retention, the Codex
-integration gate, and synthetic cleanup gate. It refuses any non-reserved, ambiguous, dirty,
+The first command prints its bound checks. The second runs the selector-owned Ruff, formatting,
+retained non-expanded BasedPyright baseline, compilation, orchestrator and watcher unit
+discoveries, attention retention, and synthetic cleanup components. It refuses any non-reserved, ambiguous, dirty,
 stable-runner, or wrong-branch root; it is a safeguard launcher, not a scheduler, retry controller,
 or alternate harness.

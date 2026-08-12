@@ -66,9 +66,16 @@ credentials, or a real provider.
 declared dependency domains/files, exact commands, tiers, platform requirements, and credit
 contracts. `fast` is local, `affected` consumes changed domains/paths, and `full`/`release` can
 enumerate release assurance. Credit is valid only when its canonical fingerprint and exact source
-root, Git common directory, branch, and tip match. The selector rejects stale, malformed,
+root, Git common directory, and branch match, with the recorded origin tip still an ancestor of
+the current tip. The selector rejects stale, malformed,
 unknown, or mixed-root records and orders shortest decisive invalidated checks first. The
 WSL/real-agent check is explicitly non-fast; this producer records its selection only.
+
+Release-tier components have stable IDs for Ruff, formatting, BasedPyright, compilation,
+orchestrator/watcher discovery, attention retention, and synthetic cleanup. The aggregate
+candidate safeguard is a ROOT-owned launcher and is excluded from the component selection it
+executes. Package release assets use one canonical `assets/release/` tree; checkout examples and
+templates are retained copies bound to those packaged resources.
 
 The portable candidate safeguard derives or accepts its repository root, reads back the exact
 Git top level/branch/tip, and gets its check commands from that selector. It retains the candidate

@@ -79,6 +79,10 @@ def copy_harness_source(source_root: Path, destination: Path) -> Path:
         }
 
     shutil.copytree(source, destination / "orchestrator_harness", ignore=ignored)
+    common = source_root / "harness_common"
+    if not common.is_dir():
+        raise RuntimeError(f"required harness_common source is unavailable: {common}")
+    shutil.copytree(common, destination / "harness_common", ignore=ignored)
     return destination
 
 
@@ -539,6 +543,11 @@ def copy_evidence(temp_root: Path, evidence: Path, secrets: list[str]) -> None:
         "proxy-audit.jsonl",
         "process-ancestry.json",
         "cgroup-evidence.json",
+        "route-launch.log",
+        "operator-receipt.json",
+        "controller-status.json",
+        "controller-result.json",
+        "lifecycle-registry.json",
         "driver-failure.txt",
     ):
         source = temp_root / name
@@ -596,6 +605,7 @@ def main() -> int:
     sys.path.insert(0, str(copied_root))
     from orchestrator_harness.cli import watch_once
     from orchestrator_harness.config import load_config
+    from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
     from orchestrator_harness.processes import process_snapshot
 
     synthetic_suite = temp_root / "synthetic-suite"
@@ -603,28 +613,15 @@ def main() -> int:
     agent_workspace = synthetic_run / ".agent-workspace"
     codex_home = temp_root / "codex-home"
     watcher_state = copied_root / "orchestrator_harness" / ".real-agent-state"
-    for directory in (agent_workspace, codex_home):
+    runtime_root = temp_root / "runtime"
+    for directory in (synthetic_run, agent_workspace, codex_home, runtime_root):
         directory.mkdir(parents=True, exist_ok=True)
-    helper = synthetic_run / "synthetic_agent_helper.py"
-    shutil.copy2(
-        copied_root
-        / "orchestrator_harness"
-        / "tests"
-        / "support"
-        / "synthetic_agent_helper.py",
-        helper,
-    )
     secrets, access_expiry, expired_id_expiry = minimal_auth(
         auth_source, codex_home / "auth.json"
     )
     os.chown(codex_home, NOBODY, NOBODY)
     os.chown(codex_home / "auth.json", NOBODY, NOBODY)
-    for root, directories, files in os.walk(synthetic_run):
-        os.chown(root, NOBODY, NOBODY)
-        for name in directories:
-            os.chown(Path(root) / name, NOBODY, NOBODY)
-        for name in files:
-            os.chown(Path(root) / name, NOBODY, NOBODY)
+    os.chown(runtime_root, NOBODY, NOBODY)
 
     config_path = temp_root / "config.json"
     atomic_json(
@@ -652,13 +649,10 @@ def main() -> int:
     (cgroup / "cpu.max").write_text("200000 100000\n")
     proxy_audit = temp_root / "proxy-audit.jsonl"
     network: dict[str, Any] | None = None
-    process: subprocess.Popen[str] | None = None
-    stdout_stream = None
-    stderr_stream = None
     event_types: list[str] = []
-    request_hash = ""
     failure: BaseException | None = None
     result: dict[str, Any] | None = None
+    process_evidence: dict[str, Any] | None = None
     try:
         network = make_network_namespace(identifier, proxy_audit)
         proxy_url = f"http://{network['host_ip']}:{network['proxy_port']}"
@@ -681,288 +675,258 @@ def main() -> int:
             }
         )
         atomic_json(temp_root / "isolation-preflight.json", isolation)
-
-        last_message = agent_workspace / "real_agent_last_message.txt"
-        jsonl = agent_workspace / "real_agent_codex.jsonl"
+        status_path = agent_workspace / "real_agent_controller.status.json"
+        receipt_path = agent_workspace / "real_agent_operator.receipt.json"
+        prompt_path = agent_workspace / "real_agent_prompt.md"
+        jsonl_path = agent_workspace / "real_agent_codex.jsonl"
         stderr_path = agent_workspace / "real_agent_codex.stderr.log"
-        stdout_stream = jsonl.open("w", encoding="utf-8")
-        stderr_stream = stderr_path.open("w", encoding="utf-8")
-        argv = [
-            "ip",
-            "netns",
-            "exec",
-            network["name"],
-            *base,
-            "/opt/codex/bin/codex",
-            "-C",
-            "/workspace",
-            "-m",
-            args.model,
-            "-c",
-            'model_reasoning_effort="high"',
-            "-c",
-            'service_tier="priority"',
-            "-c",
-            "mcp_servers={}",
-            "-c",
-            'approval_policy="never"',
-            "-c",
-            'approvals_reviewer="user"',
-            "-s",
-            "danger-full-access",
-            "-a",
-            "never",
-            "exec",
-            "--skip-git-repo-check",
-            "--ignore-user-config",
-            "--json",
-            "--output-last-message",
-            "/workspace/.agent-workspace/real_agent_last_message.txt",
-            "-",
-        ]
-
-        cgroup_launcher = (
-            copied_root
-            / "orchestrator_harness"
-            / "tests"
-            / "support"
-            / "cgroup_exec.py"
+        last_message_path = agent_workspace / "real_agent_last_message.txt"
+        branch = "real-agent"
+        run(["git", "-C", str(synthetic_run), "init", "-b", branch])
+        run(["git", "-C", str(synthetic_run), "config", "user.email", "real-agent@example.invalid"])
+        run(["git", "-C", str(synthetic_run), "config", "user.name", "Synthetic Real Agent"])
+        (synthetic_run / ".gitignore").write_text(
+            ".agent-workspace/\n*.py[cod]\n", encoding="utf-8"
         )
-        process = subprocess.Popen(
+        (synthetic_run / "task.txt").write_text(
+            "Create the local real-agent route marker and report the exact commit.\n",
+            encoding="utf-8",
+        )
+        run(["git", "-C", str(synthetic_run), "add", ".gitignore", "task.txt"])
+        run(["git", "-C", str(synthetic_run), "commit", "-m", "Initialize real-agent route project"])
+        base_commit = run(
+            ["git", "-C", str(synthetic_run), "rev-parse", "HEAD"]
+        ).stdout.strip()
+        common_dir = run(
+            ["git", "-C", str(synthetic_run), "rev-parse", "--git-common-dir"]
+        ).stdout.strip()
+        provider_entry = (
+            copied_root / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
+        )
+        provider_command = [
+            "/usr/bin/python3",
+            str(provider_entry),
+            "--bwrap",
+            str(bwrap),
+            "--release",
+            str(release),
+            "--workspace",
+            str(synthetic_run),
+            "--codex-home",
+            str(codex_home),
+            "--proxy-url",
+            proxy_url,
+        ]
+        prompt_path.write_text(
+            "Work only in the synthetic repository at /workspace. Do not inspect parent "
+            "directories and do not use network, MCP, firmware, hardware, or credentials "
+            "beyond the already provided Codex session.\n\n"
+            "Create marker.txt containing the single line `public route passed`. Run `git "
+            "add marker.txt` and `git commit -m 'Complete public route task'`. Then write "
+            ".agent-workspace/RESULT.json with exactly the orchestrator-lane-result/v1 "
+            "coding result shape: lane_id real-agent, worker_invocation_id real-agent-001, "
+            "branch real-agent, outcome PASS, a short summary, and one PASS check. Set "
+            "commit to the exact `git rev-parse HEAD` after the commit. Leave the "
+            "repository clean. Finally reply REAL_AGENT_PUBLIC_ROUTE_COMPLETE.",
+            encoding="utf-8",
+        )
+        invocation = {
+            "schema": "orchestrator-coding-invocation/v1",
+            "action": "start",
+            "runtime_root": str(runtime_root),
+            "resource_lock_root": str(runtime_root / "coding-resource-locks"),
+            "run_root": str(synthetic_run),
+            "repository": {
+                "common_dir": common_dir,
+                "worktree_root": str(synthetic_run),
+                "branch": branch,
+                "base_commit": base_commit,
+            },
+            "prompt_path": str(prompt_path),
+            "prompt_sha256": hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
+            "output_paths": {
+                "status": str(status_path),
+                "jsonl": str(jsonl_path),
+                "stderr": str(stderr_path),
+                "last_message": str(last_message_path),
+            },
+            "event_log_path": str(runtime_root / "LANE_EVENTS.jsonl"),
+            "lane_id": "real-agent",
+            "worker_invocation_id": "real-agent-001",
+            "task": "Complete the public real-agent controller route",
+            "phase": "public-route",
+            "exclusive_resources": [],
+            "codex": {
+                "command": provider_command,
+                "model": args.model,
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+                "sandbox": "danger-full-access",
+                "approval_policy": "never",
+                "config_overrides": ["mcp_servers={}"],
+            },
+        }
+        invocation_path = agent_workspace / "invocation.json"
+        atomic_json(invocation_path, invocation)
+        for root, directories, files in os.walk(synthetic_run):
+            os.chown(root, NOBODY, NOBODY)
+            for name in directories:
+                os.chown(Path(root) / name, NOBODY, NOBODY)
+            for name in files:
+                os.chown(Path(root) / name, NOBODY, NOBODY)
+
+        route_entry = (
+            copied_root / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
+        )
+        cgroup_launcher = copied_root / "orchestrator_harness" / "tests" / "support" / "cgroup_exec.py"
+        route_completed = run(
             [
+                "ip",
+                "netns",
+                "exec",
+                network["name"],
                 "/usr/bin/python3",
                 str(cgroup_launcher),
                 "--cgroup",
                 str(cgroup),
                 "--",
-                *argv,
+                "/usr/bin/python3",
+                str(route_entry),
+                "--invocation",
+                str(invocation_path),
+                "--receipt",
+                str(receipt_path),
+                "--cwd",
+                str(copied_root),
+                "--status",
+                str(status_path),
             ],
-            cwd=synthetic_run,
-            stdin=subprocess.PIPE,
-            stdout=stdout_stream,
-            stderr=stderr_stream,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            check=False,
+            timeout=60,
         )
-        codex_pid, chain = discover_codex(cgroup, pinned_codex, process.pid, 20)
-        cgroup_pids = cgroup_processes(cgroup)
-        if any(int(item["pid"]) not in cgroup_pids for item in chain[:-1]):
-            raise RuntimeError(
-                "Codex containment ancestry escaped the dedicated cgroup"
-            )
-        immediate_parent = int(chain[0]["ppid"])
-        snapshot = process_snapshot()
-        codex_observation = snapshot.by_pid.get(codex_pid)
-        parent_observation = snapshot.by_pid.get(immediate_parent)
-        if (
-            not snapshot.complete
-            or codex_observation is None
-            or parent_observation is None
-            or codex_observation.created_utc is None
-            or parent_observation.created_utc is None
-        ):
-            raise RuntimeError("cannot prove actual Codex outer process identity")
-        process_evidence = {
-            "sandbox_root_pid": process.pid,
-            "codex_pid": codex_pid,
-            "codex_created_utc": codex_observation.created_utc.isoformat().replace(
-                "+00:00", "Z"
-            ),
-            "controller_created_utc": parent_observation.created_utc.isoformat().replace(
-                "+00:00", "Z"
-            ),
-            "immediate_parent_pid": immediate_parent,
-            "ancestry": chain,
-            "cgroup": str(cgroup),
-            "cgroup_pids_at_capture": sorted(cgroup_pids),
-            "pinned_codex_sha256": hashlib.sha256(
-                pinned_codex.read_bytes()
-            ).hexdigest(),
-        }
-        atomic_json(temp_root / "process-ancestry.json", process_evidence)
-        atomic_json(
-            agent_workspace / "outer_identity.json",
-            {
-                "pid": codex_pid,
-                "started_utc": process_evidence["codex_created_utc"],
-                "executable_sha256": process_evidence["pinned_codex_sha256"],
-            },
+        (temp_root / "route-launch.log").write_text(
+            route_completed.stdout + route_completed.stderr, encoding="utf-8"
         )
-        started = process_evidence["codex_created_utc"]
-        status_path = agent_workspace / "real_agent_controller.status.json"
-        atomic_json(
-            status_path,
-            {
-                "state": "running",
-                "controller_pid": immediate_parent,
-                "codex_pid": codex_pid,
-                "outer_supervisor_pid": process.pid,
-                "doer": "RealAgent",
-                "task": "HARNESS-REAL-AGENT",
-                "phase": "synthetic same-turn relay wait",
-                "thread_id": "real-agent-synthetic-session",
-                "started_utc": started,
-                "controller_started_utc": process_evidence["controller_created_utc"],
-                "codex_started_utc": process_evidence["codex_created_utc"],
-                "board_tokens": [],
-                "mcp_servers": [],
-                "sandbox": "danger-full-access-inside-bubblewrap",
-                "approval_policy": "never",
-                "model": args.model,
-                "service_tier": "priority",
-            },
-        )
-        prompt = (
-            "Authorized local host-only orchestration-harness validation. "
-            "Work only in this synthetic directory. No firmware server, MCP server, board, "
-            "probe, serial endpoint, hardware utility, network fetch, or parent-directory "
-            "inspection is in scope. Run exactly this one command and wait for it to finish:\n\n"
-            "python3 ./synthetic_agent_helper.py ./.agent-workspace "
-            "--identity-file ./.agent-workspace/outer_identity.json --wait-seconds 90\n\n"
-            "Do not run any other command. When it exits zero, reply SYNTHETIC_RELAY_COMPLETE."
-        )
-        assert process.stdin is not None
-        process.stdin.write(prompt)
-        process.stdin.close()
-
+        if route_completed.returncode != 0:
+            raise RuntimeError(f"public route entry failed: {route_completed.returncode}")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        controller_pid = receipt.get("pid")
+        controller_created = receipt.get("created_utc")
+        if not isinstance(controller_pid, int) or not isinstance(controller_created, str):
+            raise RuntimeError(f"public operator receipt lacks exact identity: {receipt}")
+        atomic_json(temp_root / "operator-receipt.json", receipt)
         _, initial_events = watch_once(config, no_write=False)
         event_types.extend(event["type"] for event in initial_events)
-        request_path = (
-            agent_workspace
-            / "permission-requests"
-            / "real-agent-synthetic-request.json"
-        )
-        wait_for(request_path, process, 120)
-        helper_pid = None
-        for pid in sorted(cgroup_processes(cgroup)):
-            if "synthetic_agent_helper.py" in proc_command(pid):
-                helper_pid = pid
-                break
-        if helper_pid is None:
-            raise RuntimeError("synthetic helper process was not visible in the cgroup")
-        helper_snapshot = process_snapshot()
-        helper_process = helper_snapshot.by_pid.get(helper_pid)
-        if (
-            not helper_snapshot.complete
-            or helper_process is None
-            or helper_process.created_utc is None
-        ):
-            raise RuntimeError("cannot prove synthetic helper process identity")
-        helper_record = agent_workspace / "helper_process.json"
-        atomic_json(
-            helper_record,
-            {
-                "role": "synthetic-real-agent-helper",
-                "pid": helper_pid,
-                "started_utc": helper_process.created_utc.isoformat().replace(
-                    "+00:00", "Z"
-                ),
-            },
-        )
-        os.chown(helper_record, NOBODY, NOBODY)
-        _, request_events = watch_once(config, no_write=False)
-        event_types.extend(event["type"] for event in request_events)
-        if "RELAY_READY" not in event_types:
-            raise AssertionError(f"watcher did not emit RELAY_READY: {event_types}")
-        for pid in cgroup_processes(cgroup):
-            command = proc_command(pid).lower()
-            scrubbed = command.replace("mcp_servers={}", "")
-            if any(marker in scrubbed for marker in FORBIDDEN_COMMAND_MARKERS):
-                raise AssertionError(
-                    f"forbidden provider process in cgroup: {pid} {command}"
-                )
 
-        request_hash = hashlib.sha256(request_path.read_bytes()).hexdigest()
-        relay_path = (
-            agent_workspace
-            / "permission-requests"
-            / "real-agent-synthetic-request.relay.json"
-        )
-        atomic_json(
-            relay_path,
-            {
-                "decision": "approved",
-                "request_sha256": request_hash,
-                "run_id": "real-agent-synthetic-run",
-                "session_id": "real-agent-synthetic-session",
-                "scope": "synthetic host-only no-hardware relay",
-            },
-        )
-        os.chown(relay_path, NOBODY, NOBODY)
-        _, relayed_events = watch_once(config, no_write=False)
-        event_types.extend(event["type"] for event in relayed_events)
-        code = process.wait(timeout=150)
-        stdout_stream.close()
-        stdout_stream = None
-        stderr_stream.close()
-        stderr_stream = None
-        status_value = json.loads(status_path.read_text(encoding="utf-8"))
-        status_value.update(
-            {
-                "state": "exited",
-                "exit_code": code,
-                "ended_utc": utc_now(),
-            }
-        )
-        atomic_json(status_path, status_value)
-        if code != 0:
-            raise RuntimeError(
-                f"real Codex exited {code}: "
-                + stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-            )
+        deadline = time.monotonic() + 240
+        status_value: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            if status_path.exists():
+                try:
+                    candidate = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    candidate = None
+                if isinstance(candidate, dict):
+                    status_value = candidate
+                    provider_pid = candidate.get("provider_pid") or candidate.get("codex_pid")
+                    provider_created = candidate.get("provider_created_utc") or candidate.get("codex_created_utc")
+                    snapshot = process_snapshot()
+                    if (
+                        isinstance(provider_pid, int)
+                        and isinstance(provider_created, str)
+                        and process_evidence is None
+                        and snapshot.complete
+                    ):
+                        provider_observation = snapshot.by_pid.get(provider_pid)
+                        if provider_observation is not None and provider_observation.created_utc is not None:
+                            process_evidence = {
+                                "controller_pid": controller_pid,
+                                "controller_created_utc": controller_created,
+                                "provider_pid": provider_pid,
+                                "provider_created_utc": provider_created,
+                                "provider_observed_created_utc": iso_utc(provider_observation.created_utc),
+                                "cgroup": str(cgroup),
+                                "cgroup_pids_at_capture": sorted(cgroup_processes(cgroup)),
+                                "pinned_codex_sha256": hashlib.sha256(pinned_codex.read_bytes()).hexdigest(),
+                            }
+                            atomic_json(temp_root / "process-ancestry.json", process_evidence)
+                    terminal = candidate.get("state") in {"CODEX_EXITED", "CONTROLLER_FAILED", "LAUNCH_FAILED"}
+                    current = snapshot.by_pid.get(controller_pid) if snapshot.complete else None
+                    live = current is not None and iso_utc(current.created_utc) == controller_created
+                    if terminal and not live:
+                        break
+            _, events = watch_once(config, no_write=False)
+            event_types.extend(event["type"] for event in events)
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("timed out waiting for the public controller receipt/status terminal state")
         _, final_events = watch_once(config, no_write=False)
         event_types.extend(event["type"] for event in final_events)
-        required = {
-            "CONTROLLER_ACTIVE",
-            "CONTROLLER_EXITED",
-            "HELPER_ACTIVE",
-            "HELPER_EXITED",
-            "RELAY_READY",
-            "RELAYED",
-            "CHECKPOINT_UPDATED",
-            "RESOURCE_RELEASE_POSSIBLE",
-        }
+        if status_value is None:
+            status_value = json.loads(status_path.read_text(encoding="utf-8"))
+        atomic_json(temp_root / "controller-status.json", status_value)
+        if status_value.get("state") != "CODEX_EXITED":
+            raise RuntimeError(f"public controller did not reach CODEX_EXITED: {status_value}")
+        if status_value.get("exit_code") != 0 or status_value.get("result_valid") is not True:
+            raise RuntimeError(f"public controller did not validate a zero-exit result: {status_value}")
+        validation = status_value.get("result_validation")
+        if not isinstance(validation, dict) or validation.get("state") != "VALID":
+            raise RuntimeError(f"public controller result validation is not VALID: {validation}")
+        if status_value.get("controller_pid") != controller_pid or status_value.get("controller_created_utc") != controller_created:
+            raise RuntimeError("controller status identity does not match the public operator receipt")
+        if status_value.get("held_resource_claims") != []:
+            raise RuntimeError("public controller retained resource claims")
+        if not all(status_value.get(key) is True for key in ("helpers_complete", "direct_child_reaped", "resource_claim_release_safe")):
+            raise RuntimeError("public controller cleanup evidence is incomplete")
+        boundary = status_value.get("process_boundary")
+        if not isinstance(boundary, dict) or boundary.get("complete") is not True or boundary.get("live_members"):
+            raise RuntimeError(f"public controller process boundary is not complete: {boundary}")
+        result_path = agent_workspace / "RESULT.json"
+        result_value = json.loads(result_path.read_text(encoding="utf-8"))
+        actual_branch = run(["git", "-C", str(synthetic_run), "branch", "--show-current"]).stdout.strip()
+        actual_head = run(["git", "-C", str(synthetic_run), "rev-parse", "HEAD"]).stdout.strip()
+        dirty = run(
+            ["git", "-C", str(synthetic_run), "status", "--porcelain=v1", "--untracked-files=all"]
+        ).stdout.strip()
+        if (
+            result_value.get("lane_id") != "real-agent"
+            or result_value.get("worker_invocation_id") != "real-agent-001"
+            or result_value.get("branch") != actual_branch
+            or result_value.get("commit") != actual_head
+            or validation.get("commit") != actual_head
+            or actual_branch != branch
+            or dirty
+        ):
+            raise RuntimeError(f"controller-validated result identity is not exact: {result_value}")
+        if process_evidence is None:
+            raise RuntimeError(
+                "native route completed without exact observed provider process evidence"
+            )
+        lifecycle_path = lifecycle_registry_path(synthetic_run, "real-agent", "real-agent-001")
+        lifecycle_value = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        lifecycle = lifecycle_value.get("lifecycle")
+        if not isinstance(lifecycle, dict) or lifecycle.get("complete") is not True or lifecycle.get("helpers_complete") is not True:
+            raise RuntimeError(f"public lifecycle registry is incomplete: {lifecycle_value}")
+        atomic_json(temp_root / "controller-result.json", result_value)
+        atomic_json(temp_root / "lifecycle-registry.json", lifecycle_value)
+        required = {"CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE"}
         missing = sorted(required - set(event_types))
         if missing:
-            raise AssertionError(
-                f"missing real-agent watcher events {missing}: {event_types}"
-            )
-        forbidden_mcp_events = {
-            "MCP_ACTIVE",
-            "MCP_EXITED",
-            "MCP_STATE_UNKNOWN",
-        } & set(event_types)
-        if forbidden_mcp_events:
-            raise AssertionError(
-                "real-agent fixture declares no MCP/provider lifetime but emitted "
-                f"{sorted(forbidden_mcp_events)}: {event_types}"
-            )
-        helper_result = json.loads(
-            (agent_workspace / "synthetic-helper-result.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        if helper_result.get("status") != "PASS":
-            raise AssertionError(f"synthetic helper did not pass: {helper_result}")
-        if "SYNTHETIC_RELAY_COMPLETE" not in last_message.read_text(
-            encoding="utf-8", errors="replace"
-        ):
-            raise AssertionError("real agent did not report synthetic relay completion")
+            raise AssertionError(f"missing public-route watcher events {missing}: {event_types}")
+        if cgroup_processes(cgroup):
+            raise RuntimeError(f"public route cgroup retained processes: {sorted(cgroup_processes(cgroup))}")
         result = {
             "status": "PASS",
             "completed_utc": utc_now(),
-            "model": args.model,
-            "reasoning_effort": "high",
-            "service_tier": "priority",
-            "sandbox": "danger-full-access inside OS-enforced WSL2/bubblewrap",
-            "mcp_servers": [],
+            "route": "public_launch -> operator_launch -> lane_controller",
+            "controller_receipt": receipt,
+            "controller_status": status_value,
+            "controller_result": result_value,
+            "lifecycle_registry": lifecycle_value,
+            "process_evidence": process_evidence,
             "event_types": event_types,
-            "request_sha256": request_hash,
             "access_token_expiry_utc": access_expiry,
-            "network_allowlist": sorted(
-                f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS
-            ),
+            "network_allowlist": sorted(f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS),
             "cgroup_limits": {
                 "pids.max": 64,
                 "memory.max": 1024 * 1024 * 1024,
@@ -978,15 +942,9 @@ def main() -> int:
     finally:
         try:
             kill_cgroup(cgroup)
-            if process is not None and process.poll() is None:
-                process.wait(timeout=10)
         except BaseException as cleanup_error:
             if failure is None:
                 failure = cleanup_error
-        if stdout_stream is not None:
-            stdout_stream.close()
-        if stderr_stream is not None:
-            stderr_stream.close()
         cgroup_evidence = {
             "limits": {
                 name: (cgroup / name).read_text().strip()

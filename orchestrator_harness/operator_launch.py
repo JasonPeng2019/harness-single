@@ -82,6 +82,26 @@ def _cleanup_exact_child(child: subprocess.Popen[str]) -> tuple[bool, str | None
         return False, str(exc)
 
 
+def _release_detached_child_handle(child: subprocess.Popen[str]) -> None:
+    """Release this launcher's ownership after the receipt is durable.
+
+    The operator boundary intentionally does not wait for a successful child.
+    Keeping the local ``Popen`` object alive after that hand-off makes Python's
+    destructor report an ignored ``ResourceWarning`` (and leaks the Windows
+    process handle).  No pipe is used by this launcher, so closing the parent
+    bookkeeping handle cannot affect the detached child.
+    """
+    if os.name == "nt":
+        handle = getattr(child, "_handle", None)
+        close_handle = getattr(handle, "Close", None)
+        if callable(close_handle):
+            close_handle()
+        if hasattr(child, "_handle"):
+            child._handle = None
+    if hasattr(child, "_child_created"):
+        child._child_created = False
+
+
 def launch_process(
     *, receipt: str | Path, label: str, role: str, cwd: str | Path,
     argv: Sequence[str], expected_state_path: str | Path | None = None,
@@ -118,6 +138,7 @@ def launch_process(
             "expected_state_path": str(expected) if expected else None,
         }
         _finalize(receipt_path, result)
+        _release_detached_child_handle(child)
         return result
     except Exception as exc:
         cleanup_confirmed: bool | None = None

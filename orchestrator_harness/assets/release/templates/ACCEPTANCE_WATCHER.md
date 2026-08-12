@@ -1,5 +1,6 @@
 # Acceptance watcher record
 
-- Candidate commit and exact watcher PID-plus-creation identity:
+- Attempt ID and candidate commit:
+- Watcher identity, model, effort, tier, PID-plus-creation identity, and timestamps:
 - Read-only scope and `evaluator_enabled: false` proof:
-- Start, report, exit, and reap evidence:
+- Ready, heartbeat, report, abort (if any), exit, and reap evidence hashes:

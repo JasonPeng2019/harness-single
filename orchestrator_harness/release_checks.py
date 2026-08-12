@@ -3,9 +3,10 @@ from __future__ import annotations
 """One owning registry and selector for portable release checks.
 
 The registry is deliberately small and declarative.  It describes the checks
-that consume the public release surface; it does not run them.  A credit is
-usable only when its declared inputs, command, tier, and exact Git source
-identity still match the current checkout.
+that consume the public release surface; it does not run them.  A credit keeps
+its exact origin identity, but may travel only along the same repository,
+common directory, branch, and ancestor lineage when its declared inputs and
+check contract remain unchanged.
 """
 
 import argparse
@@ -30,6 +31,45 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _TIERS = frozenset({"fast", "affected", "full", "release"})
 _INTENTS = frozenset({"fast", "affected", "full", "release"})
+
+# This is the audited, intentionally small route manifest.  It follows the
+# actual imports used by public_launch -> operator_launch -> lane_controller,
+# including the primitives that establish invocation, provider, Git/result,
+# process, claim, lifecycle, and cleanup truth.  It is shared by the local
+# public journey and the optional real-agent journey; it is not a repository
+# walk or a caller-supplied domain shortcut.
+PUBLIC_ROUTE_DEPENDENCIES = (
+    "orchestrator_harness/public_launch.py",
+    "orchestrator_harness/operator_launch.py",
+    "orchestrator_harness/lane_controller.py",
+    "orchestrator_harness/invocation.py",
+    "orchestrator_harness/provider.py",
+    "orchestrator_harness/process_supervisor.py",
+    "orchestrator_harness/processes.py",
+    "orchestrator_harness/git_safety.py",
+    "orchestrator_harness/resource_locks.py",
+    "orchestrator_harness/lane_lifecycle.py",
+    "orchestrator_harness/models.py",
+    "orchestrator_harness/mutation.py",
+    "orchestrator_harness/stable_io.py",
+    "orchestrator_harness/profile.py",
+    "orchestrator_harness/prompt_bundle.py",
+    "orchestrator_harness/resume.py",
+    "orchestrator_harness/task.py",
+    "orchestrator_harness/cli.py",
+    "orchestrator_harness/config.py",
+    "harness_common/process_identity.py",
+)
+
+REAL_AGENT_ROUTE_DEPENDENCIES = PUBLIC_ROUTE_DEPENDENCIES + (
+    "orchestrator_harness/tests/real_agent_test.py",
+    "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
+    "orchestrator_harness/tests/support/wsl_codex_provider.py",
+    "orchestrator_harness/tests/support/wsl_public_route_entry.py",
+    "orchestrator_harness/tests/support/wsl_guarded_entry.py",
+    "orchestrator_harness/tests/support/cgroup_exec.py",
+    "orchestrator_harness/tests/support/allowlist_connect_proxy.py",
+)
 
 
 class SelectionError(ValueError):
@@ -276,14 +316,11 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "-m",
                 "unittest",
                 "-v",
-                "orchestrator_harness.tests.test_real_agent_isolation",
+                "orchestrator_harness.tests.test_s6_public_release.S6LocalIsolationTests",
             ),
             ("isolation-local",),
-            (
-                "orchestrator_harness/tests/test_real_agent_isolation.py",
-                "orchestrator_harness/tests/support/allowlist_connect_proxy.py",
-                "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
-            ),
+            REAL_AGENT_ROUTE_DEPENDENCIES
+            + ("orchestrator_harness/tests/test_s6_public_release.py",),
             estimated_duration_seconds=2.0,
         ),
         CheckSpec(
@@ -295,11 +332,8 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "S6PublicJourneyTests",
             ),
             ("public-launch", "controller-lifecycle"),
-            (
-                "orchestrator_harness/public_launch.py",
-                "orchestrator_harness/operator_launch.py",
-                "orchestrator_harness/lane_controller.py",
-                "orchestrator_harness/lane_lifecycle.py",
+            PUBLIC_ROUTE_DEPENDENCIES
+            + (
                 "examples/disposable_coding_fixture.py",
                 "orchestrator_harness/tests/test_s6_public_release.py",
             ),
@@ -346,14 +380,135 @@ def _registry() -> tuple[CheckSpec, ...]:
             "affected",
             ("python", "orchestrator_harness/tests/real_agent_test.py"),
             ("isolation-real-agent",),
-            (
-                "orchestrator_harness/tests/real_agent_test.py",
-                "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
-                "orchestrator_harness/tests/support/wsl_guarded_entry.py",
-            ),
+            REAL_AGENT_ROUTE_DEPENDENCIES,
             external_requirements=("WSL2", "Codex provider", "ephemeral auth"),
             platform_requirements=("windows", "wsl2"),
             estimated_duration_seconds=120.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.RUFF",
+            "accumulated Ruff check",
+            "release",
+            ("python", "-m", "ruff", "check", "."),
+            ("release-ruff",),
+            (
+                "orchestrator_harness/pyproject.toml",
+                "tools/Invoke-CandidateSafeguard.ps1",
+            ),
+            estimated_duration_seconds=15.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.FORMAT",
+            "accumulated Ruff format check",
+            "release",
+            ("python", "-m", "ruff", "format", "--check", "."),
+            ("release-format",),
+            (
+                "orchestrator_harness/pyproject.toml",
+                "tools/Invoke-CandidateSafeguard.ps1",
+            ),
+            estimated_duration_seconds=15.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.BASEDPYRIGHT",
+            "retained BasedPyright baseline check",
+            "release",
+            ("python", "-m", "basedpyright", "--project", "pyrightconfig.json"),
+            ("release-basedpyright",),
+            (
+                "orchestrator_harness/pyproject.toml",
+                "tools/Invoke-CandidateSafeguard.ps1",
+            ),
+            estimated_duration_seconds=30.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.COMPILE",
+            "accumulated Python compilation",
+            "release",
+            (
+                "python",
+                "-m",
+                "compileall",
+                "-q",
+                "orchestrator_harness",
+                "harness_watcher_implementation",
+                "firmware_acceptance",
+            ),
+            ("release-compile",),
+            (
+                "orchestrator_harness/pyproject.toml",
+                "harness_watcher_implementation/__init__.py",
+                "firmware_acceptance/__init__.py",
+            ),
+            estimated_duration_seconds=10.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.ORCHESTRATOR-UNIT",
+            "accumulated orchestrator unit discovery",
+            "release",
+            (
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "orchestrator_harness/tests",
+                "-t",
+                ".",
+                "-v",
+            ),
+            ("release-orchestrator-unit",),
+            (
+                "orchestrator_harness/tests/test_s6_public_release.py",
+                "orchestrator_harness/tests/test_coding_lane_controller.py",
+            ),
+            estimated_duration_seconds=120.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.WATCHER-UNIT",
+            "accumulated watcher unit discovery",
+            "release",
+            (
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "harness_watcher_implementation/tests",
+                "-t",
+                ".",
+                "-v",
+            ),
+            ("release-watcher-unit",),
+            (
+                "harness_watcher_implementation/__init__.py",
+                "harness_watcher_implementation/tests/test_attention.py",
+            ),
+            estimated_duration_seconds=120.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.ATTENTION",
+            "attention-retention practical",
+            "release",
+            ("python", "harness_watcher_implementation/tests/run_attention_practical.py"),
+            ("release-attention",),
+            (
+                "harness_watcher_implementation/tests/run_attention_practical.py",
+                "harness_watcher_implementation/tests/test_attention_practical_retention.py",
+            ),
+            estimated_duration_seconds=30.0,
+        ),
+        CheckSpec(
+            "S6.RELEASE.SYNTHETIC-CLEANUP",
+            "synthetic cleanup guard",
+            "release",
+            ("python", "orchestrator_harness/tests/wsl_cleanup_guard_test.py"),
+            ("release-synthetic-cleanup",),
+            (
+                "orchestrator_harness/tests/wsl_cleanup_guard_test.py",
+                "orchestrator_harness/tests/support/wsl_cleanup_fixture_driver.py",
+            ),
+            estimated_duration_seconds=20.0,
         ),
         CheckSpec(
             RELEASE_AGGREGATE_ID,
@@ -597,10 +752,40 @@ def _valid_credit_shape(credit: Mapping[str, Any]) -> bool:
     )
 
 
-def _source_matches(value: object, expected: SourceIdentity) -> bool:
+def _is_ancestor(root: Path, origin_tip: str, current_tip: str) -> bool:
+    if not _COMMIT.fullmatch(origin_tip) or not _COMMIT.fullmatch(current_tip):
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", origin_tip, current_tip],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _source_matches(value: object, expected: SourceIdentity, root: Path) -> bool:
+    """Validate origin identity without requiring the current tip to be unchanged."""
+
     if not isinstance(value, Mapping):
         return False
-    return dict(value) == expected.to_record()
+    origin_root = value.get("source_root")
+    origin_common = value.get("git_common_dir")
+    origin_branch = value.get("branch")
+    origin_tip = value.get("tip")
+    if (
+        origin_root != expected.source_root
+        or origin_common != expected.git_common_dir
+        or origin_branch != expected.branch
+        or not isinstance(origin_tip, str)
+    ):
+        return False
+    return _is_ancestor(root, origin_tip.lower(), expected.tip)
 
 
 def _eligible(
@@ -686,15 +871,20 @@ def select_checks(
     selected: list[SelectedCheck] = []
     for spec in CHECK_REGISTRY:
         credit = by_id.get(spec.stable_id)
+        changed_dependency = bool(
+            (changed_paths is not None or normalized_domains)
+            and spec.consumes(path_set, domain_set)
+        )
         is_valid = bool(
             credit is not None
             and spec.stable_id not in ambiguous
             and _valid_credit_shape(credit)
-            and _source_matches(credit.get("source"), source)
+            and _source_matches(credit.get("source"), source, Path(source.source_root))
             and credit.get("tier") == spec.tier
             and credit.get("command") == list(spec.command)
             and credit.get("output_contract") == spec.output_contract
             and credit.get("dependency_fingerprint") == fingerprints[spec.stable_id]
+            and not changed_dependency
         )
         if is_valid:
             preserved.append(spec.stable_id)
@@ -792,6 +982,8 @@ if __name__ == "__main__":
 __all__ = [
     "CHECK_REGISTRY",
     "CREDIT_SCHEMA",
+    "PUBLIC_ROUTE_DEPENDENCIES",
+    "REAL_AGENT_ROUTE_DEPENDENCIES",
     "RELEASE_AGGREGATE_ID",
     "SELECTION_SCHEMA",
     "CheckSpec",

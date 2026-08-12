@@ -334,10 +334,32 @@ class ProcessBoundary:
                         history_by_pid = {item.pid: item for item in self.history}
                         for pid in sorted(member_pids):
                             item = by_pid.get(pid)
+                            absent_proven = False
                             if item is None and os.name == "nt":
-                                direct = windows_process_query(pid)
-                                item = direct.process if direct.complete else None
+                                # A Job Object can retain a just-exited child
+                                # briefly after CIM has stopped reporting it.
+                                # Re-query the exact PID before declaring the
+                                # boundary incomplete; an authoritative empty
+                                # query proves that no replacement process is
+                                # being hidden under the same PID.
+                                for retry in range(3):
+                                    direct = windows_process_query(pid)
+                                    if not direct.complete:
+                                        break
+                                    item = direct.process
+                                    if item is not None or retry == 2:
+                                        absent_proven = item is None
+                                        break
+                                    time.sleep(0.02)
                             if item is None or item.created_utc is None:
+                                if item is None and absent_proven:
+                                    # The member was absent from the complete
+                                    # process snapshot and from bounded exact
+                                    # PID queries.  It is a stale containment
+                                    # listing, not a live or identity-unknown
+                                    # process, so do not turn normal reaping
+                                    # into a false retained claim.
+                                    continue
                                 if item is None and pid in history_by_pid and history_by_pid[pid].created_utc is not None:
                                     # A job can retain a recently reaped PID
                                     # for one query.  It is safe to classify

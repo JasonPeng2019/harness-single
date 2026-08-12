@@ -58,11 +58,14 @@
 ## Release checks
 
 - Use `python -m orchestrator_harness.release_checks` as the one stable-ID registry/selector.
-- Credit requires declared-input fingerprints plus exact source root, Git common directory,
-  branch, and full tip. Unknown or stale credit is not green evidence.
+- Credit requires declared-input fingerprints plus exact source root, Git common directory, and
+  branch; its origin tip must remain an ancestor of the current tip. Unknown, divergent, mixed,
+  or stale credit is not green evidence.
 - Fast selection is local; WSL/real-agent and accumulated release assurance are never default-fast.
 - `tools/Invoke-CandidateSafeguard.ps1` accepts an exact repository root and reads its branch/tip;
-  it has no developer checkout path. The safeguard is candidate-only and release-owned.
+  it can consume selector credit and rechecks root/common-directory/branch/tip, baseline/config,
+  and cleanliness after each selector-owned component. It has no developer checkout path. The
+  safeguard is candidate-only and release-owned.
 
 ## Firmware compatibility
 

@@ -105,6 +105,8 @@ def _fake_worker(argv: Sequence[str]) -> int:
         return 2
     lane, delay_text = argv[1:3]
     delay = float(delay_text)
+    worker_invocation_id = argv[3] if len(argv) > 3 else f"{lane}-001"
+    emit_result = len(argv) <= 4 or argv[4] == "write-result"
     _ = sys.stdin.buffer.read()
     print(
         json.dumps({"type": "thread.started", "thread_id": f"fixture-{lane}"}),
@@ -116,23 +118,25 @@ def _fake_worker(argv: Sequence[str]) -> int:
         f"# {lane} checkpoint\n\nFake worker started.\n", encoding="utf-8"
     )
     time.sleep(delay)
-    if lane in {"alpha", "beta"}:
+    if lane in {"alpha", "beta", "beta-success"}:
         value = 1 if lane == "alpha" else 2
-        (Path.cwd() / f"feature_{lane}.py").write_text(
-            f"def value() -> int:\n    return {value}\n", encoding="utf-8"
-        )
-        _git(Path.cwd(), "add", f"feature_{lane}.py")
-        _git(Path.cwd(), "commit", "-m", f"Add {lane} feature")
+        feature_lane = "alpha" if lane == "alpha" else "beta"
+        feature = Path.cwd() / f"feature_{feature_lane}.py"
+        content = f"def value() -> int:\n    return {value}\n"
+        if not feature.exists() or feature.read_text(encoding="utf-8") != content:
+            feature.write_text(content, encoding="utf-8")
+            _git(Path.cwd(), "add", f"feature_{feature_lane}.py")
+            _git(Path.cwd(), "commit", "-m", f"Add {lane} feature")
     elif lane == "merge":
         _run((sys.executable, "-m", "unittest", "-v"), cwd=Path.cwd())
     else:
         return 2
-    if lane != "beta":
+    if emit_result:
         branch = _git(Path.cwd(), "branch", "--show-current")
         commit = _git(Path.cwd(), "rev-parse", "HEAD")
         _write_json(
             workspace / "RESULT.json",
-            _result(lane, f"{lane}-001", branch, commit, f"{lane} fixture work passed"),
+            _result(lane, worker_invocation_id, branch, commit, f"{lane} fixture work passed"),
         )
     last_message_index = next(
         (index for index, value in enumerate(argv) if value == "--output-last-message"),
@@ -154,6 +158,9 @@ def _invocation(
     runtime: Path,
     delay: float,
     merge_inputs: list[str] | None = None,
+    worker_invocation_id: str | None = None,
+    emit_result: bool = True,
+    status_suffix: str = "",
 ) -> Path:
     workspace = worktree / ".agent-workspace"
     workspace.mkdir(exist_ok=True)
@@ -162,6 +169,7 @@ def _invocation(
         f"Complete the disposable {lane} coding lane.\n", encoding="utf-8"
     )
     branch = _git(worktree, "branch", "--show-current")
+    worker_id = worker_invocation_id or f"{lane}-001"
     invocation = {
         "schema": "orchestrator-coding-invocation/v1",
         "action": "start",
@@ -178,14 +186,14 @@ def _invocation(
         "prompt_path": str(prompt),
         "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
         "output_paths": {
-            "status": str(workspace / "fixture_controller.status.json"),
+            "status": str(workspace / f"fixture_controller{status_suffix}.status.json"),
             "jsonl": str(workspace / "fixture_codex.jsonl"),
             "stderr": str(workspace / "fixture_codex.stderr.log"),
             "last_message": str(workspace / "fixture_last_message.txt"),
         },
         "event_log_path": str(runtime / "LANE_EVENTS.jsonl"),
         "lane_id": lane,
-        "worker_invocation_id": f"{lane}-001",
+        "worker_invocation_id": worker_id,
         "task": f"Disposable {lane} coding work",
         "phase": "merge" if lane == "merge" else "implementation",
         "exclusive_resources": [] if lane == "merge" else [FIXTURE_RESOURCE],
@@ -196,6 +204,8 @@ def _invocation(
                 "_fake_worker",
                 lane,
                 str(delay),
+                worker_id,
+                "write-result" if emit_result else "no-result",
             ],
             "model": "fixture-model",
             "reasoning_effort": "low",
@@ -220,8 +230,11 @@ def _controller_env() -> dict[str, str]:
 def _start_controller(invocation: Path) -> dict[str, Any]:
     """Use the same operator-launch -> lane-controller path as a manager."""
 
-    status_path = invocation.parent / "fixture_controller.status.json"
-    receipt_path = invocation.parent / "fixture_operator_launch.json"
+    raw = json.loads(invocation.read_text(encoding="utf-8"))
+    status_path = Path(raw["output_paths"]["status"])
+    status_name = status_path.name
+    suffix = status_name.removeprefix("fixture_controller").removesuffix(".status.json")
+    receipt_path = invocation.parent / f"fixture_operator_launch{suffix}.json"
     return launch_lane_controller(
         invocation,
         receipt=receipt_path,
@@ -246,7 +259,7 @@ def _wait_for_status(
     raise FixtureError(f"timed out waiting for status condition in {path}")
 
 
-def _finish_controller(receipt: Mapping[str, Any]) -> None:
+def _finish_controller(receipt: Mapping[str, Any]) -> dict[str, Any]:
     pid = receipt.get("pid")
     created_utc = receipt.get("created_utc")
     if not isinstance(pid, int) or not isinstance(created_utc, str):
@@ -259,7 +272,15 @@ def _finish_controller(receipt: Mapping[str, Any]) -> None:
         if snapshot.complete:
             process = snapshot.by_pid.get(pid)
             if process is None or iso_utc(process.created_utc) != created_utc:
-                return
+                status_path = Path(str(receipt["expected_state_path"]))
+                return _wait_for_status(
+                    status_path,
+                    lambda value: value.get("state") in {
+                        "CODEX_EXITED",
+                        "CONTROLLER_FAILED",
+                        "LAUNCH_FAILED",
+                    },
+                )
         time.sleep(0.05)
     raise FixtureError(
         f"controller PID {pid} with creation identity {created_utc} did not exit"
@@ -344,6 +365,7 @@ def run_fixture(root: Path) -> dict[str, object]:
         base_commit=base_commit,
         runtime=runtime,
         delay=0.0,
+        emit_result=False,
     )
     _write_json(
         beta / ".agent-workspace" / "RESULT.json",
@@ -362,19 +384,48 @@ def run_fixture(root: Path) -> dict[str, object]:
     _wait_for_status(
         beta_status, lambda value: value.get("state") == "WAITING_RESOURCE"
     )
-    _finish_controller(alpha_process)
-    _finish_controller(beta_process)
-    stale_status = json.loads(beta_status.read_text(encoding="utf-8"))
+    alpha_status_value = _finish_controller(alpha_process)
+    stale_status = _finish_controller(beta_process)
     if stale_status.get("result_validation", {}).get("state") != "INVALID":
         raise FixtureError("stale result was not rejected")
 
-    beta_commit = _git(beta, "rev-parse", "HEAD")
-    _write_json(
-        beta / ".agent-workspace" / "RESULT.json",
-        _result(
-            "beta", "beta-001", "lane/beta", beta_commit, "beta fixture work passed"
-        ),
+    if (
+        alpha_status_value.get("state") != "CODEX_EXITED"
+        or alpha_status_value.get("exit_code") != 0
+        or alpha_status_value.get("result_valid") is not True
+    ):
+        raise FixtureError("alpha controller did not validate a successful result")
+
+    beta_success = worktrees / "beta-success"
+    beta_head = _git(beta, "rev-parse", "HEAD")
+    _git(
+        project,
+        "worktree",
+        "add",
+        "-b",
+        "lane/beta-success",
+        str(beta_success),
+        beta_head,
     )
+    beta_success_invocation = _invocation(
+        lane="beta-success",
+        worktree=beta_success,
+        common_dir=common_dir,
+        base_commit=base_commit,
+        runtime=runtime,
+        delay=0.0,
+        worker_invocation_id="beta-success-001",
+        emit_result=True,
+        status_suffix="-success",
+    )
+    beta_success_process = _start_controller(beta_success_invocation)
+    beta_success_value = _finish_controller(beta_success_process)
+    if (
+        beta_success_value.get("state") != "CODEX_EXITED"
+        or beta_success_value.get("exit_code") != 0
+        or beta_success_value.get("result_valid") is not True
+    ):
+        raise FixtureError("beta-success controller did not validate a distinct successful result")
     scan = json.loads(_harness(config, "scan", "--no-write").stdout)
     lanes = scan.get("lanes", [])
     coding_lanes = [lane for lane in lanes if lane.get("lane_id") in {"alpha", "beta"}]
@@ -435,7 +486,13 @@ def run_fixture(root: Path) -> dict[str, object]:
         merge_inputs=["lane/alpha", "lane/beta"],
     )
     merge_process = _start_controller(merge_invocation)
-    _finish_controller(merge_process)
+    merge_status_value = _finish_controller(merge_process)
+    if (
+        merge_status_value.get("state") != "CODEX_EXITED"
+        or merge_status_value.get("exit_code") != 0
+        or merge_status_value.get("result_valid") is not True
+    ):
+        raise FixtureError("merge controller did not validate a successful result")
     tests = _run((sys.executable, "-m", "unittest", "-v"), cwd=merge)
     remaining_claims = list((runtime / "coding-resource-locks").glob("*.json"))
     if remaining_claims:
@@ -445,11 +502,11 @@ def run_fixture(root: Path) -> dict[str, object]:
     return {
         "schema": "orchestrator-disposable-coding-fixture/v1",
         "base_commit": base_commit,
-        "branches": ["lane/alpha", "lane/beta", "integration/merge"],
-        "coding_lane_count": 3,
+        "branches": ["lane/alpha", "lane/beta", "lane/beta-success", "integration/merge"],
+        "coding_lane_count": 4,
         "contention_observed": True,
         "stale_result_rejected": True,
-        "valid_results": ["alpha", "beta", "merge"],
+        "valid_results": ["alpha", "beta-success", "merge"],
         "acknowledged_event_id": event_id,
         "s3_queue_pending_after_ack": len(router.pending_events()),
         "s3_queue_root": str(manager_queue),

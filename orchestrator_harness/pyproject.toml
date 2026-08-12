@@ -11,11 +11,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
-package-dir = { orchestrator_harness = "." }
+package-dir = { orchestrator_harness = ".", harness_common = "../harness_common" }
 packages = [
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
+    "harness_common",
 ]
 
 [tool.setuptools.package-data]
@@ -30,11 +31,18 @@ orchestrator_harness = [
 
 [tool.setuptools.data-files]
 "examples" = [
-    "../examples/*.json",
-    "../examples/*.md",
-    "../examples/*.py",
+    "../examples/coding.invocation.example.json",
+    "../examples/coding.named-lock.example.json",
+    "../examples/coding.result.example.json",
+    "../examples/disposable_coding_fixture.py",
+    "../examples/dual-path-manager.example.md",
+    "../examples/harness.example.json",
+    "../examples/legacy-firmware.invocation.example.json",
+    "../examples/watcher.diagnostic.example.json",
+    "assets/release/examples/*.json",
+    "assets/release/examples/*.md",
 ]
-"release_evidence_templates" = ["../release_evidence_templates/*.md"]
+"release_evidence_templates" = ["assets/release/templates/*.md"]
 
 [tool.pyright]
 pythonVersion = "3.11"

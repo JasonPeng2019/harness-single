@@ -67,7 +67,8 @@ Fast is local and never selects the WSL/real-agent journey or accumulated releas
 Affected selection includes only consumers of the supplied dependency paths/domains; full/release
 may enumerate every check, including the ROOT-owned safeguard, but this producer does not run
 that accumulated gate. Credit is reusable only with the same canonical declared-input
-fingerprints and exact source root, Git common directory, branch, and full tip. Missing, stale,
+fingerprints and exact source root, Git common directory, and branch, while its origin tip remains
+an ancestor of the current tip. Missing, stale,
 malformed, unknown, or mixed-root credit is selected again.
 
 `examples/public-coding-launch.example.md` and `examples/release-selection.example.json` are
@@ -166,7 +167,8 @@ The firmware-v2 static acceptance material is in `firmware_acceptance/`. The ret
 `examples/dual-path-manager.example.md` show how legacy firmware and coding V1 coexist without a
 schema migration or an alternate event loop. `QUICK_START.md` contains the release-role assignments,
 fresh-epoch/operator commands, exact identity cleanup procedure, and the candidate-only safeguard
-entry point. Release record shells are intentionally small and live in `release_evidence_templates/`.
+entry point. Release record shells are intentionally small and live in `release_evidence_templates/`;
+the packaged canonical copies are listed by `orchestrator_harness.release_assets`.
 
 ## Documentation
 
