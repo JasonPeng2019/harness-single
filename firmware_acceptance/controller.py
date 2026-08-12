@@ -20,8 +20,11 @@ from typing import Any, Callable, Protocol
 
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import ResourceClaims
+from orchestrator_harness.capability_broker import CapabilityBroker, CapabilityResult
 from harness_common.process_identity import exact_process_identity
 from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256, reject_linked_path, validate_delegated_authorization
+from .campaign_pack import DEFAULT_CAMPAIGN_PACK, FirmwareCampaignPack
+from .capability_adapter import FirmwareHardwareAdapter
 
 
 class StdioProcess(Protocol):
@@ -110,6 +113,7 @@ def _launch(config: dict[str, Any]) -> StdioProcess:
     return subprocess.Popen(  # type: ignore[return-value]
         config["mcp_command"], cwd=config["working_directory"], env=config["environment"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        **dict(config.get("popen_kwargs", {})),
     )
 
 
@@ -144,8 +148,8 @@ def _server_run_id(guidance: str) -> str:
 
 class _StdioTransport:
     """The controller's only stdio owner: one writer and permanent stdout/stderr drains."""
-    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float, stderr_path: Path | None = None) -> None:
-        self.process, self.remaining, self.io_cap = process, remaining, io_cap
+    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float, stderr_path: Path | None = None, authority_check: Callable[[], bool] | None = None) -> None:
+        self.process, self.remaining, self.io_cap, self.authority_check = process, remaining, io_cap, authority_check
         self.stderr_path = stderr_path
         try: self.stderr_log = stderr_path.open("xb") if stderr_path is not None else None
         except OSError as exc: raise AdmissionError("MCP stderr log path is unavailable") from exc
@@ -158,6 +162,8 @@ class _StdioTransport:
 
     def _wait(self, event: threading.Event, label: str) -> None:
         while not event.is_set():
+            if self.authority_check is not None and not self.authority_check():
+                raise AdmissionError("MCP " + label + " authority expired")
             remaining = self._budget()
             if remaining <= 0: raise AdmissionError("MCP " + label + " timed out")
             event.wait(min(remaining, 0.02))
@@ -167,6 +173,7 @@ class _StdioTransport:
 
     def send(self, value: dict[str, Any], label: str) -> None:
         if not self.accepting.is_set() or self.stop.is_set() or self.process.stdin is None: raise AdmissionError("MCP stdin is unavailable")
+        if self.authority_check is not None and not self.authority_check(): raise AdmissionError("MCP " + label + " authority expired before enqueue")
         done, errors = threading.Event(), []
         self.writes.put((json.dumps(value, separators=(",", ":")).encode() + b"\n", done, errors))
         self._wait(done, label)
@@ -252,6 +259,7 @@ class _StdioTransport:
             except queue.Empty: continue
             try:
                 if self.process.stdin is None: raise OSError("stdin unavailable")
+                if self.authority_check is not None and not self.authority_check(): raise AdmissionError("MCP writer authority expired before I/O")
                 self.process.stdin.write(data); self.process.stdin.flush()
             except BaseException as exc: errors.append(exc)
             finally: done.set()
@@ -297,9 +305,22 @@ def _scrubbed_environment(config: dict[str, Any]) -> dict[str, str]:
 class FirmwareAcceptanceController:
     """Two-phase controller that alone owns the MCP stdio process and physical capability."""
 
-    def __init__(self, broker: AcceptanceBroker, *, launcher: Launcher | None = None, clock: Callable[[], float] = time.monotonic, identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity, claims_factory: Callable[[str, str], Any] | None = None, io_timeout: float = 5.0, topology: dict[str, Any] | None = None, session_root_for: Callable[[dict[str, Any]], Path] | None = None, lane_root_for: Callable[[str], Path] | None = None) -> None:
+    def __init__(
+        self,
+        broker: AcceptanceBroker,
+        *,
+        launcher: Launcher | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        identity_provider: Callable[[int], dict[str, Any] | None] = _process_identity,
+        claims_factory: Callable[[str, str], Any] | None = None,
+        io_timeout: float = 5.0,
+        topology: dict[str, Any] | None = None,
+        session_root_for: Callable[[dict[str, Any]], Path] | None = None,
+        lane_root_for: Callable[[str], Path] | None = None,
+    ) -> None:
         self.broker, self.launcher, self.clock, self.identity_provider = broker, launcher or _launch, clock, identity_provider
         self.claims_factory, self.io_timeout = claims_factory, io_timeout
+        self._capability_state_root = _safe_child(self.broker.root, "capability-state")
         self._live_claims: Any | None = None
         self._live_claim: dict[str, Any] | None = None
         self._proposal_binding: tuple[Path, str] | None = None
@@ -308,6 +329,88 @@ class FirmwareAcceptanceController:
         self.session_root_for = session_root_for
         self.lane_root_for = lane_root_for
         self._session: dict[str, Any] | None = None
+
+    @property
+    def capability_state_root(self) -> Path:
+        """Return the immutable ledger namespace selected at construction."""
+
+        return self._capability_state_root
+
+    def make_capability_adapter(
+        self,
+        *,
+        snapshot_provider: Callable[[Any], Any],
+        campaign_pack: FirmwareCampaignPack = DEFAULT_CAMPAIGN_PACK,
+    ) -> FirmwareHardwareAdapter:
+        """Build the controller-owned hardware adapter without exposing its transport."""
+
+        def config_provider(request: Any, operation: Any) -> dict[str, Any]:
+            config = self.broker.controller_config(
+                request.lane_id,
+                {},
+                lane_root=(self.lane_root_for(request.lane_id) if self.lane_root_for is not None else None),
+            )
+            return {**config, "environment": _scrubbed_environment(config)}
+
+        def transport_factory(process: Any, remaining: Callable[[], float], request_id: str, config: dict[str, Any]) -> _StdioTransport:
+            stderr_path = _safe_child(Path(config["roots"]["logs"]), request_id + ".stderr.log")
+            return _StdioTransport(process, remaining, self.io_timeout, stderr_path, config.get("_authority_check"))
+
+        controller_authority = {
+            "manifest": self.broker.manifest,
+            "policy": self.broker.policy,
+            "templates": self.broker.templates,
+            "manifest_path": self.broker.manifest_path,
+            "policy_path": self.broker.policy_path,
+            "templates_path": self.broker.templates_path,
+        }
+
+        return FirmwareHardwareAdapter(
+            campaign_pack=campaign_pack,
+            controller_authority=controller_authority,
+            snapshot_provider=snapshot_provider,
+            launcher=self.launcher,
+            identity_provider=self.identity_provider,
+            config_provider=config_provider,
+            transport_factory=transport_factory,
+            clock=self.clock,
+            io_timeout=self.io_timeout,
+        )
+
+    def execute_capability_request(
+        self,
+        request: dict[str, Any],
+        approval: dict[str, Any],
+        verifier: SignatureVerifier | Any,
+        *,
+        adapter: Any | None = None,
+        snapshot_provider: Callable[[Any], Any] | None = None,
+        policy_verifier: Callable[[Any, Any, Any], bool] | None = None,
+        identity_provider: Callable[[], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Run the generic broker while retaining the legacy controller entrypoint."""
+
+        if adapter is None:
+            if snapshot_provider is None:
+                raise AdmissionError("capability snapshot provider is required")
+            adapter = self.make_capability_adapter(snapshot_provider=snapshot_provider)
+        if policy_verifier is None:
+            candidate = getattr(adapter, "verify_approval", None)
+            if not callable(candidate):
+                raise AdmissionError("capability adapter has no policy verifier")
+            policy_verifier = candidate
+        claims_factory = self.claims_factory or self._claims
+        broker = CapabilityBroker(
+            adapter,
+            approval_verifier=verifier,
+            policy_verifier=policy_verifier,
+            identity_provider=identity_provider,
+            claims_factory=claims_factory,
+            state_root=self._capability_state_root,
+            clock=self.clock,
+        )
+        result: CapabilityResult = broker.execute(request, approval)
+        return result.to_record()
 
     # Session APIs deliberately remain narrow: this controller owns exactly one
     # session/claim/child, and callers can only provide signed call artifacts.

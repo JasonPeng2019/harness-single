@@ -24,6 +24,22 @@ from .codex_adapter import (
     run_installed_codex_hook,
 )
 from .lane_lifecycle import ImmutableSourceView, RetirementResult
+from .capability_broker import (
+    AdapterResult,
+    CapabilityAdapter,
+    CapabilityAdapterError,
+    CapabilityAdapterUnavailable,
+    CapabilityApproval,
+    CapabilityBroker,
+    CapabilityDenied,
+    CapabilityError,
+    CapabilityPermit,
+    CapabilityRequest,
+    CapabilityResult,
+    CapabilitySnapshot,
+    CleanupEvidence,
+    FakeCapabilityAdapter,
+)
 
 __all__ = [
     "CANONICAL_INVOCATION_SCHEMA",
@@ -49,6 +65,20 @@ __all__ = [
     "ImmutableSourceView",
     "ManagerEventAck",
     "RetirementResult",
+    "AdapterResult",
+    "CapabilityAdapter",
+    "CapabilityAdapterError",
+    "CapabilityAdapterUnavailable",
+    "CapabilityApproval",
+    "CapabilityBroker",
+    "CapabilityDenied",
+    "CapabilityError",
+    "CapabilityPermit",
+    "CapabilityRequest",
+    "CapabilityResult",
+    "CapabilitySnapshot",
+    "CleanupEvidence",
+    "FakeCapabilityAdapter",
     "run_installed_codex_hook",
     "SyntheticCodexTransport",
 ]
