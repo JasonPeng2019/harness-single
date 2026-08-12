@@ -20,8 +20,11 @@ from typing import Any, Callable, Protocol
 
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import ResourceClaims
+from orchestrator_harness.capability_broker import CapabilityBroker, CapabilityResult
 from harness_common.process_identity import exact_process_identity
 from .kit import AcceptanceBroker, AdmissionError, SignatureVerifier, _safe_child, _write_new, canonical_decision_payload, canonical_sha256, raw_result_sha256, reject_linked_path, validate_delegated_authorization
+from .campaign_pack import DEFAULT_CAMPAIGN_PACK, FirmwareCampaignPack
+from .capability_adapter import FirmwareHardwareAdapter
 
 
 class StdioProcess(Protocol):
@@ -308,6 +311,71 @@ class FirmwareAcceptanceController:
         self.session_root_for = session_root_for
         self.lane_root_for = lane_root_for
         self._session: dict[str, Any] | None = None
+
+    def make_capability_adapter(
+        self,
+        *,
+        snapshot_provider: Callable[[Any], Any],
+        campaign_pack: FirmwareCampaignPack = DEFAULT_CAMPAIGN_PACK,
+    ) -> FirmwareHardwareAdapter:
+        """Build the controller-owned hardware adapter without exposing its transport."""
+
+        def config_provider(request: Any, operation: Any) -> dict[str, Any]:
+            config = self.broker.controller_config(
+                request.lane_id,
+                {},
+                lane_root=(self.lane_root_for(request.lane_id) if self.lane_root_for is not None else None),
+            )
+            return {**config, "environment": _scrubbed_environment(config)}
+
+        def transport_factory(process: Any, remaining: Callable[[], float], request_id: str, config: dict[str, Any]) -> _StdioTransport:
+            stderr_path = _safe_child(Path(config["roots"]["logs"]), request_id + ".stderr.log")
+            return _StdioTransport(process, remaining, self.io_timeout, stderr_path)
+
+        return FirmwareHardwareAdapter(
+            campaign_pack=campaign_pack,
+            snapshot_provider=snapshot_provider,
+            launcher=self.launcher,
+            identity_provider=self.identity_provider,
+            config_provider=config_provider,
+            transport_factory=transport_factory,
+            clock=self.clock,
+            io_timeout=self.io_timeout,
+        )
+
+    def execute_capability_request(
+        self,
+        request: dict[str, Any],
+        approval: dict[str, Any],
+        verifier: SignatureVerifier | Any,
+        *,
+        adapter: Any | None = None,
+        snapshot_provider: Callable[[Any], Any] | None = None,
+        policy_verifier: Callable[[Any, Any, Any], bool] | None = None,
+        identity_provider: Callable[[], dict[str, Any] | None] | None = None,
+    ) -> dict[str, Any]:
+        """Run the generic broker while retaining the legacy controller entrypoint."""
+
+        if adapter is None:
+            if snapshot_provider is None:
+                raise AdmissionError("capability snapshot provider is required")
+            adapter = self.make_capability_adapter(snapshot_provider=snapshot_provider)
+        if policy_verifier is None:
+            candidate = getattr(adapter, "verify_approval", None)
+            if not callable(candidate):
+                raise AdmissionError("capability adapter has no policy verifier")
+            policy_verifier = candidate
+        claims_factory = self.claims_factory or self._claims
+        broker = CapabilityBroker(
+            adapter,
+            approval_verifier=verifier,
+            policy_verifier=policy_verifier,
+            identity_provider=identity_provider,
+            claims_factory=claims_factory,
+            clock=self.clock,
+        )
+        result: CapabilityResult = broker.execute(request, approval)
+        return result.to_record()
 
     # Session APIs deliberately remain narrow: this controller owns exactly one
     # session/claim/child, and callers can only provide signed call artifacts.
