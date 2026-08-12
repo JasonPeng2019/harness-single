@@ -7,13 +7,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from contextlib import ExitStack
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as lane_controller
+from orchestrator_harness import codex_adapter, mutation
 
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
+    CodexAdapterError,
     SyntheticCodexTransport,
     activate_codex_binding,
     check_codex_adapter,
@@ -43,6 +46,261 @@ from orchestrator_harness.notifications import ManagerEventRouter
 
 
 class S4ContractTests(unittest.TestCase):
+    def test_S4_ROOT_R10_PACKAGED_ROOTED_AND_DRIVE_RELATIVE_REJECT_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        for destination in (r"\escape.py", "C:escape.py"):
+            with self.subTest(destination=destination):
+                calls: list[str] = []
+
+                def substitute(name: str) -> bytes:
+                    calls.append(name)
+                    data = original_resource(name)
+                    if name == "manifest.json":
+                        manifest = json.loads(data.decode("utf-8"))
+                        manifest["files"][0]["destination"] = destination
+                        return json.dumps(manifest).encode("utf-8")
+                    if name == "orchestrator_harness_post_tool_use.py":
+                        self.fail("root reproduction read the named hook resource")
+                    return data
+
+                with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                    with self.assertRaises(CodexAdapterError):
+                        codex_adapter.packaged_codex_assets()
+                self.assertEqual(["manifest.json"], calls)
+
+    def test_S4_CODEX_PACKAGED_ASSET_CANONICALIZATION_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def crlf_resource(name: str) -> bytes:
+            data = original_resource(name)
+            if name == "orchestrator_harness_post_tool_use.py":
+                return data.replace(b"\n", b"\r\n")
+            if name == "orchestrator_harness_stop.py":
+                lines = data.splitlines(keepends=True)
+                return b"".join(
+                    line.replace(b"\n", b"\r\n") if index % 2 else line
+                    for index, line in enumerate(lines)
+                )
+            return data
+
+        with patch.object(codex_adapter, "_package_resource", side_effect=crlf_resource):
+            assets = codex_adapter.packaged_codex_assets()
+        for relative, resource in (
+            (Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), "orchestrator_harness_post_tool_use.py"),
+            (Path(".codex/hooks/orchestrator_harness_stop.py"), "orchestrator_harness_stop.py"),
+        ):
+            expected = original_resource(resource)
+            self.assertEqual(expected, assets[relative])
+            self.assertNotIn(b"\r\n", assets[relative])
+            self.assertNotIn(b"\r", assets[relative])
+
+    def test_S4_CODEX_PACKAGED_ASSET_INTEGRITY_REJECTS_NONCANONICAL_INPUT_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+        resource_name = "orchestrator_harness_post_tool_use.py"
+        original = original_resource(resource_name)
+
+        def expect_rejected(transform) -> None:
+            def substitute(name: str) -> bytes:
+                data = original_resource(name)
+                return transform(data) if name == resource_name else data
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+
+        with self.subTest(case="invalid-utf8"):
+            expect_rejected(lambda data: data + b"\xff")
+        with self.subTest(case="bom"):
+            expect_rejected(lambda data: b"\xef\xbb\xbf" + data)
+        with self.subTest(case="lone-carriage-return"):
+            expect_rejected(lambda data: data + b"\r")
+        with self.subTest(case="non-newline-mutation"):
+            self.assertIn(b"import", original)
+            expect_rejected(lambda data: data.replace(b"import", b"IMPORT", 1))
+
+    def test_S4_CODEX_PACKAGED_ASSET_MODE_is_closed_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def expect_rejected(mode_marker: object) -> None:
+            def substitute(name: str) -> bytes:
+                data = original_resource(name)
+                if name != "manifest.json":
+                    return data
+                manifest = json.loads(data.decode("utf-8"))
+                entry = manifest["files"][0]
+                if mode_marker is None:
+                    entry.pop("content_mode", None)
+                else:
+                    entry["content_mode"] = mode_marker
+                return json.dumps(manifest).encode("utf-8")
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+
+        for label, marker in (
+            ("missing", None),
+            ("non-string", 1),
+            ("unknown", "binary"),
+        ):
+            with self.subTest(case=label):
+                expect_rejected(marker)
+
+    def test_S4_CODEX_PACKAGED_ASSET_PATHS_REJECT_UNSAFE_001(self) -> None:
+        original_resource = codex_adapter._package_resource
+
+        def expect_rejected(field: str, value: str) -> None:
+            calls: list[str] = []
+
+            def substitute(name: str) -> bytes:
+                calls.append(name)
+                data = original_resource(name)
+                if name == "manifest.json":
+                    manifest = json.loads(data.decode("utf-8"))
+                    manifest["files"][0][field] = value
+                    return json.dumps(manifest).encode("utf-8")
+                if name == "orchestrator_harness_post_tool_use.py":
+                    self.fail(f"unsafe {field} was read as a hook resource: {value!r}")
+                return data
+
+            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with self.assertRaises(CodexAdapterError):
+                    codex_adapter.packaged_codex_assets()
+            self.assertEqual(["manifest.json"], calls)
+
+        dangerous = (
+            "",
+            ".",
+            "..",
+            "../escape.py",
+            r"..\escape.py",
+            r"\escape.py",
+            "/escape.py",
+            "C:escape.py",
+            r"C:\escape.py",
+            r"\\server\share\escape.py",
+            r"\\?\C:\escape.py",
+            r"\\.\C:\escape.py",
+            "folder:stream",
+        )
+        for field in ("destination", "resource"):
+            for value in dangerous:
+                with self.subTest(field=field, value=value):
+                    expect_rejected(field, value)
+
+        assets = codex_adapter.packaged_codex_assets()
+        self.assertIn(Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), assets)
+        self.assertIn(Path(".codex/hooks/orchestrator_harness_stop.py"), assets)
+        self.assertEqual(Path("nested/file.py"), mutation.safe_relative_path("nested/file.py"))
+
+    def test_S4_R10_SHARED_RELATIVE_CLASSIFIER_AND_ABSOLUTE_CONTROLS_001(self) -> None:
+        dangerous = (
+            "",
+            ".",
+            "..",
+            "../escape.py",
+            r"..\escape.py",
+            r"\escape.py",
+            "/escape.py",
+            "C:escape.py",
+            r"C:\escape.py",
+            r"\\server\share\escape.py",
+            r"\\?\C:\escape.py",
+            r"\\.\C:\escape.py",
+            "folder:stream",
+        )
+        for value in dangerous:
+            with self.subTest(value=value):
+                with self.assertRaises(mutation.MutationConflict):
+                    mutation.safe_relative_path(value)
+        self.assertEqual(
+            Path("nested/file.py"),
+            mutation.safe_relative_path(PureWindowsPath(r"nested\file.py")),
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inside = root / "nested" / "file.py"
+            self.assertEqual(Path("nested/file.py"), mutation._relative(root, inside))
+            with self.assertRaises(mutation.MutationConflict):
+                mutation._relative(root, root.parent / "outside.py")
+
+    def test_S4_R10_MUTATION_REJECTS_BEFORE_OBSERVATION_001(self) -> None:
+        dangerous = (r"\escape.py", "C:escape.py", r"C:\escape.py", "folder:stream")
+        directory_dangerous = (
+            r"\escape.py",
+            "C:escape.py",
+            r"\\server\share\escape.py",
+            r"\\?\C:\escape.py",
+            "folder:stream",
+            "..",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def observed(*args, **kwargs):
+                raise AssertionError("dangerous mutation reached a filesystem seam")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(mutation, "_validate_chain", side_effect=observed))
+                stack.enter_context(patch.object(mutation, "_capture_path", side_effect=observed))
+                stack.enter_context(patch.object(mutation, "open_append_file", side_effect=observed))
+                for value in dangerous:
+                    with self.subTest(value=value):
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.capture_target(root, value)
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.replace(root, value, b"data")
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.delete(root, value)
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.append_bytes(root, value, b"data")
+
+            with patch.object(mutation, "_lexical", side_effect=observed):
+                for value in directory_dangerous:
+                    with self.subTest(directory_value=value):
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.ensure_directory_path(value)
+                        with self.assertRaises(mutation.MutationConflict):
+                            mutation.make_temporary_directory(value, prefix="escape-")
+
+    def test_S4_R10_PROJECT_GUARD_REJECTS_BEFORE_OBSERVATION_001(self) -> None:
+        dangerous = (r"\escape.py", "C:escape.py", r"C:\escape.py", "folder:stream")
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw)
+            guard = codex_adapter._ProjectMutationGuard(project)
+
+            def observed(*args, **kwargs):
+                raise AssertionError("dangerous guard path reached an observation or mutation seam")
+
+            operations = (
+                ("path", lambda value: guard.path(value)),
+                ("ensure_directory", lambda value: guard.ensure_directory(value)),
+                ("_relative", lambda value: guard._relative(value)),
+                ("snapshot", lambda value: guard.snapshot(value)),
+                ("read", lambda value: guard.read(value)),
+                ("atomic_replace", lambda value: guard.atomic_replace(value, b"data")),
+                ("delete", lambda value: guard.delete(value)),
+                ("restore", lambda value: guard.restore(value, b"data")),
+            )
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(guard, "_check_project_identity", side_effect=observed))
+                stack.enter_context(patch.object(codex_adapter.os.path, "lexists", side_effect=observed))
+                stack.enter_context(patch.object(codex_adapter, "capture_target", side_effect=observed))
+                stack.enter_context(patch.object(codex_adapter, "ensure_directory_path", side_effect=observed))
+                stack.enter_context(patch.object(codex_adapter, "mutation_replace", side_effect=observed))
+                stack.enter_context(patch.object(codex_adapter, "mutation_delete", side_effect=observed))
+                for operation, invoke in operations:
+                    for value in dangerous:
+                        with self.subTest(operation=operation, value=value):
+                            with self.assertRaises(CodexAdapterError):
+                                invoke(value)
+
+            (project / "nested").mkdir()
+            self.assertEqual(project / "nested" / "file.py", guard.path(project / "nested" / "file.py"))
+            self.assertEqual(Path("nested/file.py"), guard._relative(project / "nested" / "file.py"))
+
     def _router(self, root: Path, *, session: str = "session-s4") -> ManagerEventRouter:
         return ManagerEventRouter(
             root,

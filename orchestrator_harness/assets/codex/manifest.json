@@ -7,11 +7,13 @@
     {
       "destination": ".codex/hooks/orchestrator_harness_post_tool_use.py",
       "resource": "orchestrator_harness_post_tool_use.py",
+      "content_mode": "utf8-lf",
       "sha256": "1cf1592c1829fb953e927b5dd6727f946e3239be59838028ede04fe2ef335a71"
     },
     {
       "destination": ".codex/hooks/orchestrator_harness_stop.py",
       "resource": "orchestrator_harness_stop.py",
+      "content_mode": "utf8-lf",
       "sha256": "616390ecec117df2db33dd6f84b5d826b523ec873e4c53f88c21426b5d92e469"
     }
   ]
