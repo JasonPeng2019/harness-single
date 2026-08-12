@@ -39,6 +39,10 @@ python -m orchestrator_harness.lane_controller <lane-invocation.json>
 The manager may use `orchestrator_harness.operator_launch` for a detached, identity-recorded
 controller. The harness does not schedule controllers automatically.
 
+For the copyable public launch shape, see `examples/public-coding-launch.example.md`. It composes
+the operator launcher and native lane controller; the controller remains the owner of provider
+lifecycle, claims, durable events, semantic resume, result validation, and cleanup.
+
 ## 4. Wait and acknowledge
 
 ```powershell
@@ -48,9 +52,13 @@ python -m orchestrator_harness --config local-config/harness.json watch --until-
 Handle one returned event, verify the corresponding action or durable record, then acknowledge the
 top-level `event_id` exactly:
 
-```powershell
-python -m orchestrator_harness --config local-config/harness.json ack --event-id <event-id>
+```python
+router.acknowledge("<top-level-event-id>", binding=router.registration)
 ```
+
+The acknowledgement is a manager action through the bound S3 `ManagerEventRouter`; this
+diagnostic CLI has no competing acknowledgement queue. `data.signal_id` is not an acknowledgement
+ID.
 
 Repeat after timeouts. Never poll worker transcripts or add a relay as an alternate discovery path.
 
@@ -62,6 +70,21 @@ clean committed branch plus `.agent-workspace/RESULT.json` matching
 
 Normal named-lock contention waits automatically. Investigate only malformed, stale, unknown, or
 excessive-wait evidence. Never delete another invocation's claim.
+
+### Select release checks
+
+The versioned registry/selector is the single owner of fast, affected, full, and release checks:
+
+```powershell
+python -m orchestrator_harness.release_checks select --intent fast --root <repository-root>
+python -m orchestrator_harness.release_checks select --intent affected --root <repository-root> `
+  --changed-domain public-launch
+```
+
+Credit is retained only for the same stable ID, exact declared dependency fingerprint, command,
+tier, output contract, and exact source root/branch/tip identity. Fast is local and does not select WSL or a
+real agent. Full/release may enumerate the accumulated safeguard, but its producer remains
+`MI-RELEASE-ASSURE`/ROOT-owned and is not run in an ordinary coding lane.
 
 ## 6. Merge and accept
 
@@ -117,8 +140,9 @@ Copy-Item examples/harness.example.json "local-config/$epoch.json"
 # Set suite_root, run_globs, and output_dir to this epoch's real paths.
 python -m orchestrator_harness --config "local-config/$epoch.json" scan --no-write
 python -m orchestrator_harness --config "local-config/$epoch.json" watch --until-actionable --timeout 60
-python -m orchestrator_harness --config "local-config/$epoch.json" ack --event-id <top-level-event-id>
-Get-Content runtime/firmware-v2/passed-tests.json
+# In the bound manager router, acknowledge the returned envelope only:
+router.acknowledge("<top-level-event-id>", binding=router.registration)
+Get-Content <accepted-evidence>/passed-tests.json
 ```
 
 Resume a coding controller only with its persisted identity and output paths; the controller, not a
@@ -132,11 +156,11 @@ That resume invocation keeps the same `worker_invocation_id` and supplies the re
 `resume_thread_id` or `resume_identity.thread_id`. Legacy firmware resumes under its retained
 policy-bound contract.
 
-Before disposal, request cooperative stop and prove absence using every recorded PID plus creation
-time from its status/launch record. Do not kill by process name or command text:
+Before disposal, let each bounded diagnostic wait return and request cooperative stop from the
+recorded owner. Prove absence using every recorded PID plus creation time from its status/launch
+record. Do not kill by process name or command text:
 
 ```powershell
-python -m orchestrator_harness --config "local-config/$epoch.json" watch stop
 # For each recorded { pid, creation_time_utc }, prove that the exact identity is absent (or stop only
 # that exact still-live identity cooperatively and re-check it).
 $process = Get-CimInstance Win32_Process -Filter "ProcessId = <recorded-pid>" -ErrorAction SilentlyContinue
@@ -179,8 +203,9 @@ slices. The deterministic watcher remains diagnostic-only with `evaluator_enable
 After C4 and pre-safeguard admission—not now—run the launcher from the reserved candidate worktree:
 
 ```powershell
-& C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/harness-candidate/tools/Invoke-CandidateSafeguard.ps1
-& C:/Users/Jason/Documents/Jason/Orchestrator_Harness/plans/general-coding-harness/runtime/firmware-v2/worktrees/harness-candidate/tools/Invoke-CandidateSafeguard.ps1 -Run
+$candidateRoot = "<candidate-root>"
+& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot
+& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -Run
 ```
 
 The first command prints its bound checks. The second runs Ruff, formatting, the retained

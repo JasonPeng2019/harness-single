@@ -1,0 +1,34 @@
+{
+  "schema": "orchestrator-release-assets/v1",
+  "registry_module": "orchestrator_harness.release_checks",
+  "registry_schema": "orchestrator-release-check-registry/v1",
+  "public_modules": [
+    "orchestrator_harness.public_launch",
+    "orchestrator_harness.release_checks",
+    "orchestrator_harness.release_assets"
+  ],
+  "examples": [
+    "examples/public-coding-launch.example.md",
+    "examples/release-selection.example.json"
+  ],
+  "release_evidence_templates": [
+    "release_evidence_templates/ACCEPTANCE_WATCHER.md",
+    "release_evidence_templates/COMPLETION.md",
+    "release_evidence_templates/CRITERIA_AUDIT.md",
+    "release_evidence_templates/FINAL_REVIEW.md",
+    "release_evidence_templates/PROTECTED_STATE.md",
+    "release_evidence_templates/PROMOTION.md",
+    "release_evidence_templates/TOPOLOGY_AUDIT.md"
+  ],
+  "package_assets": [
+    "assets/release/examples/public-coding-launch.example.md",
+    "assets/release/examples/release-selection.example.json",
+    "assets/release/templates/ACCEPTANCE_WATCHER.md",
+    "assets/release/templates/COMPLETION.md",
+    "assets/release/templates/CRITERIA_AUDIT.md",
+    "assets/release/templates/FINAL_REVIEW.md",
+    "assets/release/templates/PROTECTED_STATE.md",
+    "assets/release/templates/PROMOTION.md",
+    "assets/release/templates/TOPOLOGY_AUDIT.md"
+  ]
+}

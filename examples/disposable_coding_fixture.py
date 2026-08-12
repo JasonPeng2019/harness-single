@@ -14,14 +14,22 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+# Direct execution puts ``examples/`` first on sys.path. Keep the documented
+# root-level command equivalent to importing this fixture from its package.
+HARNESS_ROOT = Path(__file__).resolve().parent.parent
+if str(HARNESS_ROOT) not in sys.path:
+    sys.path.insert(0, str(HARNESS_ROOT))
+
+from orchestrator_harness.models import iso_utc
 from orchestrator_harness.notifications import ManagerEventRouter
+from orchestrator_harness.processes import process_snapshot
+from orchestrator_harness.public_launch import launch_lane_controller
 
 FIXTURE_RESOURCE = "service:fixture-database"
-HARNESS_ROOT = Path(__file__).resolve().parent.parent
 
 
 class FixtureError(RuntimeError):
@@ -209,18 +217,16 @@ def _controller_env() -> dict[str, str]:
     return env
 
 
-def _start_controller(invocation: Path) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        (sys.executable, "-m", "orchestrator_harness.lane_controller", str(invocation)),
+def _start_controller(invocation: Path) -> dict[str, Any]:
+    """Use the same operator-launch -> lane-controller path as a manager."""
+
+    status_path = invocation.parent / "fixture_controller.status.json"
+    receipt_path = invocation.parent / "fixture_operator_launch.json"
+    return launch_lane_controller(
+        invocation,
+        receipt=receipt_path,
         cwd=HARNESS_ROOT,
-        env=_controller_env(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        shell=False,
+        expected_state_path=status_path,
     )
 
 
@@ -240,20 +246,24 @@ def _wait_for_status(
     raise FixtureError(f"timed out waiting for status condition in {path}")
 
 
-def _finish_controller(
-    process: subprocess.Popen[str], *, expected: tuple[int, ...]
-) -> None:
-    try:
-        stdout, stderr = process.communicate(timeout=20)
-    except subprocess.TimeoutExpired as exc:
-        process.terminate()
-        process.wait(timeout=5)
-        raise FixtureError(f"controller PID {process.pid} did not exit") from exc
-    if process.returncode not in expected:
+def _finish_controller(receipt: Mapping[str, Any]) -> None:
+    pid = receipt.get("pid")
+    created_utc = receipt.get("created_utc")
+    if not isinstance(pid, int) or not isinstance(created_utc, str):
         raise FixtureError(
-            f"controller PID {process.pid} exited {process.returncode}\n"
-            f"stdout: {stdout[-2000:]}\nstderr: {stderr[-2000:]}"
+            f"operator launch receipt has no exact process identity: {receipt}"
         )
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        snapshot = process_snapshot()
+        if snapshot.complete:
+            process = snapshot.by_pid.get(pid)
+            if process is None or iso_utc(process.created_utc) != created_utc:
+                return
+        time.sleep(0.05)
+    raise FixtureError(
+        f"controller PID {pid} with creation identity {created_utc} did not exit"
+    )
 
 
 def _harness(
@@ -352,8 +362,8 @@ def run_fixture(root: Path) -> dict[str, object]:
     _wait_for_status(
         beta_status, lambda value: value.get("state") == "WAITING_RESOURCE"
     )
-    _finish_controller(alpha_process, expected=(0,))
-    _finish_controller(beta_process, expected=(1,))
+    _finish_controller(alpha_process)
+    _finish_controller(beta_process)
     stale_status = json.loads(beta_status.read_text(encoding="utf-8"))
     if stale_status.get("result_validation", {}).get("state") != "INVALID":
         raise FixtureError("stale result was not rejected")
@@ -389,17 +399,19 @@ def run_fixture(root: Path) -> dict[str, object]:
         manager_invocation_id="coding-manager-invocation",
         registration_id="coding-manager-registration",
     )
-    admitted = router.admit({
-        "event_id": "coding-manager-event",
-        "type": "MANAGER_SIGNAL",
-        "identity": "coding-fixture:manager-event",
-        "data": {
-            "signal_id": "coding-manager-event",
-            "lane_id": "coding-fixture",
-            "manager_actionable": True,
-            "severity": "warning",
-        },
-    })
+    admitted = router.admit(
+        {
+            "event_id": "coding-manager-event",
+            "type": "MANAGER_SIGNAL",
+            "identity": "coding-fixture:manager-event",
+            "data": {
+                "signal_id": "coding-manager-event",
+                "lane_id": "coding-fixture",
+                "manager_actionable": True,
+                "severity": "warning",
+            },
+        }
+    )
     if not isinstance(admitted, dict):
         raise FixtureError("S3 manager event was not admitted")
     event = router.next_event()
@@ -423,7 +435,7 @@ def run_fixture(root: Path) -> dict[str, object]:
         merge_inputs=["lane/alpha", "lane/beta"],
     )
     merge_process = _start_controller(merge_invocation)
-    _finish_controller(merge_process, expected=(0,))
+    _finish_controller(merge_process)
     tests = _run((sys.executable, "-m", "unittest", "-v"), cwd=merge)
     remaining_claims = list((runtime / "coding-resource-locks").glob("*.json"))
     if remaining_claims:

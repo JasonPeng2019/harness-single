@@ -53,6 +53,27 @@ Delivery notices contain binding identity, queue revision, pending count,
 highest class/severity, timestamp, and adapter profile only. Delivery receipts
 are transport evidence and never acknowledge pending events.
 
+## Public launch and check selection
+
+`orchestrator_harness.public_launch.launch_lane_controller` is a thin public composition of
+`operator_launch.launch_process` and the `lane_controller` CLI. The operator receipt binds the
+exact controller PID plus creation identity; the controller owns provider lifecycle, durable
+events/results, claims, semantic resume, and archive-first cleanup. The disposable public journey
+uses fake provider output in temporary Git worktrees and does not require WSL, hardware, MCP,
+credentials, or a real provider.
+
+`orchestrator_harness.release_checks` is the only check registry/selector. It exposes stable IDs,
+declared dependency domains/files, exact commands, tiers, platform requirements, and credit
+contracts. `fast` is local, `affected` consumes changed domains/paths, and `full`/`release` can
+enumerate release assurance. Credit is valid only when its canonical fingerprint and exact source
+root, Git common directory, branch, and tip match. The selector rejects stale, malformed,
+unknown, or mixed-root records and orders shortest decisive invalidated checks first. The
+WSL/real-agent check is explicitly non-fast; this producer records its selection only.
+
+The portable candidate safeguard derives or accepts its repository root, reads back the exact
+Git top level/branch/tip, and gets its check commands from that selector. It retains the candidate
+branch and BasedPyright-baseline safety boundary without a developer-specific checkout path.
+
 ## Immutable views and terminal lanes
 
 Static work can receive an exact-commit read-only source view with separate

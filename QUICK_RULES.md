@@ -55,6 +55,15 @@
 - Preserve failures as evidence; do not hide them with wrappers, schedulers, retry controllers, or
   mid-run automatic repair.
 
+## Release checks
+
+- Use `python -m orchestrator_harness.release_checks` as the one stable-ID registry/selector.
+- Credit requires declared-input fingerprints plus exact source root, Git common directory,
+  branch, and full tip. Unknown or stale credit is not green evidence.
+- Fast selection is local; WSL/real-agent and accumulated release assurance are never default-fast.
+- `tools/Invoke-CandidateSafeguard.ps1` accepts an exact repository root and reads its branch/tip;
+  it has no developer checkout path. The safeguard is candidate-only and release-owned.
+
 ## Firmware compatibility
 
 Schema-less policy-bound firmware invocations remain supported separately. Their board, relay,

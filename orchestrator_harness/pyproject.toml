@@ -9,8 +9,32 @@ dependencies = ["cryptography>=42"]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = true
+package-dir = { orchestrator_harness = "." }
+packages = [
+    "orchestrator_harness",
+    "orchestrator_harness.assets",
+    "orchestrator_harness.assets.codex",
+]
+
 [tool.setuptools.package-data]
-orchestrator_harness = ["assets/codex/*.json", "assets/codex/*.py"]
+orchestrator_harness = [
+    "assets/codex/*.json",
+    "assets/codex/*.py",
+    "assets/release/*.json",
+    "assets/release/examples/*.json",
+    "assets/release/examples/*.md",
+    "assets/release/templates/*.md",
+]
+
+[tool.setuptools.data-files]
+"examples" = [
+    "../examples/*.json",
+    "../examples/*.md",
+    "../examples/*.py",
+]
+"release_evidence_templates" = ["../release_evidence_templates/*.md"]
 
 [tool.pyright]
 pythonVersion = "3.11"

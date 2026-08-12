@@ -1,0 +1,809 @@
+from __future__ import annotations
+
+"""One owning registry and selector for portable release checks.
+
+The registry is deliberately small and declarative.  It describes the checks
+that consume the public release surface; it does not run them.  A credit is
+usable only when its declared inputs, command, tier, and exact Git source
+identity still match the current checkout.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REGISTRY_SCHEMA = "orchestrator-release-check-registry/v1"
+SELECTION_SCHEMA = "orchestrator-check-selection/v1"
+CREDIT_SCHEMA = "orchestrator-check-credit/v1"
+REGISTRY_VERSION = 1
+RELEASE_AGGREGATE_ID = "S6.RELEASE.ACCUMULATED-SAFEGUARD"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_TIERS = frozenset({"fast", "affected", "full", "release"})
+_INTENTS = frozenset({"fast", "affected", "full", "release"})
+
+
+class SelectionError(ValueError):
+    """Raised when a source root, registry, or credit cannot be trusted."""
+
+
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _nonempty(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SelectionError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _string_tuple(value: Iterable[str], name: str) -> tuple[str, ...]:
+    result = tuple(value)
+    if any(not isinstance(item, str) or not item.strip() for item in result):
+        raise SelectionError(f"{name} must contain non-empty strings")
+    if len(set(result)) != len(result):
+        raise SelectionError(f"{name} must not contain duplicates")
+    return result
+
+
+def _relative_path(value: str, name: str) -> str:
+    candidate = value.replace("\\", "/")
+    path = Path(candidate)
+    if path.is_absolute() or ".." in path.parts:
+        raise SelectionError(f"{name} must be a relative path")
+    normalized = "/".join(part for part in path.parts if part not in ("", "."))
+    if not normalized:
+        raise SelectionError(f"{name} must not be empty")
+    return normalized
+
+
+@dataclass(frozen=True)
+class CheckSpec:
+    """A stable, fingerprinted check declaration."""
+
+    stable_id: str
+    name: str
+    tier: str
+    command: tuple[str, ...]
+    dependency_domains: tuple[str, ...]
+    dependency_paths: tuple[str, ...]
+    external_requirements: tuple[str, ...] = ()
+    platform_requirements: tuple[str, ...] = ()
+    estimated_duration_seconds: float = 1.0
+    decisive: bool = False
+    output_contract: str = CREDIT_SCHEMA
+    producer: str = "S6.P"
+
+    def __post_init__(self) -> None:
+        _nonempty(self.stable_id, "stable_id")
+        _nonempty(self.name, "name")
+        if self.tier not in _TIERS:
+            raise SelectionError(f"unsupported check tier: {self.tier}")
+        if not self.command or any(
+            not isinstance(item, str) or not item for item in self.command
+        ):
+            raise SelectionError(f"{self.stable_id} command must be non-empty")
+        _string_tuple(self.dependency_domains, f"{self.stable_id}.dependency_domains")
+        for path in self.dependency_paths:
+            _relative_path(path, f"{self.stable_id}.dependency_paths")
+        _string_tuple(
+            self.external_requirements, f"{self.stable_id}.external_requirements"
+        )
+        _string_tuple(
+            self.platform_requirements, f"{self.stable_id}.platform_requirements"
+        )
+        if self.estimated_duration_seconds <= 0:
+            raise SelectionError(f"{self.stable_id} duration must be positive")
+        _nonempty(self.output_contract, f"{self.stable_id}.output_contract")
+        _nonempty(self.producer, f"{self.stable_id}.producer")
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "stable_id": self.stable_id,
+            "name": self.name,
+            "tier": self.tier,
+            "command": list(self.command),
+            "dependency_domains": list(self.dependency_domains),
+            "dependency_paths": list(self.dependency_paths),
+            "external_requirements": list(self.external_requirements),
+            "platform_requirements": list(self.platform_requirements),
+            "estimated_duration_seconds": self.estimated_duration_seconds,
+            "decisive": self.decisive,
+            "output_contract": self.output_contract,
+            "producer": self.producer,
+        }
+
+    def consumes(self, changed_paths: set[str], changed_domains: set[str]) -> bool:
+        if changed_domains.intersection(self.dependency_domains):
+            return True
+        declared = {
+            _relative_path(path, "dependency_path").casefold()
+            for path in self.dependency_paths
+        }
+        for changed in changed_paths:
+            normalized = changed.casefold().rstrip("/")
+            if normalized in declared:
+                return True
+            if any(normalized.startswith(path + "/") for path in declared):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    source_root: str
+    git_common_dir: str
+    branch: str
+    tip: str
+
+    def to_record(self) -> dict[str, str]:
+        return {
+            "source_root": self.source_root,
+            "git_common_dir": self.git_common_dir,
+            "branch": self.branch,
+            "tip": self.tip,
+        }
+
+
+@dataclass(frozen=True)
+class SelectedCheck:
+    spec: CheckSpec
+    dependency_fingerprint: str
+    reason: str
+
+    def to_record(self) -> dict[str, Any]:
+        record = self.spec.to_record()
+        record.update(
+            {
+                "dependency_fingerprint": self.dependency_fingerprint,
+                "selection_reason": self.reason,
+            }
+        )
+        return record
+
+
+@dataclass(frozen=True)
+class SelectionDecision:
+    intent: str
+    source: SourceIdentity
+    selected: tuple[SelectedCheck, ...]
+    preserved_credit_ids: tuple[str, ...]
+    invalidated_credit_ids: tuple[str, ...]
+    rejected_credit_ids: tuple[str, ...]
+    registry_fingerprint: str
+    changed_paths: tuple[str, ...]
+    changed_domains: tuple[str, ...]
+
+    @property
+    def selected_ids(self) -> tuple[str, ...]:
+        return tuple(item.spec.stable_id for item in self.selected)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "schema": SELECTION_SCHEMA,
+            "intent": self.intent,
+            "source": self.source.to_record(),
+            "registry_fingerprint": self.registry_fingerprint,
+            "changed_paths": list(self.changed_paths),
+            "changed_domains": list(self.changed_domains),
+            "selected": [item.to_record() for item in self.selected],
+            "selected_ids": list(self.selected_ids),
+            "preserved_credit_ids": list(self.preserved_credit_ids),
+            "invalidated_credit_ids": list(self.invalidated_credit_ids),
+            "rejected_credit_ids": list(self.rejected_credit_ids),
+            "producer_must_not_run": [RELEASE_AGGREGATE_ID],
+        }
+
+
+def _python_test(module: str, test: str) -> tuple[str, ...]:
+    return ("python", "-m", "unittest", "-v", f"{module}.{test}")
+
+
+def _registry() -> tuple[CheckSpec, ...]:
+    return (
+        CheckSpec(
+            "S6.FAST.SELECTOR",
+            "stable selector and credit contract",
+            "fast",
+            _python_test(
+                "orchestrator_harness.tests.test_s6_public_release", "S6SelectorTests"
+            ),
+            ("selector",),
+            (
+                "orchestrator_harness/release_checks.py",
+                "orchestrator_harness/tests/test_s6_public_release.py",
+            ),
+            estimated_duration_seconds=1.0,
+            decisive=True,
+        ),
+        CheckSpec(
+            "S6.FAST.DOCS",
+            "public release documentation contract",
+            "fast",
+            _python_test(
+                "orchestrator_harness.tests.test_s6_public_release",
+                "S6DocumentationTests",
+            ),
+            ("docs",),
+            (
+                "README.md",
+                "QUICK_START.md",
+                "QUICK_RULES.md",
+                "orchestrator_harness/README.md",
+                "examples/public-coding-launch.example.md",
+                "examples/release-selection.example.json",
+                "orchestrator_harness/tests/test_s6_public_release.py",
+            ),
+            estimated_duration_seconds=1.0,
+        ),
+        CheckSpec(
+            "S6.FAST.PACKAGE",
+            "package resource and metadata contract",
+            "fast",
+            _python_test(
+                "orchestrator_harness.tests.test_s6_public_release", "S6PackageTests"
+            ),
+            ("package",),
+            (
+                "orchestrator_harness/pyproject.toml",
+                "orchestrator_harness/release_assets.py",
+                "orchestrator_harness/assets/release/manifest.json",
+                "orchestrator_harness/tests/test_s6_public_release.py",
+            ),
+            estimated_duration_seconds=1.0,
+        ),
+        CheckSpec(
+            "S6.FAST.LOCAL-ISOLATION",
+            "deterministic isolation helper contract",
+            "fast",
+            (
+                "python",
+                "-m",
+                "unittest",
+                "-v",
+                "orchestrator_harness.tests.test_real_agent_isolation",
+            ),
+            ("isolation-local",),
+            (
+                "orchestrator_harness/tests/test_real_agent_isolation.py",
+                "orchestrator_harness/tests/support/allowlist_connect_proxy.py",
+                "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
+            ),
+            estimated_duration_seconds=2.0,
+        ),
+        CheckSpec(
+            "S6.AFFECTED.PUBLIC-E2E",
+            "public operator/controller disposable journey",
+            "affected",
+            _python_test(
+                "orchestrator_harness.tests.test_s6_public_release",
+                "S6PublicJourneyTests",
+            ),
+            ("public-launch", "controller-lifecycle"),
+            (
+                "orchestrator_harness/public_launch.py",
+                "orchestrator_harness/operator_launch.py",
+                "orchestrator_harness/lane_controller.py",
+                "orchestrator_harness/lane_lifecycle.py",
+                "examples/disposable_coding_fixture.py",
+                "orchestrator_harness/tests/test_s6_public_release.py",
+            ),
+            estimated_duration_seconds=8.0,
+            decisive=True,
+        ),
+        CheckSpec(
+            "S6.AFFECTED.SAFEGUARD",
+            "portable candidate safeguard contract",
+            "affected",
+            _python_test(
+                "orchestrator_harness.tests.test_s6_public_release", "S6SafeguardTests"
+            ),
+            ("safeguard", "selector"),
+            (
+                "tools/Invoke-CandidateSafeguard.ps1",
+                "orchestrator_harness/release_checks.py",
+                "orchestrator_harness/tests/test_s6_public_release.py",
+            ),
+            platform_requirements=("powershell",),
+            estimated_duration_seconds=2.0,
+        ),
+        CheckSpec(
+            "S6.AFFECTED.LEGACY",
+            "schema-less legacy and coding fixture compatibility",
+            "affected",
+            _python_test(
+                "orchestrator_harness.tests.test_general_coding_docs",
+                "GeneralCodingDocumentationTests",
+            ),
+            ("legacy-compat", "controller-lifecycle"),
+            (
+                "orchestrator_harness/invocation.py",
+                "orchestrator_harness/lane_controller.py",
+                "examples/legacy-firmware.invocation.example.json",
+                "examples/coding.invocation.example.json",
+                "orchestrator_harness/tests/test_general_coding_docs.py",
+            ),
+            estimated_duration_seconds=3.0,
+        ),
+        CheckSpec(
+            "S6.AFFECTED.REAL-AGENT",
+            "optional real-agent isolation journey",
+            "affected",
+            ("python", "orchestrator_harness/tests/real_agent_test.py"),
+            ("isolation-real-agent",),
+            (
+                "orchestrator_harness/tests/real_agent_test.py",
+                "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
+                "orchestrator_harness/tests/support/wsl_guarded_entry.py",
+            ),
+            external_requirements=("WSL2", "Codex provider", "ephemeral auth"),
+            platform_requirements=("windows", "wsl2"),
+            estimated_duration_seconds=120.0,
+        ),
+        CheckSpec(
+            RELEASE_AGGREGATE_ID,
+            "accumulated candidate safeguard (ROOT release assurance)",
+            "release",
+            (
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "tools/Invoke-CandidateSafeguard.ps1",
+                "-Run",
+            ),
+            ("release-assurance", "safeguard"),
+            (
+                "tools/Invoke-CandidateSafeguard.ps1",
+                "orchestrator_harness/release_checks.py",
+                "orchestrator_harness/pyproject.toml",
+            ),
+            external_requirements=("ROOT release assurance",),
+            platform_requirements=("windows",),
+            estimated_duration_seconds=600.0,
+            producer="ROOT-IM",
+        ),
+    )
+
+
+CHECK_REGISTRY = _registry()
+
+
+def registry() -> tuple[CheckSpec, ...]:
+    """Return the immutable public registry in stable order."""
+
+    return CHECK_REGISTRY
+
+
+def registry_record() -> dict[str, Any]:
+    records = [spec.to_record() for spec in CHECK_REGISTRY]
+    return {
+        "schema": REGISTRY_SCHEMA,
+        "version": REGISTRY_VERSION,
+        "registry_fingerprint": _sha256(_canonical_json(records)),
+        "checks": records,
+    }
+
+
+def _canonical_root(path: Path) -> str:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SelectionError(f"source root cannot be resolved: {path}: {exc}") from exc
+    if not resolved.is_dir():
+        raise SelectionError(f"source root is not a directory: {resolved}")
+    return os.path.normcase(os.path.normpath(str(resolved)))
+
+
+def _git(root: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SelectionError(f"Git identity read failed: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise SelectionError(
+            f"Git identity read failed for {' '.join(arguments)}: {detail}"
+        )
+    return completed.stdout.strip()
+
+
+def read_source_identity(
+    root: str | Path,
+    *,
+    expected_branch: str | None = None,
+    expected_tip: str | None = None,
+) -> SourceIdentity:
+    """Read and validate the exact repository identity used by selection."""
+
+    root_path = Path(root).expanduser().resolve(strict=True)
+    canonical = _canonical_root(root_path)
+    top_level = Path(_git(root_path, "rev-parse", "--show-toplevel")).resolve(
+        strict=True
+    )
+    if _canonical_root(top_level) != canonical:
+        raise SelectionError(
+            f"Git top level does not match requested source root: {top_level}"
+        )
+    branch = _git(root_path, "branch", "--show-current")
+    if not branch:
+        raise SelectionError("detached HEAD cannot satisfy exact branch binding")
+    tip = _git(root_path, "rev-parse", "HEAD").lower()
+    if not _COMMIT.fullmatch(tip):
+        raise SelectionError("Git HEAD is not a full commit identity")
+    common_value = Path(_git(root_path, "rev-parse", "--git-common-dir"))
+    common = (
+        root_path / common_value if not common_value.is_absolute() else common_value
+    ).resolve(strict=True)
+    identity = SourceIdentity(canonical, _canonical_root(common), branch, tip)
+    if expected_branch is not None and branch != _nonempty(
+        expected_branch, "expected_branch"
+    ):
+        raise SelectionError(
+            f"branch mismatch: expected {expected_branch}, observed {branch}"
+        )
+    if expected_tip is not None:
+        requested_tip = _nonempty(expected_tip, "expected_tip").lower()
+        if not _COMMIT.fullmatch(requested_tip) or requested_tip != tip:
+            raise SelectionError(
+                f"tip mismatch: expected {expected_tip}, observed {tip}"
+            )
+    return identity
+
+
+def _changed_path(root: Path, value: str) -> str:
+    text = _nonempty(value, "changed_path").replace("\\", "/")
+    candidate = Path(text)
+    if candidate.is_absolute():
+        try:
+            text = (
+                candidate.resolve(strict=False).relative_to(root.resolve()).as_posix()
+            )
+        except ValueError as exc:
+            raise SelectionError(f"changed_path escapes source root: {value}") from exc
+    return _relative_path(text, "changed_path")
+
+
+def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
+    """Hash only the files explicitly declared by ``spec`` plus its contract."""
+
+    root_path = Path(root).expanduser().resolve(strict=True)
+    inputs: list[dict[str, Any]] = []
+    for raw_path in spec.dependency_paths:
+        relative = _relative_path(raw_path, f"{spec.stable_id}.dependency_path")
+        path = (root_path / Path(relative)).resolve(strict=False)
+        try:
+            path.relative_to(root_path)
+        except ValueError as exc:
+            raise SelectionError(
+                f"declared dependency escapes source root: {relative}"
+            ) from exc
+        if not path.is_file() or path.is_symlink():
+            raise SelectionError(
+                f"declared dependency is not a regular file: {relative}"
+            )
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise SelectionError(
+                f"cannot read declared dependency {relative}: {exc}"
+            ) from exc
+        inputs.append({"path": relative, "sha256": _sha256(data), "bytes": len(data)})
+    return _sha256(_canonical_json({"check": spec.to_record(), "inputs": inputs}))
+
+
+def credit_record(
+    check: str | CheckSpec,
+    root: str | Path,
+    *,
+    outcome: str = "PASS",
+    observed_utc: str | None = None,
+) -> dict[str, Any]:
+    """Create a strict credit record after a check has actually passed."""
+
+    spec = get_check(check) if isinstance(check, str) else check
+    if outcome != "PASS":
+        raise SelectionError("only PASS checks may publish credit")
+    identity = read_source_identity(root)
+    return {
+        "schema": CREDIT_SCHEMA,
+        "stable_id": spec.stable_id,
+        "status": "PASS",
+        "outcome": outcome,
+        "tier": spec.tier,
+        "command": list(spec.command),
+        "output_contract": spec.output_contract,
+        "dependency_fingerprint": dependency_fingerprint(spec, root),
+        "source": identity.to_record(),
+        "observed_utc": observed_utc
+        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def get_check(stable_id: str) -> CheckSpec:
+    for spec in CHECK_REGISTRY:
+        if spec.stable_id == stable_id:
+            return spec
+    raise SelectionError(f"unknown stable check ID: {stable_id}")
+
+
+def _credit_items(value: object) -> list[Mapping[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        if "credits" in value:
+            value = value["credits"]
+        elif isinstance(value.get("green_test_ids"), list):
+            value = [
+                {"stable_id": item}
+                for item in value["green_test_ids"]
+                if isinstance(item, str)
+            ]
+        else:
+            expanded: list[Mapping[str, Any]] = []
+            for stable_id, item in value.items():
+                if isinstance(item, Mapping):
+                    expanded.append({"stable_id": stable_id, **dict(item)})
+            value = expanded
+    if not isinstance(value, list):
+        raise SelectionError("credits must be a list or an object containing credits")
+    result: list[Mapping[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise SelectionError("credit records must be objects")
+        result.append(item)
+    return result
+
+
+def _valid_credit_shape(credit: Mapping[str, Any]) -> bool:
+    stable_id = credit.get("stable_id")
+    source = credit.get("source")
+    return (
+        isinstance(stable_id, str)
+        and isinstance(source, Mapping)
+        and credit.get("schema") == CREDIT_SCHEMA
+        and credit.get("status") == "PASS"
+        and credit.get("outcome") == "PASS"
+        and isinstance(credit.get("tier"), str)
+        and isinstance(credit.get("command"), list)
+        and isinstance(credit.get("output_contract"), str)
+        and isinstance(credit.get("dependency_fingerprint"), str)
+        and bool(_SHA256.fullmatch(credit["dependency_fingerprint"]))
+    )
+
+
+def _source_matches(value: object, expected: SourceIdentity) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return dict(value) == expected.to_record()
+
+
+def _eligible(
+    spec: CheckSpec,
+    intent: str,
+    changed_paths: set[str],
+    changed_domains: set[str],
+    unknown_changes: bool,
+) -> bool:
+    if intent == "fast":
+        return spec.tier == "fast"
+    if intent == "affected":
+        if spec.tier == "fast":
+            return True
+        if spec.tier == "affected":
+            return unknown_changes or spec.consumes(changed_paths, changed_domains)
+        return False
+    if intent == "full":
+        return spec.tier in {"fast", "affected", "full", "release"}
+    return True
+
+
+def select_checks(
+    intent: str,
+    root: str | Path,
+    *,
+    credits: object = None,
+    changed_paths: Sequence[str] | None = None,
+    changed_domains: Sequence[str] = (),
+    expected_branch: str | None = None,
+    expected_tip: str | None = None,
+    exclude_ids: Sequence[str] = (),
+) -> SelectionDecision:
+    """Select checks and preserve only exact, still-valid credit."""
+
+    if intent not in _INTENTS:
+        raise SelectionError(f"intent must be one of {sorted(_INTENTS)}")
+    source = read_source_identity(
+        root, expected_branch=expected_branch, expected_tip=expected_tip
+    )
+    normalized_paths = tuple(
+        sorted(
+            {
+                _changed_path(Path(source.source_root), item)
+                for item in (changed_paths or ())
+            }
+        )
+    )
+    normalized_domains = tuple(
+        sorted({_nonempty(item, "changed_domain") for item in changed_domains})
+    )
+    path_set = set(normalized_paths)
+    domain_set = set(normalized_domains)
+    unknown_changes = changed_paths is None and not normalized_domains
+    excluded = set(exclude_ids)
+    known = {spec.stable_id: spec for spec in CHECK_REGISTRY}
+    raw_credits = _credit_items(credits)
+    by_id: dict[str, Mapping[str, Any]] = {}
+    rejected: set[str] = set()
+    ambiguous: set[str] = set()
+    for credit in raw_credits:
+        stable_id = credit.get("stable_id")
+        if (
+            not isinstance(stable_id, str)
+            or stable_id not in known
+            or stable_id in by_id
+        ):
+            rejected.add(str(stable_id) if stable_id is not None else "<missing>")
+            if isinstance(stable_id, str) and stable_id in known:
+                ambiguous.add(stable_id)
+                by_id.pop(stable_id, None)
+            continue
+        by_id[stable_id] = credit
+        if not _valid_credit_shape(credit):
+            rejected.add(stable_id)
+
+    fingerprints = {
+        spec.stable_id: dependency_fingerprint(spec, source.source_root)
+        for spec in CHECK_REGISTRY
+    }
+    preserved: list[str] = []
+    invalidated: list[str] = []
+    selected: list[SelectedCheck] = []
+    for spec in CHECK_REGISTRY:
+        credit = by_id.get(spec.stable_id)
+        is_valid = bool(
+            credit is not None
+            and spec.stable_id not in ambiguous
+            and _valid_credit_shape(credit)
+            and _source_matches(credit.get("source"), source)
+            and credit.get("tier") == spec.tier
+            and credit.get("command") == list(spec.command)
+            and credit.get("output_contract") == spec.output_contract
+            and credit.get("dependency_fingerprint") == fingerprints[spec.stable_id]
+        )
+        if is_valid:
+            preserved.append(spec.stable_id)
+        elif credit is not None:
+            invalidated.append(spec.stable_id)
+        if spec.stable_id in excluded or not _eligible(
+            spec, intent, path_set, domain_set, unknown_changes
+        ):
+            continue
+        if is_valid:
+            continue
+        reason = "missing-credit" if credit is None else "stale-or-invalid-credit"
+        selected.append(SelectedCheck(spec, fingerprints[spec.stable_id], reason))
+
+    def order(item: SelectedCheck) -> tuple[int, float, int, str]:
+        decisive_bucket = 0 if item.spec.decisive else 1
+        tier_bucket = {"fast": 0, "affected": 1, "full": 2, "release": 3}[
+            item.spec.tier
+        ]
+        return (
+            decisive_bucket,
+            item.spec.estimated_duration_seconds,
+            tier_bucket,
+            item.spec.stable_id,
+        )
+
+    selected.sort(key=order)
+    registry_hash = registry_record()["registry_fingerprint"]
+    return SelectionDecision(
+        intent=intent,
+        source=source,
+        selected=tuple(selected),
+        preserved_credit_ids=tuple(sorted(preserved)),
+        invalidated_credit_ids=tuple(sorted(set(invalidated).union(rejected))),
+        rejected_credit_ids=tuple(sorted(rejected)),
+        registry_fingerprint=registry_hash,
+        changed_paths=normalized_paths,
+        changed_domains=normalized_domains,
+    )
+
+
+def _load_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SelectionError(f"cannot read credit file {path}: {exc}") from exc
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Portable stable release-check registry and selector"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("registry", help="print the versioned check registry")
+    select = sub.add_parser("select", help="select checks for one exact source root")
+    select.add_argument("--intent", choices=sorted(_INTENTS), required=True)
+    select.add_argument("--root", required=True, type=Path)
+    select.add_argument("--credit-file", type=Path)
+    select.add_argument("--changed-path", action="append", default=[])
+    select.add_argument("--changed-domain", action="append", default=[])
+    select.add_argument("--expected-branch")
+    select.add_argument("--expected-tip")
+    select.add_argument("--exclude-id", action="append", default=[])
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "registry":
+            print(json.dumps(registry_record(), indent=2, sort_keys=True))
+            return 0
+        credits = _load_json(args.credit_file) if args.credit_file else None
+        decision = select_checks(
+            args.intent,
+            args.root,
+            credits=credits,
+            changed_paths=args.changed_path if args.changed_path else None,
+            changed_domains=args.changed_domain,
+            expected_branch=args.expected_branch,
+            expected_tip=args.expected_tip,
+            exclude_ids=args.exclude_id,
+        )
+        print(json.dumps(decision.to_record(), indent=2, sort_keys=True))
+        return 0
+    except SelectionError as exc:
+        print(f"release-check selector error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "CHECK_REGISTRY",
+    "CREDIT_SCHEMA",
+    "RELEASE_AGGREGATE_ID",
+    "SELECTION_SCHEMA",
+    "CheckSpec",
+    "SelectionDecision",
+    "SelectionError",
+    "SourceIdentity",
+    "credit_record",
+    "dependency_fingerprint",
+    "get_check",
+    "main",
+    "read_source_identity",
+    "registry",
+    "registry_record",
+    "select_checks",
+]

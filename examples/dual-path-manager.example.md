@@ -19,8 +19,8 @@ python -m orchestrator_harness.lane_controller C:/absolute/path/legacy-firmware.
 
 # Native blocking discovery is the sole manager wake mechanism.
 python -m orchestrator_harness --config "local-config/$epoch.json" watch --until-actionable --timeout 60
-# After handling and verifying the returned envelope, acknowledge its top-level ID only.
-python -m orchestrator_harness --config "local-config/$epoch.json" ack --event-id <top-level-event-id>
+# After handling and verifying the returned envelope, the bound S3 manager router acknowledges it:
+router.acknowledge("<top-level-event-id>", binding=router.registration)
 ```
 
 Use `examples/coding.invocation.example.json` unchanged for the coding lane. Use

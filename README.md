@@ -43,6 +43,38 @@ python -m orchestrator_harness --config local-config/harness.json scan --no-writ
 The complete coding invocation, result, and lock-record shapes are in `examples/`. Paths and Git
 IDs in those static examples are placeholders and must be replaced with facts from the active lane.
 
+## Public release surface
+
+The supported launch journey is the operator boundary followed by the native lane-controller
+CLI. `orchestrator_harness.public_launch` is only a thin composition of those two existing
+interfaces; it does not own a second lifecycle or workflow engine. A controller validates one
+coding or schema-less legacy invocation, launches one provider, publishes durable status/events,
+and owns claims, semantic resume, result validation, and archive-first cleanup. The capability
+broker and optional firmware adapter remain on the legacy route; workers never receive hardware
+endpoints or credentials.
+
+Release checks are declared once in `orchestrator_harness.release_checks`. Each stable check ID
+declares its exact command, tier, dependency domains/files, platform or external requirements,
+and credit contract. Select the shortest decisive invalidated checks first:
+
+```powershell
+python -m orchestrator_harness.release_checks select --intent fast --root <repository-root>
+python -m orchestrator_harness.release_checks select --intent affected --root <repository-root> `
+  --changed-path orchestrator_harness/lane_controller.py
+```
+
+Fast is local and never selects the WSL/real-agent journey or accumulated release assurance.
+Affected selection includes only consumers of the supplied dependency paths/domains; full/release
+may enumerate every check, including the ROOT-owned safeguard, but this producer does not run
+that accumulated gate. Credit is reusable only with the same canonical declared-input
+fingerprints and exact source root, Git common directory, branch, and full tip. Missing, stale,
+malformed, unknown, or mixed-root credit is selected again.
+
+`examples/public-coding-launch.example.md` and `examples/release-selection.example.json` are
+copyable shapes. The public disposable journey is host-only and uses fake provider output in
+temporary Git worktrees; it proves terminal events, result/Git identity, and exact cleanup without
+hardware, MCP, WSL, a real provider, credentials, network, or installation.
+
 ## Manager loop
 
 The persistent manager launches controllers explicitly:
@@ -61,13 +93,13 @@ Exit `0` returns one JSON event. Exit `3` is a quiet timeout. Exit `1` is a conf
 observation, or safety failure. Handle the event, verify the durable action, and acknowledge only
 its top-level native `event_id`:
 
-```powershell
-python -m orchestrator_harness --config local-config/harness.json ack --event-id <event-id>
-```
+The harness has no competing acknowledgement CLI. In the manager process, acknowledge through the
+bound S3 `ManagerEventRouter` API: `router.acknowledge("<top-level-event-id>",
+binding=router.registration)`. The envelope's top-level `event_id` is the only acknowledgement
+ID; `data.signal_id` identifies a worker signal.
 
-`data.signal_id` identifies a source signal and is not an acknowledgement ID. Delivery is
-at-least-once, so consumers deduplicate by `event_id`. An event remains pending until exact
-acknowledgement succeeds.
+Delivery is at-least-once, so consumers deduplicate by `event_id`. An event remains pending until
+exact acknowledgement succeeds.
 
 ## Lane records
 
@@ -104,8 +136,9 @@ PID-plus-creation identity.
 
 ## Cleanup
 
-Stop managed observation cooperatively with `watch stop` when used. Confirm controller, worker, and
-watcher PID-plus-creation identities are absent; named claims are released; worktrees are clean;
+Return from the bounded diagnostic wait and stop any externally managed observer through its
+recorded owner. Confirm controller, worker, and watcher PID-plus-creation identities are absent;
+named claims are released; worktrees are clean;
 and no pending event is silently discarded. Remove disposable worktrees with Git only after their
 commits and results have been preserved. Runtime data belongs under ignored `runtime/`.
 
