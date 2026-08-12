@@ -43,6 +43,7 @@ from .mutation import (
     delete as mutation_delete,
     ensure_directory_path,
     replace as mutation_replace,
+    safe_relative_path,
 )
 from .notifications import ManagerEventRouter
 from .stable_io import canonical_json
@@ -330,25 +331,18 @@ def packaged_codex_assets() -> dict[Path, bytes]:
         if not isinstance(item, Mapping):
             raise CodexAdapterError("packaged Codex asset entry is invalid")
         destination = item.get("destination")
-        relative = Path(destination) if isinstance(destination, str) else Path()
         resource_name = item.get("resource")
         content_mode = item.get("content_mode")
-        resource_path = Path(resource_name) if isinstance(resource_name, str) else Path()
-        if (
-            not isinstance(destination, str)
-            or not destination
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or not isinstance(resource_name, str)
-            or not resource_name
-            or resource_path.is_absolute()
-            or resource_path.anchor
-            or ".." in resource_path.parts
-        ):
-            raise CodexAdapterError("packaged Codex asset destination is unsafe")
+        if not isinstance(destination, str) or not isinstance(resource_name, str):
+            raise CodexAdapterError("packaged Codex asset destination or resource is unsafe")
+        try:
+            relative = safe_relative_path(destination)
+            resource_relative = safe_relative_path(resource_name)
+        except MutationConflict as exc:
+            raise CodexAdapterError("packaged Codex asset destination or resource is unsafe") from exc
         if not isinstance(content_mode, str) or content_mode != "utf8-lf":
             raise CodexAdapterError(f"packaged Codex asset content mode is unsupported: {relative}")
-        data = _package_resource(resource_name)
+        data = _package_resource(resource_relative.as_posix())
         try:
             text = data.decode("utf-8", errors="strict")
         except (UnicodeDecodeError, AttributeError) as exc:
@@ -419,14 +413,7 @@ class _ProjectMutationGuard:
             raise CodexAdapterError("project-root disappeared") from exc
 
     def path(self, relative: str | Path, *, require_parent: bool = False) -> Path:
-        candidate = Path(relative)
-        if candidate.is_absolute():
-            try:
-                candidate = candidate.relative_to(self.project)
-            except ValueError as exc:
-                raise CodexAdapterError("installer destination is outside the project") from exc
-        if ".." in candidate.parts:
-            raise CodexAdapterError("installer destination is not project-relative")
+        candidate = self._relative(relative)
         self._check_project_identity()
         target = self.project / candidate
         current = self.project
@@ -447,9 +434,7 @@ class _ProjectMutationGuard:
         return target
 
     def ensure_directory(self, relative: str | Path) -> Path:
-        candidate = Path(relative)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise CodexAdapterError("project directory is not project-relative")
+        candidate = self._relative(relative)
         self._check_project_identity()
         try:
             result = ensure_directory_path(self.project / candidate)
@@ -465,9 +450,10 @@ class _ProjectMutationGuard:
                 candidate = candidate.relative_to(self.project)
             except ValueError as exc:
                 raise CodexAdapterError("installer destination is outside the project") from exc
-        if not candidate.parts or ".." in candidate.parts:
-            raise CodexAdapterError("installer destination is not project-relative")
-        return candidate
+        try:
+            return safe_relative_path(candidate)
+        except MutationConflict as exc:
+            raise CodexAdapterError("installer destination is not project-relative") from exc
 
     def snapshot(self, relative_or_path: str | Path) -> TargetState:
         relative = self._relative(relative_or_path)

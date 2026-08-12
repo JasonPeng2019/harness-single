@@ -18,7 +18,7 @@ import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 class MutationError(OSError):
@@ -100,6 +100,61 @@ def _has_ads(path: Path) -> bool:
     return False
 
 
+def safe_relative_path(value: str | os.PathLike[str]) -> Path:
+    """Return one conservative path safe for use below a verified root.
+
+    Both host and Windows grammar are evaluated so a Windows-rooted or
+    drive-relative spelling cannot become an escape when the same manifest or
+    test is handled on another host.
+    """
+
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        raise MutationConflict("mutation target must be a safe relative path") from exc
+    if not isinstance(raw, str) or not raw:
+        raise MutationConflict("mutation target must be a safe relative path")
+    if any(part in {"", ".", ".."} for part in raw.replace("\\", "/").split("/")):
+        raise MutationConflict("mutation target contains an ambiguous component")
+    if ":" in raw:
+        raise MutationConflict("mutation target contains alternate-stream or drive syntax")
+
+    host = Path(raw)
+    windows = PureWindowsPath(raw)
+    for candidate in (host, windows):
+        if (
+            candidate.is_absolute()
+            or candidate.anchor
+            or candidate.root
+            or candidate.drive
+            or not candidate.parts
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            raise MutationConflict("mutation target must be a safe relative path")
+
+    return Path(*windows.parts)
+
+
+def _validate_directory_input(value: str | os.PathLike[str]) -> None:
+    """Reject ambiguous Windows spellings before observing a full path."""
+
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        raise MutationConflict("directory path is not safe") from exc
+    if not isinstance(raw, str) or not raw:
+        raise MutationConflict("directory path is not safe")
+    components = raw.replace("\\", "/").split("/")
+    if any(part in {".", ".."} for part in components):
+        raise MutationConflict("directory path contains an ambiguous component")
+    host = Path(raw)
+    windows = PureWindowsPath(raw)
+    if windows.drive.startswith("\\\\") or (not host.is_absolute() and windows.anchor):
+        raise MutationConflict("directory path is not safe")
+    if not host.is_absolute():
+        safe_relative_path(raw)
+
+
 def _relative(root: Path, value: str | Path) -> Path:
     candidate = Path(value)
     if candidate.is_absolute():
@@ -107,11 +162,7 @@ def _relative(root: Path, value: str | Path) -> Path:
             candidate = candidate.relative_to(root)
         except ValueError as exc:
             raise MutationConflict("mutation target is outside its verified root") from exc
-    if not candidate.parts or candidate.is_absolute() or ".." in candidate.parts or _has_ads(candidate):
-        raise MutationConflict("mutation target must be a safe relative path")
-    if any(part in {"", "."} for part in candidate.parts):
-        raise MutationConflict("mutation target contains an ambiguous component")
-    return candidate
+    return safe_relative_path(candidate)
 
 
 def _validate_chain(root: Path, relative: Path) -> tuple[Path, str]:
@@ -847,6 +898,7 @@ def delete(
 def ensure_directory_path(path: str | Path) -> Path:
     """Create missing regular directories without following a reparse chain."""
 
+    _validate_directory_input(path)
     target = _lexical(path)
     if _has_ads(target):
         raise MutationConflict(f"directory path contains alternate-stream syntax: {target}")
@@ -887,6 +939,7 @@ def ensure_directory_path(path: str | Path) -> Path:
 
 
 def make_temporary_directory(root: str | Path, *, prefix: str) -> Path:
+    _validate_directory_input(root)
     _require_supported_root_boundary()
     root_path = _lexical(root)
     if not root_path.is_dir() or _is_reparse(root_path):
@@ -1040,4 +1093,5 @@ __all__ = [
     "remove_tree",
     "rename",
     "replace",
+    "safe_relative_path",
 ]
