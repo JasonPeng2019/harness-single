@@ -325,11 +325,15 @@ class AcceptanceBroker:
     """Controller-side materializer and immutable evidence chain; it never dispatches MCP itself."""
 
     def __init__(self, root: Path, seed: Path, policy_path: Path, templates_path: Path, manifest_path: Path | None = None, *, target_root: Path | None = None) -> None:
-        for item in (root, seed, policy_path, templates_path, manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json")): reject_linked_path(item)
-        self.root, self.seed, self.policy_path = root.resolve(), seed.resolve(), policy_path.resolve()
-        self.templates = json.loads(templates_path.read_text(encoding="utf-8"))
+        selected_manifest = manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json")
+        for item in (root, seed, policy_path, templates_path, selected_manifest): reject_linked_path(item)
+        self.root, self.seed = root.resolve(), seed.resolve()
+        self.policy_path = policy_path.resolve()
+        self.templates_path = templates_path.resolve()
+        self.manifest_path = selected_manifest.resolve()
+        self.templates = json.loads(self.templates_path.read_text(encoding="utf-8"))
         self.policy = _load_policy(self.policy_path)
-        self.manifest = validate_manifest(manifest_path or Path(__file__).with_name("ACCEPTANCE_MANIFEST.json"))
+        self.manifest = validate_manifest(self.manifest_path)
         self.root.mkdir(parents=True, exist_ok=True)
         self.target_parent = _safe_child(self.root, "targets")
         if target_root is not None:

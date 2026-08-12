@@ -113,6 +113,7 @@ def _launch(config: dict[str, Any]) -> StdioProcess:
     return subprocess.Popen(  # type: ignore[return-value]
         config["mcp_command"], cwd=config["working_directory"], env=config["environment"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        **dict(config.get("popen_kwargs", {})),
     )
 
 
@@ -147,8 +148,8 @@ def _server_run_id(guidance: str) -> str:
 
 class _StdioTransport:
     """The controller's only stdio owner: one writer and permanent stdout/stderr drains."""
-    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float, stderr_path: Path | None = None) -> None:
-        self.process, self.remaining, self.io_cap = process, remaining, io_cap
+    def __init__(self, process: StdioProcess, remaining: Callable[[], float], io_cap: float, stderr_path: Path | None = None, authority_check: Callable[[], bool] | None = None) -> None:
+        self.process, self.remaining, self.io_cap, self.authority_check = process, remaining, io_cap, authority_check
         self.stderr_path = stderr_path
         try: self.stderr_log = stderr_path.open("xb") if stderr_path is not None else None
         except OSError as exc: raise AdmissionError("MCP stderr log path is unavailable") from exc
@@ -161,6 +162,8 @@ class _StdioTransport:
 
     def _wait(self, event: threading.Event, label: str) -> None:
         while not event.is_set():
+            if self.authority_check is not None and not self.authority_check():
+                raise AdmissionError("MCP " + label + " authority expired")
             remaining = self._budget()
             if remaining <= 0: raise AdmissionError("MCP " + label + " timed out")
             event.wait(min(remaining, 0.02))
@@ -170,6 +173,7 @@ class _StdioTransport:
 
     def send(self, value: dict[str, Any], label: str) -> None:
         if not self.accepting.is_set() or self.stop.is_set() or self.process.stdin is None: raise AdmissionError("MCP stdin is unavailable")
+        if self.authority_check is not None and not self.authority_check(): raise AdmissionError("MCP " + label + " authority expired before enqueue")
         done, errors = threading.Event(), []
         self.writes.put((json.dumps(value, separators=(",", ":")).encode() + b"\n", done, errors))
         self._wait(done, label)
@@ -255,6 +259,7 @@ class _StdioTransport:
             except queue.Empty: continue
             try:
                 if self.process.stdin is None: raise OSError("stdin unavailable")
+                if self.authority_check is not None and not self.authority_check(): raise AdmissionError("MCP writer authority expired before I/O")
                 self.process.stdin.write(data); self.process.stdin.flush()
             except BaseException as exc: errors.append(exc)
             finally: done.set()
@@ -330,10 +335,20 @@ class FirmwareAcceptanceController:
 
         def transport_factory(process: Any, remaining: Callable[[], float], request_id: str, config: dict[str, Any]) -> _StdioTransport:
             stderr_path = _safe_child(Path(config["roots"]["logs"]), request_id + ".stderr.log")
-            return _StdioTransport(process, remaining, self.io_timeout, stderr_path)
+            return _StdioTransport(process, remaining, self.io_timeout, stderr_path, config.get("_authority_check"))
+
+        controller_authority = {
+            "manifest": self.broker.manifest,
+            "policy": self.broker.policy,
+            "templates": self.broker.templates,
+            "manifest_path": self.broker.manifest_path,
+            "policy_path": self.broker.policy_path,
+            "templates_path": self.broker.templates_path,
+        }
 
         return FirmwareHardwareAdapter(
             campaign_pack=campaign_pack,
+            controller_authority=controller_authority,
             snapshot_provider=snapshot_provider,
             launcher=self.launcher,
             identity_provider=self.identity_provider,
@@ -353,6 +368,7 @@ class FirmwareAcceptanceController:
         snapshot_provider: Callable[[Any], Any] | None = None,
         policy_verifier: Callable[[Any, Any, Any], bool] | None = None,
         identity_provider: Callable[[], dict[str, Any] | None] | None = None,
+        state_root: Path | None = None,
     ) -> dict[str, Any]:
         """Run the generic broker while retaining the legacy controller entrypoint."""
 
@@ -372,6 +388,7 @@ class FirmwareAcceptanceController:
             policy_verifier=policy_verifier,
             identity_provider=identity_provider,
             claims_factory=claims_factory,
+            state_root=state_root or (self.broker.root / "capability-state"),
             clock=self.clock,
         )
         result: CapabilityResult = broker.execute(request, approval)

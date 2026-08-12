@@ -1,8 +1,8 @@
 """Firmware-specific capability adapter.
 
-The adapter owns campaign method mapping, controller-local transport state,
-child identity, raw response interpretation, and exact cleanup.  Its public
-results contain only generic capability facts.
+The adapter owns controller-private campaign mapping, process boundaries,
+transport state, raw response interpretation, and exact cleanup.  The generic
+broker receives only public capability facts.
 """
 from __future__ import annotations
 
@@ -19,7 +19,9 @@ from orchestrator_harness.capability_broker import (
     CapabilitySnapshot,
     CleanupEvidence,
 )
-from orchestrator_harness.process_supervisor import ProcessSupervisor
+from orchestrator_harness.models import ProcessInfo, iso_utc
+from orchestrator_harness.process_supervisor import ProcessBoundary, ProcessSupervisor
+from orchestrator_harness.processes import process_snapshot
 
 from .campaign_pack import DEFAULT_CAMPAIGN_PACK, FirmwareCampaignPack, FirmwareOperation
 
@@ -29,19 +31,24 @@ ChildIdentityProvider = Callable[[int], Mapping[str, Any] | None]
 ConfigProvider = Callable[[CapabilityRequest, FirmwareOperation], Mapping[str, Any]]
 SnapshotProvider = Callable[[CapabilityRequest], CapabilitySnapshot | Mapping[str, Any]]
 TransportFactory = Callable[[Any, Callable[[], float], str, Mapping[str, Any]], Any]
-SupervisorFactory = Callable[[Any, Mapping[str, Any], str], ProcessSupervisor]
+SupervisorFactory = Callable[..., ProcessSupervisor]
+BoundaryFactory = Callable[[], ProcessBoundary]
+OperationKey = tuple[str, str]
 
 
 @dataclass
 class _ActiveOperation:
-    process: Any
+    process: Any | None
     identity: Mapping[str, Any] | None
+    supervisor_identity: ProcessInfo | Mapping[str, Any] | None
     transport: Any | None
+    boundary: ProcessBoundary | Any
     operation: FirmwareOperation
+    launch_attempted: bool = False
 
 
 class FirmwareHardwareAdapter:
-    """Controller-owned adapter for the inert campaign's authorized mappings."""
+    """Controller-owned adapter for the controller-pinned campaign."""
 
     ADAPTER_IDENTITY = {"adapter_id": "firmware-hardware", "adapter_version": "v1"}
 
@@ -49,12 +56,14 @@ class FirmwareHardwareAdapter:
         self,
         *,
         campaign_pack: FirmwareCampaignPack = DEFAULT_CAMPAIGN_PACK,
+        controller_authority: Mapping[str, Any] | None = None,
         snapshot_provider: SnapshotProvider | None = None,
         launcher: Launcher | None = None,
         identity_provider: ChildIdentityProvider | None = None,
         config_provider: ConfigProvider | None = None,
         transport_factory: TransportFactory | None = None,
         supervisor_factory: SupervisorFactory | None = None,
+        boundary_factory: BoundaryFactory = ProcessBoundary.prepare,
         graceful_timeout_seconds: float = 5.0,
         force_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
@@ -67,78 +76,146 @@ class FirmwareHardwareAdapter:
         self.config_provider = config_provider
         self.transport_factory = transport_factory
         self.supervisor_factory = supervisor_factory
+        self.boundary_factory = boundary_factory
         self.graceful_timeout_seconds = graceful_timeout_seconds
         self.force_timeout_seconds = force_timeout_seconds
         self.clock = clock
         self.io_timeout = io_timeout
-        self._active: dict[str, _ActiveOperation] = {}
-        self._cleanup_results: dict[str, CleanupEvidence] = {}
+        self._active: dict[OperationKey, _ActiveOperation] = {}
+        self._cleanup_results: dict[OperationKey, CleanupEvidence] = {}
+        self._retained_boundaries: dict[OperationKey, Any] = {}
+        self._authority_error: str | None = None
+        if controller_authority is not None:
+            try:
+                self.campaign_pack = campaign_pack.with_controller_authority(controller_authority)
+            except Exception as exc:
+                self._authority_error = type(exc).__name__
+        elif not campaign_pack.controller_bound:
+            self._authority_error = "controller_authority_unavailable"
 
     @property
     def adapter_identity(self) -> Mapping[str, str]:
         return dict(self.ADAPTER_IDENTITY)
 
+    @staticmethod
+    def _operation_key(permit: CapabilityPermit) -> OperationKey:
+        return (permit.request.request_id, permit.permit_sha256)
+
+    def _operation(self, request: CapabilityRequest) -> FirmwareOperation:
+        if self._authority_error is not None:
+            raise CapabilityAdapterUnavailable("controller campaign authority is unavailable")
+        operation = self.campaign_pack.resolve(request)
+        self.campaign_pack.validate_operation(request, operation, now_monotonic=self.clock())
+        return operation
+
     def supports(self, request: CapabilityRequest) -> bool:
         try:
-            self.campaign_pack.resolve(request)
+            self._operation(request)
             return True
-        except CapabilityAdapterUnavailable:
+        except Exception:
             return False
 
     def observe(self, request: CapabilityRequest) -> CapabilitySnapshot:
+        operation = self._operation(request)
         if self.snapshot_provider is None:
             raise CapabilityAdapterUnavailable("current target snapshot provider is unavailable")
         value = self.snapshot_provider(request)
         snapshot = CapabilitySnapshot.from_record(value.to_record() if isinstance(value, CapabilitySnapshot) else value)
         if snapshot.adapter_identity != dict(self.ADAPTER_IDENTITY):
             raise CapabilityAdapterError("snapshot belongs to another adapter")
+        if (
+            snapshot.resources != (operation.canonical_resource,)
+            or snapshot.resource_identities.get(operation.canonical_resource) != operation.fixture_identity
+            or snapshot.identity.get("canonical_resource") != operation.canonical_resource
+            or snapshot.identity.get("fixture_identity") != operation.fixture_identity
+        ):
+            raise CapabilityAdapterError("snapshot does not bind the exact firmware fixture resource")
         return snapshot
 
     def verify_approval(self, request: CapabilityRequest, snapshot: CapabilitySnapshot, approval: Any) -> bool:
         try:
-            operation = self.campaign_pack.resolve(request)
-        except CapabilityAdapterUnavailable:
+            operation = self._operation(request)
+            return hasattr(approval, "policy") and self.campaign_pack.approval_policy(request, operation, approval)
+        except Exception:
             return False
-        policy = getattr(approval, "policy", None)
-        return isinstance(policy, Mapping) and self.campaign_pack.approval_policy(request, operation, policy)
+
+    def effective_expiry(
+        self,
+        request: CapabilityRequest,
+        snapshot: CapabilitySnapshot,
+        approval: Any,
+        now_monotonic: float,
+    ) -> float:
+        operation = self._operation(request)
+        if not hasattr(approval, "issued_monotonic"):
+            raise CapabilityAdapterUnavailable("approval duration identity is unavailable")
+        return min(
+            request.expires_monotonic,
+            float(approval.expires_monotonic),
+            self.campaign_pack.effective_duration(request, operation, now_monotonic=now_monotonic),
+        )
+
+    @staticmethod
+    def _child_identity(pid: int, exact: Mapping[str, Any], process: ProcessInfo | None) -> dict[str, Any]:
+        exact_created = exact.get("created_utc")
+        if not isinstance(exact_created, str) or not exact_created:
+            raise CapabilityAdapterError("adapter child creation identity is unavailable")
+        created = iso_utc(process.created_utc) if process is not None else exact_created
+        if not isinstance(created, str) or not created:
+            raise CapabilityAdapterError("adapter child process timestamp is unavailable")
+        return {"pid": pid, "created_utc": created, "creation_identity": exact_created}
 
     def dispatch(self, permit: CapabilityPermit) -> AdapterResult:
-        operation = self.campaign_pack.resolve(permit.request)
+        operation = self._operation(permit.request)
         if self.launcher is None or self.identity_provider is None or self.config_provider is None or self.transport_factory is None:
             raise CapabilityAdapterUnavailable("controller-owned adapter dependencies are unavailable")
-        config = self.config_provider(permit.request, operation)
-        if not isinstance(config, Mapping):
-            raise CapabilityAdapterError("adapter configuration is not an object")
-        process = self.launcher(config)
-        active = _ActiveOperation(process=process, identity=None, transport=None, operation=operation)
-        self._active[permit.request.request_id] = active
+        if self.clock() >= permit.expires_monotonic:
+            raise CapabilityAdapterError("adapter permit expired before launch")
+        boundary = self.boundary_factory()
+        key = self._operation_key(permit)
+        active = _ActiveOperation(process=None, identity=None, supervisor_identity=None, transport=None, boundary=boundary, operation=operation)
+        self._active[key] = active
         try:
+            config = self.config_provider(permit.request, operation)
+            if not isinstance(config, Mapping):
+                raise CapabilityAdapterError("adapter configuration is not an object")
+            launch_config = dict(config)
+            launch_config["popen_kwargs"] = dict(boundary.popen_kwargs)
+            active.launch_attempted = True
+            process = self.launcher(launch_config)
+            active.process = process
             pid = getattr(process, "pid", None)
             if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
                 raise CapabilityAdapterError("adapter child identity has no valid PID")
-            identity = self.identity_provider(pid)
-            if not isinstance(identity, Mapping) or identity.get("pid") != pid or not isinstance(identity.get("created_utc"), str) or not identity["created_utc"]:
+            exact = self.identity_provider(pid)
+            if not isinstance(exact, Mapping) or exact.get("pid") != pid:
                 raise CapabilityAdapterError("adapter child creation identity is unavailable")
-            active.identity = dict(identity)
+            process_info = process_snapshot().by_pid.get(pid)
+            active.identity = self._child_identity(pid, exact, process_info)
+            active.supervisor_identity = process_info or active.identity
+            boundary.attach(process, process_info or active.identity)
             remaining = lambda: permit.expires_monotonic - self.clock()
-            transport = self.transport_factory(process, remaining, permit.request.request_id, config)
-            active.transport = transport
-            transport.send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"capabilities": {}, "client": {"version": "1"}},
-                },
+            authority_check = lambda: self.clock() < permit.expires_monotonic
+            transport_config = dict(launch_config)
+            transport_config["_authority_check"] = authority_check
+            active.transport = self.transport_factory(process, remaining, permit.request.request_id, transport_config)
+
+            def send_checked(value: dict[str, Any], label: str) -> None:
+                if not authority_check():
+                    raise CapabilityAdapterError("adapter permit expired before transport enqueue")
+                active.transport.send(value, label)
+
+            send_checked(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}, "client": {"version": "1"}}},
                 "initialize",
             )
-            transport.receive(1)
-            transport.send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, "initialized")
-            transport.send(
+            active.transport.receive(1)
+            send_checked({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, "initialized")
+            send_checked(
                 {"jsonrpc": "2.0", "id": 2, "method": operation.method, "params": {"arguments": dict(operation.arguments)}},
                 "dispatch",
             )
-            raw = transport.receive(2)
+            raw = active.transport.receive(2)
             if not isinstance(raw, Mapping) or not isinstance(raw.get("result"), Mapping):
                 raise CapabilityAdapterError("adapter response is not a structured result")
             result_payload = dict(raw["result"])
@@ -150,9 +227,53 @@ class FirmwareHardwareAdapter:
                 adapter_identity=dict(self.ADAPTER_IDENTITY),
             )
         except Exception:
-            # Keep the active operation private so cleanup can still account
-            # for a child that was created before dispatch failed.
+            # Keep the active operation private so cleanup can account for a
+            # child that was created before a later boundary/transport failure.
             raise
+
+    @staticmethod
+    def _public_child_cleanup(result: Any) -> dict[str, Any]:
+        record = result.to_record() if hasattr(result, "to_record") else {}
+        allowed = {
+            "status", "stages", "terminate_attempted", "kill_attempted", "final_reap",
+            "cleanup_confirmed", "identity_verified", "identity_uncertain", "exit_code",
+            "reaped_after", "errors", "owned_boundary_empty", "boundary_complete",
+            "boundary_cleanup", "boundary_errors",
+        }
+        return {key: value for key, value in record.items() if key in allowed}
+
+    @staticmethod
+    def _public_io_cleanup(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {"closed": False, "helpers_stopped": False, "errors": ["invalid transport cleanup"]}
+        allowed = {
+            "closed", "helpers_stopped", "stderr_sha256", "stderr_log_complete",
+            "stderr_log_sha256", "stderr_log_partial_sha256", "stderr_eof",
+            "stderr_forced_close", "helper_threads", "stream_close_errors", "error_type",
+        }
+        return {key: value[key] for key in value if key in allowed}
+
+    @staticmethod
+    def _public_boundary_cleanup(value: Any) -> dict[str, Any]:
+        """Reduce boundary implementation records to stable public facts.
+
+        ProcessBoundary records also contain OS-specific group/session and
+        kernel-handle identity fields.  Those are adapter authority, not
+        generic cleanup evidence, and must not cross the public seam.
+        """
+
+        if not isinstance(value, Mapping):
+            return {"complete": False, "members": [], "live_members": [], "errors": ["invalid boundary cleanup"]}
+        allowed = {"kind", "complete", "inventory_source", "cleanup", "errors", "members", "live_members"}
+        result = {key: value[key] for key in value if key in allowed}
+        result.setdefault("complete", False)
+        live_members = result.get("live_members", [])
+        # ProcessBoundary also reports historical observations in `members`.
+        # The public release fact is the current owned set, so do not let a
+        # reaped historical member contradict complete-empty cleanup.
+        result["live_members"] = live_members
+        result["members"] = live_members
+        return result
 
     def cleanup(
         self,
@@ -160,88 +281,94 @@ class FirmwareHardwareAdapter:
         dispatch_result: AdapterResult | None,
         failure: Mapping[str, Any] | None,
     ) -> CleanupEvidence:
-        request_id = permit.request.request_id
-        prior = self._cleanup_results.get(request_id)
+        key = self._operation_key(permit)
+        prior = self._cleanup_results.get(key)
         if prior is not None:
             return prior
-        active = self._active.pop(request_id, None)
+        active = self._active.pop(key, None)
         if active is None:
             result = CleanupEvidence(
                 proved=True,
-                boundary={"complete": True, "members": []},
+                boundary={"complete": True, "members": [], "live_members": []},
                 identities=(),
                 details={"launch_started": False, "dispatch_failed": failure is not None},
             )
-            self._cleanup_results[request_id] = result
+            self._cleanup_results[key] = result
             return result
 
-        # Prove the exact child first.  Closing the channel and joining its
-        # helpers follows the same ordering as the retained controller path.
-        cleanup_result = None
+        cleanup_result: Any | None = None
         cleanup_error: str | None = None
-        if active.identity is None:
-            cleanup_error = "child identity was unavailable"
-        else:
-            try:
-                supervisor = self.supervisor_factory(active.process, active.identity, request_id) if self.supervisor_factory is not None else ProcessSupervisor(
+        try:
+            if active.identity is None:
+                if active.launch_attempted:
+                    cleanup_error = "child identity was unavailable"
+            elif self.supervisor_factory is not None:
+                try:
+                    supervisor = self.supervisor_factory(active.process, active.identity, permit.request.request_id, active.boundary)
+                except TypeError:
+                    supervisor = self.supervisor_factory(active.process, active.identity, permit.request.request_id)
+                cleanup_result = supervisor.cleanup()
+            else:
+                supervisor = ProcessSupervisor(
                     active.process,
-                    active.identity,
+                    active.supervisor_identity or active.identity,
                     graceful_timeout_seconds=self.graceful_timeout_seconds,
                     force_timeout_seconds=self.force_timeout_seconds,
+                    boundary=active.boundary,
                 )
                 cleanup_result = supervisor.cleanup()
-            except Exception as exc:
-                cleanup_error = f"{type(exc).__name__}"
+        except Exception as exc:
+            cleanup_error = type(exc).__name__
 
-        transport_ok = True
-        transport_record: dict[str, Any] = {"closed": False, "helpers_stopped": False}
+        boundary_record: dict[str, Any] = {"complete": False, "members": [], "live_members": [], "errors": ["boundary evidence unavailable"]}
+        try:
+            inventory = active.boundary.inventory()
+            boundary_record = self._public_boundary_cleanup(active.boundary.to_record(inventory))
+        except Exception as exc:
+            boundary_record = {"complete": False, "members": [], "live_members": [], "errors": [f"boundary inventory failed: {type(exc).__name__}"]}
+
+        io_record = {"closed": True, "helpers_stopped": True}
         if active.transport is not None:
             try:
                 closed = active.transport.close_and_join()
                 if isinstance(closed, tuple) and len(closed) == 2:
-                    transport_ok = bool(closed[0])
-                    transport_record["closed"] = transport_ok
-                    transport_record["helpers_stopped"] = transport_ok
-                    if isinstance(closed[1], Mapping):
-                        transport_record["details"] = {key: value for key, value in closed[1].items() if key not in {"endpoint", "transport", "handle"}}
+                    io_record = self._public_io_cleanup(closed[1])
+                    io_record["closed"] = bool(closed[0])
+                    io_record["helpers_stopped"] = bool(closed[0])
                 else:
-                    transport_ok = False
+                    io_record = {"closed": False, "helpers_stopped": False, "errors": ["invalid transport cleanup"]}
             except Exception as exc:
-                transport_ok = False
-                transport_record["error_type"] = type(exc).__name__
+                io_record = {"closed": False, "helpers_stopped": False, "error_type": type(exc).__name__}
 
-        if cleanup_error is not None or cleanup_result is None:
-            result = CleanupEvidence(
-                proved=False,
-                boundary={"complete": False, "errors": ["exact child cleanup was unavailable"]},
-                identities=() if active.identity is None else (dict(active.identity),),
-                details={"error_type": cleanup_error or "missing cleanup result", "channel_cleanup": transport_record},
+        child_record = self._public_child_cleanup(cleanup_result) if cleanup_result is not None else {}
+        child_ok = (
+            cleanup_error is None
+            and (
+                (not active.launch_attempted and active.process is None)
+                or (cleanup_result is not None and bool(getattr(cleanup_result, "proved_reap", False)))
             )
-            self._cleanup_results[request_id] = result
-            return result
-        try:
-            cleanup_record = cleanup_result.to_record()
-            proved = bool(cleanup_result.proved_reap and transport_ok)
-            boundary = {
-                "complete": bool(cleanup_result.boundary_complete),
-                "members": [],
-                "errors": list(cleanup_result.boundary_errors),
-                "cleanup": cleanup_result.boundary_cleanup,
-            }
-            result = CleanupEvidence(
-                proved=proved,
-                boundary=boundary,
-                identities=() if proved else (dict(active.identity),),
-                details={"process": cleanup_record, "channel_cleanup": transport_record},
-            )
-        except Exception as exc:
-            result = CleanupEvidence(
-                proved=False,
-                boundary={"complete": False, "errors": ["exact child cleanup was unavailable"]},
-                identities=(dict(active.identity),),
-                details={"error_type": type(exc).__name__, "channel_cleanup": transport_record},
-            )
-        self._cleanup_results[request_id] = result
+        )
+        boundary_ok = boundary_record.get("complete") is True and not boundary_record.get("live_members") and not boundary_record.get("errors")
+        io_ok = io_record.get("closed") is True and io_record.get("helpers_stopped") is True and not io_record.get("error_type") and not io_record.get("errors")
+        proved = child_ok and boundary_ok and io_ok
+        identities: tuple[dict[str, Any], ...] = () if proved else (() if active.identity is None else (dict(active.identity),))
+        details: dict[str, Any] = {
+            "launch_started": active.launch_attempted,
+            "child_cleanup": child_record,
+            "owned_boundary": boundary_record,
+            "io_cleanup": io_record,
+        }
+        if cleanup_error is not None:
+            details["cleanup_error"] = cleanup_error
+        result = CleanupEvidence(proved=proved, boundary=boundary_record, identities=identities, details=details)
+        if proved:
+            try:
+                active.boundary.close()
+            except Exception:
+                pass
+        else:
+            self._retained_boundaries[key] = active.boundary
+        self._cleanup_results[key] = result
         return result
 
 

@@ -21,8 +21,9 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 from harness_common.process_identity import exact_process_identity
 
 from .models import iso_utc
+from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
 from .processes import process_snapshot
-from .resource_locks import ResourceClaims, ResourceLockError
+from .resource_locks import BOUNDARY_ARMED_STATE, ResourceClaims
 
 
 REQUEST_SCHEMA = "orchestrator-capability-request/v1"
@@ -31,24 +32,30 @@ APPROVAL_SCHEMA = "orchestrator-capability-approval/v1"
 PERMIT_SCHEMA = "orchestrator-capability-permit/v1"
 RESULT_SCHEMA = "orchestrator-capability-result/v1"
 CLEANUP_SCHEMA = "orchestrator-capability-cleanup/v1"
+STATE_SCHEMA = "orchestrator-capability-state/v1"
 
 _IDENTITY_KEYS = {"pid", "created_utc", "creation_identity"}
 _ADAPTER_IDENTITY_KEYS = {"adapter_id", "adapter_version"}
-_PRIVATE_KEYS = {
+_AUTHORITY_KEY_PARTS = {
     "endpoint",
+    "mcp",
+    "server",
+    "connection",
     "transport",
+    "session",
     "handle",
-    "credential",
-    "credentials",
-    "secret",
+    "config",
     "token",
+    "credential",
+    "secret",
     "password",
     "stdio",
-    "command",
-    "server",
     "provider",
-    "process_handle",
-    "physical_connection",
+    "command",
+    "physical",
+    "socket",
+    "pipe",
+    "channel",
 }
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -97,7 +104,8 @@ def _public_json(value: Any, *, label: str) -> Any:
         for key, item in value.items():
             if not isinstance(key, str) or not key:
                 raise CapabilityError(f"{label} has a non-string key")
-            if key.casefold() in _PRIVATE_KEYS:
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+            if any(part in normalized_key for part in _AUTHORITY_KEY_PARTS):
                 raise CapabilityError(f"{label} contains private capability material")
             result[key] = _public_json(item, label=label)
         return {key: result[key] for key in sorted(result)}
@@ -610,6 +618,14 @@ class CapabilityAdapter(Protocol):
 
     def dispatch(self, permit: CapabilityPermit) -> AdapterResult: ...
 
+    def effective_expiry(
+        self,
+        request: CapabilityRequest,
+        snapshot: CapabilitySnapshot,
+        approval: CapabilityApproval,
+        now_monotonic: float,
+    ) -> float: ...
+
     def cleanup(
         self,
         permit: CapabilityPermit,
@@ -735,6 +751,7 @@ class CapabilityBroker:
         identity_provider: IdentityProvider | None = None,
         claims_factory: ClaimsFactory | None = None,
         claims_root: Path | None = None,
+        state_root: Path | None = None,
         clock: Callable[[], float] = time.monotonic,
         wait_excess_seconds: float = 30.0,
         evidence_sink: Callable[[dict[str, Any]], None] | None = None,
@@ -748,6 +765,22 @@ class CapabilityBroker:
         self.evidence_sink = evidence_sink
         self._claims_factory = claims_factory
         self.claims_root = claims_root.resolve() if claims_root is not None else None
+        if state_root is not None and Path(state_root).is_symlink():
+            raise ValueError("capability state root cannot be a symlink")
+        self.state_root = state_root.resolve() if state_root is not None else None
+        if self.state_root is not None:
+            if self.state_root.is_symlink():
+                raise ValueError("capability state root cannot be a symlink")
+            self.state_root.mkdir(parents=True, exist_ok=True)
+            self._state_requests_root = self.state_root / "requests"
+            self._state_approvals_root = self.state_root / "approvals"
+            for root in (self._state_requests_root, self._state_approvals_root):
+                if root.is_symlink():
+                    raise ValueError("capability state directory cannot be a symlink")
+                root.mkdir(parents=True, exist_ok=True)
+        else:
+            self._state_requests_root = None
+            self._state_approvals_root = None
         self._active: dict[str, str] = {}
         self._terminal: dict[str, CapabilityResult] = {}
         self._used_approvals: set[str] = set()
@@ -757,6 +790,234 @@ class CapabilityBroker:
             self._adapter_identity = _adapter_identity(adapter.adapter_identity)
         except (AttributeError, CapabilityError) as exc:
             raise ValueError("capability adapter identity is unavailable") from exc
+
+    @staticmethod
+    def _state_filename(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest() + ".json"
+
+    def _state_path(self, kind: str, value: str) -> Path | None:
+        root = self._state_requests_root if kind == "request" else self._state_approvals_root
+        return root / self._state_filename(value) if root is not None else None
+
+    def _read_state(self, path: Path) -> dict[str, Any] | None:
+        if path.is_symlink() or not path.is_file():
+            if not path.exists() and not path.is_symlink():
+                return None
+            raise CapabilityError("durable capability state path is not a regular file")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CapabilityError("durable capability state is unreadable") from exc
+        if not isinstance(value, dict) or value.get("schema") != STATE_SCHEMA:
+            raise CapabilityError("durable capability state schema is invalid")
+        copied = _public_json(value, label="durable capability state")
+        if not isinstance(copied, dict):
+            raise CapabilityError("durable capability state is not an object")
+        return copied
+
+    def _write_state(self, path: Path, value: Mapping[str, Any], *, expected: Any | None = None) -> None:
+        raw = canonical_json_bytes(value)
+        target = expected if expected is not None else capture_target(path.parent, path.name)
+        mutation_replace(path.parent, path.name, raw, expected=target)
+
+    def _supplied_approval_sha(self, value: CapabilityApproval | Mapping[str, Any]) -> tuple[str | None, str | None]:
+        try:
+            record = value.to_record() if isinstance(value, CapabilityApproval) else value
+            if not isinstance(record, Mapping):
+                return None, None
+            approval_id = record.get("approval_id")
+            approval_sha = canonical_sha256(record)
+            return approval_id if isinstance(approval_id, str) else None, approval_sha
+        except (CapabilityError, TypeError, ValueError):
+            return None, None
+
+    def _load_durable_retry(
+        self,
+        request: CapabilityRequest,
+        approval_value: CapabilityApproval | Mapping[str, Any],
+    ) -> CapabilityResult | None:
+        path = self._state_path("request", request.request_id)
+        if path is None:
+            return None
+        state = self._read_state(path)
+        if state is None:
+            return None
+        if state.get("request_sha256") != request.sha256:
+            raise CapabilityDenied(
+                "REPLAY_MISMATCH",
+                "request identity was reused with changed semantics",
+                stage="request",
+            )
+        approval_id, approval_sha = self._supplied_approval_sha(approval_value)
+        if approval_id != state.get("approval_id") or approval_sha != state.get("approval_sha256"):
+            raise CapabilityDenied(
+                "APPROVAL_REPLAY",
+                "request retry does not carry the exact consumed approval",
+                stage="approval",
+            )
+        stage = state.get("stage")
+        if stage in {"TERMINAL", "TERMINAL_PENDING_RELEASE"}:
+            terminal = state.get("terminal_result")
+            if not isinstance(terminal, Mapping):
+                raise CapabilityDenied("STATE_INVALID", "durable terminal result is missing", stage="state")
+            result = CapabilityResult(dict(terminal))
+            with self._state_lock:
+                self._terminal[request.request_id] = result
+            self._publish(result.to_record())
+            return result
+        raise CapabilityDenied(
+            "REQUEST_INDETERMINATE",
+            "durable request state records an admitted operation without a terminal fact",
+            stage="state",
+            details={"state": stage},
+        )
+
+    def _reserve_permit_state(
+        self,
+        request: CapabilityRequest,
+        snapshot: CapabilitySnapshot,
+        approval: CapabilityApproval,
+        permit: CapabilityPermit,
+        wait_findings: Sequence[Mapping[str, Any]],
+    ) -> tuple[bool, str | None]:
+        request_path = self._state_path("request", request.request_id)
+        approval_path = self._state_path("approval", approval.approval_id)
+        if request_path is None or approval_path is None:
+            return True, None
+        approval_record = {
+            "schema": STATE_SCHEMA,
+            "stage": "APPROVAL_CONSUMED",
+            "request_id": request.request_id,
+            "request_sha256": request.sha256,
+            "approval_id": approval.approval_id,
+            "approval_sha256": approval.sha256,
+            "permit_sha256": permit.permit_sha256,
+        }
+        try:
+            self._write_state(approval_path, approval_record)
+        except MutationConflict:
+            return False, "approval was already durably consumed"
+        except (MutationUnsupported, OSError, CapabilityError) as exc:
+            return False, f"approval state could not be durably written: {type(exc).__name__}"
+        state = {
+            "schema": STATE_SCHEMA,
+            "stage": "PERMIT_COMMITTED",
+            "request_id": request.request_id,
+            "request_sha256": request.sha256,
+            "approval_id": approval.approval_id,
+            "approval_sha256": approval.sha256,
+            "snapshot_sha256": snapshot.sha256,
+            "permit_sha256": permit.permit_sha256,
+            "request": request.to_record(),
+            "snapshot": snapshot.to_record(),
+            "approval": approval.to_record(),
+            "permit": permit.to_record(),
+            "wait_findings": list(wait_findings),
+            "terminal_result": None,
+            "updated_monotonic": self.clock(),
+        }
+        try:
+            self._write_state(request_path, state)
+        except MutationConflict:
+            return False, "request identity was already durably admitted"
+        except (MutationUnsupported, OSError, CapabilityError) as exc:
+            return False, f"request state could not be durably written: {type(exc).__name__}"
+        return True, None
+
+    def _persist_terminal_state(
+        self,
+        request: CapabilityRequest,
+        approval: CapabilityApproval,
+        permit: CapabilityPermit,
+        record: Mapping[str, Any],
+        *,
+        stage: str,
+    ) -> tuple[bool, str | None]:
+        path = self._state_path("request", request.request_id)
+        if path is None:
+            return True, None
+        try:
+            current = self._read_state(path)
+            if current is None:
+                return False, "durable request state disappeared before terminal publication"
+            updated = dict(current)
+            updated["stage"] = stage
+            updated["terminal_result"] = dict(record)
+            updated["updated_monotonic"] = self.clock()
+            self._write_state(path, updated, expected=capture_target(path.parent, path.name))
+            return True, None
+        except (MutationConflict, MutationUnsupported, OSError, CapabilityError) as exc:
+            return False, f"terminal state could not be durably written: {type(exc).__name__}"
+
+    def _effective_expiry(
+        self,
+        request: CapabilityRequest,
+        snapshot: CapabilitySnapshot,
+        approval: CapabilityApproval,
+    ) -> float:
+        candidate = min(request.expires_monotonic, approval.expires_monotonic)
+        authority = getattr(self.adapter, "effective_expiry", None)
+        if callable(authority):
+            try:
+                candidate = min(candidate, float(authority(request, snapshot, approval, self.clock())))
+            except Exception as exc:
+                raise CapabilityDenied(
+                    "APPROVAL_POLICY_UNAVAILABLE",
+                    "capability duration policy could not be evaluated",
+                    stage="approval",
+                    details={"error_type": type(exc).__name__},
+                ) from exc
+        if not math.isfinite(candidate):
+            raise CapabilityDenied("INVALID_EXPIRY", "effective capability expiry is not finite", stage="approval")
+        return candidate
+
+    def _arm_claims(self, claims: Any) -> list[str]:
+        arm = getattr(claims, "arm_boundary", None)
+        if not callable(arm):
+            raise CapabilityDenied(
+                "CLAIM_ARM_UNAVAILABLE",
+                "resource claims do not expose the accepted arm_boundary primitive",
+                stage="claim",
+            )
+        failures = arm()
+        if not isinstance(failures, (list, tuple)) or any(not isinstance(item, str) for item in failures):
+            raise CapabilityDenied("CLAIM_ARM_INVALID", "resource claim arming evidence is malformed", stage="claim")
+        return list(failures)
+
+    @staticmethod
+    def _cleanup_is_valid(cleanup: CleanupEvidence) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        if cleanup.proved is not True:
+            reasons.append("adapter did not prove cleanup")
+        boundary = cleanup.boundary if isinstance(cleanup.boundary, Mapping) else {}
+        if boundary.get("complete") is not True:
+            reasons.append("owned cleanup boundary is incomplete")
+        if cleanup.identities:
+            reasons.append("cleanup retains live or unresolved identities")
+        for key in ("errors", "boundary_errors"):
+            value = boundary.get(key)
+            if value not in (None, [], (), ""):
+                reasons.append(f"cleanup boundary reports {key}")
+        for key in ("live_members", "live_identities", "members"):
+            value = boundary.get(key)
+            if value not in (None, [], (), ""):
+                reasons.append(f"cleanup boundary reports {key}")
+        details = cleanup.details if isinstance(cleanup.details, Mapping) else {}
+        stack: list[tuple[str, Any]] = [(str(key).casefold(), value) for key, value in details.items()]
+        while stack:
+            key, value = stack.pop()
+            normalized = re.sub(r"[^a-z0-9]", "", key)
+            if normalized not in {"dispatchfailed", "launchstarted"} and any(token in normalized for token in ("error", "failure", "unresolved")) and value not in (None, False, "", [], ()):
+                reasons.append(f"cleanup details report {key}")
+            if normalized in {"closed", "helpersstopped", "helperthreadsstopped", "stderrlogcomplete"} and value is not True:
+                reasons.append(f"cleanup details do not prove {key}")
+            if normalized == "stopped" and value is not True:
+                reasons.append(f"cleanup details do not prove {key}")
+            if isinstance(value, Mapping):
+                stack.extend((str(child).casefold(), item) for child, item in value.items())
+            elif isinstance(value, (list, tuple)):
+                stack.extend((key, item) for item in value)
+        return not reasons, sorted(set(reasons))
 
     def execute(self, request_value: CapabilityRequest | Mapping[str, Any], approval_value: CapabilityApproval | Mapping[str, Any]) -> CapabilityResult:
         """Run one request or return an exact prior terminal result on retry."""
@@ -771,6 +1032,18 @@ class CapabilityBroker:
             return self._denial(request_hint if isinstance(request_hint, str) else None, denial)
         except (CapabilityError, TypeError, ValueError) as exc:
             return self._denial(request_hint if isinstance(request_hint, str) else None, CapabilityDenied("REQUEST_INVALID", str(exc), stage="request"))
+
+        try:
+            durable = self._load_durable_retry(request, approval_value)
+        except CapabilityDenied as denial:
+            return self._denial(request.request_id, denial)
+        except (CapabilityError, OSError, TypeError, ValueError) as exc:
+            return self._denial(
+                request.request_id,
+                CapabilityDenied("STATE_INVALID", "durable capability state could not be read", stage="state", details={"error_type": type(exc).__name__}),
+            )
+        if durable is not None:
+            return durable
 
         with self._state_lock:
             prior = self._terminal.get(request.request_id)
@@ -804,6 +1077,9 @@ class CapabilityBroker:
         return result
 
     def _execute_new(self, request: CapabilityRequest, approval_value: CapabilityApproval | Mapping[str, Any]) -> CapabilityResult:
+        claims: Any | None = None
+        arming_attempted = False
+        wait_findings: list[dict[str, Any]] = []
         try:
             self._verify_owner(request)
             try:
@@ -816,17 +1092,29 @@ class CapabilityBroker:
                 snapshot = self.adapter.observe(request)
                 snapshot = CapabilitySnapshot.from_record(snapshot.to_record() if isinstance(snapshot, CapabilitySnapshot) else snapshot)
             except CapabilityAdapterUnavailable as exc:
-                raise CapabilityDenied("SNAPSHOT_UNAVAILABLE", str(exc), stage="snapshot") from exc
-            except (CapabilityError, CapabilityAdapterError) as exc:
+                raise CapabilityDenied(
+                    "SNAPSHOT_UNAVAILABLE",
+                    "adapter snapshot is unavailable",
+                    stage="snapshot",
+                    details={"error_type": type(exc).__name__},
+                ) from exc
+            except Exception as exc:
                 raise CapabilityDenied("SNAPSHOT_INVALID", "adapter snapshot is unavailable or invalid", stage="snapshot", details={"error_type": type(exc).__name__}) from exc
             self._verify_snapshot(request, snapshot)
             approval = self._verify_approval(request, snapshot, approval_value)
+            effective_expiry = self._effective_expiry(request, snapshot, approval)
+            if self.clock() >= effective_expiry:
+                raise CapabilityDenied("APPROVAL_EXPIRED", "authorized capability duration is already exhausted", stage="approval")
         except CapabilityDenied as denial:
             return self._denial(request.request_id, denial)
+        except Exception as exc:
+            return self._denial(
+                request.request_id,
+                CapabilityDenied("ADMISSION_FAILED", "capability admission failed closed", stage="approval", details={"error_type": type(exc).__name__}),
+            )
 
         try:
             claims = self._new_claims(request)
-            wait_findings: list[dict[str, Any]] = []
 
             def on_wait(finding: Mapping[str, Any]) -> None:
                 fact = {key: finding.get(key) for key in ("resource", "state", "reason", "wait_seconds", "actionable") if key in finding}
@@ -840,28 +1128,88 @@ class CapabilityBroker:
 
             claims.acquire_all(list(request.resources), on_wait=on_wait)
             claim_records = self._exact_claims(claims, request)
-        except CapabilityDenied as denial:
-            release = self._release_claims(claims if "claims" in locals() else None)
-            denial.details["claims_released"] = release[0]
-            if not release[0]:
-                denial.details["release_failures"] = release[1]
-            return self._denial(request.request_id, denial)
-        except (ResourceLockError, OSError, RuntimeError, ValueError) as exc:
-            release = self._release_claims(claims if "claims" in locals() else None)
-            denial = CapabilityDenied("CLAIM_FAILED", "resource claim was not safely acquired", stage="claim", details={"error_type": type(exc).__name__, "claims_released": release[0], "release_failures": release[1]})
-            return self._denial(request.request_id, denial)
-
-        try:
             self._verify_owner(request)
             if self.clock() >= min(request.expires_monotonic, approval.expires_monotonic):
-                raise CapabilityDenied("APPROVAL_EXPIRED", "approval expired before dispatch", stage="dispatch")
+                raise CapabilityDenied("APPROVAL_EXPIRED", "approval expired before claim arming", stage="claim")
             self._verify_approval(request, snapshot, approval)
+            effective_expiry = self._effective_expiry(request, snapshot, approval)
+            if self.clock() >= effective_expiry:
+                raise CapabilityDenied("APPROVAL_EXPIRED", "authorized capability duration expired before claim arming", stage="claim")
             self._exact_claims(claims, request)
+            arming_attempted = True
+            arm_failures = self._arm_claims(claims)
+            if arm_failures:
+                raise CapabilityDenied(
+                    "CLAIM_ARM_FAILED",
+                    "not every exact native resource claim could be durably armed",
+                    stage="claim",
+                    details={"arming_failures": arm_failures},
+                )
+            claim_records = self._exact_claims(claims, request, require_armed=True)
         except CapabilityDenied as denial:
-            release = self._release_claims(claims)
-            denial.details["claims_released"] = release[0]
-            if not release[0]:
-                denial.details["release_failures"] = release[1]
+            if claims is not None and arming_attempted:
+                retained = self._retain_claims(
+                    claims,
+                    CleanupEvidence(
+                        proved=False,
+                        boundary={"complete": False, "errors": ["claim arming did not complete"]},
+                        identities=(),
+                        details={"arming_failure": denial.reason_code},
+                    ),
+                )
+                denial.details["claims_released"] = False
+                denial.details["retention_failures"] = retained
+            else:
+                release = self._release_claims(claims)
+                denial.details["claims_released"] = release[0]
+                if not release[0]:
+                    denial.details["release_failures"] = release[1]
+                    denial.details["retention_failures"] = self._retain_claims(
+                        claims,
+                        CleanupEvidence(
+                            proved=False,
+                            boundary={"complete": False, "errors": ["claim release was not proved"]},
+                            identities=(),
+                            details={"release_failures": release[1]},
+                        ),
+                    )
+            return self._denial(request.request_id, denial)
+        except Exception as exc:
+            if claims is not None and arming_attempted:
+                retained = self._retain_claims(
+                    claims,
+                    CleanupEvidence(
+                        proved=False,
+                        boundary={"complete": False, "errors": ["claim arming raised"]},
+                        identities=(),
+                        details={"arming_error": type(exc).__name__},
+                    ),
+                )
+                denial = CapabilityDenied("CLAIM_ARM_FAILED", "resource claim arming failed closed", stage="claim", details={"error_type": type(exc).__name__, "claims_released": False, "retention_failures": retained})
+            else:
+                release = self._release_claims(claims)
+                retention_failures: list[str] = []
+                if not release[0]:
+                    retention_failures = self._retain_claims(
+                        claims,
+                        CleanupEvidence(
+                            proved=False,
+                            boundary={"complete": False, "errors": ["claim release was not proved"]},
+                            identities=(),
+                            details={"release_failures": release[1]},
+                        ),
+                    )
+                denial = CapabilityDenied(
+                    "CLAIM_FAILED",
+                    "resource claim was not safely acquired",
+                    stage="claim",
+                    details={
+                        "error_type": type(exc).__name__,
+                        "claims_released": release[0],
+                        "release_failures": release[1],
+                        "retention_failures": retention_failures,
+                    },
+                )
             return self._denial(request.request_id, denial)
 
         permit_record = {
@@ -872,7 +1220,7 @@ class CapabilityBroker:
             "claims": claim_records,
             "owner_identity": dict(request.controller_identity),
             "adapter_identity": dict(self._adapter_identity),
-            "expires_monotonic": min(request.expires_monotonic, approval.expires_monotonic),
+            "expires_monotonic": effective_expiry,
         }
         permit_sha = canonical_sha256(permit_record)
         permit = CapabilityPermit(
@@ -882,18 +1230,30 @@ class CapabilityBroker:
             claims=tuple(claim_records),
             owner_identity=dict(request.controller_identity),
             adapter_identity=dict(self._adapter_identity),
-            expires_monotonic=permit_record["expires_monotonic"],
+            expires_monotonic=effective_expiry,
             permit_sha256=permit_sha,
         )
+        state_ok, state_error = self._reserve_permit_state(request, snapshot, approval, permit, wait_findings)
+        if not state_ok:
+            retained = self._retain_claims(
+                claims,
+                CleanupEvidence(
+                    proved=False,
+                    boundary={"complete": False, "errors": ["durable at-most-once state was not committed"]},
+                    identities=(),
+                    details={"state_error": state_error or "unknown"},
+                ),
+            )
+            reason_code = "APPROVAL_REPLAY" if state_error and "approval" in state_error else "STATE_PERSIST_FAILED"
+            denial = CapabilityDenied(reason_code, state_error or "durable request state was not committed", stage="state", details={"claims_released": False, "retention_failures": retained})
+            return self._denial(request.request_id, denial)
         with self._state_lock:
-            if approval.approval_id in self._used_approvals:
-                approval_replayed = True
-            else:
+            approval_replayed = approval.approval_id in self._used_approvals
+            if not approval_replayed:
                 self._used_approvals.add(approval.approval_id)
-                approval_replayed = False
         if approval_replayed:
-            release = self._release_claims(claims)
-            denial = CapabilityDenied("APPROVAL_REPLAY", "approval was already consumed", stage="dispatch", details={"claims_released": release[0], "release_failures": release[1]})
+            retained = self._retain_claims(claims, CleanupEvidence(proved=False, boundary={"complete": False, "errors": ["approval replay"]}, identities=(), details={"approval_replay": True}))
+            denial = CapabilityDenied("APPROVAL_REPLAY", "approval was already consumed", stage="dispatch", details={"claims_released": False, "retention_failures": retained})
             return self._denial(request.request_id, denial)
 
         dispatch_result: AdapterResult | None = None
@@ -903,7 +1263,7 @@ class CapabilityBroker:
             if self.clock() >= permit.expires_monotonic:
                 raise CapabilityAdapterError("permit expired immediately before dispatch")
             self._verify_owner(request)
-            self._exact_claims(claims, request)
+            self._exact_claims(claims, request, require_armed=True)
             dispatch_count = 1
             raw_dispatch = self.adapter.dispatch(permit)
             if not isinstance(raw_dispatch, AdapterResult):
@@ -915,16 +1275,6 @@ class CapabilityBroker:
             dispatch_failure = {"error_type": type(exc).__name__, "reason_code": "DISPATCH_FAILED"}
 
         cleanup = self._cleanup_adapter(permit, dispatch_result, dispatch_failure)
-        release_failures: list[str] = []
-        claims_released = False
-        if cleanup.proved:
-            release_failures = self._release_claims(claims)[1]
-            claims_released = not release_failures and not bool(getattr(claims, "held", ()))
-            if not claims_released:
-                self._retain_claims(claims, cleanup)
-        else:
-            self._retain_claims(claims, cleanup)
-
         if dispatch_result is None:
             raw_result = {"status": "FAIL", "reason_code": (dispatch_failure or {}).get("reason_code", "DISPATCH_FAILED")}
             interpreted = {"status": "FAIL"}
@@ -934,49 +1284,110 @@ class CapabilityBroker:
             interpreted = dispatch_result.interpreted_result
             dispatch_succeeded = dispatch_result.succeeded
         raw_result_sha = canonical_sha256(raw_result)
-        if not cleanup.proved or not claims_released:
-            outcome = "UNCERTAIN"
-            terminal_reason = "cleanup_or_release_unproved"
-        elif not dispatch_succeeded:
-            outcome = "FAIL"
-            terminal_reason = "adapter_result_failed"
+        cleanup_valid, cleanup_reasons = self._cleanup_is_valid(cleanup)
+
+        def make_record(
+            *,
+            outcome: str,
+            terminal_reason: str,
+            claims_released: bool,
+            release_failures: Sequence[str],
+            retention_failures: Sequence[str],
+        ) -> dict[str, Any]:
+            record: dict[str, Any] = {
+                "schema": RESULT_SCHEMA,
+                "request_id": request.request_id,
+                "request_sha256": request.sha256,
+                "state": "TERMINAL",
+                "outcome": outcome,
+                "terminal_reason": terminal_reason,
+                "lane_id": request.lane_id,
+                "capability": request.capability,
+                "action": request.action,
+                "arguments": dict(request.arguments),
+                "resources": list(request.resources),
+                "controller_identity": dict(request.controller_identity),
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_sha256": snapshot.sha256,
+                "approval_id": approval.approval_id,
+                "approval_sha256": approval.sha256,
+                "permit_sha256": permit.permit_sha256,
+                "adapter_identity": dict(self._adapter_identity),
+                "raw_result": raw_result,
+                "raw_result_sha256": raw_result_sha,
+                "interpreted_result": interpreted,
+                "cleanup": cleanup.to_record(),
+                "cleanup_validation": {"valid": cleanup_valid, "reasons": list(cleanup_reasons)},
+                "claims_released": claims_released,
+                "release_failures": list(release_failures),
+                "retention_failures": list(retention_failures),
+                "dispatch_count": dispatch_count,
+                "wait_findings": wait_findings,
+            }
+            if dispatch_failure is not None:
+                record["dispatch_failure"] = dispatch_failure
+            return record
+
+        if not cleanup_valid:
+            retention_failures = self._retain_claims(claims, cleanup)
+            record = make_record(
+                outcome="UNCERTAIN",
+                terminal_reason="cleanup_or_release_unproved",
+                claims_released=False,
+                release_failures=(),
+                retention_failures=retention_failures,
+            )
+            state_ok, state_error = self._persist_terminal_state(request, approval, permit, record, stage="TERMINAL")
+            if not state_ok:
+                record["durable_state_error"] = state_error
+            result = CapabilityResult(record)
         else:
-            outcome = "PASS"
-            terminal_reason = "completed"
-        record: dict[str, Any] = {
-            "schema": RESULT_SCHEMA,
-            "request_id": request.request_id,
-            "request_sha256": request.sha256,
-            "state": "TERMINAL",
-            "outcome": outcome,
-            "terminal_reason": terminal_reason,
-            "lane_id": request.lane_id,
-            "capability": request.capability,
-            "action": request.action,
-            "arguments": dict(request.arguments),
-            "resources": list(request.resources),
-            "controller_identity": dict(request.controller_identity),
-            "snapshot_id": snapshot.snapshot_id,
-            "snapshot_sha256": snapshot.sha256,
-            "approval_id": approval.approval_id,
-            "approval_sha256": approval.sha256,
-            "permit_sha256": permit.permit_sha256,
-            "adapter_identity": dict(self._adapter_identity),
-            "raw_result": raw_result,
-            "raw_result_sha256": raw_result_sha,
-            "interpreted_result": interpreted,
-            "cleanup": cleanup.to_record(),
-            "claims_released": claims_released,
-            "release_failures": release_failures,
-            "dispatch_count": dispatch_count,
-            "wait_findings": wait_findings,
-        }
-        if dispatch_failure is not None:
-            record["dispatch_failure"] = dispatch_failure
-        result = CapabilityResult(record)
+            pending = make_record(
+                outcome="UNCERTAIN",
+                terminal_reason="release_pending",
+                claims_released=False,
+                release_failures=(),
+                retention_failures=(),
+            )
+            pending_ok, pending_error = self._persist_terminal_state(request, approval, permit, pending, stage="TERMINAL_PENDING_RELEASE")
+            if not pending_ok:
+                retention_failures = self._retain_claims(claims, cleanup)
+                record = make_record(
+                    outcome="UNCERTAIN",
+                    terminal_reason="terminal_state_persist_failed",
+                    claims_released=False,
+                    release_failures=(),
+                    retention_failures=retention_failures,
+                )
+                record["durable_state_error"] = pending_error
+                result = CapabilityResult(record)
+            else:
+                claims_released, release_failures = self._release_claims(claims)
+                retention_failures: list[str] = []
+                if not claims_released:
+                    retention_failures = self._retain_claims(claims, cleanup)
+                if not claims_released:
+                    outcome, terminal_reason = "UNCERTAIN", "cleanup_or_release_unproved"
+                elif not dispatch_succeeded:
+                    outcome, terminal_reason = "FAIL", "adapter_result_failed"
+                else:
+                    outcome, terminal_reason = "PASS", "completed"
+                record = make_record(
+                    outcome=outcome,
+                    terminal_reason=terminal_reason,
+                    claims_released=claims_released,
+                    release_failures=release_failures,
+                    retention_failures=retention_failures,
+                )
+                final_ok, final_error = self._persist_terminal_state(request, approval, permit, record, stage="TERMINAL")
+                if not final_ok:
+                    record["outcome"] = "UNCERTAIN"
+                    record["terminal_reason"] = "terminal_state_persist_failed_after_release"
+                    record["durable_state_error"] = final_error
+                result = CapabilityResult(record)
         with self._state_lock:
             self._terminal[request.request_id] = result
-        self._publish(record)
+        self._publish(result.to_record())
         return result
 
     def _verify_owner(self, request: CapabilityRequest) -> None:
@@ -1065,7 +1476,7 @@ class CapabilityBroker:
             identity_provider=lambda pid: exact_process_identity(pid),
         )
 
-    def _exact_claims(self, claims: Any, request: CapabilityRequest) -> list[dict[str, Any]]:
+    def _exact_claims(self, claims: Any, request: CapabilityRequest, *, require_armed: bool = False) -> list[dict[str, Any]]:
         held_value = getattr(claims, "held", None)
         held = held_value() if callable(held_value) else held_value
         if not isinstance(held, (list, tuple)):
@@ -1078,6 +1489,8 @@ class CapabilityBroker:
                 raise CapabilityDenied("CLAIM_OWNER_MISMATCH", "resource claim belongs to another controller identity", stage="claim")
             if not isinstance(record.get("path"), str) or not record["path"]:
                 raise CapabilityDenied("CLAIM_EVIDENCE_INVALID", "resource claim path is unavailable", stage="claim")
+            if require_armed and record.get("boundary_state") != BOUNDARY_ARMED_STATE:
+                raise CapabilityDenied("CLAIM_NOT_ARMED", "resource claim was not durably armed before dispatch", stage="claim")
         return sorted(records, key=lambda item: str(item["resource"]))
 
     def _cleanup_adapter(self, permit: CapabilityPermit, dispatch_result: AdapterResult | None, failure: Mapping[str, Any] | None) -> CleanupEvidence:
@@ -1099,7 +1512,11 @@ class CapabilityBroker:
         if not callable(retain):
             return ["retain_boundary_unavailable"]
         try:
-            return list(retain(boundary=cleanup.boundary, identities=list(cleanup.identities)))
+            # CleanupEvidence intentionally freezes nested facts.  Native
+            # ResourceClaims persists ordinary JSON bytes, so thaw the
+            # evidence at this one persistence seam rather than leaking
+            # MappingProxyType/tuple implementation objects into claims.
+            return list(retain(boundary=_thaw(cleanup.boundary), identities=_thaw(list(cleanup.identities))))
         except Exception as exc:
             return [f"retain_boundary_failed:{type(exc).__name__}"]
 
@@ -1161,6 +1578,7 @@ __all__ = [
     "REQUEST_SCHEMA",
     "RESULT_SCHEMA",
     "SNAPSHOT_SCHEMA",
+    "STATE_SCHEMA",
     "canonical_json_bytes",
     "canonical_sha256",
     "current_process_identity",
