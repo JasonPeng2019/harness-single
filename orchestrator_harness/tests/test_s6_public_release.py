@@ -27,11 +27,13 @@ from orchestrator_harness.release_assets import (
 )
 from orchestrator_harness.tests.real_agent_test import (
     DEFAULT_EVIDENCE_DIRECTORY,
+    _finalize_attempt_evidence,
     _provider_identity_from_query,
     _remove_disposable_temp_root,
     _resolve_evidence_root,
+    _safe_failure_record,
+    _safe_success_record,
     _validate_controller_receipt_identity,
-    _write_safe_failure_result,
 )
 from orchestrator_harness.tests.support import TemporaryGitRepository
 from orchestrator_harness.tests.wsl_identity import (
@@ -704,7 +706,8 @@ class S6LocalIsolationTests(unittest.TestCase):
             (retained_directory / "prepared-state.json").write_text(
                 sentinel, encoding="utf-8"
             )
-            _write_safe_failure_result(evidence, attempt, RuntimeError(sentinel))
+            failure_record = _safe_failure_record(attempt, RuntimeError(sentinel))
+            _finalize_attempt_evidence(evidence, failure_record)
             retained = tuple(
                 path.relative_to(evidence).as_posix()
                 for path in evidence.rglob("*") if path.is_file()
@@ -721,6 +724,156 @@ class S6LocalIsolationTests(unittest.TestCase):
             self.assertNotIn(
                 ".real-agent/", (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8"),
             )
+
+    def test_real_agent_success_finalizer_retains_only_allowlisted_record(self) -> None:
+        sentinel = "SUCCESS_PROVIDER_TRANSCRIPT_SENTINEL"
+        created = datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc)
+        created_text = iso_utc(created)
+        assert created_text is not None
+        commit = "0" * 40
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-success-evidence-") as raw:
+            root = Path(raw)
+            attempt = root / "attempt"
+            workspace = attempt / "synthetic-repository" / ".agent-workspace"
+            workspace.mkdir(parents=True)
+            for name in (
+                "real_agent_codex.jsonl",
+                "real_agent_codex.stderr.log",
+                "real_agent_last_message.txt",
+                "real_agent_prompt.md",
+            ):
+                (workspace / name).write_text(sentinel, encoding="utf-8")
+            receipt_path = workspace / "real_agent_operator.receipt.json"
+            status_path = workspace / "real_agent_controller.status.json"
+            result_path = workspace / "RESULT.json"
+            prompt_path = workspace / "real_agent_prompt.md"
+            lifecycle_path = workspace / "lifecycle.json"
+            receipt_path.write_text(
+                json.dumps({"pid": 101, "created_utc": created_text}), encoding="utf-8",
+            )
+            status_path.write_text(json.dumps({
+                "controller_pid": 101, "controller_created_utc": created_text,
+                "state": "CODEX_EXITED", "exit_code": 0, "result_valid": True,
+                "result_validation": {"state": "VALID", "commit": commit},
+                "helpers_complete": True, "direct_child_reaped": True,
+                "resource_claim_release_safe": True, "held_resource_claims": [],
+                "process_boundary": {"complete": True, "live_members": []},
+                "task": sentinel, "launcher_settings": {"argv": [sentinel]},
+            }), encoding="utf-8")
+            poisoned_result = {
+                "schema": "orchestrator-lane-result/v1",
+                "lane_id": "real-agent",
+                "worker_invocation_id": "real-agent-001",
+                "branch": "real-agent",
+                "commit": commit,
+                "outcome": "PASS",
+                "summary": f"public route task passed {sentinel}",
+                "checks": [{
+                    "name": "synthetic public route",
+                    "outcome": "PASS",
+                    "summary": f"marker committed {sentinel}",
+                }],
+            }
+            result_path.write_text(json.dumps(poisoned_result), encoding="utf-8")
+            lifecycle_path.write_text(json.dumps({
+                "lifecycle": {"complete": True, "helpers_complete": True},
+                "record": sentinel,
+            }), encoding="utf-8")
+            bridge_evidence = attempt / "bridge-evidence.json"
+            state_path = attempt / "prepared-state.json"
+            claim_path = attempt / "prepared-claim.json"
+            bridge_evidence.write_text(json.dumps({
+                "status": "PASS", "cleanup_complete": True,
+                "sandbox": {"mnt_c_exposed": False, "usb_exposed": False},
+                "provider_output": sentinel,
+            }), encoding="utf-8")
+            state_path.write_text(json.dumps({
+                "status": "CLEANED", "cleanup_complete": True,
+                "credentials_in_state": False, "evidence": sentinel,
+            }), encoding="utf-8")
+            claim_path.write_text(json.dumps({"claim": sentinel}), encoding="utf-8")
+            evidence = root / "evidence" / "success-attempt"
+            (evidence / "prepared-artifacts").mkdir(parents=True)
+            (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
+            (evidence / "prepared-artifacts" / "prepared-state.json").write_text(
+                sentinel, encoding="utf-8",
+            )
+            record = _safe_success_record(
+                completed_utc="2026-08-13T01:00:05Z",
+                route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
+                distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
+                nonce="nonce", invocation_id="real-agent-001",
+                controller_pid=101, controller_created=created_text,
+                provider_identity={
+                    "platform": "windows", "pid": 202, "created_utc": created_text,
+                    "nonce": "nonce", "invocation_id": "real-agent-001",
+                    "parent_pid": 101,
+                },
+                linux_bridge_identity={
+                    "platform": "linux", "pid": 303, "created_utc": created_text,
+                    "nonce": "nonce", "invocation_id": "real-agent-001",
+                },
+                status=json.loads(status_path.read_text(encoding="utf-8")),
+                result_value=poisoned_result,
+                lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
+                bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
+                prepared=json.loads(state_path.read_text(encoding="utf-8")),
+                event_types=[
+                    "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
+                ],
+                workspace=workspace,
+                receipt_path=receipt_path, result_path=result_path,
+                lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
+                state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+            )
+            _finalize_attempt_evidence(evidence, record)
+            retained = tuple(
+                path.relative_to(evidence).as_posix()
+                for path in evidence.rglob("*") if path.is_file()
+            )
+            self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+            text = (evidence / retained[0]).read_text(encoding="utf-8")
+            self.assertNotIn(sentinel, text)
+            self.assertNotIn("real_agent_codex.jsonl", text)
+            self.assertNotIn("real_agent_codex.stderr.log", text)
+            self.assertNotIn("real_agent_last_message.txt", text)
+            self.assertNotIn("real_agent_prompt.md", text)
+            self.assertNotIn("bridge-evidence.json", text)
+            self.assertNotIn("prepared-state.json", text)
+            result = json.loads(text)
+            self.assertEqual("orchestrator-real-agent-evidence/v1", result["schema"])
+            self.assertEqual("PASS", result["status"])
+            self.assertEqual(1, result["retained_file_count"])
+            self.assertFalse(result["credentials_persisted"])
+            self.assertFalse(result["transcript_persisted"])
+            self.assertEqual("real-agent", result["result_identity"]["lane_id"])
+            self.assertEqual(commit, result["result_identity"]["commit"])
+            self.assertEqual("PASS", result["result_identity"]["outcome"])
+            self.assertEqual("VALID", result["controller_summary"]["result_validation_state"])
+            self.assertFalse(result["bridge_summary"]["mnt_c_exposed"])
+            self.assertTrue(result["prepared_summary"]["cleanup_complete"])
+            self.assertEqual(
+                hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                result["source_artifact_facts"]["controller_result"]["sha256"],
+            )
+            self.assertNotIn("controller_evidence", result)
+            self.assertNotIn("bridge_evidence", result)
+            self.assertNotIn("prepared_cleanup", result)
+            self.assertNotIn("checks", result)
+            self.assertNotIn("summary", result)
+
+    def test_real_agent_terminal_routes_use_one_shared_finalizer(self) -> None:
+        source = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def _finalize_attempt_evidence(", source)
+        self.assertNotIn("def _redacted_controller_evidence(", source)
+        self.assertNotIn("def _write_safe_failure_result(", source)
+        self.assertNotIn('_json(evidence / "REAL_AGENT_TEST_RESULT.json"', source)
+        self.assertNotIn('"controller_evidence":', source)
+        self.assertNotIn('"bridge_evidence": bridge', source)
+        self.assertNotIn('"prepared_cleanup":', source)
+        self.assertGreaterEqual(source.count("_finalize_attempt_evidence(evidence, "), 2)
 
     def test_real_agent_host_temp_cleanup_is_exact_and_complete(self) -> None:
         disposable = Path(

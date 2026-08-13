@@ -220,6 +220,7 @@ def _safe_failure_record(
 ) -> dict[str, Any]:
     workspace = temp_root / "synthetic-repository" / ".agent-workspace"
     return {
+        "schema": "orchestrator-real-agent-evidence/v1",
         "status": "FAIL",
         "completed_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "failure_type": type(failure).__name__,
@@ -242,28 +243,120 @@ def _safe_failure_record(
     }
 
 
-def _write_safe_failure_result(
-    evidence: Path,
-    temp_root: Path,
-    failure: BaseException,
+def _safe_success_record(
     *,
-    record: dict[str, Any] | None = None,
+    completed_utc: str,
+    route: str,
+    distro: str,
+    codex_root: str,
+    nonce: str,
+    invocation_id: str,
+    controller_pid: int,
+    controller_created: str,
+    provider_identity: dict[str, Any],
+    linux_bridge_identity: dict[str, Any],
+    status: dict[str, Any],
+    result_value: dict[str, Any],
+    lifecycle: dict[str, Any],
+    bridge: dict[str, Any],
+    prepared: dict[str, Any],
+    event_types: list[str],
+    workspace: Path,
+    receipt_path: Path,
+    result_path: Path,
+    lifecycle_path: Path,
+    bridge_evidence: Path,
+    state_path: Path,
+    claim_path: Path,
+    prompt_path: Path,
 ) -> dict[str, Any]:
-    """Persist one allowlisted failure record and no other evidence files."""
+    """Build the fixed allowlisted success record.
 
-    result = record or _safe_failure_record(temp_root, failure)
-    result_path = evidence / "REAL_AGENT_TEST_RESULT.json"
-    for retained in evidence.iterdir():
-        if retained == result_path:
-            continue
-        if retained.is_symlink() or retained.is_file():
-            retained.unlink()
-        elif retained.is_dir():
-            shutil.rmtree(retained)
+    The accepted provider result is represented only by its validated fixed
+    identity fields and a SHA-256 of the discarded RESULT.json; provider
+    summaries, per-check command/summary text, transcripts, and complete
+    controller/lifecycle/bridge/preparation objects are never copied.
+    """
+
+    source_artifact_facts = {
+        name: _artifact_fact(artifact_path)
+        for name, artifact_path in (
+            ("controller_status", workspace / "real_agent_controller.status.json"),
+            ("operator_receipt", receipt_path),
+            ("controller_result", result_path),
+            ("provider_event_stream", workspace / "real_agent_codex.jsonl"),
+            ("provider_standard_error", workspace / "real_agent_codex.stderr.log"),
+            ("provider_last_message", workspace / "real_agent_last_message.txt"),
+            ("prompt", prompt_path),
+            ("lifecycle_registry", lifecycle_path),
+            ("bridge_evidence", bridge_evidence),
+            ("prepared_state", state_path),
+            ("prepared_claim", claim_path),
+        )
+    }
+    return {
+        "schema": "orchestrator-real-agent-evidence/v1",
+        "status": "PASS",
+        "completed_utc": completed_utc,
+        "route": route,
+        "distro": distro,
+        "codex_root": codex_root,
+        "attempt_identity": {"nonce": nonce, "invocation_id": invocation_id},
+        "controller_identity": {
+            "platform": "windows", "pid": controller_pid, "created_utc": controller_created,
+        },
+        "provider_identity": provider_identity,
+        "linux_bridge_identity": linux_bridge_identity,
+        "cross_os_relation": "nonce-and-invocation-bound-independent-identities",
+        "controller_summary": _safe_controller_summary(status),
+        "bridge_summary": _safe_bridge_summary(bridge),
+        "prepared_summary": _safe_prepared_summary(prepared),
+        "lifecycle_complete": bool(
+            isinstance(lifecycle.get("lifecycle"), dict)
+            and lifecycle["lifecycle"].get("complete") is True
+        ),
+        "result_identity": {
+            "lane_id": result_value.get("lane_id"),
+            "worker_invocation_id": result_value.get("worker_invocation_id"),
+            "branch": result_value.get("branch"),
+            "commit": result_value.get("commit"),
+            "outcome": result_value.get("outcome"),
+        },
+        "event_types": sorted(set(event_types)),
+        "source_artifact_facts": source_artifact_facts,
+        "retained_file_count": 1,
+        "credentials_persisted": False,
+        "transcript_persisted": False,
+    }
+
+
+def _finalize_attempt_evidence(
+    evidence: Path, record: dict[str, Any],
+) -> dict[str, Any]:
+    """Purge the attempt evidence directory and retain one allowlisted record.
+
+    Every terminal route (success and failure) publishes through this single
+    finalization owner.  Purging is fail closed: the attempt directory must be
+    a real directory and every entry must be removable, otherwise no record is
+    written.  The retained record is constructed only from fixed identity and
+    outcome scalars plus safe hashes/counts; provider-controlled text and full
+    controller/provider objects are never copied into it.
+    """
+
+    resolved = evidence.resolve(strict=False)
+    if not resolved.is_dir():
+        raise RuntimeError(f"attempt evidence directory is unavailable: {resolved}")
+    if record.get("status") not in {"PASS", "FAIL"} or record.get("retained_file_count") != 1:
+        raise RuntimeError("attempt evidence record violates the fixed allowlist")
+    for entry in list(resolved.iterdir()):
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            shutil.rmtree(entry)
         else:
-            raise RuntimeError(f"unsupported retained evidence entry: {retained.name}")
-    _json(result_path, result)
-    return result
+            raise RuntimeError(f"unsupported attempt evidence entry: {entry.name}")
+    _json(resolved / "REAL_AGENT_TEST_RESULT.json", record)
+    return record
 
 
 def _remove_disposable_temp_root(
@@ -434,19 +527,6 @@ def _event_types(event_log: Path) -> list[str]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         pass
     return types
-
-
-def _redacted_controller_evidence(status: dict[str, Any], result: dict[str, Any], lifecycle: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "status": status,
-        "result": result,
-        "lifecycle": lifecycle,
-        "resource_claims": status.get("held_resource_claims", []),
-        "cleanup": status.get("cleanup"),
-        "process_boundary": status.get("process_boundary"),
-        "credentials_in_evidence": False,
-        "transcript_persisted": False,
-    }
 
 
 def main() -> int:
@@ -635,18 +715,20 @@ def main() -> int:
                 f"native watcher events are incomplete: {sorted(set(event_types))}"
                 + (f"; watcher failures: {watcher_failures}" if watcher_failures else "")
             )
-        result = {
-            "status": "PASS", "completed_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "route": "public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
-            "distro": args.distro, "codex_root": args.codex_root,
-            "controller_identity": {"platform": "windows", "pid": controller_pid, "created_utc": controller_created},
-            "provider_identity": provider_identity, "linux_bridge_identity": linux_bridge,
-            "cross_os_relation": "nonce-and-invocation-bound-independent-identities",
-            "controller_evidence": _redacted_controller_evidence(status, result_value, lifecycle),
-            "bridge_evidence": bridge, "prepared_cleanup": prepared_cleaned,
-            "event_types": sorted(set(event_types)), "credentials_persisted": False,
-            "transcript_persisted": False,
-        }
+        result = _safe_success_record(
+            completed_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
+            distro=args.distro, codex_root=args.codex_root,
+            nonce=nonce, invocation_id=WORKER_ID,
+            controller_pid=controller_pid, controller_created=controller_created,
+            provider_identity=provider_identity, linux_bridge_identity=linux_bridge,
+            status=status, result_value=result_value, lifecycle=lifecycle,
+            bridge=bridge, prepared=prepared_cleaned, event_types=event_types,
+            workspace=repo / ".agent-workspace",
+            receipt_path=receipt_path, result_path=result_path,
+            lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
+            state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+        )
     except BaseException as exc:  # noqa: BLE001
         failure = exc
     finally:
@@ -683,15 +765,10 @@ def main() -> int:
                 failure_record["host_temp_cleanup_failure_type"] = type(
                     cleanup_failure
                 ).__name__
-            _write_safe_failure_result(
-                evidence,
-                temp_root,
-                failure,
-                record=failure_record,
-            )
+            _finalize_attempt_evidence(evidence, failure_record)
         elif result is not None:
             result["host_temp_cleanup_complete"] = True
-            _json(evidence / "REAL_AGENT_TEST_RESULT.json", result)
+            _finalize_attempt_evidence(evidence, result)
         # No runtime, authentication material, or provider transcript is
         # retained in source or copied from the disposable repository.
     if failure is not None:
