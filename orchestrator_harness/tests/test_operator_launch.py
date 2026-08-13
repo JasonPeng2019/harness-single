@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -15,16 +14,18 @@ from pathlib import Path
 from orchestrator_harness.operator_launch import detached_owner_snapshot, launch_process
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.models import iso_utc
+from examples.disposable_coding_fixture import _invocation
 
 
 class OperatorLaunchTests(unittest.TestCase):
-    def _wait_for_exact(self, pid: int, created: str | None = None) -> bool:
+    def _wait_for_exact(self, pid: int, created: str | None = None):
         for _ in range(20):
             item = process_snapshot().by_pid.get(pid)
             if item is not None and item.created_utc is not None:
-                return True
+                if created is None or iso_utc(item.created_utc) == created:
+                    return item
             time.sleep(.05)
-        return False
+        return None
 
     def _wait_for_no_detached_owners(self) -> None:
         for _ in range(100):
@@ -47,59 +48,41 @@ class OperatorLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             receipt = root / "failed.json"
-            captured: dict[str, subprocess.Popen[str]] = {}
-            real_popen = subprocess.Popen
-
-            def capture(*args, **kwargs):
-                child = real_popen(*args, **kwargs)
-                captured["child"] = child
-                return child
-
-            with patch("orchestrator_harness.operator_launch.subprocess.Popen", side_effect=capture), patch(
-                "orchestrator_harness.operator_launch._creation_identity", return_value=None
-            ):
+            with patch("orchestrator_harness.operator_launch._creation_identity", return_value=None):
                 with self.assertRaises(RuntimeError):
                     launch_process(
                         receipt=receipt, label="forced-failure", role="test", cwd=root,
                         argv=[sys.executable, "-c", "import time; time.sleep(30)"],
                     )
-            child = captured["child"]
-            self.assertIsNotNone(child.returncode)
-            self.assertIsNone(process_snapshot().by_pid.get(child.pid))
             failure = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual("failed", failure["status"])
             self.assertTrue(failure["cleanup_confirmed"])
+            self.assertIsNone(process_snapshot().by_pid.get(failure["child_pid"]))
 
     def test_child_survives_launch_cli_and_receipt_has_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             receipt = root / "receipt.json"
             command = [
-                sys.executable, "-m", "orchestrator_harness.operator_launch",
+                sys.executable, "-W", "error::ResourceWarning", "-m", "orchestrator_harness.operator_launch",
                 "--receipt", str(receipt), "--label", "smoke", "--role", "test",
-                "--cwd", str(root), "--", sys.executable, "-c", "import time; time.sleep(30)",
+                "--cwd", str(root), "--", sys.executable, "-c", "import time; time.sleep(2)",
             ]
             completed = subprocess.run(command, cwd=str(Path(__file__).resolve().parents[2]), text=True, capture_output=True, check=False)
             self.assertEqual(0, completed.returncode, completed.stderr)
             data = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual("launched", data["status"])
-            self.assertTrue(self._wait_for_exact(data["pid"], data["created_utc"]))
-            try:
-                exact = process_snapshot().by_pid.get(data["pid"])
-                self.assertIsNotNone(exact)
-                self.assertEqual(data["created_utc"], iso_utc(exact.created_utc))
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(data["pid"]), "/T", "/F"], check=False, capture_output=True)
-                else:
-                    os.kill(data["pid"], 15)
-            finally:
-                for _ in range(20):
-                    if process_snapshot().by_pid.get(data["pid"]) is None:
-                        break
-                    time.sleep(.05)
-                self.assertIsNone(process_snapshot().by_pid.get(data["pid"]))
+            exact = self._wait_for_exact(data["pid"], data["created_utc"])
+            self.assertIsNotNone(exact)
+            assert exact is not None
+            self.assertEqual(data["created_utc"], iso_utc(exact.created_utc))
+            for _ in range(40):
+                if process_snapshot().by_pid.get(data["pid"]) is None:
+                    break
+                time.sleep(.05)
+            self.assertIsNone(process_snapshot().by_pid.get(data["pid"]))
 
-    def test_supported_reaper_waits_for_natural_exit_without_resource_warning(self) -> None:
+    def test_native_ownership_waits_for_natural_exit_without_resource_warning(self) -> None:
         with tempfile.TemporaryDirectory() as raw, warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ResourceWarning)
             root = Path(raw)
@@ -111,7 +94,11 @@ class OperatorLaunchTests(unittest.TestCase):
                 argv=[sys.executable, "-c", "import time; time.sleep(2)"],
             )
             self.assertTrue(detached_owner_snapshot())
-            self._wait_for_no_detached_owners()
+            for _ in range(40):
+                if not detached_owner_snapshot():
+                    break
+                time.sleep(.05)
+            self.assertFalse(detached_owner_snapshot())
             self.assertEqual(0, len([item for item in caught if item.category is ResourceWarning]))
             self.assertIsNone(process_snapshot().by_pid.get(result["pid"]))
 
@@ -133,6 +120,57 @@ class OperatorLaunchTests(unittest.TestCase):
             self.assertEqual(4, len({(item["pid"], item["created_utc"]) for item in results}))
             self.assertLessEqual(len(detached_owner_snapshot()), 4)
             self._wait_for_no_detached_owners()
+
+    def test_public_route_entry_returns_without_waiting_and_naturally_reaps(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("error", ResourceWarning)
+            root = Path(raw)
+            repo = root / "repo"
+            repo.mkdir()
+            for command in (
+                ("git", "init", "-b", "route"),
+                ("git", "config", "user.email", "route@example.invalid"),
+                ("git", "config", "user.name", "Route Test"),
+            ):
+                subprocess.run(command, cwd=repo, check=True, capture_output=True)
+            (repo / "task.txt").write_text("route\n", encoding="utf-8")
+            subprocess.run(("git", "add", "task.txt"), cwd=repo, check=True, capture_output=True)
+            subprocess.run(("git", "commit", "-m", "route base"), cwd=repo, check=True, capture_output=True)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            base = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            invocation = _invocation(
+                lane="beta-success", worktree=repo, common_dir=repo / ".git", base_commit=base,
+                runtime=runtime, delay=0.2,
+            )
+            receipt = repo / ".agent-workspace" / "route-entry.receipt.json"
+            status = repo / ".agent-workspace" / "fixture_controller.status.json"
+            code = (
+                "from orchestrator_harness.public_launch import launch_lane_controller; "
+                f"launch_lane_controller({str(invocation)!r}, receipt={str(receipt)!r}, cwd={str(Path(__file__).resolve().parents[2])!r}, expected_state_path={str(status)!r})"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-W", "error::ResourceWarning", "-c", code],
+                cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            value: dict[str, object] = {}
+            receipt_value: dict[str, object] = {}
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                value = json.loads(status.read_text(encoding="utf-8")) if status.exists() else {}
+                receipt_value = json.loads(receipt.read_text(encoding="utf-8")) if receipt.exists() else {}
+                terminal = value.get("state") in {
+                    "CODEX_EXITED", "PROVIDER_EXITED", "CONTROLLER_FAILED", "LAUNCH_FAILED",
+                } and value.get("ended_utc") is not None
+                if terminal and process_snapshot().by_pid.get(receipt_value.get("pid")) is None:
+                    break
+                time.sleep(.1)
+            self.assertEqual("CODEX_EXITED", value.get("state"), value)
+            self.assertIsNone(process_snapshot().by_pid.get(receipt_value.get("pid")))
+            time.sleep(0.5)
+            self.assertEqual(0, len(caught))
 
 
 if __name__ == "__main__":

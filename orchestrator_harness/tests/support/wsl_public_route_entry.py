@@ -1,51 +1,21 @@
-"""Start one coding controller through the released public operator boundary."""
+"""Retired Linux controller route.
+
+The released public controller is Windows-native.  WSL is admitted only for
+the controller-owned provider bridge, so this historical entry point refuses
+to launch anything and cannot accidentally recreate the old Linux route.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import sys
-from pathlib import Path
-
-SOURCE_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(SOURCE_ROOT))
-prior_pythonpath = os.environ.get("PYTHONPATH")
-os.environ["PYTHONPATH"] = str(SOURCE_ROOT) + (
-    os.pathsep + prior_pythonpath if prior_pythonpath else ""
-)
-
-from orchestrator_harness.public_launch import launch_lane_controller
-
-
-def _drop_to_workspace_owner() -> None:
-    """Keep the public controller and its Git view on the synthetic owner."""
-
-    if os.geteuid() != 0:
-        return
-    os.setgroups([])
-    os.setgid(65534)
-    os.setuid(65534)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Launch the native coding controller route")
-    parser.add_argument("--invocation", required=True, type=Path)
-    parser.add_argument("--receipt", required=True, type=Path)
-    parser.add_argument("--cwd", required=True, type=Path)
-    parser.add_argument("--status", required=True, type=Path)
-    args = parser.parse_args()
-    _drop_to_workspace_owner()
-    receipt = launch_lane_controller(
-        args.invocation,
-        receipt=args.receipt,
-        cwd=args.cwd,
-        label="real-agent-coding-controller",
-        role="coding-lane-controller",
-        expected_state_path=args.status,
+    parser = argparse.ArgumentParser(description="Retired: public controller is host-native")
+    parser.parse_args()
+    raise RuntimeError(
+        "public controller route is Windows-native; WSL may launch only the provider bridge"
     )
-    print(json.dumps(receipt, sort_keys=True))
-    return 0
 
 
 if __name__ == "__main__":

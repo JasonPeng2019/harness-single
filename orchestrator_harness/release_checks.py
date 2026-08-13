@@ -279,6 +279,7 @@ class SelectionDecision:
         return {
             "schema": SELECTION_SCHEMA,
             "intent": self.intent,
+            "selector_module": str(Path(__file__).resolve()),
             "source": self.source.to_record(),
             "registry_fingerprint": self.registry_fingerprint,
             "changed_paths": list(self.changed_paths),
@@ -318,18 +319,59 @@ _COMPILE_INPUT_SCOPES = (
     InputScope("glob", "harness_watcher_implementation/**/*.py"),
     InputScope("glob", "firmware_acceptance/**/*.py"),
 )
-_ORCHESTRATOR_UNIT_INPUT_SCOPES = (
-    InputScope("glob", "orchestrator_harness/**/*.py"),
-    InputScope("glob", "harness_common/**/*.py"),
-)
-_WATCHER_UNIT_INPUT_SCOPES = (
-    InputScope("glob", "harness_watcher_implementation/**/*.py"),
-    InputScope("glob", "harness_common/**/*.py"),
-)
-_ATTENTION_INPUT_SCOPES = _WATCHER_UNIT_INPUT_SCOPES
 _SYNTHETIC_CLEANUP_INPUT_SCOPES = (
     InputScope("glob", "orchestrator_harness/**/*.py"),
     InputScope("glob", "harness_common/**/*.py"),
+)
+_PACKAGE_INPUT_SCOPES = (
+    # ``pip wheel orchestrator_harness`` consumes the complete package tree,
+    # including its package data, and the declared data-file trees below.
+    InputScope("tree", "orchestrator_harness"),
+    InputScope("tree", "harness_common"),
+    InputScope("tree", "examples"),
+    InputScope("tree", "release_evidence_templates"),
+)
+_ORCHESTRATOR_UNIT_INPUT_SCOPES = (
+    # Discovery imports every harness test and its package dependencies and
+    # the discovered tests read these bounded release-facing inputs.
+    InputScope("tree", "orchestrator_harness"),
+    InputScope("tree", "harness_common"),
+    InputScope("tree", "examples"),
+    InputScope("tree", "release_evidence_templates"),
+    InputScope("tree", "tools"),
+    InputScope("tree", "docs"),
+    InputScope("file", "README.md"),
+    InputScope("file", "QUICK_START.md"),
+    InputScope("file", "QUICK_RULES.md"),
+    InputScope("file", "AGENTS.md"),
+    InputScope("file", "PORTABLE_CONTENTS.md"),
+    InputScope("file", "pyrightconfig.json", required=False),
+    InputScope("file", ".codex/dev/basedpyright-baseline.json", required=False),
+)
+_WATCHER_UNIT_INPUT_SCOPES = (
+    InputScope("tree", "harness_watcher_implementation"),
+    InputScope("tree", "harness_common"),
+    InputScope("file", "README.md"),
+    InputScope("file", "QUICK_START.md"),
+    InputScope("file", "QUICK_RULES.md"),
+)
+_ATTENTION_INPUT_SCOPES = _WATCHER_UNIT_INPUT_SCOPES
+_RELEASE_AGGREGATE_INPUT_SCOPES = (
+    InputScope("tree", "orchestrator_harness"),
+    InputScope("tree", "harness_common"),
+    InputScope("tree", "harness_watcher_implementation"),
+    InputScope("tree", "firmware_acceptance"),
+    InputScope("tree", "examples"),
+    InputScope("tree", "release_evidence_templates"),
+    InputScope("tree", "tools"),
+    InputScope("tree", "docs"),
+    InputScope("file", "README.md"),
+    InputScope("file", "QUICK_START.md"),
+    InputScope("file", "QUICK_RULES.md"),
+    InputScope("file", "AGENTS.md"),
+    InputScope("file", "PORTABLE_CONTENTS.md"),
+    InputScope("file", "pyrightconfig.json", required=False),
+    InputScope("file", ".codex/dev/basedpyright-baseline.json", required=False),
 )
 
 
@@ -471,6 +513,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "orchestrator_harness/tests/test_s6_public_release.py",
             ),
             estimated_duration_seconds=1.0,
+            input_scopes=_PACKAGE_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.FAST.LOCAL-ISOLATION",
@@ -707,6 +750,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             platform_requirements=("windows",),
             estimated_duration_seconds=600.0,
             producer="ROOT-IM",
+            input_scopes=_RELEASE_AGGREGATE_INPUT_SCOPES,
         ),
     )
 

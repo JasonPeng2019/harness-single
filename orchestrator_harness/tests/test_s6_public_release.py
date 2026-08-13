@@ -28,9 +28,22 @@ from orchestrator_harness.tests.support import TemporaryGitRepository
 from orchestrator_harness.tests.wsl_identity import (
     provider_identity_matches,
     validate_codex_identity,
+    validate_cross_os_identity_relation,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_SUPPORT_ROOT = Path(__file__).resolve().parent / "support"
+if str(_SUPPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SUPPORT_ROOT))
+_support_spec = importlib.util.spec_from_file_location(
+    "s6_wsl_real_agent_driver", _SUPPORT_ROOT / "wsl_real_agent_driver.py"
+)
+assert _support_spec is not None and _support_spec.loader is not None
+_support_module = importlib.util.module_from_spec(_support_spec)
+_support_spec.loader.exec_module(_support_module)
+PREPARED_STATE_SCHEMA = _support_module.PREPARED_STATE_SCHEMA
+claim_prepared_state = _support_module.claim_prepared_state
+validate_prepared_state = _support_module.validate_prepared_state
 
 
 class S6SelectorTests(unittest.TestCase):
@@ -366,6 +379,147 @@ class S6SelectorTests(unittest.TestCase):
         self.assertEqual(len(selected), len(set(selected)))
         self.assertNotIn(release_checks.RELEASE_AGGREGATE_ID, selected)
 
+    def test_package_scope_consumes_manifest_assets_and_checkout_copies(self) -> None:
+        spec = release_checks.get_check("S6.FAST.PACKAGE")
+        credit = release_checks.credit_record(spec, REPOSITORY_ROOT)
+        manifest = release_manifest()
+        scoped = set(release_checks.resolve_input_scope(spec, REPOSITORY_ROOT))
+        excluded = set(spec.dependency_paths)
+        # The manifest names canonical assets relative to the
+        # orchestrator_harness package root; the tracked paths are the same
+        # files under the package tree.  Checkout copies are tracked at their
+        # repository-relative copies.
+        canonical = tuple(
+            f"orchestrator_harness/{relative}"
+            for relative in manifest["examples"] + manifest["release_evidence_templates"]
+            if f"orchestrator_harness/{relative}" in scoped
+            and f"orchestrator_harness/{relative}" not in excluded
+        )
+        checkout = tuple(
+            relative for relative in manifest["checkout_copies"]
+            if relative in scoped and relative not in excluded
+        )
+        self.assertTrue(canonical)
+        self.assertTrue(checkout)
+        for relative in canonical + checkout:
+            with self.subTest(relative=relative):
+                decision = release_checks.select_checks(
+                    "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[relative],
+                )
+                self.assertIn(spec.stable_id, decision.invalidated_credit_ids, relative)
+                self.assertNotIn(spec.stable_id, decision.preserved_credit_ids, relative)
+        preserved = release_checks.select_checks(
+            "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[".gitattributes"],
+        )
+        self.assertIn(spec.stable_id, preserved.preserved_credit_ids)
+        self.assertNotIn(spec.stable_id, preserved.invalidated_credit_ids)
+
+    def test_unit_scope_consumes_non_python_docs_config_and_fixtures(self) -> None:
+        spec = release_checks.get_check("S6.RELEASE.ORCHESTRATOR-UNIT")
+        credit = release_checks.credit_record(spec, REPOSITORY_ROOT)
+        scoped = set(release_checks.resolve_input_scope(spec, REPOSITORY_ROOT))
+        excluded = set(spec.dependency_paths)
+        candidates = tuple(
+            relative for relative in scoped
+            if relative not in excluded and not relative.endswith(".py")
+        )
+        self.assertTrue(candidates)
+        for relative in candidates[:3]:
+            with self.subTest(relative=relative):
+                decision = release_checks.select_checks(
+                    "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[relative],
+                )
+                self.assertIn(spec.stable_id, decision.invalidated_credit_ids, relative)
+                self.assertNotIn(spec.stable_id, decision.preserved_credit_ids, relative)
+        preserved = release_checks.select_checks(
+            "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[".gitattributes"],
+        )
+        self.assertIn(spec.stable_id, preserved.preserved_credit_ids)
+        self.assertNotIn(spec.stable_id, preserved.invalidated_credit_ids)
+
+    def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-foreign-selection-") as raw:
+            raw_path = Path(raw)
+            root = raw_path / "candidate"
+            shutil.copytree(
+                REPOSITORY_ROOT, root,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
+                ),
+            )
+            subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "foreign@example.invalid"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Foreign Selection"], check=True, capture_output=True)
+            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
+            baseline.parent.mkdir(parents=True)
+            baseline.write_text("{}\n", encoding="utf-8")
+            (root / "pyrightconfig.json").write_text(
+                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n', encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "candidate"], check=True, capture_output=True)
+            head = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(root) + (
+                os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+            )
+            real = subprocess.run(
+                [
+                    sys.executable, "-m", "orchestrator_harness.release_checks", "select",
+                    "--intent", "release", "--root", str(root),
+                    "--expected-branch", "firmware/v2-candidate", "--expected-tip", head,
+                    "--exclude-id", "S6.RELEASE.ACCUMULATED-SAFEGUARD",
+                ],
+                cwd=root, env=environment, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(0, real.returncode, real.stdout + real.stderr)
+            selection = json.loads(real.stdout)
+            tampered = False
+            for item in selection["selected"]:
+                if item["stable_id"].startswith("S6.RELEASE.RUFF"):
+                    item["command"] = ["python", "-m", "ruff", "check", "--foreign", "."]
+                    tampered = True
+                    break
+            self.assertTrue(tampered)
+            crafted = raw_path / "crafted-selection.json"
+            crafted.write_text(json.dumps(selection, separators=(",", ":")), encoding="utf-8")
+            shim_dir = raw_path / "shim"
+            shim_dir.mkdir()
+            shim = shim_dir / "python.cmd"
+            shim.write_text(
+                "@echo off\r\n"
+                'if "%1"=="-c" (\r\n'
+                f'  "{sys.executable}" %*\r\n'
+                "  exit /b %errorlevel%\r\n"
+                ")\r\n"
+                'if "%3"=="registry" (\r\n'
+                f'  "{sys.executable}" -m orchestrator_harness.release_checks registry\r\n'
+                "  exit /b %errorlevel%\r\n"
+                ")\r\n"
+                f'type "{crafted}"\r\n'
+                "exit /b 0\r\n",
+                encoding="utf-8",
+            )
+            credit_file = raw_path / "credits.json"
+            credit_file.write_text('{"credits": []}\n', encoding="utf-8")
+            shim_environment = dict(os.environ)
+            shim_environment["PATH"] = str(shim_dir) + os.pathsep + shim_environment.get("PATH", "")
+            completed = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    str(root / "tools" / "Invoke-CandidateSafeguard.ps1"),
+                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
+                    "-ExpectedTip", head, "-CreditFile", str(credit_file),
+                ],
+                cwd=REPOSITORY_ROOT, env=shim_environment,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(0, completed.returncode)
+            self.assertIn("does not match the candidate registry", completed.stderr)
+
 
 class S6LocalIsolationTests(unittest.TestCase):
     def test_provider_wrapper_preserves_exec_action_and_adapter_flags(self) -> None:
@@ -412,6 +566,9 @@ class S6LocalIsolationTests(unittest.TestCase):
             module._provider_argv(["--json"], ["bwrap"])
 
     def test_real_agent_uses_native_public_route_and_native_evidence(self) -> None:
+        host_driver = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
+        ).read_text(encoding="utf-8")
         driver = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_real_agent_driver.py"
         ).read_text(encoding="utf-8")
@@ -422,31 +579,25 @@ class S6LocalIsolationTests(unittest.TestCase):
         provider = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("wsl_public_route_entry.py", driver)
-        self.assertIn("operator-receipt.json", driver)
-        self.assertIn("controller-status.json", driver)
-        self.assertIn("controller-result.json", driver)
-        self.assertIn("lifecycle-registry.json", driver)
-        self.assertIn("CONTROLLER_ACTIVE", driver)
-        self.assertIn("RESOURCE_RELEASE_POSSIBLE", driver)
-        self.assertNotIn("subprocess.Popen(", driver)
-        self.assertNotIn("synthetic_controller.status", driver)
+        self.assertIn("public_launch -> operator_launch -> lane_controller", host_driver)
+        self.assertIn("launch_lane_controller", host_driver)
+        self.assertIn("wsl.exe", host_driver)
+        self.assertIn("prepared-state", driver)
+        self.assertIn("PREPARED_STATE_SCHEMA", driver)
+        self.assertIn("claim_prepared_state", provider)
+        self.assertNotIn("wsl_public_route_entry.py", driver + host_driver)
+        self.assertNotIn("synthetic_controller.status", driver + host_driver)
         self.assertNotIn("/opt/codex/bin/codex", driver)
-        self.assertLess(driver.index("chown_tree(synthetic_run)"), driver.index("isolation = preflight("))
-        self.assertGreaterEqual(driver.count("chown_tree(synthetic_run)"), 2)
-        self.assertIn("provider_identity_matches", driver)
+        self.assertLess(driver.index("chown_tree(workspace)"), driver.index("isolation = preflight("))
+        self.assertIn("validate_cross_os_identity_relation", host_driver)
         self.assertIn("discover_codex", driver)
-        self.assertIn("validate_codex_identity", driver)
-        self.assertIn("provider_observed_created_utc", driver)
-        self.assertIn("codex_ancestry", driver)
-        self.assertIn("launch_lane_controller", route)
-        self.assertIn("from orchestrator_harness.public_launch", route)
-        self.assertIn("_drop_to_workspace_owner", route)
+        self.assertIn("validate_prepared_state", driver)
+        self.assertNotIn("launch_lane_controller", route)
+        self.assertIn("Windows-native", route)
         self.assertNotIn("ORCH_HARNESS_POSIX_MUTATION_ROOTS", driver + route + mutation)
         self.assertNotIn("safe.directory", driver + route)
-        self.assertIn("os.execvp", provider)
+        self.assertIn("os.execv", provider)
         self.assertIn("/opt/codex/bin/codex", provider)
-        self.assertNotIn("subprocess.Popen(", provider)
         self.assertEqual(
             tuple(release_checks.PUBLIC_ROUTE_DEPENDENCIES),
             tuple(
@@ -488,6 +639,38 @@ class S6LocalIsolationTests(unittest.TestCase):
                     provider_pid=33,
                     observed_executable=pinned,
                 )
+        validate_cross_os_identity_relation(
+            {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"},
+            {"platform": "linux", "pid": 17, "created_utc": "linux-created", "nonce": "n", "invocation_id": "i"},
+            nonce="n", invocation_id="i",
+        )
+        with self.assertRaisesRegex(RuntimeError, "nonce"):
+            validate_cross_os_identity_relation(
+                {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"},
+                {"platform": "linux", "pid": 18, "created_utc": "linux-created", "nonce": "different", "invocation_id": "i"},
+                nonce="n", invocation_id="i",
+            )
+
+    def test_prepared_state_is_one_use_and_rejects_negative_identity(self) -> None:
+        state = {
+            "schema": PREPARED_STATE_SCHEMA, "status": "READY", "consumed": False,
+            "run_id": "a" * 32, "nonce": "b" * 64, "invocation_id": "invocation",
+            "cgroup": "/sys/fs/cgroup/orchestrator-harness-aaaaaaaa",
+            "network_namespace": "oh-aaaaaaaa", "proxy_url": "http://10.0.0.1:1",
+            "workspace": "/mnt/c/synthetic", "codex_home": "/tmp/codex-home",
+            "release": "/opt/codex", "pinned_codex": "/opt/codex/bin/codex",
+            "bwrap": "/opt/codex/codex-resources/bwrap",
+            "cgroup_launcher": "/mnt/c/cgroup_exec.py", "release_signal": "/mnt/c/release",
+        }
+        self.assertEqual(state, validate_prepared_state(state, nonce="b" * 64, invocation_id="invocation"))
+        with self.assertRaisesRegex(RuntimeError, "nonce"):
+            validate_prepared_state(state, nonce="c" * 64, invocation_id="invocation")
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-claim-") as raw:
+            claim = Path(raw) / "claim.json"
+            first = claim_prepared_state(claim, nonce="b" * 64, invocation_id="invocation")
+            self.assertEqual("orchestrator-wsl-prepared-claim/v1", first["schema"])
+            with self.assertRaisesRegex(RuntimeError, "more than once"):
+                claim_prepared_state(claim, nonce="b" * 64, invocation_id="invocation")
 
     def test_wsl_installer_is_byte_exact_repeatable_and_pinned(self) -> None:
         installer = (
@@ -499,6 +682,133 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertIn("requested %s", installer.lower())
         self.assertIn("already installed", installer.lower())
         self.assertNotIn("$script | wsl.exe", installer)
+
+    def test_prepared_protocol_state_machine_rejects_foreign_or_reused_state(self) -> None:
+        state = {
+            "schema": PREPARED_STATE_SCHEMA, "status": "READY", "consumed": False,
+            "run_id": "a" * 32, "nonce": "b" * 64, "invocation_id": "invocation",
+            "cgroup": "/sys/fs/cgroup/orchestrator-harness-aaaaaaaa",
+            "network_namespace": "oh-aaaaaaaa", "proxy_url": "http://10.0.0.1:1",
+            "workspace": "/mnt/c/synthetic", "codex_home": "/tmp/codex-home",
+            "release": "/opt/codex", "pinned_codex": "/opt/codex/bin/codex",
+            "bwrap": "/opt/codex/codex-resources/bwrap",
+            "cgroup_launcher": "/mnt/c/cgroup_exec.py", "release_signal": "/mnt/c/release",
+        }
+        with self.assertRaisesRegex(RuntimeError, "invocation"):
+            validate_prepared_state(state, nonce="b" * 64, invocation_id="foreign")
+        with self.assertRaisesRegex(RuntimeError, "consumed"):
+            validate_prepared_state(dict(state, consumed=True), nonce="b" * 64, invocation_id="invocation")
+        with self.assertRaisesRegex(RuntimeError, "not READY"):
+            validate_prepared_state(dict(state, status="FAILED"), nonce="b" * 64, invocation_id="invocation")
+        with self.assertRaisesRegex(RuntimeError, "namespace"):
+            validate_prepared_state(dict(state, network_namespace="oh-zzzzzzzz"), nonce="b" * 64, invocation_id="invocation")
+        with self.assertRaisesRegex(RuntimeError, "namespace"):
+            validate_prepared_state(dict(state, run_id="z" * 32), nonce="b" * 64, invocation_id="invocation")
+
+    def test_cross_os_identity_relation_never_asserts_pid_equality(self) -> None:
+        host = {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"}
+        linux = {"platform": "linux", "pid": 17, "created_utc": "linux-created", "nonce": "n", "invocation_id": "i"}
+        # Equal PIDs across the two domains are deliberately not a relation:
+        # the nonce and invocation are the only binding, so equality neither
+        # validates nor invalidates the pairing.
+        validate_cross_os_identity_relation(host, linux, nonce="n", invocation_id="i")
+        validate_cross_os_identity_relation(dict(host, pid=18), linux, nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "nonce"):
+            validate_cross_os_identity_relation(host, dict(linux, nonce="foreign"), nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "invocation"):
+            validate_cross_os_identity_relation(host, dict(linux, invocation_id="foreign"), nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "platform"):
+            validate_cross_os_identity_relation(dict(host, platform="linux"), linux, nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "host PID"):
+            validate_cross_os_identity_relation(dict(host, pid=0), linux, nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "creation identity"):
+            validate_cross_os_identity_relation(dict(host, created_utc=""), linux, nonce="n", invocation_id="i")
+        with self.assertRaisesRegex(RuntimeError, "nonce and invocation"):
+            validate_cross_os_identity_relation(host, linux, nonce="", invocation_id="i")
+
+    def test_bwrap_manifest_binds_only_declared_roots_and_drops_capabilities(self) -> None:
+        argv = _support_module.bwrap_base(
+            Path("/pinned/bwrap"), Path("/pinned/release"), Path("/synthetic/workspace"),
+            Path("/synthetic/home"), "http://10.0.0.1:1234",
+        )
+        rendered = "\0".join(argv).replace("\\", "/")
+        self.assertNotIn("/mnt/c", rendered)
+        self.assertNotIn("/dev/bus/usb", rendered)
+        self.assertNotIn("BYO-Firmware-MCP", rendered)
+        self.assertNotIn("/root/.codex", rendered)
+        self.assertIn("--cap-drop\0ALL", rendered)
+        self.assertNotIn("--cap-add", rendered)
+        self.assertIn("--ro-bind\0/usr\0/usr", rendered)
+        self.assertNotIn("--bind\0/usr", rendered)
+        writable_binds = rendered.count("--bind\0")
+        self.assertEqual(2, writable_binds, rendered)
+        self.assertIn("--bind\0/synthetic/workspace\0/workspace", rendered)
+        self.assertIn("--bind\0/synthetic/home\0/home/agent/.codex", rendered)
+
+    def test_retired_linux_controller_route_fails_closed_when_executed(self) -> None:
+        route = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
+        )
+        completed = subprocess.run(
+            [sys.executable, str(route)], cwd=REPOSITORY_ROOT,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("Windows-native", completed.stderr)
+
+    def test_bridge_evidence_linux_identity_carries_nonce_for_cross_os_relation(self) -> None:
+        provider = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
+        ).read_text(encoding="utf-8")
+        # The provider's linux_bridge identity must carry the one-use nonce and
+        # invocation so the Windows host can bind the two halves without ever
+        # asserting PID equality across the two identity domains.
+        self.assertIn('"nonce": args.nonce, "invocation_id": args.invocation_id', provider)
+        bridge_evidence = {
+            "status": "PASS",
+            "nonce": "n" * 64,
+            "invocation_id": "invocation",
+            "linux_bridge": {
+                "platform": "linux",
+                "pid": 999,
+                "created_utc": "linux-created",
+                "nonce": "n" * 64,
+                "invocation_id": "invocation",
+            },
+        }
+        host_identity = {
+            "platform": "windows",
+            "pid": 1234,
+            "created_utc": "host-created",
+            "nonce": "n" * 64,
+            "invocation_id": "invocation",
+            "parent_pid": 12,
+        }
+        validate_cross_os_identity_relation(
+            host_identity,
+            bridge_evidence["linux_bridge"],
+            nonce="n" * 64,
+            invocation_id="invocation",
+        )
+        with self.assertRaisesRegex(RuntimeError, "nonce"):
+            validate_cross_os_identity_relation(
+                host_identity,
+                dict(bridge_evidence["linux_bridge"], nonce="m" * 64),
+                nonce="n" * 64,
+                invocation_id="invocation",
+            )
+
+    def test_provider_bridge_argv_is_the_only_wsl_route_element(self) -> None:
+        host = (REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py").read_text(encoding="utf-8")
+        controller = (REPOSITORY_ROOT / "orchestrator_harness" / "public_launch.py").read_text(encoding="utf-8")
+        operator = (REPOSITORY_ROOT / "orchestrator_harness" / "operator_launch.py").read_text(encoding="utf-8")
+        # The provider shim argv is the only WSL element on the route: the
+        # controller command stays a native Python lane-controller invocation.
+        self.assertIn('"wsl.exe"', host)
+        self.assertIn("provider_command = [", host)
+        self.assertIn('"-m",\n            "orchestrator_harness.lane_controller"', controller)
+        self.assertNotIn("wsl.exe", controller)
+        self.assertNotIn("wsl.exe", operator)
 
 
 class S6PublicJourneyTests(unittest.TestCase):
@@ -684,10 +994,13 @@ class S6SafeguardTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "commit", "-m", "selector candidate"], check=True, capture_output=True)
             credit_file = Path(raw) / "credits.json"
             credit_file.write_text('{"credits": []}\n', encoding="utf-8")
-            script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
+            candidate_script = root / "tools" / "Invoke-CandidateSafeguard.ps1"
+            self.assertTrue(candidate_script.is_file())
+            # The safeguard must be executed from the candidate copy itself;
+            # running it from a foreign cwd is fine, a foreign script is not.
             completed = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate_script),
                     "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
                     "-CreditFile", str(credit_file),
                 ],
@@ -700,9 +1013,23 @@ class S6SafeguardTests(unittest.TestCase):
             self.assertIn("READY S6.RELEASE.", completed.stdout)
             self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
 
+            foreign_script = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    str(REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"),
+                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(0, foreign_script.returncode)
+            self.assertIn("candidate RepositoryRoot tools directory", foreign_script.stderr)
+
             injected = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate_script),
                     "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
                     "-SelectionFile", str(Path(raw) / "selection.json"),
                 ],
