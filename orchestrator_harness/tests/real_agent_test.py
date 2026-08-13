@@ -330,32 +330,115 @@ def _safe_success_record(
     }
 
 
-def _finalize_attempt_evidence(
-    evidence: Path, record: dict[str, Any],
-) -> dict[str, Any]:
-    """Purge the attempt evidence directory and retain one allowlisted record.
+def _attempt_directory_identity(path: Path) -> dict[str, Any]:
+    """Capture the no-follow identity of one created attempt directory.
 
-    Every terminal route (success and failure) publishes through this single
-    finalization owner.  Purging is fail closed: the attempt directory must be
-    a real directory and every entry must be removable, otherwise no record is
-    written.  The retained record is constructed only from fixed identity and
-    outcome scalars plus safe hashes/counts; provider-controlled text and full
-    controller/provider objects are never copied into it.
+    The lexical path is never resolved.  Symbolic links and Windows reparse
+    points (including junctions) are rejected without following them, and the
+    exact non-link directory plus its expected parent are bound by device and
+    file-index identity.
     """
 
-    resolved = evidence.resolve(strict=False)
-    if not resolved.is_dir():
-        raise RuntimeError(f"attempt evidence directory is unavailable: {resolved}")
+    if path.is_symlink():
+        raise RuntimeError(f"attempt root must not be a symbolic link: {path}")
+    st = os.lstat(path)
+    if getattr(st, "st_reparse_tag", 0) != 0:
+        raise RuntimeError(f"attempt root must not be a reparse point: {path}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"attempt root is not a directory: {path}")
+    parent = path.parent
+    parent_st = os.lstat(parent)
+    return {
+        "path": str(path),
+        "parent": str(parent),
+        "st_dev": st.st_dev,
+        "st_ino": st.st_ino,
+        "parent_st_dev": parent_st.st_dev,
+        "parent_st_ino": parent_st.st_ino,
+    }
+
+
+def _revalidate_attempt_identity(path: Path, identity: dict[str, Any]) -> None:
+    """Fail closed unless the lexical path is still the exact created directory.
+
+    No-follow semantics: the path itself is inspected with ``os.lstat`` and
+    never resolved through a replaced root.  A symbolic link, Windows reparse
+    point, non-directory, changed device/file index, or changed parent fails
+    closed before any destructive or publication boundary.
+    """
+
+    if path.is_symlink():
+        raise RuntimeError(f"attempt root was replaced by a symbolic link: {path}")
+    st = os.lstat(path)
+    if getattr(st, "st_reparse_tag", 0) != 0:
+        raise RuntimeError(f"attempt root was replaced by a reparse point: {path}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"attempt root is no longer a directory: {path}")
+    if (st.st_dev, st.st_ino) != (identity["st_dev"], identity["st_ino"]):
+        raise RuntimeError(f"attempt root identity changed: {path}")
+    parent_st = os.lstat(path.parent)
+    if (parent_st.st_dev, parent_st.st_ino) != (
+        identity["parent_st_dev"],
+        identity["parent_st_ino"],
+    ):
+        raise RuntimeError(f"attempt root parent identity changed: {path}")
+
+
+def _remove_attempt_entry(entry: Path, bound_root: Path) -> None:
+    """Remove one attempt entry no-follow and strictly inside the bound root.
+
+    Symbolic links and Windows reparse/junction entries are unlinked as the
+    link itself; real directories are recursed no-follow and then removed;
+    regular files are unlinked.  Nothing outside the exact lexical bound root
+    is ever deleted or followed.
+    """
+
+    try:
+        entry.relative_to(bound_root)
+    except ValueError as exc:
+        raise RuntimeError(f"refusing cleanup outside the attempt root: {entry}") from exc
+    st = os.lstat(entry)
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
+        entry.unlink()
+        return
+    if stat.S_ISDIR(st.st_mode):
+        for child in list(entry.iterdir()):
+            _remove_attempt_entry(child, bound_root)
+        entry.rmdir()
+        return
+    if stat.S_ISREG(st.st_mode):
+        entry.unlink()
+        return
+    raise RuntimeError(f"unsupported attempt evidence entry: {entry.name}")
+
+
+def _finalize_attempt_evidence(
+    evidence: Path,
+    record: dict[str, Any],
+    *,
+    attempt_identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Purge the exact attempt evidence directory and retain one allowlisted record.
+
+    Every terminal route (success and failure) publishes through this single
+    finalization owner.  The attempt root is bound by the no-follow identity
+    captured at creation; the lexical path is never resolved.  Identity/type/
+    parent are revalidated immediately before destructive iteration, before
+    each destructive boundary, and immediately before atomic publication, and
+    any replacement fails closed.  Child cleanup is no-follow and stays inside
+    the exact bound root.  The retained record is constructed only from fixed
+    identity and outcome scalars plus safe hashes/counts; provider-controlled
+    text and full controller/provider objects are never copied into it.
+    """
+
     if record.get("status") not in {"PASS", "FAIL"} or record.get("retained_file_count") != 1:
         raise RuntimeError("attempt evidence record violates the fixed allowlist")
-    for entry in list(resolved.iterdir()):
-        if entry.is_symlink() or entry.is_file():
-            entry.unlink()
-        elif entry.is_dir():
-            shutil.rmtree(entry)
-        else:
-            raise RuntimeError(f"unsupported attempt evidence entry: {entry.name}")
-    _json(resolved / "REAL_AGENT_TEST_RESULT.json", record)
+    _revalidate_attempt_identity(evidence, attempt_identity)
+    for entry in list(evidence.iterdir()):
+        _revalidate_attempt_identity(evidence, attempt_identity)
+        _remove_attempt_entry(entry, evidence)
+    _revalidate_attempt_identity(evidence, attempt_identity)
+    _json(evidence / "REAL_AGENT_TEST_RESULT.json", record)
     return record
 
 
@@ -411,6 +494,126 @@ def _remove_disposable_temp_root(
                 f"real-agent host temp cleanup did not complete{detail}"
             ) from last_error
         time.sleep(0.1)
+
+
+def _release_preparation_process(
+    prep_process: subprocess.Popen[bytes] | None,
+    release_signal: Any,
+) -> BaseException | None:
+    """Release the exact preparation process and return the first cleanup fault.
+
+    Owns only the exact Popen handle and the exact release signal; no process
+    scans, name matching, or broad cleanup.  Every ordinary release-write,
+    initial wait, timeout-kill, and post-kill-wait fault is captured while
+    safe exact-handle fallback steps are still attempted.  The first captured
+    fault is returned so the terminal seam can convert it into the existing
+    failure state.
+    """
+
+    if prep_process is None:
+        return None
+    first_fault: BaseException | None = None
+
+    def capture(fault: BaseException) -> None:
+        nonlocal first_fault
+        if first_fault is None:
+            first_fault = fault
+
+    if prep_process.poll() is None:
+        if release_signal is None:
+            try:
+                prep_process.kill()
+            except BaseException as exc:  # noqa: BLE001
+                capture(exc)
+        else:
+            try:
+                release_signal.write_text("release\n", encoding="utf-8")
+            except BaseException as exc:  # noqa: BLE001
+                capture(exc)
+                try:
+                    prep_process.kill()
+                except BaseException as kill_exc:  # noqa: BLE001
+                    capture(kill_exc)
+    try:
+        prep_process.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        try:
+            prep_process.kill()
+        except BaseException as exc:  # noqa: BLE001
+            capture(exc)
+        try:
+            prep_process.wait(timeout=10)
+        except BaseException as exc:  # noqa: BLE001
+            capture(exc)
+    except BaseException as exc:  # noqa: BLE001
+        capture(exc)
+        try:
+            prep_process.kill()
+        except BaseException as kill_exc:  # noqa: BLE001
+            capture(kill_exc)
+        try:
+            prep_process.wait(timeout=10)
+        except BaseException as post_exc:  # noqa: BLE001
+            capture(post_exc)
+    return first_fault
+
+
+def _terminal_finalize(
+    *,
+    evidence: Path,
+    attempt_identity: dict[str, Any],
+    temp_root: Path,
+    failure: BaseException | None,
+    result: dict[str, Any] | None,
+    prep_process: subprocess.Popen[bytes] | None,
+    release_signal: Any,
+) -> None:
+    """Production terminal seam: funnel cleanup faults and publish one record.
+
+    Every terminal route (success and failure) passes through this single
+    orchestration owner, which main()'s finally block calls.  Preparation-
+    process cleanup faults are captured and converted into the existing
+    failure state while safe exact-handle fallback steps still run; safe
+    failure-record construction, exact disposable-root removal, and exactly
+    one attempt-evidence finalizer call cannot be bypassed by those faults.
+    The terminal fault is re-raised only after the safe retained record is
+    published, unless finalization itself fails closed.
+    """
+
+    prep_cleanup_failure = _release_preparation_process(prep_process, release_signal)
+    if prep_cleanup_failure is not None and failure is None:
+        failure = prep_cleanup_failure
+    failure_record = (
+        _safe_failure_record(temp_root, failure) if failure is not None else None
+    )
+    cleanup_failure: RuntimeError | None = None
+    try:
+        _remove_disposable_temp_root(temp_root)
+    except RuntimeError as exc:
+        cleanup_failure = exc
+        if failure is None:
+            failure = exc
+            failure_record = _safe_failure_record(temp_root, failure)
+    if failure is not None:
+        assert failure_record is not None
+        failure_record["host_temp_cleanup_complete"] = cleanup_failure is None
+        if cleanup_failure is not None:
+            failure_record["host_temp_cleanup_failure_type"] = type(
+                cleanup_failure
+            ).__name__
+        if prep_cleanup_failure is not None:
+            failure_record["preparation_cleanup_failure_type"] = type(
+                prep_cleanup_failure
+            ).__name__
+        _finalize_attempt_evidence(
+            evidence, failure_record, attempt_identity=attempt_identity,
+        )
+        raise failure
+    elif result is not None:
+        result["host_temp_cleanup_complete"] = True
+        _finalize_attempt_evidence(
+            evidence, result, attempt_identity=attempt_identity,
+        )
 
 
 def _wait_json(path: Path, predicate: Any, *, timeout: float, process: subprocess.Popen[bytes] | None = None) -> dict[str, Any]:
@@ -548,8 +751,9 @@ def main() -> int:
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     evidence_root = _resolve_evidence_root(args.evidence_root)
-    evidence = (evidence_root / stamp).resolve()
+    evidence = evidence_root / stamp
     evidence.mkdir(parents=True, exist_ok=False)
+    attempt_identity = _attempt_directory_identity(evidence)
     print(f"REAL_AGENT_EVIDENCE={evidence}", flush=True)
     run_id = uuid.uuid4().hex
     nonce = uuid.uuid4().hex + uuid.uuid4().hex
@@ -732,47 +936,17 @@ def main() -> int:
     except BaseException as exc:  # noqa: BLE001
         failure = exc
     finally:
-        if prep_process is not None:
-            if prep_process.poll() is None:
-                # Release is also safe on a failed public route: it cannot
-                # leave the Linux preparation waiter behind.
-                if release_signal is None:
-                    prep_process.kill()
-                else:
-                    release_signal.write_text("release\n", encoding="utf-8")
-            try:
-                prep_process.wait(timeout=90)
-            except subprocess.TimeoutExpired:
-                prep_process.kill()
-                prep_process.wait(timeout=10)
-        failure_record = (
-            _safe_failure_record(temp_root, failure)
-            if failure is not None
-            else None
+        _terminal_finalize(
+            evidence=evidence,
+            attempt_identity=attempt_identity,
+            temp_root=temp_root,
+            failure=failure,
+            result=result,
+            prep_process=prep_process,
+            release_signal=release_signal,
         )
-        cleanup_failure: RuntimeError | None = None
-        try:
-            _remove_disposable_temp_root(temp_root)
-        except RuntimeError as exc:
-            cleanup_failure = exc
-            if failure is None:
-                failure = exc
-                failure_record = _safe_failure_record(temp_root, failure)
-        if failure is not None:
-            assert failure_record is not None
-            failure_record["host_temp_cleanup_complete"] = cleanup_failure is None
-            if cleanup_failure is not None:
-                failure_record["host_temp_cleanup_failure_type"] = type(
-                    cleanup_failure
-                ).__name__
-            _finalize_attempt_evidence(evidence, failure_record)
-        elif result is not None:
-            result["host_temp_cleanup_complete"] = True
-            _finalize_attempt_evidence(evidence, result)
         # No runtime, authentication material, or provider transcript is
         # retained in source or copied from the disposable repository.
-    if failure is not None:
-        raise failure
     assert result is not None
     return 0
 

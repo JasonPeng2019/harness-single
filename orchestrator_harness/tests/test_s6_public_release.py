@@ -27,12 +27,16 @@ from orchestrator_harness.release_assets import (
 )
 from orchestrator_harness.tests.real_agent_test import (
     DEFAULT_EVIDENCE_DIRECTORY,
+    _attempt_directory_identity,
     _finalize_attempt_evidence,
     _provider_identity_from_query,
+    _release_preparation_process,
     _remove_disposable_temp_root,
     _resolve_evidence_root,
+    _revalidate_attempt_identity,
     _safe_failure_record,
     _safe_success_record,
+    _terminal_finalize,
     _validate_controller_receipt_identity,
 )
 from orchestrator_harness.tests.support import TemporaryGitRepository
@@ -56,6 +60,80 @@ _support_spec.loader.exec_module(_support_module)
 PREPARED_STATE_SCHEMA = _support_module.PREPARED_STATE_SCHEMA
 claim_prepared_state = _support_module.claim_prepared_state
 validate_prepared_state = _support_module.validate_prepared_state
+
+
+class _FakePrepProcess:
+    """Duck-typed exact Popen handle for terminal-seam fault injection."""
+
+    def __init__(
+        self,
+        *,
+        running: bool = True,
+        wait_fault: BaseException | None = None,
+        kill_fault: BaseException | None = None,
+        post_kill_wait_fault: BaseException | None = None,
+    ) -> None:
+        self._running = running
+        self._wait_fault = wait_fault
+        self._kill_fault = kill_fault
+        self._post_kill_wait_fault = post_kill_wait_fault
+        self.kill_calls = 0
+        self.wait_calls = 0
+
+    def poll(self) -> int | None:
+        return None if self._running else 0
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self._kill_fault is not None:
+            raise self._kill_fault
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        if timeout == 90:
+            if self._wait_fault is not None:
+                raise self._wait_fault
+            if self._running:
+                raise subprocess.TimeoutExpired("wsl.exe", timeout)
+            return 0
+        if timeout == 10:
+            if self._post_kill_wait_fault is not None:
+                raise self._post_kill_wait_fault
+            return 0
+        return 0
+
+
+class _FakeReleaseSignal:
+    """Duck-typed release signal whose write can be fault-injected."""
+
+    def __init__(self, fault: BaseException | None = None) -> None:
+        self._fault = fault
+        self.writes = 0
+
+    def write_text(self, text: str, encoding: str = "utf-8") -> None:
+        self.writes += 1
+        if self._fault is not None:
+            raise self._fault
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    """Create a directory symlink or a Windows junction at link -> target."""
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True, shell=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"junction creation failed: {result.stderr}")
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _is_directory_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    return os.name == "nt" and os.path.isjunction(path)
 
 
 class S6SelectorTests(unittest.TestCase):
@@ -681,49 +759,60 @@ class S6LocalIsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "outside the source"):
                 _resolve_evidence_root(source / "runtime", repository_root=source)
 
-            attempt = root / "attempt"
-            workspace = attempt / "synthetic-repository" / ".agent-workspace"
-            workspace.mkdir(parents=True)
-            for name in (
-                "real_agent_codex.jsonl", "real_agent_codex.stderr.log",
-                "real_agent_last_message.txt",
-            ):
-                (workspace / name).write_text(sentinel, encoding="utf-8")
-            (workspace / "real_agent_controller.status.json").write_text(json.dumps({
-                "state": "CONTROLLER_FAILED", "exit_code": 1, "task": sentinel,
-                "launcher_settings": {"argv": [sentinel]}, "held_resource_claims": [],
-            }), encoding="utf-8")
-            (attempt / "bridge-evidence.json").write_text(
-                json.dumps({"status": "FAIL", "provider_output": sentinel}), encoding="utf-8",
-            )
-            evidence = outside / "forced-failure"
-            evidence.mkdir()
-            (evidence / "proxy-audit.jsonl").write_text(
-                sentinel, encoding="utf-8"
-            )
-            retained_directory = evidence / "prepared-artifacts"
-            retained_directory.mkdir()
-            (retained_directory / "prepared-state.json").write_text(
-                sentinel, encoding="utf-8"
-            )
-            failure_record = _safe_failure_record(attempt, RuntimeError(sentinel))
-            _finalize_attempt_evidence(evidence, failure_record)
-            retained = tuple(
-                path.relative_to(evidence).as_posix()
-                for path in evidence.rglob("*") if path.is_file()
-            )
-            self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-            text = (evidence / retained[0]).read_text(encoding="utf-8")
-            self.assertNotIn(sentinel, text)
-            self.assertNotIn("real_agent_codex.jsonl", text)
-            self.assertNotIn("real_agent_codex.stderr.log", text)
-            result = json.loads(text)
-            self.assertFalse(result["transcript_persisted"])
-            self.assertEqual(1, result["retained_file_count"])
-            self.assertTrue(result["source_artifact_facts"]["provider_event_stream"]["present"])
-            self.assertNotIn(
-                ".real-agent/", (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8"),
-            )
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+                workspace.mkdir(parents=True)
+                for name in (
+                    "real_agent_codex.jsonl", "real_agent_codex.stderr.log",
+                    "real_agent_last_message.txt",
+                ):
+                    (workspace / name).write_text(sentinel, encoding="utf-8")
+                (workspace / "real_agent_controller.status.json").write_text(json.dumps({
+                    "state": "CONTROLLER_FAILED", "exit_code": 1, "task": sentinel,
+                    "launcher_settings": {"argv": [sentinel]}, "held_resource_claims": [],
+                }), encoding="utf-8")
+                (temp_root / "bridge-evidence.json").write_text(
+                    json.dumps({"status": "FAIL", "provider_output": sentinel}), encoding="utf-8",
+                )
+                evidence = outside / "forced-failure"
+                evidence.mkdir()
+                (evidence / "proxy-audit.jsonl").write_text(
+                    sentinel, encoding="utf-8"
+                )
+                retained_directory = evidence / "prepared-artifacts"
+                retained_directory.mkdir()
+                (retained_directory / "prepared-state.json").write_text(
+                    sentinel, encoding="utf-8"
+                )
+                attempt_identity = _attempt_directory_identity(evidence)
+                with self.assertRaisesRegex(RuntimeError, "PROVIDER_TRANSCRIPT_SENTINEL"):
+                    _terminal_finalize(
+                        evidence=evidence, attempt_identity=attempt_identity,
+                        temp_root=temp_root, failure=RuntimeError(sentinel),
+                        result=None, prep_process=None, release_signal=None,
+                    )
+                self.assertFalse(temp_root.exists())
+                retained = tuple(
+                    path.relative_to(evidence).as_posix()
+                    for path in evidence.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                text = (evidence / retained[0]).read_text(encoding="utf-8")
+                self.assertNotIn(sentinel, text)
+                self.assertNotIn("real_agent_codex.jsonl", text)
+                self.assertNotIn("real_agent_codex.stderr.log", text)
+                result = json.loads(text)
+                self.assertFalse(result["transcript_persisted"])
+                self.assertEqual(1, result["retained_file_count"])
+                self.assertTrue(result["host_temp_cleanup_complete"])
+                self.assertTrue(result["source_artifact_facts"]["provider_event_stream"]["present"])
+                self.assertNotIn(
+                    ".real-agent/", (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8"),
+                )
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
 
     def test_real_agent_success_finalizer_retains_only_allowlisted_record(self) -> None:
         sentinel = "SUCCESS_PROVIDER_TRANSCRIPT_SENTINEL"
@@ -733,147 +822,443 @@ class S6LocalIsolationTests(unittest.TestCase):
         commit = "0" * 40
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-success-evidence-") as raw:
             root = Path(raw)
-            attempt = root / "attempt"
-            workspace = attempt / "synthetic-repository" / ".agent-workspace"
-            workspace.mkdir(parents=True)
-            for name in (
-                "real_agent_codex.jsonl",
-                "real_agent_codex.stderr.log",
-                "real_agent_last_message.txt",
-                "real_agent_prompt.md",
-            ):
-                (workspace / name).write_text(sentinel, encoding="utf-8")
-            receipt_path = workspace / "real_agent_operator.receipt.json"
-            status_path = workspace / "real_agent_controller.status.json"
-            result_path = workspace / "RESULT.json"
-            prompt_path = workspace / "real_agent_prompt.md"
-            lifecycle_path = workspace / "lifecycle.json"
-            receipt_path.write_text(
-                json.dumps({"pid": 101, "created_utc": created_text}), encoding="utf-8",
-            )
-            status_path.write_text(json.dumps({
-                "controller_pid": 101, "controller_created_utc": created_text,
-                "state": "CODEX_EXITED", "exit_code": 0, "result_valid": True,
-                "result_validation": {"state": "VALID", "commit": commit},
-                "helpers_complete": True, "direct_child_reaped": True,
-                "resource_claim_release_safe": True, "held_resource_claims": [],
-                "process_boundary": {"complete": True, "live_members": []},
-                "task": sentinel, "launcher_settings": {"argv": [sentinel]},
-            }), encoding="utf-8")
-            poisoned_result = {
-                "schema": "orchestrator-lane-result/v1",
-                "lane_id": "real-agent",
-                "worker_invocation_id": "real-agent-001",
-                "branch": "real-agent",
-                "commit": commit,
-                "outcome": "PASS",
-                "summary": f"public route task passed {sentinel}",
-                "checks": [{
-                    "name": "synthetic public route",
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+                workspace.mkdir(parents=True)
+                for name in (
+                    "real_agent_codex.jsonl",
+                    "real_agent_codex.stderr.log",
+                    "real_agent_last_message.txt",
+                    "real_agent_prompt.md",
+                ):
+                    (workspace / name).write_text(sentinel, encoding="utf-8")
+                receipt_path = workspace / "real_agent_operator.receipt.json"
+                status_path = workspace / "real_agent_controller.status.json"
+                result_path = workspace / "RESULT.json"
+                prompt_path = workspace / "real_agent_prompt.md"
+                lifecycle_path = workspace / "lifecycle.json"
+                receipt_path.write_text(
+                    json.dumps({"pid": 101, "created_utc": created_text}), encoding="utf-8",
+                )
+                status_path.write_text(json.dumps({
+                    "controller_pid": 101, "controller_created_utc": created_text,
+                    "state": "CODEX_EXITED", "exit_code": 0, "result_valid": True,
+                    "result_validation": {"state": "VALID", "commit": commit},
+                    "helpers_complete": True, "direct_child_reaped": True,
+                    "resource_claim_release_safe": True, "held_resource_claims": [],
+                    "process_boundary": {"complete": True, "live_members": []},
+                    "task": sentinel, "launcher_settings": {"argv": [sentinel]},
+                }), encoding="utf-8")
+                poisoned_result = {
+                    "schema": "orchestrator-lane-result/v1",
+                    "lane_id": "real-agent",
+                    "worker_invocation_id": "real-agent-001",
+                    "branch": "real-agent",
+                    "commit": commit,
                     "outcome": "PASS",
-                    "summary": f"marker committed {sentinel}",
-                }],
-            }
-            result_path.write_text(json.dumps(poisoned_result), encoding="utf-8")
-            lifecycle_path.write_text(json.dumps({
-                "lifecycle": {"complete": True, "helpers_complete": True},
-                "record": sentinel,
-            }), encoding="utf-8")
-            bridge_evidence = attempt / "bridge-evidence.json"
-            state_path = attempt / "prepared-state.json"
-            claim_path = attempt / "prepared-claim.json"
-            bridge_evidence.write_text(json.dumps({
-                "status": "PASS", "cleanup_complete": True,
-                "sandbox": {"mnt_c_exposed": False, "usb_exposed": False},
-                "provider_output": sentinel,
-            }), encoding="utf-8")
-            state_path.write_text(json.dumps({
-                "status": "CLEANED", "cleanup_complete": True,
-                "credentials_in_state": False, "evidence": sentinel,
-            }), encoding="utf-8")
-            claim_path.write_text(json.dumps({"claim": sentinel}), encoding="utf-8")
-            evidence = root / "evidence" / "success-attempt"
-            (evidence / "prepared-artifacts").mkdir(parents=True)
-            (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
-            (evidence / "prepared-artifacts" / "prepared-state.json").write_text(
-                sentinel, encoding="utf-8",
-            )
-            record = _safe_success_record(
-                completed_utc="2026-08-13T01:00:05Z",
-                route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
-                distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
-                nonce="nonce", invocation_id="real-agent-001",
-                controller_pid=101, controller_created=created_text,
-                provider_identity={
-                    "platform": "windows", "pid": 202, "created_utc": created_text,
-                    "nonce": "nonce", "invocation_id": "real-agent-001",
-                    "parent_pid": 101,
-                },
-                linux_bridge_identity={
-                    "platform": "linux", "pid": 303, "created_utc": created_text,
-                    "nonce": "nonce", "invocation_id": "real-agent-001",
-                },
-                status=json.loads(status_path.read_text(encoding="utf-8")),
-                result_value=poisoned_result,
-                lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
-                bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
-                prepared=json.loads(state_path.read_text(encoding="utf-8")),
-                event_types=[
-                    "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
-                ],
-                workspace=workspace,
-                receipt_path=receipt_path, result_path=result_path,
-                lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
-                state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
-            )
-            _finalize_attempt_evidence(evidence, record)
-            retained = tuple(
-                path.relative_to(evidence).as_posix()
-                for path in evidence.rglob("*") if path.is_file()
-            )
-            self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-            text = (evidence / retained[0]).read_text(encoding="utf-8")
-            self.assertNotIn(sentinel, text)
-            self.assertNotIn("real_agent_codex.jsonl", text)
-            self.assertNotIn("real_agent_codex.stderr.log", text)
-            self.assertNotIn("real_agent_last_message.txt", text)
-            self.assertNotIn("real_agent_prompt.md", text)
-            self.assertNotIn("bridge-evidence.json", text)
-            self.assertNotIn("prepared-state.json", text)
-            result = json.loads(text)
-            self.assertEqual("orchestrator-real-agent-evidence/v1", result["schema"])
-            self.assertEqual("PASS", result["status"])
-            self.assertEqual(1, result["retained_file_count"])
-            self.assertFalse(result["credentials_persisted"])
-            self.assertFalse(result["transcript_persisted"])
-            self.assertEqual("real-agent", result["result_identity"]["lane_id"])
-            self.assertEqual(commit, result["result_identity"]["commit"])
-            self.assertEqual("PASS", result["result_identity"]["outcome"])
-            self.assertEqual("VALID", result["controller_summary"]["result_validation_state"])
-            self.assertFalse(result["bridge_summary"]["mnt_c_exposed"])
-            self.assertTrue(result["prepared_summary"]["cleanup_complete"])
-            self.assertEqual(
-                hashlib.sha256(result_path.read_bytes()).hexdigest(),
-                result["source_artifact_facts"]["controller_result"]["sha256"],
-            )
-            self.assertNotIn("controller_evidence", result)
-            self.assertNotIn("bridge_evidence", result)
-            self.assertNotIn("prepared_cleanup", result)
-            self.assertNotIn("checks", result)
-            self.assertNotIn("summary", result)
+                    "summary": f"public route task passed {sentinel}",
+                    "checks": [{
+                        "name": "synthetic public route",
+                        "outcome": "PASS",
+                        "summary": f"marker committed {sentinel}",
+                        "command": f"provider check command {sentinel}",
+                    }],
+                }
+                result_path.write_text(json.dumps(poisoned_result), encoding="utf-8")
+                lifecycle_path.write_text(json.dumps({
+                    "lifecycle": {"complete": True, "helpers_complete": True},
+                    "record": sentinel,
+                }), encoding="utf-8")
+                bridge_evidence = temp_root / "bridge-evidence.json"
+                state_path = temp_root / "prepared-state.json"
+                claim_path = temp_root / "prepared-claim.json"
+                bridge_evidence.write_text(json.dumps({
+                    "status": "PASS", "cleanup_complete": True,
+                    "sandbox": {"mnt_c_exposed": False, "usb_exposed": False},
+                    "provider_output": sentinel,
+                }), encoding="utf-8")
+                state_path.write_text(json.dumps({
+                    "status": "CLEANED", "cleanup_complete": True,
+                    "credentials_in_state": False, "evidence": sentinel,
+                }), encoding="utf-8")
+                claim_path.write_text(json.dumps({"claim": sentinel}), encoding="utf-8")
+                evidence = root / "evidence" / "success-attempt"
+                (evidence / "prepared-artifacts").mkdir(parents=True)
+                (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
+                (evidence / "prepared-artifacts" / "prepared-state.json").write_text(
+                    sentinel, encoding="utf-8",
+                )
+                attempt_identity = _attempt_directory_identity(evidence)
+                expected_result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+                record = _safe_success_record(
+                    completed_utc="2026-08-13T01:00:05Z",
+                    route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
+                    distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
+                    nonce="nonce", invocation_id="real-agent-001",
+                    controller_pid=101, controller_created=created_text,
+                    provider_identity={
+                        "platform": "windows", "pid": 202, "created_utc": created_text,
+                        "nonce": "nonce", "invocation_id": "real-agent-001",
+                        "parent_pid": 101,
+                    },
+                    linux_bridge_identity={
+                        "platform": "linux", "pid": 303, "created_utc": created_text,
+                        "nonce": "nonce", "invocation_id": "real-agent-001",
+                    },
+                    status=json.loads(status_path.read_text(encoding="utf-8")),
+                    result_value=poisoned_result,
+                    lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
+                    bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
+                    prepared=json.loads(state_path.read_text(encoding="utf-8")),
+                    event_types=[
+                        "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
+                    ],
+                    workspace=workspace,
+                    receipt_path=receipt_path, result_path=result_path,
+                    lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
+                    state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+                )
+                terminal_failure = _terminal_finalize(
+                    evidence=evidence, attempt_identity=attempt_identity,
+                    temp_root=temp_root, failure=None, result=record,
+                    prep_process=None, release_signal=None,
+                )
+                self.assertIsNone(terminal_failure)
+                self.assertFalse(temp_root.exists())
+                retained = tuple(
+                    path.relative_to(evidence).as_posix()
+                    for path in evidence.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                text = (evidence / retained[0]).read_text(encoding="utf-8")
+                self.assertNotIn(sentinel, text)
+                self.assertNotIn("real_agent_codex.jsonl", text)
+                self.assertNotIn("real_agent_codex.stderr.log", text)
+                self.assertNotIn("real_agent_last_message.txt", text)
+                self.assertNotIn("real_agent_prompt.md", text)
+                self.assertNotIn("bridge-evidence.json", text)
+                self.assertNotIn("prepared-state.json", text)
+                result = json.loads(text)
+                self.assertEqual("orchestrator-real-agent-evidence/v1", result["schema"])
+                self.assertEqual("PASS", result["status"])
+                self.assertEqual(1, result["retained_file_count"])
+                self.assertFalse(result["credentials_persisted"])
+                self.assertFalse(result["transcript_persisted"])
+                self.assertTrue(result["host_temp_cleanup_complete"])
+                self.assertEqual("real-agent", result["result_identity"]["lane_id"])
+                self.assertEqual(commit, result["result_identity"]["commit"])
+                self.assertEqual("PASS", result["result_identity"]["outcome"])
+                self.assertEqual("VALID", result["controller_summary"]["result_validation_state"])
+                self.assertFalse(result["bridge_summary"]["mnt_c_exposed"])
+                self.assertTrue(result["prepared_summary"]["cleanup_complete"])
+                self.assertEqual(
+                    expected_result_sha,
+                    result["source_artifact_facts"]["controller_result"]["sha256"],
+                )
+                self.assertNotIn("controller_evidence", result)
+                self.assertNotIn("bridge_evidence", result)
+                self.assertNotIn("prepared_cleanup", result)
+                self.assertNotIn("checks", result)
+                self.assertNotIn("summary", result)
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
 
     def test_real_agent_terminal_routes_use_one_shared_finalizer(self) -> None:
         source = (
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
         ).read_text(encoding="utf-8")
         self.assertIn("def _finalize_attempt_evidence(", source)
+        self.assertIn("def _terminal_finalize(", source)
+        self.assertIn("def _release_preparation_process(", source)
+        self.assertIn("def _attempt_directory_identity(", source)
+        self.assertIn("def _revalidate_attempt_identity(", source)
         self.assertNotIn("def _redacted_controller_evidence(", source)
         self.assertNotIn("def _write_safe_failure_result(", source)
-        self.assertNotIn('_json(evidence / "REAL_AGENT_TEST_RESULT.json"', source)
         self.assertNotIn('"controller_evidence":', source)
         self.assertNotIn('"bridge_evidence": bridge', source)
         self.assertNotIn('"prepared_cleanup":', source)
-        self.assertGreaterEqual(source.count("_finalize_attempt_evidence(evidence, "), 2)
+        # The finalizer never resolves the lexical attempt root.
+        self.assertNotIn("evidence.resolve(", source)
+        # main()'s finally block delegates the whole terminal flow to the seam.
+        main_tail = source.split("def main()", 1)[1]
+        finally_block = main_tail.split("finally:", 1)[1].split("assert result", 1)[0]
+        self.assertEqual(1, finally_block.count("_terminal_finalize("))
+        self.assertNotIn("release_signal.write_text(", finally_block)
+        self.assertNotIn("prep_process.wait(", finally_block)
+        self.assertNotIn("prep_process.kill(", finally_block)
+        # The exact-handle release sequence lives only inside the funnel helper.
+        self.assertEqual(1, source.count("release_signal.write_text("))
+        self.assertGreaterEqual(source.count("prep_process.wait("), 2)
+        self.assertGreaterEqual(source.count("prep_process.kill("), 2)
+        # Both terminal routes call the same finalizer owner inside the seam.
+        seam = source.split("def _terminal_finalize(", 1)[1].split("\ndef ", 1)[0]
+        self.assertEqual(2, seam.count("_finalize_attempt_evidence("))
+
+    def test_real_agent_cleanup_faults_funnel_through_terminal_seam(self) -> None:
+        sentinel = "CLEANUP_FAULT_TRANSCRIPT_SENTINEL"
+        scenarios = (
+            (
+                "release_write",
+                _FakeReleaseSignal(OSError("release write fault")),
+                _FakePrepProcess(running=True),
+            ),
+            (
+                "non_timeout_wait",
+                None,
+                _FakePrepProcess(running=True, wait_fault=OSError("initial wait fault")),
+            ),
+            (
+                "timeout_kill",
+                None,
+                _FakePrepProcess(running=True, kill_fault=OSError("timeout kill fault")),
+            ),
+            (
+                "post_kill_wait",
+                None,
+                _FakePrepProcess(
+                    running=True, post_kill_wait_fault=OSError("post-kill wait fault"),
+                ),
+            ),
+        )
+        for name, release_signal, prep_process in scenarios:
+            with self.subTest(operation=name):
+                with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-fault-") as raw:
+                    root = Path(raw)
+                    temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+                    try:
+                        workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+                        workspace.mkdir(parents=True)
+                        (workspace / "real_agent_codex.jsonl").write_text(
+                            sentinel, encoding="utf-8",
+                        )
+                        (workspace / "real_agent_controller.status.json").write_text(
+                            json.dumps({
+                                "state": "CONTROLLER_FAILED", "exit_code": 1,
+                                "task": sentinel, "held_resource_claims": [],
+                            }),
+                            encoding="utf-8",
+                        )
+                        evidence = root / "evidence" / name
+                        evidence.mkdir(parents=True)
+                        (evidence / "proxy-audit.jsonl").write_text(
+                            sentinel, encoding="utf-8",
+                        )
+                        attempt_identity = _attempt_directory_identity(evidence)
+                        success_record = {
+                            "schema": "orchestrator-real-agent-evidence/v1",
+                            "status": "PASS",
+                            "completed_utc": "2026-08-13T06:30:00Z",
+                            "retained_file_count": 1,
+                            "credentials_persisted": False,
+                            "transcript_persisted": False,
+                        }
+                        with self.assertRaises(OSError):
+                            _terminal_finalize(
+                                evidence=evidence, attempt_identity=attempt_identity,
+                                temp_root=temp_root, failure=None, result=success_record,
+                                prep_process=prep_process, release_signal=release_signal,
+                            )
+                        self.assertFalse(temp_root.exists())
+                        retained = tuple(
+                            path.relative_to(evidence).as_posix()
+                            for path in evidence.rglob("*") if path.is_file()
+                        )
+                        self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                        text = (evidence / retained[0]).read_text(encoding="utf-8")
+                        self.assertNotIn(sentinel, text)
+                        record = json.loads(text)
+                        self.assertEqual("FAIL", record["status"])
+                        self.assertEqual("OSError", record["preparation_cleanup_failure_type"])
+                        self.assertTrue(record["host_temp_cleanup_complete"])
+                        self.assertEqual(1, record["retained_file_count"])
+                    finally:
+                        if temp_root.exists():
+                            shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_cleanup_fault_on_failure_route_preserves_original_failure(self) -> None:
+        sentinel = "ORIGINAL_FAILURE_TRANSCRIPT_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-fault-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+                workspace.mkdir(parents=True)
+                (workspace / "real_agent_codex.jsonl").write_text(
+                    sentinel, encoding="utf-8",
+                )
+                evidence = root / "evidence" / "failure-route"
+                evidence.mkdir(parents=True)
+                (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
+                attempt_identity = _attempt_directory_identity(evidence)
+                with self.assertRaisesRegex(RuntimeError, "original product failure"):
+                    _terminal_finalize(
+                        evidence=evidence, attempt_identity=attempt_identity,
+                        temp_root=temp_root, failure=RuntimeError("original product failure"),
+                        result=None,
+                        prep_process=_FakePrepProcess(
+                            running=True, kill_fault=OSError("kill fault"),
+                        ),
+                        release_signal=None,
+                    )
+                self.assertFalse(temp_root.exists())
+                retained = tuple(
+                    path.relative_to(evidence).as_posix()
+                    for path in evidence.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                record = json.loads((evidence / retained[0]).read_text(encoding="utf-8"))
+                self.assertEqual("FAIL", record["status"])
+                self.assertEqual("RuntimeError", record["failure_type"])
+                self.assertEqual("OSError", record["preparation_cleanup_failure_type"])
+                self.assertTrue(record["host_temp_cleanup_complete"])
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_attempt_identity_capture_and_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-identity-") as raw:
+            root = Path(raw)
+            first = root / "first"
+            first.mkdir()
+            identity = _attempt_directory_identity(first)
+            self.assertEqual(str(first), identity["path"])
+            self.assertEqual(str(root), identity["parent"])
+            self.assertTrue(identity["st_ino"])
+            _revalidate_attempt_identity(first, identity)
+            second = root / "second"
+            second.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                _revalidate_attempt_identity(second, identity)
+            # Same-path type replacement fails closed.
+            (first / "marker").write_text("x", encoding="utf-8")
+            (first / "marker").unlink()
+            first.rmdir()
+            first.write_text("now a file", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "no longer a directory"):
+                _revalidate_attempt_identity(first, identity)
+            first.unlink()
+            # Same-path directory replacement fails closed when the filesystem
+            # assigns a new identity (the normal case on NTFS).
+            first.mkdir()
+            (first / "swapped.jsonl").write_text("swapped", encoding="utf-8")
+            if _attempt_directory_identity(first)["st_ino"] != identity["st_ino"]:
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    _revalidate_attempt_identity(first, identity)
+
+    def test_real_agent_attempt_root_replacement_fails_closed(self) -> None:
+        sentinel = "OUTSIDE_SENTINEL_MARKER"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-replacement-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                attempt = evidence_root / "attempt"
+                attempt.mkdir()
+                (attempt / "raw.jsonl").write_text(sentinel, encoding="utf-8")
+                identity = _attempt_directory_identity(attempt)
+                outside = root / "outside-target"
+                outside.mkdir()
+                (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+                (attempt / "raw.jsonl").unlink()
+                attempt.rmdir()
+                _make_directory_link(attempt, outside)
+                self.assertTrue(_is_directory_link(attempt))
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                with self.assertRaisesRegex(RuntimeError, "symbolic link|reparse point"):
+                    _terminal_finalize(
+                        evidence=attempt, attempt_identity=identity,
+                        temp_root=temp_root, failure=None, result=record,
+                        prep_process=None, release_signal=None,
+                    )
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+            finally:
+                if _is_directory_link(attempt):
+                    attempt.unlink()
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_attempt_identity_swap_fails_closed(self) -> None:
+        sentinel = "SWAP_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-swap-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                attempt = evidence_root / "attempt"
+                attempt.mkdir()
+                (attempt / "raw.jsonl").write_text("original", encoding="utf-8")
+                identity = _attempt_directory_identity(attempt)
+                # Same-path replacement with a different directory: the stale
+                # identity must fail closed before any deletion or publication.
+                (attempt / "raw.jsonl").unlink()
+                attempt.rmdir()
+                attempt.mkdir()
+                (attempt / "swapped.jsonl").write_text(sentinel, encoding="utf-8")
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    _terminal_finalize(
+                        evidence=attempt, attempt_identity=identity,
+                        temp_root=temp_root, failure=None, result=record,
+                        prep_process=None, release_signal=None,
+                    )
+                self.assertEqual(sentinel, (attempt / "swapped.jsonl").read_text(encoding="utf-8"))
+                self.assertFalse((attempt / "REAL_AGENT_TEST_RESULT.json").exists())
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_child_reparse_entry_cleanup_is_no_follow(self) -> None:
+        sentinel = "CHILD_LINK_OUTSIDE_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-child-link-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            child_link = root / "evidence" / "child-link-attempt" / "linked-artifacts"
+            try:
+                evidence = root / "evidence" / "child-link-attempt"
+                evidence.mkdir(parents=True)
+                (evidence / "raw.jsonl").write_text(sentinel, encoding="utf-8")
+                outside = root / "child-link-target"
+                outside.mkdir()
+                (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+                _make_directory_link(child_link, outside)
+                identity = _attempt_directory_identity(evidence)
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                terminal_failure = _terminal_finalize(
+                    evidence=evidence, attempt_identity=identity,
+                    temp_root=temp_root, failure=None, result=record,
+                    prep_process=None, release_signal=None,
+                )
+                self.assertIsNone(terminal_failure)
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertFalse(os.path.lexists(child_link))
+                retained = tuple(
+                    path.relative_to(evidence).as_posix()
+                    for path in evidence.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+            finally:
+                if os.path.lexists(child_link) and _is_directory_link(child_link):
+                    child_link.unlink()
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
 
     def test_real_agent_host_temp_cleanup_is_exact_and_complete(self) -> None:
         disposable = Path(
