@@ -46,6 +46,12 @@ from .mutation import (
     safe_relative_path,
 )
 from .notifications import ManagerEventRouter
+from .provider import (
+    NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY,
+    NOTIFICATION_MODE_WAKE,
+    notification_mode,
+    provider_adapter,
+)
 from .stable_io import canonical_json
 
 
@@ -1279,15 +1285,40 @@ def _load_binding_for_hook(project: Path, guard: _ProjectMutationGuard) -> dict[
     return value
 
 
+def _final_response_declarations(payload: Mapping[str, Any] | None) -> list[Mapping[str, Any]] | None:
+    """Extract only the minimum structured final-response evidence from a Stop payload.
+
+    The closed shape is ``orchestrator_final_response``: a list of
+    ``{notification_id, required_actor, required_action}`` objects.  Nothing
+    else in the hook payload is ever copied into notices, receipts, logs, or
+    provider evidence.
+    """
+    if payload is None:
+        return None
+    value = payload.get("orchestrator_final_response")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        raise CodexAdapterError("orchestrator_final_response must be a list of declarations")
+    return [dict(item) for item in value]
+
+
 def run_installed_codex_hook(
     project_root: str | Path,
     *,
     boundary: str,
     payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run the actually installed, exact-binding safe-boundary route."""
+    """Run the actually installed, exact-binding safe-boundary route.
 
-    del payload  # Hook input is never copied into the notice or receipt.
+    ``post_tool_use`` delivers the sparse notice at the safe boundary and
+    emits the selected provider adapter's exact content-free wake text (or
+    ``SAFE_BOUNDARY_ONLY`` honestly).  ``stop`` enforces the notification stop
+    matrix: OPEN items reject stop without payload disclosure, an empty queue
+    permits stop, and all-EXTERNALLY_BLOCKED items permit stop only after the
+    final response names every ID and its exact required external
+    actor/action.  Transport delivery never acknowledges queue work.
+    """
     if boundary not in {"post_tool_use", "stop"}:
         raise CodexAdapterError("supported installed Codex hooks are post_tool_use and stop")
     guard = _project_guard(project_root)
@@ -1317,13 +1348,62 @@ def run_installed_codex_hook(
     notice = coordinator.notice_for_wake()
     receipt: DeliveryReceipt | None = None
     continuation_requested = False
-    if notice is not None:
-        if boundary == "post_tool_use":
-            receipt = coordinator.deliver_at_boundary(notice, boundary="post_tool_use")
+    continuation_result: bool | None = None
+    wake: dict[str, Any] | None = None
+    stop_decision: dict[str, Any] | None = None
+    if boundary == "post_tool_use":
+        # PA-R1-002: the selected provider adapter owns the safe-boundary
+        # delivery binding.  The installed Codex route consumes the same seam
+        # as any other notification=true adapter; the wake is adapter-owned
+        # and content-free (the exact text or an honest SAFE_BOUNDARY_ONLY
+        # declaration, never payload or IDs).
+        provider = provider_adapter("codex")
+        mode = notification_mode("codex")
+        if notice is not None:
+            receipt = provider.deliver_notification(
+                coordinator, notice, boundary="post_tool_use"
+            )
+        if (
+            mode.get("mode") == NOTIFICATION_MODE_WAKE
+            and notice is not None
+            and receipt is not None
+        ):
+            wake = {
+                "mode": NOTIFICATION_MODE_WAKE,
+                "wake_text": mode.get("wake_text"),
+                "content_free": True,
+                "preemptive": False,
+            }
         else:
-            receipt = coordinator.deliver_at_boundary(notice, boundary="finalization")
-            if receipt is not None and receipt.outcome == "DELIVERED":
-                continuation_requested = transport.request_continuation()
+            wake = {
+                "mode": NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY,
+                "wake_text": None,
+                "content_free": True,
+                "preemptive": False,
+            }
+    else:
+        declarations = None
+        try:
+            declarations = _final_response_declarations(payload)
+        except CodexAdapterError:
+            declarations = None
+        if declarations is not None:
+            try:
+                coordinator.record_notification_final_response(declarations)
+            except HostAdapterError:
+                # A malformed or partial final response keeps stop rejected.
+                pass
+        decision = coordinator.notification_stop_request()
+        stop_decision = decision.as_record()
+        if decision.permitted:
+            # A permitted Stop makes no continuation request.
+            continuation_requested = False
+        else:
+            # REQ-O38: every rejected installed Stop invokes the real
+            # continuation transport and reports its actual result.  The
+            # payload never enters the decision or the transport record.
+            continuation_result = transport.request_continuation()
+            continuation_requested = bool(continuation_result)
     return {
         "schema": "orchestrator-codex-installed-hook/v1",
         "boundary": boundary,
@@ -1339,7 +1419,10 @@ def run_installed_codex_hook(
         },
         "notice": notice.as_record() if notice is not None else None,
         "receipt": receipt.as_record() if receipt is not None else None,
+        "wake": wake,
+        "stop_decision": stop_decision,
         "continuation_requested": continuation_requested,
+        "continuation_result": continuation_result,
         "pending_count": len(router.pending_events()),
         "acknowledged_by_hook": False,
         "transport_calls": list(transport.calls),

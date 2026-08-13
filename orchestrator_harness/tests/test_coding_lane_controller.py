@@ -194,7 +194,16 @@ class CodingLaneControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(controller.InvocationError, "resume identity worker_invocation_id mismatch"):
             controller.load_invocation(path)
         path, _ = self.invocation(action="resume", worker_id="worker-2")
-        self.assertEqual(2, controller.main([str(path)]))
+        # REQ-O35: identity-mismatched resume emits a declared same-role
+        # structured handoff with fabricated_continuity=false instead of
+        # silently rejecting and losing the logical task.
+        self.assertEqual(1, controller.main([str(path)]))
+        status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        self.assertEqual("PROVIDER_HANDOFF", status["state"])
+        handoff = status["provider_handoff"]
+        self.assertIsNotNone(handoff)
+        self.assertFalse(handoff["fabricated_continuity"])
+        self.assertIn("worker_invocation_id", handoff["reason"])
 
     def test_resource_acquisition_publishes_running_only_after_child_launch_and_popen_failure_releases_claim(self) -> None:
         path, _ = self.invocation()

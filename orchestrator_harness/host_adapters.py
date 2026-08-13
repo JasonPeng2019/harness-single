@@ -30,6 +30,19 @@ DELIVERY_RECEIPT_SCHEMA = "orchestrator-delivery-receipt/v1"
 MANAGER_EVENT_ACK_SCHEMA = "orchestrator-manager-event-ack/v1"
 DELIVERY_COORDINATOR_SCHEMA = "orchestrator-delivery-coordinator/v1"
 
+# Notification stop-policy vocabulary.  The active queue authority is the S3
+# ManagerEventRouter; this coordinator keeps only the typed notification
+# decoration (OPEN vs EXTERNALLY_BLOCKED and the exact external actor/action)
+# in its own per-binding durable state.  CLOSED is never a retained state:
+# handled items are mechanically acknowledged and removed from the router.
+NOTIFICATION_ITEM_SCHEMA = "orchestrator-notification-item/v1"
+NOTIFICATION_OPEN = "OPEN"
+NOTIFICATION_EXTERNALLY_BLOCKED = "EXTERNALLY_BLOCKED"
+NOTIFICATION_STOP_OPEN_ITEMS_REMAIN = "OPEN_ITEMS_REMAIN"
+NOTIFICATION_STOP_QUEUE_EMPTY = "QUEUE_EMPTY"
+NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED = "EXTERNALLY_BLOCKED_FINAL_RESPONSE_REQUIRED"
+NOTIFICATION_STOP_EXTERNAL_DECLARED = "EXTERNALLY_BLOCKED_DECLARED"
+
 _CAPABILITY_NAMES = (
     "active_turn_notice",
     "idle_wake",
@@ -372,6 +385,45 @@ class ManagerEventAck:
         }
 
 
+@dataclass(frozen=True)
+class NotificationStopDecision:
+    """The typed stop decision for one exact binding's active notification queue.
+
+    Rejection paths never disclose notification IDs or payload.  The accepted
+    all-EXTERNALLY_BLOCKED path carries only the minimum structured
+    final-response declarations the hook itself supplied.
+    """
+
+    permitted: bool
+    reason: str
+    open_count: int = 0
+    externally_blocked_count: int = 0
+    declarations: tuple[dict[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.permitted, bool):
+            raise HostAdapterError("stop decision permitted must be boolean")
+        _text(self.reason, "stop decision reason")
+        _nonnegative_int(self.open_count, "stop decision open_count")
+        _nonnegative_int(self.externally_blocked_count, "stop decision externally_blocked_count")
+        if not isinstance(self.declarations, tuple) or not all(
+            isinstance(item, dict) and set(item) == {"notification_id", "required_actor", "required_action"}
+            for item in self.declarations
+        ):
+            raise HostAdapterError("stop decision declarations have an invalid closed shape")
+
+    def as_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "permitted": self.permitted,
+            "reason": self.reason,
+            "open_count": self.open_count,
+            "externally_blocked_count": self.externally_blocked_count,
+        }
+        if self.declarations:
+            record["declarations"] = [dict(item) for item in self.declarations]
+        return record
+
+
 class HostAdapter(ABC):
     """Common host contract consumed by ``DeliveryCoordinator``."""
 
@@ -565,6 +617,7 @@ class DeliveryCoordinator:
             "next_retry_utc": None,
             "last_receipt": None,
             "markers": [],
+            "notification_policy": {"items": {}},
         }
 
     def _subscription_record(self, generation: int) -> dict[str, Any]:
@@ -955,9 +1008,23 @@ class DeliveryCoordinator:
     def acknowledge_event(self, event_id: str, *, action: str = "ACKNOWLEDGED") -> ManagerEventAck:
         if isinstance(event_id, DeliveryReceipt):
             raise HostAdapterError("a delivery receipt is not a manager event acknowledgement")
-        ack = ManagerEventAck(event_id=_text(event_id, "event_id"), action=action)
-        self.router.acknowledge(ack.event_id, action=ack.action, binding=self.binding)
+        event_id = _text(event_id, "event_id")
         state = self._state_or_register()
+        policy = dict(state.get("notification_policy") or {})
+        items_map = dict(policy.get("items") or {})
+        entry = items_map.get(event_id)
+        if isinstance(entry, Mapping) and entry.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED:
+            raise HostAdapterError(
+                "EXTERNALLY_BLOCKED notification items cannot be acknowledged by the worker"
+            )
+        ack = ManagerEventAck(event_id=event_id, action=action)
+        self.router.acknowledge(ack.event_id, action=ack.action, binding=self.binding)
+        # Prune decoration for items the mechanical acknowledgement removed.
+        pending_ids = {item.get("event_id") for item in self.router.pending_events()}
+        for key in [key for key in items_map if key not in pending_ids]:
+            items_map.pop(key, None)
+        policy["items"] = items_map
+        state["notification_policy"] = policy
         state["attempt_count"] = 0
         state["retry_backoff_seconds"] = 0.0
         state["next_retry_utc"] = None
@@ -968,6 +1035,231 @@ class DeliveryCoordinator:
 
     acknowledge = acknowledge_event
     manager_acknowledge = acknowledge_event
+
+    def admit_notification(
+        self,
+        *,
+        notification_id: str,
+        payload_ref: object = None,
+        required_actor: str | None = None,
+        required_action: str | None = None,
+        externally_blocked: bool = False,
+        priority: object = 3,
+        **facts: Any,
+    ) -> dict[str, Any] | None:
+        """Admit one typed notification item through the existing manager-actionable transition.
+
+        The item is durably admitted to the one per-binding ManagerEventRouter
+        queue (the active-queue authority).  EXTERNALLY_BLOCKED items keep
+        their exact required external actor/action as typed decoration in this
+        coordinator's per-binding state; they remain active until the external
+        actor acts and the manager acknowledges them.
+        """
+        notification_id = _text(notification_id, "notification_id")
+        data: dict[str, Any] = {
+            "signal_id": notification_id,
+            "lane_id": self.binding.get("manager_thread_id") or "notification",
+            "manager_actionable": True,
+            "severity": "warning",
+        }
+        data.update(facts)
+        event = {
+            "event_id": notification_id,
+            "type": "MANAGER_SIGNAL",
+            "identity": f"notification:{notification_id}",
+            "data": data,
+            "binding": self.binding,
+        }
+        admitted = self.router.admit(event, priority=priority, payload_ref=payload_ref, binding=self.binding)
+        if admitted is not None and externally_blocked:
+            if required_actor is None or required_action is None:
+                raise HostAdapterError(
+                    "EXTERNALLY_BLOCKED admission requires required_actor and required_action"
+                )
+            self.mark_externally_blocked(
+                notification_id,
+                required_actor=required_actor,
+                required_action=required_action,
+            )
+        return admitted
+
+    def notification_items(self) -> list[dict[str, Any]]:
+        """Active notification items derived from the router queue plus decoration.
+
+        Every pending router event is an active item.  OPEN is the default;
+        EXTERNALLY_BLOCKED items carry their exact required external
+        actor/action.  CLOSED is never retained as an active state.
+        """
+        state = self._state_or_register()
+        policy = state.get("notification_policy")
+        items_map = policy.get("items") if isinstance(policy, Mapping) else {}
+        items: list[dict[str, Any]] = []
+        for record in self.router.pending_events():
+            event_id = record.get("event_id")
+            if not isinstance(event_id, str) or not event_id:
+                continue
+            decoration = items_map.get(event_id) if isinstance(items_map, Mapping) else None
+            if isinstance(decoration, Mapping) and decoration.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED:
+                items.append({
+                    "schema": NOTIFICATION_ITEM_SCHEMA,
+                    "notification_id": event_id,
+                    "state": NOTIFICATION_EXTERNALLY_BLOCKED,
+                    "required_actor": decoration.get("required_actor"),
+                    "required_action": decoration.get("required_action"),
+                    "external_block_reason": decoration.get("reason"),
+                })
+            else:
+                items.append({
+                    "schema": NOTIFICATION_ITEM_SCHEMA,
+                    "notification_id": event_id,
+                    "state": NOTIFICATION_OPEN,
+                    "required_actor": None,
+                    "required_action": None,
+                    "external_block_reason": None,
+                })
+        return items
+
+    def mark_externally_blocked(
+        self,
+        event_id: str,
+        *,
+        required_actor: str,
+        required_action: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably decorate one active item as EXTERNALLY_BLOCKED."""
+        event_id = _text(event_id, "event_id")
+        required_actor = _text(required_actor, "required_actor")
+        required_action = _text(required_action, "required_action")
+        state = self._state_or_register()
+        pending_ids = {item.get("event_id") for item in self.router.pending_events()}
+        if event_id not in pending_ids:
+            raise HostAdapterError("external block references an item that is not active")
+        policy = dict(state.get("notification_policy") or {})
+        items_map = dict(policy.get("items") or {})
+        entry = {
+            "state": NOTIFICATION_EXTERNALLY_BLOCKED,
+            "required_actor": required_actor,
+            "required_action": required_action,
+            "reason": reason if isinstance(reason, str) and reason.strip() else None,
+            "marked_utc": self._timestamp(),
+        }
+        items_map[event_id] = entry
+        policy["items"] = items_map
+        state["notification_policy"] = policy
+        self._write_state(state)
+        return dict(entry)
+
+    def notification_stop_request(self) -> NotificationStopDecision:
+        """Enforce the stop matrix without exposing payload or notification IDs.
+
+        OPEN items reject stop; an empty active queue permits stop; all
+        EXTERNALLY_BLOCKED items permit stop only after a final response named
+        every ID and its exact required external actor/action.
+        """
+        items = self.notification_items()
+        open_items = [item for item in items if item.get("state") == NOTIFICATION_OPEN]
+        blocked = [item for item in items if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED]
+        if open_items:
+            return NotificationStopDecision(
+                permitted=False,
+                reason=NOTIFICATION_STOP_OPEN_ITEMS_REMAIN,
+                open_count=len(open_items),
+                externally_blocked_count=len(blocked),
+            )
+        if not blocked:
+            return NotificationStopDecision(
+                permitted=True,
+                reason=NOTIFICATION_STOP_QUEUE_EMPTY,
+                open_count=0,
+                externally_blocked_count=0,
+            )
+        state = self._state_or_register()
+        policy = state.get("notification_policy")
+        items_map = policy.get("items") if isinstance(policy, Mapping) else {}
+        complete = all(
+            isinstance(items_map.get(item["notification_id"]), Mapping)
+            and items_map[item["notification_id"]].get("final_response_declared") is True
+            for item in blocked
+        )
+        if complete:
+            declarations = tuple(
+                {
+                    "notification_id": item["notification_id"],
+                    "required_actor": item["required_actor"],
+                    "required_action": item["required_action"],
+                }
+                for item in blocked
+            )
+            return NotificationStopDecision(
+                permitted=True,
+                reason=NOTIFICATION_STOP_EXTERNAL_DECLARED,
+                open_count=0,
+                externally_blocked_count=len(blocked),
+                declarations=declarations,
+            )
+        return NotificationStopDecision(
+            permitted=False,
+            reason=NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED,
+            open_count=0,
+            externally_blocked_count=len(blocked),
+        )
+
+    def record_notification_final_response(
+        self, declarations: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...]
+    ) -> list[dict[str, str]]:
+        """Record the exact final response for every active EXTERNALLY_BLOCKED item.
+
+        The declarations must name every active notification ID with its exact
+        required external actor/action.  Items remain active and are never
+        marked CLOSED.
+        """
+        if not isinstance(declarations, (list, tuple)) or not all(
+            isinstance(item, Mapping) for item in declarations
+        ):
+            raise HostAdapterError("final response must be a list of declarations")
+        items = self.notification_items()
+        blocked = [item for item in items if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED]
+        expected = {
+            (item["notification_id"], item["required_actor"], item["required_action"])
+            for item in blocked
+        }
+        provided: set[tuple[str, str, str]] = set()
+        for declaration in declarations:
+            notification_id = declaration.get("notification_id")
+            required_actor = declaration.get("required_actor")
+            required_action = declaration.get("required_action")
+            if (
+                not isinstance(notification_id, str) or not notification_id.strip()
+                or not isinstance(required_actor, str) or not required_actor.strip()
+                or not isinstance(required_action, str) or not required_action.strip()
+            ):
+                raise HostAdapterError("final response declaration is incomplete")
+            provided.add((notification_id.strip(), required_actor.strip(), required_action.strip()))
+        if provided != expected:
+            raise HostAdapterError(
+                "final response must name every active EXTERNALLY_BLOCKED notification ID "
+                "with its exact required actor/action"
+            )
+        state = self._state_or_register()
+        policy = dict(state.get("notification_policy") or {})
+        items_map = dict(policy.get("items") or {})
+        for notification_id, required_actor, required_action in provided:
+            entry = dict(items_map.get(notification_id) or {})
+            entry["final_response_declared"] = True
+            entry["declared_utc"] = self._timestamp()
+            items_map[notification_id] = entry
+        policy["items"] = items_map
+        state["notification_policy"] = policy
+        self._write_state(state)
+        return [
+            {
+                "notification_id": notification_id,
+                "required_actor": required_actor,
+                "required_action": required_action,
+            }
+            for notification_id, required_actor, required_action in sorted(provided)
+        ]
 
     def close_binding(self) -> bool:
         self._binding_closed = True

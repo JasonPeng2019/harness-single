@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Mapping
 
+from .provider import provider_registry
+
 
 PROFILE_SCHEMA = "orchestrator-runtime-profile/v1"
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -123,8 +125,8 @@ class RuntimeProfile:
     def __post_init__(self) -> None:
         if self.schema != PROFILE_SCHEMA:
             raise ProfileError("unsupported profile schema")
-        if self.provider not in {"codex", "claude-code"}:
-            raise ProfileError("profile provider must be codex or claude-code")
+        if self.provider not in provider_registry():
+            raise ProfileError("profile provider is not a registered provider")
         _text(self.profile_id, "profile_id")
         _text(self.role, "role")
         _text(self.model, "model")

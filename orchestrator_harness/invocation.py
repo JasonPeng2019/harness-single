@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .prompt_bundle import PROMPT_BUNDLE_SCHEMA, PromptBundleError, bundle_from_record
+from .provider import provider_adapter, provider_registry
 from .stable_io import canonical_json
 
 
@@ -263,12 +264,13 @@ class CanonicalInvocation:
             "sandbox": options.get("sandbox", "workspace-write"),
             "approval_policy": options.get("approval_policy", "never"),
         }
-        if self.provider_id == "codex":
-            workspace = self.run_root.expanduser().resolve(strict=False) / ".agent-workspace"
-            last_message = self.output_paths["last_message"]
-            effective_path = last_message if last_message.is_absolute() else workspace / last_message
+        adapter = provider_adapter(self.provider_id)
+        last_message = adapter.last_message_path(
+            self.run_root, self.output_paths["last_message"]
+        )
+        if last_message is not None:
             record["last_message_path"] = os.path.normcase(
-                str(effective_path.expanduser().resolve(strict=False))
+                str(last_message.expanduser().resolve(strict=False))
             )
         return record
 
@@ -352,12 +354,15 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
             "config_overrides",
             "sandbox",
             "approval_policy",
+            "notification",
         },
         "provider",
     )
     provider_id = _text(provider.get("id"), "provider.id")
-    if provider_id not in {"codex", "claude-code"}:
-        raise InvocationValidationError("provider.id must be codex or claude-code")
+    if provider_id not in provider_registry():
+        raise InvocationValidationError(
+            f"provider.id is not a registered provider: {provider_id}"
+        )
     model = _text(provider.get("model"), "provider.model")
     if "command" in provider:
         _strings(provider.get("command"), "provider.command")
@@ -366,6 +371,8 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
             _strings(provider.get(key), f"provider.{key}")
     if "mcp_config" in provider and not isinstance(provider.get("mcp_config"), (str, dict, list)):
         raise InvocationValidationError("provider.mcp_config must be a path or JSON value")
+    if "notification" in provider and not isinstance(provider.get("notification"), bool):
+        raise InvocationValidationError("provider.notification must be boolean")
     return provider_id, model, _immutable(provider)
 
 

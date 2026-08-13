@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -45,10 +45,20 @@ from .profile import ProfileError, RuntimeProfile, build_child_environment
 from .process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryUnsupported, ProcessSupervisor
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
+    PROVIDER_OPERATION_NAMES,
+    ProviderAdapter,
     ProviderAdapterError,
     ProviderEvent,
+    ProviderEvidence,
+    ProviderHandoff,
     ProviderLaunchSpec,
+    ProviderResumeDecision,
+    build_provider_evidence,
+    classify_operation,
+    decide_resume_or_handoff,
     provider_adapter,
+    structured_handoff,
+    unsupported_operation_result,
 )
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
@@ -1211,6 +1221,52 @@ def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> Pro
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
 
 
+def _requested_provider_operations(
+    invocation: Invocation, spec: ProviderLaunchSpec
+) -> list[str]:
+    """The concrete operations this controller requests from the selected adapter.
+
+    Permission and configuration are requested whenever the controller
+    supplies their launch semantics (sandbox/approval and
+    model/reasoning/tier/configuration), even when optional override lists
+    are empty.  Classification therefore precedes any adapter work.
+    """
+    operations = ["launch", "prompt", "event_result", "session", "permission", "configuration"]
+    if invocation.action == "resume":
+        operations.append("resume")
+    if spec.provider_options.get("notification") is True:
+        operations.append("notification")
+    return operations
+
+
+def _classify_provider_operations(
+    provider_id: str, operations: list[str]
+) -> list[dict[str, Any]]:
+    """Classify every requested operation before any provider work is fabricated."""
+    results: list[dict[str, Any]] = []
+    for operation in operations:
+        if operation not in PROVIDER_OPERATION_NAMES:
+            results.append(
+                unsupported_operation_result(
+                    provider_id, operation, "operation is not part of the provider contract"
+                ).as_record()
+            )
+            continue
+        results.append(classify_operation(provider_id, operation).as_record())
+    return results
+
+
+def _provider_handoff_identity(invocation: Invocation) -> tuple[str, str]:
+    """The preserved workflow role and logical task identity for a handoff."""
+    role = invocation.doer or (invocation.canonical.role if invocation.canonical is not None else None) or "coder-main"
+    logical_task_id = (
+        invocation.canonical.task_card_id
+        if invocation.canonical is not None and invocation.canonical.task_card_id
+        else invocation.lane_id
+    )
+    return role, logical_task_id
+
+
 def _canonical_resume_admission_path(invocation: Invocation) -> Path:
     """Return the one confined ROOT review path for a canonical continuation."""
     assert invocation.canonical is not None
@@ -1325,101 +1381,194 @@ def run(invocation: Invocation) -> int:
         except GitSafetyError as exc:
             raise InvocationError(str(exc)) from exc
     resume_admission_record: dict[str, Any] | None = None
+    provider_resume_handoff: ProviderHandoff | None = None
+    provider_resume_decision: ProviderResumeDecision | None = None
+
+    def _resume_handoff(
+        reason: str,
+        *,
+        requested_session_id: str | None,
+        persisted_session_id: str | None,
+        identity_mismatch: bool = False,
+    ) -> ProviderHandoff:
+        """REQ-O35: one declared same-role handoff with no fabricated continuity."""
+        role, logical_task_id = _provider_handoff_identity(invocation)
+        decision = decide_resume_or_handoff(
+            invocation.provider_id,
+            role=role,
+            logical_task_id=logical_task_id,
+            worker_invocation_id=invocation.worker_invocation_id,
+            requested_session_id=requested_session_id,
+            persisted_session_id=persisted_session_id,
+            identity_mismatch=identity_mismatch,
+        )
+        handoff = decision.handoff
+        if handoff is None:
+            handoff = structured_handoff(
+                role=role,
+                logical_task_id=logical_task_id,
+                worker_invocation_id=invocation.worker_invocation_id,
+                provider_id=invocation.provider_id,
+                prior_session_id=persisted_session_id,
+                requested_session_id=requested_session_id,
+                reason=reason,
+            )
+        elif identity_mismatch:
+            handoff = replace(handoff, reason=reason)
+        return handoff
+
     if invocation.action == "resume":
         if invocation.canonical is not None:
             if prior_status is None:
                 raise InvocationError("canonical resume requires persisted controller status")
+            canonical_resume_mismatch: str | None = None
             if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
-                raise InvocationError("resume worker_invocation_id does not match persisted status")
-            if prior_status.get("invocation_schema") != invocation.invocation_schema:
-                raise InvocationError("resume invocation schema does not match persisted status")
+                canonical_resume_mismatch = "resume worker_invocation_id does not match persisted status"
+            elif prior_status.get("invocation_schema") != invocation.invocation_schema:
+                canonical_resume_mismatch = "resume invocation schema does not match persisted status"
             if prior_thread is None:
                 prior_thread_value = prior_status.get("provider_session_id", prior_status.get("session_id"))
                 prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
             if prior_thread is None:
                 raise InvocationError("canonical resume requires a persisted provider session ID")
-            starting_commit = _persisted_repository(invocation, prior_status) if invocation.repository is not None else None
-            thread = invocation.requested_thread_id or prior_thread
-            if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
-                raise InvocationError("resume requires the persisted provider session ID")
-            requested_identity = invocation.canonical.identity(
+            requested_session_id = (
+                invocation.canonical.requested_session_id
+                if invocation.canonical is not None
+                else None
+            )
+            if canonical_resume_mismatch is None and (
+                requested_session_id is not None
+                and requested_session_id != prior_thread
+            ):
+                canonical_resume_mismatch = (
+                    "resume requested session does not match the persisted provider session"
+                )
+            if canonical_resume_mismatch is None and (
+                invocation.requested_thread_id is not None
+                and invocation.requested_thread_id != prior_thread
+            ):
+                canonical_resume_mismatch = (
+                    "resume requested thread does not match the persisted lane thread"
+                )
+            if canonical_resume_mismatch is not None:
+                thread = invocation.requested_thread_id or prior_thread
+                provider_resume_handoff = _resume_handoff(
+                    canonical_resume_mismatch,
+                    requested_session_id=(
+                        requested_session_id
+                        or invocation.requested_thread_id
+                        or prior_thread
+                    ),
+                    persisted_session_id=prior_thread,
+                    identity_mismatch=True,
+                )
+                provider_resume_decision = ProviderResumeDecision(
+                    "HANDOFF", canonical_resume_mismatch, provider_resume_handoff
+                )
+            else:
+                starting_commit = _persisted_repository(invocation, prior_status) if invocation.repository is not None else None
+                thread = invocation.requested_thread_id or prior_thread
+                if not thread:
+                    raise InvocationError("resume requires the persisted provider session ID")
+                requested_identity = invocation.canonical.identity(
                 session_id=thread,
                 starting_commit=starting_commit,
             )
-            requested_identity["live_identity"] = {
-                "provider_id": invocation.provider_id,
-                "session_id": thread,
-            }
-            persisted_identity = prior_status.get("resume_identity")
-            if not isinstance(persisted_identity, Mapping):
-                raise InvocationError("canonical resume requires persisted resume_identity")
-            raw_identity_fields = frozenset({
-                "task_card_sha256", "prompt_bundle_sha256", "prompt_content_sha256",
-            })
-            raw_identity_changed = any(
-                requested_identity.get(field) != persisted_identity.get(field)
-                for field in raw_identity_fields
-            )
-            if not raw_identity_changed:
-                _canonical_prior_identity_check(
+                requested_identity["live_identity"] = {
+                    "provider_id": invocation.provider_id,
+                    "session_id": thread,
+                }
+                persisted_identity = prior_status.get("resume_identity")
+                if not isinstance(persisted_identity, Mapping):
+                    raise InvocationError("canonical resume requires persisted resume_identity")
+                raw_identity_fields = frozenset({
+                    "task_card_sha256", "prompt_bundle_sha256", "prompt_content_sha256",
+                })
+                raw_identity_changed = any(
+                    requested_identity.get(field) != persisted_identity.get(field)
+                    for field in raw_identity_fields
+                )
+                if not raw_identity_changed:
+                    _canonical_prior_identity_check(
+                        invocation,
+                        prior_status,
+                        prior_status_path=prior_status_path,
+                        thread=thread,
+                        starting_commit=starting_commit,
+                        git_identity=git_identity,
+                    )
+                if _canonical_resume_claims_accepted(invocation, prior_status):
+                    raise InvocationError(
+                        "canonical accepted task cannot be resumed or amended before provider launch"
+                    )
+                amendment_review = _read_canonical_resume_amendment(invocation)
+                live_identity = {
+                    "live_identity": {
+                        "provider_id": invocation.provider_id,
+                        "session_id": thread,
+                    },
+                    "repository": (
+                        repository_status(git_identity, starting_commit=starting_commit)
+                        if git_identity is not None
+                        else requested_identity.get("repository")
+                    ),
+                }
+                try:
+                    admission = require_resume_admission(
+                        requested_identity,
+                        persisted_identity,
+                        live_identity,
+                        amendment_review=amendment_review,
+                        expected_job_identity=_canonical_amendment_job_identity(
+                            invocation, requested_identity, persisted_identity
+                        ),
+                    )
+                except ResumeAdmissionError as exc:
+                    raise InvocationError(str(exc)) from exc
+                _canonical_prior_task_preflight(
                     invocation,
                     prior_status,
                     prior_status_path=prior_status_path,
                     thread=thread,
                     starting_commit=starting_commit,
                     git_identity=git_identity,
+                    allowed_identity_fields=(raw_identity_fields if raw_identity_changed else frozenset()),
                 )
-            if _canonical_resume_claims_accepted(invocation, prior_status):
-                raise InvocationError(
-                    "canonical accepted task cannot be resumed or amended before provider launch"
-                )
-            amendment_review = _read_canonical_resume_amendment(invocation)
-            live_identity = {
-                "live_identity": {
-                    "provider_id": invocation.provider_id,
-                    "session_id": thread,
-                },
-                "repository": (
-                    repository_status(git_identity, starting_commit=starting_commit)
-                    if git_identity is not None
-                    else requested_identity.get("repository")
-                ),
-            }
-            try:
-                admission = require_resume_admission(
-                    requested_identity,
-                    persisted_identity,
-                    live_identity,
-                    amendment_review=amendment_review,
-                    expected_job_identity=_canonical_amendment_job_identity(
-                        invocation, requested_identity, persisted_identity
-                    ),
-                )
-            except ResumeAdmissionError as exc:
-                raise InvocationError(str(exc)) from exc
-            _canonical_prior_task_preflight(
-                invocation,
-                prior_status,
-                prior_status_path=prior_status_path,
-                thread=thread,
-                starting_commit=starting_commit,
-                git_identity=git_identity,
-                allowed_identity_fields=(raw_identity_fields if raw_identity_changed else frozenset()),
-            )
-            resume_admission_record = admission.to_record()
+                resume_admission_record = admission.to_record()
         elif invocation.worker_invocation_id is not None:
             if prior_status is None:
                 raise InvocationError("coding resume requires persisted controller status")
+            coding_resume_mismatch: str | None = None
             if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
-                raise InvocationError("resume worker_invocation_id does not match persisted status")
-            if prior_status.get("invocation_schema") != invocation.invocation_schema:
-                raise InvocationError("resume invocation schema does not match persisted status")
-            if prior_thread is None:
+                coding_resume_mismatch = "resume worker_invocation_id does not match persisted status"
+            elif prior_status.get("invocation_schema") != invocation.invocation_schema:
+                coding_resume_mismatch = "resume invocation schema does not match persisted status"
+            elif prior_thread is None:
                 raise InvocationError("coding resume requires a persisted lane thread ID")
-            starting_commit = _persisted_repository(invocation, prior_status)
-            thread = invocation.requested_thread_id or prior_thread
-            if not thread or (prior_thread and invocation.requested_thread_id and prior_thread != invocation.requested_thread_id):
-                raise InvocationError("resume requires the persisted lane thread ID")
+            else:
+                try:
+                    starting_commit = _persisted_repository(invocation, prior_status)
+                except InvocationError as exc:
+                    coding_resume_mismatch = str(exc)
+            if coding_resume_mismatch is None:
+                thread = invocation.requested_thread_id or prior_thread
+                if not thread or (
+                    prior_thread
+                    and invocation.requested_thread_id
+                    and prior_thread != invocation.requested_thread_id
+                ):
+                    coding_resume_mismatch = "resume requires the persisted lane thread ID"
+            if coding_resume_mismatch is not None:
+                thread = invocation.requested_thread_id or prior_thread
+                provider_resume_handoff = _resume_handoff(
+                    coding_resume_mismatch,
+                    requested_session_id=thread,
+                    persisted_session_id=prior_thread,
+                    identity_mismatch=True,
+                )
+                provider_resume_decision = ProviderResumeDecision(
+                    "HANDOFF", coding_resume_mismatch, provider_resume_handoff
+                )
         else:
             thread = invocation.requested_thread_id or prior_thread
             if not thread:
@@ -1437,6 +1586,30 @@ def run(invocation: Invocation) -> int:
                 starting_commit=starting_commit,
                 git_identity=git_identity,
             )
+    if (
+        invocation.action == "resume"
+        and provider_resume_handoff is None
+        and thread is not None
+    ):
+        # REQ-O35: run the real adapter resume decision before any adapter
+        # construction.  An adapter that does not declare resume (or is not
+        # registered) preserves the logical task, workflow role, and state in
+        # a declared same-role handoff with fabricated_continuity=false and
+        # zero adapter construction or launch.  Identity mismatches were
+        # already decided above; this path covers the exact persisted identity
+        # with an unsupported resume capability.
+        role, logical_task_id = _provider_handoff_identity(invocation)
+        resume_decision = decide_resume_or_handoff(
+            invocation.provider_id,
+            role=role,
+            logical_task_id=logical_task_id,
+            worker_invocation_id=invocation.worker_invocation_id,
+            requested_session_id=thread,
+            persisted_session_id=prior_thread,
+        )
+        if resume_decision.mode == "HANDOFF":
+            provider_resume_handoff = resume_decision.handoff
+            provider_resume_decision = resume_decision
     if invocation.repository is not None:
         try:
             conflicts = active_declaration_conflicts(
@@ -1454,11 +1627,48 @@ def run(invocation: Invocation) -> int:
         if git_identity is None or launch_identity.head_commit != git_identity.head_commit:
             raise InvocationError("coding worktree HEAD changed during pre-launch validation")
     controller = _identity(os.getpid())
-    try:
-        adapter = provider_adapter(invocation.provider_id)
-        argv = adapter.build_argv(_provider_launch_spec(invocation, thread))
-    except ProviderAdapterError as exc:
-        raise InvocationError(str(exc)) from exc
+    if provider_resume_handoff is not None:
+        # A declared handoff never fabricates provider work: no adapter
+        # selection, no argv construction, no launch.
+        adapter = None
+        launch_spec = None
+        argv = None
+        provider_operation_results: list[dict[str, Any]] = []
+        unsupported_operations: list[dict[str, Any]] = []
+        provider_evidence = None
+    else:
+        # REQ-O33: construct only the provider-neutral launch specification
+        # before enforcement.  Every requested operation is classified before
+        # adapter selection, adapter.build_argv, or any other provider work.
+        launch_spec = _provider_launch_spec(invocation, thread)
+        requested_operations = _requested_provider_operations(invocation, launch_spec)
+        provider_operation_results = _classify_provider_operations(
+            invocation.provider_id, requested_operations
+        )
+        unsupported_operations = [
+            result for result in provider_operation_results if not result.get("supported")
+        ]
+        if unsupported_operations:
+            # An unsupported requested operation returns a closed actionable
+            # result with zero adapter construction and zero provider launch.
+            adapter = None
+            argv = None
+            provider_evidence = None
+        else:
+            try:
+                adapter = provider_adapter(invocation.provider_id)
+                argv = adapter.build_argv(launch_spec)
+            except ProviderAdapterError as exc:
+                raise InvocationError(str(exc)) from exc
+            provider_evidence = build_provider_evidence(
+                invocation.provider_id,
+                spec=launch_spec,
+                argv=argv,
+                worker_invocation_id=(
+                    invocation.worker_invocation_id or invocation.label or "unidentified-worker"
+                ),
+                session_id=thread,
+            )
     if invocation.canonical is not None:
         try:
             invocation.workspace.mkdir(exist_ok=True)
@@ -1516,14 +1726,26 @@ def run(invocation: Invocation) -> int:
         "policy_sha256": invocation.policy_sha256,
         "resume_identity": invocation.canonical.identity(session_id=thread, starting_commit=starting_commit) if invocation.canonical is not None else None,
         "resume_admission": resume_admission_record,
+        "provider_evidence": (
+            provider_evidence.as_record() if provider_evidence is not None else None
+        ),
+        "provider_operation_results": provider_operation_results,
+        "provider_handoff": (
+            provider_resume_handoff.as_record() if provider_resume_handoff is not None else None
+        ),
+        "provider_resume_decision": (
+            provider_resume_decision.as_record() if provider_resume_decision is not None else None
+        ),
         "terminal_acceptance_state": "PENDING" if invocation.canonical is not None else None,
         "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
         "launcher_settings": {"model": invocation.model, "model_reasoning_effort": invocation.reasoning_effort,
             "service_tier": invocation.service_tier, "sandbox": invocation.sandbox,
             "approval_policy": invocation.approval_policy,
             "approvals_reviewer": "user" if invocation.worker_invocation_id is None else None,
-            "config_overrides": invocation.config_overrides,
-            "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": argv[:-1]},
+            "configuration_digest": (
+                provider_evidence.configuration_digest if provider_evidence is not None else None
+            ),
+            "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": list(provider_evidence.command_provenance) if provider_evidence is not None else []},
     }
     registry_generation = uuid.uuid4().hex
     state["lifecycle_registry_generation"] = registry_generation
@@ -1623,12 +1845,51 @@ def run(invocation: Invocation) -> int:
                 target_revision=state.get("lifecycle_target_revision"),
             )
 
+    if provider_resume_handoff is not None:
+        # REQ-O35: an unsupported or identity-mismatched resume preserves the
+        # logical task, workflow role, and state in a declared same-role
+        # structured handoff with fabricated_continuity=false.  No provider is
+        # launched and no successor is scheduled by this controller.
+        state.update({
+            "state": "PROVIDER_HANDOFF",
+            "ended_utc": _utc(),
+            "error": provider_resume_handoff.reason,
+        })
+        _atomic_json(invocation.status_path, state)
+        _append_event(invocation.event_log, _event(
+            invocation,
+            "PROVIDER_HANDOFF",
+            provider_id=invocation.provider_id,
+            reason=provider_resume_handoff.reason,
+            thread_id=state.get("thread_id"),
+            session_id=state.get("provider_session_id"),
+        ))
+        return 1
+    if unsupported_operations:
+        # REQ-O33: an unsupported requested operation returns an actionable
+        # classified result before any provider work is fabricated.
+        state.update({
+            "state": "PROVIDER_OPERATION_UNSUPPORTED",
+            "ended_utc": _utc(),
+            "error": "selected provider adapter does not support a requested operation",
+        })
+        _atomic_json(invocation.status_path, state)
+        _append_event(invocation.event_log, _event(
+            invocation,
+            "LAUNCH_FAILED",
+            provider_id=invocation.provider_id,
+            error="unsupported provider operation",
+        ))
+        return 1
+    assert adapter is not None and argv is not None
+
     if invocation.repository is not None:
         # Admission must precede both initial and resumed status publication.
         # This makes the fixed owner the first durable lifecycle authority and
         # prevents a resumed status from advertising a fresh generation.
         _publish_registry()
         _atomic_json(invocation.status_path, state)
+    assert adapter is not None and argv is not None
     lock = threading.Lock()
     process: subprocess.Popen[bytes] | None = None
     child: ProcessInfo | None = None
@@ -2043,6 +2304,11 @@ def run(invocation: Invocation) -> int:
                                         state["provider_session_id"] = event.session_id
                                         state["session_id"] = event.session_id
                                         state["thread_id"] = event.session_id
+                                        evidence = state.get("provider_evidence")
+                                        if isinstance(evidence, Mapping):
+                                            evidence = dict(evidence)
+                                            evidence["session_id"] = event.session_id
+                                            state["provider_evidence"] = evidence
                                         if invocation.canonical is not None:
                                             resume_identity = dict(state.get("resume_identity") or {})
                                             resume_identity["session_id"] = event.session_id
@@ -2303,7 +2569,7 @@ def run(invocation: Invocation) -> int:
                 _atomic_json(invocation.status_path, state)
             except OSError:
                 pass
-        if invocation.repository is not None:
+        if invocation.repository is not None and provider_resume_handoff is None and not unsupported_operations:
             try:
                 _publish_registry()
             except Exception as exc:

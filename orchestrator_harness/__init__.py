@@ -3,7 +3,31 @@
 from .models import ProcessInfo, ProcessSnapshot
 from .invocation import CANONICAL_INVOCATION_SCHEMA, CanonicalInvocation
 from .prompt_bundle import PromptBundle, PromptComponent
-from .provider import ClaudeCodeProviderAdapter, CodexProviderAdapter
+from .provider import (
+    ClaudeCodeProviderAdapter,
+    CodexProviderAdapter,
+    ProviderAdapterRegistration,
+    ProviderCapabilities,
+    ProviderEvidence,
+    ProviderHandoff,
+    ProviderOperationResult,
+    ProviderResumeDecision,
+    build_provider_evidence,
+    classify_operation,
+    decide_resume_or_handoff,
+    provider_registry,
+    redact_command,
+    register_provider_adapter,
+    structured_handoff,
+    unregister_provider_adapter,
+)
+from .provider import (
+    NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY,
+    NOTIFICATION_MODE_WAKE,
+    NOTIFICATION_WAKE_TEXT,
+    WAKE_TEXT,
+    notification_mode,
+)
 from .profile import RuntimeProfile
 from .resume import ResumeAdmission
 from .host_adapters import (
@@ -46,6 +70,25 @@ __all__ = [
     "CanonicalInvocation",
     "ClaudeCodeProviderAdapter",
     "CodexProviderAdapter",
+    "NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY",
+    "NOTIFICATION_MODE_WAKE",
+    "NOTIFICATION_WAKE_TEXT",
+    "ProviderAdapterRegistration",
+    "ProviderCapabilities",
+    "ProviderEvidence",
+    "ProviderHandoff",
+    "ProviderOperationResult",
+    "ProviderResumeDecision",
+    "WAKE_TEXT",
+    "build_provider_evidence",
+    "notification_mode",
+    "classify_operation",
+    "decide_resume_or_handoff",
+    "provider_registry",
+    "redact_command",
+    "register_provider_adapter",
+    "structured_handoff",
+    "unregister_provider_adapter",
     "ProcessInfo",
     "ProcessSnapshot",
     "PromptBundle",

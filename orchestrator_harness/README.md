@@ -53,6 +53,117 @@ Delivery notices contain binding identity, queue revision, pending count,
 highest class/severity, timestamp, and adapter profile only. Delivery receipts
 are transport evidence and never acknowledge pending events.
 
+## Registered provider adapters
+
+Provider semantics live inside one small versioned adapter contract
+(`orchestrator-provider-adapter/v1`).  The generic core selects a registered
+adapter and never hard-codes a provider.  Codex and Claude Code are
+maintained built-ins; a separately registered external CLI adapter becomes
+selectable without edits to generic dispatch, workflow, task, event,
+supervisor, or cleanup code.
+
+A minimal adapter implements the required methods: `build_argv(spec)`,
+`encode_prompt(prompt)`, `parse_transcript_line(line)`,
+`terminal_outcome(event, exit_code)`, and `redact_argv(argv)` ? the
+adapter-owned complete redacted command provenance.  The generic core never
+guesses provider credential spellings; the one adapter-produced value is used
+identically for `ProviderEvidence.command_provenance` and
+`launcher_settings.argv`.  Inheriting the `BaseProviderAdapter` generic
+fallback is rejected at registration: the adapter must implement
+`redact_argv` explicitly, and a generic-safe adapter may explicitly delegate
+to `redact_command`.  A `notification=True` adapter must additionally
+implement `deliver_notification(coordinator, notice, *, boundary)`: one real
+safe-boundary delivery binding through the per-binding `DeliveryCoordinator`.
+
+Registration is process-local: it must happen in the same interpreter that
+parses and launches the invocation, before `controller.main(...)` runs.  A
+fresh interpreter contains only the built-ins.  The supported operator shape
+is a small wrapper that registers the adapter, then invokes the native
+controller:
+
+```python
+# my_cli_bootstrap.py -- run: python my_cli_bootstrap.py start.invocation.json
+import sys
+from orchestrator_harness.lane_controller import main
+from orchestrator_harness.provider import (
+    BaseProviderAdapter, ProviderCapabilities, ProviderEvent,
+    ProviderLaunchSpec, register_provider_adapter,
+)
+
+class MyCliProviderAdapter(BaseProviderAdapter):
+    provider_id = "my-cli"
+    def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
+        return [*spec.command, "--run", "--model", spec.model]
+    def encode_prompt(self, prompt: bytes) -> bytes:
+        return prompt
+    def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
+        return None
+    def terminal_outcome(self, event, exit_code) -> str:
+        return "COMPLETED" if exit_code == 0 else "FAILED"
+    def redact_argv(self, argv):
+        # Own every credential spelling; the generic core never guesses.
+        redacted, redact_next = [], False
+        for token in argv:
+            if redact_next:
+                redacted.append("<redacted>"); redact_next = False
+            elif token == "--auth":
+                redacted.append("<redacted>"); redact_next = True
+            else:
+                redacted.append(token)
+        if redact_next:
+            redacted.append("<redacted>")
+        return tuple(redacted)
+
+register_provider_adapter(
+    "my-cli",
+    MyCliProviderAdapter(),
+    version="my-cli-v1",
+    capabilities=ProviderCapabilities(
+        launch=True, prompt=True, event_result=True, session=True,
+        resume=True, permission=True, configuration=True, notification=False,
+    ),
+)
+sys.exit(main([sys.argv[1]]))
+```
+
+The canonical invocation selects the adapter with `provider.id = "my-cli"`
+and the matching `profile.provider = "my-cli"`; invocation validation admits
+only registered provider IDs.  `provider_registry()` returns the immutable
+registered set; `provider_adapter` selects one adapter; `classify_operation`
+returns an actionable classified result for unsupported operations.  Command
+construction, prompt transport, result/session parsing, permission mapping,
+and redacted provenance live in the selected adapter.  Same-role resume is
+optional: unsupported or identity-mismatched resume preserves the logical
+task state and starts a declared same-role structured handoff without
+fabricated continuity (`decide_resume_or_handoff`).  Evidence binds adapter
+identity/version, capabilities, the selected configuration digest,
+attempt/session identity, and the adapter-owned redacted command provenance
+(`build_provider_evidence`).
+
+## Deferred notification
+
+Notification is an adapter-owned operation.  `notification_mode(provider_id)`
+returns the selected adapter's executable mode: `WAKE` with the exact
+content-free, non-preemptive wake text, or an honest `SAFE_BOUNDARY_ONLY`
+when immediate wake is unavailable.  A `notification=True` adapter must also
+implement `deliver_notification(coordinator, notice, *, boundary)`: the one
+real safe-boundary delivery binding that emits the exact wake through the
+per-binding `DeliveryCoordinator`.  The installed Codex hook route consumes
+that same seam; adapters without the binding stay `SAFE_BOUNDARY_ONLY` and
+perform no immediate wake.  The one durable per-binding active-queue
+authority is the S3 `notifications.ManagerEventRouter`; `host_adapters.DeliveryCoordinator`
+admits typed notification items through that router and keeps only the
+OPEN/EXTERNALLY_BLOCKED decoration (with the exact required external
+actor/action) in its own per-binding state.  The wake never contains
+notification payload and never stops, redirects, or preempts the active
+directive.  At the safe boundary, acknowledgement atomically records success
+and mechanically removes each addressed item from the router queue; transport
+receipts never acknowledge queue work and `CLOSED` is never retained as an
+active state.  The installed Codex hook routes (`run_installed_codex_hook`)
+enforce the stop matrix: any `OPEN` item rejects stop without payload
+disclosure, an empty active queue permits stop, and all-`EXTERNALLY_BLOCKED`
+items permit stop only after the final response names every notification ID
+and its exact required external actor/action, while those items remain active.
 ## Public launch and check selection
 
 `orchestrator_harness.public_launch.launch_lane_controller` is a thin public composition of

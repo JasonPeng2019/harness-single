@@ -923,7 +923,18 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             wrong["resume"] = {"session_id": "wrong-session"}
             wrong_path = root / "run" / ".agent-workspace" / "wrong.invocation.json"
             wrong_path.write_text(json.dumps(wrong), encoding="utf-8")
-            self.assertEqual(2, controller.main([str(wrong_path)]))
+            # REQ-O35: identity-mismatched resume emits a declared same-role
+            # structured handoff with fabricated_continuity=false instead of
+            # silently rejecting and losing the logical task.
+            self.assertEqual(1, controller.main([str(wrong_path)]))
+            wrong_status = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual("PROVIDER_HANDOFF", wrong_status["state"])
+            handoff = wrong_status["provider_handoff"]
+            self.assertIsNotNone(handoff)
+            self.assertFalse(handoff["fabricated_continuity"])
+            self.assertEqual("session-1", handoff["prior_session_id"])
+            self.assertEqual("wrong-session", handoff["requested_session_id"])
+            self.assertIn("session", handoff["reason"])
 
             failure_root = root / "failure"
             failure_raw, _ = self._canonical(failure_root)
