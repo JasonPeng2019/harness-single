@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,11 +26,13 @@ from orchestrator_harness.cli import watch_once
 from orchestrator_harness.config import load_config
 from orchestrator_harness.lane_controller import load_invocation
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
-from orchestrator_harness.models import iso_utc
-from orchestrator_harness.processes import process_snapshot, targeted_process_query
+from orchestrator_harness.models import ProcessQuery, iso_utc
+from orchestrator_harness.processes import (
+    WINDOWS_CREATE_NO_WINDOW,
+    targeted_process_query,
+)
 from orchestrator_harness.public_launch import launch_lane_controller
 from orchestrator_harness.tests.wsl_identity import validate_cross_os_identity_relation
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SUPPORT = Path(__file__).resolve().parent / "support"
@@ -37,9 +40,12 @@ DEFAULT_DISTRO = "Ubuntu"
 DEFAULT_CODEX_ROOT = "/opt/orchestrator-harness-codex"
 LANE_ID = "real-agent"
 WORKER_ID = "real-agent-001"
+DEFAULT_EVIDENCE_DIRECTORY = "orchestrator-harness-real-agent-evidence"
 if str(SUPPORT) not in sys.path:
     sys.path.insert(0, str(SUPPORT))
-from wsl_real_agent_driver import validate_prepared_state  # type: ignore[import-not-found]
+from wsl_real_agent_driver import (
+    validate_prepared_state,  # type: ignore[import-not-found]
+)
 
 
 def wsl_path(_distro: str, path: Path) -> str:
@@ -61,9 +67,10 @@ def _json(path: Path, value: object) -> None:
 
 def _run(cwd: Path, *argv: str) -> str:
     result = subprocess.run(
-        list(argv), cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        list(argv), cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
         check=False, timeout=30, shell=False,
+        creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     if result.returncode != 0:
         raise RuntimeError(f"Git command failed: {argv[0]} {argv[1:]}")
@@ -78,7 +85,242 @@ def _read_object(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _wait_json(path: Path, predicate: Any, *, timeout: float, process: subprocess.Popen[str] | None = None) -> dict[str, Any]:
+def _resolve_evidence_root(
+    value: str | Path | None, *, repository_root: Path = REPOSITORY_ROOT,
+) -> Path:
+    """Resolve one writable evidence root that cannot be inside source."""
+
+    candidate = (
+        Path(value).expanduser()
+        if value is not None
+        else Path(tempfile.gettempdir()) / DEFAULT_EVIDENCE_DIRECTORY
+    )
+    resolved = candidate.resolve(strict=False)
+    source = repository_root.resolve(strict=True)
+    try:
+        resolved.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("real-agent evidence root must be outside the source checkout")
+    if resolved.exists() and not resolved.is_dir():
+        raise RuntimeError("real-agent evidence root must be a directory")
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _validate_controller_receipt_identity(
+    receipt: dict[str, Any], status: dict[str, Any],
+) -> tuple[int, str]:
+    """Require the public receipt and controller status to name one process."""
+
+    receipt_pid = receipt.get("pid")
+    receipt_created = receipt.get("created_utc")
+    if not isinstance(receipt_pid, int) or not isinstance(receipt_created, str):
+        raise TypeError("Windows controller receipt lacks exact identity")
+    if status.get("controller_pid") != receipt_pid:
+        raise RuntimeError("controller status PID does not match the public receipt")
+    if status.get("controller_created_utc") != receipt_created:
+        raise RuntimeError("controller status creation identity does not match the public receipt")
+    return receipt_pid, receipt_created
+
+
+def _provider_identity_from_query(
+    query: ProcessQuery, *, provider_pid: int, provider_created: str,
+    controller_pid: int, nonce: str, invocation_id: str,
+) -> dict[str, Any]:
+    """Fail closed unless one targeted query proves the exact direct child."""
+
+    if not query.complete:
+        raise RuntimeError("Windows provider identity query is incomplete")
+    if query.errors:
+        raise RuntimeError("Windows provider identity query returned errors")
+    process = query.process
+    if process is None:
+        raise RuntimeError("Windows provider identity query found no process")
+    if process.pid != provider_pid:
+        raise RuntimeError("Windows provider identity query returned the wrong PID")
+    if process.created_utc is None or iso_utc(process.created_utc) != provider_created:
+        raise RuntimeError("Windows wsl.exe provider creation identity changed")
+    if process.ppid != controller_pid:
+        raise RuntimeError("Windows provider shim is not a direct controller child")
+    command_line = process.command_line.lower()
+    if "wsl.exe" not in command_line and "wslhost" not in command_line:
+        raise RuntimeError("provider identity is not the controller-owned wsl.exe child")
+    return {
+        "platform": "windows", "pid": provider_pid,
+        "created_utc": provider_created, "nonce": nonce,
+        "invocation_id": invocation_id, "parent_pid": process.ppid,
+    }
+
+
+def _artifact_fact(path: Path) -> dict[str, Any]:
+    """Describe a disposable artifact without retaining its content or path."""
+
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return {"present": False, "byte_count": 0, "sha256": None}
+    return {
+        "present": True, "byte_count": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _safe_controller_summary(status: dict[str, Any] | None) -> dict[str, Any]:
+    if status is None:
+        return {"available": False}
+    validation = status.get("result_validation")
+    boundary = status.get("process_boundary")
+    return {
+        "available": True,
+        "state": status.get("state"),
+        "exit_code": status.get("exit_code"),
+        "result_valid": status.get("result_valid"),
+        "result_validation_state": validation.get("state") if isinstance(validation, dict) else None,
+        "helpers_complete": status.get("helpers_complete"),
+        "direct_child_reaped": status.get("direct_child_reaped"),
+        "resource_claim_release_safe": status.get("resource_claim_release_safe"),
+        "held_resource_claim_count": len(status["held_resource_claims"])
+        if isinstance(status.get("held_resource_claims"), list) else None,
+        "process_boundary_complete": boundary.get("complete")
+        if isinstance(boundary, dict) else None,
+        "process_boundary_live_member_count": len(boundary["live_members"])
+        if isinstance(boundary, dict) and isinstance(boundary.get("live_members"), list)
+        else None,
+    }
+
+
+def _safe_bridge_summary(bridge: dict[str, Any] | None) -> dict[str, Any]:
+    if bridge is None:
+        return {"available": False}
+    sandbox = bridge.get("sandbox")
+    return {
+        "available": True,
+        "status": bridge.get("status"),
+        "cleanup_complete": bridge.get("cleanup_complete"),
+        "mnt_c_exposed": sandbox.get("mnt_c_exposed") if isinstance(sandbox, dict) else None,
+        "usb_exposed": sandbox.get("usb_exposed") if isinstance(sandbox, dict) else None,
+    }
+
+
+def _safe_prepared_summary(prepared: dict[str, Any] | None) -> dict[str, Any]:
+    if prepared is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "status": prepared.get("status"),
+        "cleanup_complete": prepared.get("cleanup_complete"),
+        "credentials_in_state": prepared.get("credentials_in_state"),
+    }
+
+
+def _safe_failure_record(
+    temp_root: Path, failure: BaseException,
+) -> dict[str, Any]:
+    workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+    return {
+        "status": "FAIL",
+        "completed_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "failure_type": type(failure).__name__,
+        "controller_summary": _safe_controller_summary(
+            _read_object(workspace / "real_agent_controller.status.json")
+        ),
+        "bridge_summary": _safe_bridge_summary(_read_object(temp_root / "bridge-evidence.json")),
+        "prepared_summary": _safe_prepared_summary(_read_object(temp_root / "prepared-state.json")),
+        "source_artifact_facts": {
+            "controller_status": _artifact_fact(workspace / "real_agent_controller.status.json"),
+            "operator_receipt": _artifact_fact(workspace / "real_agent_operator.receipt.json"),
+            "controller_result": _artifact_fact(workspace / "RESULT.json"),
+            "provider_event_stream": _artifact_fact(workspace / "real_agent_codex.jsonl"),
+            "provider_standard_error": _artifact_fact(workspace / "real_agent_codex.stderr.log"),
+            "provider_last_message": _artifact_fact(workspace / "real_agent_last_message.txt"),
+        },
+        "retained_file_count": 1,
+        "credentials_persisted": False,
+        "transcript_persisted": False,
+    }
+
+
+def _write_safe_failure_result(
+    evidence: Path,
+    temp_root: Path,
+    failure: BaseException,
+    *,
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist one allowlisted failure record and no other evidence files."""
+
+    result = record or _safe_failure_record(temp_root, failure)
+    result_path = evidence / "REAL_AGENT_TEST_RESULT.json"
+    for retained in evidence.iterdir():
+        if retained == result_path:
+            continue
+        if retained.is_symlink() or retained.is_file():
+            retained.unlink()
+        elif retained.is_dir():
+            shutil.rmtree(retained)
+        else:
+            raise RuntimeError(f"unsupported retained evidence entry: {retained.name}")
+    _json(result_path, result)
+    return result
+
+
+def _remove_disposable_temp_root(
+    temp_root: Path, *, timeout_seconds: float = 15.0,
+) -> None:
+    """Remove the exact mkdtemp root or fail the live oracle."""
+
+    expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    resolved = temp_root.resolve(strict=False)
+    if (
+        resolved.parent != expected_parent
+        or not resolved.name.startswith("orchestrator-s6-real-agent-")
+    ):
+        raise RuntimeError(f"refusing unexpected real-agent temp root: {resolved}")
+    deadline = time.monotonic() + timeout_seconds
+    last_error: OSError | None = None
+
+    def clear_readonly_and_retry(
+        function: Any, path: str, failure: BaseException,
+    ) -> None:
+        candidate = Path(path).resolve(strict=False)
+        try:
+            candidate.relative_to(resolved)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"refusing cleanup outside the real-agent temp root: {candidate}"
+            ) from exc
+        if not isinstance(failure, PermissionError):
+            raise failure
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+
+    def clear_readonly_legacy(
+        function: Any, path: str, failure_info: Any,
+    ) -> None:
+        clear_readonly_and_retry(function, path, failure_info[1])
+
+    while resolved.exists():
+        try:
+            remove_tree: Any = shutil.rmtree
+            if sys.version_info >= (3, 12):
+                remove_tree(resolved, onexc=clear_readonly_and_retry)
+            else:
+                remove_tree(resolved, onerror=clear_readonly_legacy)
+        except OSError as exc:
+            last_error = exc
+        if not resolved.exists():
+            return
+        if time.monotonic() >= deadline:
+            detail = f": {last_error}" if last_error is not None else ""
+            raise RuntimeError(
+                f"real-agent host temp cleanup did not complete{detail}"
+            ) from last_error
+        time.sleep(0.1)
+
+
+def _wait_json(path: Path, predicate: Any, *, timeout: float, process: subprocess.Popen[bytes] | None = None) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = _read_object(path)
@@ -211,6 +453,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the Windows public route with one isolated Ubuntu provider")
     parser.add_argument("--distro", default=os.environ.get("ORCH_HARNESS_WSL_DISTRO", DEFAULT_DISTRO))
     parser.add_argument("--codex-root", default=os.environ.get("ORCH_HARNESS_WSL_CODEX_ROOT", DEFAULT_CODEX_ROOT))
+    parser.add_argument("--evidence-root", default=os.environ.get("ORCH_HARNESS_REAL_AGENT_EVIDENCE_ROOT"))
     parser.add_argument("--model", default="gpt-5.6-terra")
     args = parser.parse_args()
     if os.name != "nt":
@@ -224,15 +467,19 @@ def main() -> int:
         raise RuntimeError("Codex authentication file is unavailable")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    evidence = (REPOSITORY_ROOT / ".real-agent" / stamp).resolve()
+    evidence_root = _resolve_evidence_root(args.evidence_root)
+    evidence = (evidence_root / stamp).resolve()
     evidence.mkdir(parents=True, exist_ok=False)
+    print(f"REAL_AGENT_EVIDENCE={evidence}", flush=True)
     run_id = uuid.uuid4().hex
     nonce = uuid.uuid4().hex + uuid.uuid4().hex
     temp_name = tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-")
     temp_root = Path(temp_name).resolve()
-    prep_process: subprocess.Popen[str] | None = None
+    prep_process: subprocess.Popen[bytes] | None = None
     result: dict[str, Any] | None = None
     failure: BaseException | None = None
+    status: dict[str, Any] | None = None
+    release_signal: Path | None = None
     try:
         repo, base_commit, common_dir = _make_repository(temp_root)
         runtime = temp_root / "runtime"
@@ -264,6 +511,7 @@ def main() -> int:
         prep_process = subprocess.Popen(
             prep_command, cwd=str(REPOSITORY_ROOT), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False,
+            creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
         prepared = _wait_json(state_path, lambda value: value.get("status") == "READY", timeout=90, process=prep_process)
         validate_prepared_state(prepared, nonce=nonce, invocation_id=WORKER_ID)
@@ -288,7 +536,7 @@ def main() -> int:
         controller_pid = receipt.get("pid")
         controller_created = receipt.get("created_utc")
         if not isinstance(controller_pid, int) or not isinstance(controller_created, str):
-            raise RuntimeError("Windows controller receipt lacks exact identity")
+            raise TypeError("Windows controller receipt lacks exact identity")
         provider_observed = False
         provider_identity: dict[str, Any] | None = None
         event_types: list[str] = []
@@ -304,32 +552,29 @@ def main() -> int:
         })
         config = load_config(config_path)
         deadline = time.monotonic() + 900
-        status: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             candidate = _read_object(status_path)
             if candidate is not None:
                 status = candidate
+                _validate_controller_receipt_identity(receipt, status)
                 provider_pid = candidate.get("provider_pid")
                 provider_created = candidate.get("provider_created_utc")
                 if isinstance(provider_pid, int) and isinstance(provider_created, str) and not provider_observed:
                     query = targeted_process_query(provider_pid, expected_parent_pid=controller_pid)
-                    if query.process is not None and query.process.created_utc is not None:
-                        observed_created = iso_utc(query.process.created_utc)
-                        if observed_created != provider_created:
-                            raise RuntimeError("Windows wsl.exe provider creation identity changed")
-                        command_line = query.process.command_line.lower()
-                        if "wsl.exe" not in command_line and "wslhost" not in command_line:
-                            raise RuntimeError("provider identity is not the controller-owned wsl.exe child")
-                        provider_identity = {
-                            "platform": "windows", "pid": provider_pid,
-                            "created_utc": provider_created, "nonce": nonce,
-                            "invocation_id": WORKER_ID, "parent_pid": controller_pid,
-                        }
-                        provider_observed = True
+                    provider_identity = _provider_identity_from_query(
+                        query, provider_pid=provider_pid, provider_created=provider_created,
+                        controller_pid=controller_pid, nonce=nonce, invocation_id=WORKER_ID,
+                    )
+                    provider_observed = True
             try:
                 _, observed_events = watch_once(config, no_write=False)
-                event_types.extend(item.get("type") for item in observed_events if isinstance(item, dict) and isinstance(item.get("type"), str))
-            except Exception as watcher_error:
+                for item in observed_events:
+                    if not isinstance(item, dict):
+                        continue
+                    event_type = item.get("type")
+                    if isinstance(event_type, str):
+                        event_types.append(event_type)
+            except Exception as watcher_error:  # noqa: BLE001
                 # A watcher observation is diagnostic; native controller state
                 # and lifecycle evidence remain decisive for this route.
                 watcher_failures.append(f"{type(watcher_error).__name__}: {watcher_error}")
@@ -346,6 +591,7 @@ def main() -> int:
             raise TimeoutError("Windows public controller did not reach terminal state")
         if status is None:
             raise RuntimeError("controller status was never published")
+        _validate_controller_receipt_identity(receipt, status)
         if not provider_observed or provider_identity is None:
             raise RuntimeError("exact Windows wsl.exe provider identity was not observed")
         if status.get("state") not in {"CODEX_EXITED", "PROVIDER_EXITED"} or status.get("exit_code") != 0:
@@ -377,7 +623,7 @@ def main() -> int:
             raise RuntimeError("prepared Linux cleanup was not complete")
         linux_bridge = bridge.get("linux_bridge")
         if not isinstance(linux_bridge, dict):
-            raise RuntimeError("Linux bridge identity evidence is missing")
+            raise TypeError("Linux bridge identity evidence is missing")
         validate_cross_os_identity_relation(
             provider_identity, linux_bridge, nonce=nonce, invocation_id=WORKER_ID
         )
@@ -401,70 +647,53 @@ def main() -> int:
             "event_types": sorted(set(event_types)), "credentials_persisted": False,
             "transcript_persisted": False,
         }
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001
         failure = exc
     finally:
         if prep_process is not None:
             if prep_process.poll() is None:
                 # Release is also safe on a failed public route: it cannot
                 # leave the Linux preparation waiter behind.
-                release_signal.write_text("release\n", encoding="utf-8")
+                if release_signal is None:
+                    prep_process.kill()
+                else:
+                    release_signal.write_text("release\n", encoding="utf-8")
             try:
                 prep_process.wait(timeout=90)
             except subprocess.TimeoutExpired:
                 prep_process.kill()
                 prep_process.wait(timeout=10)
+        failure_record = (
+            _safe_failure_record(temp_root, failure)
+            if failure is not None
+            else None
+        )
+        cleanup_failure: RuntimeError | None = None
+        try:
+            _remove_disposable_temp_root(temp_root)
+        except RuntimeError as exc:
+            cleanup_failure = exc
+            if failure is None:
+                failure = exc
+                failure_record = _safe_failure_record(temp_root, failure)
         if failure is not None:
-            _json(evidence / "REAL_AGENT_TEST_RESULT.json", {
-                "status": "FAIL", "completed_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "failure_type": type(failure).__name__, "credentials_persisted": False,
-                "transcript_persisted": False,
-            })
+            assert failure_record is not None
+            failure_record["host_temp_cleanup_complete"] = cleanup_failure is None
+            if cleanup_failure is not None:
+                failure_record["host_temp_cleanup_failure_type"] = type(
+                    cleanup_failure
+                ).__name__
+            _write_safe_failure_result(
+                evidence,
+                temp_root,
+                failure,
+                record=failure_record,
+            )
         elif result is not None:
+            result["host_temp_cleanup_complete"] = True
             _json(evidence / "REAL_AGENT_TEST_RESULT.json", result)
-        if failure is not None:
-            # Retain the exact controller-side objects so a failed live
-            # route stays inspectable instead of being silently destroyed.
-            failure_evidence = evidence / "controller-failure-evidence"
-            failure_evidence.mkdir(parents=True, exist_ok=True)
-            for name in (
-                "prepared-state.json", "prepared-claim.json", "release-signal.json",
-                "bridge-evidence.json", "real_agent_operator.receipt.json",
-            ):
-                source = temp_root / name
-                if source.is_file():
-                    shutil.copy2(source, failure_evidence / name)
-            for relative in (
-                "synthetic-repository/.agent-workspace/real_agent_controller.status.json",
-                "synthetic-repository/.agent-workspace/real_agent_operator.receipt.json",
-                "synthetic-repository/.agent-workspace/invocation.json",
-                "synthetic-repository/.agent-workspace/RESULT.json",
-                "synthetic-repository/.agent-workspace/real_agent_codex.stderr.log",
-                "synthetic-repository/.agent-workspace/real_agent_codex.jsonl",
-            ):
-                source = temp_root / relative
-                if source.is_file():
-                    shutil.copy2(source, failure_evidence / source.name)
-            try:
-                secrets = json.loads(auth.read_text(encoding="utf-8")).get("tokens", {})
-                secret_values = [
-                    value for value in secrets.values()
-                    if isinstance(value, str) and value
-                ]
-            except Exception:
-                secret_values = []
-            for file in failure_evidence.rglob("*"):
-                if not file.is_file():
-                    continue
-                raw = file.read_bytes()
-                changed = raw
-                for secret in secret_values:
-                    changed = changed.replace(secret.encode(), b"<REDACTED>")
-                if changed != raw:
-                    file.write_bytes(changed)
-        # No runtime or authentication material is retained in the source
-        # checkout; only the explicitly redacted evidence directory remains.
-        shutil.rmtree(temp_root, ignore_errors=True)
+        # No runtime, authentication material, or provider transcript is
+        # retained in source or copied from the disposable repository.
     if failure is not None:
         raise failure
     assert result is not None

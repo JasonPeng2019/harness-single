@@ -21,15 +21,20 @@ from .mutation import (
     MutationUnsupported,
     TargetState,
     capture_target,
-    delete as mutation_delete,
     ensure_directory_path,
     make_temporary_directory,
     remove_tree,
+)
+from .mutation import (
+    delete as mutation_delete,
+)
+from .mutation import (
     rename as mutation_rename,
+)
+from .mutation import (
     replace as mutation_replace,
 )
-from .processes import process_snapshot
-
+from .processes import WINDOWS_CREATE_NO_WINDOW, process_snapshot
 
 IMMUTABLE_VIEW_SCHEMA = "orchestrator-immutable-source-view/v1"
 LANE_ARCHIVE_SCHEMA = "orchestrator-lane-archive/v1"
@@ -74,6 +79,7 @@ def _git(cwd: Path, *args: str, check: bool = False) -> subprocess.CompletedProc
             ["git", "-C", str(cwd), *args], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             timeout=15, env=_git_env(), shell=False,
+            creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LaneLifecycleError(f"Git lifecycle inspection failed: {exc}") from exc

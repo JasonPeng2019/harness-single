@@ -20,8 +20,7 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 REGISTRY_SCHEMA = "orchestrator-release-check-registry/v1"
@@ -33,6 +32,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _TIERS = frozenset({"fast", "affected", "full", "release"})
 _INTENTS = frozenset({"fast", "affected", "full", "release"})
+_WINDOWLESS_CREATION_FLAGS = 0x08000000 if os.name == "nt" else 0
 
 # This is the audited, intentionally small route manifest.  It follows the
 # actual imports used by public_launch -> operator_launch -> lane_controller,
@@ -60,6 +60,7 @@ PUBLIC_ROUTE_DEPENDENCIES = (
     "orchestrator_harness/task.py",
     "orchestrator_harness/cli.py",
     "orchestrator_harness/config.py",
+    "orchestrator_harness/discovery.py",
     "harness_common/process_identity.py",
 )
 
@@ -370,6 +371,7 @@ _RELEASE_AGGREGATE_INPUT_SCOPES = (
     InputScope("file", "QUICK_RULES.md"),
     InputScope("file", "AGENTS.md"),
     InputScope("file", "PORTABLE_CONTENTS.md"),
+    InputScope("file", ".gitignore"),
     InputScope("file", "pyrightconfig.json", required=False),
     InputScope("file", ".codex/dev/basedpyright-baseline.json", required=False),
 )
@@ -405,6 +407,7 @@ def _tracked_paths(root: Path) -> tuple[str, ...]:
             capture_output=True,
             check=False,
             timeout=10,
+            creationflags=_WINDOWLESS_CREATION_FLAGS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SelectionError(f"cannot enumerate tracked input paths: {exc}") from exc
@@ -472,8 +475,11 @@ def _registry() -> tuple[CheckSpec, ...]:
             ),
             ("selector",),
             (
+                ".gitignore",
                 "orchestrator_harness/release_checks.py",
                 "orchestrator_harness/tests/test_s6_public_release.py",
+                "tools/Invoke-CandidateSafeguard.ps1",
+                "tools/CandidateSafeguard.Core.psm1",
             ),
             estimated_duration_seconds=1.0,
             decisive=True,
@@ -587,7 +593,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.AFFECTED.REAL-AGENT",
             "optional real-agent isolation journey",
             "affected",
-            ("python", "orchestrator_harness/tests/real_agent_test.py"),
+            ("python", "-m", "orchestrator_harness.tests.real_agent_test"),
             ("isolation-real-agent",),
             REAL_AGENT_ROUTE_DEPENDENCIES,
             external_requirements=("WSL2", "Codex provider", "ephemeral auth"),
@@ -795,6 +801,7 @@ def _git(root: Path, *arguments: str) -> str:
             errors="replace",
             check=False,
             timeout=10,
+            creationflags=_WINDOWLESS_CREATION_FLAGS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SelectionError(f"Git identity read failed: {exc}") from exc
@@ -994,6 +1001,7 @@ def _is_ancestor(root: Path, origin_tip: str, current_tip: str) -> bool:
             stderr=subprocess.DEVNULL,
             check=False,
             timeout=10,
+            creationflags=_WINDOWLESS_CREATION_FLAGS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1213,18 +1221,18 @@ if __name__ == "__main__":
 __all__ = [
     "CHECK_REGISTRY",
     "CREDIT_SCHEMA",
-    "InputScope",
     "PUBLIC_ROUTE_DEPENDENCIES",
     "REAL_AGENT_ROUTE_DEPENDENCIES",
     "RELEASE_AGGREGATE_ID",
     "SELECTION_SCHEMA",
     "CheckSpec",
+    "InputScope",
     "SelectionDecision",
     "SelectionError",
     "SourceIdentity",
     "credit_record",
-    "dependency_input_paths",
     "dependency_fingerprint",
+    "dependency_input_paths",
     "get_check",
     "main",
     "read_source_identity",

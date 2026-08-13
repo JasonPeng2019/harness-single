@@ -8,22 +8,24 @@ import time
 import unittest
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
+from examples.disposable_coding_fixture import _invocation
+from orchestrator_harness.models import iso_utc
 from orchestrator_harness.operator_launch import detached_owner_snapshot, launch_process
 from orchestrator_harness.processes import process_snapshot
-from orchestrator_harness.models import iso_utc
-from examples.disposable_coding_fixture import _invocation
 
 
 class OperatorLaunchTests(unittest.TestCase):
     def _wait_for_exact(self, pid: int, created: str | None = None):
         for _ in range(20):
             item = process_snapshot().by_pid.get(pid)
-            if item is not None and item.created_utc is not None:
-                if created is None or iso_utc(item.created_utc) == created:
-                    return item
+            if (
+                item is not None and item.created_utc is not None
+                and (created is None or iso_utc(item.created_utc) == created)
+            ):
+                return item
             time.sleep(.05)
         return None
 
@@ -48,12 +50,13 @@ class OperatorLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             receipt = root / "failed.json"
-            with patch("orchestrator_harness.operator_launch._creation_identity", return_value=None):
-                with self.assertRaises(RuntimeError):
-                    launch_process(
-                        receipt=receipt, label="forced-failure", role="test", cwd=root,
-                        argv=[sys.executable, "-c", "import time; time.sleep(30)"],
-                    )
+            with patch(
+                "orchestrator_harness.operator_launch._creation_identity", return_value=None,
+            ), self.assertRaises(RuntimeError):
+                launch_process(
+                    receipt=receipt, label="forced-failure", role="test", cwd=root,
+                    argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+                )
             failure = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual("failed", failure["status"])
             self.assertTrue(failure["cleanup_confirmed"])
@@ -168,6 +171,10 @@ class OperatorLaunchTests(unittest.TestCase):
                     break
                 time.sleep(.1)
             self.assertEqual("CODEX_EXITED", value.get("state"), value)
+            self.assertEqual(receipt_value.get("pid"), value.get("controller_pid"))
+            self.assertEqual(
+                receipt_value.get("created_utc"), value.get("controller_created_utc")
+            )
             self.assertIsNone(process_snapshot().by_pid.get(receipt_value.get("pid")))
             time.sleep(0.5)
             self.assertEqual(0, len(caught))

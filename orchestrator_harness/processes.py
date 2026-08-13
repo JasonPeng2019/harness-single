@@ -8,9 +8,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Sequence, cast
 
-from .models import ProcessBoundaryInventory, ProcessInfo, ProcessQuery, ProcessSnapshot, iso_utc, parse_utc
+from .models import (
+    ProcessBoundaryInventory,
+    ProcessInfo,
+    ProcessQuery,
+    ProcessSnapshot,
+    iso_utc,
+    parse_utc,
+)
 
-
+WINDOWS_CREATE_NO_WINDOW = 0x08000000
 WINDOWS_CIM_SCRIPT = r"""
 $ErrorActionPreference='Stop'
 @(Get-CimInstance Win32_Process | ForEach-Object {
@@ -66,6 +73,7 @@ def windows_process_snapshot(
             errors="replace",
             timeout=timeout_seconds,
             check=False,
+            creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
     except Exception as exc:
         return ProcessSnapshot(
@@ -144,6 +152,7 @@ def windows_process_query(
             errors="replace",
             timeout=timeout_seconds,
             check=False,
+            creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
     except Exception as exc:
         return ProcessQuery(False, None, (f"CIM identity query failed: {exc}",))

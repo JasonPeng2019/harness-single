@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .models import parse_utc
-from .processes import ProcessSnapshot, process_snapshot
+from .processes import WINDOWS_CREATE_NO_WINDOW, ProcessSnapshot, process_snapshot
 
 
 class GitSafetyError(ValueError):
@@ -186,6 +186,7 @@ def _git(cwd: Path, *args: str, allow_failure: bool = False) -> str | None:
             timeout=10,
             env=env,
             shell=False,
+            creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitSafetyError(f"Git inspection failed: {exc}") from exc

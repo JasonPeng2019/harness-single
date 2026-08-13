@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -10,17 +11,22 @@ from typing import Any, Mapping
 from .config import HarnessConfig, path_identity
 from .git_safety import (
     GitSafetyError,
+    _git_inspection_env,
     declaration_from_status,
     invalid_result_evidence,
-    _git_inspection_env,
     validate_coding_result,
     validate_task_result_repository,
 )
-from .models import ObservationError, StableBytes
-from .models import parse_utc
-from .stable_io import read_stable, read_tail_stable
-from .task import TaskValidationError, read_task_advancement, task_card_from_identity, validate_task_result
+from .models import ObservationError, StableBytes, parse_utc
+from .processes import WINDOWS_CREATE_NO_WINDOW
 from .provider import ProviderAdapterError, provider_adapter
+from .stable_io import read_stable, read_tail_stable
+from .task import (
+    TaskValidationError,
+    read_task_advancement,
+    task_card_from_identity,
+    validate_task_result,
+)
 
 
 @dataclass(frozen=True)
@@ -514,6 +520,7 @@ def _git_state_fingerprint(worktree: Path) -> tuple[str, ...]:
                 timeout=10,
                 env=_git_inspection_env(),
                 shell=False,
+                creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             outputs.append(
                 f"{completed.returncode}:"

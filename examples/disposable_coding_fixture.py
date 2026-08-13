@@ -26,10 +26,14 @@ if str(HARNESS_ROOT) not in sys.path:
 
 from orchestrator_harness.models import iso_utc
 from orchestrator_harness.notifications import ManagerEventRouter
-from orchestrator_harness.processes import process_snapshot
+from orchestrator_harness.processes import (
+    WINDOWS_CREATE_NO_WINDOW,
+    targeted_process_query,
+)
 from orchestrator_harness.public_launch import launch_lane_controller
 
 FIXTURE_RESOURCE = "service:fixture-database"
+FIXTURE_CONTROLLER_COMPLETION_SECONDS = 120
 
 
 class FixtureError(RuntimeError):
@@ -55,6 +59,7 @@ def _run(
         errors="replace",
         timeout=30,
         shell=False,
+        creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     if completed.returncode not in expected:
         raise FixtureError(
@@ -107,6 +112,7 @@ def _fake_worker(argv: Sequence[str]) -> int:
     delay = float(delay_text)
     worker_invocation_id = argv[3] if len(argv) > 3 else f"{lane}-001"
     emit_result = len(argv) <= 4 or argv[4] == "write-result"
+    release_signal = Path(argv[5]) if len(argv) > 5 and argv[5] != "-" else None
     _ = sys.stdin.buffer.read()
     print(
         json.dumps({"type": "thread.started", "thread_id": f"fixture-{lane}"}),
@@ -117,6 +123,16 @@ def _fake_worker(argv: Sequence[str]) -> int:
     (workspace / "PARALLEL_CHECKPOINT.md").write_text(
         f"# {lane} checkpoint\n\nFake worker started.\n", encoding="utf-8"
     )
+    if release_signal is not None:
+        deadline = (
+            time.monotonic() + 2 * FIXTURE_CONTROLLER_COMPLETION_SECONDS
+        )
+        while not release_signal.is_file():
+            if time.monotonic() >= deadline:
+                raise FixtureError(
+                    f"timed out waiting for fixture release signal: {release_signal}"
+                )
+            time.sleep(0.05)
     time.sleep(delay)
     if lane in {"alpha", "beta", "beta-success"}:
         value = 1 if lane == "alpha" else 2
@@ -161,6 +177,7 @@ def _invocation(
     worker_invocation_id: str | None = None,
     emit_result: bool = True,
     status_suffix: str = "",
+    release_signal: Path | None = None,
 ) -> Path:
     workspace = worktree / ".agent-workspace"
     workspace.mkdir(exist_ok=True)
@@ -206,6 +223,7 @@ def _invocation(
                 str(delay),
                 worker_id,
                 "write-result" if emit_result else "no-result",
+                str(release_signal) if release_signal is not None else "-",
             ],
             "model": "fixture-model",
             "reasoning_effort": "low",
@@ -244,7 +262,10 @@ def _start_controller(invocation: Path) -> dict[str, Any]:
 
 
 def _wait_for_status(
-    path: Path, predicate: Any, *, timeout: float = 10.0
+    path: Path,
+    predicate: Any,
+    *,
+    timeout: float = FIXTURE_CONTROLLER_COMPLETION_SECONDS,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -266,11 +287,11 @@ def _finish_controller(receipt: Mapping[str, Any]) -> dict[str, Any]:
         raise FixtureError(
             f"operator launch receipt has no exact process identity: {receipt}"
         )
-    deadline = time.monotonic() + 20.0
+    deadline = time.monotonic() + FIXTURE_CONTROLLER_COMPLETION_SECONDS
     while time.monotonic() < deadline:
-        snapshot = process_snapshot()
-        if snapshot.complete:
-            process = snapshot.by_pid.get(pid)
+        query = targeted_process_query(pid)
+        if query.complete and not query.errors:
+            process = query.process
             if process is None or iso_utc(process.created_utc) != created_utc:
                 status_path = Path(str(receipt["expected_state_path"]))
                 return _wait_for_status(
@@ -343,20 +364,22 @@ def run_fixture(root: Path) -> dict[str, object]:
             "output_dir": str(runtime / "manager-epoch"),
             "poll_interval_seconds": 0.05,
             "watch_timeout_seconds": 5,
-            "request_warning_seconds": 120,
+            "request_warning_seconds": FIXTURE_CONTROLLER_COMPLETION_SECONDS,
             "request_critical_seconds": 30,
             "process_start_tolerance_seconds": 2,
         },
     )
     _harness(config, "watch", "--once")
 
+    alpha_release_signal = runtime / "alpha-release.signal"
     alpha_invocation = _invocation(
         lane="alpha",
         worktree=alpha,
         common_dir=common_dir,
         base_commit=base_commit,
         runtime=runtime,
-        delay=5.0,
+        delay=0.0,
+        release_signal=alpha_release_signal,
     )
     beta_invocation = _invocation(
         lane="beta",
@@ -381,9 +404,12 @@ def run_fixture(root: Path) -> dict[str, object]:
     )
     beta_process = _start_controller(beta_invocation)
     beta_status = beta / ".agent-workspace" / "fixture_controller.status.json"
-    _wait_for_status(
-        beta_status, lambda value: value.get("state") == "WAITING_RESOURCE"
-    )
+    try:
+        _wait_for_status(
+            beta_status, lambda value: value.get("state") == "WAITING_RESOURCE"
+        )
+    finally:
+        _write_json(alpha_release_signal, {"release": True})
     alpha_status_value = _finish_controller(alpha_process)
     stale_status = _finish_controller(beta_process)
     if stale_status.get("result_validation", {}).get("state") != "INVALID":

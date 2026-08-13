@@ -1,15 +1,16 @@
 from __future__ import annotations
-# pyright: reportImplicitRelativeImport=false
 
+# pyright: reportImplicitRelativeImport=false
 import json
 import subprocess
 import unittest
-
 from datetime import datetime, timezone
 
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
+from orchestrator_harness.process_supervisor import ProcessBoundary
 from orchestrator_harness.processes import (
     WINDOWS_CIM_SCRIPT,
+    WINDOWS_CREATE_NO_WINDOW,
     windows_process_query,
     windows_process_snapshot,
 )
@@ -41,6 +42,7 @@ class ProcessProviderTests(unittest.TestCase):
 
         def runner(argv, **kwargs):
             captured["argv"] = argv
+            captured["kwargs"] = kwargs
             payload = {
                 "pid": 11,
                 "ppid": 10,
@@ -55,6 +57,9 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertEqual(11, query.process.pid if query.process else None)
         self.assertIn("ProcessId = 11", captured["argv"][-1])
         self.assertNotIn("Get-CimInstance Win32_Process | ForEach-Object", captured["argv"][-1])
+        self.assertEqual(
+            WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"]
+        )
 
     def test_windows_provider_uses_only_fixed_command(self) -> None:
         captured = {}
@@ -79,6 +84,16 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertEqual(WINDOWS_CIM_SCRIPT, captured["argv"][-1])
         self.assertEqual("-Command", captured["argv"][-2])
         self.assertNotIn("shell", captured["kwargs"])
+        self.assertEqual(
+            WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"]
+        )
+
+    def test_windows_provider_boundary_suppresses_console_window(self) -> None:
+        boundary = ProcessBoundary(kind="windows-job")
+        self.assertEqual(
+            0x00000004 | WINDOWS_CREATE_NO_WINDOW,
+            boundary.popen_kwargs["creationflags"],
+        )
 
     def test_windows_provider_fails_unknown_on_cim_error(self) -> None:
         def runner(argv, **kwargs):

@@ -10,9 +10,21 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
-from .models import ProcessBoundaryInventory, ProcessInfo, ProcessQuery, ProcessSnapshot, iso_utc, parse_utc
-from .processes import process_group_inventory, process_snapshot, targeted_process_query, windows_process_query
-
+from .models import (
+    ProcessBoundaryInventory,
+    ProcessInfo,
+    ProcessQuery,
+    ProcessSnapshot,
+    iso_utc,
+    parse_utc,
+)
+from .processes import (
+    WINDOWS_CREATE_NO_WINDOW,
+    process_group_inventory,
+    process_snapshot,
+    targeted_process_query,
+    windows_process_query,
+)
 
 PROCESS_CLEANUP_SCHEMA = "orchestrator-process-cleanup/v1"
 PROCESS_BOUNDARY_SCHEMA = "orchestrator-process-boundary/v1"
@@ -171,7 +183,9 @@ class ProcessBoundary:
     @property
     def popen_kwargs(self) -> dict[str, Any]:
         if self.kind == "windows-job":
-            return {"creationflags": 0x00000004}  # CREATE_SUSPENDED
+            # The provider starts suspended for exact Job Object attachment and
+            # without a console window because its controller is detached.
+            return {"creationflags": 0x00000004 | WINDOWS_CREATE_NO_WINDOW}
         if self.kind in {"linux-process-group", "linux-subreaper"}:
             return {"start_new_session": True}
         raise ProcessBoundaryUnsupported("process boundary has no launch contract")
