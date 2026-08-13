@@ -2359,26 +2359,58 @@ class S6SafeguardTests(unittest.TestCase):
         self.assertIn("--untracked-files=all", core)
 
     def test_non_candidate_branch_is_rejected_before_selector_or_checks(self) -> None:
-        script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-                "-RepositoryRoot",
-                str(REPOSITORY_ROOT),
-            ],
-            cwd=REPOSITORY_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=_WINDOWLESS_CREATION_FLAGS,
-        )
-        self.assertNotEqual(0, completed.returncode)
-        self.assertIn("unexpected branch", completed.stderr)
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-non-candidate-") as raw:
+            root = Path(raw) / "candidate"
+            shutil.copytree(
+                REPOSITORY_ROOT,
+                root,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
+                ),
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "init", "-b", "firmware/v2-postjoin-fixture"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "postjoin@example.invalid"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Postjoin Fixture"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "non-candidate fixture"],
+                check=True, capture_output=True,
+            )
+            branch = subprocess.run(
+                ["git", "-C", str(root), "branch", "--show-current"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertNotEqual("firmware/v2-candidate", branch)
+            script = root / "tools" / "Invoke-CandidateSafeguard.ps1"
+            self.assertTrue(script.is_file())
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-RepositoryRoot",
+                    str(root),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertNotEqual(0, completed.returncode)
+            self.assertIn("unexpected branch", completed.stderr)
 
     def test_safeguard_rejects_injection_and_uses_native_credit_selection(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-selector-forward-") as raw:
