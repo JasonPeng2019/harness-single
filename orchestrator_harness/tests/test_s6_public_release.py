@@ -25,15 +25,18 @@ from orchestrator_harness.release_assets import (
     read_package_asset,
     release_manifest,
 )
+from orchestrator_harness.tests import real_agent_test as real_agent_test_module
 from orchestrator_harness.tests.real_agent_test import (
     DEFAULT_EVIDENCE_DIRECTORY,
-    _attempt_directory_identity,
+    _capture_directory_identity,
+    _close_evidence_root_handle,
     _finalize_attempt_evidence,
+    _open_evidence_root_handle,
     _provider_identity_from_query,
     _release_preparation_process,
     _remove_disposable_temp_root,
     _resolve_evidence_root,
-    _revalidate_attempt_identity,
+    _revalidate_evidence_root_binding,
     _safe_failure_record,
     _safe_success_record,
     _terminal_finalize,
@@ -775,30 +778,35 @@ class S6LocalIsolationTests(unittest.TestCase):
                 (temp_root / "bridge-evidence.json").write_text(
                     json.dumps({"status": "FAIL", "provider_output": sentinel}), encoding="utf-8",
                 )
-                evidence = outside / "forced-failure"
-                evidence.mkdir()
-                (evidence / "proxy-audit.jsonl").write_text(
+                prepared_evidence = temp_root / "prepared-evidence"
+                prepared_evidence.mkdir()
+                (prepared_evidence / "proxy-audit.jsonl").write_text(
                     sentinel, encoding="utf-8"
                 )
-                retained_directory = evidence / "prepared-artifacts"
-                retained_directory.mkdir()
-                (retained_directory / "prepared-state.json").write_text(
+                (prepared_evidence / "prepared-state.json").write_text(
                     sentinel, encoding="utf-8"
                 )
-                attempt_identity = _attempt_directory_identity(evidence)
-                with self.assertRaisesRegex(RuntimeError, "PROVIDER_TRANSCRIPT_SENTINEL"):
-                    _terminal_finalize(
-                        evidence=evidence, attempt_identity=attempt_identity,
-                        temp_root=temp_root, failure=RuntimeError(sentinel),
-                        result=None, prep_process=None, release_signal=None,
-                    )
+                root_binding = _open_evidence_root_handle(outside)
+                attempt_name = "forced-failure"
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "PROVIDER_TRANSCRIPT_SENTINEL"):
+                        _terminal_finalize(
+                            root_binding=root_binding, attempt_name=attempt_name,
+                            temp_root=temp_root, failure=RuntimeError(sentinel),
+                            result=None, prep_process=None, release_signal=None,
+                        )
+                finally:
+                    _close_evidence_root_handle(root_binding)
                 self.assertFalse(temp_root.exists())
+                published = outside / attempt_name
+                self.assertTrue(published.is_dir())
+                self.assertEqual([attempt_name], [p.name for p in outside.iterdir()])
                 retained = tuple(
-                    path.relative_to(evidence).as_posix()
-                    for path in evidence.rglob("*") if path.is_file()
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-                text = (evidence / retained[0]).read_text(encoding="utf-8")
+                text = (published / retained[0]).read_text(encoding="utf-8")
                 self.assertNotIn(sentinel, text)
                 self.assertNotIn("real_agent_codex.jsonl", text)
                 self.assertNotIn("real_agent_codex.stderr.log", text)
@@ -883,55 +891,60 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "credentials_in_state": False, "evidence": sentinel,
                 }), encoding="utf-8")
                 claim_path.write_text(json.dumps({"claim": sentinel}), encoding="utf-8")
-                evidence = root / "evidence" / "success-attempt"
-                (evidence / "prepared-artifacts").mkdir(parents=True)
-                (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
-                (evidence / "prepared-artifacts" / "prepared-state.json").write_text(
-                    sentinel, encoding="utf-8",
-                )
-                attempt_identity = _attempt_directory_identity(evidence)
-                expected_result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
-                record = _safe_success_record(
-                    completed_utc="2026-08-13T01:00:05Z",
-                    route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
-                    distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
-                    nonce="nonce", invocation_id="real-agent-001",
-                    controller_pid=101, controller_created=created_text,
-                    provider_identity={
-                        "platform": "windows", "pid": 202, "created_utc": created_text,
-                        "nonce": "nonce", "invocation_id": "real-agent-001",
-                        "parent_pid": 101,
-                    },
-                    linux_bridge_identity={
-                        "platform": "linux", "pid": 303, "created_utc": created_text,
-                        "nonce": "nonce", "invocation_id": "real-agent-001",
-                    },
-                    status=json.loads(status_path.read_text(encoding="utf-8")),
-                    result_value=poisoned_result,
-                    lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
-                    bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
-                    prepared=json.loads(state_path.read_text(encoding="utf-8")),
-                    event_types=[
-                        "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
-                    ],
-                    workspace=workspace,
-                    receipt_path=receipt_path, result_path=result_path,
-                    lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
-                    state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
-                )
-                terminal_failure = _terminal_finalize(
-                    evidence=evidence, attempt_identity=attempt_identity,
-                    temp_root=temp_root, failure=None, result=record,
-                    prep_process=None, release_signal=None,
-                )
-                self.assertIsNone(terminal_failure)
+                prepared_evidence = temp_root / "prepared-evidence"
+                prepared_evidence.mkdir()
+                (prepared_evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
+                (prepared_evidence / "prepared-state.json").write_text(sentinel, encoding="utf-8")
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "success-attempt"
+                try:
+                    expected_result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+                    record = _safe_success_record(
+                        completed_utc="2026-08-13T01:00:05Z",
+                        route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
+                        distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
+                        nonce="nonce", invocation_id="real-agent-001",
+                        controller_pid=101, controller_created=created_text,
+                        provider_identity={
+                            "platform": "windows", "pid": 202, "created_utc": created_text,
+                            "nonce": "nonce", "invocation_id": "real-agent-001",
+                            "parent_pid": 101,
+                        },
+                        linux_bridge_identity={
+                            "platform": "linux", "pid": 303, "created_utc": created_text,
+                            "nonce": "nonce", "invocation_id": "real-agent-001",
+                        },
+                        status=json.loads(status_path.read_text(encoding="utf-8")),
+                        result_value=poisoned_result,
+                        lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
+                        bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
+                        prepared=json.loads(state_path.read_text(encoding="utf-8")),
+                        event_types=[
+                            "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
+                        ],
+                        workspace=workspace,
+                        receipt_path=receipt_path, result_path=result_path,
+                        lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
+                        state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+                    )
+                    published = _terminal_finalize(
+                        root_binding=root_binding, attempt_name=attempt_name,
+                        temp_root=temp_root, failure=None, result=record,
+                        prep_process=None, release_signal=None,
+                    )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(evidence_root / attempt_name, published)
                 self.assertFalse(temp_root.exists())
+                self.assertEqual([attempt_name], [p.name for p in evidence_root.iterdir()])
                 retained = tuple(
-                    path.relative_to(evidence).as_posix()
-                    for path in evidence.rglob("*") if path.is_file()
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-                text = (evidence / retained[0]).read_text(encoding="utf-8")
+                text = (published / retained[0]).read_text(encoding="utf-8")
                 self.assertNotIn(sentinel, text)
                 self.assertNotIn("real_agent_codex.jsonl", text)
                 self.assertNotIn("real_agent_codex.stderr.log", text)
@@ -972,29 +985,36 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertIn("def _finalize_attempt_evidence(", source)
         self.assertIn("def _terminal_finalize(", source)
         self.assertIn("def _release_preparation_process(", source)
-        self.assertIn("def _attempt_directory_identity(", source)
-        self.assertIn("def _revalidate_attempt_identity(", source)
+        self.assertIn("def _open_evidence_root_handle(", source)
+        self.assertIn("def _close_evidence_root_handle(", source)
+        self.assertIn("def _rename_attempt_relative(", source)
+        self.assertIn("_PUBLICATION_INTERPOSITION_HOOK", source)
         self.assertNotIn("def _redacted_controller_evidence(", source)
         self.assertNotIn("def _write_safe_failure_result(", source)
         self.assertNotIn('"controller_evidence":', source)
         self.assertNotIn('"bridge_evidence": bridge', source)
         self.assertNotIn('"prepared_cleanup":', source)
-        # The finalizer never resolves the lexical attempt root.
+        self.assertNotIn("def _remove_attempt_entry(", source)
+        self.assertNotIn("def _revalidate_attempt_identity(", source)
+        self.assertNotIn("evidence.rglob(", source)
+        self.assertNotIn("evidence.iterdir(", source)
         self.assertNotIn("evidence.resolve(", source)
-        # main()'s finally block delegates the whole terminal flow to the seam.
+        self.assertNotIn("_json(evidence /", source)
+        self.assertNotIn("os.replace(evidence", source)
+        self.assertNotIn("shutil.rmtree(evidence", source)
         main_tail = source.split("def main()", 1)[1]
         finally_block = main_tail.split("finally:", 1)[1].split("assert result", 1)[0]
         self.assertEqual(1, finally_block.count("_terminal_finalize("))
+        self.assertEqual(1, finally_block.count("REAL_AGENT_EVIDENCE="))
         self.assertNotIn("release_signal.write_text(", finally_block)
         self.assertNotIn("prep_process.wait(", finally_block)
         self.assertNotIn("prep_process.kill(", finally_block)
-        # The exact-handle release sequence lives only inside the funnel helper.
         self.assertEqual(1, source.count("release_signal.write_text("))
         self.assertGreaterEqual(source.count("prep_process.wait("), 2)
         self.assertGreaterEqual(source.count("prep_process.kill("), 2)
-        # Both terminal routes call the same finalizer owner inside the seam.
         seam = source.split("def _terminal_finalize(", 1)[1].split("\ndef ", 1)[0]
         self.assertEqual(2, seam.count("_finalize_attempt_evidence("))
+        self.assertIn("_close_evidence_root_handle(", seam)
 
     def test_real_agent_cleanup_faults_funnel_through_terminal_seam(self) -> None:
         sentinel = "CLEANUP_FAULT_TRANSCRIPT_SENTINEL"
@@ -1040,12 +1060,10 @@ class S6LocalIsolationTests(unittest.TestCase):
                             }),
                             encoding="utf-8",
                         )
-                        evidence = root / "evidence" / name
-                        evidence.mkdir(parents=True)
-                        (evidence / "proxy-audit.jsonl").write_text(
-                            sentinel, encoding="utf-8",
-                        )
-                        attempt_identity = _attempt_directory_identity(evidence)
+                        evidence_root = root / "evidence"
+                        evidence_root.mkdir()
+                        root_binding = _open_evidence_root_handle(evidence_root)
+                        attempt_name = name
                         success_record = {
                             "schema": "orchestrator-real-agent-evidence/v1",
                             "status": "PASS",
@@ -1054,19 +1072,23 @@ class S6LocalIsolationTests(unittest.TestCase):
                             "credentials_persisted": False,
                             "transcript_persisted": False,
                         }
-                        with self.assertRaises(OSError):
-                            _terminal_finalize(
-                                evidence=evidence, attempt_identity=attempt_identity,
-                                temp_root=temp_root, failure=None, result=success_record,
-                                prep_process=prep_process, release_signal=release_signal,
-                            )
+                        try:
+                            with self.assertRaises(OSError):
+                                _terminal_finalize(
+                                    root_binding=root_binding, attempt_name=attempt_name,
+                                    temp_root=temp_root, failure=None, result=success_record,
+                                    prep_process=prep_process, release_signal=release_signal,
+                                )
+                        finally:
+                            _close_evidence_root_handle(root_binding)
                         self.assertFalse(temp_root.exists())
+                        published = evidence_root / attempt_name
                         retained = tuple(
-                            path.relative_to(evidence).as_posix()
-                            for path in evidence.rglob("*") if path.is_file()
+                            path.relative_to(published).as_posix()
+                            for path in published.rglob("*") if path.is_file()
                         )
                         self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-                        text = (evidence / retained[0]).read_text(encoding="utf-8")
+                        text = (published / retained[0]).read_text(encoding="utf-8")
                         self.assertNotIn(sentinel, text)
                         record = json.loads(text)
                         self.assertEqual("FAIL", record["status"])
@@ -1088,27 +1110,31 @@ class S6LocalIsolationTests(unittest.TestCase):
                 (workspace / "real_agent_codex.jsonl").write_text(
                     sentinel, encoding="utf-8",
                 )
-                evidence = root / "evidence" / "failure-route"
-                evidence.mkdir(parents=True)
-                (evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
-                attempt_identity = _attempt_directory_identity(evidence)
-                with self.assertRaisesRegex(RuntimeError, "original product failure"):
-                    _terminal_finalize(
-                        evidence=evidence, attempt_identity=attempt_identity,
-                        temp_root=temp_root, failure=RuntimeError("original product failure"),
-                        result=None,
-                        prep_process=_FakePrepProcess(
-                            running=True, kill_fault=OSError("kill fault"),
-                        ),
-                        release_signal=None,
-                    )
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "failure-route"
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "original product failure"):
+                        _terminal_finalize(
+                            root_binding=root_binding, attempt_name=attempt_name,
+                            temp_root=temp_root, failure=RuntimeError("original product failure"),
+                            result=None,
+                            prep_process=_FakePrepProcess(
+                                running=True, kill_fault=OSError("kill fault"),
+                            ),
+                            release_signal=None,
+                        )
+                finally:
+                    _close_evidence_root_handle(root_binding)
                 self.assertFalse(temp_root.exists())
+                published = evidence_root / attempt_name
                 retained = tuple(
-                    path.relative_to(evidence).as_posix()
-                    for path in evidence.rglob("*") if path.is_file()
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-                record = json.loads((evidence / retained[0]).read_text(encoding="utf-8"))
+                record = json.loads((published / retained[0]).read_text(encoding="utf-8"))
                 self.assertEqual("FAIL", record["status"])
                 self.assertEqual("RuntimeError", record["failure_type"])
                 self.assertEqual("OSError", record["preparation_cleanup_failure_type"])
@@ -1122,30 +1148,45 @@ class S6LocalIsolationTests(unittest.TestCase):
             root = Path(raw)
             first = root / "first"
             first.mkdir()
-            identity = _attempt_directory_identity(first)
-            self.assertEqual(str(first), identity["path"])
-            self.assertEqual(str(root), identity["parent"])
-            self.assertTrue(identity["st_ino"])
-            _revalidate_attempt_identity(first, identity)
-            second = root / "second"
-            second.mkdir()
-            with self.assertRaisesRegex(RuntimeError, "identity changed"):
-                _revalidate_attempt_identity(second, identity)
-            # Same-path type replacement fails closed.
-            (first / "marker").write_text("x", encoding="utf-8")
-            (first / "marker").unlink()
-            first.rmdir()
-            first.write_text("now a file", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "no longer a directory"):
-                _revalidate_attempt_identity(first, identity)
-            first.unlink()
-            # Same-path directory replacement fails closed when the filesystem
-            # assigns a new identity (the normal case on NTFS).
+            binding = _open_evidence_root_handle(first)
+            try:
+                self.assertEqual(str(first), binding["path"])
+                self.assertTrue(binding["volume_serial"])
+                self.assertTrue(binding["file_index"])
+                _revalidate_evidence_root_binding(binding)
+                captured = _capture_directory_identity(first)
+                self.assertEqual(binding["volume_serial"], captured["volume_serial"])
+                self.assertEqual(binding["file_index"], captured["file_index"])
+                second = root / "second"
+                second.mkdir()
+                other = _open_evidence_root_handle(second)
+                try:
+                    self.assertNotEqual(
+                        (binding["volume_serial"], binding["file_index"]),
+                        (other["volume_serial"], other["file_index"]),
+                    )
+                finally:
+                    _close_evidence_root_handle(other)
+                with self.assertRaises(PermissionError):
+                    os.rename(first, root / "first-moved")
+                with self.assertRaises(PermissionError):
+                    os.rmdir(first)
+                with self.assertRaises(PermissionError):
+                    os.replace(first, root / "first-replaced")
+            finally:
+                _close_evidence_root_handle(binding)
+            with self.assertRaisesRegex(RuntimeError, "already closed"):
+                _revalidate_evidence_root_binding(binding)
+            os.rename(first, root / "first-moved")
             first.mkdir()
-            (first / "swapped.jsonl").write_text("swapped", encoding="utf-8")
-            if _attempt_directory_identity(first)["st_ino"] != identity["st_ino"]:
-                with self.assertRaisesRegex(RuntimeError, "identity changed"):
-                    _revalidate_attempt_identity(first, identity)
+            replacement = _open_evidence_root_handle(first)
+            try:
+                self.assertNotEqual(
+                    (binding["volume_serial"], binding["file_index"]),
+                    (replacement["volume_serial"], replacement["file_index"]),
+                )
+            finally:
+                _close_evidence_root_handle(replacement)
 
     def test_real_agent_attempt_root_replacement_fails_closed(self) -> None:
         sentinel = "OUTSIDE_SENTINEL_MARKER"
@@ -1155,34 +1196,57 @@ class S6LocalIsolationTests(unittest.TestCase):
             try:
                 evidence_root = root / "evidence"
                 evidence_root.mkdir()
-                attempt = evidence_root / "attempt"
-                attempt.mkdir()
-                (attempt / "raw.jsonl").write_text(sentinel, encoding="utf-8")
-                identity = _attempt_directory_identity(attempt)
                 outside = root / "outside-target"
                 outside.mkdir()
                 (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
-                (attempt / "raw.jsonl").unlink()
-                attempt.rmdir()
-                _make_directory_link(attempt, outside)
-                self.assertTrue(_is_directory_link(attempt))
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+                observed: list[str] = []
+
+                def interpose(binding, attempt_name, staging, record_path):
+                    bound = Path(binding["path"])
+                    try:
+                        os.rename(bound, Path(str(bound) + "-moved"))
+                    except PermissionError:
+                        observed.append("rename-denied")
+                    try:
+                        os.rmdir(bound)
+                    except PermissionError:
+                        observed.append("rmdir-denied")
+                    try:
+                        _make_directory_link(bound, outside)
+                    except (OSError, RuntimeError):
+                        observed.append("link-refused")
+
                 record = {
                     "schema": "orchestrator-real-agent-evidence/v1",
                     "status": "PASS",
                     "retained_file_count": 1,
                 }
-                with self.assertRaisesRegex(RuntimeError, "symbolic link|reparse point"):
-                    _terminal_finalize(
-                        evidence=attempt, attempt_identity=identity,
-                        temp_root=temp_root, failure=None, result=record,
-                        prep_process=None, release_signal=None,
-                    )
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                    ):
+                        published = _terminal_finalize(
+                            root_binding=root_binding, attempt_name=attempt_name,
+                            temp_root=temp_root, failure=None, result=record,
+                            prep_process=None, release_signal=None,
+                        )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(
+                    ["rename-denied", "rmdir-denied", "link-refused"], observed,
+                )
                 self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
                 self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+                self.assertEqual(evidence_root / attempt_name, published)
+                retained = tuple(
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
             finally:
-                if _is_directory_link(attempt):
-                    attempt.unlink()
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1191,72 +1255,196 @@ class S6LocalIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-swap-") as raw:
             root = Path(raw)
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            moved: list[Path] = []
             try:
                 evidence_root = root / "evidence"
                 evidence_root.mkdir()
-                attempt = evidence_root / "attempt"
-                attempt.mkdir()
-                (attempt / "raw.jsonl").write_text("original", encoding="utf-8")
-                identity = _attempt_directory_identity(attempt)
-                # Same-path replacement with a different directory: the stale
-                # identity must fail closed before any deletion or publication.
-                (attempt / "raw.jsonl").unlink()
-                attempt.rmdir()
-                attempt.mkdir()
-                (attempt / "swapped.jsonl").write_text(sentinel, encoding="utf-8")
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+
+                def interpose(binding, attempt_name, staging, record_path):
+                    swapped = Path(str(staging) + "-swapped")
+                    os.rename(staging, swapped)
+                    moved.append(swapped)
+                    staging.mkdir()
+                    (staging / "foreign.jsonl").write_text(sentinel, encoding="utf-8")
+
                 record = {
                     "schema": "orchestrator-real-agent-evidence/v1",
                     "status": "PASS",
                     "retained_file_count": 1,
                 }
-                with self.assertRaisesRegex(RuntimeError, "identity changed"):
-                    _terminal_finalize(
-                        evidence=attempt, attempt_identity=identity,
-                        temp_root=temp_root, failure=None, result=record,
-                        prep_process=None, release_signal=None,
-                    )
-                self.assertEqual(sentinel, (attempt / "swapped.jsonl").read_text(encoding="utf-8"))
-                self.assertFalse((attempt / "REAL_AGENT_TEST_RESULT.json").exists())
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "staging identity changed"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertFalse((evidence_root / attempt_name).exists())
+                self.assertFalse(
+                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                )
+            finally:
+                for swapped in moved:
+                    if swapped.exists():
+                        shutil.rmtree(swapped, ignore_errors=True)
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_no_retained_tree_recursive_cleanup(self) -> None:
+        source = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("def _remove_attempt_entry(", source)
+        self.assertNotIn("evidence.rglob(", source)
+        self.assertNotIn("evidence.iterdir(", source)
+        self.assertNotIn("_json(evidence /", source)
+        self.assertNotIn("shutil.rmtree(evidence", source)
+        self.assertNotIn("os.replace(evidence", source)
+        self.assertIn('evidence_dir = temp_root / "prepared-evidence"', source)
+        self.assertIn("def _remove_private_staging_root(", source)
+        self.assertIn("def _rename_attempt_relative(", source)
+        self.assertIn("NtSetInformationFile", source)
+
+    def test_real_agent_destination_collision_fails_closed(self) -> None:
+        sentinel = "DEST_COLLISION_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-collision-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+                precreated: Path | None = None
+
+                def interpose(binding, attempt_name, staging, record_path):
+                    nonlocal precreated
+                    precreated = Path(binding["path"]) / attempt_name
+                    precreated.mkdir()
+                    (precreated / "marker.txt").write_text(sentinel, encoding="utf-8")
+
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "already exists"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertIsNotNone(precreated)
+                self.assertEqual(
+                    sentinel, (precreated / "marker.txt").read_text(encoding="utf-8")
+                )
+                self.assertFalse((precreated / "REAL_AGENT_TEST_RESULT.json").exists())
+                self.assertEqual(["marker.txt"], [p.name for p in precreated.iterdir()])
             finally:
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_child_reparse_entry_cleanup_is_no_follow(self) -> None:
-        sentinel = "CHILD_LINK_OUTSIDE_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-child-link-") as raw:
+    def test_real_agent_destination_reparse_collision_fails_closed(self) -> None:
+        sentinel = "DEST_REPARSE_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-collision-") as raw:
             root = Path(raw)
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
-            child_link = root / "evidence" / "child-link-attempt" / "linked-artifacts"
             try:
-                evidence = root / "evidence" / "child-link-attempt"
-                evidence.mkdir(parents=True)
-                (evidence / "raw.jsonl").write_text(sentinel, encoding="utf-8")
-                outside = root / "child-link-target"
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                outside = root / "outside-target"
                 outside.mkdir()
                 (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
-                _make_directory_link(child_link, outside)
-                identity = _attempt_directory_identity(evidence)
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+                destination = evidence_root / attempt_name
+
+                def interpose(binding, attempt_name, staging, record_path):
+                    _make_directory_link(Path(binding["path"]) / attempt_name, outside)
+
                 record = {
                     "schema": "orchestrator-real-agent-evidence/v1",
                     "status": "PASS",
                     "retained_file_count": 1,
                 }
-                terminal_failure = _terminal_finalize(
-                    evidence=evidence, attempt_identity=identity,
-                    temp_root=temp_root, failure=None, result=record,
-                    prep_process=None, release_signal=None,
-                )
-                self.assertIsNone(terminal_failure)
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "already exists"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertTrue(_is_directory_link(destination))
                 self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
-                self.assertFalse(os.path.lexists(child_link))
-                retained = tuple(
-                    path.relative_to(evidence).as_posix()
-                    for path in evidence.rglob("*") if path.is_file()
-                )
-                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
             finally:
-                if os.path.lexists(child_link) and _is_directory_link(child_link):
-                    child_link.unlink()
+                if _is_directory_link(evidence_root / attempt_name):
+                    (evidence_root / attempt_name).unlink()
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_staging_reparse_substitution_fails_closed(self) -> None:
+        sentinel = "STAGING_REPARSE_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-staging-") as raw:
+            root = Path(raw)
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                evidence_root = root / "evidence"
+                evidence_root.mkdir()
+                outside = root / "outside-target"
+                outside.mkdir()
+                (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+
+                def interpose(binding, attempt_name, staging, record_path):
+                    record_path.unlink()
+                    _make_directory_link(record_path, outside)
+
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "reparse point|link"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertFalse((evidence_root / attempt_name).exists())
+                self.assertFalse(
+                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                )
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+            finally:
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 

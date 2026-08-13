@@ -8,6 +8,7 @@ the lane controller launches only ``wsl.exe`` as its provider child.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -330,116 +332,418 @@ def _safe_success_record(
     }
 
 
-def _attempt_directory_identity(path: Path) -> dict[str, Any]:
-    """Capture the no-follow identity of one created attempt directory.
+# --- Windows handle-bound evidence publication --------------------------------
 
-    The lexical path is never resolved.  Symbolic links and Windows reparse
-    points (including junctions) are rejected without following them, and the
-    exact non-link directory plus its expected parent are bound by device and
-    file-index identity.
-    """
+_FILE_READ_DATA = 0x0001
+_FILE_READ_ATTRIBUTES = 0x0080
+_FILE_WRITE_ATTRIBUTES = 0x0100
+_FILE_DELETE = 0x00010000
+_FILE_SYNCHRONIZE = 0x00100000
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_RENAME_INFORMATION_CLASS = 10
+_FILE_RENAME_INFO_HEADER_SIZE = 20
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-    if path.is_symlink():
-        raise RuntimeError(f"attempt root must not be a symbolic link: {path}")
-    st = os.lstat(path)
-    if getattr(st, "st_reparse_tag", 0) != 0:
-        raise RuntimeError(f"attempt root must not be a reparse point: {path}")
-    if not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"attempt root is not a directory: {path}")
-    parent = path.parent
-    parent_st = os.lstat(parent)
+_WINDOWS_API_READY = False
+_KERNEL32: Any = None
+_NTDLL: Any = None
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = [
+        ("Status", wintypes.LONG),
+        ("Information", ctypes.c_void_p),
+    ]
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", wintypes.DWORD),
+        ("dwHighDateTime", wintypes.DWORD),
+    ]
+
+
+class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", _FILETIME),
+        ("ftLastAccessTime", _FILETIME),
+        ("ftLastWriteTime", _FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+class _FILE_RENAME_INFO_FIXED(ctypes.Structure):
+    _fields_ = [
+        ("ReplaceIfExists", wintypes.BOOL),
+        ("RootDirectory", wintypes.HANDLE),
+        ("FileNameLength", wintypes.DWORD),
+    ]
+
+
+def _windows_api() -> None:
+    """Configure the exact Windows APIs used by handle-bound publication once."""
+
+    global _WINDOWS_API_READY, _KERNEL32, _NTDLL
+    if _WINDOWS_API_READY:
+        return
+    if os.name != "nt":
+        raise RuntimeError(
+            "real-agent evidence publication requires the Windows controller host"
+        )
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
+    _KERNEL32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    _KERNEL32.CreateFileW.restype = wintypes.HANDLE
+    _KERNEL32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+    ]
+    _KERNEL32.GetFileInformationByHandle.restype = wintypes.BOOL
+    _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _KERNEL32.CloseHandle.restype = wintypes.BOOL
+    _NTDLL.NtSetInformationFile.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_IO_STATUS_BLOCK), ctypes.c_void_p,
+        wintypes.ULONG, ctypes.c_int,
+    ]
+    _NTDLL.NtSetInformationFile.restype = wintypes.LONG
+    _WINDOWS_API_READY = True
+
+
+def _open_directory_handle(path: Path, *, access: int, share: int) -> int:
+    """Open one directory no-follow and return the exact Windows handle."""
+
+    _windows_api()
+    handle = _KERNEL32.CreateFileW(
+        str(path), access, share, None, 3,  # OPEN_EXISTING
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise OSError(ctypes.get_last_error(), f"failed to open directory handle: {path}")
+    return int(handle)
+
+
+def _close_handle(handle: int) -> None:
+    if handle is not None and handle != _INVALID_HANDLE_VALUE:
+        _windows_api()
+        _KERNEL32.CloseHandle(handle)
+
+
+def _handle_file_information(handle: int) -> dict[str, Any]:
+    """Return attributes, volume serial, and file index by handle."""
+
+    _windows_api()
+    info = _BY_HANDLE_FILE_INFORMATION()
+    if not _KERNEL32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
     return {
-        "path": str(path),
-        "parent": str(parent),
-        "st_dev": st.st_dev,
-        "st_ino": st.st_ino,
-        "parent_st_dev": parent_st.st_dev,
-        "parent_st_ino": parent_st.st_ino,
+        "attributes": int(info.dwFileAttributes),
+        "volume_serial": int(info.dwVolumeSerialNumber),
+        "file_index": (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow),
     }
 
 
-def _revalidate_attempt_identity(path: Path, identity: dict[str, Any]) -> None:
-    """Fail closed unless the lexical path is still the exact created directory.
+def _capture_directory_identity(path: Path) -> dict[str, Any]:
+    """Capture one no-follow non-reparse directory identity by Windows handle."""
 
-    No-follow semantics: the path itself is inspected with ``os.lstat`` and
-    never resolved through a replaced root.  A symbolic link, Windows reparse
-    point, non-directory, changed device/file index, or changed parent fails
-    closed before any destructive or publication boundary.
+    handle = _open_directory_handle(
+        path,
+        access=_FILE_READ_ATTRIBUTES | _FILE_SYNCHRONIZE,
+        share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+    )
+    try:
+        info = _handle_file_information(handle)
+    finally:
+        _close_handle(handle)
+    if not (info["attributes"] & _FILE_ATTRIBUTE_DIRECTORY):
+        raise RuntimeError(f"expected a directory: {path}")
+    if info["attributes"] & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise RuntimeError(f"reparse point is not allowed: {path}")
+    return {
+        "path": str(path),
+        "volume_serial": info["volume_serial"],
+        "file_index": info["file_index"],
+        "attributes": info["attributes"],
+    }
+
+
+def _open_evidence_root_handle(path: Path) -> dict[str, Any]:
+    """Open and bind the exact external evidence root for one attempt.
+
+    The returned binding holds a no-follow Windows directory handle whose
+    sharing mode denies delete sharing, so the bound root cannot be renamed,
+    deleted, or replaced while the attempt is active.  The identity is
+    captured by handle and the lexical path is never resolved.
     """
 
-    if path.is_symlink():
-        raise RuntimeError(f"attempt root was replaced by a symbolic link: {path}")
-    st = os.lstat(path)
-    if getattr(st, "st_reparse_tag", 0) != 0:
-        raise RuntimeError(f"attempt root was replaced by a reparse point: {path}")
-    if not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"attempt root is no longer a directory: {path}")
-    if (st.st_dev, st.st_ino) != (identity["st_dev"], identity["st_ino"]):
-        raise RuntimeError(f"attempt root identity changed: {path}")
-    parent_st = os.lstat(path.parent)
-    if (parent_st.st_dev, parent_st.st_ino) != (
-        identity["parent_st_dev"],
-        identity["parent_st_ino"],
+    if os.name != "nt":
+        raise RuntimeError("evidence-root handle binding requires Windows")
+    if path.is_symlink() or (os.name == "nt" and os.path.isjunction(path)):
+        raise RuntimeError(f"evidence root must not be a link: {path}")
+    handle = _open_directory_handle(
+        path,
+        access=(
+            _FILE_READ_DATA | _FILE_READ_ATTRIBUTES
+            | _FILE_WRITE_ATTRIBUTES | _FILE_SYNCHRONIZE
+        ),
+        share=_FILE_SHARE_READ | _FILE_SHARE_WRITE,  # delete sharing denied
+    )
+    try:
+        info = _handle_file_information(handle)
+    except BaseException:
+        _close_handle(handle)
+        raise
+    if not (info["attributes"] & _FILE_ATTRIBUTE_DIRECTORY):
+        _close_handle(handle)
+        raise RuntimeError(f"evidence root is not a directory: {path}")
+    if info["attributes"] & _FILE_ATTRIBUTE_REPARSE_POINT:
+        _close_handle(handle)
+        raise RuntimeError(f"evidence root must not be a reparse point: {path}")
+    return {
+        "handle": int(handle),
+        "path": str(path),
+        "volume_serial": info["volume_serial"],
+        "file_index": info["file_index"],
+        "attributes": info["attributes"],
+    }
+
+
+def _close_evidence_root_handle(binding: dict[str, Any]) -> None:
+    """Close the bound evidence-root handle exactly once per terminal route."""
+
+    handle = binding.get("handle")
+    if handle is not None:
+        _close_handle(handle)
+        binding["handle"] = None
+
+
+def _revalidate_evidence_root_binding(binding: dict[str, Any]) -> None:
+    """Fail closed unless the bound root is still the exact verified directory."""
+
+    if binding.get("handle") is None:
+        raise RuntimeError("evidence-root handle is already closed")
+    current = _capture_directory_identity(Path(binding["path"]))
+    if (current["volume_serial"], current["file_index"]) != (
+        binding["volume_serial"],
+        binding["file_index"],
     ):
-        raise RuntimeError(f"attempt root parent identity changed: {path}")
+        raise RuntimeError(f"evidence-root identity changed: {binding['path']}")
 
 
-def _remove_attempt_entry(entry: Path, bound_root: Path) -> None:
-    """Remove one attempt entry no-follow and strictly inside the bound root.
+def _validate_attempt_name(name: str) -> str:
+    if not isinstance(name, str) or not name or len(name) > 200:
+        raise RuntimeError("attempt name is invalid")
+    if any(ch in name for ch in '/\\:*?"<>|'):
+        raise RuntimeError("attempt name is invalid")
+    if name in {".", ".."} or name.strip() != name or name.endswith((" ", ".")):
+        raise RuntimeError("attempt name is invalid")
+    return name
 
-    Symbolic links and Windows reparse/junction entries are unlinked as the
-    link itself; real directories are recursed no-follow and then removed;
-    regular files are unlinked.  Nothing outside the exact lexical bound root
-    is ever deleted or followed.
+
+def _remove_private_staging_root(staging: Path) -> None:
+    """Delete only the exact private staging root created by this invocation.
+
+    Entries are removed no-follow: junctions and symlinks are unlinked as the
+    link itself and real directories are recursed, so an outside reparse
+    target is never entered or modified.
     """
 
     try:
-        entry.relative_to(bound_root)
-    except ValueError as exc:
-        raise RuntimeError(f"refusing cleanup outside the attempt root: {entry}") from exc
-    st = os.lstat(entry)
+        st = os.lstat(staging)
+    except FileNotFoundError:
+        return
     if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
-        entry.unlink()
+        os.unlink(staging)
         return
-    if stat.S_ISDIR(st.st_mode):
-        for child in list(entry.iterdir()):
-            _remove_attempt_entry(child, bound_root)
-        entry.rmdir()
+    expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    resolved = staging.resolve(strict=False)
+    if (
+        resolved.parent != expected_parent
+        or not resolved.name.startswith("orchestrator-s6-evidence-staging-")
+    ):
+        raise RuntimeError(f"refusing unexpected evidence staging root: {resolved}")
+
+    def remove_entry(entry: Path) -> None:
+        entry_st = os.lstat(entry)
+        if stat.S_ISLNK(entry_st.st_mode) or getattr(entry_st, "st_reparse_tag", 0) != 0:
+            os.unlink(entry)
+            return
+        if stat.S_ISDIR(entry_st.st_mode):
+            for child in list(entry.iterdir()):
+                remove_entry(child)
+            entry.rmdir()
+            return
+        if stat.S_ISREG(entry_st.st_mode):
+            os.unlink(entry)
+            return
+        raise RuntimeError(f"unsupported evidence staging entry: {entry.name}")
+
+    remove_entry(resolved)
+
+
+def _build_staging_evidence(
+    root_binding: dict[str, Any], record: dict[str, Any],
+) -> Path:
+    """Build one private same-volume staging directory with exactly the record.
+
+    No disposable artifact is ever written under the retained external
+    evidence tree; the record is created exclusively inside a fresh private
+    staging directory under the host temp root.
+    """
+
+    staging = Path(
+        tempfile.mkdtemp(prefix="orchestrator-s6-evidence-staging-")
+    ).resolve()
+    try:
+        staging_identity = _capture_directory_identity(staging)
+        if staging_identity["volume_serial"] != root_binding["volume_serial"]:
+            raise RuntimeError("evidence staging is not on the evidence-root volume")
+        record_path = staging / "REAL_AGENT_TEST_RESULT.json"
+        with open(record_path, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        return staging
+    except BaseException:
+        _remove_private_staging_root(staging)
+        raise
+
+
+def _verify_regular_record_file(record_path: Path) -> None:
+    try:
+        st = os.lstat(record_path)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"staging record file is missing: {record_path}") from exc
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
+        raise RuntimeError(
+            f"staging record file must not be a link or reparse point: {record_path}"
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"staging record file is not a regular file: {record_path}")
+
+
+# Test-only interposition point invoked with (root_binding, attempt_name,
+# staging, record_path) after evidence-root/staging validation and immediately
+# before the native handle-relative publication.  Production runs never set it.
+_PUBLICATION_INTERPOSITION_HOOK: Any = None
+
+
+def _rename_attempt_relative(
+    source_handle: int, root_handle: int, attempt_name: str,
+) -> None:
+    """One no-replace handle-relative native atomic rename.
+
+    Uses NtSetInformationFile with FileRenameInformation whose RootDirectory
+    is the retained evidence-root handle; the destination is a fresh
+    unpredictable attempt name and ReplaceIfExists is always FALSE.
+    """
+
+    _windows_api()
+    name_bytes = attempt_name.encode("utf-16-le")
+    fixed = _FILE_RENAME_INFO_FIXED(False, root_handle, len(name_bytes))
+    buffer_size = _FILE_RENAME_INFO_HEADER_SIZE + len(name_bytes)
+    buffer = ctypes.create_string_buffer(buffer_size)
+    ctypes.memmove(buffer, ctypes.byref(fixed), _FILE_RENAME_INFO_HEADER_SIZE)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + _FILE_RENAME_INFO_HEADER_SIZE,
+        name_bytes,
+        len(name_bytes),
+    )
+    status_block = _IO_STATUS_BLOCK()
+    status = _NTDLL.NtSetInformationFile(
+        source_handle,
+        ctypes.byref(status_block),
+        buffer,
+        buffer_size,
+        _FILE_RENAME_INFORMATION_CLASS,
+    )
+    if status == 0:
         return
-    if stat.S_ISREG(st.st_mode):
-        entry.unlink()
-        return
-    raise RuntimeError(f"unsupported attempt evidence entry: {entry.name}")
+    if (status & 0xFFFFFFFF) == 0xC0000035:  # STATUS_OBJECT_NAME_COLLISION
+        raise RuntimeError(
+            f"attempt destination already exists; native publication failed "
+            f"closed: {attempt_name}"
+        )
+    raise RuntimeError(
+        f"native handle-relative publication failed closed "
+        f"(0x{status & 0xFFFFFFFF:08X}): {attempt_name}"
+    )
+
+
+def _publish_attempt_directory(
+    root_binding: dict[str, Any], attempt_name: str, staging: Path,
+) -> Path:
+    """Publish one complete one-file attempt via handle-relative atomic rename.
+
+    The final external attempt path never exists and is never announced
+    before this rename.  The root binding is revalidated and the private
+    staging identity is re-captured immediately before the native call, and
+    any substitution, collision, or native error fails closed without
+    touching either target.
+    """
+
+    _validate_attempt_name(attempt_name)
+    _revalidate_evidence_root_binding(root_binding)
+    staging_identity = _capture_directory_identity(staging)
+    if staging_identity["volume_serial"] != root_binding["volume_serial"]:
+        raise RuntimeError("evidence staging is not on the evidence-root volume")
+    record_path = staging / "REAL_AGENT_TEST_RESULT.json"
+    _verify_regular_record_file(record_path)
+    hook = _PUBLICATION_INTERPOSITION_HOOK
+    if hook is not None:
+        hook(root_binding, attempt_name, staging, record_path)
+    _revalidate_evidence_root_binding(root_binding)
+    current_staging = _capture_directory_identity(staging)
+    if (current_staging["volume_serial"], current_staging["file_index"]) != (
+        staging_identity["volume_serial"],
+        staging_identity["file_index"],
+    ):
+        raise RuntimeError("evidence staging identity changed before publication")
+    _verify_regular_record_file(record_path)
+    source = _open_directory_handle(
+        staging,
+        access=_FILE_DELETE | _FILE_READ_ATTRIBUTES | _FILE_SYNCHRONIZE,
+        share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+    )
+    try:
+        _rename_attempt_relative(source, root_binding["handle"], attempt_name)
+    finally:
+        _close_handle(source)
+    return Path(root_binding["path"]) / attempt_name
 
 
 def _finalize_attempt_evidence(
-    evidence: Path,
+    root_binding: dict[str, Any],
+    attempt_name: str,
     record: dict[str, Any],
-    *,
-    attempt_identity: dict[str, Any],
-) -> dict[str, Any]:
-    """Purge the exact attempt evidence directory and retain one allowlisted record.
+) -> Path:
+    """Publish exactly one allowlisted record through one handle-bound rename.
 
     Every terminal route (success and failure) publishes through this single
-    finalization owner.  The attempt root is bound by the no-follow identity
-    captured at creation; the lexical path is never resolved.  Identity/type/
-    parent are revalidated immediately before destructive iteration, before
-    each destructive boundary, and immediately before atomic publication, and
-    any replacement fails closed.  Child cleanup is no-follow and stays inside
-    the exact bound root.  The retained record is constructed only from fixed
+    finalization owner.  The retained record is constructed only from fixed
     identity and outcome scalars plus safe hashes/counts; provider-controlled
     text and full controller/provider objects are never copied into it.
     """
 
     if record.get("status") not in {"PASS", "FAIL"} or record.get("retained_file_count") != 1:
         raise RuntimeError("attempt evidence record violates the fixed allowlist")
-    _revalidate_attempt_identity(evidence, attempt_identity)
-    for entry in list(evidence.iterdir()):
-        _revalidate_attempt_identity(evidence, attempt_identity)
-        _remove_attempt_entry(entry, evidence)
-    _revalidate_attempt_identity(evidence, attempt_identity)
-    _json(evidence / "REAL_AGENT_TEST_RESULT.json", record)
-    return record
+    _revalidate_evidence_root_binding(root_binding)
+    staging = _build_staging_evidence(root_binding, record)
+    try:
+        return _publish_attempt_directory(root_binding, attempt_name, staging)
+    finally:
+        _remove_private_staging_root(staging)
 
 
 def _remove_disposable_temp_root(
@@ -560,60 +864,66 @@ def _release_preparation_process(
 
 def _terminal_finalize(
     *,
-    evidence: Path,
-    attempt_identity: dict[str, Any],
+    root_binding: dict[str, Any],
+    attempt_name: str,
     temp_root: Path,
     failure: BaseException | None,
     result: dict[str, Any] | None,
     prep_process: subprocess.Popen[bytes] | None,
     release_signal: Any,
-) -> None:
-    """Production terminal seam: funnel cleanup faults and publish one record.
+) -> Path | None:
+    """Production terminal seam: publish one record and close the root handle.
 
     Every terminal route (success and failure) passes through this single
     orchestration owner, which main()'s finally block calls.  Preparation-
     process cleanup faults are captured and converted into the existing
     failure state while safe exact-handle fallback steps still run; safe
     failure-record construction, exact disposable-root removal, and exactly
-    one attempt-evidence finalizer call cannot be bypassed by those faults.
-    The terminal fault is re-raised only after the safe retained record is
+    one construction-only attempt-evidence finalizer call cannot be bypassed
+    by those faults.  The evidence-root handle is closed exactly once on every
+    route.  The terminal fault is re-raised only after the retained record is
     published, unless finalization itself fails closed.
     """
 
-    prep_cleanup_failure = _release_preparation_process(prep_process, release_signal)
-    if prep_cleanup_failure is not None and failure is None:
-        failure = prep_cleanup_failure
-    failure_record = (
-        _safe_failure_record(temp_root, failure) if failure is not None else None
-    )
-    cleanup_failure: RuntimeError | None = None
+    published: Path | None = None
     try:
-        _remove_disposable_temp_root(temp_root)
-    except RuntimeError as exc:
-        cleanup_failure = exc
-        if failure is None:
-            failure = exc
-            failure_record = _safe_failure_record(temp_root, failure)
-    if failure is not None:
-        assert failure_record is not None
-        failure_record["host_temp_cleanup_complete"] = cleanup_failure is None
-        if cleanup_failure is not None:
-            failure_record["host_temp_cleanup_failure_type"] = type(
-                cleanup_failure
-            ).__name__
-        if prep_cleanup_failure is not None:
-            failure_record["preparation_cleanup_failure_type"] = type(
-                prep_cleanup_failure
-            ).__name__
-        _finalize_attempt_evidence(
-            evidence, failure_record, attempt_identity=attempt_identity,
+        prep_cleanup_failure = _release_preparation_process(prep_process, release_signal)
+        if prep_cleanup_failure is not None and failure is None:
+            failure = prep_cleanup_failure
+        failure_record = (
+            _safe_failure_record(temp_root, failure) if failure is not None else None
         )
-        raise failure
-    elif result is not None:
-        result["host_temp_cleanup_complete"] = True
-        _finalize_attempt_evidence(
-            evidence, result, attempt_identity=attempt_identity,
-        )
+        cleanup_failure: RuntimeError | None = None
+        try:
+            _remove_disposable_temp_root(temp_root)
+        except RuntimeError as exc:
+            cleanup_failure = exc
+            if failure is None:
+                failure = exc
+                failure_record = _safe_failure_record(temp_root, failure)
+        if failure is not None:
+            assert failure_record is not None
+            failure_record["host_temp_cleanup_complete"] = cleanup_failure is None
+            if cleanup_failure is not None:
+                failure_record["host_temp_cleanup_failure_type"] = type(
+                    cleanup_failure
+                ).__name__
+            if prep_cleanup_failure is not None:
+                failure_record["preparation_cleanup_failure_type"] = type(
+                    prep_cleanup_failure
+                ).__name__
+            _finalize_attempt_evidence(root_binding, attempt_name, failure_record)
+            raise failure
+        elif result is not None:
+            result["host_temp_cleanup_complete"] = True
+            published = _finalize_attempt_evidence(
+                root_binding, attempt_name, result,
+            )
+        else:
+            raise RuntimeError("terminal seam requires a result or a failure")
+    finally:
+        _close_evidence_root_handle(root_binding)
+    return published
 
 
 def _wait_json(path: Path, predicate: Any, *, timeout: float, process: subprocess.Popen[bytes] | None = None) -> dict[str, Any]:
@@ -750,15 +1060,20 @@ def main() -> int:
         raise RuntimeError("Codex authentication file is unavailable")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    attempt_name = stamp
     evidence_root = _resolve_evidence_root(args.evidence_root)
-    evidence = evidence_root / stamp
-    evidence.mkdir(parents=True, exist_ok=False)
-    attempt_identity = _attempt_directory_identity(evidence)
-    print(f"REAL_AGENT_EVIDENCE={evidence}", flush=True)
-    run_id = uuid.uuid4().hex
-    nonce = uuid.uuid4().hex + uuid.uuid4().hex
     temp_name = tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-")
     temp_root = Path(temp_name).resolve()
+    try:
+        root_binding = _open_evidence_root_handle(evidence_root)
+    except BaseException:
+        try:
+            _remove_disposable_temp_root(temp_root)
+        except BaseException:
+            pass
+        raise
+    run_id = uuid.uuid4().hex
+    nonce = uuid.uuid4().hex + uuid.uuid4().hex
     prep_process: subprocess.Popen[bytes] | None = None
     result: dict[str, Any] | None = None
     failure: BaseException | None = None
@@ -778,13 +1093,14 @@ def main() -> int:
         guarded = wsl_path(args.distro, SUPPORT / "wsl_guarded_entry.py")
         provider = wsl_path(args.distro, SUPPORT / "wsl_codex_provider.py")
         cgroup_launcher = wsl_path(args.distro, SUPPORT / "cgroup_exec.py")
+        evidence_dir = temp_root / "prepared-evidence"
         prep_command = [
             "wsl.exe", "-d", args.distro, "-u", "root", "--", "python3", guarded,
             "--run-id", run_id, "--driver", driver, "--",
             "--mode", "prepare", "--nonce", nonce, "--invocation-id", WORKER_ID,
             "--state", wsl_path(args.distro, state_path),
             "--release-signal", wsl_path(args.distro, release_signal),
-            "--evidence", wsl_path(args.distro, evidence),
+            "--evidence", wsl_path(args.distro, evidence_dir),
             "--auth-json", wsl_path(args.distro, auth),
             "--workspace", wsl_path(args.distro, repo),
             "--codex-root", args.codex_root,
@@ -936,15 +1252,16 @@ def main() -> int:
     except BaseException as exc:  # noqa: BLE001
         failure = exc
     finally:
-        _terminal_finalize(
-            evidence=evidence,
-            attempt_identity=attempt_identity,
+        published = _terminal_finalize(
+            root_binding=root_binding,
+            attempt_name=attempt_name,
             temp_root=temp_root,
             failure=failure,
             result=result,
             prep_process=prep_process,
             release_signal=release_signal,
         )
+        print(f"REAL_AGENT_EVIDENCE={published}", flush=True)
         # No runtime, authentication material, or provider transcript is
         # retained in source or copied from the disposable repository.
     assert result is not None
