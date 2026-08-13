@@ -1,0 +1,25 @@
+{
+  "include": [
+    "orchestrator_harness",
+    "harness_common",
+    "harness_watcher_implementation",
+    "firmware_acceptance",
+    "examples"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.git/**",
+    ".agent-workspace/**",
+    "multi-agent-logs/**",
+    "docs/**",
+    "tools/**",
+    "release_evidence_templates/**"
+  ],
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "extraPaths": [
+    "."
+  ],
+  "typeCheckingMode": "standard",
+  "baselineFile": ".codex/dev/basedpyright-baseline.json"
+}

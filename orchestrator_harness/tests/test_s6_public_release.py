@@ -591,12 +591,6 @@ class S6SelectorTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(root), "config", "user.email", "foreign@example.invalid"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(root), "config", "user.name", "Foreign Selection"], check=True, capture_output=True)
-            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
-            baseline.parent.mkdir(parents=True)
-            baseline.write_text("{}\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text(
-                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n', encoding="utf-8"
-            )
             subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(root), "commit", "-m", "candidate"], check=True, capture_output=True)
             head = subprocess.run(
@@ -2399,13 +2393,6 @@ class S6SafeguardTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(root), "config", "user.email", "selector@example.invalid"], check=True)
             subprocess.run(["git", "-C", str(root), "config", "user.name", "Selector Test"], check=True)
-            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
-            baseline.parent.mkdir(parents=True)
-            baseline.write_text("{}\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text(
-                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n',
-                encoding="utf-8",
-            )
             subprocess.run(["git", "-C", str(root), "add", "."], check=True)
             subprocess.run(["git", "-C", str(root), "commit", "-m", "selector candidate"], check=True, capture_output=True)
             credit_file = Path(raw) / "credits.json"
@@ -2459,6 +2446,58 @@ class S6SafeguardTests(unittest.TestCase):
             )
             self.assertNotEqual(0, injected.returncode)
             self.assertIn("parameter", (injected.stdout + injected.stderr).lower())
+
+    def test_safeguard_reaches_ready_from_candidate_owned_prerequisites(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-candidate-owned-") as raw:
+            root = Path(raw) / "candidate"
+            shutil.copytree(
+                REPOSITORY_ROOT,
+                root,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
+                ),
+            )
+            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
+            pyright_config = root / "pyrightconfig.json"
+            self.assertTrue(baseline.is_file())
+            self.assertTrue(pyright_config.is_file())
+            subprocess.run(
+                ["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "candidate@example.invalid"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Candidate Test"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "candidate tree"],
+                check=True, capture_output=True,
+            )
+            head = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            completed = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    str(root / "tools" / "Invoke-CandidateSafeguard.ps1"),
+                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
+                    "-ExpectedTip", head,
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertIn("READY S6.RELEASE.", completed.stdout)
+            self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
 
     def test_safeguard_stops_before_second_component_after_identity_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-safeguard-core-") as raw:
