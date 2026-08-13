@@ -54,7 +54,7 @@ from orchestrator_harness.provider import (
     unregister_provider_adapter,
 )
 from orchestrator_harness.prompt_bundle import prompt_bundle_record_from_paths
-from orchestrator_harness.task import TASK_CARD_SCHEMA, record_sha256
+from orchestrator_harness.task import TASK_CARD_SCHEMA, TASK_RESULT_SCHEMA, record_sha256
 
 
 FAKE_CLI = r'''
@@ -389,6 +389,39 @@ class MyCliBuildAdapter(BaseProviderAdapter):
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
         return "COMPLETED" if exit_code == 0 else "FAILED"
+
+    def redact_argv(self, argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        # PA-ROOT-COMPLETION-016: explicit redaction choice (generic-safe).
+        return redact_command(argv)
+
+
+class ForeignUnknownTerminalAdapter(BaseProviderAdapter):
+    """Foreign adapter whose terminal outcome is outside the closed vocabulary.
+
+    REL.R1-001: an external adapter may return a string outside the closed
+    provider-neutral COMPLETED/FAILED/CANCELLED vocabulary; the generic
+    controller must fail closed instead of publishing PROVIDER_EXITED or
+    returning success.
+    """
+
+    provider_id = "foreign-unknown"
+
+    def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
+        return [*spec.command, "--unknown"]
+
+    def encode_prompt(self, prompt: bytes) -> bytes:
+        return prompt
+
+    def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
+        text = line.decode("utf-8", errors="replace").strip()
+        if "thread.started" in text:
+            return ProviderEvent("STARTED", session_id="fake-cli-session", raw_type="thread.started")
+        if "turn.completed" in text:
+            return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="turn.completed")
+        return None
+
+    def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
+        return "UNKNOWN"
 
     def redact_argv(self, argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         # PA-ROOT-COMPLETION-016: explicit redaction choice (generic-safe).
@@ -836,6 +869,98 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         transcript = (self.workspace / "worker_provider.jsonl").read_text(encoding="utf-8")
         self.assertIn(payload, transcript)
         self.assertNotIn(sentinel, transcript)
+
+    def test_unknown_terminal_outcome_fails_closed_with_controller_failure(self) -> None:
+        # REL.R1-001: the selected adapter's provider-neutral terminal outcome
+        # must be in the closed COMPLETED/FAILED/CANCELLED vocabulary before
+        # the generic controller may publish PROVIDER_EXITED or return
+        # success.  An external adapter returning UNKNOWN after a child exit
+        # 0 and a shape-valid RESULT.json yields truthful CONTROLLER_FAILED
+        # evidence and controller exit 1.
+        register_provider_adapter(
+            "foreign-unknown",
+            ForeignUnknownTerminalAdapter(),
+            version="foreign-unknown-1.0",
+            capabilities=_capabilities(notification=False),
+        )
+        try:
+            raw = self._canonical(provider_id="foreign-unknown")
+            card = {
+                "schema": TASK_CARD_SCHEMA,
+                "card_id": "card-1",
+                "lane_id": "lane-1",
+                "stage_cohort_id": "cohort-1",
+                "worker_invocation_id": "worker-1",
+                "objective": "Do the bounded task",
+                "revision": "r1",
+            }
+            bundle = raw["prompt_bundle"]
+            result = {
+                "schema": TASK_RESULT_SCHEMA,
+                "card_id": card["card_id"],
+                "lane_id": card["lane_id"],
+                "worker_invocation_id": card["worker_invocation_id"],
+                "cohort_id": card["stage_cohort_id"],
+                "revision": card["revision"],
+                "task_card_sha256": record_sha256(card),
+                "branch": "synthetic",
+                "commit": "a" * 40,
+                "outcome": "PASS",
+                "summary": "synthetic provider completed",
+                "checks": [{"name": "fake-provider", "outcome": "PASS"}],
+                "prompt_bundle_sha256": bundle["bundle_sha256"],
+                "prompt_content_sha256": bundle["final_sha256"],
+            }
+            # The child writes the shape-valid RESULT.json during its run so
+            # the canonical start pre-launch fixed-artifact check passes and
+            # the controller validates it after the exit-0 child.
+            result_file = self.root / "result.json"
+            result_file.write_text(json.dumps(result), encoding="utf-8")
+            fake_unknown = self.root / "fake_unknown.py"
+            fake_unknown.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "marker = Path(sys.argv[1])\n"
+                "target = Path(sys.argv[2])\n"
+                "source = Path(sys.argv[3])\n"
+                "marker.write_text('launch\\n', encoding='utf-8')\n"
+                "target.write_text(source.read_text(encoding='utf-8'), encoding='utf-8')\n"
+                "sys.stdin.read()\n"
+                "print(json.dumps({'type': 'thread.started', 'thread_id': 'fake-cli-session'}), flush=True)\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n",
+                encoding="utf-8",
+            )
+            raw["provider"] = {
+                **raw["provider"],
+                "command": [
+                    sys.executable,
+                    str(fake_unknown),
+                    str(self.marker),
+                    str(self.workspace / "RESULT.json"),
+                    str(result_file),
+                ],
+            }
+            path = self.workspace / "start.invocation.json"
+            self._write(path, raw)
+            self.assertEqual(1, controller.main([str(path)]))
+            self.assertEqual("launch\n", self.marker.read_text(encoding="utf-8"))
+            status = self._status()
+            self.assertEqual("CONTROLLER_FAILED", status["state"])
+            self.assertEqual("UNKNOWN", status["provider_terminal_outcome"])
+            self.assertEqual(0, status["exit_code"])
+            self.assertEqual("SHAPE_VALID", status["result_validation"]["state"])
+            self.assertTrue(status["result_valid"])
+            self.assertIn("closed provider-neutral vocabulary", status["error"])
+            invalid = status["terminal_outcome_invalid"]
+            self.assertEqual("UNKNOWN", invalid["returned"])
+            self.assertEqual(["CANCELLED", "COMPLETED", "FAILED"], invalid["allowed"])
+            evidence = status["provider_evidence"]
+            self.assertIsNotNone(evidence)
+            self.assertEqual("foreign-unknown", evidence["provider_id"])
+            self.assertEqual("foreign-unknown-1.0", evidence["adapter_version"])
+            self.assertEqual("fake-cli-session", evidence["session_id"])
+        finally:
+            unregister_provider_adapter("foreign-unknown")
 
     def test_foreign_auth_secret_reaches_child_but_never_persists(self) -> None:
         # PA-R1-001: the selected adapter owns complete redacted argv

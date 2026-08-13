@@ -46,6 +46,13 @@ PROVIDER_OPERATION_NAMES = (
     "notification",
 )
 
+# The closed provider-neutral terminal-outcome vocabulary (REL.R1-001).
+# The generic controller may publish PROVIDER_EXITED or return success only
+# for one of these adapter-produced outcomes; any other string is a
+# controller failure even when the child exited 0 and the result is
+# shape-valid.
+PROVIDER_TERMINAL_OUTCOMES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
 # Deterministic redaction markers for command provenance.  Provenance never
 # carries credentials; any token that looks like a credential is replaced.
 _REDACTION_MARKERS = (
@@ -96,7 +103,7 @@ class ProviderEvent:
 
     @property
     def is_terminal(self) -> bool:
-        return self.kind in {"COMPLETED", "FAILED", "CANCELLED"}
+        return self.kind in PROVIDER_TERMINAL_OUTCOMES
 
 
 class ProviderAdapter(Protocol):

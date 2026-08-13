@@ -46,6 +46,7 @@ from .process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryU
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     PROVIDER_OPERATION_NAMES,
+    PROVIDER_TERMINAL_OUTCOMES,
     ProviderAdapter,
     ProviderAdapterError,
     ProviderEvent,
@@ -2444,6 +2445,42 @@ def run(invocation: Invocation) -> int:
             state["result_validation"] = result_validation
             state["result_valid"] = result_valid
         terminal_outcome = adapter.terminal_outcome(provider_terminal_event, exit_code)
+        if terminal_outcome not in PROVIDER_TERMINAL_OUTCOMES:
+            # REL.R1-001: the selected adapter's provider-neutral terminal
+            # outcome must be in the closed COMPLETED/FAILED/CANCELLED
+            # vocabulary before the generic controller may publish
+            # PROVIDER_EXITED or return success.  An unknown outcome is a
+            # truthful controller failure even when the child exited 0 and
+            # the result is shape-valid.
+            terminal_error = (
+                f"provider adapter {invocation.provider_id!r} returned terminal outcome "
+                f"{terminal_outcome!r} outside the closed provider-neutral vocabulary "
+                "COMPLETED/FAILED/CANCELLED"
+            )
+            state.update({
+                "state": "CONTROLLER_FAILED",
+                "provider_terminal_outcome": terminal_outcome,
+                "exit_code": exit_code,
+                "ended_utc": _utc(),
+                "error": terminal_error,
+                "terminal_outcome_invalid": {
+                    "returned": terminal_outcome,
+                    "allowed": sorted(PROVIDER_TERMINAL_OUTCOMES),
+                },
+            })
+            _atomic_json(invocation.status_path, state)
+            _append_event(invocation.event_log, _event(
+                invocation,
+                "CONTROLLER_FAILED",
+                provider_id=invocation.provider_id,
+                provider_terminal_outcome=terminal_outcome,
+                exit_code=exit_code,
+                thread_id=state.get("thread_id"),
+                session_id=state.get("provider_session_id"),
+                result_validation=state.get("result_validation"),
+                error=terminal_error,
+            ))
+            return 1
         state.update({"state": exited_state, "provider_terminal_outcome": terminal_outcome, "exit_code": exit_code, "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
         _append_event(invocation.event_log, _event(
