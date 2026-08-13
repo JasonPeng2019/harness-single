@@ -347,7 +347,8 @@ _FILE_SHARE_DELETE = 0x00000004
 _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _FILE_RENAME_INFORMATION_CLASS = 10
-_FILE_RENAME_INFO_HEADER_SIZE = 20
+_FILE_DIRECTORY_INFORMATION_CLASS = 1
+_FILE_DISPOSITION_INFORMATION_CLASS = 13
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 _WINDOWS_API_READY = False
@@ -384,12 +385,49 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
     ]
 
 
-class _FILE_RENAME_INFO_FIXED(ctypes.Structure):
+class _LARGE_INTEGER(ctypes.Structure):
+    _fields_ = [
+        ("QuadPart", ctypes.c_longlong),
+    ]
+
+
+class _FILE_DIRECTORY_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("NextEntryOffset", wintypes.ULONG),
+        ("FileIndex", wintypes.ULONG),
+        ("CreationTime", _LARGE_INTEGER),
+        ("LastAccessTime", _LARGE_INTEGER),
+        ("LastWriteTime", _LARGE_INTEGER),
+        ("ChangeTime", _LARGE_INTEGER),
+        ("EndOfFile", _LARGE_INTEGER),
+        ("AllocationSize", _LARGE_INTEGER),
+        ("FileAttributes", wintypes.ULONG),
+        ("FileNameLength", wintypes.ULONG),
+        ("FileName", wintypes.WCHAR * 1),
+    ]
+
+
+class _FILE_RENAME_INFORMATION(ctypes.Structure):
     _fields_ = [
         ("ReplaceIfExists", wintypes.BOOL),
         ("RootDirectory", wintypes.HANDLE),
         ("FileNameLength", wintypes.DWORD),
+        ("FileName", wintypes.WCHAR * 1),
     ]
+
+
+class _FILE_DISPOSITION_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("DeleteFile", wintypes.BOOLEAN),
+        ("_reserved", wintypes.BYTE * 3),
+    ]
+
+
+# The filename payload begins at the native FileName member offset: 20 bytes
+# on 64-bit Windows and 12 bytes on 32-bit Windows.  sizeof() of the
+# structure is not used because trailing array alignment would overestimate
+# the header.
+_FILE_RENAME_INFO_HEADER_SIZE = _FILE_RENAME_INFORMATION.FileName.offset
 
 
 def _windows_api() -> None:
@@ -420,6 +458,26 @@ def _windows_api() -> None:
         wintypes.ULONG, ctypes.c_int,
     ]
     _NTDLL.NtSetInformationFile.restype = wintypes.LONG
+    _KERNEL32.ReadFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    _KERNEL32.ReadFile.restype = wintypes.BOOL
+    _KERNEL32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    _KERNEL32.SetFilePointerEx.restype = wintypes.BOOL
+    _KERNEL32.GetFileSizeEx.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_LARGE_INTEGER),
+    ]
+    _KERNEL32.GetFileSizeEx.restype = wintypes.BOOL
+    _NTDLL.NtQueryDirectoryFile.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(_IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
+        ctypes.c_int, wintypes.BOOLEAN, ctypes.c_void_p, wintypes.BOOLEAN,
+    ]
+    _NTDLL.NtQueryDirectoryFile.restype = wintypes.LONG
     _WINDOWS_API_READY = True
 
 
@@ -440,6 +498,95 @@ def _close_handle(handle: int) -> None:
     if handle is not None and handle != _INVALID_HANDLE_VALUE:
         _windows_api()
         _KERNEL32.CloseHandle(handle)
+
+
+def _open_regular_file_handle(path: Path, *, access: int, share: int) -> int:
+    """Open one file no-follow and return the exact Windows handle."""
+
+    _windows_api()
+    handle = _KERNEL32.CreateFileW(
+        str(path), access, share, None, 3,  # OPEN_EXISTING
+        _FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise OSError(ctypes.get_last_error(), f"failed to open file handle: {path}")
+    return int(handle)
+
+
+def _read_file_handle(handle: int, size: int) -> bytes:
+    """Read exactly the requested byte count through one retained handle."""
+
+    _windows_api()
+    distance = ctypes.c_longlong(0)
+    if not _KERNEL32.SetFilePointerEx(handle, 0, ctypes.byref(distance), 0):
+        raise OSError(ctypes.get_last_error(), "SetFilePointerEx failed")
+    buffer = ctypes.create_string_buffer(size)
+    read = wintypes.DWORD(0)
+    if not _KERNEL32.ReadFile(handle, buffer, size, ctypes.byref(read), None):
+        raise OSError(ctypes.get_last_error(), "ReadFile failed")
+    return buffer.raw[: read.value]
+
+
+def _file_size_handle(handle: int) -> int:
+    """Return the exact byte size of one retained file handle."""
+
+    _windows_api()
+    size = _LARGE_INTEGER()
+    if not _KERNEL32.GetFileSizeEx(handle, ctypes.byref(size)):
+        raise OSError(ctypes.get_last_error(), "GetFileSizeEx failed")
+    return int(size.QuadPart)
+
+
+def _enumerate_directory_handle(handle: int) -> list[dict[str, Any]]:
+    """List one directory through its retained handle; no pathname is used."""
+
+    _windows_api()
+    buffer = ctypes.create_string_buffer(65536)
+    status_block = _IO_STATUS_BLOCK()
+    status = _NTDLL.NtQueryDirectoryFile(
+        handle, None, None, None, ctypes.byref(status_block),
+        buffer, len(buffer), _FILE_DIRECTORY_INFORMATION_CLASS,
+        False, None, True,
+    )
+    if (status & 0xFFFFFFFF) == 0x80000006:  # STATUS_NO_MORE_FILES
+        return []
+    if status != 0:
+        raise RuntimeError(
+            f"directory enumeration failed closed (0x{status & 0xFFFFFFFF:08X})"
+        )
+    entries: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        entry = ctypes.cast(
+            ctypes.byref(buffer, offset), ctypes.POINTER(_FILE_DIRECTORY_INFORMATION)
+        ).contents
+        name_length = int(entry.FileNameLength)
+        name = ctypes.string_at(
+            ctypes.addressof(entry) + _FILE_DIRECTORY_INFORMATION.FileName.offset,
+            name_length,
+        ).decode("utf-16-le")
+        entries.append({"name": name, "attributes": int(entry.FileAttributes)})
+        if entry.NextEntryOffset == 0:
+            break
+        offset += int(entry.NextEntryOffset)
+    return entries
+
+
+def _set_file_disposition(handle: int, delete: bool) -> None:
+    """Mark one retained handle for native deletion at close; no pathname."""
+
+    _windows_api()
+    info = _FILE_DISPOSITION_INFORMATION(bool(delete))
+    status_block = _IO_STATUS_BLOCK()
+    status = _NTDLL.NtSetInformationFile(
+        handle, ctypes.byref(status_block), ctypes.byref(info),
+        ctypes.sizeof(_FILE_DISPOSITION_INFORMATION),
+        _FILE_DISPOSITION_INFORMATION_CLASS,
+    )
+    if status != 0:
+        raise RuntimeError(
+            f"native disposition failed closed (0x{status & 0xFFFFFFFF:08X})"
+        )
 
 
 def _handle_file_information(handle: int) -> dict[str, Any]:
@@ -544,7 +691,7 @@ def _revalidate_evidence_root_binding(binding: dict[str, Any]) -> None:
 
 
 def _validate_attempt_name(name: str) -> str:
-    if not isinstance(name, str) or not name or len(name) > 200:
+    if not isinstance(name, str) or not name:
         raise RuntimeError("attempt name is invalid")
     if any(ch in name for ch in '/\\:*?"<>|'):
         raise RuntimeError("attempt name is invalid")
@@ -553,89 +700,221 @@ def _validate_attempt_name(name: str) -> str:
     return name
 
 
-def _remove_private_staging_root(staging: Path) -> None:
-    """Delete only the exact private staging root created by this invocation.
+# Test-only interposition point invoked with the staging binding inside the
+# fail-closed handle-closing owner of exact staging disposal; a hook fault
+# closes and clears the retained staging handle and leaves the private stage
+# untouched.  Production runs never set it.
+_CLEANUP_INTERPOSITION_HOOK: Any = None
 
-    Entries are removed no-follow: junctions and symlinks are unlinked as the
-    link itself and real directories are recursed, so an outside reparse
-    target is never entered or modified.
+
+def _verify_staging_via_handles(binding: dict[str, Any]) -> None:
+    """Fail closed unless the retained staging object is exact and current.
+
+    All checks use only the retained no-follow staging-directory handle and
+    transient no-follow record opens; the staging pathname is never resolved
+    or reopened in the final check-use interval.  The record handle is never
+    held across the native directory rename (Windows refuses to rename a
+    directory that contains an open child handle), so the exact record bytes
+    and identity are re-verified immediately before publication.
     """
 
-    try:
-        st = os.lstat(staging)
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
-        os.unlink(staging)
-        return
-    expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
-    resolved = staging.resolve(strict=False)
-    if (
-        resolved.parent != expected_parent
-        or not resolved.name.startswith("orchestrator-s6-evidence-staging-")
+    staging_handle = binding.get("handle")
+    if staging_handle is None:
+        raise RuntimeError("staging binding is not retained")
+    info = _handle_file_information(staging_handle)
+    if (info["volume_serial"], info["file_index"]) != (
+        binding["volume_serial"],
+        binding["file_index"],
     ):
-        raise RuntimeError(f"refusing unexpected evidence staging root: {resolved}")
+        raise RuntimeError("evidence staging identity changed")
+    entries = _enumerate_directory_handle(staging_handle)
+    names = sorted(
+        entry["name"] for entry in entries if entry["name"] not in (".", "..")
+    )
+    if names != [binding["record_name"]]:
+        raise RuntimeError(
+            f"staging directory must contain exactly one record: {names}"
+        )
+    for entry in entries:
+        if entry["name"] in (".", ".."):
+            continue
+        if entry["attributes"] & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError("staging record must not be a reparse point")
+        if entry["attributes"] & _FILE_ATTRIBUTE_DIRECTORY:
+            raise RuntimeError("staging record must be an ordinary file")
+    record_handle = _open_record_handle(binding, delete=False)
+    try:
+        record_info = _handle_file_information(record_handle)
+        if (record_info["volume_serial"], record_info["file_index"]) != (
+            binding["record_volume_serial"],
+            binding["record_file_index"],
+        ):
+            raise RuntimeError("staging record identity changed")
+        if _file_size_handle(record_handle) != len(binding["record_bytes"]):
+            raise RuntimeError("staging record size changed")
+        actual = _read_file_handle(record_handle, len(binding["record_bytes"]))
+        if actual != binding["record_bytes"]:
+            raise RuntimeError("staging record bytes changed")
+    finally:
+        _close_handle(record_handle)
 
-    def remove_entry(entry: Path) -> None:
-        entry_st = os.lstat(entry)
-        if stat.S_ISLNK(entry_st.st_mode) or getattr(entry_st, "st_reparse_tag", 0) != 0:
-            os.unlink(entry)
-            return
-        if stat.S_ISDIR(entry_st.st_mode):
-            for child in list(entry.iterdir()):
-                remove_entry(child)
-            entry.rmdir()
-            return
-        if stat.S_ISREG(entry_st.st_mode):
-            os.unlink(entry)
-            return
-        raise RuntimeError(f"unsupported evidence staging entry: {entry.name}")
 
-    remove_entry(resolved)
+def _dispose_staging_evidence(binding: dict[str, Any]) -> None:
+    """Dispose exactly the retained staging object by handle or fail closed.
+
+    Verifies through the retained staging-directory handle that it still
+    contains exactly the retained record with the expected bytes, then opens
+    the exact record no-follow with DELETE access, verifies its identity
+    again, marks it for native deletion, marks the now-empty directory for
+    native deletion, and closes every owned handle.  The test-only cleanup
+    interposition hook runs inside this fail-closed handle-closing owner, so
+    a hook fault still closes and clears the exact retained staging handle
+    and leaves the private staging directory untouched.  If the exact object
+    cannot be verified, every owned handle is still closed and the private
+    staging directory is left untouched with a RuntimeError so the terminal
+    rules preserve the cleanup failure.  No mutable staging pathname is ever
+    traversed, unlinked, or removed.
+    """
+
+    staging_handle = binding.get("handle")
+    if staging_handle is None:
+        return
+    try:
+        hook = _CLEANUP_INTERPOSITION_HOOK
+        if hook is not None:
+            hook(binding)
+        _verify_staging_via_handles(binding)
+        record_handle = _open_record_handle(binding, delete=True)
+        try:
+            record_info = _handle_file_information(record_handle)
+            if (record_info["volume_serial"], record_info["file_index"]) != (
+                binding["record_volume_serial"],
+                binding["record_file_index"],
+            ):
+                raise RuntimeError("staging record identity changed during cleanup")
+            _set_file_disposition(record_handle, True)
+        finally:
+            _close_handle(record_handle)
+        entries = _enumerate_directory_handle(staging_handle)
+        if any(entry["name"] not in (".", "..") for entry in entries):
+            raise RuntimeError("staging directory gained entries during cleanup")
+        _set_file_disposition(staging_handle, True)
+        _close_handle(staging_handle)
+        binding["handle"] = None
+    except BaseException as exc:
+        _close_handle(staging_handle)
+        binding["handle"] = None
+        raise RuntimeError(f"exact staging cleanup failed closed: {exc}") from exc
+
+
+def _release_staging_handles(binding: dict[str, Any]) -> None:
+    """Close the retained staging handle after a successful publication."""
+
+    _close_handle(binding.get("handle"))
+    binding["handle"] = None
+
+
+def _open_record_handle(binding: dict[str, Any], *, delete: bool) -> int:
+    """Open the exact record file no-follow inside the bound staging directory.
+
+    The parent directory is retained with delete sharing denied, so the
+    staging pathname cannot be replaced while this open is performed; the
+    record itself is opened no-follow and verified by identity.
+    """
+
+    access = _FILE_READ_ATTRIBUTES | _FILE_READ_DATA | _FILE_SYNCHRONIZE
+    if delete:
+        access |= _FILE_DELETE
+    return _open_regular_file_handle(
+        Path(binding["path"]) / binding["record_name"],
+        access=access,
+        share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+    )
 
 
 def _build_staging_evidence(
     root_binding: dict[str, Any], record: dict[str, Any],
-) -> Path:
+) -> dict[str, Any]:
     """Build one private same-volume staging directory with exactly the record.
 
-    No disposable artifact is ever written under the retained external
-    evidence tree; the record is created exclusively inside a fresh private
-    staging directory under the host temp root.
+    The fresh staging directory is bound immediately after creation with a
+    no-follow handle opened without delete sharing; that exact handle and its
+    volume/file identity are retained through record construction, final
+    source validation, native publication, and safe cleanup.  The record file
+    is created inside the bound directory and its identity and serialized
+    bytes are captured through transient no-follow opens.  The staging
+    pathname is never resolved or reopened after construction, and the record
+    handle is never held across the native directory rename.
     """
 
-    staging = Path(
-        tempfile.mkdtemp(prefix="orchestrator-s6-evidence-staging-")
-    ).resolve()
+    staging_path = Path(tempfile.mkdtemp(prefix="orchestrator-s6-evidence-staging-"))
+    staging_handle: int | None = None
     try:
-        staging_identity = _capture_directory_identity(staging)
-        if staging_identity["volume_serial"] != root_binding["volume_serial"]:
+        staging_handle = _open_directory_handle(
+            staging_path,
+            access=(
+                _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _FILE_WRITE_ATTRIBUTES
+                | _FILE_SYNCHRONIZE | _FILE_DELETE
+            ),
+            share=_FILE_SHARE_READ | _FILE_SHARE_WRITE,  # delete sharing denied
+        )
+        info = _handle_file_information(staging_handle)
+        if not (info["attributes"] & _FILE_ATTRIBUTE_DIRECTORY):
+            raise RuntimeError(f"evidence staging is not a directory: {staging_path}")
+        if info["attributes"] & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeError(
+                f"evidence staging must not be a reparse point: {staging_path}"
+            )
+        if info["volume_serial"] != root_binding["volume_serial"]:
             raise RuntimeError("evidence staging is not on the evidence-root volume")
-        record_path = staging / "REAL_AGENT_TEST_RESULT.json"
+        record_bytes = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        record_path = staging_path / "REAL_AGENT_TEST_RESULT.json"
         with open(record_path, "x", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
-        return staging
+            handle.write(record_bytes.decode("utf-8"))
+        record_handle = _open_regular_file_handle(
+            record_path,
+            access=_FILE_DELETE | _FILE_READ_ATTRIBUTES | _FILE_READ_DATA | _FILE_SYNCHRONIZE,
+            share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        )
+        try:
+            record_info = _handle_file_information(record_handle)
+            if record_info["attributes"] & _FILE_ATTRIBUTE_DIRECTORY:
+                raise RuntimeError("staging record is not an ordinary file")
+            if record_info["attributes"] & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise RuntimeError("staging record must not be a reparse point")
+            actual = _read_file_handle(record_handle, len(record_bytes))
+            if actual != record_bytes:
+                raise RuntimeError("staging record bytes do not match the constructed record")
+        finally:
+            _close_handle(record_handle)
+        return {
+            "handle": staging_handle,
+            "path": str(staging_path),
+            "volume_serial": info["volume_serial"],
+            "file_index": info["file_index"],
+            "record_volume_serial": record_info["volume_serial"],
+            "record_file_index": record_info["file_index"],
+            "record_bytes": record_bytes,
+            "record_name": "REAL_AGENT_TEST_RESULT.json",
+        }
     except BaseException:
-        _remove_private_staging_root(staging)
+        # A partially built fresh private directory is left untouched after
+        # the owned handles close; the construction failure is the terminal
+        # failure and no mutable staging pathname is ever cleaned.
+        _close_handle(staging_handle)
         raise
 
 
-def _verify_regular_record_file(record_path: Path) -> None:
-    try:
-        st = os.lstat(record_path)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"staging record file is missing: {record_path}") from exc
-    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
-        raise RuntimeError(
-            f"staging record file must not be a link or reparse point: {record_path}"
-        )
-    if not stat.S_ISREG(st.st_mode):
-        raise RuntimeError(f"staging record file is not a regular file: {record_path}")
-
+# Test-only interposition point invoked with the staging binding before the
+# final retained-object staging verification.  Record-substitution tests use
+# this seam so the actual final verification detects the swap.  Production
+# runs never set it.
+_PRE_FINAL_STAGING_VALIDATION_HOOK: Any = None
 
 # Test-only interposition point invoked with (root_binding, attempt_name,
-# staging, record_path) after evidence-root/staging validation and immediately
-# before the native handle-relative publication.  Production runs never set it.
+# staging-binding) after the final full retained-object staging verification
+# and immediately before the native handle-relative publication.  Production
+# runs never set it.
 _PUBLICATION_INTERPOSITION_HOOK: Any = None
 
 
@@ -646,17 +925,23 @@ def _rename_attempt_relative(
 
     Uses NtSetInformationFile with FileRenameInformation whose RootDirectory
     is the retained evidence-root handle; the destination is a fresh
-    unpredictable attempt name and ReplaceIfExists is always FALSE.
+    unpredictable attempt name and ReplaceIfExists is always FALSE.  The
+    FILE_RENAME_INFORMATION filename payload offset is derived from the
+    active ctypes native layout (FileName.offset), never hard-coded.
     """
 
     _windows_api()
     name_bytes = attempt_name.encode("utf-16-le")
-    fixed = _FILE_RENAME_INFO_FIXED(False, root_handle, len(name_bytes))
-    buffer_size = _FILE_RENAME_INFO_HEADER_SIZE + len(name_bytes)
+    header_size = _FILE_RENAME_INFO_HEADER_SIZE
+    info = _FILE_RENAME_INFORMATION()
+    info.ReplaceIfExists = False
+    info.RootDirectory = root_handle
+    info.FileNameLength = len(name_bytes)
+    buffer_size = header_size + len(name_bytes)
     buffer = ctypes.create_string_buffer(buffer_size)
-    ctypes.memmove(buffer, ctypes.byref(fixed), _FILE_RENAME_INFO_HEADER_SIZE)
+    ctypes.memmove(buffer, ctypes.byref(info), header_size)
     ctypes.memmove(
-        ctypes.addressof(buffer) + _FILE_RENAME_INFO_HEADER_SIZE,
+        ctypes.addressof(buffer) + header_size,
         name_bytes,
         len(name_bytes),
     )
@@ -682,44 +967,30 @@ def _rename_attempt_relative(
 
 
 def _publish_attempt_directory(
-    root_binding: dict[str, Any], attempt_name: str, staging: Path,
+    root_binding: dict[str, Any], attempt_name: str, staging: dict[str, Any],
 ) -> Path:
     """Publish one complete one-file attempt via handle-relative atomic rename.
 
     The final external attempt path never exists and is never announced
-    before this rename.  The root binding is revalidated and the private
-    staging identity is re-captured immediately before the native call, and
-    any substitution, collision, or native error fails closed without
-    touching either target.
+    before this rename.  The root binding is revalidated and the retained
+    staging object is verified entirely through its no-follow handles, then
+    the publication interposition hook runs immediately before the native
+    rename; no staging validation runs between that hook and the rename.
+    The native rename source is the retained staging handle itself, so the
+    staging pathname is never resolved or reopened in the final check-use
+    interval.
     """
 
     _validate_attempt_name(attempt_name)
     _revalidate_evidence_root_binding(root_binding)
-    staging_identity = _capture_directory_identity(staging)
-    if staging_identity["volume_serial"] != root_binding["volume_serial"]:
-        raise RuntimeError("evidence staging is not on the evidence-root volume")
-    record_path = staging / "REAL_AGENT_TEST_RESULT.json"
-    _verify_regular_record_file(record_path)
+    pre_final_hook = _PRE_FINAL_STAGING_VALIDATION_HOOK
+    if pre_final_hook is not None:
+        pre_final_hook(staging)
+    _verify_staging_via_handles(staging)
     hook = _PUBLICATION_INTERPOSITION_HOOK
     if hook is not None:
-        hook(root_binding, attempt_name, staging, record_path)
-    _revalidate_evidence_root_binding(root_binding)
-    current_staging = _capture_directory_identity(staging)
-    if (current_staging["volume_serial"], current_staging["file_index"]) != (
-        staging_identity["volume_serial"],
-        staging_identity["file_index"],
-    ):
-        raise RuntimeError("evidence staging identity changed before publication")
-    _verify_regular_record_file(record_path)
-    source = _open_directory_handle(
-        staging,
-        access=_FILE_DELETE | _FILE_READ_ATTRIBUTES | _FILE_SYNCHRONIZE,
-        share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-    )
-    try:
-        _rename_attempt_relative(source, root_binding["handle"], attempt_name)
-    finally:
-        _close_handle(source)
+        hook(root_binding, attempt_name, staging)
+    _rename_attempt_relative(staging["handle"], root_binding["handle"], attempt_name)
     return Path(root_binding["path"]) / attempt_name
 
 
@@ -741,9 +1012,12 @@ def _finalize_attempt_evidence(
     _revalidate_evidence_root_binding(root_binding)
     staging = _build_staging_evidence(root_binding, record)
     try:
-        return _publish_attempt_directory(root_binding, attempt_name, staging)
-    finally:
-        _remove_private_staging_root(staging)
+        published = _publish_attempt_directory(root_binding, attempt_name, staging)
+    except BaseException:
+        _dispose_staging_evidence(staging)
+        raise
+    _release_staging_handles(staging)
+    return published
 
 
 def _remove_disposable_temp_root(

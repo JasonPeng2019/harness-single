@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,7 @@ import tempfile
 import types
 import unittest
 import zipfile
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -989,6 +991,7 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertIn("def _close_evidence_root_handle(", source)
         self.assertIn("def _rename_attempt_relative(", source)
         self.assertIn("_PUBLICATION_INTERPOSITION_HOOK", source)
+        self.assertIn("_PRE_FINAL_STAGING_VALIDATION_HOOK", source)
         self.assertNotIn("def _redacted_controller_evidence(", source)
         self.assertNotIn("def _write_safe_failure_result(", source)
         self.assertNotIn('"controller_evidence":', source)
@@ -1203,7 +1206,7 @@ class S6LocalIsolationTests(unittest.TestCase):
                 attempt_name = "attempt"
                 observed: list[str] = []
 
-                def interpose(binding, attempt_name, staging, record_path):
+                def interpose(binding, attempt_name, staging):
                     bound = Path(binding["path"])
                     try:
                         os.rename(bound, Path(str(bound) + "-moved"))
@@ -1250,24 +1253,39 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_attempt_identity_swap_fails_closed(self) -> None:
-        sentinel = "SWAP_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-swap-") as raw:
+    def test_real_agent_final_check_use_interval_refuses_staging_substitution(self) -> None:
+        sentinel = "FINAL_CHECK_USE_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-final-check-") as raw:
             root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            outside = root / "outside-target"
+            outside.mkdir()
+            (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
-            moved: list[Path] = []
             try:
-                evidence_root = root / "evidence"
-                evidence_root.mkdir()
                 root_binding = _open_evidence_root_handle(evidence_root)
                 attempt_name = "attempt"
+                observed: list[str] = []
 
-                def interpose(binding, attempt_name, staging, record_path):
-                    swapped = Path(str(staging) + "-swapped")
-                    os.rename(staging, swapped)
-                    moved.append(swapped)
-                    staging.mkdir()
-                    (staging / "foreign.jsonl").write_text(sentinel, encoding="utf-8")
+                def interpose(binding, attempt_name, staging):
+                    staging_path = Path(staging["path"])
+                    moved = Path(str(staging_path) + "-moved")
+                    try:
+                        os.rename(staging_path, moved)
+                        observed.append("rename-allowed")
+                    except PermissionError:
+                        observed.append("rename-refused")
+                    try:
+                        _make_directory_link(staging_path, outside)
+                        observed.append("junction-allowed")
+                    except (OSError, RuntimeError):
+                        observed.append("junction-refused")
+                    try:
+                        os.rmdir(staging_path)
+                        observed.append("rmdir-allowed")
+                    except PermissionError:
+                        observed.append("rmdir-refused")
 
                 record = {
                     "schema": "orchestrator-real-agent-evidence/v1",
@@ -1278,22 +1296,27 @@ class S6LocalIsolationTests(unittest.TestCase):
                     with patch.object(
                         real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "staging identity changed"):
-                            _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
-                            )
+                        published = _terminal_finalize(
+                            root_binding=root_binding, attempt_name=attempt_name,
+                            temp_root=temp_root, failure=None, result=record,
+                            prep_process=None, release_signal=None,
+                        )
                 finally:
                     _close_evidence_root_handle(root_binding)
-                self.assertFalse((evidence_root / attempt_name).exists())
-                self.assertFalse(
-                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                self.assertEqual(
+                    ["rename-refused", "junction-refused", "rmdir-refused"], observed,
                 )
+                self.assertEqual(evidence_root / attempt_name, published)
+                retained = tuple(
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+                text = (published / retained[0]).read_text(encoding="utf-8")
+                self.assertNotIn(sentinel, text)
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
             finally:
-                for swapped in moved:
-                    if swapped.exists():
-                        shutil.rmtree(swapped, ignore_errors=True)
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1307,9 +1330,20 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertNotIn("_json(evidence /", source)
         self.assertNotIn("shutil.rmtree(evidence", source)
         self.assertNotIn("os.replace(evidence", source)
+        self.assertNotIn("def _remove_private_staging_root(", source)
+        self.assertNotIn("staging.resolve(", source)
+        self.assertNotIn("shutil.rmtree(staging", source)
+        self.assertNotIn("os.walk(staging", source)
+        self.assertNotIn("_capture_directory_identity(staging", source)
+        self.assertNotIn("_verify_regular_record_file(", source)
         self.assertIn('evidence_dir = temp_root / "prepared-evidence"', source)
-        self.assertIn("def _remove_private_staging_root(", source)
+        self.assertIn("def _build_staging_evidence(", source)
+        self.assertIn("def _dispose_staging_evidence(", source)
         self.assertIn("def _rename_attempt_relative(", source)
+        self.assertIn("_FILE_RENAME_INFORMATION.FileName.offset", source)
+        self.assertIn("def _enumerate_directory_handle(", source)
+        self.assertIn("_CLEANUP_INTERPOSITION_HOOK", source)
+        self.assertIn("_PRE_FINAL_STAGING_VALIDATION_HOOK", source)
         self.assertIn("NtSetInformationFile", source)
 
     def test_real_agent_destination_collision_fails_closed(self) -> None:
@@ -1324,7 +1358,7 @@ class S6LocalIsolationTests(unittest.TestCase):
                 attempt_name = "attempt"
                 precreated: Path | None = None
 
-                def interpose(binding, attempt_name, staging, record_path):
+                def interpose(binding, attempt_name, staging):
                     nonlocal precreated
                     precreated = Path(binding["path"]) / attempt_name
                     precreated.mkdir()
@@ -1372,7 +1406,7 @@ class S6LocalIsolationTests(unittest.TestCase):
                 attempt_name = "attempt"
                 destination = evidence_root / attempt_name
 
-                def interpose(binding, attempt_name, staging, record_path):
+                def interpose(binding, attempt_name, staging):
                     _make_directory_link(Path(binding["path"]) / attempt_name, outside)
 
                 record = {
@@ -1402,21 +1436,25 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_staging_reparse_substitution_fails_closed(self) -> None:
-        sentinel = "STAGING_REPARSE_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-staging-") as raw:
+    def test_real_agent_staging_record_substitution_is_detected_and_fails_closed(self) -> None:
+        sentinel = "STAGING_RECORD_SUBSTITUTION_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-staging-record-") as raw:
             root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            outside = root / "outside-target"
+            outside.mkdir()
+            (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            staging_path: Path | None = None
             try:
-                evidence_root = root / "evidence"
-                evidence_root.mkdir()
-                outside = root / "outside-target"
-                outside.mkdir()
-                (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
                 root_binding = _open_evidence_root_handle(evidence_root)
                 attempt_name = "attempt"
 
-                def interpose(binding, attempt_name, staging, record_path):
+                def interpose(staging):
+                    nonlocal staging_path
+                    staging_path = Path(staging["path"])
+                    record_path = staging_path / "REAL_AGENT_TEST_RESULT.json"
                     record_path.unlink()
                     _make_directory_link(record_path, outside)
 
@@ -1427,9 +1465,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                        real_agent_test_module, "_PRE_FINAL_STAGING_VALIDATION_HOOK", interpose,
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "reparse point|link"):
+                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
                             _terminal_finalize(
                                 root_binding=root_binding, attempt_name=attempt_name,
                                 temp_root=temp_root, failure=None, result=record,
@@ -1437,16 +1475,448 @@ class S6LocalIsolationTests(unittest.TestCase):
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
-                self.assertFalse((evidence_root / attempt_name).exists())
-                self.assertFalse(
-                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                self.assertIsNotNone(staging_path)
+                self.assertTrue(staging_path.exists())
+                self.assertTrue(
+                    _is_directory_link(staging_path / "REAL_AGENT_TEST_RESULT.json")
                 )
                 self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
                 self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+                self.assertFalse((evidence_root / attempt_name).exists())
+                self.assertFalse(
+                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                )
+            finally:
+                if staging_path is not None and staging_path.exists():
+                    record_link = staging_path / "REAL_AGENT_TEST_RESULT.json"
+                    if _is_directory_link(record_link):
+                        record_link.unlink()
+                    shutil.rmtree(staging_path, ignore_errors=True)
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_publication_event_order_verifies_then_hooks_then_renames(self) -> None:
+        module = real_agent_test_module
+        record = {
+            "schema": "orchestrator-real-agent-evidence/v1",
+            "status": "PASS",
+            "retained_file_count": 1,
+        }
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-event-order-") as raw:
+            root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            order: list[str] = []
+            try:
+                root_binding = _open_evidence_root_handle(evidence_root)
+                real_verify = module._verify_staging_via_handles
+                real_rename = module._rename_attempt_relative
+
+                def tracked_verify(binding):
+                    order.append("final-verify")
+                    real_verify(binding)
+
+                def tracked_rename(source_handle, root_handle, attempt_name):
+                    order.append("native-rename")
+                    real_rename(source_handle, root_handle, attempt_name)
+
+                def pre_final_hook(staging):
+                    order.append("pre-final-hook")
+
+                def publication_hook(binding, attempt_name, staging):
+                    order.append("publication-hook")
+
+                try:
+                    with patch.object(module, "_verify_staging_via_handles", tracked_verify), \
+                         patch.object(module, "_rename_attempt_relative", tracked_rename), \
+                         patch.object(module, "_PRE_FINAL_STAGING_VALIDATION_HOOK", pre_final_hook), \
+                         patch.object(module, "_PUBLICATION_INTERPOSITION_HOOK", publication_hook):
+                        published = _terminal_finalize(
+                            root_binding=root_binding, attempt_name="attempt",
+                            temp_root=temp_root, failure=None, result=record,
+                            prep_process=None, release_signal=None,
+                        )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(
+                    ["pre-final-hook", "final-verify", "publication-hook", "native-rename"],
+                    order,
+                )
+                self.assertEqual(evidence_root / "attempt", published)
+                retained = tuple(
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
             finally:
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_file_rename_information_layout_derives_native_offset(self) -> None:
+        module = real_agent_test_module
+        self.assertEqual(
+            module._FILE_RENAME_INFO_HEADER_SIZE,
+            module._FILE_RENAME_INFORMATION.FileName.offset,
+        )
+        self.assertLess(
+            module._FILE_RENAME_INFO_HEADER_SIZE,
+            ctypes.sizeof(module._FILE_RENAME_INFORMATION),
+        )
+
+        class _RenameInfo32(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", wintypes.BOOL),
+                ("RootDirectory", ctypes.c_uint32),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * 1),
+            ]
+
+        # Fixed-width c_uint64 keeps the synthetic 64-bit pointer member 8
+        # bytes on any host; c_void_p would collapse to 4 bytes on 32-bit.
+        class _RenameInfo64(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", wintypes.BOOL),
+                ("RootDirectory", ctypes.c_uint64),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * 1),
+            ]
+
+        self.assertEqual(12, _RenameInfo32.FileName.offset)
+        self.assertEqual(20, _RenameInfo64.FileName.offset)
+        pointer_width = ctypes.sizeof(ctypes.c_void_p)
+        self.assertIn(pointer_width, (4, 8))
+        expected = 12 if pointer_width == 4 else 20
+        self.assertEqual(expected, module._FILE_RENAME_INFO_HEADER_SIZE)
+        self.assertEqual(module._FILE_RENAME_INFORMATION.FileName.offset, expected)
+
+    def test_real_agent_long_attempt_name_reaches_native_publication(self) -> None:
+        module = real_agent_test_module
+        long_name = "a" * 240
+        huge_name = "b" * 300
+        self.assertEqual(long_name, module._validate_attempt_name(long_name))
+        self.assertEqual(huge_name, module._validate_attempt_name(huge_name))
+        record = {
+            "schema": "orchestrator-real-agent-evidence/v1",
+            "status": "PASS",
+            "retained_file_count": 1,
+        }
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-long-name-") as raw:
+            root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            try:
+                root_binding = _open_evidence_root_handle(evidence_root)
+                try:
+                    published = _terminal_finalize(
+                        root_binding=root_binding, attempt_name=long_name,
+                        temp_root=temp_root, failure=None, result=record,
+                        prep_process=None, release_signal=None,
+                    )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(evidence_root / long_name, published)
+                self.assertTrue(published.is_dir())
+                retained = tuple(
+                    path.relative_to(published).as_posix()
+                    for path in published.rglob("*") if path.is_file()
+                )
+                self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
+
+                root_binding = _open_evidence_root_handle(evidence_root)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "publication failed closed"):
+                        _terminal_finalize(
+                            root_binding=root_binding, attempt_name=huge_name,
+                            temp_root=temp_root, failure=None, result=record,
+                            prep_process=None, release_signal=None,
+                        )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertFalse((evidence_root / huge_name).exists())
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_cleanup_refuses_staging_substitution_and_disposes_exact(self) -> None:
+        sentinel = "CLEANUP_SWAP_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-swap-") as raw:
+            root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            outside = root / "outside-target"
+            outside.mkdir()
+            (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            cleanup_refusals: list[str] = []
+            staging_path: Path | None = None
+            try:
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+
+                def publication_interpose(binding, attempt_name, staging):
+                    destination = Path(binding["path"]) / attempt_name
+                    destination.mkdir()
+                    (destination / "marker.txt").write_text(sentinel, encoding="utf-8")
+
+                def cleanup_interpose(staging):
+                    nonlocal staging_path
+                    staging_path = Path(staging["path"])
+                    moved = Path(str(staging_path) + "-moved")
+                    try:
+                        os.rename(staging_path, moved)
+                        cleanup_refusals.append("rename-allowed")
+                    except PermissionError:
+                        cleanup_refusals.append("rename-refused")
+                    try:
+                        _make_directory_link(staging_path, outside)
+                        cleanup_refusals.append("junction-allowed")
+                    except (OSError, RuntimeError):
+                        cleanup_refusals.append("junction-refused")
+
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
+                    ), patch.object(
+                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "already exists"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(["rename-refused", "junction-refused"], cleanup_refusals)
+                self.assertIsNotNone(staging_path)
+                self.assertFalse(staging_path.exists())
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+                self.assertEqual(
+                    sentinel,
+                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                )
+                self.assertFalse(
+                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                )
+            finally:
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_cleanup_leaves_untouched_when_stage_gains_entries(self) -> None:
+        sentinel = "CLEANUP_ENTRY_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-entry-") as raw:
+            root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            outside = root / "outside-target"
+            outside.mkdir()
+            (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            staging_path: Path | None = None
+            try:
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+
+                def publication_interpose(binding, attempt_name, staging):
+                    destination = Path(binding["path"]) / attempt_name
+                    destination.mkdir()
+                    (destination / "marker.txt").write_text(sentinel, encoding="utf-8")
+
+                def cleanup_interpose(staging):
+                    nonlocal staging_path
+                    staging_path = Path(staging["path"])
+                    (staging_path / "attacker.txt").write_text(sentinel, encoding="utf-8")
+
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
+                    ), patch.object(
+                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertIsNotNone(staging_path)
+                self.assertTrue(staging_path.exists())
+                self.assertEqual(
+                    {"REAL_AGENT_TEST_RESULT.json", "attacker.txt"},
+                    {p.name for p in staging_path.iterdir()},
+                )
+                self.assertEqual(
+                    sentinel, (staging_path / "attacker.txt").read_text(encoding="utf-8")
+                )
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+                self.assertEqual(
+                    sentinel,
+                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                )
+            finally:
+                if staging_path is not None and staging_path.exists():
+                    shutil.rmtree(staging_path, ignore_errors=True)
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_cleanup_hook_fault_closes_handle_and_leaves_stage_exact(self) -> None:
+        sentinel = "CLEANUP_HOOK_FAULT_SENTINEL"
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-hook-fault-") as raw:
+            root = Path(raw)
+            evidence_root = root / "evidence"
+            evidence_root.mkdir()
+            outside = root / "outside-target"
+            outside.mkdir()
+            (outside / "sentinel.txt").write_text(sentinel, encoding="utf-8")
+            temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+            staging_path: Path | None = None
+            captured: list[dict[str, object]] = []
+            try:
+                root_binding = _open_evidence_root_handle(evidence_root)
+                attempt_name = "attempt"
+
+                def publication_interpose(binding, attempt_name, staging):
+                    destination = Path(binding["path"]) / attempt_name
+                    destination.mkdir()
+                    (destination / "marker.txt").write_text(sentinel, encoding="utf-8")
+
+                def cleanup_interpose(staging):
+                    nonlocal staging_path
+                    staging_path = Path(staging["path"])
+                    captured.append(staging)
+                    raise RuntimeError("simulated cleanup interposition fault")
+
+                record = {
+                    "schema": "orchestrator-real-agent-evidence/v1",
+                    "status": "PASS",
+                    "retained_file_count": 1,
+                }
+                try:
+                    with patch.object(
+                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
+                    ), patch.object(
+                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
+                            _terminal_finalize(
+                                root_binding=root_binding, attempt_name=attempt_name,
+                                temp_root=temp_root, failure=None, result=record,
+                                prep_process=None, release_signal=None,
+                            )
+                finally:
+                    _close_evidence_root_handle(root_binding)
+                self.assertEqual(1, len(captured))
+                self.assertIsNone(captured[0]["handle"])
+                self.assertIsNotNone(staging_path)
+                self.assertTrue(staging_path.exists())
+                self.assertEqual(
+                    ["REAL_AGENT_TEST_RESULT.json"],
+                    [p.name for p in staging_path.iterdir()],
+                )
+                retained_text = (
+                    staging_path / "REAL_AGENT_TEST_RESULT.json"
+                ).read_text(encoding="utf-8")
+                self.assertNotIn(sentinel, retained_text)
+                self.assertEqual(
+                    "orchestrator-real-agent-evidence/v1",
+                    json.loads(retained_text)["schema"],
+                )
+                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
+                self.assertEqual(
+                    sentinel,
+                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                )
+                self.assertFalse(
+                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                )
+            finally:
+                if staging_path is not None and staging_path.exists():
+                    shutil.rmtree(staging_path, ignore_errors=True)
+                if temp_root.exists():
+                    shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_real_agent_handles_close_on_every_terminal_route(self) -> None:
+        module = real_agent_test_module
+        record = {
+            "schema": "orchestrator-real-agent-evidence/v1",
+            "status": "PASS",
+            "retained_file_count": 1,
+        }
+        for scenario in ("success", "failure"):
+            with self.subTest(route=scenario):
+                opened: list[int] = []
+                closed: list[int] = []
+                real_open_dir = module._open_directory_handle
+                real_open_file = module._open_regular_file_handle
+                real_close = module._close_handle
+
+                def track_open_dir(path, *, access, share):
+                    handle = real_open_dir(path, access=access, share=share)
+                    opened.append(handle)
+                    return handle
+
+                def track_open_file(path, *, access, share):
+                    handle = real_open_file(path, access=access, share=share)
+                    opened.append(handle)
+                    return handle
+
+                def track_close(handle):
+                    if handle is not None and handle != module._INVALID_HANDLE_VALUE:
+                        closed.append(handle)
+                    return real_close(handle)
+
+                with tempfile.TemporaryDirectory(prefix="orchestrator-s6-closure-") as raw:
+                    root = Path(raw)
+                    evidence_root = root / "evidence"
+                    evidence_root.mkdir()
+                    temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+                    try:
+                        with patch.object(module, "_open_directory_handle", side_effect=track_open_dir), \
+                             patch.object(module, "_open_regular_file_handle", side_effect=track_open_file), \
+                             patch.object(module, "_close_handle", side_effect=track_close):
+                            root_binding = _open_evidence_root_handle(evidence_root)
+                            try:
+                                if scenario == "success":
+                                    published = _terminal_finalize(
+                                        root_binding=root_binding, attempt_name="attempt",
+                                        temp_root=temp_root, failure=None, result=record,
+                                        prep_process=None, release_signal=None,
+                                    )
+                                    self.assertTrue(
+                                        (published / "REAL_AGENT_TEST_RESULT.json").is_file()
+                                    )
+                                else:
+                                    with self.assertRaisesRegex(RuntimeError, "original product failure"):
+                                        _terminal_finalize(
+                                            root_binding=root_binding, attempt_name="attempt",
+                                            temp_root=temp_root, failure=RuntimeError("original product failure"),
+                                            result=None, prep_process=None, release_signal=None,
+                                        )
+                            finally:
+                                _close_evidence_root_handle(root_binding)
+                    finally:
+                        if temp_root.exists():
+                            shutil.rmtree(temp_root, ignore_errors=True)
+                self.assertTrue(opened)
+                self.assertEqual(sorted(opened), sorted(closed))
 
     def test_real_agent_host_temp_cleanup_is_exact_and_complete(self) -> None:
         disposable = Path(
