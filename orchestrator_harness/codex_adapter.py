@@ -132,7 +132,12 @@ class SyntheticCodexTransport(CodexTransport):
         if notice.get("schema") != DELIVERY_NOTICE_SCHEMA:
             raise CodexAdapterError("synthetic transport received a non-notice payload")
         forbidden = {
-            "event_id", "event_ids", "data", "payload", "raw_output", "source_event",
+            "event_id",
+            "event_ids",
+            "data",
+            "payload",
+            "raw_output",
+            "source_event",
             "queue_records",
         }
         if forbidden.intersection(notice):
@@ -145,7 +150,9 @@ class SyntheticCodexTransport(CodexTransport):
     def inject_items(self, items: Sequence[Mapping[str, Any]]) -> None:
         if any(not isinstance(item, Mapping) for item in items):
             raise CodexAdapterError("synthetic injected items must be objects")
-        self.calls.append({"method": "thread/inject_items", "items": [dict(item) for item in items]})
+        self.calls.append(
+            {"method": "thread/inject_items", "items": [dict(item) for item in items]}
+        )
 
     def turn_completed(self) -> None:
         self.active_turn = False
@@ -170,7 +177,9 @@ class RecordingCodexTransport(SyntheticCodexTransport):
 class CodexAdapter(HostAdapter):
     """The implemented current host profile."""
 
-    def __init__(self, transport: CodexTransport, coordinator: DeliveryCoordinator) -> None:
+    def __init__(
+        self, transport: CodexTransport, coordinator: DeliveryCoordinator
+    ) -> None:
         if not isinstance(transport, CodexTransport):
             raise CodexAdapterError("CodexAdapter requires a CodexTransport")
         if coordinator.adapter is not self:
@@ -191,19 +200,21 @@ class CodexAdapter(HostAdapter):
     def profile(self) -> HostProfile:
         return self._profile
 
-    def deliver_notice(self, notice: DeliveryNotice, *, boundary: str) -> DeliveryReceipt:
+    def deliver_notice(
+        self, notice: DeliveryNotice, *, boundary: str
+    ) -> DeliveryReceipt:
         if notice.adapter_profile != self.profile.profile_id:
             raise CodexAdapterError("notice was created for another adapter profile")
         if boundary in {"post_tool_use", "tool_result"}:
             self.transport.post_tool_result_context(notice.as_record())
         elif boundary in {"turn_completed", "idle"}:
-            self.transport.inject_items([
-                {"type": "orchestrator_delivery_notice", "notice": notice.as_record()}
-            ])
+            self.transport.inject_items(
+                [{"type": "orchestrator_delivery_notice", "notice": notice.as_record()}]
+            )
         elif boundary == "finalization":
-            self.transport.inject_items([
-                {"type": "orchestrator_delivery_notice", "notice": notice.as_record()}
-            ])
+            self.transport.inject_items(
+                [{"type": "orchestrator_delivery_notice", "notice": notice.as_record()}]
+            )
         else:
             raise CodexAdapterError(f"unsupported Codex safe boundary: {boundary}")
         return DeliveryReceipt(
@@ -238,8 +249,14 @@ class CodexAdapter(HostAdapter):
             self.coordinator.complete_bounded_task(task_label)
         self.transport.turn_completed()
         notice = self.coordinator.notice_for_wake()
-        receipt = self.coordinator.deliver_at_boundary(notice, boundary="turn_completed")
-        if notice is not None and receipt is not None and receipt.outcome == "DELIVERED":
+        receipt = self.coordinator.deliver_at_boundary(
+            notice, boundary="turn_completed"
+        )
+        if (
+            notice is not None
+            and receipt is not None
+            and receipt.outcome == "DELIVERED"
+        ):
             self.transport.start_turn()
         return receipt
 
@@ -316,7 +333,11 @@ def select_host_adapter(
 
 def _package_resource(name: str) -> bytes:
     try:
-        return resources.files("orchestrator_harness.assets.codex").joinpath(name).read_bytes()
+        return (
+            resources.files("orchestrator_harness.assets.codex")
+            .joinpath(name)
+            .read_bytes()
+        )
     except (FileNotFoundError, ModuleNotFoundError, OSError) as exc:
         raise CodexAdapterError(f"packaged Codex asset is unavailable: {name}") from exc
 
@@ -346,27 +367,44 @@ def packaged_codex_assets() -> dict[Path, bytes]:
         resource_name = item.get("resource")
         content_mode = item.get("content_mode")
         if not isinstance(destination, str) or not isinstance(resource_name, str):
-            raise CodexAdapterError("packaged Codex asset destination or resource is unsafe")
+            raise CodexAdapterError(
+                "packaged Codex asset destination or resource is unsafe"
+            )
         try:
             relative = safe_relative_path(destination)
             resource_relative = safe_relative_path(resource_name)
         except MutationConflict as exc:
-            raise CodexAdapterError("packaged Codex asset destination or resource is unsafe") from exc
+            raise CodexAdapterError(
+                "packaged Codex asset destination or resource is unsafe"
+            ) from exc
         if not isinstance(content_mode, str) or content_mode != "utf8-lf":
-            raise CodexAdapterError(f"packaged Codex asset content mode is unsupported: {relative}")
+            raise CodexAdapterError(
+                f"packaged Codex asset content mode is unsupported: {relative}"
+            )
         data = _package_resource(resource_relative.as_posix())
         try:
             text = data.decode("utf-8", errors="strict")
         except (UnicodeDecodeError, AttributeError) as exc:
-            raise CodexAdapterError(f"packaged Codex asset is not valid UTF-8: {relative}") from exc
+            raise CodexAdapterError(
+                f"packaged Codex asset is not valid UTF-8: {relative}"
+            ) from exc
         if "\ufeff" in text:
-            raise CodexAdapterError(f"packaged Codex asset contains an unsupported UTF-8 BOM: {relative}")
-        if any(char == "\r" and (index + 1 == len(text) or text[index + 1] != "\n") for index, char in enumerate(text)):
-            raise CodexAdapterError(f"packaged Codex asset contains a lone carriage return: {relative}")
+            raise CodexAdapterError(
+                f"packaged Codex asset contains an unsupported UTF-8 BOM: {relative}"
+            )
+        if any(
+            char == "\r" and (index + 1 == len(text) or text[index + 1] != "\n")
+            for index, char in enumerate(text)
+        ):
+            raise CodexAdapterError(
+                f"packaged Codex asset contains a lone carriage return: {relative}"
+            )
         canonical = text.replace("\r\n", "\n").encode("utf-8")
         expected = item.get("sha256")
         if not isinstance(expected, str):
-            raise CodexAdapterError(f"packaged Codex asset hash is missing or invalid: {relative}")
+            raise CodexAdapterError(
+                f"packaged Codex asset hash is missing or invalid: {relative}"
+            )
         actual = hashlib.sha256(canonical).hexdigest()
         if expected != actual:
             raise CodexAdapterError(f"packaged Codex asset hash mismatch: {relative}")
@@ -402,7 +440,9 @@ class _ProjectMutationGuard:
         self.project = project
         self._validate_project_chain(project)
         if not project.is_dir() or _is_reparse(project):
-            raise CodexAdapterError("project-root must be an existing regular directory")
+            raise CodexAdapterError(
+                "project-root must be an existing regular directory"
+            )
         self._project_identity = _identity(project)
         self._last_receipts: dict[str, MutationReceipt] = {}
         if prepare_codex:
@@ -416,11 +456,15 @@ class _ProjectMutationGuard:
         for part in project.parts[1:]:
             current = current / part
             if os.path.lexists(current) and _is_reparse(current):
-                raise CodexAdapterError(f"project path contains a symlink or reparse point: {current}")
+                raise CodexAdapterError(
+                    f"project path contains a symlink or reparse point: {current}"
+                )
 
     def _check_project_identity(self) -> None:
         try:
-            if _identity(self.project) != self._project_identity or _is_reparse(self.project):
+            if _identity(self.project) != self._project_identity or _is_reparse(
+                self.project
+            ):
                 raise CodexAdapterError("project-root identity changed")
         except FileNotFoundError as exc:
             raise CodexAdapterError("project-root disappeared") from exc
@@ -435,15 +479,23 @@ class _ProjectMutationGuard:
             current = current / part
             if os.path.lexists(current):
                 if _is_reparse(current):
-                    raise CodexInstallConflict(f"project mutation component is a reparse point: {current}")
+                    raise CodexInstallConflict(
+                        f"project mutation component is a reparse point: {current}"
+                    )
                 if index < len(parts) - 1 and not current.is_dir():
-                    raise CodexInstallConflict(f"project mutation parent is not a directory: {current}")
+                    raise CodexInstallConflict(
+                        f"project mutation parent is not a directory: {current}"
+                    )
             elif index < len(parts) - 1 and require_parent:
-                raise CodexInstallConflict(f"project mutation parent is missing: {current}")
+                raise CodexInstallConflict(
+                    f"project mutation parent is missing: {current}"
+                )
         if require_parent:
             parent = target.parent
             if not parent.is_dir() or _is_reparse(parent):
-                raise CodexInstallConflict(f"project mutation parent is unsafe: {parent}")
+                raise CodexInstallConflict(
+                    f"project mutation parent is unsafe: {parent}"
+                )
         return target
 
     def ensure_directory(self, relative: str | Path) -> Path:
@@ -462,11 +514,15 @@ class _ProjectMutationGuard:
             try:
                 candidate = candidate.relative_to(self.project)
             except ValueError as exc:
-                raise CodexAdapterError("installer destination is outside the project") from exc
+                raise CodexAdapterError(
+                    "installer destination is outside the project"
+                ) from exc
         try:
             return safe_relative_path(candidate)
         except MutationConflict as exc:
-            raise CodexAdapterError("installer destination is not project-relative") from exc
+            raise CodexAdapterError(
+                "installer destination is not project-relative"
+            ) from exc
 
     def snapshot(self, relative_or_path: str | Path) -> TargetState:
         relative = self._relative(relative_or_path)
@@ -476,7 +532,9 @@ class _ProjectMutationGuard:
         except (MutationConflict, MutationUnsupported) as exc:
             raise CodexInstallConflict(str(exc)) from exc
         if state.present and state.kind != "file":
-            raise CodexInstallConflict(f"managed destination is not a regular file: {self.project / relative}")
+            raise CodexInstallConflict(
+                f"managed destination is not a regular file: {self.project / relative}"
+            )
         self._check_project_identity()
         return state
 
@@ -486,7 +544,9 @@ class _ProjectMutationGuard:
         if not state.present:
             return None
         if state.size is not None and state.size > _MAX_MANIFEST_BYTES:
-            raise CodexInstallConflict(f"managed destination is oversized: {self.project / relative}")
+            raise CodexInstallConflict(
+                f"managed destination is oversized: {self.project / relative}"
+            )
         return state.content
 
     def atomic_replace(
@@ -500,7 +560,9 @@ class _ProjectMutationGuard:
         self.path(relative, require_parent=True)
         authorized = expected if expected is not None else self.snapshot(relative)
         try:
-            receipt = mutation_replace(self.project, relative, data, expected=authorized)
+            receipt = mutation_replace(
+                self.project, relative, data, expected=authorized
+            )
         except (MutationConflict, MutationUnsupported) as exc:
             raise CodexInstallConflict(str(exc)) from exc
         self._last_receipts[relative.as_posix()] = receipt
@@ -529,9 +591,13 @@ class _ProjectMutationGuard:
         prior = self._last_receipts.get(relative.as_posix())
         current = self.snapshot(relative)
         if prior is None:
-            if (data is None and not current.present) or (data is not None and current.content == data):
+            if (data is None and not current.present) or (
+                data is not None and current.content == data
+            ):
                 return
-            raise CodexInstallConflict(f"rollback target changed outside this transaction: {relative}")
+            raise CodexInstallConflict(
+                f"rollback target changed outside this transaction: {relative}"
+            )
         expected = prior.resulting
         if data is None:
             if not expected.present:
@@ -541,7 +607,9 @@ class _ProjectMutationGuard:
             self.atomic_replace(relative, data, expected=expected)
 
 
-def _project_guard(value: str | Path, *, prepare_codex: bool = False) -> _ProjectMutationGuard:
+def _project_guard(
+    value: str | Path, *, prepare_codex: bool = False
+) -> _ProjectMutationGuard:
     return _ProjectMutationGuard(value, prepare_codex=prepare_codex)
 
 
@@ -560,7 +628,11 @@ def _read_bytes(path: Path, guard: _ProjectMutationGuard | None = None) -> bytes
         info = path.lstat()
     except FileNotFoundError:
         return None
-    if stat.S_ISLNK(info.st_mode) or _is_reparse(path) or not stat.S_ISREG(info.st_mode):
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or _is_reparse(path)
+        or not stat.S_ISREG(info.st_mode)
+    ):
         raise CodexInstallConflict(f"managed destination is not a regular file: {path}")
     if info.st_size > _MAX_MANIFEST_BYTES:
         raise CodexInstallConflict(f"managed destination is oversized: {path}")
@@ -568,7 +640,9 @@ def _read_bytes(path: Path, guard: _ProjectMutationGuard | None = None) -> bytes
 
 
 def _json_bytes(value: Mapping[str, Any]) -> bytes:
-    return (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    return (
+        json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
 
 
 def _manifest_content_digest(value: Mapping[str, Any]) -> str:
@@ -585,13 +659,17 @@ def _relative_text(path: Path, project: Path) -> str:
     return path.relative_to(project).as_posix()
 
 
-def _atomic_replace(path: Path, data: bytes, *, guard: _ProjectMutationGuard | None = None) -> None:
+def _atomic_replace(
+    path: Path, data: bytes, *, guard: _ProjectMutationGuard | None = None
+) -> None:
     if guard is None:
         raise CodexInstallConflict("project mutation requires an identity-bound guard")
     guard.atomic_replace(path, data)
 
 
-def _load_install_manifest(path: Path, *, guard: _ProjectMutationGuard | None = None) -> dict[str, Any] | None:
+def _load_install_manifest(
+    path: Path, *, guard: _ProjectMutationGuard | None = None
+) -> dict[str, Any] | None:
     data = _read_bytes(path, guard)
     if data is None:
         return None
@@ -599,7 +677,10 @@ def _load_install_manifest(path: Path, *, guard: _ProjectMutationGuard | None = 
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexInstallConflict("installation manifest is malformed") from exc
-    if not isinstance(value, dict) or value.get("schema") != CODEX_INSTALL_MANIFEST_SCHEMA:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != CODEX_INSTALL_MANIFEST_SCHEMA
+    ):
         raise CodexInstallConflict("installation manifest is not owned by this adapter")
     return value
 
@@ -617,7 +698,8 @@ def _manifest_is_unchanged(
         return (
             data is not None
             and data == _json_bytes(manifest)
-            and _manifest_content_digest(manifest) == manifest.get("manifest_content_sha256")
+            and _manifest_content_digest(manifest)
+            == manifest.get("manifest_content_sha256")
         )
     except (CodexAdapterError, TypeError, ValueError):
         return False
@@ -634,21 +716,30 @@ def _managed_hook_fragment() -> dict[str, list[dict[str, str]]]:
     result: dict[str, list[dict[str, str]]] = {}
     for event_name in _HOOK_EVENT_NAMES:
         entries = raw["hooks"].get(event_name)
-        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        if not isinstance(entries, list) or any(
+            not isinstance(item, dict) for item in entries
+        ):
             raise CodexAdapterError("packaged Codex hook entries are invalid")
         result[event_name] = [dict(item) for item in entries]
         for entry in result[event_name]:
             if set(entry) != {"id", "type", "command"}:
                 raise CodexAdapterError("packaged Codex hook entries are not closed")
-            if not all(isinstance(entry.get(key), str) and entry[key].strip() for key in ("id", "type", "command")):
+            if not all(
+                isinstance(entry.get(key), str) and entry[key].strip()
+                for key in ("id", "type", "command")
+            ):
                 raise CodexAdapterError("packaged Codex hook entry identity is invalid")
     return result
 
 
 def _managed_paths(packaged: Mapping[Path, bytes]) -> list[str]:
-    return sorted({path.as_posix() for path in packaged} | {
-        HOOKS_RELATIVE.as_posix(), INSTALL_MANIFEST_RELATIVE.as_posix(),
-    })
+    return sorted(
+        {path.as_posix() for path in packaged}
+        | {
+            HOOKS_RELATIVE.as_posix(),
+            INSTALL_MANIFEST_RELATIVE.as_posix(),
+        }
+    )
 
 
 def _legacy_asset_hashes() -> dict[str, str]:
@@ -682,13 +773,25 @@ def _validate_manifest_identity(
 ) -> str:
     """Validate a closed supported manifest and return its managed revision."""
 
-    if not isinstance(manifest, Mapping) or manifest.get("schema") != CODEX_INSTALL_MANIFEST_SCHEMA:
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("schema") != CODEX_INSTALL_MANIFEST_SCHEMA
+    ):
         raise CodexInstallConflict("installation manifest is foreign or malformed")
-    if manifest.get("adapter") != "codex" or manifest.get("adapter_version") != CODEX_ADAPTER_VERSION:
-        raise CodexInstallConflict("installation manifest belongs to another adapter revision")
+    if (
+        manifest.get("adapter") != "codex"
+        or manifest.get("adapter_version") != CODEX_ADAPTER_VERSION
+    ):
+        raise CodexInstallConflict(
+            "installation manifest belongs to another adapter revision"
+        )
     if manifest.get("project_root") != str(project):
         raise CodexInstallConflict("installation manifest project identity differs")
-    if guard is not None and manifest.get("project_identity") != f"{guard._project_identity[0]}:{guard._project_identity[1]}":
+    if (
+        guard is not None
+        and manifest.get("project_identity")
+        != f"{guard._project_identity[0]}:{guard._project_identity[1]}"
+    ):
         raise CodexInstallConflict("installation manifest directory identity differs")
 
     revision = manifest.get("package_revision")
@@ -699,62 +802,141 @@ def _validate_manifest_identity(
     if revision == CODEX_PACKAGE_REVISION:
         expected_fragment = _managed_hook_fragment()
         if manifest.get("managed_paths") != expected_paths:
-            raise CodexInstallConflict("installation manifest managed path set is not supported")
+            raise CodexInstallConflict(
+                "installation manifest managed path set is not supported"
+            )
         assets = manifest.get("managed_assets")
         packaged = packaged_codex_assets()
-        expected_assets = {path.as_posix(): _hash(data) for path, data in packaged.items()}
+        expected_assets = {
+            path.as_posix(): _hash(data) for path, data in packaged.items()
+        }
         if assets != expected_assets:
-            raise CodexInstallConflict("installation manifest managed asset identities are not supported")
+            raise CodexInstallConflict(
+                "installation manifest managed asset identities are not supported"
+            )
         if manifest.get("managed_hook_fragment") != expected_fragment:
-            raise CodexInstallConflict("installation manifest hook fragment is not supported")
-        if manifest.get("managed_hook_fragment_sha256") != _fragment_digest(expected_fragment):
-            raise CodexInstallConflict("installation manifest hook fragment identity is invalid")
-        if manifest.get("hooks_path") != HOOKS_RELATIVE.as_posix() or manifest.get("manifest_path") != INSTALL_MANIFEST_RELATIVE.as_posix():
-            raise CodexInstallConflict("installation manifest destination contract is invalid")
+            raise CodexInstallConflict(
+                "installation manifest hook fragment is not supported"
+            )
+        if manifest.get("managed_hook_fragment_sha256") != _fragment_digest(
+            expected_fragment
+        ):
+            raise CodexInstallConflict(
+                "installation manifest hook fragment identity is invalid"
+            )
+        if (
+            manifest.get("hooks_path") != HOOKS_RELATIVE.as_posix()
+            or manifest.get("manifest_path") != INSTALL_MANIFEST_RELATIVE.as_posix()
+        ):
+            raise CodexInstallConflict(
+                "installation manifest destination contract is invalid"
+            )
         if not isinstance(manifest.get("hooks_preexisting"), bool):
-            raise CodexInstallConflict("installation manifest pre-existing hook fact is invalid")
+            raise CodexInstallConflict(
+                "installation manifest pre-existing hook fact is invalid"
+            )
         installed = manifest.get("installed_content_sha256")
-        if not isinstance(installed, Mapping) or set(installed) != set(expected_assets) | {HOOKS_RELATIVE.as_posix()}:
-            raise CodexInstallConflict("installation manifest installed content set is invalid")
+        if not isinstance(installed, Mapping) or set(installed) != set(
+            expected_assets
+        ) | {HOOKS_RELATIVE.as_posix()}:
+            raise CodexInstallConflict(
+                "installation manifest installed content set is invalid"
+            )
         prior_revision = manifest.get("prior_managed_revision")
-        if prior_revision is not None and prior_revision not in CODEX_SUPPORTED_LEGACY_REVISIONS | {CODEX_PACKAGE_REVISION}:
-            raise CodexInstallConflict("installation manifest prior revision is unsupported")
+        if (
+            prior_revision is not None
+            and prior_revision
+            not in CODEX_SUPPORTED_LEGACY_REVISIONS | {CODEX_PACKAGE_REVISION}
+        ):
+            raise CodexInstallConflict(
+                "installation manifest prior revision is unsupported"
+            )
         trust = manifest.get("trust")
-        if not isinstance(trust, Mapping) or set(trust) != {"project_layer", "synthetic_self_test", "hook_review"}:
+        if not isinstance(trust, Mapping) or set(trust) != {
+            "project_layer",
+            "synthetic_self_test",
+            "hook_review",
+        }:
             raise CodexInstallConflict("installation manifest trust state is invalid")
         if set(manifest) != {
-            "schema", "adapter", "adapter_version", "package_revision", "project_root",
-            "project_identity", "managed_paths", "managed_assets", "managed_hook_fragment",
-            "managed_hook_fragment_sha256", "hooks_path", "manifest_path", "hooks_preexisting",
-            "prior_managed_revision", "installed_content_sha256", "trust", "installed_utc",
+            "schema",
+            "adapter",
+            "adapter_version",
+            "package_revision",
+            "project_root",
+            "project_identity",
+            "managed_paths",
+            "managed_assets",
+            "managed_hook_fragment",
+            "managed_hook_fragment_sha256",
+            "hooks_path",
+            "manifest_path",
+            "hooks_preexisting",
+            "prior_managed_revision",
+            "installed_content_sha256",
+            "trust",
+            "installed_utc",
             "manifest_content_sha256",
         }:
             raise CodexInstallConflict("installation manifest has an unsupported field")
-        if _manifest_content_digest(manifest) != manifest.get("manifest_content_sha256"):
-            raise CodexInstallConflict("installation manifest content identity is invalid")
+        if _manifest_content_digest(manifest) != manifest.get(
+            "manifest_content_sha256"
+        ):
+            raise CodexInstallConflict(
+                "installation manifest content identity is invalid"
+            )
         return revision
 
     # Accepted legacy revisions are the exact v1/v2 packaged path sets.  Their
     # historical byte maps are opaque metadata and never become an authority
     # for uninstall or rollback.
     legacy_fields = {
-        "schema", "adapter", "adapter_version", "package_revision", "project_root",
-        "owned_paths", "prior_managed_revision", "prior_content",
-        "installed_content_sha256", "trust", "installed_utc", "manifest_content_sha256",
+        "schema",
+        "adapter",
+        "adapter_version",
+        "package_revision",
+        "project_root",
+        "owned_paths",
+        "prior_managed_revision",
+        "prior_content",
+        "installed_content_sha256",
+        "trust",
+        "installed_utc",
+        "manifest_content_sha256",
     }
     if set(manifest) != legacy_fields:
-        raise CodexInstallConflict("legacy installation manifest has an unsupported field")
+        raise CodexInstallConflict(
+            "legacy installation manifest has an unsupported field"
+        )
     old_assets = _legacy_assets_for(revision)
-    legacy_paths = sorted(set(old_assets) | {HOOKS_RELATIVE.as_posix(), INSTALL_MANIFEST_RELATIVE.as_posix()})
+    legacy_paths = sorted(
+        set(old_assets)
+        | {HOOKS_RELATIVE.as_posix(), INSTALL_MANIFEST_RELATIVE.as_posix()}
+    )
     if manifest.get("owned_paths") != legacy_paths:
-        raise CodexInstallConflict("legacy installation manifest managed path set is not supported")
+        raise CodexInstallConflict(
+            "legacy installation manifest managed path set is not supported"
+        )
     installed = manifest.get("installed_content_sha256")
-    if not isinstance(installed, Mapping) or any(installed.get(path) != digest for path, digest in old_assets.items()):
-        raise CodexInstallConflict("legacy installation manifest asset identities are not supported")
-    if manifest.get("hooks_path", HOOKS_RELATIVE.as_posix()) != HOOKS_RELATIVE.as_posix():
-        raise CodexInstallConflict("legacy installation manifest hook path is not supported")
-    if not isinstance(manifest.get("manifest_content_sha256"), str) or _manifest_content_digest(manifest) != manifest.get("manifest_content_sha256"):
-        raise CodexInstallConflict("legacy installation manifest content identity is invalid")
+    if not isinstance(installed, Mapping) or any(
+        installed.get(path) != digest for path, digest in old_assets.items()
+    ):
+        raise CodexInstallConflict(
+            "legacy installation manifest asset identities are not supported"
+        )
+    if (
+        manifest.get("hooks_path", HOOKS_RELATIVE.as_posix())
+        != HOOKS_RELATIVE.as_posix()
+    ):
+        raise CodexInstallConflict(
+            "legacy installation manifest hook path is not supported"
+        )
+    if not isinstance(
+        manifest.get("manifest_content_sha256"), str
+    ) or _manifest_content_digest(manifest) != manifest.get("manifest_content_sha256"):
+        raise CodexInstallConflict(
+            "legacy installation manifest content identity is invalid"
+        )
     return revision
 
 
@@ -766,7 +948,9 @@ def _merge_hooks(existing: bytes | None) -> bytes:
             value = json.loads(existing.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CodexInstallConflict(".codex/hooks.json is not valid JSON") from exc
-        if not isinstance(value, dict) or ("hooks" in value and not isinstance(value["hooks"], dict)):
+        if not isinstance(value, dict) or (
+            "hooks" in value and not isinstance(value["hooks"], dict)
+        ):
             raise CodexInstallConflict(".codex/hooks.json has an unsupported shape")
         value = dict(value)
         value.setdefault("hooks", {})
@@ -778,12 +962,16 @@ def _merge_hooks(existing: bytes | None) -> bytes:
             raise CodexInstallConflict(f".codex/hooks.json {event_name} is not a list")
         merged = [item for item in prior if isinstance(item, dict)]
         if len(merged) != len(prior):
-            raise CodexInstallConflict(f".codex/hooks.json {event_name} contains invalid entries")
+            raise CodexInstallConflict(
+                f".codex/hooks.json {event_name} contains invalid entries"
+            )
         for entry in entries:
             marker = entry.get("id")
             clashes = [item for item in merged if item.get("id") == marker]
             if clashes and any(item != entry for item in clashes):
-                raise CodexInstallConflict(f".codex/hooks.json contains an ambiguous owned hook: {marker}")
+                raise CodexInstallConflict(
+                    f".codex/hooks.json contains an ambiguous owned hook: {marker}"
+                )
             if not clashes:
                 merged.append(entry)
         hooks[event_name] = merged
@@ -798,7 +986,9 @@ def _hook_state(existing: bytes | None) -> tuple[dict[str, Any], bool, set[str]]
         value = json.loads(existing.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexInstallConflict(".codex/hooks.json is not valid JSON") from exc
-    if not isinstance(value, dict) or ("hooks" in value and not isinstance(value["hooks"], dict)):
+    if not isinstance(value, dict) or (
+        "hooks" in value and not isinstance(value["hooks"], dict)
+    ):
         raise CodexInstallConflict(".codex/hooks.json has an unsupported shape")
     value = dict(value)
     value.setdefault("hooks", {})
@@ -806,8 +996,12 @@ def _hook_state(existing: bytes | None) -> tuple[dict[str, Any], bool, set[str]]
     conflicts: set[str] = set()
     for event_name, entries in fragment.items():
         rows = value["hooks"].get(event_name, [])
-        if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
-            raise CodexInstallConflict(f".codex/hooks.json {event_name} is not a list of objects")
+        if not isinstance(rows, list) or any(
+            not isinstance(item, dict) for item in rows
+        ):
+            raise CodexInstallConflict(
+                f".codex/hooks.json {event_name} is not a list of objects"
+            )
         for entry in entries:
             marker = entry["id"]
             for row in rows:
@@ -816,7 +1010,9 @@ def _hook_state(existing: bytes | None) -> tuple[dict[str, Any], bool, set[str]]
     return value, True, conflicts
 
 
-def _subtract_hooks(existing: bytes | None) -> tuple[bytes | None, list[str], list[str]]:
+def _subtract_hooks(
+    existing: bytes | None,
+) -> tuple[bytes | None, list[str], list[str]]:
     value, present, conflicts = _hook_state(existing)
     if not present:
         return None, [], []
@@ -867,20 +1063,29 @@ def check_codex_adapter(project_root: str | Path) -> dict[str, Any]:
             return result
         revision = _validate_manifest_identity(manifest, project, guard=guard)
     except CodexInstallConflict as exc:
-        result.update({"installed": True, "ownership": "foreign_or_ambiguous", "reason": str(exc)})
+        result.update(
+            {"installed": True, "ownership": "foreign_or_ambiguous", "reason": str(exc)}
+        )
         return result
-    result.update({
-        "installed": True,
-        "ownership": "owned",
-        "manifest_revision": revision,
-        "synthetic_self_test": (manifest.get("trust") or {}).get("synthetic_self_test", "not_run"),
-        "hook_review": (manifest.get("trust") or {}).get("hook_review", "not-reviewed"),
-    })
+    result.update(
+        {
+            "installed": True,
+            "ownership": "owned",
+            "manifest_revision": revision,
+            "synthetic_self_test": (manifest.get("trust") or {}).get(
+                "synthetic_self_test", "not_run"
+            ),
+            "hook_review": (manifest.get("trust") or {}).get(
+                "hook_review", "not-reviewed"
+            ),
+        }
+    )
     manifest_current = _manifest_is_unchanged(manifest_path, manifest, guard=guard)
     packaged = packaged_codex_assets()
     expected_assets = (
         {path.as_posix(): _hash(data) for path, data in packaged.items()}
-        if revision == CODEX_PACKAGE_REVISION else _legacy_assets_for(revision)
+        if revision == CODEX_PACKAGE_REVISION
+        else _legacy_assets_for(revision)
     )
     installed_hashes = manifest.get("installed_content_sha256", {})
     editable_relatives = {
@@ -896,37 +1101,52 @@ def check_codex_adapter(project_root: str | Path) -> dict[str, Any]:
             expected = manifest.get("manifest_content_sha256")
         else:
             actual = _hash(data)
-            expected = expected_assets.get(relative) if relative in expected_assets else installed_hashes.get(relative)
+            expected = (
+                expected_assets.get(relative)
+                if relative in expected_assets
+                else installed_hashes.get(relative)
+            )
         same = actual == expected
         # The launcher JSON and exclusion file are editable provider policy:
         # editing them changes guard behavior but does not break ownership.
         editable = relative in editable_relatives
         if relative in expected_assets and not same and not editable:
             current = False
-        rows.append({
-            "path": relative,
-            "installed_sha256": expected,
-            "current_sha256": actual,
-            "unchanged": same,
-            "editable": editable,
-        })
+        rows.append(
+            {
+                "path": relative,
+                "installed_sha256": expected,
+                "current_sha256": actual,
+                "unchanged": same,
+                "editable": editable,
+            }
+        )
     try:
         _, hook_present, hook_conflicts = _hook_state(guard.read(HOOKS_RELATIVE))
-        managed_hooks_present = hook_present and not hook_conflicts and _subtract_hooks(guard.read(HOOKS_RELATIVE))[1] == sorted(_MANAGED_HOOK_IDS)
+        managed_hooks_present = (
+            hook_present
+            and not hook_conflicts
+            and _subtract_hooks(guard.read(HOOKS_RELATIVE))[1]
+            == sorted(_MANAGED_HOOK_IDS)
+        )
     except CodexInstallConflict:
         managed_hooks_present = False
     current = current and managed_hooks_present
-    result.update({
-        "managed_paths": rows,
-        "owned_paths": rows,
-        "current": current,
-        "manifest_current": manifest_current,
-        "bounded_policy": bounded_policy_status(project),
-    })
+    result.update(
+        {
+            "managed_paths": rows,
+            "owned_paths": rows,
+            "current": current,
+            "manifest_current": manifest_current,
+            "bounded_policy": bounded_policy_status(project),
+        }
+    )
     return result
 
 
-def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) -> dict[str, Any]:
+def install_codex_adapter(
+    project_root: str | Path, *, upgrade: bool = False
+) -> dict[str, Any]:
     guard = _project_guard(project_root, prepare_codex=True)
     project = guard.project
     packaged = packaged_codex_assets()
@@ -935,32 +1155,49 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
     existing_manifest = _load_install_manifest(manifest_path, guard=guard)
     existing_revision: str | None = None
     if existing_manifest is not None:
-        existing_revision = _validate_manifest_identity(existing_manifest, project, guard=guard)
+        existing_revision = _validate_manifest_identity(
+            existing_manifest, project, guard=guard
+        )
         if not _manifest_is_unchanged(manifest_path, existing_manifest, guard=guard):
-            raise CodexInstallConflict("owned installation manifest was modified; refusing overwrite")
-        if existing_revision == CODEX_PACKAGE_REVISION and check_codex_adapter(project)["current"]:
+            raise CodexInstallConflict(
+                "owned installation manifest was modified; refusing overwrite"
+            )
+        if (
+            existing_revision == CODEX_PACKAGE_REVISION
+            and check_codex_adapter(project)["current"]
+        ):
             current = check_codex_adapter(project)
             current["operation"] = "upgrade" if upgrade else "install"
             current["changed"] = []
             current["idempotent"] = True
             return current
         if existing_revision != CODEX_PACKAGE_REVISION and not upgrade:
-            raise CodexInstallConflict("an older owned Codex adapter requires explicit upgrade")
-        old_assets = _legacy_assets_for(existing_revision) if existing_revision != CODEX_PACKAGE_REVISION else {
-            path.as_posix(): _hash(data) for path, data in packaged.items()
-        }
+            raise CodexInstallConflict(
+                "an older owned Codex adapter requires explicit upgrade"
+            )
+        old_assets = (
+            _legacy_assets_for(existing_revision)
+            if existing_revision != CODEX_PACKAGE_REVISION
+            else {path.as_posix(): _hash(data) for path, data in packaged.items()}
+        )
         for relative, expected in old_assets.items():
             if _hash(guard.read(relative)) != expected:
-                raise CodexInstallConflict(f"owned file was modified; refusing overwrite: {relative}")
+                raise CodexInstallConflict(
+                    f"owned file was modified; refusing overwrite: {relative}"
+                )
     else:
         # _load_install_manifest rejects any regular foreign manifest before
         # this branch.  Packaged hook destinations may not already be claimed.
         for relative in packaged:
             if guard.read(relative) is not None:
-                raise CodexInstallConflict(f"unmanaged hook destination already exists: {relative}")
+                raise CodexInstallConflict(
+                    f"unmanaged hook destination already exists: {relative}"
+                )
 
     target_relatives = [*packaged, HOOKS_RELATIVE, INSTALL_MANIFEST_RELATIVE]
-    original_states = {relative: guard.snapshot(relative) for relative in target_relatives}
+    original_states = {
+        relative: guard.snapshot(relative) for relative in target_relatives
+    }
     originals = {relative: state.content for relative, state in original_states.items()}
     changed: list[str] = []
     try:
@@ -970,10 +1207,14 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
                 changed.append(str(relative))
         hooks_data = _merge_hooks(originals[HOOKS_RELATIVE])
         if originals[HOOKS_RELATIVE] != hooks_data:
-            guard.atomic_replace(HOOKS_RELATIVE, hooks_data, expected=original_states[HOOKS_RELATIVE])
+            guard.atomic_replace(
+                HOOKS_RELATIVE, hooks_data, expected=original_states[HOOKS_RELATIVE]
+            )
             changed.append(HOOKS_RELATIVE.as_posix())
         expected_fragment = _managed_hook_fragment()
-        managed_assets = {relative.as_posix(): _hash(value) for relative, value in packaged.items()}
+        managed_assets = {
+            relative.as_posix(): _hash(value) for relative, value in packaged.items()
+        }
         installed_hashes: dict[str, str | None] = dict(managed_assets)
         installed_hashes[HOOKS_RELATIVE.as_posix()] = _hash(hooks_data)
         manifest = {
@@ -1018,7 +1259,13 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
             detail += "; rollback errors: " + ", ".join(rollback_errors)
         raise CodexInstallRollback(detail) from exc
     result = check_codex_adapter(project)
-    result.update({"operation": "upgrade" if upgrade else "install", "changed": changed, "idempotent": not bool(changed)})
+    result.update(
+        {
+            "operation": "upgrade" if upgrade else "install",
+            "changed": changed,
+            "idempotent": not bool(changed),
+        }
+    )
     return result
 
 
@@ -1029,7 +1276,9 @@ def upgrade_codex_adapter(project_root: str | Path) -> dict[str, Any]:
 def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     guard = _project_guard(project_root)
     project = guard.project
-    manifest = _load_install_manifest(guard.path(INSTALL_MANIFEST_RELATIVE), guard=guard)
+    manifest = _load_install_manifest(
+        guard.path(INSTALL_MANIFEST_RELATIVE), guard=guard
+    )
     if manifest is None:
         return {
             "schema": CODEX_INSTALL_MANIFEST_SCHEMA,
@@ -1044,14 +1293,25 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     revision = _validate_manifest_identity(manifest, project, guard=guard)
     manifest_path = guard.path(INSTALL_MANIFEST_RELATIVE, require_parent=True)
     if not _manifest_is_unchanged(manifest_path, manifest, guard=guard):
-        raise CodexInstallConflict("installation manifest was modified; refusing uninstall")
+        raise CodexInstallConflict(
+            "installation manifest was modified; refusing uninstall"
+        )
     packaged = packaged_codex_assets()
-    expected_assets = ({path.as_posix(): _hash(data) for path, data in packaged.items()} if revision == CODEX_PACKAGE_REVISION else _legacy_assets_for(revision))
+    expected_assets = (
+        {path.as_posix(): _hash(data) for path, data in packaged.items()}
+        if revision == CODEX_PACKAGE_REVISION
+        else _legacy_assets_for(revision)
+    )
     removed: list[str] = []
     preserved: list[str] = []
     original_states = {
         relative: guard.snapshot(relative)
-        for relative in [*packaged, HOOKS_RELATIVE, INSTALL_MANIFEST_RELATIVE, CODEX_BINDING_RELATIVE]
+        for relative in [
+            *packaged,
+            HOOKS_RELATIVE,
+            INSTALL_MANIFEST_RELATIVE,
+            CODEX_BINDING_RELATIVE,
+        ]
     }
     originals = {relative: state.content for relative, state in original_states.items()}
     try:
@@ -1062,13 +1322,19 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
                 removed.append(relative.as_posix())
             elif originals[relative] is not None:
                 preserved.append(relative.as_posix())
-        hooks_data, hook_removed, hook_conflicts = _subtract_hooks(originals[HOOKS_RELATIVE])
+        hooks_data, hook_removed, hook_conflicts = _subtract_hooks(
+            originals[HOOKS_RELATIVE]
+        )
         if hook_removed:
             if hooks_data is not None:
                 parsed, _, _ = _hook_state(hooks_data)
-                no_unrelated = set(parsed) == {"hooks"} and all(not parsed["hooks"].get(name, []) for name in parsed["hooks"])
+                no_unrelated = set(parsed) == {"hooks"} and all(
+                    not parsed["hooks"].get(name, []) for name in parsed["hooks"]
+                )
                 if no_unrelated and manifest.get("hooks_preexisting") is False:
-                    guard.delete(HOOKS_RELATIVE, expected=original_states[HOOKS_RELATIVE])
+                    guard.delete(
+                        HOOKS_RELATIVE, expected=original_states[HOOKS_RELATIVE]
+                    )
                 else:
                     guard.atomic_replace(
                         HOOKS_RELATIVE,
@@ -1081,14 +1347,22 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
         if originals[CODEX_BINDING_RELATIVE] is not None:
             try:
                 binding = _load_binding_for_hook(project, guard)
-                if binding.get("schema") == CODEX_BINDING_SCHEMA and binding.get("project_root") == str(project):
-                    guard.delete(CODEX_BINDING_RELATIVE, expected=original_states[CODEX_BINDING_RELATIVE])
+                if binding.get("schema") == CODEX_BINDING_SCHEMA and binding.get(
+                    "project_root"
+                ) == str(project):
+                    guard.delete(
+                        CODEX_BINDING_RELATIVE,
+                        expected=original_states[CODEX_BINDING_RELATIVE],
+                    )
                     removed.append(CODEX_BINDING_RELATIVE.as_posix())
                 else:
                     preserved.append(CODEX_BINDING_RELATIVE.as_posix())
             except (CodexAdapterError, OSError):
                 preserved.append(CODEX_BINDING_RELATIVE.as_posix())
-        guard.delete(INSTALL_MANIFEST_RELATIVE, expected=original_states[INSTALL_MANIFEST_RELATIVE])
+        guard.delete(
+            INSTALL_MANIFEST_RELATIVE,
+            expected=original_states[INSTALL_MANIFEST_RELATIVE],
+        )
         removed.append(INSTALL_MANIFEST_RELATIVE.as_posix())
     except Exception as exc:
         rollback_errors: list[str] = []
@@ -1129,9 +1403,12 @@ class InstalledCodexHookTransport(CodexTransport):
     @staticmethod
     def _assert_notice(notice: Mapping[str, Any]) -> None:
         if notice.get("schema") != DELIVERY_NOTICE_SCHEMA or any(
-            key in notice for key in ("event_id", "event_ids", "data", "payload", "queue_records")
+            key in notice
+            for key in ("event_id", "event_ids", "data", "payload", "queue_records")
         ):
-            raise CodexAdapterError("installed hook received a non-sparse delivery notice")
+            raise CodexAdapterError(
+                "installed hook received a non-sparse delivery notice"
+            )
 
     def post_tool_result_context(self, notice: Mapping[str, Any]) -> None:
         self._assert_notice(notice)
@@ -1141,7 +1418,9 @@ class InstalledCodexHookTransport(CodexTransport):
     def inject_items(self, items: Sequence[Mapping[str, Any]]) -> None:
         if any(not isinstance(item, Mapping) for item in items):
             raise CodexAdapterError("installed Codex continuation items are invalid")
-        self.calls.append({"method": "thread/inject_items", "items": [dict(item) for item in items]})
+        self.calls.append(
+            {"method": "thread/inject_items", "items": [dict(item) for item in items]}
+        )
 
     def turn_completed(self) -> None:
         self.calls.append({"method": "turn/completed"})
@@ -1160,7 +1439,9 @@ def _external_directory(value: str | Path, *, name: str) -> Path:
     for part in path.parts[1:]:
         current = current / part
         if os.path.lexists(current) and _is_reparse(current):
-            raise CodexAdapterError(f"{name} contains a symlink or reparse point: {current}")
+            raise CodexAdapterError(
+                f"{name} contains a symlink or reparse point: {current}"
+            )
     if not path.is_dir() or _is_reparse(path):
         raise CodexAdapterError(f"{name} must be an existing regular directory")
     return path
@@ -1198,7 +1479,9 @@ def _directory_identity(path: Path) -> str:
     return f"{_identity(path)[0]}:{_identity(path)[1]}"
 
 
-def _binding_record(project: Path, router: ManagerEventRouter, coordinator_root: Path) -> dict[str, Any]:
+def _binding_record(
+    project: Path, router: ManagerEventRouter, coordinator_root: Path
+) -> dict[str, Any]:
     registration = router.registration
     router.validate_binding(registration)
     queue = _external_directory(router.root, name="manager queue root")
@@ -1240,9 +1523,15 @@ def activate_codex_binding(
 
     guard = _project_guard(project_root)
     if not check_codex_adapter(guard.project).get("current"):
-        raise CodexInstallConflict("Codex binding requires a current owned installation")
+        raise CodexInstallConflict(
+            "Codex binding requires a current owned installation"
+        )
     queue = _external_directory(router.root, name="manager queue root")
-    root = _lexical_path(coordinator_root) if coordinator_root is not None else queue / "codex-coordinator"
+    root = (
+        _lexical_path(coordinator_root)
+        if coordinator_root is not None
+        else queue / "codex-coordinator"
+    )
     if not root.exists():
         _external_directory(root.parent, name="coordinator parent")
         try:
@@ -1275,13 +1564,19 @@ def activate_codex_binding(
             _json_bytes(record),
             expected=guard.snapshot(CODEX_BINDING_RELATIVE),
         )
-    return {"schema": CODEX_BINDING_SCHEMA, "binding": record, "state": coordinator.load_state()}
+    return {
+        "schema": CODEX_BINDING_SCHEMA,
+        "binding": record,
+        "state": coordinator.load_state(),
+    }
 
 
 bind_codex_project = activate_codex_binding
 
 
-def _load_binding_for_hook(project: Path, guard: _ProjectMutationGuard) -> dict[str, Any]:
+def _load_binding_for_hook(
+    project: Path, guard: _ProjectMutationGuard
+) -> dict[str, Any]:
     data = guard.read(CODEX_BINDING_RELATIVE)
     if data is None:
         raise CodexInstallConflict("installed Codex hook has no harness binding")
@@ -1292,42 +1587,75 @@ def _load_binding_for_hook(project: Path, guard: _ProjectMutationGuard) -> dict[
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexInstallConflict("Codex binding record is malformed") from exc
     required = {
-        "schema", "adapter", "adapter_version", "package_revision", "project_root",
-        "project_identity", "queue_root", "queue_identity", "coordinator_root",
-        "coordinator_identity", "run_id", "queue_id", "manager_session_id",
-        "manager_thread_id", "manager_invocation_id", "registration_id",
-        "registration_generation", "adapter_profile",
+        "schema",
+        "adapter",
+        "adapter_version",
+        "package_revision",
+        "project_root",
+        "project_identity",
+        "queue_root",
+        "queue_identity",
+        "coordinator_root",
+        "coordinator_identity",
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "manager_invocation_id",
+        "registration_id",
+        "registration_generation",
+        "adapter_profile",
     }
     if not isinstance(value, dict) or set(value) != required:
         raise CodexInstallConflict("Codex binding record has an invalid closed shape")
-    if value["schema"] != CODEX_BINDING_SCHEMA or value["adapter"] != "codex" or value["adapter_version"] != CODEX_ADAPTER_VERSION or value["package_revision"] != CODEX_PACKAGE_REVISION:
+    if (
+        value["schema"] != CODEX_BINDING_SCHEMA
+        or value["adapter"] != "codex"
+        or value["adapter_version"] != CODEX_ADAPTER_VERSION
+        or value["package_revision"] != CODEX_PACKAGE_REVISION
+    ):
         raise CodexInstallConflict("Codex binding record revision is stale")
-    if value["project_root"] != str(project) or value["project_identity"] != _directory_identity(project):
+    if value["project_root"] != str(project) or value[
+        "project_identity"
+    ] != _directory_identity(project):
         raise CodexInstallConflict("Codex binding project identity is stale")
     if value["adapter_profile"] != codex_profile().profile_id:
         raise CodexInstallConflict("Codex binding adapter profile is stale")
     generation = value["registration_generation"]
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
         raise CodexInstallConflict("Codex binding registration generation is invalid")
     queue = _external_directory(value["queue_root"], name="bound manager queue root")
     if _directory_identity(queue) != value["queue_identity"]:
         raise CodexInstallConflict("bound manager queue identity changed")
-    coordinator = _external_directory(value["coordinator_root"], name="bound coordinator root")
+    coordinator = _external_directory(
+        value["coordinator_root"], name="bound coordinator root"
+    )
     if _directory_identity(coordinator) != value["coordinator_identity"]:
         raise CodexInstallConflict("bound coordinator identity changed")
     registration = _read_external_json(
         queue / "REGISTRATION.json", name="bound manager registration"
     )
     for key in (
-        "run_id", "queue_id", "manager_session_id", "manager_thread_id",
-        "manager_invocation_id", "registration_id", "registration_generation",
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "manager_invocation_id",
+        "registration_id",
+        "registration_generation",
     ):
         if registration.get(key) != value.get(key):
             raise CodexInstallConflict(f"bound manager registration mismatch in {key}")
     return value
 
 
-def _final_response_declarations(payload: Mapping[str, Any] | None) -> list[Mapping[str, Any]] | None:
+def _final_response_declarations(
+    payload: Mapping[str, Any] | None,
+) -> list[Mapping[str, Any]] | None:
     """Extract only the minimum structured final-response evidence from a Stop payload.
 
     The closed shape is ``orchestrator_final_response``: a list of
@@ -1340,8 +1668,12 @@ def _final_response_declarations(payload: Mapping[str, Any] | None) -> list[Mapp
     value = payload.get("orchestrator_final_response")
     if value is None:
         return None
-    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
-        raise CodexAdapterError("orchestrator_final_response must be a list of declarations")
+    if not isinstance(value, list) or not all(
+        isinstance(item, Mapping) for item in value
+    ):
+        raise CodexAdapterError(
+            "orchestrator_final_response must be a list of declarations"
+        )
     return [dict(item) for item in value]
 
 
@@ -1362,10 +1694,14 @@ def run_installed_codex_hook(
     actor/action.  Transport delivery never acknowledges queue work.
     """
     if boundary not in {"post_tool_use", "stop"}:
-        raise CodexAdapterError("supported installed Codex hooks are post_tool_use and stop")
+        raise CodexAdapterError(
+            "supported installed Codex hooks are post_tool_use and stop"
+        )
     guard = _project_guard(project_root)
     if not check_codex_adapter(guard.project).get("current"):
-        raise CodexInstallConflict("installed Codex hook is not a current trusted byte set")
+        raise CodexInstallConflict(
+            "installed Codex hook is not a current trusted byte set"
+        )
     binding = _load_binding_for_hook(guard.project, guard)
     router = ManagerEventRouter(
         Path(binding["queue_root"]),
@@ -1480,7 +1816,9 @@ def _set_self_test_state(project: Path, outcome: str) -> None:
     _validate_manifest_identity(manifest, project, guard=guard)
     current = check_codex_adapter(project)
     if not current.get("current"):
-        raise CodexInstallConflict("synthetic self-test refuses a modified installation")
+        raise CodexInstallConflict(
+            "synthetic self-test refuses a modified installation"
+        )
     trust = dict(manifest.get("trust") or {})
     trust["synthetic_self_test"] = outcome
     manifest["trust"] = trust
@@ -1514,7 +1852,9 @@ def run_synthetic_wake_self_test(coordinator: DeliveryCoordinator) -> dict[str, 
     if notice is None:
         raise CodexAdapterError("synthetic queue revision did not produce a notice")
     notice_record = notice.as_record()
-    if any(key in notice_record for key in ("event_id", "event_ids", "payload", "data")):
+    if any(
+        key in notice_record for key in ("event_id", "event_ids", "payload", "data")
+    ):
         raise CodexAdapterError("synthetic notice contains event payload")
     receipt = coordinator.deliver_at_boundary(notice, boundary="post_tool_use")
     if receipt is None or receipt.outcome != "DELIVERED":
@@ -1534,7 +1874,9 @@ def run_synthetic_wake_self_test(coordinator: DeliveryCoordinator) -> dict[str, 
     }
 
 
-def synthetic_wake_self_test(project_root: str | Path, *, queue_root: str | Path | None = None) -> dict[str, Any]:
+def synthetic_wake_self_test(
+    project_root: str | Path, *, queue_root: str | Path | None = None
+) -> dict[str, Any]:
     project = _project_root(project_root)
     if queue_root is None:
         queue = project / ".codex" / ".synthetic-manager-binding"
@@ -1550,7 +1892,9 @@ def synthetic_wake_self_test(project_root: str | Path, *, queue_root: str | Path
     transport = SyntheticCodexTransport()
     # Construct a small adapter shell first, then bind the coordinator to its
     # exact profile.  The public constructor also supports direct composition.
-    coordinator = DeliveryCoordinator(router=router, adapter=FutureHostFixture("codex-bootstrap"))
+    coordinator = DeliveryCoordinator(
+        router=router, adapter=FutureHostFixture("codex-bootstrap")
+    )
     adapter = CodexAdapter(transport, coordinator)
     coordinator.adapter = adapter
     evidence = run_synthetic_wake_self_test(coordinator)

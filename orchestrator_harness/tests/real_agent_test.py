@@ -63,15 +63,24 @@ def wsl_path(_distro: str, path: Path) -> str:
 def _json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
 def _run(cwd: Path, *argv: str) -> str:
     result = subprocess.run(
-        list(argv), cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        check=False, timeout=30, shell=False,
+        list(argv),
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+        shell=False,
         creationflags=WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     if result.returncode != 0:
@@ -88,7 +97,9 @@ def _read_object(path: Path) -> dict[str, Any] | None:
 
 
 def _resolve_evidence_root(
-    value: str | Path | None, *, repository_root: Path = REPOSITORY_ROOT,
+    value: str | Path | None,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> Path:
     """Resolve one writable evidence root that cannot be inside source."""
 
@@ -104,7 +115,9 @@ def _resolve_evidence_root(
     except ValueError:
         pass
     else:
-        raise RuntimeError("real-agent evidence root must be outside the source checkout")
+        raise RuntimeError(
+            "real-agent evidence root must be outside the source checkout"
+        )
     if resolved.exists() and not resolved.is_dir():
         raise RuntimeError("real-agent evidence root must be a directory")
     resolved.mkdir(parents=True, exist_ok=True)
@@ -112,7 +125,8 @@ def _resolve_evidence_root(
 
 
 def _validate_controller_receipt_identity(
-    receipt: dict[str, Any], status: dict[str, Any],
+    receipt: dict[str, Any],
+    status: dict[str, Any],
 ) -> tuple[int, str]:
     """Require the public receipt and controller status to name one process."""
 
@@ -123,13 +137,20 @@ def _validate_controller_receipt_identity(
     if status.get("controller_pid") != receipt_pid:
         raise RuntimeError("controller status PID does not match the public receipt")
     if status.get("controller_created_utc") != receipt_created:
-        raise RuntimeError("controller status creation identity does not match the public receipt")
+        raise RuntimeError(
+            "controller status creation identity does not match the public receipt"
+        )
     return receipt_pid, receipt_created
 
 
 def _provider_identity_from_query(
-    query: ProcessQuery, *, provider_pid: int, provider_created: str,
-    controller_pid: int, nonce: str, invocation_id: str,
+    query: ProcessQuery,
+    *,
+    provider_pid: int,
+    provider_created: str,
+    controller_pid: int,
+    nonce: str,
+    invocation_id: str,
 ) -> dict[str, Any]:
     """Fail closed unless one targeted query proves the exact direct child."""
 
@@ -148,11 +169,16 @@ def _provider_identity_from_query(
         raise RuntimeError("Windows provider shim is not a direct controller child")
     command_line = process.command_line.lower()
     if "wsl.exe" not in command_line and "wslhost" not in command_line:
-        raise RuntimeError("provider identity is not the controller-owned wsl.exe child")
+        raise RuntimeError(
+            "provider identity is not the controller-owned wsl.exe child"
+        )
     return {
-        "platform": "windows", "pid": provider_pid,
-        "created_utc": provider_created, "nonce": nonce,
-        "invocation_id": invocation_id, "parent_pid": process.ppid,
+        "platform": "windows",
+        "pid": provider_pid,
+        "created_utc": provider_created,
+        "nonce": nonce,
+        "invocation_id": invocation_id,
+        "parent_pid": process.ppid,
     }
 
 
@@ -164,7 +190,8 @@ def _artifact_fact(path: Path) -> dict[str, Any]:
     except OSError:
         return {"present": False, "byte_count": 0, "sha256": None}
     return {
-        "present": True, "byte_count": len(content),
+        "present": True,
+        "byte_count": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
 
@@ -179,14 +206,18 @@ def _safe_controller_summary(status: dict[str, Any] | None) -> dict[str, Any]:
         "state": status.get("state"),
         "exit_code": status.get("exit_code"),
         "result_valid": status.get("result_valid"),
-        "result_validation_state": validation.get("state") if isinstance(validation, dict) else None,
+        "result_validation_state": validation.get("state")
+        if isinstance(validation, dict)
+        else None,
         "helpers_complete": status.get("helpers_complete"),
         "direct_child_reaped": status.get("direct_child_reaped"),
         "resource_claim_release_safe": status.get("resource_claim_release_safe"),
         "held_resource_claim_count": len(status["held_resource_claims"])
-        if isinstance(status.get("held_resource_claims"), list) else None,
+        if isinstance(status.get("held_resource_claims"), list)
+        else None,
         "process_boundary_complete": boundary.get("complete")
-        if isinstance(boundary, dict) else None,
+        if isinstance(boundary, dict)
+        else None,
         "process_boundary_live_member_count": len(boundary["live_members"])
         if isinstance(boundary, dict) and isinstance(boundary.get("live_members"), list)
         else None,
@@ -201,8 +232,12 @@ def _safe_bridge_summary(bridge: dict[str, Any] | None) -> dict[str, Any]:
         "available": True,
         "status": bridge.get("status"),
         "cleanup_complete": bridge.get("cleanup_complete"),
-        "mnt_c_exposed": sandbox.get("mnt_c_exposed") if isinstance(sandbox, dict) else None,
-        "usb_exposed": sandbox.get("usb_exposed") if isinstance(sandbox, dict) else None,
+        "mnt_c_exposed": sandbox.get("mnt_c_exposed")
+        if isinstance(sandbox, dict)
+        else None,
+        "usb_exposed": sandbox.get("usb_exposed")
+        if isinstance(sandbox, dict)
+        else None,
     }
 
 
@@ -218,7 +253,8 @@ def _safe_prepared_summary(prepared: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _safe_failure_record(
-    temp_root: Path, failure: BaseException,
+    temp_root: Path,
+    failure: BaseException,
 ) -> dict[str, Any]:
     workspace = temp_root / "synthetic-repository" / ".agent-workspace"
     return {
@@ -229,15 +265,29 @@ def _safe_failure_record(
         "controller_summary": _safe_controller_summary(
             _read_object(workspace / "real_agent_controller.status.json")
         ),
-        "bridge_summary": _safe_bridge_summary(_read_object(temp_root / "bridge-evidence.json")),
-        "prepared_summary": _safe_prepared_summary(_read_object(temp_root / "prepared-state.json")),
+        "bridge_summary": _safe_bridge_summary(
+            _read_object(temp_root / "bridge-evidence.json")
+        ),
+        "prepared_summary": _safe_prepared_summary(
+            _read_object(temp_root / "prepared-state.json")
+        ),
         "source_artifact_facts": {
-            "controller_status": _artifact_fact(workspace / "real_agent_controller.status.json"),
-            "operator_receipt": _artifact_fact(workspace / "real_agent_operator.receipt.json"),
+            "controller_status": _artifact_fact(
+                workspace / "real_agent_controller.status.json"
+            ),
+            "operator_receipt": _artifact_fact(
+                workspace / "real_agent_operator.receipt.json"
+            ),
             "controller_result": _artifact_fact(workspace / "RESULT.json"),
-            "provider_event_stream": _artifact_fact(workspace / "real_agent_codex.jsonl"),
-            "provider_standard_error": _artifact_fact(workspace / "real_agent_codex.stderr.log"),
-            "provider_last_message": _artifact_fact(workspace / "real_agent_last_message.txt"),
+            "provider_event_stream": _artifact_fact(
+                workspace / "real_agent_codex.jsonl"
+            ),
+            "provider_standard_error": _artifact_fact(
+                workspace / "real_agent_codex.stderr.log"
+            ),
+            "provider_last_message": _artifact_fact(
+                workspace / "real_agent_last_message.txt"
+            ),
         },
         "retained_file_count": 1,
         "credentials_persisted": False,
@@ -305,7 +355,9 @@ def _safe_success_record(
         "codex_root": codex_root,
         "attempt_identity": {"nonce": nonce, "invocation_id": invocation_id},
         "controller_identity": {
-            "platform": "windows", "pid": controller_pid, "created_utc": controller_created,
+            "platform": "windows",
+            "pid": controller_pid,
+            "created_utc": controller_created,
         },
         "provider_identity": provider_identity,
         "linux_bridge_identity": linux_bridge_identity,
@@ -443,39 +495,62 @@ def _windows_api() -> None:
     _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
     _KERNEL32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
     ]
     _KERNEL32.CreateFileW.restype = wintypes.HANDLE
     _KERNEL32.GetFileInformationByHandle.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+        wintypes.HANDLE,
+        ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
     ]
     _KERNEL32.GetFileInformationByHandle.restype = wintypes.BOOL
     _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
     _KERNEL32.CloseHandle.restype = wintypes.BOOL
     _NTDLL.NtSetInformationFile.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(_IO_STATUS_BLOCK), ctypes.c_void_p,
-        wintypes.ULONG, ctypes.c_int,
+        wintypes.HANDLE,
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.c_int,
     ]
     _NTDLL.NtSetInformationFile.restype = wintypes.LONG
     _KERNEL32.ReadFile.argtypes = [
-        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
     ]
     _KERNEL32.ReadFile.restype = wintypes.BOOL
     _KERNEL32.SetFilePointerEx.argtypes = [
-        wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong),
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
         wintypes.DWORD,
     ]
     _KERNEL32.SetFilePointerEx.restype = wintypes.BOOL
     _KERNEL32.GetFileSizeEx.argtypes = [
-        wintypes.HANDLE, ctypes.POINTER(_LARGE_INTEGER),
+        wintypes.HANDLE,
+        ctypes.POINTER(_LARGE_INTEGER),
     ]
     _KERNEL32.GetFileSizeEx.restype = wintypes.BOOL
     _NTDLL.NtQueryDirectoryFile.argtypes = [
-        wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.POINTER(_IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG,
-        ctypes.c_int, wintypes.BOOLEAN, ctypes.c_void_p, wintypes.BOOLEAN,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.BOOLEAN,
+        ctypes.c_void_p,
+        wintypes.BOOLEAN,
     ]
     _NTDLL.NtQueryDirectoryFile.restype = wintypes.LONG
     _WINDOWS_API_READY = True
@@ -486,11 +561,18 @@ def _open_directory_handle(path: Path, *, access: int, share: int) -> int:
 
     _windows_api()
     handle = _KERNEL32.CreateFileW(
-        str(path), access, share, None, 3,  # OPEN_EXISTING
-        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
+        str(path),
+        access,
+        share,
+        None,
+        3,  # OPEN_EXISTING
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
     )
     if handle == _INVALID_HANDLE_VALUE:
-        raise OSError(ctypes.get_last_error(), f"failed to open directory handle: {path}")
+        raise OSError(
+            ctypes.get_last_error(), f"failed to open directory handle: {path}"
+        )
     return int(handle)
 
 
@@ -505,8 +587,13 @@ def _open_regular_file_handle(path: Path, *, access: int, share: int) -> int:
 
     _windows_api()
     handle = _KERNEL32.CreateFileW(
-        str(path), access, share, None, 3,  # OPEN_EXISTING
-        _FILE_FLAG_OPEN_REPARSE_POINT, None,
+        str(path),
+        access,
+        share,
+        None,
+        3,  # OPEN_EXISTING
+        _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
     )
     if handle == _INVALID_HANDLE_VALUE:
         raise OSError(ctypes.get_last_error(), f"failed to open file handle: {path}")
@@ -544,9 +631,17 @@ def _enumerate_directory_handle(handle: int) -> list[dict[str, Any]]:
     buffer = ctypes.create_string_buffer(65536)
     status_block = _IO_STATUS_BLOCK()
     status = _NTDLL.NtQueryDirectoryFile(
-        handle, None, None, None, ctypes.byref(status_block),
-        buffer, len(buffer), _FILE_DIRECTORY_INFORMATION_CLASS,
-        False, None, True,
+        handle,
+        None,
+        None,
+        None,
+        ctypes.byref(status_block),
+        buffer,
+        len(buffer),
+        _FILE_DIRECTORY_INFORMATION_CLASS,
+        False,
+        None,
+        True,
     )
     if (status & 0xFFFFFFFF) == 0x80000006:  # STATUS_NO_MORE_FILES
         return []
@@ -579,7 +674,9 @@ def _set_file_disposition(handle: int, delete: bool) -> None:
     info = _FILE_DISPOSITION_INFORMATION(bool(delete))
     status_block = _IO_STATUS_BLOCK()
     status = _NTDLL.NtSetInformationFile(
-        handle, ctypes.byref(status_block), ctypes.byref(info),
+        handle,
+        ctypes.byref(status_block),
+        ctypes.byref(info),
         ctypes.sizeof(_FILE_DISPOSITION_INFORMATION),
         _FILE_DISPOSITION_INFORMATION_CLASS,
     )
@@ -643,8 +740,10 @@ def _open_evidence_root_handle(path: Path) -> dict[str, Any]:
     handle = _open_directory_handle(
         path,
         access=(
-            _FILE_READ_DATA | _FILE_READ_ATTRIBUTES
-            | _FILE_WRITE_ATTRIBUTES | _FILE_SYNCHRONIZE
+            _FILE_READ_DATA
+            | _FILE_READ_ATTRIBUTES
+            | _FILE_WRITE_ATTRIBUTES
+            | _FILE_SYNCHRONIZE
         ),
         share=_FILE_SHARE_READ | _FILE_SHARE_WRITE,  # delete sharing denied
     )
@@ -833,7 +932,8 @@ def _open_record_handle(binding: dict[str, Any], *, delete: bool) -> int:
 
 
 def _build_staging_evidence(
-    root_binding: dict[str, Any], record: dict[str, Any],
+    root_binding: dict[str, Any],
+    record: dict[str, Any],
 ) -> dict[str, Any]:
     """Build one private same-volume staging directory with exactly the record.
 
@@ -853,8 +953,11 @@ def _build_staging_evidence(
         staging_handle = _open_directory_handle(
             staging_path,
             access=(
-                _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _FILE_WRITE_ATTRIBUTES
-                | _FILE_SYNCHRONIZE | _FILE_DELETE
+                _FILE_READ_DATA
+                | _FILE_READ_ATTRIBUTES
+                | _FILE_WRITE_ATTRIBUTES
+                | _FILE_SYNCHRONIZE
+                | _FILE_DELETE
             ),
             share=_FILE_SHARE_READ | _FILE_SHARE_WRITE,  # delete sharing denied
         )
@@ -867,13 +970,18 @@ def _build_staging_evidence(
             )
         if info["volume_serial"] != root_binding["volume_serial"]:
             raise RuntimeError("evidence staging is not on the evidence-root volume")
-        record_bytes = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        record_bytes = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
         record_path = staging_path / "REAL_AGENT_TEST_RESULT.json"
         with open(record_path, "x", encoding="utf-8", newline="\n") as handle:
             handle.write(record_bytes.decode("utf-8"))
         record_handle = _open_regular_file_handle(
             record_path,
-            access=_FILE_DELETE | _FILE_READ_ATTRIBUTES | _FILE_READ_DATA | _FILE_SYNCHRONIZE,
+            access=_FILE_DELETE
+            | _FILE_READ_ATTRIBUTES
+            | _FILE_READ_DATA
+            | _FILE_SYNCHRONIZE,
             share=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
         )
         try:
@@ -884,7 +992,9 @@ def _build_staging_evidence(
                 raise RuntimeError("staging record must not be a reparse point")
             actual = _read_file_handle(record_handle, len(record_bytes))
             if actual != record_bytes:
-                raise RuntimeError("staging record bytes do not match the constructed record")
+                raise RuntimeError(
+                    "staging record bytes do not match the constructed record"
+                )
         finally:
             _close_handle(record_handle)
         return {
@@ -919,7 +1029,9 @@ _PUBLICATION_INTERPOSITION_HOOK: Any = None
 
 
 def _rename_attempt_relative(
-    source_handle: int, root_handle: int, attempt_name: str,
+    source_handle: int,
+    root_handle: int,
+    attempt_name: str,
 ) -> None:
     """One no-replace handle-relative native atomic rename.
 
@@ -967,7 +1079,9 @@ def _rename_attempt_relative(
 
 
 def _publish_attempt_directory(
-    root_binding: dict[str, Any], attempt_name: str, staging: dict[str, Any],
+    root_binding: dict[str, Any],
+    attempt_name: str,
+    staging: dict[str, Any],
 ) -> Path:
     """Publish one complete one-file attempt via handle-relative atomic rename.
 
@@ -1007,7 +1121,10 @@ def _finalize_attempt_evidence(
     text and full controller/provider objects are never copied into it.
     """
 
-    if record.get("status") not in {"PASS", "FAIL"} or record.get("retained_file_count") != 1:
+    if (
+        record.get("status") not in {"PASS", "FAIL"}
+        or record.get("retained_file_count") != 1
+    ):
         raise RuntimeError("attempt evidence record violates the fixed allowlist")
     _revalidate_evidence_root_binding(root_binding)
     staging = _build_staging_evidence(root_binding, record)
@@ -1021,22 +1138,25 @@ def _finalize_attempt_evidence(
 
 
 def _remove_disposable_temp_root(
-    temp_root: Path, *, timeout_seconds: float = 15.0,
+    temp_root: Path,
+    *,
+    timeout_seconds: float = 15.0,
 ) -> None:
     """Remove the exact mkdtemp root or fail the live oracle."""
 
     expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
     resolved = temp_root.resolve(strict=False)
-    if (
-        resolved.parent != expected_parent
-        or not resolved.name.startswith("orchestrator-s6-real-agent-")
+    if resolved.parent != expected_parent or not resolved.name.startswith(
+        "orchestrator-s6-real-agent-"
     ):
         raise RuntimeError(f"refusing unexpected real-agent temp root: {resolved}")
     deadline = time.monotonic() + timeout_seconds
     last_error: OSError | None = None
 
     def clear_readonly_and_retry(
-        function: Any, path: str, failure: BaseException,
+        function: Any,
+        path: str,
+        failure: BaseException,
     ) -> None:
         candidate = Path(path).resolve(strict=False)
         try:
@@ -1051,7 +1171,9 @@ def _remove_disposable_temp_root(
         function(path)
 
     def clear_readonly_legacy(
-        function: Any, path: str, failure_info: Any,
+        function: Any,
+        path: str,
+        failure_info: Any,
     ) -> None:
         clear_readonly_and_retry(function, path, failure_info[1])
 
@@ -1161,7 +1283,9 @@ def _terminal_finalize(
 
     published: Path | None = None
     try:
-        prep_cleanup_failure = _release_preparation_process(prep_process, release_signal)
+        prep_cleanup_failure = _release_preparation_process(
+            prep_process, release_signal
+        )
         if prep_cleanup_failure is not None and failure is None:
             failure = prep_cleanup_failure
         failure_record = (
@@ -1191,7 +1315,9 @@ def _terminal_finalize(
         elif result is not None:
             result["host_temp_cleanup_complete"] = True
             published = _finalize_attempt_evidence(
-                root_binding, attempt_name, result,
+                root_binding,
+                attempt_name,
+                result,
             )
         else:
             raise RuntimeError("terminal seam requires a result or a failure")
@@ -1200,14 +1326,22 @@ def _terminal_finalize(
     return published
 
 
-def _wait_json(path: Path, predicate: Any, *, timeout: float, process: subprocess.Popen[bytes] | None = None) -> dict[str, Any]:
+def _wait_json(
+    path: Path,
+    predicate: Any,
+    *,
+    timeout: float,
+    process: subprocess.Popen[bytes] | None = None,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = _read_object(path)
         if value is not None and predicate(value):
             return value
         if process is not None and process.poll() is not None and not path.exists():
-            raise RuntimeError(f"prepared Linux side exited before publishing {path.name}")
+            raise RuntimeError(
+                f"prepared Linux side exited before publishing {path.name}"
+            )
         time.sleep(0.1)
     raise TimeoutError(f"timed out waiting for {path}")
 
@@ -1226,11 +1360,19 @@ def _make_repository(root: Path) -> tuple[Path, str, str]:
     _run(repo, "git", "add", ".gitignore", "task.txt")
     _run(repo, "git", "commit", "-m", "Initialize synthetic real-agent repository")
     common_dir = _run(repo, "git", "rev-parse", "--git-common-dir")
-    return repo, _run(repo, "git", "rev-parse", "HEAD"), str((repo / common_dir).resolve())
+    return (
+        repo,
+        _run(repo, "git", "rev-parse", "HEAD"),
+        str((repo / common_dir).resolve()),
+    )
 
 
 def _make_invocation(
-    repo: Path, base_commit: str, common_dir: str, runtime: Path, prompt: Path,
+    repo: Path,
+    base_commit: str,
+    common_dir: str,
+    runtime: Path,
+    prompt: Path,
     provider_command: list[str],
 ) -> Path:
     workspace = repo / ".agent-workspace"
@@ -1317,14 +1459,26 @@ def _event_types(event_log: Path) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the Windows public route with one isolated Ubuntu provider")
-    parser.add_argument("--distro", default=os.environ.get("ORCH_HARNESS_WSL_DISTRO", DEFAULT_DISTRO))
-    parser.add_argument("--codex-root", default=os.environ.get("ORCH_HARNESS_WSL_CODEX_ROOT", DEFAULT_CODEX_ROOT))
-    parser.add_argument("--evidence-root", default=os.environ.get("ORCH_HARNESS_REAL_AGENT_EVIDENCE_ROOT"))
+    parser = argparse.ArgumentParser(
+        description="Run the Windows public route with one isolated Ubuntu provider"
+    )
+    parser.add_argument(
+        "--distro", default=os.environ.get("ORCH_HARNESS_WSL_DISTRO", DEFAULT_DISTRO)
+    )
+    parser.add_argument(
+        "--codex-root",
+        default=os.environ.get("ORCH_HARNESS_WSL_CODEX_ROOT", DEFAULT_CODEX_ROOT),
+    )
+    parser.add_argument(
+        "--evidence-root",
+        default=os.environ.get("ORCH_HARNESS_REAL_AGENT_EVIDENCE_ROOT"),
+    )
     parser.add_argument("--model", default="gpt-5.6-terra")
     args = parser.parse_args()
     if os.name != "nt":
-        raise RuntimeError("real-agent public route requires the Windows controller host")
+        raise RuntimeError(
+            "real-agent public route requires the Windows controller host"
+        )
     if args.distro != "Ubuntu":
         raise RuntimeError("repair-003 real-agent oracle is pinned to Ubuntu")
     if args.codex_root != DEFAULT_CODEX_ROOT:
@@ -1333,7 +1487,11 @@ def main() -> int:
     if not auth.is_file():
         raise RuntimeError("Codex authentication file is unavailable")
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    stamp = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
     attempt_name = stamp
     evidence_root = _resolve_evidence_root(args.evidence_root)
     temp_name = tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-")
@@ -1369,47 +1527,102 @@ def main() -> int:
         cgroup_launcher = wsl_path(args.distro, SUPPORT / "cgroup_exec.py")
         evidence_dir = temp_root / "prepared-evidence"
         prep_command = [
-            "wsl.exe", "-d", args.distro, "-u", "root", "--", "python3", guarded,
-            "--run-id", run_id, "--driver", driver, "--",
-            "--mode", "prepare", "--nonce", nonce, "--invocation-id", WORKER_ID,
-            "--state", wsl_path(args.distro, state_path),
-            "--release-signal", wsl_path(args.distro, release_signal),
-            "--evidence", wsl_path(args.distro, evidence_dir),
-            "--auth-json", wsl_path(args.distro, auth),
-            "--workspace", wsl_path(args.distro, repo),
-            "--codex-root", args.codex_root,
-            "--cgroup-launcher", cgroup_launcher,
-            "--provider-entry", provider,
-            "--wait-seconds", "900",
+            "wsl.exe",
+            "-d",
+            args.distro,
+            "-u",
+            "root",
+            "--",
+            "python3",
+            guarded,
+            "--run-id",
+            run_id,
+            "--driver",
+            driver,
+            "--",
+            "--mode",
+            "prepare",
+            "--nonce",
+            nonce,
+            "--invocation-id",
+            WORKER_ID,
+            "--state",
+            wsl_path(args.distro, state_path),
+            "--release-signal",
+            wsl_path(args.distro, release_signal),
+            "--evidence",
+            wsl_path(args.distro, evidence_dir),
+            "--auth-json",
+            wsl_path(args.distro, auth),
+            "--workspace",
+            wsl_path(args.distro, repo),
+            "--codex-root",
+            args.codex_root,
+            "--cgroup-launcher",
+            cgroup_launcher,
+            "--provider-entry",
+            provider,
+            "--wait-seconds",
+            "900",
         ]
         prep_process = subprocess.Popen(
-            prep_command, cwd=str(REPOSITORY_ROOT), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False,
+            prep_command,
+            cwd=str(REPOSITORY_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
             creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
-        prepared = _wait_json(state_path, lambda value: value.get("status") == "READY", timeout=90, process=prep_process)
+        prepared = _wait_json(
+            state_path,
+            lambda value: value.get("status") == "READY",
+            timeout=90,
+            process=prep_process,
+        )
         validate_prepared_state(prepared, nonce=nonce, invocation_id=WORKER_ID)
         if prepared.get("credentials_in_state") is not False:
             raise RuntimeError("prepared state claims to contain credentials")
         provider_command = [
-            "wsl.exe", "-d", args.distro, "-u", "root", "--", "python3", provider,
-            "--state", wsl_path(args.distro, state_path), "--nonce", nonce,
-            "--invocation-id", WORKER_ID, "--evidence", wsl_path(args.distro, bridge_evidence),
-            "--claim", wsl_path(args.distro, claim_path),
+            "wsl.exe",
+            "-d",
+            args.distro,
+            "-u",
+            "root",
+            "--",
+            "python3",
+            provider,
+            "--state",
+            wsl_path(args.distro, state_path),
+            "--nonce",
+            nonce,
+            "--invocation-id",
+            WORKER_ID,
+            "--evidence",
+            wsl_path(args.distro, bridge_evidence),
+            "--claim",
+            wsl_path(args.distro, claim_path),
         ]
-        invocation = _make_invocation(repo, base_commit, common_dir, runtime, prompt_path, provider_command)
+        invocation = _make_invocation(
+            repo, base_commit, common_dir, runtime, prompt_path, provider_command
+        )
         # Deterministic preflight: the controller must accept the invocation before it is launched.
         load_invocation(invocation)
         receipt_path = repo / ".agent-workspace" / "real_agent_operator.receipt.json"
         status_path = repo / ".agent-workspace" / "real_agent_controller.status.json"
         receipt = launch_lane_controller(
-            invocation, receipt=receipt_path, cwd=REPOSITORY_ROOT,
-            label="real-agent-coding-controller", role="coding-lane-controller",
+            invocation,
+            receipt=receipt_path,
+            cwd=REPOSITORY_ROOT,
+            label="real-agent-coding-controller",
+            role="coding-lane-controller",
             expected_state_path=status_path,
         )
         controller_pid = receipt.get("pid")
         controller_created = receipt.get("created_utc")
-        if not isinstance(controller_pid, int) or not isinstance(controller_created, str):
+        if not isinstance(controller_pid, int) or not isinstance(
+            controller_created, str
+        ):
             raise TypeError("Windows controller receipt lacks exact identity")
         provider_observed = False
         provider_identity: dict[str, Any] | None = None
@@ -1417,13 +1630,21 @@ def main() -> int:
         watcher_failures: list[str] = []
         config_path = temp_root / "watcher.json"
         watcher_root = temp_root / "runtime" / "watcher-state"
-        _json(config_path, {
-            "suite_root": str(temp_root), "run_globs": ["synthetic-repository"],
-            "workspace_relpath": ".agent-workspace", "output_dir": str(watcher_root),
-            "poll_interval_seconds": 0.1, "watch_timeout_seconds": 900,
-            "request_warning_seconds": 900, "request_critical_seconds": 899,
-            "process_start_tolerance_seconds": 2, "stable_read_delay_seconds": 0.02,
-        })
+        _json(
+            config_path,
+            {
+                "suite_root": str(temp_root),
+                "run_globs": ["synthetic-repository"],
+                "workspace_relpath": ".agent-workspace",
+                "output_dir": str(watcher_root),
+                "poll_interval_seconds": 0.1,
+                "watch_timeout_seconds": 900,
+                "request_warning_seconds": 900,
+                "request_critical_seconds": 899,
+                "process_start_tolerance_seconds": 2,
+                "stable_read_delay_seconds": 0.02,
+            },
+        )
         config = load_config(config_path)
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
@@ -1433,11 +1654,21 @@ def main() -> int:
                 _validate_controller_receipt_identity(receipt, status)
                 provider_pid = candidate.get("provider_pid")
                 provider_created = candidate.get("provider_created_utc")
-                if isinstance(provider_pid, int) and isinstance(provider_created, str) and not provider_observed:
-                    query = targeted_process_query(provider_pid, expected_parent_pid=controller_pid)
+                if (
+                    isinstance(provider_pid, int)
+                    and isinstance(provider_created, str)
+                    and not provider_observed
+                ):
+                    query = targeted_process_query(
+                        provider_pid, expected_parent_pid=controller_pid
+                    )
                     provider_identity = _provider_identity_from_query(
-                        query, provider_pid=provider_pid, provider_created=provider_created,
-                        controller_pid=controller_pid, nonce=nonce, invocation_id=WORKER_ID,
+                        query,
+                        provider_pid=provider_pid,
+                        provider_created=provider_created,
+                        controller_pid=controller_pid,
+                        nonce=nonce,
+                        invocation_id=WORKER_ID,
                     )
                     provider_observed = True
             try:
@@ -1451,11 +1682,19 @@ def main() -> int:
             except Exception as watcher_error:  # noqa: BLE001
                 # A watcher observation is diagnostic; native controller state
                 # and lifecycle evidence remain decisive for this route.
-                watcher_failures.append(f"{type(watcher_error).__name__}: {watcher_error}")
+                watcher_failures.append(
+                    f"{type(watcher_error).__name__}: {watcher_error}"
+                )
             controller_query = targeted_process_query(controller_pid)
             terminal = (
                 status is not None
-                and status.get("state") in {"CODEX_EXITED", "PROVIDER_EXITED", "CONTROLLER_FAILED", "LAUNCH_FAILED"}
+                and status.get("state")
+                in {
+                    "CODEX_EXITED",
+                    "PROVIDER_EXITED",
+                    "CONTROLLER_FAILED",
+                    "LAUNCH_FAILED",
+                }
                 and status.get("ended_utc") is not None
             )
             if terminal and controller_query.process is None:
@@ -1467,15 +1706,39 @@ def main() -> int:
             raise RuntimeError("controller status was never published")
         _validate_controller_receipt_identity(receipt, status)
         if not provider_observed or provider_identity is None:
-            raise RuntimeError("exact Windows wsl.exe provider identity was not observed")
-        if status.get("state") not in {"CODEX_EXITED", "PROVIDER_EXITED"} or status.get("exit_code") != 0:
-            raise RuntimeError(f"public controller did not exit successfully: {status.get('state')}")
-        if status.get("result_valid") is not True or not isinstance(status.get("result_validation"), dict) or status["result_validation"].get("state") != "VALID":
-            raise RuntimeError("controller did not validate a distinct successful result")
-        if status.get("held_resource_claims") != [] or not all(status.get(key) is True for key in ("helpers_complete", "direct_child_reaped", "resource_claim_release_safe")):
+            raise RuntimeError(
+                "exact Windows wsl.exe provider identity was not observed"
+            )
+        if (
+            status.get("state") not in {"CODEX_EXITED", "PROVIDER_EXITED"}
+            or status.get("exit_code") != 0
+        ):
+            raise RuntimeError(
+                f"public controller did not exit successfully: {status.get('state')}"
+            )
+        if (
+            status.get("result_valid") is not True
+            or not isinstance(status.get("result_validation"), dict)
+            or status["result_validation"].get("state") != "VALID"
+        ):
+            raise RuntimeError(
+                "controller did not validate a distinct successful result"
+            )
+        if status.get("held_resource_claims") != [] or not all(
+            status.get(key) is True
+            for key in (
+                "helpers_complete",
+                "direct_child_reaped",
+                "resource_claim_release_safe",
+            )
+        ):
             raise RuntimeError("native lifecycle/claim cleanup evidence is incomplete")
         boundary = status.get("process_boundary")
-        if not isinstance(boundary, dict) or boundary.get("complete") is not True or boundary.get("live_members"):
+        if (
+            not isinstance(boundary, dict)
+            or boundary.get("complete") is not True
+            or boundary.get("live_members")
+        ):
             raise RuntimeError("native controller process boundary is incomplete")
         result_path = repo / ".agent-workspace" / "RESULT.json"
         result_value = _read_object(result_path)
@@ -1485,15 +1748,39 @@ def main() -> int:
         actual_head = _run(repo, "git", "rev-parse", "HEAD")
         dirty = _run(repo, "git", "status", "--porcelain=v1", "--untracked-files=all")
         validation = status["result_validation"]
-        if result_value.get("lane_id") != LANE_ID or result_value.get("worker_invocation_id") != WORKER_ID or result_value.get("branch") != actual_branch or result_value.get("commit") != actual_head or validation.get("commit") != actual_head or actual_branch != LANE_ID or dirty:
-            raise RuntimeError("result identity is not exact and distinct from stale state")
+        if (
+            result_value.get("lane_id") != LANE_ID
+            or result_value.get("worker_invocation_id") != WORKER_ID
+            or result_value.get("branch") != actual_branch
+            or result_value.get("commit") != actual_head
+            or validation.get("commit") != actual_head
+            or actual_branch != LANE_ID
+            or dirty
+        ):
+            raise RuntimeError(
+                "result identity is not exact and distinct from stale state"
+            )
         lifecycle_path = lifecycle_registry_path(repo, LANE_ID, WORKER_ID)
         lifecycle = _read_object(lifecycle_path)
-        if lifecycle is None or lifecycle.get("lifecycle", {}).get("complete") is not True or lifecycle.get("lifecycle", {}).get("helpers_complete") is not True:
+        if (
+            lifecycle is None
+            or lifecycle.get("lifecycle", {}).get("complete") is not True
+            or lifecycle.get("lifecycle", {}).get("helpers_complete") is not True
+        ):
             raise RuntimeError("native lifecycle registry is incomplete")
-        bridge = _wait_json(bridge_evidence, lambda value: value.get("status") == "PASS", timeout=30)
-        prepared_cleaned = _wait_json(state_path, lambda value: value.get("status") == "CLEANED", timeout=60, process=prep_process)
-        if prepared_cleaned.get("cleanup_complete") is not True or prepared_cleaned.get("credentials_in_state") is not False:
+        bridge = _wait_json(
+            bridge_evidence, lambda value: value.get("status") == "PASS", timeout=30
+        )
+        prepared_cleaned = _wait_json(
+            state_path,
+            lambda value: value.get("status") == "CLEANED",
+            timeout=60,
+            process=prep_process,
+        )
+        if (
+            prepared_cleaned.get("cleanup_complete") is not True
+            or prepared_cleaned.get("credentials_in_state") is not False
+        ):
             raise RuntimeError("prepared Linux cleanup was not complete")
         linux_bridge = bridge.get("linux_bridge")
         if not isinstance(linux_bridge, dict):
@@ -1501,27 +1788,51 @@ def main() -> int:
         validate_cross_os_identity_relation(
             provider_identity, linux_bridge, nonce=nonce, invocation_id=WORKER_ID
         )
-        if bridge.get("sandbox", {}).get("mnt_c_exposed") is not False or bridge.get("sandbox", {}).get("usb_exposed") is not False or bridge.get("cleanup_complete") is not True:
+        if (
+            bridge.get("sandbox", {}).get("mnt_c_exposed") is not False
+            or bridge.get("sandbox", {}).get("usb_exposed") is not False
+            or bridge.get("cleanup_complete") is not True
+        ):
             raise RuntimeError("Linux sandbox/cleanup evidence is incomplete")
-        required_events = {"CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE"}
+        required_events = {
+            "CONTROLLER_ACTIVE",
+            "CONTROLLER_EXITED",
+            "RESOURCE_RELEASE_POSSIBLE",
+        }
         if not required_events.issubset(set(event_types)):
             raise RuntimeError(
                 f"native watcher events are incomplete: {sorted(set(event_types))}"
-                + (f"; watcher failures: {watcher_failures}" if watcher_failures else "")
+                + (
+                    f"; watcher failures: {watcher_failures}"
+                    if watcher_failures
+                    else ""
+                )
             )
         result = _safe_success_record(
             completed_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
-            distro=args.distro, codex_root=args.codex_root,
-            nonce=nonce, invocation_id=WORKER_ID,
-            controller_pid=controller_pid, controller_created=controller_created,
-            provider_identity=provider_identity, linux_bridge_identity=linux_bridge,
-            status=status, result_value=result_value, lifecycle=lifecycle,
-            bridge=bridge, prepared=prepared_cleaned, event_types=event_types,
+            distro=args.distro,
+            codex_root=args.codex_root,
+            nonce=nonce,
+            invocation_id=WORKER_ID,
+            controller_pid=controller_pid,
+            controller_created=controller_created,
+            provider_identity=provider_identity,
+            linux_bridge_identity=linux_bridge,
+            status=status,
+            result_value=result_value,
+            lifecycle=lifecycle,
+            bridge=bridge,
+            prepared=prepared_cleaned,
+            event_types=event_types,
             workspace=repo / ".agent-workspace",
-            receipt_path=receipt_path, result_path=result_path,
-            lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
-            state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+            receipt_path=receipt_path,
+            result_path=result_path,
+            lifecycle_path=lifecycle_path,
+            bridge_evidence=bridge_evidence,
+            state_path=state_path,
+            claim_path=claim_path,
+            prompt_path=prompt_path,
         )
     except BaseException as exc:  # noqa: BLE001
         failure = exc

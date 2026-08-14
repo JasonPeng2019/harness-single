@@ -45,93 +45,97 @@ EVENT_DISPOSITION_WAKING = "WAKING_MANAGER_EVENT"
 EVENT_DISPOSITION_OBSERVED = "OBSERVED_STATE"
 EVENT_DISPOSITION_SUPERSEDED = "SUPERSESSION"
 
-_WAKING_EVENT_TYPES = frozenset({
-    "RELAY_READY",
-    "REQUEST_AMBIGUOUS",
-    "RELAY_UNBOUND",
-    "REQUEST_EXPIRY_WARNING",
-    "DUPLICATE_CONTROLLER",
-    "DUPLICATE_CODING_BRANCH",
-    "DUPLICATE_CODING_WORKTREE",
-    "CODING_RESULT_INVALID",
-    "COORDINATION_FAILED",
-    "RESOURCE_CLAIM_STALE",
-    "RESOURCE_CONFLICT",
-    "RESOURCE_WAIT",
-    "RESOURCE_AMBIGUOUS",
-    "STALE_STATUS",
-    "PROCESS_STATE_UNKNOWN",
-    "PROCESS_INVENTORY_INCOMPLETE",
-    "OBSERVATION_ERROR",
-    "MANAGER_SIGNAL",
-    "CONTROLLER_EXITED",
-    "HELPER_EXITED",
-    "MCP_EXITED",
-    "HELPER_STATE_UNKNOWN",
-    "MCP_STATE_UNKNOWN",
-    "PROVIDER_WAIT",
-    "LANE_STATE_UNKNOWN",
-    "MANAGER_REVIEW_DUE",
-    "LANE_NO_PROGRESS",
-    "LANE_STAGE_REPEAT",
-    "CHECKPOINT_UPDATED",
-    "RESULT_AVAILABLE",
-})
+_WAKING_EVENT_TYPES = frozenset(
+    {
+        "RELAY_READY",
+        "REQUEST_AMBIGUOUS",
+        "RELAY_UNBOUND",
+        "REQUEST_EXPIRY_WARNING",
+        "DUPLICATE_CONTROLLER",
+        "DUPLICATE_CODING_BRANCH",
+        "DUPLICATE_CODING_WORKTREE",
+        "CODING_RESULT_INVALID",
+        "COORDINATION_FAILED",
+        "RESOURCE_CLAIM_STALE",
+        "RESOURCE_CONFLICT",
+        "RESOURCE_WAIT",
+        "RESOURCE_AMBIGUOUS",
+        "STALE_STATUS",
+        "PROCESS_STATE_UNKNOWN",
+        "PROCESS_INVENTORY_INCOMPLETE",
+        "OBSERVATION_ERROR",
+        "MANAGER_SIGNAL",
+        "CONTROLLER_EXITED",
+        "HELPER_EXITED",
+        "MCP_EXITED",
+        "HELPER_STATE_UNKNOWN",
+        "MCP_STATE_UNKNOWN",
+        "PROVIDER_WAIT",
+        "LANE_STATE_UNKNOWN",
+        "MANAGER_REVIEW_DUE",
+        "LANE_NO_PROGRESS",
+        "LANE_STAGE_REPEAT",
+        "CHECKPOINT_UPDATED",
+        "RESULT_AVAILABLE",
+    }
+)
 
-_OBSERVED_EVENT_TYPES = frozenset({
-    "CONTROLLER_ACTIVE",
-    "LANE_WAITING_RESOURCE",
-    "LANE_WAITING_RELAY",
-    "RESULT_ACCEPTANCE_PENDING",
-    "RESOURCE_RELEASE_POSSIBLE",
-    "REQUEST_STALE",
-    "RELAYED",
-    "RELAYED_INACTIVE",
-    "RELAYED_AMBIGUOUS",
-    "HELPER_ACTIVE",
-    "MCP_ACTIVE",
-    "CONDITION_CLEARED",
-    # These are intentionally explicit: raw worker/provider material is not a
-    # manager obligation and must never be copied into QUEUE.jsonl.
-    "RAW_OUTPUT",
-    "WORKER_OUTPUT",
-    "LOG",
-    "DIAGNOSTIC",
-    "PROVIDER_TELEMETRY",
-    "HEARTBEAT",
-    "HARNESS_SIGNAL_OBSERVED",
-    "HARNESS_EVENT_INELIGIBLE",
-    "HARNESS_EVENT_ACTIONABLE",
-    "HARNESS_EVENT_PENDING",
-    "HARNESS_EVENT_DEFERRED",
-    "HARNESS_ACK_ATTEMPTED",
-    "HARNESS_ACK_SUCCEEDED",
-    "HARNESS_WAKE_ATTEMPTED",
-    "HARNESS_WAKE_DELIVERED",
-    "HARNESS_WAKE_FAILED",
-    "HARNESS_SCAN_COMMITTED",
-    "MANAGER_WAKE_RECEIVED",
-    "MANAGER_WAIT_FINISHED",
-    "WATCH_TIMEOUT",
-    "RUNNING_CODEX",
-    "RUNNING_PROVIDER",
-    "WAITING_RELAY",
-    "WAITING_RESOURCE",
-    "HELPER_RUNNING",
-    "MCP_RUNNING",
-    "CODEX_STARTED",
-    "CODEX_EXITED",
-    "PROVIDER_STARTED",
-    "PROVIDER_EXITED",
-    "LAUNCH_FAILED",
-    "CONTROLLER_FAILED",
-    "CONTROLLER_INTERRUPTED",
-    "MANAGER_WAKE_ATTEMPTED",
-    "MANAGER_WAKE_DELIVERED",
-    "MANAGER_WAKE_FAILED",
-    "FORMAL_REVIEW_BASELINE_ADVANCED",
-    "HARNESS_WATCHER_ALERT",
-})
+_OBSERVED_EVENT_TYPES = frozenset(
+    {
+        "CONTROLLER_ACTIVE",
+        "LANE_WAITING_RESOURCE",
+        "LANE_WAITING_RELAY",
+        "RESULT_ACCEPTANCE_PENDING",
+        "RESOURCE_RELEASE_POSSIBLE",
+        "REQUEST_STALE",
+        "RELAYED",
+        "RELAYED_INACTIVE",
+        "RELAYED_AMBIGUOUS",
+        "HELPER_ACTIVE",
+        "MCP_ACTIVE",
+        "CONDITION_CLEARED",
+        # These are intentionally explicit: raw worker/provider material is not a
+        # manager obligation and must never be copied into QUEUE.jsonl.
+        "RAW_OUTPUT",
+        "WORKER_OUTPUT",
+        "LOG",
+        "DIAGNOSTIC",
+        "PROVIDER_TELEMETRY",
+        "HEARTBEAT",
+        "HARNESS_SIGNAL_OBSERVED",
+        "HARNESS_EVENT_INELIGIBLE",
+        "HARNESS_EVENT_ACTIONABLE",
+        "HARNESS_EVENT_PENDING",
+        "HARNESS_EVENT_DEFERRED",
+        "HARNESS_ACK_ATTEMPTED",
+        "HARNESS_ACK_SUCCEEDED",
+        "HARNESS_WAKE_ATTEMPTED",
+        "HARNESS_WAKE_DELIVERED",
+        "HARNESS_WAKE_FAILED",
+        "HARNESS_SCAN_COMMITTED",
+        "MANAGER_WAKE_RECEIVED",
+        "MANAGER_WAIT_FINISHED",
+        "WATCH_TIMEOUT",
+        "RUNNING_CODEX",
+        "RUNNING_PROVIDER",
+        "WAITING_RELAY",
+        "WAITING_RESOURCE",
+        "HELPER_RUNNING",
+        "MCP_RUNNING",
+        "CODEX_STARTED",
+        "CODEX_EXITED",
+        "PROVIDER_STARTED",
+        "PROVIDER_EXITED",
+        "LAUNCH_FAILED",
+        "CONTROLLER_FAILED",
+        "CONTROLLER_INTERRUPTED",
+        "MANAGER_WAKE_ATTEMPTED",
+        "MANAGER_WAKE_DELIVERED",
+        "MANAGER_WAKE_FAILED",
+        "FORMAL_REVIEW_BASELINE_ADVANCED",
+        "HARNESS_WATCHER_ALERT",
+    }
+)
 
 EVENT_DISPOSITIONS: dict[str, str] = {
     **{kind: EVENT_DISPOSITION_WAKING for kind in _WAKING_EVENT_TYPES},
@@ -146,21 +150,23 @@ EVENT_WIRING = EVENT_DISPOSITIONS
 # corroborates their liveness/actionability.  A direct manager producer may
 # supply the explicit manager_actionable assertion for the adapter-neutral
 # synthetic boundary when no snapshot is available.
-_SNAPSHOT_REQUIRED_TYPES = frozenset({
-    "RELAY_READY",
-    "REQUEST_AMBIGUOUS",
-    "RELAY_UNBOUND",
-    "REQUEST_EXPIRY_WARNING",
-    "RESOURCE_WAIT",
-    "RESOURCE_AMBIGUOUS",
-    "PROCESS_STATE_UNKNOWN",
-    "OBSERVATION_ERROR",
-    "CONTROLLER_EXITED",
-    "HELPER_EXITED",
-    "MCP_EXITED",
-    "HELPER_STATE_UNKNOWN",
-    "MCP_STATE_UNKNOWN",
-})
+_SNAPSHOT_REQUIRED_TYPES = frozenset(
+    {
+        "RELAY_READY",
+        "REQUEST_AMBIGUOUS",
+        "RELAY_UNBOUND",
+        "REQUEST_EXPIRY_WARNING",
+        "RESOURCE_WAIT",
+        "RESOURCE_AMBIGUOUS",
+        "PROCESS_STATE_UNKNOWN",
+        "OBSERVATION_ERROR",
+        "CONTROLLER_EXITED",
+        "HELPER_EXITED",
+        "MCP_EXITED",
+        "HELPER_STATE_UNKNOWN",
+        "MCP_STATE_UNKNOWN",
+    }
+)
 
 MANAGER_REGISTRATION_SCHEMA = "orchestrator-manager-registration/v1"
 MANAGER_QUEUE_SCHEMA = "orchestrator-manager-queue-record/v1"
@@ -229,17 +235,28 @@ def _nonempty_text(value: object, field: str) -> str:
 
 
 def _finite_priority(value: object) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
         raise ManagerRecordError("priority must be a finite number")
     return float(value)
 
 
-def _safe_reference(data: Mapping[str, Any], explicit: object = None) -> dict[str, str] | None:
+def _safe_reference(
+    data: Mapping[str, Any], explicit: object = None
+) -> dict[str, str] | None:
     candidate = explicit
     if candidate is None:
         candidate = data.get("payload_ref")
     if candidate is None:
-        path = data.get("path") or data.get("source_path") or data.get("checkpoint_path") or data.get("result_path")
+        path = (
+            data.get("path")
+            or data.get("source_path")
+            or data.get("checkpoint_path")
+            or data.get("result_path")
+        )
         digest = (
             data.get("sha256")
             or data.get("content_sha256")
@@ -257,18 +274,46 @@ def _safe_reference(data: Mapping[str, Any], explicit: object = None) -> dict[st
         candidate.get("sha256") or candidate.get("content_sha256"),
         "payload_ref.sha256",
     )
-    if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+    if len(digest) != 64 or any(
+        char not in "0123456789abcdefABCDEF" for char in digest
+    ):
         raise ManagerRecordError("payload_ref.sha256 must be a SHA-256 digest")
     return {"path": path, "sha256": digest.lower()}
 
 
-_FACT_KEYS = frozenset({
-    "lane_id", "declared_lane_id", "run_id", "request_id", "signal_id", "kind", "severity",
-    "state", "reason", "phase", "expiry_bucket", "manager_actionable", "actionable",
-    "agent_blocked", "deadline_utc", "delivery_deadline_utc", "generation", "fingerprint",
-    "unchanged_since_utc", "worker_invocation_id", "session_id", "thread_id", "resource",
-    "resources", "owners", "attempts", "code", "provider_id", "event_id",
-})
+_FACT_KEYS = frozenset(
+    {
+        "lane_id",
+        "declared_lane_id",
+        "run_id",
+        "request_id",
+        "signal_id",
+        "kind",
+        "severity",
+        "state",
+        "reason",
+        "phase",
+        "expiry_bucket",
+        "manager_actionable",
+        "actionable",
+        "agent_blocked",
+        "deadline_utc",
+        "delivery_deadline_utc",
+        "generation",
+        "fingerprint",
+        "unchanged_since_utc",
+        "worker_invocation_id",
+        "session_id",
+        "thread_id",
+        "resource",
+        "resources",
+        "owners",
+        "attempts",
+        "code",
+        "provider_id",
+        "event_id",
+    }
+)
 
 
 def _typed_facts(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -295,7 +340,9 @@ def _typed_facts(data: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(value, (str, int, float, bool)):
             result[key] = scalar(value, key)
-        elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+        elif isinstance(value, list) and all(
+            isinstance(item, (str, int, float, bool)) for item in value
+        ):
             result[key] = [scalar(item, key) for item in value]
     return result
 
@@ -331,10 +378,22 @@ class ManagerEventRouter:
         supplied = dict(binding or {})
         run_id = run_id or supplied.get("run_id")
         queue_id = queue_id or supplied.get("queue_id")
-        manager_session_id = manager_session_id or supplied.get("manager_session_id") or supplied.get("session_id")
-        manager_thread_id = manager_thread_id or supplied.get("manager_thread_id") or supplied.get("thread_id")
+        manager_session_id = (
+            manager_session_id
+            or supplied.get("manager_session_id")
+            or supplied.get("session_id")
+        )
+        manager_thread_id = (
+            manager_thread_id
+            or supplied.get("manager_thread_id")
+            or supplied.get("thread_id")
+        )
         registration_id = registration_id or supplied.get("registration_id")
-        manager_invocation_id = manager_invocation_id or supplied.get("manager_invocation_id") or supplied.get("invocation_id")
+        manager_invocation_id = (
+            manager_invocation_id
+            or supplied.get("manager_invocation_id")
+            or supplied.get("invocation_id")
+        )
         if registration_generation is None:
             registration_generation = supplied.get("registration_generation", 1)
         if (
@@ -342,7 +401,9 @@ class ManagerEventRouter:
             or isinstance(registration_generation, bool)
             or registration_generation < 0
         ):
-            raise ManagerBindingError("registration_generation must be a non-negative integer")
+            raise ManagerBindingError(
+                "registration_generation must be a non-negative integer"
+            )
         run_text = _nonempty_text(run_id, "run_id")
         session_text = _nonempty_text(manager_session_id, "manager_session_id")
         thread_text = _nonempty_text(manager_thread_id, "manager_thread_id")
@@ -352,25 +413,42 @@ class ManagerEventRouter:
             "manager_thread_id": thread_text,
             "manager_invocation_id": (
                 _nonempty_text(manager_invocation_id, "manager_invocation_id")
-                if manager_invocation_id is not None else None
+                if manager_invocation_id is not None
+                else None
             ),
         }
         if queue_id is None:
-            queue_id = "queue-" + hashlib.sha256(canonical_json(provisional).encode("utf-8")).hexdigest()[:32]
+            queue_id = (
+                "queue-"
+                + hashlib.sha256(
+                    canonical_json(provisional).encode("utf-8")
+                ).hexdigest()[:32]
+            )
         queue_text = _nonempty_text(queue_id, "queue_id")
         if registration_id is None:
-            registration_id = "registration-" + hashlib.sha256(
-                canonical_json({**provisional, "queue_id": queue_text}).encode("utf-8")
-            ).hexdigest()[:32]
+            registration_id = (
+                "registration-"
+                + hashlib.sha256(
+                    canonical_json({**provisional, "queue_id": queue_text}).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:32]
+            )
         registration_text = _nonempty_text(registration_id, "registration_id")
         self.binding = ManagerBinding(
-            run_text, queue_text, session_text, thread_text, registration_text,
+            run_text,
+            queue_text,
+            session_text,
+            thread_text,
+            registration_text,
             provisional["manager_invocation_id"],
         )
         self.registration_generation = registration_generation
         self.root = Path(root).absolute()
         self._now = now
-        self._transaction = PreparedOutputTransaction(self.root, allowed_roots=(self.root.parent,))
+        self._transaction = PreparedOutputTransaction(
+            self.root, allowed_roots=(self.root.parent,)
+        )
         self._transaction.prepare()
         for path in (
             self.registration_path,
@@ -404,7 +482,9 @@ class ManagerEventRouter:
 
     @property
     def registration(self) -> dict[str, Any]:
-        value = self._read_json(self.registration_path, schema=MANAGER_REGISTRATION_SCHEMA)
+        value = self._read_json(
+            self.registration_path, schema=MANAGER_REGISTRATION_SCHEMA
+        )
         if value is None:
             raise ManagerRecordError("manager registration is missing")
         return dict(value)
@@ -424,23 +504,37 @@ class ManagerEventRouter:
     def _assert_binding(self, record: Mapping[str, Any]) -> None:
         expected = self._binding_record()
         fields = (
-            "run_id", "queue_id", "manager_session_id", "manager_thread_id",
-            "binding_digest", "registration_id",
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "binding_digest",
+            "registration_id",
         )
         for field in fields:
             if record.get(field) != expected[field]:
                 raise ManagerBindingError(f"manager binding mismatch in {field}")
-        if "manager_invocation_id" in record and record.get("manager_invocation_id") != expected.get("manager_invocation_id"):
-            raise ManagerBindingError("manager binding mismatch in manager_invocation_id")
-        if "registration_generation" in record and record.get("registration_generation") != expected.get("registration_generation"):
-            raise ManagerBindingError("manager binding mismatch in registration_generation")
+        if "manager_invocation_id" in record and record.get(
+            "manager_invocation_id"
+        ) != expected.get("manager_invocation_id"):
+            raise ManagerBindingError(
+                "manager binding mismatch in manager_invocation_id"
+            )
+        if "registration_generation" in record and record.get(
+            "registration_generation"
+        ) != expected.get("registration_generation"):
+            raise ManagerBindingError(
+                "manager binding mismatch in registration_generation"
+            )
 
     def _read_json(self, path: Path, *, schema: str) -> dict[str, Any] | None:
         if not path.exists():
             return None
         self._transaction.revalidate(path)
         try:
-            stable = read_stable(path, max_bytes=self._MAX_RECORD_BYTES, retries=3, delay_seconds=0.01)
+            stable = read_stable(
+                path, max_bytes=self._MAX_RECORD_BYTES, retries=3, delay_seconds=0.01
+            )
             value = json.loads(stable.data.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ManagerRecordError(f"cannot read {path.name}: {exc}") from exc
@@ -450,14 +544,22 @@ class ManagerEventRouter:
         return value
 
     def _write_registration(self) -> None:
-        current = self._read_json(self.registration_path, schema=MANAGER_REGISTRATION_SCHEMA)
+        current = self._read_json(
+            self.registration_path, schema=MANAGER_REGISTRATION_SCHEMA
+        )
         if current is not None:
             return
         record = {
             "schema": MANAGER_REGISTRATION_SCHEMA,
             **self._binding_record(),
             "registered_utc": self._timestamp(),
-            "channel": ["REGISTRATION.json", "QUEUE.jsonl", "STATE.json", "WAKE.json", "DELIVERY.jsonl"],
+            "channel": [
+                "REGISTRATION.json",
+                "QUEUE.jsonl",
+                "STATE.json",
+                "WAKE.json",
+                "DELIVERY.jsonl",
+            ],
         }
         self._transaction.atomic_json(self.registration_path, record)
 
@@ -486,22 +588,28 @@ class ManagerEventRouter:
             if state is None:
                 self._transaction.atomic_json(self.state_path, self._empty_state())
         if not self.wake_path.exists():
-            self._transaction.atomic_json(self.wake_path, {
-                "schema": MANAGER_WAKE_SCHEMA,
-                **self._binding_record(),
-                "wake_revision": 0,
-                "published_utc": self._timestamp(),
-            })
-        else:
-            try:
-                self._read_json(self.wake_path, schema=MANAGER_WAKE_SCHEMA)
-            except ManagerRecordError:
-                self._transaction.atomic_json(self.wake_path, {
+            self._transaction.atomic_json(
+                self.wake_path,
+                {
                     "schema": MANAGER_WAKE_SCHEMA,
                     **self._binding_record(),
                     "wake_revision": 0,
                     "published_utc": self._timestamp(),
-                })
+                },
+            )
+        else:
+            try:
+                self._read_json(self.wake_path, schema=MANAGER_WAKE_SCHEMA)
+            except ManagerRecordError:
+                self._transaction.atomic_json(
+                    self.wake_path,
+                    {
+                        "schema": MANAGER_WAKE_SCHEMA,
+                        **self._binding_record(),
+                        "wake_revision": 0,
+                        "published_utc": self._timestamp(),
+                    },
+                )
         for path in (self.queue_path, self.delivery_path):
             if not path.exists():
                 self._transaction.write_bytes(path, b"")
@@ -514,38 +622,66 @@ class ManagerEventRouter:
             return []
         self._transaction.revalidate(self.queue_path)
         try:
-            data = read_stable(self.queue_path, max_bytes=self._QUEUE_READ_MAX_BYTES, retries=3, delay_seconds=0.01).data
+            data = read_stable(
+                self.queue_path,
+                max_bytes=self._QUEUE_READ_MAX_BYTES,
+                retries=3,
+                delay_seconds=0.01,
+            ).data
         except OSError as exc:
             raise ManagerRecordError(f"cannot read QUEUE.jsonl: {exc}") from exc
         records: list[dict[str, Any]] = []
         prior_journal = 0
         prior_admission = 0
         common_fields = set(self._binding_record()) | {
-            "schema", "record_kind", "journal_seq", "event_id",
+            "schema",
+            "record_kind",
+            "journal_seq",
+            "event_id",
         }
         for line_number, line in enumerate(data.splitlines(), 1):
             try:
                 raw = json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ManagerRecordError(f"invalid queue record {line_number}: {exc}") from exc
+                raise ManagerRecordError(
+                    f"invalid queue record {line_number}: {exc}"
+                ) from exc
             if not isinstance(raw, dict) or raw.get("schema") != MANAGER_QUEUE_SCHEMA:
                 raise ManagerRecordError(f"invalid queue record {line_number} schema")
             self._assert_binding(raw)
             journal = raw.get("journal_seq")
-            if not isinstance(journal, int) or isinstance(journal, bool) or journal <= prior_journal:
-                raise ManagerRecordError(f"queue journal sequence is not strictly increasing at {line_number}")
+            if (
+                not isinstance(journal, int)
+                or isinstance(journal, bool)
+                or journal <= prior_journal
+            ):
+                raise ManagerRecordError(
+                    f"queue journal sequence is not strictly increasing at {line_number}"
+                )
             prior_journal = journal
             kind = raw.get("record_kind")
             if kind not in {"EVENT", "ACK", "SUPERSESSION"}:
                 raise ManagerRecordError(f"unknown queue record kind at {line_number}")
             allowed = common_fields | {
-                "admission_seq", "source_event_id", "event_type", "source_type",
-                "identity", "disposition", "priority", "admitted_utc", "facts",
-                "payload_ref", "action", "acknowledged_utc", "superseded_by",
+                "admission_seq",
+                "source_event_id",
+                "event_type",
+                "source_type",
+                "identity",
+                "disposition",
+                "priority",
+                "admitted_utc",
+                "facts",
+                "payload_ref",
+                "action",
+                "acknowledged_utc",
+                "superseded_by",
                 "superseded_utc",
             }
             if set(raw) - allowed:
-                raise ManagerRecordError(f"queue record {line_number} has unknown fields")
+                raise ManagerRecordError(
+                    f"queue record {line_number} has unknown fields"
+                )
             event_id = raw.get("event_id")
             if not isinstance(event_id, str) or not event_id:
                 raise ManagerRecordError(f"queue record {line_number} has no event_id")
@@ -556,7 +692,9 @@ class ManagerEventRouter:
                     or isinstance(admission, bool)
                     or admission <= prior_admission
                 ):
-                    raise ManagerRecordError(f"event record {line_number} has invalid admission_seq")
+                    raise ManagerRecordError(
+                        f"event record {line_number} has invalid admission_seq"
+                    )
                 prior_admission = admission
                 if (
                     not isinstance(raw.get("event_type"), str)
@@ -568,18 +706,31 @@ class ManagerEventRouter:
                     or raw.get("disposition") != EVENT_DISPOSITION_WAKING
                     or not isinstance(raw.get("facts"), dict)
                 ):
-                    raise ManagerRecordError(f"event record {line_number} has invalid identity")
+                    raise ManagerRecordError(
+                        f"event record {line_number} has invalid identity"
+                    )
                 _finite_priority(raw.get("priority"))
-                if not isinstance(raw.get("admitted_utc"), str) or parse_utc(raw["admitted_utc"]) is None:
-                    raise ManagerRecordError(f"event record {line_number} has invalid timestamp")
+                if (
+                    not isinstance(raw.get("admitted_utc"), str)
+                    or parse_utc(raw["admitted_utc"]) is None
+                ):
+                    raise ManagerRecordError(
+                        f"event record {line_number} has invalid timestamp"
+                    )
                 source_event_id = raw.get("source_event_id")
-                if source_event_id is not None and (not isinstance(source_event_id, str) or not source_event_id):
-                    raise ManagerRecordError(f"event record {line_number} has invalid source_event_id")
+                if source_event_id is not None and (
+                    not isinstance(source_event_id, str) or not source_event_id
+                ):
+                    raise ManagerRecordError(
+                        f"event record {line_number} has invalid source_event_id"
+                    )
                 if "payload_ref" in raw:
                     try:
                         _safe_reference({}, raw["payload_ref"])
                     except ManagerRoutingError as exc:
-                        raise ManagerRecordError(f"event record {line_number} has invalid payload_ref") from exc
+                        raise ManagerRecordError(
+                            f"event record {line_number} has invalid payload_ref"
+                        ) from exc
             elif kind == "ACK":
                 if (
                     raw.get("action") != "ACKNOWLEDGED"
@@ -595,11 +746,15 @@ class ManagerEventRouter:
                     or not isinstance(raw.get("superseded_utc"), str)
                     or parse_utc(raw["superseded_utc"]) is None
                 ):
-                    raise ManagerRecordError(f"supersession record {line_number} is invalid")
+                    raise ManagerRecordError(
+                        f"supersession record {line_number} is invalid"
+                    )
             records.append(raw)
         return records
 
-    def _ledger(self) -> tuple[list[dict[str, Any]], set[str], dict[str, str], int, int]:
+    def _ledger(
+        self,
+    ) -> tuple[list[dict[str, Any]], set[str], dict[str, str], int, int]:
         events: dict[str, dict[str, Any]] = {}
         acknowledged: set[str] = set()
         superseded: dict[str, str] = {}
@@ -609,7 +764,9 @@ class ManagerEventRouter:
             next_journal = max(next_journal, int(record["journal_seq"]) + 1)
             if record["record_kind"] == "EVENT":
                 prior = events.get(record["event_id"])
-                if prior is not None and canonical_json(prior) != canonical_json(record):
+                if prior is not None and canonical_json(prior) != canonical_json(
+                    record
+                ):
                     raise ManagerRecordError("event ID collision in QUEUE.jsonl")
                 events[record["event_id"]] = record
                 next_admission = max(next_admission, int(record["admission_seq"]) + 1)
@@ -618,19 +775,35 @@ class ManagerEventRouter:
             else:
                 superseded[record["event_id"]] = record["superseded_by"]
         pending = [
-            record for event_id, record in events.items()
+            record
+            for event_id, record in events.items()
             if event_id not in acknowledged and event_id not in superseded
         ]
-        pending.sort(key=lambda item: (float(item["priority"]), int(item["admission_seq"]), item["event_id"]))
+        pending.sort(
+            key=lambda item: (
+                float(item["priority"]),
+                int(item["admission_seq"]),
+                item["event_id"],
+            )
+        )
         return pending, acknowledged, superseded, next_admission, next_journal
 
-    def _state_for_ledger(self, *, observed: Mapping[str, Any] | None = None, wake_revision: int | None = None) -> dict[str, Any]:
+    def _state_for_ledger(
+        self,
+        *,
+        observed: Mapping[str, Any] | None = None,
+        wake_revision: int | None = None,
+    ) -> dict[str, Any]:
         pending, acknowledged, superseded, next_admission, next_journal = self._ledger()
         try:
             prior = self._read_json(self.state_path, schema=MANAGER_STATE_SCHEMA)
         except ManagerRecordError:
             prior = None
-        prior_observed = prior.get("observed", {}) if isinstance(prior, dict) and isinstance(prior.get("observed"), dict) else {}
+        prior_observed = (
+            prior.get("observed", {})
+            if isinstance(prior, dict) and isinstance(prior.get("observed"), dict)
+            else {}
+        )
         merged_observed = dict(prior_observed)
         if observed:
             merged_observed.update(observed)
@@ -717,7 +890,12 @@ class ManagerEventRouter:
         source_event_id = event.get("event_id")
         if source_event_id is not None:
             source_event_id = _nonempty_text(source_event_id, "event.event_id")
-        identity = event.get("identity") or data.get("signal_id") or data.get("path") or source_event_id
+        identity = (
+            event.get("identity")
+            or data.get("signal_id")
+            or data.get("path")
+            or source_event_id
+        )
         identity_text = _nonempty_text(identity, "event.identity")
         disposition = EVENT_DISPOSITIONS.get(source_type)
         if disposition is None:
@@ -730,14 +908,43 @@ class ManagerEventRouter:
                 "unknown source type",
             )
         if data.get("manager_actionable") is False or data.get("actionable") is False:
-            return ManagerRouteDecision(EVENT_DISPOSITION_OBSERVED, source_type, source_type, source_event_id, identity_text, "source marked non-actionable")
+            return ManagerRouteDecision(
+                EVENT_DISPOSITION_OBSERVED,
+                source_type,
+                source_type,
+                source_event_id,
+                identity_text,
+                "source marked non-actionable",
+            )
         if disposition == EVENT_DISPOSITION_SUPERSEDED:
-            return ManagerRouteDecision(disposition, source_type, source_type, source_event_id, identity_text, "source explicitly supersedes prior state")
-        return ManagerRouteDecision(disposition, source_type, source_type, source_event_id, identity_text, "declared event wiring")
+            return ManagerRouteDecision(
+                disposition,
+                source_type,
+                source_type,
+                source_event_id,
+                identity_text,
+                "source explicitly supersedes prior state",
+            )
+        return ManagerRouteDecision(
+            disposition,
+            source_type,
+            source_type,
+            source_event_id,
+            identity_text,
+            "declared event wiring",
+        )
 
     def _validate_input_binding(self, event: Mapping[str, Any]) -> None:
         candidate: dict[str, Any] = {}
-        for key in ("run_id", "queue_id", "manager_session_id", "manager_thread_id", "manager_invocation_id", "registration_id", "binding_digest"):
+        for key in (
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "manager_invocation_id",
+            "registration_id",
+            "binding_digest",
+        ):
             if key in event:
                 candidate[key] = event[key]
         for container_name in ("binding", "manager_binding"):
@@ -746,9 +953,17 @@ class ManagerEventRouter:
                 candidate.update({str(key): value[key] for key in value})
         expected = self._binding_record()
         for key, value in candidate.items():
-            normalized = "manager_session_id" if key == "session_id" else "manager_thread_id" if key == "thread_id" else key
+            normalized = (
+                "manager_session_id"
+                if key == "session_id"
+                else "manager_thread_id"
+                if key == "thread_id"
+                else key
+            )
             if normalized in expected and value != expected[normalized]:
-                raise ManagerBindingError(f"source event binding mismatch in {normalized}")
+                raise ManagerBindingError(
+                    f"source event binding mismatch in {normalized}"
+                )
 
     def validate_binding(self, record: Mapping[str, Any]) -> None:
         """Validate all durable binding coordinates, including registration."""
@@ -780,8 +995,16 @@ class ManagerEventRouter:
             "facts": facts,
             "payload_ref": reference,
         }
-        event_id = source_event_id or "event-" + hashlib.sha256(canonical_json(stable_identity).encode("utf-8")).hexdigest()
-        timestamp = iso_utc(observed_at) if observed_at is not None else self._timestamp()
+        event_id = (
+            source_event_id
+            or "event-"
+            + hashlib.sha256(
+                canonical_json(stable_identity).encode("utf-8")
+            ).hexdigest()
+        )
+        timestamp = (
+            iso_utc(observed_at) if observed_at is not None else self._timestamp()
+        )
         record: dict[str, Any] = {
             "schema": MANAGER_QUEUE_SCHEMA,
             **self._binding_record(),
@@ -886,7 +1109,9 @@ class ManagerEventRouter:
         if event_id in acknowledged:
             raise ManagerRecordError("supersession references an acknowledged event")
         if event_id in superseded:
-            raise ManagerRecordError("supersession references an already-superseded event")
+            raise ManagerRecordError(
+                "supersession references an already-superseded event"
+            )
         if not any(item.get("event_id") == event_id for item in pending):
             raise ManagerRecordError("supersession reference is not pending")
         if identity is None:
@@ -900,11 +1125,15 @@ class ManagerEventRouter:
         if target.get("event_type") != event_type:
             raise ManagerRecordError("supersession condition type does not match")
         if target.get("source_type") != source_type:
-            raise ManagerRecordError("supersession condition source type does not match")
+            raise ManagerRecordError(
+                "supersession condition source type does not match"
+            )
         record = self._supersession_record(event_id, superseded_by, next_journal)
         self._append_journal_locked(_jsonl_bytes([record]))
 
-    def _supersession_record(self, old_event_id: str, new_event_id: str, journal_seq: int) -> dict[str, Any]:
+    def _supersession_record(
+        self, old_event_id: str, new_event_id: str, journal_seq: int
+    ) -> dict[str, Any]:
         return {
             "schema": MANAGER_QUEUE_SCHEMA,
             **self._binding_record(),
@@ -916,7 +1145,9 @@ class ManagerEventRouter:
             "superseded_utc": self._timestamp(),
         }
 
-    def _ack_record(self, event_id: str, journal_seq: int, *, action: str = "ACKNOWLEDGED") -> dict[str, Any]:
+    def _ack_record(
+        self, event_id: str, journal_seq: int, *, action: str = "ACKNOWLEDGED"
+    ) -> dict[str, Any]:
         return {
             "schema": MANAGER_QUEUE_SCHEMA,
             **self._binding_record(),
@@ -954,7 +1185,9 @@ class ManagerEventRouter:
         else:
             self._validate_input_binding(event)
         decision = self.classify(event)
-        timestamp = observed_at or (self._now() if callable(self._now) else datetime.now().astimezone())
+        timestamp = observed_at or (
+            self._now() if callable(self._now) else datetime.now().astimezone()
+        )
         if decision.disposition == EVENT_DISPOSITION_WAKING:
             data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
             # Validate all whitelisted members before any cache repair or
@@ -975,7 +1208,9 @@ class ManagerEventRouter:
                 }
                 self._transaction.atomic_json(
                     self.state_path,
-                    self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)),
+                    self._state_for_ledger(
+                        observed=observed, wake_revision=state.get("wake_revision", 0)
+                    ),
                 )
             return None
         if decision.disposition == EVENT_DISPOSITION_SUPERSEDED:
@@ -994,7 +1229,9 @@ class ManagerEventRouter:
                 or not cleared_source_type.strip()
                 or cleared_source_type != cleared_type
             ):
-                raise ManagerRecordError("condition clear source type does not match cleared type")
+                raise ManagerRecordError(
+                    "condition clear source type does not match cleared type"
+                )
             with self._queue_mutation():
                 self._supersede_pending_locked(
                     old_id,
@@ -1005,7 +1242,9 @@ class ManagerEventRouter:
                 )
                 self._publish_queue_state_locked(publish_wake=False)
             return None
-        selected_priority = self._priority_for(event, decision, priority, snapshot, timestamp)
+        selected_priority = self._priority_for(
+            event, decision, priority, snapshot, timestamp
+        )
         if selected_priority is None:
             with self._queue_mutation():
                 state = self._load_state_locked()
@@ -1020,23 +1259,38 @@ class ManagerEventRouter:
                 }
                 self._transaction.atomic_json(
                     self.state_path,
-                    self._state_for_ledger(observed=observed, wake_revision=state.get("wake_revision", 0)),
+                    self._state_for_ledger(
+                        observed=observed, wake_revision=state.get("wake_revision", 0)
+                    ),
                 )
             return None
         with self._queue_mutation():
-            _pending, acknowledged, superseded, next_admission, next_journal = self._ledger()
+            _pending, acknowledged, superseded, next_admission, next_journal = (
+                self._ledger()
+            )
             existing_records = self._queue_records()
             if decision.event_id is not None:
                 for prior in existing_records:
-                    if prior.get("record_kind") == "EVENT" and prior.get("event_id") == decision.event_id:
+                    if (
+                        prior.get("record_kind") == "EVENT"
+                        and prior.get("event_id") == decision.event_id
+                    ):
                         return prior
             record = self._event_record(
-                event, decision, admission_seq=next_admission, journal_seq=next_journal,
-                priority=selected_priority, payload_ref=payload_ref, observed_at=timestamp,
+                event,
+                decision,
+                admission_seq=next_admission,
+                journal_seq=next_journal,
+                priority=selected_priority,
+                payload_ref=payload_ref,
+                observed_at=timestamp,
             )
             event_id = record["event_id"]
             for prior in existing_records:
-                if prior.get("record_kind") == "EVENT" and prior.get("event_id") == event_id:
+                if (
+                    prior.get("record_kind") == "EVENT"
+                    and prior.get("event_id") == event_id
+                ):
                     if (
                         prior.get("event_type") != record.get("event_type")
                         or prior.get("source_type") != record.get("source_type")
@@ -1044,7 +1298,9 @@ class ManagerEventRouter:
                         or prior.get("facts") != record.get("facts")
                         or prior.get("payload_ref") != record.get("payload_ref")
                     ):
-                        raise ManagerRecordError("event ID collision for manager binding")
+                        raise ManagerRecordError(
+                            "event ID collision for manager binding"
+                        )
                     return prior
             supersede_ids: list[str] = []
             for prior in existing_records:
@@ -1062,7 +1318,9 @@ class ManagerEventRouter:
             journal_records = [record]
             for old_id in sorted(set(supersede_ids)):
                 journal += 1
-                journal_records.append(self._supersession_record(old_id, event_id, journal))
+                journal_records.append(
+                    self._supersession_record(old_id, event_id, journal)
+                )
             # This append is the crash-consistency boundary: queue first, cache
             # and payload-free wake second, all under the same queue lock.
             self._append_journal_locked(_jsonl_bytes(journal_records))
@@ -1102,8 +1360,12 @@ class ManagerEventRouter:
             if not any(item.get("event_id") == event_id for item in pending):
                 if event_id in acknowledged:
                     return True
-                raise ManagerRoutingError("event ID is not pending for this exact manager binding")
-            self._append_journal_locked(_jsonl_bytes([self._ack_record(event_id, next_journal, action=action)]))
+                raise ManagerRoutingError(
+                    "event ID is not pending for this exact manager binding"
+                )
+            self._append_journal_locked(
+                _jsonl_bytes([self._ack_record(event_id, next_journal, action=action)])
+            )
             state = self._publish_queue_state_locked(publish_wake=True)
             del state
         return True
@@ -1121,7 +1383,11 @@ class ManagerEventRouter:
         source_type: str | None = None,
     ) -> bool:
         event_id = _nonempty_text(event_id, "event_id")
-        replacement = _nonempty_text(superseded_by, "superseded_by") if superseded_by is not None else "explicit-supersession"
+        replacement = (
+            _nonempty_text(superseded_by, "superseded_by")
+            if superseded_by is not None
+            else "explicit-supersession"
+        )
         with self._queue_mutation():
             self._supersede_pending_locked(
                 event_id,
@@ -1146,18 +1412,30 @@ class ManagerEventRouter:
         if binding is not None:
             self.validate_binding(binding)
         delivery_id = _nonempty_text(delivery_id, "delivery_id")
-        if not isinstance(wake_revision, int) or isinstance(wake_revision, bool) or wake_revision < 0:
-            raise ManagerRecordError("delivery wake_revision must be a non-negative integer")
+        if (
+            not isinstance(wake_revision, int)
+            or isinstance(wake_revision, bool)
+            or wake_revision < 0
+        ):
+            raise ManagerRecordError(
+                "delivery wake_revision must be a non-negative integer"
+            )
         if wake_revision > self.wake_revision:
-            raise ManagerBindingError("delivery references a wake revision not published by this binding")
+            raise ManagerBindingError(
+                "delivery references a wake revision not published by this binding"
+            )
         ids = list(event_ids or [])
         if any(not isinstance(item, str) or not item for item in ids):
             raise ManagerRecordError("delivery event_ids must be non-empty strings")
         known_event_ids = {
-            item["event_id"] for item in self._queue_records() if item.get("record_kind") == "EVENT"
+            item["event_id"]
+            for item in self._queue_records()
+            if item.get("record_kind") == "EVENT"
         }
         if any(item not in known_event_ids for item in ids):
-            raise ManagerRecordError("delivery references an event outside this manager queue")
+            raise ManagerRecordError(
+                "delivery references an event outside this manager queue"
+            )
         delivered_utc = iso_utc(delivered_at) if delivered_at else self._timestamp()
         if delivered_utc is None or parse_utc(delivered_utc) is None:
             raise ManagerRecordError("delivery timestamp is invalid")
@@ -1175,7 +1453,9 @@ class ManagerEventRouter:
         for prior in self.read_deliveries():
             if prior["delivery_id"] == delivery_id:
                 if canonical_json(prior) != canonical_json(record):
-                    raise ManagerRecordError("delivery ID collision for manager binding")
+                    raise ManagerRecordError(
+                        "delivery ID collision for manager binding"
+                    )
                 return prior
         self._transaction.append_jsonl(self.delivery_path, [record])
         return record
@@ -1190,39 +1470,77 @@ class ManagerEventRouter:
         if not self.delivery_path.exists():
             return []
         self._transaction.revalidate(self.delivery_path)
-        data = read_stable(self.delivery_path, max_bytes=self._QUEUE_READ_MAX_BYTES, retries=3, delay_seconds=0.01).data
+        data = read_stable(
+            self.delivery_path,
+            max_bytes=self._QUEUE_READ_MAX_BYTES,
+            retries=3,
+            delay_seconds=0.01,
+        ).data
         result: list[dict[str, Any]] = []
         common_fields = set(self._binding_record()) | {
-            "schema", "delivery_id", "wake_revision", "event_ids", "outcome", "delivered_utc",
+            "schema",
+            "delivery_id",
+            "wake_revision",
+            "event_ids",
+            "outcome",
+            "delivered_utc",
         }
         for index, line in enumerate(data.splitlines(), 1):
             try:
                 value = json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ManagerRecordError(f"invalid delivery record {index}: {exc}") from exc
-            if not isinstance(value, dict) or value.get("schema") != MANAGER_DELIVERY_SCHEMA:
+                raise ManagerRecordError(
+                    f"invalid delivery record {index}: {exc}"
+                ) from exc
+            if (
+                not isinstance(value, dict)
+                or value.get("schema") != MANAGER_DELIVERY_SCHEMA
+            ):
                 raise ManagerRecordError(f"invalid delivery record {index} schema")
             self._assert_binding(value)
             if set(value) - common_fields:
                 raise ManagerRecordError(f"delivery record {index} has unknown fields")
-            if not isinstance(value.get("delivery_id"), str) or not value["delivery_id"]:
-                raise ManagerRecordError(f"delivery record {index} has invalid delivery_id")
+            if (
+                not isinstance(value.get("delivery_id"), str)
+                or not value["delivery_id"]
+            ):
+                raise ManagerRecordError(
+                    f"delivery record {index} has invalid delivery_id"
+                )
             revision = value.get("wake_revision")
-            if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
-                raise ManagerRecordError(f"delivery record {index} has invalid wake_revision")
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+            ):
+                raise ManagerRecordError(
+                    f"delivery record {index} has invalid wake_revision"
+                )
             if revision > self.wake_revision:
-                raise ManagerBindingError(f"delivery record {index} references an unpublished wake revision")
+                raise ManagerBindingError(
+                    f"delivery record {index} references an unpublished wake revision"
+                )
             ids = value.get("event_ids")
             if (
                 not isinstance(ids, list)
                 or any(not isinstance(item, str) or not item for item in ids)
                 or ids != sorted(set(ids))
             ):
-                raise ManagerRecordError(f"delivery record {index} has invalid event_ids")
-            if not isinstance(value.get("outcome"), str) or not value["outcome"].strip():
+                raise ManagerRecordError(
+                    f"delivery record {index} has invalid event_ids"
+                )
+            if (
+                not isinstance(value.get("outcome"), str)
+                or not value["outcome"].strip()
+            ):
                 raise ManagerRecordError(f"delivery record {index} has invalid outcome")
-            if not isinstance(value.get("delivered_utc"), str) or parse_utc(value["delivered_utc"]) is None:
-                raise ManagerRecordError(f"delivery record {index} has invalid timestamp")
+            if (
+                not isinstance(value.get("delivered_utc"), str)
+                or parse_utc(value["delivered_utc"]) is None
+            ):
+                raise ManagerRecordError(
+                    f"delivery record {index} has invalid timestamp"
+                )
             result.append(value)
         return result
 
@@ -1230,7 +1548,12 @@ class ManagerEventRouter:
 def _active_lanes(snapshot: dict[str, Any]) -> bool:
     return any(
         lane.get("process_state", lane.get("operational_state"))
-        in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+        in {
+            "RUNNING_CODEX",
+            "WAITING_RESOURCE",
+            "WAITING_RELAY",
+            "PROCESS_STATE_UNKNOWN",
+        }
         for lane in snapshot.get("lanes", [])
     )
 
@@ -1282,7 +1605,12 @@ def _manager_signal_ineligibility_reason(
     lane_current = any(
         lane.get("lane_id") == lane_id
         and lane.get("process_state", lane.get("operational_state"))
-        in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
+        in {
+            "RUNNING_CODEX",
+            "WAITING_RESOURCE",
+            "WAITING_RELAY",
+            "PROCESS_STATE_UNKNOWN",
+        }
         for lane in snapshot.get("lanes", [])
     )
     if lane_current:
@@ -1295,8 +1623,7 @@ def _manager_signal_ineligibility_reason(
         return None
     helper_current = any(
         item.get("declared_lane_id") == lane_id
-        and item.get("operational_state")
-        in {"HELPER_RUNNING", "MCP_RUNNING"}
+        and item.get("operational_state") in {"HELPER_RUNNING", "MCP_RUNNING"}
         for group in ("helpers", "mcps")
         for item in snapshot.get(group, [])
     )
@@ -1353,7 +1680,9 @@ def _manager_signal_has_delivery_urgency(data: dict[str, Any]) -> bool:
 
 def _notification_deadline(data: dict[str, Any]) -> datetime | None:
     """Use a HELP delivery deadline for manager ordering when one was declared."""
-    return parse_utc(data.get("delivery_deadline_utc")) or parse_utc(data.get("deadline_utc"))
+    return parse_utc(data.get("delivery_deadline_utc")) or parse_utc(
+        data.get("deadline_utc")
+    )
 
 
 def _priority(
@@ -1366,7 +1695,12 @@ def _priority(
     if kind in {"RELAY_READY", "REQUEST_AMBIGUOUS", "RELAY_UNBOUND"}:
         return 1 if _event_manager_actionable(data) else None
     if kind == "REQUEST_EXPIRY_WARNING":
-        return 1 if _event_manager_actionable(data) and data.get("expiry_bucket") in {"WARNING", "CRITICAL"} else None
+        return (
+            1
+            if _event_manager_actionable(data)
+            and data.get("expiry_bucket") in {"WARNING", "CRITICAL"}
+            else None
+        )
     if kind in {
         "DUPLICATE_CONTROLLER",
         "DUPLICATE_CODING_BRANCH",
@@ -1381,7 +1715,9 @@ def _priority(
     if kind == "RESOURCE_WAIT":
         return 2 if data.get("actionable") is True else None
     if kind == "RESOURCE_AMBIGUOUS":
-        return 2 if _resource_ambiguity_is_current(data, snapshot, observed_at) else None
+        return (
+            2 if _resource_ambiguity_is_current(data, snapshot, observed_at) else None
+        )
     if kind == "STALE_STATUS":
         return 2
     if kind == "PROCESS_STATE_UNKNOWN":
@@ -1389,42 +1725,90 @@ def _priority(
     if kind == "PROCESS_INVENTORY_INCOMPLETE":
         return 2
     if kind == "OBSERVATION_ERROR":
-        return 2 if _active_lanes(snapshot) or any(item.get("lifetime_state") == "LIVE" for item in snapshot.get("requests", [])) else None
+        return (
+            2
+            if _active_lanes(snapshot)
+            or any(
+                item.get("lifetime_state") == "LIVE"
+                for item in snapshot.get("requests", [])
+            )
+            else None
+        )
     if kind == "MANAGER_SIGNAL":
         if not _manager_signal_is_live(data, snapshot, observed_at):
             return None
         return 1.5 if _manager_signal_has_delivery_urgency(data) else 3
     if kind == "CONTROLLER_EXITED":
         lane = next(
-            (item for item in snapshot.get("lanes", []) if item.get("lane_id") == data.get("lane_id")),
+            (
+                item
+                for item in snapshot.get("lanes", [])
+                if item.get("lane_id") == data.get("lane_id")
+            ),
             {},
         )
         if lane.get("checkpoint_path") or lane.get("result_path"):
             return None
         declared = str(lane.get("declared_state", "")).lower()
-        if declared in {"controller_failed", "launch_failed", "error", "failed", "terminated", "killed", "cancelled"}:
+        if declared in {
+            "controller_failed",
+            "launch_failed",
+            "error",
+            "failed",
+            "terminated",
+            "killed",
+            "cancelled",
+        }:
             return 4
         ended = parse_utc(lane.get("ended_utc"))
-        return 4 if ended is not None and (observed_at - ended).total_seconds() <= 2 else None
-    if kind in {"HELPER_EXITED", "MCP_EXITED", "HELPER_STATE_UNKNOWN", "MCP_STATE_UNKNOWN", "PROVIDER_WAIT"}:
+        return (
+            4
+            if ended is not None and (observed_at - ended).total_seconds() <= 2
+            else None
+        )
+    if kind in {
+        "HELPER_EXITED",
+        "MCP_EXITED",
+        "HELPER_STATE_UNKNOWN",
+        "MCP_STATE_UNKNOWN",
+        "PROVIDER_WAIT",
+    }:
         if kind == "PROVIDER_WAIT":
             return 4
         lane_id = data.get("declared_lane_id")
         session_id = data.get("session_id")
         if isinstance(lane_id, str) and lane_id:
-            return 4 if any(
-                lane.get("lane_id") == lane_id
-                and lane.get("process_state", lane.get("operational_state"))
-                in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
-                for lane in snapshot.get("lanes", [])
-            ) else None
+            return (
+                4
+                if any(
+                    lane.get("lane_id") == lane_id
+                    and lane.get("process_state", lane.get("operational_state"))
+                    in {
+                        "RUNNING_CODEX",
+                        "WAITING_RESOURCE",
+                        "WAITING_RELAY",
+                        "PROCESS_STATE_UNKNOWN",
+                    }
+                    for lane in snapshot.get("lanes", [])
+                )
+                else None
+            )
         if isinstance(session_id, str) and session_id:
-            return 4 if any(
-                lane.get("thread_id") == session_id
-                and lane.get("process_state", lane.get("operational_state"))
-                in {"RUNNING_CODEX", "WAITING_RESOURCE", "WAITING_RELAY", "PROCESS_STATE_UNKNOWN"}
-                for lane in snapshot.get("lanes", [])
-            ) else None
+            return (
+                4
+                if any(
+                    lane.get("thread_id") == session_id
+                    and lane.get("process_state", lane.get("operational_state"))
+                    in {
+                        "RUNNING_CODEX",
+                        "WAITING_RESOURCE",
+                        "WAITING_RELAY",
+                        "PROCESS_STATE_UNKNOWN",
+                    }
+                    for lane in snapshot.get("lanes", [])
+                )
+                else None
+            )
         return 4 if _active_lanes(snapshot) else None
     if kind == "LANE_STAGE_REPEAT":
         return 4.1
@@ -1460,10 +1844,19 @@ def select_actionable(
         if priority is None:
             continue
         deadline = _notification_deadline(condition.get("data", {}))
-        candidates.append((priority, deadline or datetime.max.replace(tzinfo=observed_at.tzinfo), condition["identity"], condition))
+        candidates.append(
+            (
+                priority,
+                deadline or datetime.max.replace(tzinfo=observed_at.tzinfo),
+                condition["identity"],
+                condition,
+            )
+        )
     if not candidates:
         return None
-    priority, _, _, condition = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+    priority, _, _, condition = min(
+        candidates, key=lambda item: (item[0], item[1], item[2])
+    )
     return {
         **condition,
         "admitted_priority": priority,
@@ -1502,7 +1895,11 @@ def admit_deferred_handoffs(
         if condition.get("type") not in _DEFERRED_HANDOFF_TYPES:
             continue
         event_id = condition.get("event_id")
-        if not isinstance(event_id, str) or event_id in acknowledged_event_ids or event_id in by_event:
+        if (
+            not isinstance(event_id, str)
+            or event_id in acknowledged_event_ids
+            or event_id in by_event
+        ):
             continue
         if (
             newly_observed_event_ids is not None
@@ -1514,19 +1911,26 @@ def admit_deferred_handoffs(
         if priority is None:
             continue
         deadline_key, identity_key = _order_key(condition, observed_at)
-        admitted.append({
-            "event": condition,
-            "priority": priority,
-            "deadline_order": deadline_key,
-            "identity": identity_key,
-            "admitted_utc": iso_utc(observed_at),
-        })
+        admitted.append(
+            {
+                "event": condition,
+                "priority": priority,
+                "deadline_order": deadline_key,
+                "identity": identity_key,
+                "admitted_utc": iso_utc(observed_at),
+            }
+        )
         by_event.add(event_id)
-    return sorted(admitted, key=lambda item: (item["priority"], item["deadline_order"], item["identity"]))
+    return sorted(
+        admitted,
+        key=lambda item: (item["priority"], item["deadline_order"], item["identity"]),
+    )
 
 
 def _prune_deferred(
-    deferred: list[dict[str, Any]], conditions: dict[str, dict[str, Any]], acknowledged: set[str]
+    deferred: list[dict[str, Any]],
+    conditions: dict[str, dict[str, Any]],
+    acknowledged: set[str],
 ) -> list[dict[str, Any]]:
     retained: list[dict[str, Any]] = []
     for item in deferred:
@@ -1564,7 +1968,9 @@ def select_actionable_with_deferred(
     """Select current work or an admitted handoff without re-gating stored work."""
     retained = _prune_deferred(deferred, conditions, acknowledged_event_ids)
     current = select_actionable(
-        conditions, snapshot, observed_at=observed_at,
+        conditions,
+        snapshot,
+        observed_at=observed_at,
         acknowledged_event_ids=acknowledged_event_ids,
         newly_observed_event_ids=newly_observed_event_ids,
     )
@@ -1576,19 +1982,46 @@ def select_actionable_with_deferred(
         choices.append((priority, deadline, identity, current, False))
     for item in retained:
         event = item["event"]
-        choices.append((item["priority"], item["deadline_order"], item["identity"], event, True))
+        choices.append(
+            (item["priority"], item["deadline_order"], item["identity"], event, True)
+        )
     if not choices:
         return None, retained
     _, _, _, selected, stored = min(choices, key=lambda item: item[:3])
     if stored:
-        retained = [item for item in retained if item.get("event", {}).get("event_id") != selected.get("event_id")]
-        source = next(item for item in deferred if item.get("event", {}).get("event_id") == selected.get("event_id"))
-        selected = {**selected, "admitted_priority": source["priority"], "admitted_utc": source["admitted_utc"], "observed_utc": iso_utc(observed_at), "notification": "MANAGER_ACTION_REQUIRED"}
+        retained = [
+            item
+            for item in retained
+            if item.get("event", {}).get("event_id") != selected.get("event_id")
+        ]
+        source = next(
+            item
+            for item in deferred
+            if item.get("event", {}).get("event_id") == selected.get("event_id")
+        )
+        selected = {
+            **selected,
+            "admitted_priority": source["priority"],
+            "admitted_utc": source["admitted_utc"],
+            "observed_utc": iso_utc(observed_at),
+            "notification": "MANAGER_ACTION_REQUIRED",
+        }
     elif selected.get("type") in _MUTABLE_HANDOFF_TYPES:
-        source = next((item for item in retained if item.get("event", {}).get("event_id") == selected.get("event_id")), None)
+        source = next(
+            (
+                item
+                for item in retained
+                if item.get("event", {}).get("event_id") == selected.get("event_id")
+            ),
+            None,
+        )
         if source is not None:
             retained = [item for item in retained if item is not source]
-            selected = {**selected, "admitted_priority": source["priority"], "admitted_utc": source["admitted_utc"]}
+            selected = {
+                **selected,
+                "admitted_priority": source["priority"],
+                "admitted_utc": source["admitted_utc"],
+            }
     return selected, retained
 
 
@@ -1605,7 +2038,8 @@ def preempt_pending_with_higher_priority(
     stored_priority = pending.get("admitted_priority")
     pending_priority = (
         float(stored_priority)
-        if isinstance(stored_priority, (int, float)) and not isinstance(stored_priority, bool)
+        if isinstance(stored_priority, (int, float))
+        and not isinstance(stored_priority, bool)
         else _priority(pending, snapshot, observed_at)
     )
     if pending_priority is None:
@@ -1621,7 +2055,11 @@ def preempt_pending_with_higher_priority(
     selected_event = selected_item["event"]
     selected_id = selected_event.get("event_id")
     pending_deadline, pending_identity = _order_key(pending, observed_at)
-    admitted_utc = pending.get("admitted_utc") or pending.get("observed_utc") or iso_utc(observed_at)
+    admitted_utc = (
+        pending.get("admitted_utc")
+        or pending.get("observed_utc")
+        or iso_utc(observed_at)
+    )
     displaced = {
         "event": pending,
         "priority": pending_priority,
@@ -1631,8 +2069,10 @@ def preempt_pending_with_higher_priority(
         "preempted_pending": True,
     }
     remaining = [
-        item for item in ranked
-        if item.get("event", {}).get("event_id") not in {selected_id, pending.get("event_id")}
+        item
+        for item in ranked
+        if item.get("event", {}).get("event_id")
+        not in {selected_id, pending.get("event_id")}
     ]
     remaining.append(displaced)
     remaining.sort(
@@ -1663,34 +2103,61 @@ def coalesce_mutable_handoffs(
         event = item.get("event") if isinstance(item, dict) else None
         if isinstance(event, dict) and event.get("type") in _MUTABLE_HANDOFF_TYPES:
             entries.append((event, item, str(item.get("admitted_utc") or "")))
-    groups: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any] | None, str]]] = {}
+    groups: dict[
+        tuple[str, str], list[tuple[dict[str, Any], dict[str, Any] | None, str]]
+    ] = {}
     for entry in entries:
         event = entry[0]
-        groups.setdefault((str(event.get("type")), str(event.get("identity"))), []).append(entry)
+        groups.setdefault(
+            (str(event.get("type")), str(event.get("identity"))), []
+        ).append(entry)
     kept_deferred = list(deferred)
     result_pending = pending
     for _, group in groups.items():
         if len(group) < 2:
             continue
-        winner, winner_item, _ = max(group, key=lambda item: (item[2], str(item[0].get("event_id") or "")))
+        winner, winner_item, _ = max(
+            group, key=lambda item: (item[2], str(item[0].get("event_id") or ""))
+        )
         superseded = sorted(
-            str(event.get("event_id")) for event, _, _ in group if event.get("event_id") != winner.get("event_id")
+            str(event.get("event_id"))
+            for event, _, _ in group
+            if event.get("event_id") != winner.get("event_id")
         )
         pending_member = next((event for event, item, _ in group if item is None), None)
         group_ids = {event.get("event_id") for event, _, _ in group}
         kept_deferred = [
-            item for item in kept_deferred
+            item
+            for item in kept_deferred
             if item.get("event", {}).get("event_id") not in group_ids
         ]
         if pending_member is not None:
             data = dict(winner.get("data", {}))
             prior = data.get("superseded_event_ids", [])
-            data["superseded_event_ids"] = sorted(set(superseded + [str(item) for item in prior]))
-            admission = winner_item.get("admitted_utc") if winner_item is not None else winner.get("admitted_utc")
-            result_pending = {**winner, "data": data, "admitted_utc": admission, "observed_utc": iso_utc(observed_at), "notification": "MANAGER_ACTION_REQUIRED"}
+            data["superseded_event_ids"] = sorted(
+                set(superseded + [str(item) for item in prior])
+            )
+            admission = (
+                winner_item.get("admitted_utc")
+                if winner_item is not None
+                else winner.get("admitted_utc")
+            )
+            result_pending = {
+                **winner,
+                "data": data,
+                "admitted_utc": admission,
+                "observed_utc": iso_utc(observed_at),
+                "notification": "MANAGER_ACTION_REQUIRED",
+            }
             if winner_item is not None:
                 result_pending["admitted_priority"] = winner_item["priority"]
         elif winner_item is not None:
             kept_deferred.append(winner_item)
-    return result_pending, sorted(kept_deferred, key=lambda item: (item.get("priority", 99), item.get("deadline_order", ""), item.get("identity", "")))
-
+    return result_pending, sorted(
+        kept_deferred,
+        key=lambda item: (
+            item.get("priority", 99),
+            item.get("deadline_order", ""),
+            item.get("identity", ""),
+        ),
+    )

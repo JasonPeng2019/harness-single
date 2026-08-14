@@ -7,6 +7,7 @@ controller prelaunch verification seam.  Only disposable local fake folders
 and a fake provider child are used; no real provider, network, hardware, MCP,
 USB, or display checkout is touched.
 """
+
 from __future__ import annotations
 
 import base64
@@ -94,7 +95,9 @@ class OverlayModuleTests(unittest.TestCase):
         self.assertTrue((self.cache / "readme.md").is_file())
         self.assertTrue((self.cache / "config" / "app.ini").is_file())
         self.assertEqual(b"# overlay\n", (self.cache / "readme.md").read_bytes())
-        self.assertEqual(b"mode=fast\n", (self.cache / "config" / "app.ini").read_bytes())
+        self.assertEqual(
+            b"mode=fast\n", (self.cache / "config" / "app.ini").read_bytes()
+        )
         self.assertEqual(b"alpha\n", (self.cache / "notes.txt").read_bytes())
         # The container folder itself is not copied.
         self.assertFalse((self.cache / source.name).exists())
@@ -116,7 +119,11 @@ class OverlayModuleTests(unittest.TestCase):
         self.assertFalse((self.cache / "drop.txt").exists())
         self.assertEqual(b"added\n", (self.cache / "new.txt").read_bytes())
         # No stale previous-cache directory remains.
-        leftovers = [item.name for item in self.harness.iterdir() if item.name.startswith(".super-cache")]
+        leftovers = [
+            item.name
+            for item in self.harness.iterdir()
+            if item.name.startswith(".super-cache")
+        ]
         self.assertEqual([], leftovers)
 
     def test_direct_cache_edits_remain_allowed_between_ingestions(self) -> None:
@@ -124,7 +131,9 @@ class OverlayModuleTests(unittest.TestCase):
         self._write(source, "tracked.txt", b"base\n")
         self._ingest(source)
         self._write(self.cache, "direct-edit.txt", b"edited directly\n")
-        self.assertEqual(b"edited directly\n", (self.cache / "direct-edit.txt").read_bytes())
+        self.assertEqual(
+            b"edited directly\n", (self.cache / "direct-edit.txt").read_bytes()
+        )
 
     def test_ingest_rejects_unsafe_source_and_destination_relationships(self) -> None:
         self._ingest(self._source())
@@ -133,13 +142,23 @@ class OverlayModuleTests(unittest.TestCase):
         nested_source = self.cache / "nested-source"
         nested_source.mkdir()
         with self.assertRaisesRegex(WorkspaceOverlayError, "must not be inside"):
-            ingest_super_cache(source_folder=nested_source, harness_worktree=self.harness)
-        with self.assertRaisesRegex(WorkspaceOverlayError, "existing regular directory"):
-            ingest_super_cache(source_folder=self.root / "missing", harness_worktree=self.harness)
+            ingest_super_cache(
+                source_folder=nested_source, harness_worktree=self.harness
+            )
+        with self.assertRaisesRegex(
+            WorkspaceOverlayError, "existing regular directory"
+        ):
+            ingest_super_cache(
+                source_folder=self.root / "missing", harness_worktree=self.harness
+            )
         file_harness = self.root / "not-a-dir"
         file_harness.write_text("x", encoding="utf-8")
-        with self.assertRaisesRegex(WorkspaceOverlayError, "existing regular directory"):
-            ingest_super_cache(source_folder=self._source(), harness_worktree=file_harness)
+        with self.assertRaisesRegex(
+            WorkspaceOverlayError, "existing regular directory"
+        ):
+            ingest_super_cache(
+                source_folder=self._source(), harness_worktree=file_harness
+            )
 
     def test_ingest_rejects_reparse_points_without_reporting_complete(self) -> None:
         source = self._source()
@@ -171,10 +190,12 @@ class OverlayModuleTests(unittest.TestCase):
             self._write(
                 source,
                 DECLARATION_NAME,
-                json.dumps({
-                    "schema": "orchestrator-super-cache-control/v1",
-                    "append_text": append_text,
-                }).encode("utf-8"),
+                json.dumps(
+                    {
+                        "schema": "orchestrator-super-cache-control/v1",
+                        "append_text": append_text,
+                    }
+                ).encode("utf-8"),
             )
         self._ingest(source)
         return self.cache
@@ -183,14 +204,23 @@ class OverlayModuleTests(unittest.TestCase):
         cache = self._declared_cache()
         self._write(self.target, "shared/existing.txt", b"existing target file\n")
         result = prepare_worktree(
-            super_cache=cache, target_worktree=self.target, role="subagent",
+            super_cache=cache,
+            target_worktree=self.target,
+            role="subagent",
             receipt_path=self.receipt,
         )
         self.assertTrue(result["complete"])
         self.assertEqual("subagent", result["role"])
-        self.assertEqual(b"created by overlay\n", (self.target / "created.txt").read_bytes())
-        self.assertEqual(b"existing target file\n", (self.target / "shared" / "existing.txt").read_bytes())
-        self.assertEqual(b"from cache\n", (self.target / "shared" / "merged.txt").read_bytes())
+        self.assertEqual(
+            b"created by overlay\n", (self.target / "created.txt").read_bytes()
+        )
+        self.assertEqual(
+            b"existing target file\n",
+            (self.target / "shared" / "existing.txt").read_bytes(),
+        )
+        self.assertEqual(
+            b"from cache\n", (self.target / "shared" / "merged.txt").read_bytes()
+        )
         # The declaration is cache control data and is never copied.
         self.assertFalse((self.target / DECLARATION_NAME).exists())
         self.assertTrue(self.receipt.is_file())
@@ -200,7 +230,9 @@ class OverlayModuleTests(unittest.TestCase):
         self._write(self.target, "created.txt", b"preexisting\n")
         with self.assertRaises(OverlayCollisionError):
             prepare_worktree(
-                super_cache=cache, target_worktree=self.target, role="subagent",
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
                 receipt_path=self.receipt,
             )
         # No mutation happened: the merge/create entries were never applied and
@@ -213,24 +245,34 @@ class OverlayModuleTests(unittest.TestCase):
         cache = self._declared_cache(append_text=["notes.txt"])
         self._write(self.target, "notes.txt", b"prefix|")
         result = prepare_worktree(
-            super_cache=cache, target_worktree=self.target, role="orchestrator",
+            super_cache=cache,
+            target_worktree=self.target,
+            role="orchestrator",
             receipt_path=self.receipt,
         )
         self.assertEqual(["notes.txt"], result["appended_paths"])
-        self.assertEqual(b"prefix|appended-payload\n", (self.target / "notes.txt").read_bytes())
+        self.assertEqual(
+            b"prefix|appended-payload\n", (self.target / "notes.txt").read_bytes()
+        )
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
-        self.assertEqual(b"prefix|", base64.b64decode(receipt["pre_overlay_bytes"]["notes.txt"]))
+        self.assertEqual(
+            b"prefix|", base64.b64decode(receipt["pre_overlay_bytes"]["notes.txt"])
+        )
         self.assertEqual(
             b"prefix|appended-payload\n",
             base64.b64decode(receipt["post_prepare_bytes"]["notes.txt"]),
         )
 
-    def test_prepare_rejects_non_utf8_or_missing_append_target_before_mutation(self) -> None:
+    def test_prepare_rejects_non_utf8_or_missing_append_target_before_mutation(
+        self,
+    ) -> None:
         cache = self._declared_cache(append_text=["notes.txt"])
         self._write(self.target, "notes.txt", b"\xff\xfe binary")
         with self.assertRaisesRegex(OverlayCollisionError, "UTF-8 text file"):
             prepare_worktree(
-                super_cache=cache, target_worktree=self.target, role="subagent",
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
                 receipt_path=self.receipt,
             )
         self.assertFalse((self.target / "created.txt").exists())
@@ -238,10 +280,14 @@ class OverlayModuleTests(unittest.TestCase):
         # exact payload (there is no existing file to append to).
         (self.target / "notes.txt").unlink()
         result = prepare_worktree(
-            super_cache=cache, target_worktree=self.target, role="subagent",
+            super_cache=cache,
+            target_worktree=self.target,
+            role="subagent",
             receipt_path=self.receipt,
         )
-        self.assertEqual(b"appended-payload\n", (self.target / "notes.txt").read_bytes())
+        self.assertEqual(
+            b"appended-payload\n", (self.target / "notes.txt").read_bytes()
+        )
         self.assertEqual("create_file", result["operations"]["notes.txt"])
 
     def test_prepare_writes_minimal_no_hash_receipt_for_both_roles(self) -> None:
@@ -251,7 +297,9 @@ class OverlayModuleTests(unittest.TestCase):
                 cache = self._declared_cache(append_text=["notes.txt"])
                 self._write(self.target, "notes.txt", b"base\n")
                 result = prepare_worktree(
-                    super_cache=cache, target_worktree=self.target, role=role,
+                    super_cache=cache,
+                    target_worktree=self.target,
+                    role=role,
                     receipt_path=receipt,
                 )
                 self.assertEqual(role, result["role"])
@@ -260,7 +308,9 @@ class OverlayModuleTests(unittest.TestCase):
                 self.assertTrue(raw["completed"])
                 self.assertEqual(role, raw["role"])
                 self.assertIn("prepared_utc", raw)
-                self.assertEqual(sorted(raw["affected_paths"]), sorted(raw["operations"]))
+                self.assertEqual(
+                    sorted(raw["affected_paths"]), sorted(raw["operations"])
+                )
                 self.assertIn("notes.txt", raw["pre_overlay_bytes"])
                 self.assertIn("notes.txt", raw["post_prepare_bytes"])
                 self.assertIn("created.txt", raw["created_paths"])
@@ -280,29 +330,38 @@ class OverlayModuleTests(unittest.TestCase):
         cache = self._declared_cache()
         with self.assertRaisesRegex(WorkspaceOverlayError, "role must be"):
             prepare_worktree(
-                super_cache=cache, target_worktree=self.target, role="root",
+                super_cache=cache,
+                target_worktree=self.target,
+                role="root",
                 receipt_path=self.receipt,
             )
         with self.assertRaisesRegex(WorkspaceOverlayError, "separate directories"):
             prepare_worktree(
-                super_cache=cache, target_worktree=cache, role="subagent",
+                super_cache=cache,
+                target_worktree=cache,
+                role="subagent",
                 receipt_path=self.receipt,
             )
         nested = cache / "nested-target"
         nested.mkdir()
         with self.assertRaisesRegex(WorkspaceOverlayError, "separate directories"):
             prepare_worktree(
-                super_cache=cache, target_worktree=nested, role="subagent",
+                super_cache=cache,
+                target_worktree=nested,
+                role="subagent",
                 receipt_path=self.receipt,
             )
 
     def test_prepare_rolls_back_partially_applied_target_mutation(self) -> None:
         cache = self._declared_cache()
         from orchestrator_harness import workspace_overlay as overlay_module
+
         real_replace = overlay_module.mutation_replace
         calls: list[str] = []
 
-        def failing_replace(parent: Path, relative: str, data: bytes, *, expected: object) -> None:
+        def failing_replace(
+            parent: Path, relative: str, data: bytes, *, expected: object
+        ) -> None:
             calls.append(relative)
             if relative == "notes.txt":
                 raise MutationError("synthetic failure")
@@ -314,7 +373,9 @@ class OverlayModuleTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(WorkspaceOverlayError, "rolled back"):
                 prepare_worktree(
-                    super_cache=cache, target_worktree=self.target, role="subagent",
+                    super_cache=cache,
+                    target_worktree=self.target,
+                    role="subagent",
                     receipt_path=self.receipt,
                 )
         self.assertIn("created.txt", calls)
@@ -325,9 +386,12 @@ class OverlayModuleTests(unittest.TestCase):
     def test_prepare_rolls_back_when_receipt_cannot_be_published(self) -> None:
         cache = self._declared_cache()
         from orchestrator_harness import workspace_overlay as overlay_module
+
         real_replace = overlay_module.mutation_replace
 
-        def failing_receipt(parent: Path, relative: str, data: bytes, *, expected: object) -> None:
+        def failing_receipt(
+            parent: Path, relative: str, data: bytes, *, expected: object
+        ) -> None:
             if relative == self.receipt.name:
                 raise MutationError("receipt write failure")
             return real_replace(parent, relative, data, expected=expected)
@@ -336,9 +400,13 @@ class OverlayModuleTests(unittest.TestCase):
             "orchestrator_harness.workspace_overlay.mutation_replace",
             side_effect=failing_receipt,
         ):
-            with self.assertRaisesRegex(WorkspaceOverlayError, "receipt could not be published"):
+            with self.assertRaisesRegex(
+                WorkspaceOverlayError, "receipt could not be published"
+            ):
                 prepare_worktree(
-                    super_cache=cache, target_worktree=self.target, role="subagent",
+                    super_cache=cache,
+                    target_worktree=self.target,
+                    role="subagent",
                     receipt_path=self.receipt,
                 )
         self.assertFalse((self.target / "created.txt").exists())
@@ -352,19 +420,26 @@ class OverlayModuleTests(unittest.TestCase):
         self._write(self.target, "notes.txt", b"original-notes\n")
         self._write(self.target, "unrelated.txt", b"unrelated target state\n")
         return prepare_worktree(
-            super_cache=cache, target_worktree=self.target, role="subagent",
+            super_cache=cache,
+            target_worktree=self.target,
+            role="subagent",
             receipt_path=self.receipt,
         )
 
     def test_restore_exact_clean_returns_original_state(self) -> None:
         self._prepared_target()
-        self.assertEqual(b"original-notes\nappended-payload\n", (self.target / "notes.txt").read_bytes())
+        self.assertEqual(
+            b"original-notes\nappended-payload\n",
+            (self.target / "notes.txt").read_bytes(),
+        )
         result = restore_worktree(receipt_path=self.receipt)
         self.assertEqual("RESTORED", result["outcome"])
         self.assertEqual(b"original-notes\n", (self.target / "notes.txt").read_bytes())
         self.assertFalse((self.target / "created.txt").exists())
         self.assertFalse((self.target / "shared" / "merged.txt").exists())
-        self.assertEqual(b"unrelated target state\n", (self.target / "unrelated.txt").read_bytes())
+        self.assertEqual(
+            b"unrelated target state\n", (self.target / "unrelated.txt").read_bytes()
+        )
         self.assertIn("notes.txt", result["restored_paths"])
         self.assertIn("created.txt", result["removed_paths"])
 
@@ -373,7 +448,9 @@ class OverlayModuleTests(unittest.TestCase):
         (self.target / "notes.txt").write_bytes(b"later edit by the agent\n")
         result = restore_worktree(receipt_path=self.receipt)
         self.assertEqual("BLOCKED", result["outcome"])
-        self.assertEqual(b"later edit by the agent\n", (self.target / "notes.txt").read_bytes())
+        self.assertEqual(
+            b"later edit by the agent\n", (self.target / "notes.txt").read_bytes()
+        )
         self.assertIn("notes.txt", result["preserved_paths"])
         self.assertIn("later edit detected", result["reason"])
 
@@ -382,7 +459,10 @@ class OverlayModuleTests(unittest.TestCase):
         self._write(self.target, "shared/agent-work.txt", b"agent later work\n")
         result = restore_worktree(receipt_path=self.receipt)
         self.assertEqual("BLOCKED", result["outcome"])
-        self.assertEqual(b"agent later work\n", (self.target / "shared" / "agent-work.txt").read_bytes())
+        self.assertEqual(
+            b"agent later work\n",
+            (self.target / "shared" / "agent-work.txt").read_bytes(),
+        )
         self.assertTrue((self.target / "shared").is_dir())
         self.assertIn("shared", result["left_directories"])
 
@@ -437,31 +517,43 @@ class OverlayModuleTests(unittest.TestCase):
 
     def test_verify_absent_receipt_is_allowed(self) -> None:
         result = verify_overlay_receipt(
-            receipt_path=None, expected_target_worktree_id=self.target, role="subagent",
+            receipt_path=None,
+            expected_target_worktree_id=self.target,
+            role="subagent",
         )
         self.assertFalse(result["present"])
         self.assertTrue(result["verified"])
 
-    def test_verify_present_receipt_requires_completed_matching_target_and_role(self) -> None:
+    def test_verify_present_receipt_requires_completed_matching_target_and_role(
+        self,
+    ) -> None:
         self._prepared_target()
         ok = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=self.target,
+            role="subagent",
         )
         self.assertTrue(ok["present"])
         self.assertTrue(ok["verified"])
         role_mismatch = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="orchestrator",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=self.target,
+            role="orchestrator",
         )
         self.assertFalse(role_mismatch["verified"])
         other_target = self.root / "other"
         other_target.mkdir()
         target_mismatch = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=other_target, role="subagent",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=other_target,
+            role="subagent",
         )
         self.assertFalse(target_mismatch["verified"])
         self.receipt.write_text("{broken", encoding="utf-8")
         malformed = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=self.target,
+            role="subagent",
         )
         self.assertTrue(malformed["present"])
         self.assertFalse(malformed["verified"])
@@ -474,7 +566,9 @@ class OverlayModuleTests(unittest.TestCase):
         self._write(source, "shared/merged.txt", b"from cache\n")
         self._ingest(source)
         result = prepare_worktree(
-            super_cache=self.cache, target_worktree=self.target, role="subagent",
+            super_cache=self.cache,
+            target_worktree=self.target,
+            role="subagent",
             receipt_path=self.receipt,
         )
         self.assertTrue(result["complete"])
@@ -483,7 +577,9 @@ class OverlayModuleTests(unittest.TestCase):
         self.assertEqual("", raw["post_prepare_bytes"]["empty.txt"])
         self.assertEqual(b"", base64.b64decode(raw["post_prepare_bytes"]["empty.txt"]))
         verified = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=self.target,
+            role="subagent",
         )
         self.assertTrue(verified["verified"])
         restored = restore_worktree(receipt_path=self.receipt)
@@ -507,11 +603,15 @@ class OverlayModuleTests(unittest.TestCase):
         cache = self._declared_cache(append_text=["notes.txt"])
         self._write(self.target, "notes.txt", b"")
         result = prepare_worktree(
-            super_cache=cache, target_worktree=self.target, role="subagent",
+            super_cache=cache,
+            target_worktree=self.target,
+            role="subagent",
             receipt_path=self.receipt,
         )
         self.assertEqual(["notes.txt"], result["appended_paths"])
-        self.assertEqual(b"appended-payload\n", (self.target / "notes.txt").read_bytes())
+        self.assertEqual(
+            b"appended-payload\n", (self.target / "notes.txt").read_bytes()
+        )
         raw = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual("", raw["pre_overlay_bytes"]["notes.txt"])
         self.assertEqual(b"", base64.b64decode(raw["pre_overlay_bytes"]["notes.txt"]))
@@ -520,7 +620,9 @@ class OverlayModuleTests(unittest.TestCase):
             base64.b64decode(raw["post_prepare_bytes"]["notes.txt"]),
         )
         verified = verify_overlay_receipt(
-            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+            receipt_path=self.receipt,
+            expected_target_worktree_id=self.target,
+            role="subagent",
         )
         self.assertTrue(verified["verified"])
         restored = restore_worktree(receipt_path=self.receipt)
@@ -548,55 +650,91 @@ class OverlayCliTests(unittest.TestCase):
 
     def test_cli_workspace_super_cache_ingest_and_prepare(self) -> None:
         parser = build_parser()
-        parsed = parser.parse_args([
-            "workspace", "super-cache", "ingest",
-            "--source", str(self.source), "--harness-worktree", str(self.harness),
-        ])
+        parsed = parser.parse_args(
+            [
+                "workspace",
+                "super-cache",
+                "ingest",
+                "--source",
+                str(self.source),
+                "--harness-worktree",
+                str(self.harness),
+            ]
+        )
         self.assertEqual("workspace", parsed.command)
         self.assertEqual("super-cache", parsed.workspace_action)
         self.assertEqual("ingest", parsed.super_cache_action)
         from unittest import mock as _mock
+
         emitted: list[object] = []
 
         def capture(value: object, **_: object) -> None:
             emitted.append(value)
 
         with _mock.patch("orchestrator_harness.cli._print_json", side_effect=capture):
-            code = cli_main([
-                "workspace", "super-cache", "ingest",
-                "--source", str(self.source), "--harness-worktree", str(self.harness),
-            ])
+            code = cli_main(
+                [
+                    "workspace",
+                    "super-cache",
+                    "ingest",
+                    "--source",
+                    str(self.source),
+                    "--harness-worktree",
+                    str(self.harness),
+                ]
+            )
         self.assertEqual(0, code)
         record = emitted[-1]
         self.assertTrue(record["complete"])
         with _mock.patch("orchestrator_harness.cli._print_json", side_effect=capture):
-            code = cli_main([
-                "workspace", "prepare",
-                "--super-cache", str(self.harness / SUPER_CACHE_NAME),
-                "--worktree", str(self.target),
-                "--role", "subagent",
-                "--receipt", str(self.receipt),
-            ])
+            code = cli_main(
+                [
+                    "workspace",
+                    "prepare",
+                    "--super-cache",
+                    str(self.harness / SUPER_CACHE_NAME),
+                    "--worktree",
+                    str(self.target),
+                    "--role",
+                    "subagent",
+                    "--receipt",
+                    str(self.receipt),
+                ]
+            )
         self.assertEqual(0, code)
         record = emitted[-1]
         self.assertTrue(record["complete"])
         self.assertEqual(b"cli payload\n", (self.target / "file.txt").read_bytes())
 
     def test_cli_lane_retire_accepts_overlay_receipt(self) -> None:
-        parsed = build_parser().parse_args([
-            "lane", "retire",
-            "--lane-root", str(self.root / "lane"),
-            "--archive-root", str(self.root / "archive"),
-            "--lane-id", "WO.P",
-            "--task-ref", str(self.root / "task.json"),
-            "--result-ref", str(self.root / "result.json"),
-            "--findings-ref", str(self.root / "findings.json"),
-            "--acceptance-ref", str(self.root / "acceptance.json"),
-            "--transcript-ref", str(self.root / "transcript.json"),
-            "--dependency-ref", str(self.root / "dependency.json"),
-            "--overlay-receipt", str(self.receipt),
-        ])
+        parsed = build_parser().parse_args(
+            [
+                "lane",
+                "retire",
+                "--lane-root",
+                str(self.root / "lane"),
+                "--archive-root",
+                str(self.root / "archive"),
+                "--lane-id",
+                "WO.P",
+                "--task-ref",
+                str(self.root / "task.json"),
+                "--result-ref",
+                str(self.root / "result.json"),
+                "--findings-ref",
+                str(self.root / "findings.json"),
+                "--acceptance-ref",
+                str(self.root / "acceptance.json"),
+                "--transcript-ref",
+                str(self.root / "transcript.json"),
+                "--dependency-ref",
+                str(self.root / "dependency.json"),
+                "--overlay-receipt",
+                str(self.receipt),
+            ]
+        )
         self.assertEqual(str(self.receipt), str(parsed.overlay_receipt))
+
 
 FAKE_CODEX = r"""
 import json, os, sys
@@ -625,14 +763,25 @@ class OverlayLaneSeamTests(unittest.TestCase):
         _git(self.main_repo, "add", "tracked.txt")
         _git(self.main_repo, "commit", "-m", "initial")
         self.lane = self.root / "lane"
-        _git(self.main_repo, "worktree", "add", "-b", "overlay-lane", str(self.lane), "HEAD")
+        _git(
+            self.main_repo,
+            "worktree",
+            "add",
+            "-b",
+            "overlay-lane",
+            str(self.lane),
+            "HEAD",
+        )
         self.revision = _git(self.lane, "rev-parse", "HEAD")
         self.workspace = self.lane / ".agent-workspace"
         self.workspace.mkdir()
         exclude = Path(_git(self.lane, "rev-parse", "--git-path", "info/exclude"))
         if not exclude.is_absolute():
             exclude = self.lane / exclude
-        exclude.write_text(exclude.read_text(encoding="utf-8") + ".agent-workspace/\n", encoding="utf-8")
+        exclude.write_text(
+            exclude.read_text(encoding="utf-8") + ".agent-workspace/\n",
+            encoding="utf-8",
+        )
         self.runtime = self.root / "runtime"
         self.runtime.mkdir()
         self.cache_root = self.root / "cache"
@@ -725,13 +874,22 @@ class OverlayLaneSeamTests(unittest.TestCase):
         return path
 
     def _status(self) -> dict[str, object]:
-        return json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
 
     def _retire(self, receipt: Path) -> object:
         evidence = self.root / "evidence"
         evidence.mkdir()
         refs: list[Path] = []
-        for name in ("task", "result", "findings", "acceptance", "transcript", "dependency"):
+        for name in (
+            "task",
+            "result",
+            "findings",
+            "acceptance",
+            "transcript",
+            "dependency",
+        ):
             ref = evidence / f"{name}.json"
             ref.write_text("{}\n", encoding="utf-8")
             refs.append(ref)
@@ -743,12 +901,18 @@ class OverlayLaneSeamTests(unittest.TestCase):
                 self.lane,
                 self.root / "archive",
                 lane_id="overlay-lane",
-                task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                task_ref=refs[0],
+                result_ref=refs[1],
+                findings_ref=refs[2],
+                acceptance_ref=refs[3],
+                transcript_ref=refs[4],
+                dependency_ref=refs[5],
                 overlay_receipt=receipt,
             )
 
-    def test_prelaunch_verification_rejects_wrong_role_before_process_start(self) -> None:
+    def test_prelaunch_verification_rejects_wrong_role_before_process_start(
+        self,
+    ) -> None:
         receipt = self._prepare_overlay(role="orchestrator")
         path = self._invocation(receipt)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
@@ -782,19 +946,28 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertEqual("RESTORED", restoration["outcome"])
         self.assertTrue(restoration["removed_paths"])
 
-    def test_retirement_blocks_and_stays_visible_when_restore_finds_later_edit(self) -> None:
+    def test_retirement_blocks_and_stays_visible_when_restore_finds_later_edit(
+        self,
+    ) -> None:
         receipt = self._prepare_overlay(role="subagent")
         path = self._invocation(receipt)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
         self.assertEqual(0, controller.main([str(path)]))
-        (self.lane / "instructions.md").write_text("agent later edit\n", encoding="utf-8")
+        (self.lane / "instructions.md").write_text(
+            "agent later edit\n", encoding="utf-8"
+        )
         result = self._retire(receipt)
         self.assertEqual("VISIBLE", result.outcome)
         self.assertTrue(result.reason.startswith("OVERLAY_RESTORE_BLOCKED"))
         self.assertTrue(self.lane.exists())
-        self.assertEqual("agent later edit\n", (self.lane / "instructions.md").read_text(encoding="utf-8"))
+        self.assertEqual(
+            "agent later edit\n",
+            (self.lane / "instructions.md").read_text(encoding="utf-8"),
+        )
 
-    def test_retirement_rejects_foreign_orchestrator_receipt_before_restoration(self) -> None:
+    def test_retirement_rejects_foreign_orchestrator_receipt_before_restoration(
+        self,
+    ) -> None:
         # WO-R1-002: a completed foreign orchestrator receipt must be rejected
         # before any restoration, leaving both worktrees unchanged.
         receipt = self._prepare_overlay(role="subagent")
@@ -804,12 +977,24 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertTrue((self.lane / "instructions.md").is_file())
 
         foreign = self.root / "foreign"
-        _git(self.main_repo, "worktree", "add", "-b", "foreign-orchestrator", str(foreign), "HEAD")
+        _git(
+            self.main_repo,
+            "worktree",
+            "add",
+            "-b",
+            "foreign-orchestrator",
+            str(foreign),
+            "HEAD",
+        )
         (foreign / ".agent-workspace").mkdir()
         foreign_source = self.root / "foreign-overlay-source"
         foreign_source.mkdir()
-        (foreign_source / "orchestrator-notes.md").write_bytes(b"orchestrator overlay\n")
-        ingest_super_cache(source_folder=foreign_source, harness_worktree=self.cache_root)
+        (foreign_source / "orchestrator-notes.md").write_bytes(
+            b"orchestrator overlay\n"
+        )
+        ingest_super_cache(
+            source_folder=foreign_source, harness_worktree=self.cache_root
+        )
         foreign_receipt = foreign / ".agent-workspace" / "orchestrator-receipt.json"
         prepare_worktree(
             super_cache=self.cache_root / SUPER_CACHE_NAME,

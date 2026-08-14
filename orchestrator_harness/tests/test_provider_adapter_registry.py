@@ -9,6 +9,7 @@ redacted provenance) live in the selected adapter; resume-or-handoff never
 fabricates continuity; evidence binds identity/version/capabilities/digest/
 session/redacted provenance.  Only deterministic fake CLI fixtures are used.
 """
+
 from __future__ import annotations
 
 import unittest
@@ -70,7 +71,9 @@ class FakeCliProviderAdapter(BaseProviderAdapter):
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         text = line.decode("utf-8", errors="replace").strip()
         if text.startswith("session:"):
-            return ProviderEvent("STARTED", session_id=text.split(":", 1)[1], raw_type="session")
+            return ProviderEvent(
+                "STARTED", session_id=text.split(":", 1)[1], raw_type="session"
+            )
         if text == "done":
             return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="done")
         if text == "error":
@@ -184,8 +187,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             self.assertEqual(
                 set(registration.capabilities.as_record()),
                 {
-                    "launch", "prompt", "event_result", "session", "resume",
-                    "permission", "configuration", "notification",
+                    "launch",
+                    "prompt",
+                    "event_result",
+                    "session",
+                    "resume",
+                    "permission",
+                    "configuration",
+                    "notification",
                 },
             )
         self.assertTrue(registry["codex"].capabilities.notification)
@@ -221,14 +230,22 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             ).kind,  # type: ignore[union-attr]
         )
 
-    def test_foreign_adapter_registers_and_is_selectable_without_core_edits(self) -> None:
+    def test_foreign_adapter_registers_and_is_selectable_without_core_edits(
+        self,
+    ) -> None:
         registration = register_provider_adapter(
             "fake-cli",
             FakeCliProviderAdapter(),
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=True, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=True,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         self.assertEqual("fake-cli", registration.provider_id)
@@ -245,8 +262,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             FakeCliProviderAdapter(),
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=True, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=True,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         profile = RuntimeProfile(
@@ -400,14 +423,22 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
         self.assertNotIn("sk-live-secret-123", redacted)
         self.assertNotIn("abc", redacted)
 
-    def test_evidence_binds_identity_version_capabilities_digest_and_provenance(self) -> None:
+    def test_evidence_binds_identity_version_capabilities_digest_and_provenance(
+        self,
+    ) -> None:
         register_provider_adapter(
             "fake-cli",
             FakeCliProviderAdapter(),
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=True, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=True,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         spec = _spec()
@@ -425,7 +456,9 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
         self.assertEqual(provider_config_digest(spec), record["configuration_digest"])
         self.assertEqual("worker-1", record["attempt_identity"])
         self.assertEqual("session-1", record["session_id"])
-        self.assertEqual(["fake-cli", "--run", "--model", "fake-model"], record["command_provenance"])
+        self.assertEqual(
+            ["fake-cli", "--run", "--model", "fake-model"], record["command_provenance"]
+        )
         self.assertFalse(record["capabilities"]["notification"])
 
     def test_resume_or_handoff_matrix_never_fabricates_continuity(self) -> None:
@@ -436,8 +469,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             adapter,
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=False, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=False,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         decision = decide_resume_or_handoff(
@@ -464,8 +503,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             adapter,
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=True, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=True,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         mismatch = decide_resume_or_handoff(
@@ -528,8 +573,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             FakeCliProviderAdapter(),
             version="fake-cli-v1",
             capabilities=ProviderCapabilities(
-                launch=True, prompt=True, event_result=True, session=True,
-                resume=True, permission=True, configuration=True, notification=False,
+                launch=True,
+                prompt=True,
+                event_result=True,
+                session=True,
+                resume=True,
+                permission=True,
+                configuration=True,
+                notification=False,
             ),
         )
         self.assertTrue(unregister_provider_adapter("fake-cli"))
@@ -542,8 +593,9 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
         effective = codex.last_message_path(Path("C:/run"), Path("last-message.txt"))
         self.assertEqual(Path("C:/run/.agent-workspace/last-message.txt"), effective)
         claude = provider_adapter("claude-code")
-        self.assertIsNone(claude.last_message_path(Path("C:/run"), Path("last-message.txt")))
-
+        self.assertIsNone(
+            claude.last_message_path(Path("C:/run"), Path("last-message.txt"))
+        )
 
     def test_redact_argv_is_a_required_adapter_contract_method(self) -> None:
         # PA-R1-001: complete redacted command provenance is an explicit
@@ -555,8 +607,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
                 NoRedactAdapter(),
                 version="no-redact-v1",
                 capabilities=ProviderCapabilities(
-                    launch=True, prompt=True, event_result=True, session=True,
-                    resume=True, permission=True, configuration=True, notification=False,
+                    launch=True,
+                    prompt=True,
+                    event_result=True,
+                    session=True,
+                    resume=True,
+                    permission=True,
+                    configuration=True,
+                    notification=False,
                 ),
             )
 
@@ -571,8 +629,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
                 InheritedBaseRedactAdapter(),
                 version="inherited-base-redact-v1",
                 capabilities=ProviderCapabilities(
-                    launch=True, prompt=True, event_result=True, session=True,
-                    resume=True, permission=True, configuration=True, notification=False,
+                    launch=True,
+                    prompt=True,
+                    event_result=True,
+                    session=True,
+                    resume=True,
+                    permission=True,
+                    configuration=True,
+                    notification=False,
                 ),
             )
         self.assertIn("redact_argv", str(ctx.exception))
@@ -597,8 +661,14 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
                 BaseOnlyNotificationAdapter(),
                 version="base-only-notification-v1",
                 capabilities=ProviderCapabilities(
-                    launch=True, prompt=True, event_result=True, session=True,
-                    resume=True, permission=True, configuration=True, notification=True,
+                    launch=True,
+                    prompt=True,
+                    event_result=True,
+                    session=True,
+                    resume=True,
+                    permission=True,
+                    configuration=True,
+                    notification=True,
                 ),
             )
 

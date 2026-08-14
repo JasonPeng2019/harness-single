@@ -72,8 +72,15 @@ class S2ContractTests(unittest.TestCase):
             "revision": "r1",
         }
         profile = RuntimeProfile(
-            "profile-1", "implementer", "claude-code", "claude-test", ("Read",), ("repo",), ("resource-1",),
-            ("CLAUDE_CODE_TEST",), ("WORKFLOW_TEST_FLAG",),
+            "profile-1",
+            "implementer",
+            "claude-code",
+            "claude-test",
+            ("Read",),
+            ("repo",),
+            ("resource-1",),
+            ("CLAUDE_CODE_TEST",),
+            ("WORKFLOW_TEST_FLAG",),
         )
         bundle = prompt_bundle_record_from_paths(
             workflow_id="workflow-1",
@@ -91,7 +98,11 @@ class S2ContractTests(unittest.TestCase):
             "worker_invocation_id": "worker-1",
             "cohort_id": "cohort-1",
             "workflow": {"id": "workflow-1", "version": "1"},
-            "task_card": {"id": "card-1", "revision": "r1", "sha256": record_sha256(card)},
+            "task_card": {
+                "id": "card-1",
+                "revision": "r1",
+                "sha256": record_sha256(card),
+            },
             "role": "implementer",
             "provider": {
                 "id": "claude-code",
@@ -115,11 +126,15 @@ class S2ContractTests(unittest.TestCase):
 
     @staticmethod
     def _write_canonical_json(path: Path, value: dict[str, object]) -> str:
-        data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        data = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
         path.write_bytes(data)
         return hashlib.sha256(data).hexdigest()
 
-    def _start_fake_canonical(self, root: Path) -> tuple[dict[str, object], dict[str, object], Path, Path, Path]:
+    def _start_fake_canonical(
+        self, root: Path
+    ) -> tuple[dict[str, object], dict[str, object], Path, Path, Path]:
         fake_source = """
 import json, sys
 from pathlib import Path
@@ -219,12 +234,16 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             },
         }
 
-    def test_canonical_prompt_resume_and_task_advancement_are_content_bound(self) -> None:
+    def test_canonical_prompt_resume_and_task_advancement_are_content_bound(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, card_raw = self._canonical(root)
             canonical = parse_canonical_invocation(raw)
-            invocation_path = root / "run" / ".agent-workspace" / "canonical.invocation.json"
+            invocation_path = (
+                root / "run" / ".agent-workspace" / "canonical.invocation.json"
+            )
             invocation_path.write_text(json.dumps(raw), encoding="utf-8")
             loaded = load_invocation(invocation_path)
             self.assertEqual(CANONICAL_INVOCATION_SCHEMA, loaded.invocation_schema)
@@ -245,11 +264,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             with self.assertRaises(ValueError):
                 bundle_from_record(tampered, run_root=root / "run")
 
-            identity = canonical.identity(session_id="session-1", starting_commit="a" * 40)
-            identity["live_identity"] = {"provider_id": "claude-code", "session_id": "session-1"}
+            identity = canonical.identity(
+                session_id="session-1", starting_commit="a" * 40
+            )
+            identity["live_identity"] = {
+                "provider_id": "claude-code",
+                "session_id": "session-1",
+            }
             persisted = dict(identity)
             live = {
-                "live_identity": {"provider_id": "claude-code", "session_id": "session-1"},
+                "live_identity": {
+                    "provider_id": "claude-code",
+                    "session_id": "session-1",
+                },
                 "repository": identity["repository"],
             }
             self.assertTrue(make_resume_admission(identity, persisted, live).admitted)
@@ -316,9 +343,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             self.assertEqual("ACCEPTED", advanced.state)
             self.assertTrue(advanced.terminal)
 
-    def test_canonical_resume_admits_exact_reviewed_card_and_prompt_amendments(self) -> None:
+    def test_canonical_resume_admits_exact_reviewed_card_and_prompt_amendments(
+        self,
+    ) -> None:
         for amendment_kind in ("card", "prompt"):
-            with self.subTest(amendment_kind=amendment_kind), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(amendment_kind=amendment_kind),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
                 persisted = json.loads(status_path.read_text(encoding="utf-8"))
@@ -358,7 +390,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 resume["resume"] = {"session_id": "session-1"}
                 resume["task_card"] = {
                     **resume["task_card"],
-                    "sha256": requested_card_hash if amendment_kind == "prompt" else new_card_hash,
+                    "sha256": requested_card_hash
+                    if amendment_kind == "prompt"
+                    else new_card_hash,
                 }
                 resume["prompt_bundle"] = requested_bundle
                 review = self._amendment_review(
@@ -376,16 +410,33 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 resume_path.write_text(json.dumps(resume), encoding="utf-8")
 
                 self.assertEqual(0, controller.main([str(resume_path)]))
-                self.assertEqual(2, (root / "launches.txt").read_text(encoding="utf-8").count("launch"))
-                admitted = json.loads(status_path.read_text(encoding="utf-8"))["resume_admission"]
+                self.assertEqual(
+                    2,
+                    (root / "launches.txt").read_text(encoding="utf-8").count("launch"),
+                )
+                admitted = json.loads(status_path.read_text(encoding="utf-8"))[
+                    "resume_admission"
+                ]
                 self.assertTrue(admitted["admitted"])
-                self.assertEqual("NO_CONTINUATION_REQUIRED", admitted["amendment_review"]["disposition"])
-                self.assertEqual(resume["task_card"]["sha256"], json.loads(status_path.read_text(encoding="utf-8"))["resume_identity"]["task_card_sha256"])
+                self.assertEqual(
+                    "NO_CONTINUATION_REQUIRED",
+                    admitted["amendment_review"]["disposition"],
+                )
+                self.assertEqual(
+                    resume["task_card"]["sha256"],
+                    json.loads(status_path.read_text(encoding="utf-8"))[
+                        "resume_identity"
+                    ]["task_card_sha256"],
+                )
 
-    def test_canonical_resume_amendment_rejects_unreviewed_material_wrong_pair_and_accepted(self) -> None:
+    def test_canonical_resume_amendment_rejects_unreviewed_material_wrong_pair_and_accepted(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            raw, card, workspace, status_path, event_path = self._start_fake_canonical(root)
+            raw, card, workspace, status_path, event_path = self._start_fake_canonical(
+                root
+            )
             persisted = json.loads(status_path.read_text(encoding="utf-8"))
             persisted_identity = persisted["resume_identity"]
             old_card = workspace / "card-old.json"
@@ -409,8 +460,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             status_before = status_path.read_bytes()
             event_before = event_path.read_bytes()
 
-            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
-                with self.assertRaisesRegex(controller.InvocationError, "resume amendment"):
+            with patch.object(
+                controller,
+                "provider_adapter",
+                side_effect=AssertionError("provider must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "resume amendment"
+                ):
                     controller.run(controller.load_invocation(resume_path))
             self.assertEqual(status_before, status_path.read_bytes())
             self.assertEqual(event_before, event_path.read_bytes())
@@ -426,9 +483,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 disposition="CONTINUATION_REQUIRED",
                 classification="MATERIAL",
             )
-            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(material), encoding="utf-8")
-            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
-                with self.assertRaisesRegex(controller.InvocationError, "scoped continuation"):
+            (workspace / "RESUME_ADMISSION.json").write_text(
+                json.dumps(material), encoding="utf-8"
+            )
+            with patch.object(
+                controller,
+                "provider_adapter",
+                side_effect=AssertionError("provider must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "scoped continuation"
+                ):
                     controller.run(controller.load_invocation(resume_path))
             self.assertEqual(status_before, status_path.read_bytes())
             self.assertEqual(event_before, event_path.read_bytes())
@@ -442,16 +507,27 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 old_prompt=old_prompt,
                 new_prompt=new_prompt,
             )
-            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(wrong_pair), encoding="utf-8")
-            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
-                with self.assertRaisesRegex(controller.InvocationError, "reviewed task-card new identity"):
+            (workspace / "RESUME_ADMISSION.json").write_text(
+                json.dumps(wrong_pair), encoding="utf-8"
+            )
+            with patch.object(
+                controller,
+                "provider_adapter",
+                side_effect=AssertionError("provider must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "reviewed task-card new identity"
+                ):
                     controller.run(controller.load_invocation(resume_path))
             self.assertEqual(status_before, status_path.read_bytes())
             self.assertEqual(event_before, event_path.read_bytes())
 
             accepted = dict(persisted)
             accepted["terminal_acceptance_state"] = "ACCEPTED"
-            accepted["resume_identity"] = {**persisted_identity, "terminal_acceptance_state": "ACCEPTED"}
+            accepted["resume_identity"] = {
+                **persisted_identity,
+                "terminal_acceptance_state": "ACCEPTED",
+            }
             status_path.write_text(json.dumps(accepted), encoding="utf-8")
             accepted_before = status_path.read_bytes()
             harmless = self._amendment_review(
@@ -463,13 +539,23 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 old_prompt=old_prompt,
                 new_prompt=new_prompt,
             )
-            (workspace / "RESUME_ADMISSION.json").write_text(json.dumps(harmless), encoding="utf-8")
-            with patch.object(controller, "provider_adapter", side_effect=AssertionError("provider must not be called")):
-                with self.assertRaisesRegex(controller.InvocationError, "accepted task"):
+            (workspace / "RESUME_ADMISSION.json").write_text(
+                json.dumps(harmless), encoding="utf-8"
+            )
+            with patch.object(
+                controller,
+                "provider_adapter",
+                side_effect=AssertionError("provider must not be called"),
+            ):
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "accepted task"
+                ):
                     controller.run(controller.load_invocation(resume_path))
             self.assertEqual(accepted_before, status_path.read_bytes())
 
-    def test_canonical_resume_admits_valid_large_root_review_without_local_cap(self) -> None:
+    def test_canonical_resume_admits_valid_large_root_review_without_local_cap(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, card, workspace, status_path, _ = self._start_fake_canonical(root)
@@ -506,7 +592,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             resume_path.write_text(json.dumps(resume), encoding="utf-8")
 
             self.assertEqual(0, controller.main([str(resume_path)]))
-            self.assertEqual(2, (root / "launches.txt").read_text(encoding="utf-8").count("launch"))
+            self.assertEqual(
+                2, (root / "launches.txt").read_text(encoding="utf-8").count("launch")
+            )
 
     def test_review_pair_paths_require_absolute_identity_before_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -540,7 +628,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             for name, pair in review["reviewed_pairs"].items():  # type: ignore[union-attr]
                 pair["old_path"] = f"relative-{name}-old"
                 pair["new_path"] = f"relative-{name}-new"
-                pair["diff"]["command"] = f"git diff --no-index -- {pair['old_path']} {pair['new_path']}"
+                pair["diff"]["command"] = (
+                    f"git diff --no-index -- {pair['old_path']} {pair['new_path']}"
+                )
             requested = dict(persisted_identity)
             with self.assertRaisesRegex(ValueError, "absolute"):
                 validate_resume_amendment_review(
@@ -550,8 +640,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                     expected_job_identity=review["same_job_identity"],
                 )
 
-    def test_canonical_output_reservations_reject_before_workspace_mutation(self) -> None:
-        reserved_names = ("RESULT.json", COMPLETION_REVIEW_FILENAME, ORCHESTRATOR_ACCEPTANCE_FILENAME)
+    def test_canonical_output_reservations_reject_before_workspace_mutation(
+        self,
+    ) -> None:
+        reserved_names = (
+            "RESULT.json",
+            COMPLETION_REVIEW_FILENAME,
+            ORCHESTRATOR_ACCEPTANCE_FILENAME,
+        )
         output_names = ("status", "jsonl", "stderr", "last_message")
         pairs = (
             ("status", "jsonl"),
@@ -582,7 +678,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                         root = Path(temporary)
                         raw, _ = self._canonical(root)
                         output_paths = dict(raw["output_paths"])  # type: ignore[arg-type]
-                        output_paths[output_name] = str(root / "run" / ".agent-workspace" / reserved_name)
+                        output_paths[output_name] = str(
+                            root / "run" / ".agent-workspace" / reserved_name
+                        )
                         raw["output_paths"] = output_paths
                         assert_rejected(raw, root, f"reserved-{output_name}")
 
@@ -623,7 +721,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "summary": "chain",
                 "checks": [{"name": "chain", "outcome": "PASS"}],
             }
-            result_bytes = (json.dumps(result_raw, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            result_bytes = (
+                json.dumps(result_raw, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
             result = validate_task_result(result_raw, card=card, raw_bytes=result_bytes)
             pending = read_task_advancement(workspace, card=card, result=result)
             self.assertEqual("PENDING", pending.state)
@@ -640,7 +740,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "verdict": "PASS",
                 "evidence": ["test://chain"],
             }
-            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
             review_sha = hashlib.sha256(review_bytes).hexdigest()
             acceptance = {
                 "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
@@ -657,8 +759,16 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "verdict": "ACCEPTED",
             }
             (workspace / "COMPLETION_REVIEW.json").write_bytes(review_bytes)
-            self.assertRaises(TaskValidationError, read_task_advancement, workspace, card=card, result=result)
-            (workspace / "ORCHESTRATOR_ACCEPTANCE.json").write_text("not-json", encoding="utf-8")
+            self.assertRaises(
+                TaskValidationError,
+                read_task_advancement,
+                workspace,
+                card=card,
+                result=result,
+            )
+            (workspace / "ORCHESTRATOR_ACCEPTANCE.json").write_text(
+                "not-json", encoding="utf-8"
+            )
             with self.assertRaises(TaskValidationError):
                 read_task_advancement(workspace, card=card, result=result)
 
@@ -715,13 +825,35 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             ],
             argv,
         )
-        self.assertEqual("session-1", adapter.parse_transcript_line(b'{"type":"system","subtype":"init","session_id":"session-1"}').session_id)  # type: ignore[union-attr]
-        self.assertEqual("COMPLETED", adapter.parse_transcript_line(b'{"type":"result","subtype":"success","session_id":"session-1"}').kind)  # type: ignore[union-attr]
-        self.assertEqual("FAILED", adapter.parse_transcript_line(b'{"type":"result","subtype":"error_during_execution","session_id":"session-1"}').kind)  # type: ignore[union-attr]
+        self.assertEqual(
+            "session-1",
+            adapter.parse_transcript_line(
+                b'{"type":"system","subtype":"init","session_id":"session-1"}'
+            ).session_id,
+        )  # type: ignore[union-attr]
+        self.assertEqual(
+            "COMPLETED",
+            adapter.parse_transcript_line(
+                b'{"type":"result","subtype":"success","session_id":"session-1"}'
+            ).kind,
+        )  # type: ignore[union-attr]
+        self.assertEqual(
+            "FAILED",
+            adapter.parse_transcript_line(
+                b'{"type":"result","subtype":"error_during_execution","session_id":"session-1"}'
+            ).kind,
+        )  # type: ignore[union-attr]
 
         profile = RuntimeProfile(
-            "profile", "worker", "claude-code", "claude-test", (), (), (),
-            ("CLAUDE_CODE_TEST",), ("WORKFLOW_TEST_FLAG",),
+            "profile",
+            "worker",
+            "claude-code",
+            "claude-test",
+            (),
+            (),
+            (),
+            ("CLAUDE_CODE_TEST",),
+            ("WORKFLOW_TEST_FLAG",),
         )
         environment, cleared = build_child_environment(
             profile,
@@ -735,8 +867,18 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "PYOCD_TARGET": "hardware",
             },
         )
-        self.assertEqual({"PATH": "path", "CLAUDE_CODE_TEST": "provider", "WORKFLOW_TEST_FLAG": "workflow"}, environment)
-        self.assertEqual(["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "MCP_ENDPOINT", "PYOCD_TARGET"], cleared)
+        self.assertEqual(
+            {
+                "PATH": "path",
+                "CLAUDE_CODE_TEST": "provider",
+                "WORKFLOW_TEST_FLAG": "workflow",
+            },
+            environment,
+        )
+        self.assertEqual(
+            ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "MCP_ENDPOINT", "PYOCD_TARGET"],
+            cleared,
+        )
 
     def test_legacy_adapters_are_separate_and_reject_ambiguous_aliases(self) -> None:
         coding = {
@@ -789,7 +931,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "service_tier": "priority",
             },
         }
-        self.assertEqual("legacy-firmware", adapt_legacy_firmware(firmware).legacy_route)
+        self.assertEqual(
+            "legacy-firmware", adapt_legacy_firmware(firmware).legacy_route
+        )
         mixed = dict(firmware)
         mixed["worker_invocation_id"] = "not-legacy"
         with self.assertRaises(InvocationValidationError):
@@ -849,7 +993,15 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for field in ("provider", "profile", "prompt_bundle", "workflow", "task_card", "cohort_id", "unknown_field"):
+            for field in (
+                "provider",
+                "profile",
+                "prompt_bundle",
+                "workflow",
+                "task_card",
+                "cohort_id",
+                "unknown_field",
+            ):
                 invocation = root / f"{field}.json"
                 invalid = dict(coding)
                 invalid[field] = {}
@@ -863,7 +1015,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         with self.assertRaises(InvocationValidationError):
             adapt_coding_v1(ambiguous)
 
-    def test_controller_fake_claude_start_resume_failure_and_wrong_session(self) -> None:
+    def test_controller_fake_claude_start_resume_failure_and_wrong_session(
+        self,
+    ) -> None:
         fake_source = """
 import json, sys
 failure = '--failure' in sys.argv
@@ -897,18 +1051,26 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
                 "prompt_bundle_sha256": bundle["bundle_sha256"],
                 "prompt_content_sha256": bundle["final_sha256"],
             }
-            invocation_path = root / "run" / ".agent-workspace" / "start.invocation.json"
+            invocation_path = (
+                root / "run" / ".agent-workspace" / "start.invocation.json"
+            )
             invocation_path.write_text(json.dumps(raw), encoding="utf-8")
             self.assertEqual(0, controller.main([str(invocation_path)]))
-            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
-            status_path = root / "run" / ".agent-workspace" / "worker_controller.status.json"
+            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            status_path = (
+                root / "run" / ".agent-workspace" / "worker_controller.status.json"
+            )
             status = json.loads(status_path.read_text(encoding="utf-8"))
             self.assertEqual("PROVIDER_EXITED", status["state"])
             self.assertEqual("claude-code", status["provider_id"])
             self.assertEqual("session-1", status["provider_session_id"])
             self.assertEqual("MISSING", status["result_validation"]["state"])
             self.assertEqual("PENDING", status["terminal_acceptance_state"])
-            self.assertTrue((root / "run" / ".agent-workspace" / "worker_provider.jsonl").is_file())
+            self.assertTrue(
+                (root / "run" / ".agent-workspace" / "worker_provider.jsonl").is_file()
+            )
 
             resume = dict(raw)
             resume["action"] = "resume"
@@ -942,15 +1104,24 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
                 **failure_raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), "--failure"],
             }
-            failure_path = failure_root / "run" / ".agent-workspace" / "failure.invocation.json"
+            failure_path = (
+                failure_root / "run" / ".agent-workspace" / "failure.invocation.json"
+            )
             failure_path.write_text(json.dumps(failure_raw), encoding="utf-8")
             self.assertEqual(1, controller.main([str(failure_path)]))
             failure_status = json.loads(
-                (failure_root / "run" / ".agent-workspace" / "worker_controller.status.json").read_text(encoding="utf-8")
+                (
+                    failure_root
+                    / "run"
+                    / ".agent-workspace"
+                    / "worker_controller.status.json"
+                ).read_text(encoding="utf-8")
             )
             self.assertEqual("FAILED", failure_status["provider_terminal_outcome"])
 
-    def test_controller_acceptance_chain_blocks_start_and_resume_before_fake_provider(self) -> None:
+    def test_controller_acceptance_chain_blocks_start_and_resume_before_fake_provider(
+        self,
+    ) -> None:
         fake_source = """
 import json, sys
 from pathlib import Path
@@ -987,28 +1158,50 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "prompt_bundle_sha256": bundle["bundle_sha256"],
                 "prompt_content_sha256": bundle["final_sha256"],
             }
-            invocation_path = root / "run" / ".agent-workspace" / "start.invocation.json"
+            invocation_path = (
+                root / "run" / ".agent-workspace" / "start.invocation.json"
+            )
             invocation_path.write_text(json.dumps(raw), encoding="utf-8")
             self.assertEqual(0, controller.main([str(invocation_path)]))
             workspace = root / "run" / ".agent-workspace"
             (workspace / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
-            self.assertEqual("PENDING", json.loads((workspace / "worker_controller.status.json").read_text())["terminal_acceptance_state"])
-            pending_status_bytes = (workspace / "worker_controller.status.json").read_bytes()
+            self.assertEqual(
+                "PENDING",
+                json.loads((workspace / "worker_controller.status.json").read_text())[
+                    "terminal_acceptance_state"
+                ],
+            )
+            pending_status_bytes = (
+                workspace / "worker_controller.status.json"
+            ).read_bytes()
             pending_start = workspace / "start-pending.invocation.json"
             pending_start.write_text(json.dumps(raw), encoding="utf-8")
-            with self.assertRaisesRegex(controller.InvocationError, "action:start.*resume"):
+            with self.assertRaisesRegex(
+                controller.InvocationError, "action:start.*resume"
+            ):
                 controller.run(controller.load_invocation(pending_start))
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
-            self.assertEqual(pending_status_bytes, (workspace / "worker_controller.status.json").read_bytes())
+            self.assertEqual(
+                pending_status_bytes,
+                (workspace / "worker_controller.status.json").read_bytes(),
+            )
 
             different_card = dict(raw)
-            different_card["task_card"] = {**different_card["task_card"], "revision": "different"}  # type: ignore[arg-type]
+            different_card["task_card"] = {
+                **different_card["task_card"],
+                "revision": "different",
+            }  # type: ignore[arg-type]
             different_path = workspace / "start-different-card.invocation.json"
             different_path.write_text(json.dumps(different_card), encoding="utf-8")
-            with self.assertRaisesRegex(controller.InvocationError, "identity does not match"):
+            with self.assertRaisesRegex(
+                controller.InvocationError, "identity does not match"
+            ):
                 controller.run(controller.load_invocation(different_path))
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
-            self.assertEqual(pending_status_bytes, (workspace / "worker_controller.status.json").read_bytes())
+            self.assertEqual(
+                pending_status_bytes,
+                (workspace / "worker_controller.status.json").read_bytes(),
+            )
 
             fixture = SuiteFixture.create()
             try:
@@ -1031,7 +1224,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "verdict": "PASS",
                 "evidence": ["test://s2-controller"],
             }
-            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
             review_sha = hashlib.sha256(review_bytes).hexdigest()
             acceptance = {
                 "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
@@ -1065,11 +1260,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
             self.assertEqual(2, controller.main([str(start_path)]))
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
-            status = json.loads((workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
+            status = json.loads(
+                (workspace / "worker_controller.status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertEqual("ACCEPTED", status["terminal_acceptance_state"])
             self.assertEqual("ACCEPTED", status["task_advancement_state"])
-            self.assertEqual("ACCEPTED", status["resume_identity"]["terminal_acceptance_state"])
-            self.assertEqual("ACCEPTED", status["resume_identity"]["task_advancement_state"])
+            self.assertEqual(
+                "ACCEPTED", status["resume_identity"]["terminal_acceptance_state"]
+            )
+            self.assertEqual(
+                "ACCEPTED", status["resume_identity"]["task_advancement_state"]
+            )
             self.assertEqual(
                 acceptance["accepted_commit"],
                 status["resume_identity"]["acceptance_identity"]["accepted_commit"],
@@ -1083,11 +1286,19 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
             self.assertEqual(2, controller.main([str(resume_path)]))
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
-            status = json.loads((workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
+            status = json.loads(
+                (workspace / "worker_controller.status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             self.assertEqual("ACCEPTED", status["terminal_acceptance_state"])
-            self.assertEqual("ACCEPTED", status["resume_identity"]["terminal_acceptance_state"])
+            self.assertEqual(
+                "ACCEPTED", status["resume_identity"]["terminal_acceptance_state"]
+            )
             self.assertEqual("ACCEPTED", status["task_advancement_state"])
-            self.assertEqual("ACCEPTED", status["resume_identity"]["task_advancement_state"])
+            self.assertEqual(
+                "ACCEPTED", status["resume_identity"]["task_advancement_state"]
+            )
             self.assertEqual(
                 acceptance["accepted_commit"],
                 status["resume_identity"]["acceptance_identity"]["accepted_commit"],
@@ -1128,12 +1339,15 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
                 "prompt_bundle_sha256": bundle["bundle_sha256"],
                 "prompt_content_sha256": bundle["final_sha256"],
             }
-            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
-            evidence, valid, task_result = controller._canonical_result_validation(invocation)
+            (root / "run" / ".agent-workspace" / "RESULT.json").write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            evidence, valid, task_result = controller._canonical_result_validation(
+                invocation
+            )
             self.assertFalse(valid)
             self.assertIsNone(task_result)
             self.assertIn("task card content identity", evidence["detail"])
-
 
     def test_canonical_no_status_fixed_artifacts_are_occupied(self) -> None:
         fake_source = """
@@ -1180,9 +1394,13 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-s
                 elif case != "fresh":
                     if case == "different":
                         result["card_id"] = "different-card"
-                    (workspace / "RESULT.json").write_text(json.dumps(result), encoding="utf-8")
+                    (workspace / "RESULT.json").write_text(
+                        json.dumps(result), encoding="utf-8"
+                    )
                     if case == "partial":
-                        (workspace / COMPLETION_REVIEW_FILENAME).write_text("not-json", encoding="utf-8")
+                        (workspace / COMPLETION_REVIEW_FILENAME).write_text(
+                            "not-json", encoding="utf-8"
+                        )
                 if case == "fresh":
                     workspace.rmdir()
                 event_parent = root / "runtime" / "missing-events"
@@ -1192,7 +1410,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-s
                 status_path = workspace / "worker_controller.status.json"
                 if case == "fresh":
                     self.assertEqual(0, controller.main([str(invocation_path)]))
-                    self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+                    self.assertEqual(
+                        1, marker.read_text(encoding="utf-8").count("launch")
+                    )
                     self.assertTrue(status_path.is_file())
                     self.assertTrue((event_parent / "events.jsonl").is_file())
                 else:
@@ -1201,7 +1421,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-s
                     self.assertFalse(status_path.exists())
                     self.assertFalse(event_parent.exists())
 
-    def test_canonical_provider_launch_identity_is_immutable_before_adapter(self) -> None:
+    def test_canonical_provider_launch_identity_is_immutable_before_adapter(
+        self,
+    ) -> None:
         fake_source = """
 import json, sys
 from pathlib import Path
@@ -1251,10 +1473,16 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
                     resume["provider"][field] = changed_value
                     resume_path = root / f"resume-{field}.invocation.json"
                     resume_path.write_text(json.dumps(resume), encoding="utf-8")
-                    with patch.object(controller, "provider_adapter", side_effect=AssertionError("adapter must not be called")):
+                    with patch.object(
+                        controller,
+                        "provider_adapter",
+                        side_effect=AssertionError("adapter must not be called"),
+                    ):
                         with self.assertRaises(controller.InvocationError):
                             controller.run(controller.load_invocation(resume_path))
-                    self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
+                    self.assertEqual(
+                        1, marker.read_text(encoding="utf-8").count("launch")
+                    )
                     self.assertEqual(status_before, status_path.read_bytes())
 
             unchanged = json.loads(json.dumps(raw))
@@ -1265,7 +1493,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
             self.assertEqual(0, controller.main([str(unchanged_path)]))
             self.assertEqual(2, marker.read_text(encoding="utf-8").count("launch"))
 
-    def test_canonical_codex_last_message_path_change_rejects_before_adapter(self) -> None:
+    def test_canonical_codex_last_message_path_change_rejects_before_adapter(
+        self,
+    ) -> None:
         fake_source = """
 import json, sys
 from pathlib import Path
@@ -1301,24 +1531,31 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
             status_before = status_path.read_bytes()
             event_before = event_path.read_bytes()
             resources_before = sorted(
-                str(path.relative_to(resource_root)) for path in resource_root.rglob("*")
+                str(path.relative_to(resource_root))
+                for path in resource_root.rglob("*")
             )
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
 
             resume = json.loads(json.dumps(raw))
             resume["action"] = "resume"
             resume["resume"] = {"session_id": "provider-session"}
-            resume["output_paths"]["last_message"] = str(workspace / "worker.last-message.changed")
+            resume["output_paths"]["last_message"] = str(
+                workspace / "worker.last-message.changed"
+            )
             resume_path = root / "changed-last-message.invocation.json"
             resume_path.write_text(json.dumps(resume), encoding="utf-8")
             with (
                 patch.object(controller, "provider_adapter") as provider_factory,
-                patch.object(controller, "ResourceClaims", wraps=controller.ResourceClaims) as resource_factory,
+                patch.object(
+                    controller, "ResourceClaims", wraps=controller.ResourceClaims
+                ) as resource_factory,
             ):
                 provider_factory.return_value.build_argv.side_effect = AssertionError(
                     "adapter build_argv must not be called"
                 )
-                with self.assertRaisesRegex(controller.InvocationError, "prior task identity"):
+                with self.assertRaisesRegex(
+                    controller.InvocationError, "prior task identity"
+                ):
                     controller.run(controller.load_invocation(resume_path))
                 provider_factory.assert_not_called()
                 provider_factory.return_value.build_argv.assert_not_called()
@@ -1328,11 +1565,16 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
             self.assertEqual(event_before, event_path.read_bytes())
             self.assertEqual(
                 resources_before,
-                sorted(str(path.relative_to(resource_root)) for path in resource_root.rglob("*")),
+                sorted(
+                    str(path.relative_to(resource_root))
+                    for path in resource_root.rglob("*")
+                ),
             )
             self.assertEqual(1, marker.read_text(encoding="utf-8").count("launch"))
 
-    def test_canonical_codex_equivalent_last_message_spellings_share_identity(self) -> None:
+    def test_canonical_codex_equivalent_last_message_spellings_share_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, _ = self._canonical(root)
@@ -1357,19 +1599,27 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
             second = load_invocation(second_path).canonical
             assert first is not None
             assert second is not None
-            self.assertEqual(first.provider_launch_sha256, second.provider_launch_sha256)
+            self.assertEqual(
+                first.provider_launch_sha256, second.provider_launch_sha256
+            )
 
-    def test_canonical_unconsumed_last_message_path_does_not_change_identity(self) -> None:
+    def test_canonical_unconsumed_last_message_path_does_not_change_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, _ = self._canonical(root)
             changed = json.loads(json.dumps(raw))
             workspace = root / "run" / ".agent-workspace"
-            changed["output_paths"]["last_message"] = str(workspace / "worker.last-message.changed")
+            changed["output_paths"]["last_message"] = str(
+                workspace / "worker.last-message.changed"
+            )
             first = parse_canonical_invocation(raw)
             second = parse_canonical_invocation(changed)
             self.assertEqual("claude-code", first.provider_id)
-            self.assertEqual(first.provider_launch_sha256, second.provider_launch_sha256)
+            self.assertEqual(
+                first.provider_launch_sha256, second.provider_launch_sha256
+            )
             self.assertNotIn("last_message_path", first.provider_launch_record())
 
     def test_canonical_workspace_symlink_is_rejected_before_mutation(self) -> None:
@@ -1399,7 +1649,9 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
                     text=True,
                 )
                 if junction.returncode != 0:
-                    self.skipTest(f"directory symlink/junction is unavailable: {junction.stderr.strip()}")
+                    self.skipTest(
+                        f"directory symlink/junction is unavailable: {junction.stderr.strip()}"
+                    )
             event_parent = root / "runtime" / "external-events"
             raw["event_log_path"] = str(event_parent / "events.jsonl")
             invocation_path = root / "symlink.invocation.json"
@@ -1471,13 +1723,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
 
             different = json.loads(json.dumps(raw))
             different["task_card"]["revision"] = "different"
-            different["event_log_path"] = str(root / "runtime" / "different-task" / "events.jsonl")
+            different["event_log_path"] = str(
+                root / "runtime" / "different-task" / "events.jsonl"
+            )
             different_path = root / "different-task.invocation.json"
             different_path.write_text(json.dumps(different), encoding="utf-8")
             self.assertEqual(2, controller.main([str(different_path)]))
             self.assertFalse((root / "runtime" / "different-task").exists())
 
-            (workspace / COMPLETION_REVIEW_FILENAME).write_text("not-json", encoding="utf-8")
+            (workspace / COMPLETION_REVIEW_FILENAME).write_text(
+                "not-json", encoding="utf-8"
+            )
             self.assertEqual(2, controller.main([str(candidate("malformed-chain"))]))
             self.assertFalse((root / "runtime" / "malformed-chain").exists())
             (workspace / COMPLETION_REVIEW_FILENAME).unlink()
@@ -1495,7 +1751,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                 "verdict": "PASS",
                 "evidence": ["test://mutation"],
             }
-            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
             acceptance = {
                 "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
                 "card_id": card["card_id"],
@@ -1512,11 +1770,14 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             }
             (workspace / COMPLETION_REVIEW_FILENAME).write_bytes(review_bytes)
             (workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).write_text(
-                json.dumps(acceptance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                json.dumps(acceptance, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
             )
             self.assertEqual(2, controller.main([str(candidate("accepted-start"))]))
             self.assertFalse((root / "runtime" / "accepted-start").exists())
-            self.assertEqual(2, controller.main([str(candidate("accepted-resume", action="resume"))]))
+            self.assertEqual(
+                2, controller.main([str(candidate("accepted-resume", action="resume"))])
+            )
             self.assertFalse((root / "runtime" / "accepted-resume").exists())
 
             fresh_root = root / "fresh"
@@ -1533,7 +1794,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             self.assertEqual(0, controller.main([str(fresh_path)]))
             self.assertTrue((fresh_event_parent / "events.jsonl").is_file())
 
-    def test_file_backed_declared_content_hashes_preserve_raw_chain_identity(self) -> None:
+    def test_file_backed_declared_content_hashes_preserve_raw_chain_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             raw, card_raw = self._canonical(root)
@@ -1556,9 +1819,15 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                 "prompt_content_sha256": bundle["final_sha256"],
             }
             result["content_sha256"] = record_sha256(result)
-            result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
-            result_record = validate_task_result(result, card=card, raw_bytes=result_bytes)
-            self.assertEqual(hashlib.sha256(result_bytes).hexdigest(), result_record.content_sha256)
+            result_bytes = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+            result_record = validate_task_result(
+                result, card=card, raw_bytes=result_bytes
+            )
+            self.assertEqual(
+                hashlib.sha256(result_bytes).hexdigest(), result_record.content_sha256
+            )
 
             review = {
                 "schema": COMPLETION_REVIEW_SCHEMA,
@@ -1573,9 +1842,15 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                 "evidence": ["test://declared"],
             }
             review["content_sha256"] = record_sha256(review)
-            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode("utf-8")
-            review_record = validate_completion_review(review, card=card, result=result_record, raw_bytes=review_bytes)
-            self.assertEqual(hashlib.sha256(review_bytes).hexdigest(), review_record.content_sha256)
+            review_bytes = (json.dumps(review, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+            review_record = validate_completion_review(
+                review, card=card, result=result_record, raw_bytes=review_bytes
+            )
+            self.assertEqual(
+                hashlib.sha256(review_bytes).hexdigest(), review_record.content_sha256
+            )
 
             acceptance = {
                 "schema": ORCHESTRATOR_ACCEPTANCE_SCHEMA,
@@ -1592,7 +1867,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                 "verdict": "ACCEPTED",
             }
             acceptance["content_sha256"] = record_sha256(acceptance)
-            acceptance_bytes = (json.dumps(acceptance, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            acceptance_bytes = (
+                json.dumps(acceptance, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
             acceptance_record = validate_orchestrator_acceptance(
                 acceptance,
                 card=card,
@@ -1600,27 +1877,48 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                 review=review_record,
                 raw_bytes=acceptance_bytes,
             )
-            self.assertEqual(hashlib.sha256(acceptance_bytes).hexdigest(), acceptance_record.content_sha256)
+            self.assertEqual(
+                hashlib.sha256(acceptance_bytes).hexdigest(),
+                acceptance_record.content_sha256,
+            )
 
             workspace = root / "chain-workspace"
             workspace.mkdir()
             (workspace / "RESULT.json").write_bytes(result_bytes)
             (workspace / COMPLETION_REVIEW_FILENAME).write_bytes(review_bytes)
             (workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).write_bytes(acceptance_bytes)
-            advancement = read_task_advancement(workspace, card=card, result=result_record)
+            advancement = read_task_advancement(
+                workspace, card=card, result=result_record
+            )
             self.assertEqual("ACCEPTED", advancement.state)
-            self.assertEqual(hashlib.sha256(review_bytes).hexdigest(), advancement.review.content_sha256)  # type: ignore[union-attr]
-            self.assertEqual(hashlib.sha256(acceptance_bytes).hexdigest(), advancement.acceptance.content_sha256)  # type: ignore[union-attr]
+            self.assertEqual(
+                hashlib.sha256(review_bytes).hexdigest(),
+                advancement.review.content_sha256,
+            )  # type: ignore[union-attr]
+            self.assertEqual(
+                hashlib.sha256(acceptance_bytes).hexdigest(),
+                advancement.acceptance.content_sha256,
+            )  # type: ignore[union-attr]
 
             for original, validator, kwargs in (
                 (result, validate_task_result, {"card": card}),
-                (review, validate_completion_review, {"card": card, "result": result_record}),
-                (acceptance, validate_orchestrator_acceptance, {"card": card, "result": result_record, "review": review_record}),
+                (
+                    review,
+                    validate_completion_review,
+                    {"card": card, "result": result_record},
+                ),
+                (
+                    acceptance,
+                    validate_orchestrator_acceptance,
+                    {"card": card, "result": result_record, "review": review_record},
+                ),
             ):
                 with self.subTest(record=original["schema"]):
                     wrong_declaration = dict(original)
                     wrong_declaration["content_sha256"] = "0" * 64
-                    wrong_bytes = (json.dumps(wrong_declaration, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    wrong_bytes = (
+                        json.dumps(wrong_declaration, indent=2, sort_keys=True) + "\n"
+                    ).encode("utf-8")
                     with self.assertRaises(TaskValidationError):
                         validator(wrong_declaration, raw_bytes=wrong_bytes, **kwargs)
                     tampered = dict(original)
@@ -1630,9 +1928,12 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
                         tampered["evidence"] = ["tampered"]
                     else:
                         tampered["accepted_by"] = "tampered"
-                    tampered_bytes = (json.dumps(tampered, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    tampered_bytes = (
+                        json.dumps(tampered, indent=2, sort_keys=True) + "\n"
+                    ).encode("utf-8")
                     with self.assertRaises(TaskValidationError):
                         validator(tampered, raw_bytes=tampered_bytes, **kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

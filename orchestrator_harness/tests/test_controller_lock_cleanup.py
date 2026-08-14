@@ -81,9 +81,21 @@ class ControllerLockCleanupTests(unittest.TestCase):
             "test",
             "implementation",
             "coding:worker-1",
-            [], [], [], {}, ["named-resource"], self.runtime / "claims",
-            "test-model", "low", "priority", ["codex"], [], "workspace-write", "never",
-            None, None,
+            [],
+            [],
+            [],
+            {},
+            ["named-resource"],
+            self.runtime / "claims",
+            "test-model",
+            "low",
+            "priority",
+            ["codex"],
+            [],
+            "workspace-write",
+            "never",
+            None,
+            None,
             self.workspace / "status.json",
             self.workspace / "output.jsonl",
             self.workspace / "stderr.log",
@@ -100,11 +112,20 @@ class ControllerLockCleanupTests(unittest.TestCase):
         release_calls: list[None] = []
 
         def claims_factory(
-            root: Path, lane_id: str, worker_id: str, process: ProcessInfo,
+            root: Path,
+            lane_id: str,
+            worker_id: str,
+            process: ProcessInfo,
         ) -> ResourceClaims:
             claims = ResourceClaims(
-                root, lane_id, worker_id, process,
-                identity_provider=lambda pid: {"pid": pid, "created_utc": f"identity:{pid}"},
+                root,
+                lane_id,
+                worker_id,
+                process,
+                identity_provider=lambda pid: {
+                    "pid": pid,
+                    "created_utc": f"identity:{pid}",
+                },
             )
             original_release_all = claims.release_all
 
@@ -117,7 +138,9 @@ class ControllerLockCleanupTests(unittest.TestCase):
             return claims
 
         with (
-            mock.patch.object(controller, "_identity", side_effect=[owner, child_identity]),
+            mock.patch.object(
+                controller, "_identity", side_effect=[owner, child_identity]
+            ),
             mock.patch.object(controller, "ResourceClaims", side_effect=claims_factory),
             mock.patch.object(controller.subprocess, "Popen", return_value=child),
         ):
@@ -128,7 +151,9 @@ class ControllerLockCleanupTests(unittest.TestCase):
         assert lock_root is not None
         claim_path = lock_root / claim_filename("named-resource")
         self.assertTrue(claim_path.is_file())
-        self.assertEqual(["named-resource"], [claim["resource"] for claim in claims.held])
+        self.assertEqual(
+            ["named-resource"], [claim["resource"] for claim in claims.held]
+        )
         self.assertEqual([], release_calls)
         self.assertTrue(child.terminated)
         self.assertTrue(child.killed)
@@ -136,9 +161,16 @@ class ControllerLockCleanupTests(unittest.TestCase):
         status = json.loads(invocation.status_path.read_text(encoding="utf-8"))
         self.assertEqual("COORDINATION_FAILED", status["state"])
         self.assertEqual(claims.held, status["held_resource_claims"])
-        self.assertTrue(status["coordination_failure"]["child_shutdown"]["terminate_wait_timed_out"])
-        self.assertTrue(status["coordination_failure"]["child_shutdown"]["kill_wait_timed_out"])
-        events = [json.loads(line) for line in invocation.event_log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(
+            status["coordination_failure"]["child_shutdown"]["terminate_wait_timed_out"]
+        )
+        self.assertTrue(
+            status["coordination_failure"]["child_shutdown"]["kill_wait_timed_out"]
+        )
+        events = [
+            json.loads(line)
+            for line in invocation.event_log.read_text(encoding="utf-8").splitlines()
+        ]
         self.assertEqual("COORDINATION_FAILED", events[-1]["event"])
         self.assertEqual(claims.held, events[-1]["retained_claims"])
 
@@ -151,19 +183,32 @@ class ControllerLockCleanupTests(unittest.TestCase):
         release_calls: list[None] = []
 
         def claims_factory(
-            root: Path, lane_id: str, worker_id: str, process: ProcessInfo,
+            root: Path,
+            lane_id: str,
+            worker_id: str,
+            process: ProcessInfo,
         ) -> ResourceClaims:
             claims = ResourceClaims(
-                root, lane_id, worker_id, process,
-                identity_provider=lambda pid: {"pid": pid, "created_utc": f"identity:{pid}"},
+                root,
+                lane_id,
+                worker_id,
+                process,
+                identity_provider=lambda pid: {
+                    "pid": pid,
+                    "created_utc": f"identity:{pid}",
+                },
             )
             original_release_all = claims.release_all
-            claims.release_all = lambda: (release_calls.append(None) or original_release_all())
+            claims.release_all = lambda: (
+                release_calls.append(None) or original_release_all()
+            )
             captured.append(claims)
             return claims
 
         with (
-            mock.patch.object(controller, "_identity", side_effect=[owner, child_identity]),
+            mock.patch.object(
+                controller, "_identity", side_effect=[owner, child_identity]
+            ),
             mock.patch.object(controller, "ResourceClaims", side_effect=claims_factory),
             mock.patch.object(controller.subprocess, "Popen", return_value=child),
         ):

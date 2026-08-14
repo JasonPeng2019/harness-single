@@ -95,7 +95,9 @@ class PathKeyedAppendLock:
                 handle.close()
             self._handle = None
             self._anchored = None
-            raise AppendLockError(f"cannot acquire append lock for {self.path}: {exc}") from exc
+            raise AppendLockError(
+                f"cannot acquire append lock for {self.path}: {exc}"
+            ) from exc
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         handle = self._handle
@@ -122,7 +124,9 @@ class PathKeyedAppendLock:
 
 
 def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:
-    return b"".join((canonical_json(dict(record)) + "\n").encode("utf-8") for record in records)
+    return b"".join(
+        (canonical_json(dict(record)) + "\n").encode("utf-8") for record in records
+    )
 
 
 def _append_jsonl_locked(path: Path, data: bytes) -> None:
@@ -173,7 +177,9 @@ class PreparedOutputTransaction:
     ) -> None:
         self.root = Path(root).absolute()
         default_allowed = self.root.parent.resolve(strict=False)
-        self.allowed_roots = tuple(Path(item).resolve() for item in (allowed_roots or (default_allowed,)))
+        self.allowed_roots = tuple(
+            Path(item).resolve() for item in (allowed_roots or (default_allowed,))
+        )
         self.forbidden_roots = tuple(Path(item).resolve() for item in forbidden_roots)
         self._root_identity: tuple[int, int] | None = None
         self._admitted: set[str] = set()
@@ -199,16 +205,24 @@ class PreparedOutputTransaction:
                 return True
         return False
 
-    def _validate_components(self, target: Path, *, allow_prepared_parent: bool = False) -> Path:
+    def _validate_components(
+        self, target: Path, *, allow_prepared_parent: bool = False
+    ) -> Path:
         lexical = Path(os.path.abspath(str(target)))
         if self._has_ads(lexical):
             raise PathSafetyError(f"alternate data stream syntax rejected: {target}")
         resolved = lexical.resolve(strict=False)
-        allowed = next((root for root in self.allowed_roots if self._inside(resolved, root)), None)
+        allowed = next(
+            (root for root in self.allowed_roots if self._inside(resolved, root)), None
+        )
         if allowed is None:
             raise PathSafetyError(f"output escapes permitted roots: {target}")
         root_resolved = self.root.resolve(strict=False)
-        if not allow_prepared_parent and not self._inside(resolved, root_resolved) and resolved != root_resolved:
+        if (
+            not allow_prepared_parent
+            and not self._inside(resolved, root_resolved)
+            and resolved != root_resolved
+        ):
             raise PathSafetyError(f"output escapes prepared root: {target}")
         for forbidden in self.forbidden_roots:
             if self._inside(resolved, forbidden) or (
@@ -221,7 +235,9 @@ class PreparedOutputTransaction:
         try:
             relative = lexical.relative_to(allowed)
         except ValueError as exc:
-            raise PathSafetyError(f"output path has ambiguous identity: {target}") from exc
+            raise PathSafetyError(
+                f"output path has ambiguous identity: {target}"
+            ) from exc
         for part in relative.parts:
             current = current / part
             if current.exists() and _is_reparse(current):
@@ -230,7 +246,11 @@ class PreparedOutputTransaction:
 
     def prepare(self) -> None:
         self._validate_components(self.root)
-        allowed = next(root for root in self.allowed_roots if self._inside(self.root.resolve(strict=False), root))
+        allowed = next(
+            root
+            for root in self.allowed_roots
+            if self._inside(self.root.resolve(strict=False), root)
+        )
         try:
             ensure_directory_path(self.root)
         except (MutationConflict, MutationUnsupported) as exc:
@@ -263,7 +283,11 @@ class PreparedOutputTransaction:
         return lexical
 
     def child(self, relative: str) -> Path:
-        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+        ):
             raise PathSafetyError("dynamic output child must be a relative path")
         return self.admit(self.root / relative)
 
@@ -273,7 +297,9 @@ class PreparedOutputTransaction:
             candidate = self.root / candidate
         lexical = self.revalidate(candidate)
         if _path_key(lexical) not in self._admitted:
-            raise PathSafetyError(f"output child was not admitted before write: {lexical}")
+            raise PathSafetyError(
+                f"output child was not admitted before write: {lexical}"
+            )
         if not lexical.parent.exists():
             raise PathSafetyError(f"output parent does not exist: {lexical.parent}")
         return lexical
@@ -333,9 +359,18 @@ OutputTransaction = PreparedOutputTransaction
 PreparedOutputRoot = PreparedOutputTransaction
 
 
-def append_jsonl(path: Path, record_or_records: Mapping[str, Any] | list[Mapping[str, Any]], *, lock_root: Path | None = None) -> None:
+def append_jsonl(
+    path: Path,
+    record_or_records: Mapping[str, Any] | list[Mapping[str, Any]],
+    *,
+    lock_root: Path | None = None,
+) -> None:
     """Compatibility spelling for the single shared append primitive."""
-    records = record_or_records if isinstance(record_or_records, list) else [record_or_records]
+    records = (
+        record_or_records
+        if isinstance(record_or_records, list)
+        else [record_or_records]
+    )
     append_jsonl_records(path, records, lock_root=lock_root)
 
 
@@ -469,7 +504,10 @@ class SafeOutput:
         self.harness_root = harness_root.resolve()
         self.output_root = output_root.absolute()
         self.forbidden_roots = tuple(root.resolve() for root in forbidden_roots)
-        self.allowed_output_roots = (self.harness_root, *(root.resolve() for root in allowed_output_roots))
+        self.allowed_output_roots = (
+            self.harness_root,
+            *(root.resolve() for root in allowed_output_roots),
+        )
         self.fail_after_event_append = fail_after_event_append
         self._root_identity: tuple[int, int] | None = None
         self._prepared_transaction = PreparedOutputTransaction(
@@ -483,7 +521,10 @@ class SafeOutput:
             raise PathSafetyError(f"alternate data stream syntax rejected: {target}")
         lexical = target.absolute()
         resolved = lexical.resolve(strict=False)
-        allowed_root = next((root for root in self.allowed_output_roots if _within(resolved, root)), None)
+        allowed_root = next(
+            (root for root in self.allowed_output_roots if _within(resolved, root)),
+            None,
+        )
         if allowed_root is None:
             raise PathSafetyError(f"output escapes permitted roots: {target}")
         output_resolved = self.output_root.resolve(strict=False)
@@ -505,7 +546,11 @@ class SafeOutput:
     def prepare(self) -> None:
         self._prepared_transaction.prepare()
         self._validate_components(self.output_root)
-        base = next(root for root in self.allowed_output_roots if _within(self.output_root.resolve(strict=False), root))
+        base = next(
+            root
+            for root in self.allowed_output_roots
+            if _within(self.output_root.resolve(strict=False), root)
+        )
         try:
             ensure_directory_path(self.output_root)
         except (MutationConflict, MutationUnsupported) as exc:

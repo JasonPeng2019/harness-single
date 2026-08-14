@@ -71,7 +71,9 @@ class ResourceLockTests(unittest.TestCase):
             ),
         )
 
-    def acquire(self, claims: ResourceClaims, resources: list[str]) -> list[dict[str, object]]:
+    def acquire(
+        self, claims: ResourceClaims, resources: list[str]
+    ) -> list[dict[str, object]]:
         waits: list[dict[str, object]] = []
         claims.acquire_all(resources, on_wait=waits.append)
         return waits
@@ -97,7 +99,9 @@ class ResourceLockTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual([], owner.held)
 
-    def test_different_resources_proceed_while_same_resource_waits_without_launch(self) -> None:
+    def test_different_resources_proceed_while_same_resource_waits_without_launch(
+        self,
+    ) -> None:
         first = self.claims(101)
         second = self.claims(202)
         self.acquire(first, ["board:a"])
@@ -117,7 +121,9 @@ class ResourceLockTests(unittest.TestCase):
         thread = threading.Thread(target=acquire_same)
         thread.start()
         self.assertTrue(waiting.wait(1))
-        self.assertFalse(launched.is_set(), "work must not launch before its claim is acquired")
+        self.assertFalse(
+            launched.is_set(), "work must not launch before its claim is acquired"
+        )
         self.assertEqual([], first.release_all())
         self.assertTrue(finished.wait(1))
         thread.join(1)
@@ -152,7 +158,9 @@ class ResourceLockTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertEqual(["board:a"], [item["resource"] for item in owner.held])
 
-    def test_malformed_and_hashed_wrong_resource_claims_are_actionable_but_not_deleted(self) -> None:
+    def test_malformed_and_hashed_wrong_resource_claims_are_actionable_but_not_deleted(
+        self,
+    ) -> None:
         resource = "board:a"
         path = self.root / claim_filename(resource)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -217,7 +225,9 @@ class ResourceLockTests(unittest.TestCase):
         self.assertEqual("OWNER_IDENTITY_REUSED", waits[0]["state"])
         self.assertTrue(path.exists())
 
-    def test_guarded_concurrent_stale_replacement_leaves_guarded_claim_untouched_and_cleans_up(self) -> None:
+    def test_guarded_concurrent_stale_replacement_leaves_guarded_claim_untouched_and_cleans_up(
+        self,
+    ) -> None:
         crashed = self.claims(101, inventory=snapshot(process(202)))
         expected = crashed._new_claim("board:a")
         path = self.root / claim_filename("board:a")
@@ -251,7 +261,9 @@ class ResourceLockTests(unittest.TestCase):
             for cycle in range(100):
                 contender = first if cycle % 2 == 0 else second
                 self.assertEqual([], self.acquire(contender, ["board:shared"]))
-                self.assertEqual(["board:shared"], [item["resource"] for item in contender.held])
+                self.assertEqual(
+                    ["board:shared"], [item["resource"] for item in contender.held]
+                )
                 self.assertEqual([], contender.release_all())
         self.assertFalse((self.root / claim_filename("board:shared")).exists())
 

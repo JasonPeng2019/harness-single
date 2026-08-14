@@ -32,7 +32,9 @@ class _Child:
 
 
 def identity() -> ProcessInfo:
-    return ProcessInfo(77, 10, "child", "child", datetime(2026, 8, 10, tzinfo=timezone.utc))
+    return ProcessInfo(
+        77, 10, "child", "child", datetime(2026, 8, 10, tzinfo=timezone.utc)
+    )
 
 
 class ProcessSupervisorTests(unittest.TestCase):
@@ -51,7 +53,9 @@ class ProcessSupervisorTests(unittest.TestCase):
             return original_wait(timeout)
 
         child.wait = graceful_wait  # type: ignore[method-assign]
-        result = ProcessSupervisor(child, identity(), graceful_timeout_seconds=0, observer=observe).cleanup()
+        result = ProcessSupervisor(
+            child, identity(), graceful_timeout_seconds=0, observer=observe
+        ).cleanup()
         self.assertTrue(result.proved_reap)
         self.assertTrue(result.terminate_attempted)
         self.assertFalse(result.kill_attempted)
@@ -59,7 +63,9 @@ class ProcessSupervisorTests(unittest.TestCase):
 
     def test_force_stop_requires_final_reap(self) -> None:
         child = _Child()
-        result = ProcessSupervisor(child, identity(), graceful_timeout_seconds=0, observer=None).cleanup()
+        result = ProcessSupervisor(
+            child, identity(), graceful_timeout_seconds=0, observer=None
+        ).cleanup()
         self.assertTrue(result.proved_reap)
         self.assertTrue(result.terminate_attempted)
         self.assertTrue(result.kill_attempted)

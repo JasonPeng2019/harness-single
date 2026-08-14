@@ -4,6 +4,7 @@ The controller accepts either the original firmware/policy-bound invocation or t
 general-coding schema. It does not schedule lanes: it validates one manager-written invocation,
 launches one child, and leaves factual process/output records for the read-only harness to observe.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,7 +43,12 @@ from .invocation import (
 )
 from .models import ProcessInfo, iso_utc
 from .profile import ProfileError, RuntimeProfile, build_child_environment
-from .process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryUnsupported, ProcessSupervisor
+from .process_supervisor import (
+    CleanupResult,
+    ProcessBoundary,
+    ProcessBoundaryUnsupported,
+    ProcessSupervisor,
+)
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     PROVIDER_OPERATION_NAMES,
@@ -65,8 +71,18 @@ from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
 from .workspace_overlay import verify_overlay_receipt
 from .stable_io import append_jsonl_record
-from .lane_lifecycle import LaneLifecycleError, _LifecycleAdmission, _admit_lifecycle_registry, _update_lifecycle_registry
-from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
+from .lane_lifecycle import (
+    LaneLifecycleError,
+    _LifecycleAdmission,
+    _admit_lifecycle_registry,
+    _update_lifecycle_registry,
+)
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    capture_target,
+    replace as mutation_replace,
+)
 from .resume import (
     ResumeAdmissionError,
     require_resume_admission,
@@ -92,55 +108,110 @@ CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 # ignoring one on the other route would make a hand-written mixed invocation
 # appear valid while dropping its safety contract.
 _FIRMWARE_ONLY_FIELDS = CODING_V1_FIRMWARE_ONLY_FIELDS
-_CODING_ONLY_FIELDS = frozenset({
-    "worker_invocation_id",
-    "runtime_root",
-    "resource_lock_root",
-    "event_log_path",
-    "event_log",
-    "lane_id",
-    "resources",
-    "exclusive_resources",
-    "repository",
-    "git",
-    "resume_identity",
-    "resume",
-    "codex",
-    "codex_settings",
-    "finding_gate",
-    "child_environment_isolation",
-})
+_CODING_ONLY_FIELDS = frozenset(
+    {
+        "worker_invocation_id",
+        "runtime_root",
+        "resource_lock_root",
+        "event_log_path",
+        "event_log",
+        "lane_id",
+        "resources",
+        "exclusive_resources",
+        "repository",
+        "git",
+        "resume_identity",
+        "resume",
+        "codex",
+        "codex_settings",
+        "finding_gate",
+        "child_environment_isolation",
+    }
+)
 # ``model_settings`` is retained by both routes, but coding accepts these
 # nested settings only as a compatibility fallback.  They must not be silently
 # discarded when a schema-less firmware invocation is parsed.
-_CODING_ONLY_MODEL_SETTINGS_FIELDS = frozenset({
-    "command",
-    "config_overrides",
-    "sandbox",
-    "approval_policy",
-})
+_CODING_ONLY_MODEL_SETTINGS_FIELDS = frozenset(
+    {
+        "command",
+        "config_overrides",
+        "sandbox",
+        "approval_policy",
+    }
+)
 
 
 def _utc() -> str:
     return iso_utc(datetime.now(timezone.utc)) or ""
 
 
-_PHYSICAL_CHILD_PREFIXES = ("MCP_", "PYOCD_", "BYO_MCP_", "FIRMWARE_MCP_", "PROBE_", "TARGET_", "SERIAL_", "OPENOCD_", "JLINK_", "CREDENTIAL_", "SECRET_", "TOKEN_", "FIRMWARE_CONFIG_")
-_CHILD_ENV_ALLOW = frozenset({"PATH", "PATHEXT", "SYSTEMROOT", "COMSPEC", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "PYTHONUTF8", "PYTHONIOENCODING", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"})
+_PHYSICAL_CHILD_PREFIXES = (
+    "MCP_",
+    "PYOCD_",
+    "BYO_MCP_",
+    "FIRMWARE_MCP_",
+    "PROBE_",
+    "TARGET_",
+    "SERIAL_",
+    "OPENOCD_",
+    "JLINK_",
+    "CREDENTIAL_",
+    "SECRET_",
+    "TOKEN_",
+    "FIRMWARE_CONFIG_",
+)
+_CHILD_ENV_ALLOW = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "LANG",
+        "LC_ALL",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    }
+)
 
 
-def isolated_coding_child_environment(inherited: Mapping[str, str] | None = None) -> tuple[dict[str, str], list[str]]:
+def isolated_coding_child_environment(
+    inherited: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], list[str]]:
     """Return the optional Codex-only child environment without physical lane capability."""
     source = dict(os.environ if inherited is None else inherited)
-    cleared = sorted(key for key in source if key.upper().startswith(_PHYSICAL_CHILD_PREFIXES))
-    allowed = {key: value for key, value in source.items() if key.upper() in _CHILD_ENV_ALLOW and not key.upper().startswith(_PHYSICAL_CHILD_PREFIXES)}
+    cleared = sorted(
+        key for key in source if key.upper().startswith(_PHYSICAL_CHILD_PREFIXES)
+    )
+    allowed = {
+        key: value
+        for key, value in source.items()
+        if key.upper() in _CHILD_ENV_ALLOW
+        and not key.upper().startswith(_PHYSICAL_CHILD_PREFIXES)
+    }
     return allowed, cleared
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        mutation_replace(path.parent, path.name, data, expected=capture_target(path.parent, path.name))
+        mutation_replace(
+            path.parent,
+            path.name,
+            data,
+            expected=capture_target(path.parent, path.name),
+        )
     except (MutationConflict, MutationUnsupported) as exc:
         raise OSError(str(exc)) from exc
 
@@ -157,7 +228,9 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _safe_path(value: object, *, root: Path, name: str, must_exist: bool = False) -> Path:
+def _safe_path(
+    value: object, *, root: Path, name: str, must_exist: bool = False
+) -> Path:
     if not isinstance(value, str) or not value:
         raise InvocationError(f"{name} must be a non-empty path string")
     candidate = Path(value).expanduser().resolve(strict=False)
@@ -173,18 +246,28 @@ def _canonical_output_path_key(path: Path) -> str:
 
 
 def _validate_canonical_output_paths(
-    output_paths: Mapping[str, Path], *, workspace: Path,
+    output_paths: Mapping[str, Path],
+    *,
+    workspace: Path,
 ) -> None:
     """Reject canonical output aliases before any workspace/output mutation."""
 
-    path_keys = {key: _canonical_output_path_key(path) for key, path in output_paths.items()}
+    path_keys = {
+        key: _canonical_output_path_key(path) for key, path in output_paths.items()
+    }
     if len(set(path_keys.values())) != len(path_keys):
-        raise InvocationValidationError("canonical output paths must be pairwise distinct")
+        raise InvocationValidationError(
+            "canonical output paths must be pairwise distinct"
+        )
 
     reserved_paths = {
         _canonical_output_path_key(workspace / "RESULT.json"): "RESULT.json",
-        _canonical_output_path_key(workspace / COMPLETION_REVIEW_FILENAME): COMPLETION_REVIEW_FILENAME,
-        _canonical_output_path_key(workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME): ORCHESTRATOR_ACCEPTANCE_FILENAME,
+        _canonical_output_path_key(
+            workspace / COMPLETION_REVIEW_FILENAME
+        ): COMPLETION_REVIEW_FILENAME,
+        _canonical_output_path_key(
+            workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME
+        ): ORCHESTRATOR_ACCEPTANCE_FILENAME,
     }
     collisions = sorted(
         f"{key}={reserved_paths[path_key]}"
@@ -193,7 +276,8 @@ def _validate_canonical_output_paths(
     )
     if collisions:
         raise InvocationValidationError(
-            "canonical output paths are reserved task artifacts: " + ", ".join(collisions)
+            "canonical output paths are reserved task artifacts: "
+            + ", ".join(collisions)
         )
 
 
@@ -213,7 +297,10 @@ def _string_list(value: object, name: str) -> list[str]:
 
 
 def _reject_foreign_fields(
-    raw: Mapping[str, Any], *, route: str, fields: frozenset[str],
+    raw: Mapping[str, Any],
+    *,
+    route: str,
+    fields: frozenset[str],
 ) -> None:
     present = sorted(field for field in fields if field in raw)
     if present:
@@ -297,7 +384,9 @@ class Invocation:
     overlay_receipt: Path | None = None
 
 
-def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
+def _common_paths(
+    raw: dict[str, Any],
+) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
     action = _string(raw, "action").lower()
     if action not in {"start", "resume"}:
         raise InvocationError("action must be start or resume")
@@ -317,16 +406,22 @@ def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, byte
         workspace.mkdir(exist_ok=True)
     except OSError as exc:
         raise InvocationError(f"cannot create run workspace: {exc}") from exc
-    prompt_path = _safe_path(raw.get("prompt_path"), root=run_root, name="prompt_path", must_exist=True)
+    prompt_path = _safe_path(
+        raw.get("prompt_path"), root=run_root, name="prompt_path", must_exist=True
+    )
     outputs = raw.get("output_paths")
     if not isinstance(outputs, dict):
         raise InvocationError("output_paths must be an object")
     status_path = _safe_path(outputs.get("status"), root=workspace, name="status")
     jsonl_path = _safe_path(outputs.get("jsonl"), root=workspace, name="jsonl")
     stderr_path = _safe_path(outputs.get("stderr"), root=workspace, name="stderr")
-    last_message_path = _safe_path(outputs.get("last_message"), root=workspace, name="last_message")
+    last_message_path = _safe_path(
+        outputs.get("last_message"), root=workspace, name="last_message"
+    )
     prompt_sha256 = _string(raw, "prompt_sha256").lower()
-    if len(prompt_sha256) != 64 or any(char not in "0123456789abcdef" for char in prompt_sha256):
+    if len(prompt_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in prompt_sha256
+    ):
         raise InvocationError("prompt_sha256 must be a SHA-256 hex digest")
     try:
         prompt_bytes = prompt_path.read_bytes()
@@ -334,31 +429,50 @@ def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, byte
         raise InvocationError(f"cannot verify prompt: {exc}") from exc
     if hashlib.sha256(prompt_bytes).hexdigest() != prompt_sha256:
         raise InvocationError("prompt bytes do not match prompt_sha256")
-    return action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, {
-        "status": status_path,
-        "jsonl": jsonl_path,
-        "stderr": stderr_path,
-        "last_message": last_message_path,
-    }
+    return (
+        action,
+        run_root,
+        workspace,
+        prompt_path,
+        prompt_sha256,
+        prompt_bytes,
+        {
+            "status": status_path,
+            "jsonl": jsonl_path,
+            "stderr": stderr_path,
+            "last_message": last_message_path,
+        },
+    )
 
 
 def _resume_thread(raw: dict[str, Any]) -> str | None:
     requested_thread = raw.get("resume_thread_id")
-    if requested_thread is not None and (not isinstance(requested_thread, str) or not requested_thread.strip()):
-        raise InvocationError("resume_thread_id must be a non-empty string when supplied")
+    if requested_thread is not None and (
+        not isinstance(requested_thread, str) or not requested_thread.strip()
+    ):
+        raise InvocationError(
+            "resume_thread_id must be a non-empty string when supplied"
+        )
     return requested_thread.strip() if isinstance(requested_thread, str) else None
 
 
 def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
-    _reject_foreign_fields(raw, route="schema-less firmware", fields=_CODING_ONLY_FIELDS)
+    _reject_foreign_fields(
+        raw, route="schema-less firmware", fields=_CODING_ONLY_FIELDS
+    )
     _reject_firmware_coding_model_settings(raw)
-    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
+    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = (
+        _common_paths(raw)
+    )
     label = _string(raw, "label")
     expected = {
         "status": f"{label}_controller.status.json",
         "jsonl": f"{label}_codex.jsonl",
     }
-    if outputs["status"].name != expected["status"] or outputs["jsonl"].name != expected["jsonl"]:
+    if (
+        outputs["status"].name != expected["status"]
+        or outputs["jsonl"].name != expected["jsonl"]
+    ):
         raise InvocationError("controller status/JSONL names must match the lane label")
     server_snapshot = raw.get("server_snapshot")
     if not isinstance(server_snapshot, dict):
@@ -372,17 +486,26 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
     requested_thread = _resume_thread(raw)
     suite_root = Path(__file__).resolve().parent.parent
     policy_path = suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.md"
-    sidecar_path = suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.sha256"
+    sidecar_path = (
+        suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.sha256"
+    )
     policy_sha256 = _string(raw, "policy_sha256").lower()
-    if len(policy_sha256) != 64 or any(char not in "0123456789abcdef" for char in policy_sha256):
+    if len(policy_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in policy_sha256
+    ):
         raise InvocationError("policy_sha256 must be a SHA-256 hex digest")
     try:
         policy_bytes = policy_path.read_bytes()
         sidecar = sidecar_path.read_text(encoding="utf-8").split()[0].lower()
     except (OSError, IndexError) as exc:
         raise InvocationError(f"cannot verify policy-bound prompt: {exc}") from exc
-    if hashlib.sha256(policy_bytes).hexdigest() != policy_sha256 or sidecar != policy_sha256:
-        raise InvocationError("canonical policy file or sidecar does not match policy_sha256")
+    if (
+        hashlib.sha256(policy_bytes).hexdigest() != policy_sha256
+        or sidecar != policy_sha256
+    ):
+        raise InvocationError(
+            "canonical policy file or sidecar does not match policy_sha256"
+        )
     try:
         prompt_text = prompt_bytes.decode("utf-8-sig")
         policy_text = policy_bytes.decode("utf-8-sig")
@@ -395,26 +518,62 @@ def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
         "## FINAL PRECEDENCE REMINDER",
         f"Policy `{policy_sha256}` and the latest signed run amendment control.",
     )
-    if any(marker not in prompt_text for marker in markers) or policy_text not in prompt_text:
-        raise InvocationError("prompt is not the required policy-bound prompt composition")
+    if (
+        any(marker not in prompt_text for marker in markers)
+        or policy_text not in prompt_text
+    ):
+        raise InvocationError(
+            "prompt is not the required policy-bound prompt composition"
+        )
     log_root = suite_root / "multi-agent-logs" / "orchestrator-harness"
-    event_log = _safe_path(raw.get("lane_event_log"), root=log_root, name="lane_event_log")
+    event_log = _safe_path(
+        raw.get("lane_event_log"), root=log_root, name="lane_event_log"
+    )
     if event_log.name != "LANE_EVENTS.jsonl":
         raise InvocationError("lane_event_log must be named LANE_EVENTS.jsonl")
     event_log.parent.mkdir(parents=True, exist_ok=True)
     return Invocation(
-        None, None, action, run_root, workspace, prompt_path,
-        prompt_sha256, prompt_bytes, policy_path, policy_sha256, label, _string(raw, "doer"),
+        None,
+        None,
+        action,
+        run_root,
+        workspace,
+        prompt_path,
+        prompt_sha256,
+        prompt_bytes,
+        policy_path,
+        policy_sha256,
+        label,
+        _string(raw, "doer"),
         _string(raw, "task"),
-        _string(raw, "phase"), _string(raw, "declared_lane_id"), _string_list(raw.get("leases", []), "leases"),
-        _string_list(raw.get("board_tokens", []), "board_tokens"), _string_list(raw.get("mcp_servers", []), "mcp_servers"),
-        server_snapshot, [], None, _string(model_settings, "model"), _string(model_settings, "reasoning_effort"),
-        _string(model_settings, "service_tier"), command, overrides, "danger-full-access", "never", requested_thread, None,
-        outputs["status"], outputs["jsonl"], outputs["stderr"], outputs["last_message"], event_log,
+        _string(raw, "phase"),
+        _string(raw, "declared_lane_id"),
+        _string_list(raw.get("leases", []), "leases"),
+        _string_list(raw.get("board_tokens", []), "board_tokens"),
+        _string_list(raw.get("mcp_servers", []), "mcp_servers"),
+        server_snapshot,
+        [],
+        None,
+        _string(model_settings, "model"),
+        _string(model_settings, "reasoning_effort"),
+        _string(model_settings, "service_tier"),
+        command,
+        overrides,
+        "danger-full-access",
+        "never",
+        requested_thread,
+        None,
+        outputs["status"],
+        outputs["jsonl"],
+        outputs["stderr"],
+        outputs["last_message"],
+        event_log,
     )
 
 
-def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], list[str], str, str]:
+def _coding_settings(
+    raw: dict[str, Any],
+) -> tuple[str, str, str, list[str], list[str], str, str]:
     codex = raw.get("codex", raw.get("codex_settings"))
     if codex is not None and not isinstance(codex, dict):
         raise InvocationError("codex must be an object")
@@ -425,10 +584,14 @@ def _coding_settings(raw: dict[str, Any]) -> tuple[str, str, str, list[str], lis
     overrides_value = settings.get("config_overrides", raw.get("config_overrides", []))
     sandbox = _string(settings, "sandbox")
     if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
-        raise InvocationError("sandbox must be read-only, workspace-write, or danger-full-access")
+        raise InvocationError(
+            "sandbox must be read-only, workspace-write, or danger-full-access"
+        )
     approval_policy = _string(settings, "approval_policy")
     if approval_policy not in {"untrusted", "on-failure", "on-request", "never"}:
-        raise InvocationError("approval_policy is not a supported Codex approval policy")
+        raise InvocationError(
+            "approval_policy is not a supported Codex approval policy"
+        )
     return (
         _string(settings, "model"),
         _string(settings, "reasoning_effort"),
@@ -450,7 +613,9 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         raise InvocationError(str(exc)) from exc
     _reject_foreign_fields(raw, route="coding", fields=_FIRMWARE_ONLY_FIELDS)
     _reject_ambiguous_coding_aliases(raw)
-    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = _common_paths(raw)
+    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = (
+        _common_paths(raw)
+    )
     if (
         outputs["status"].parent != workspace
         or outputs["status"].suffix != ".json"
@@ -468,13 +633,17 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         raise InvocationError("runtime_root must be an existing directory")
     if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
         raise InvocationError("runtime_root must be separate from run_root")
-    lock_value = raw.get("resource_lock_root", str(runtime_root / "coding-resource-locks"))
+    lock_value = raw.get(
+        "resource_lock_root", str(runtime_root / "coding-resource-locks")
+    )
     resource_lock_root = _safe_path(
         lock_value, root=runtime_root, name="resource_lock_root"
     )
     if resource_lock_root == runtime_root:
         raise InvocationError("resource_lock_root must be below runtime_root")
-    event_value = raw.get("event_log_path", raw.get("event_log", raw.get("lane_event_log")))
+    event_value = raw.get(
+        "event_log_path", raw.get("event_log", raw.get("lane_event_log"))
+    )
     event_log = _safe_path(event_value, root=runtime_root, name="event_log_path")
     event_log.parent.mkdir(parents=True, exist_ok=True)
     worker_invocation_id = _string(raw, "worker_invocation_id")
@@ -493,14 +662,18 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
             "resources and exclusive_resources must match when both are supplied"
         )
     resources = _string_list(
-        exclusive_resources if exclusive_resources is not None else legacy_resources or [],
+        exclusive_resources
+        if exclusive_resources is not None
+        else legacy_resources or [],
         "exclusive_resources",
     )
     try:
         repository = declaration_from_invocation(raw, run_root)
     except GitSafetyError as exc:
         raise InvocationError(str(exc)) from exc
-    model, reasoning, tier, command, overrides, sandbox, approval = _coding_settings(raw)
+    model, reasoning, tier, command, overrides, sandbox, approval = _coding_settings(
+        raw
+    )
     requested_thread = _resume_thread(raw)
     resume_identity = raw.get("resume_identity", raw.get("resume"))
     if resume_identity is not None:
@@ -510,10 +683,20 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         identity_thread = resume_identity.get("thread_id")
         if identity_worker is not None and identity_worker != worker_invocation_id:
             raise InvocationError("resume identity worker_invocation_id mismatch")
-        if identity_thread is not None and (not isinstance(identity_thread, str) or not identity_thread.strip()):
-            raise InvocationError("resume identity thread_id must be a non-empty string")
-        normalized_identity_thread = identity_thread.strip() if isinstance(identity_thread, str) else None
-        if requested_thread and normalized_identity_thread and requested_thread != normalized_identity_thread:
+        if identity_thread is not None and (
+            not isinstance(identity_thread, str) or not identity_thread.strip()
+        ):
+            raise InvocationError(
+                "resume identity thread_id must be a non-empty string"
+            )
+        normalized_identity_thread = (
+            identity_thread.strip() if isinstance(identity_thread, str) else None
+        )
+        if (
+            requested_thread
+            and normalized_identity_thread
+            and requested_thread != normalized_identity_thread
+        ):
             raise InvocationError("conflicting requested resume thread IDs")
         requested_thread = requested_thread or normalized_identity_thread
     label_value = raw.get("label", worker_invocation_id)
@@ -529,7 +712,9 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
             raise InvocationError("finding_gate must contain only role and path")
         if finding_gate.get("role") not in {"reviewer", "test_writer", "test_executor"}:
             raise InvocationError("finding_gate role is invalid")
-        finding_path = _safe_path(finding_gate.get("path"), root=workspace, name="finding_gate.path")
+        finding_path = _safe_path(
+            finding_gate.get("path"), root=workspace, name="finding_gate.path"
+        )
         if finding_path.parent != workspace or finding_path.name != "FINDINGS.json":
             raise InvocationError("finding_gate.path must be workspace/FINDINGS.json")
         normalized_gate = {"role": finding_gate["role"], "path": str(finding_path)}
@@ -541,14 +726,47 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     if overlay_value is not None:
         if not isinstance(overlay_value, str) or not overlay_value.strip():
             raise InvocationError("overlay_receipt must be a non-empty path string")
-        overlay_receipt = _safe_path(overlay_value, root=workspace, name="overlay_receipt")
+        overlay_receipt = _safe_path(
+            overlay_value, root=workspace, name="overlay_receipt"
+        )
     return Invocation(
-        CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
-        prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
-        _string(raw, "phase"), lane_id, [], [], [], {}, resources, resource_lock_root,
-        model, reasoning, tier, command,
-        overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
-        outputs["stderr"], outputs["last_message"], event_log, normalized_gate, isolation,
+        CODING_INVOCATION_SCHEMA,
+        worker_invocation_id,
+        action,
+        run_root,
+        workspace,
+        prompt_path,
+        prompt_sha256,
+        prompt_bytes,
+        None,
+        None,
+        label_value.strip(),
+        doer_value.strip(),
+        _string(raw, "task"),
+        _string(raw, "phase"),
+        lane_id,
+        [],
+        [],
+        [],
+        {},
+        resources,
+        resource_lock_root,
+        model,
+        reasoning,
+        tier,
+        command,
+        overrides,
+        sandbox,
+        approval,
+        requested_thread,
+        repository,
+        outputs["status"],
+        outputs["jsonl"],
+        outputs["stderr"],
+        outputs["last_message"],
+        event_log,
+        normalized_gate,
+        isolation,
         overlay_receipt=overlay_receipt,
     )
 
@@ -561,27 +779,46 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         run_root = canonical.run_root.expanduser().resolve(strict=True)
         runtime_root = canonical.runtime_root.expanduser().resolve(strict=True)
         if not run_root.is_dir() or not runtime_root.is_dir():
-            raise InvocationValidationError("canonical run_root and runtime_root must be directories")
+            raise InvocationValidationError(
+                "canonical run_root and runtime_root must be directories"
+            )
         if _inside(runtime_root, run_root) or _inside(run_root, runtime_root):
-            raise InvocationValidationError("canonical runtime_root must be separate from run_root")
+            raise InvocationValidationError(
+                "canonical runtime_root must be separate from run_root"
+            )
         workspace = (run_root / ".agent-workspace").resolve(strict=False)
         if workspace.parent != run_root:
-            raise InvocationValidationError("canonical workspace must be a direct child of run_root")
+            raise InvocationValidationError(
+                "canonical workspace must be a direct child of run_root"
+            )
         if canonical.resume_admission_path is not None:
             review_path = canonical.resume_admission_path
             if not review_path.is_absolute():
                 review_path = workspace / review_path
             _safe_path(review_path, root=workspace, name="resume_admission_path")
+
         def rooted(value: Path, base: Path) -> str:
             return str(value if value.is_absolute() else base / value)
+
         output_paths = {
-            key: _safe_path(rooted(value, workspace), root=workspace, name=f"output_paths.{key}")
+            key: _safe_path(
+                rooted(value, workspace), root=workspace, name=f"output_paths.{key}"
+            )
             for key, value in canonical.output_paths.items()
         }
         _validate_canonical_output_paths(output_paths, workspace=workspace)
-        if output_paths["status"].parent != workspace or output_paths["status"].suffix != ".json":
-            raise InvocationValidationError("canonical status must be a direct *.json file under .agent-workspace")
-        event_log = _safe_path(rooted(canonical.event_log_path, runtime_root), root=runtime_root, name="event_log_path")
+        if (
+            output_paths["status"].parent != workspace
+            or output_paths["status"].suffix != ".json"
+        ):
+            raise InvocationValidationError(
+                "canonical status must be a direct *.json file under .agent-workspace"
+            )
+        event_log = _safe_path(
+            rooted(canonical.event_log_path, runtime_root),
+            root=runtime_root,
+            name="event_log_path",
+        )
         bundle = bundle_from_record(canonical.prompt_bundle, run_root=run_root)
         if not bundle.final_bytes:
             raise InvocationValidationError("canonical prompt bundle is empty")
@@ -589,7 +826,9 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         profile_record.setdefault("schema", "orchestrator-runtime-profile/v1")
         profile = RuntimeProfile.from_mapping(profile_record)
         if tuple(canonical.resources) != profile.resources:
-            raise InvocationValidationError("invocation resources must match profile resources")
+            raise InvocationValidationError(
+                "invocation resources must match profile resources"
+            )
         repository = None
         if canonical.repository is not None:
             try:
@@ -601,25 +840,53 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         provider_options = dict(canonical.provider_options)
         command = provider_options.get("command", [canonical.provider_id])
         command_list = _string_list(command, "provider.command")
-        overrides = _string_list(provider_options.get("config_overrides", []), "provider.config_overrides")
+        overrides = _string_list(
+            provider_options.get("config_overrides", []), "provider.config_overrides"
+        )
         reasoning = provider_options.get("reasoning_effort", "medium")
         tier = provider_options.get("service_tier", "priority")
         permission_mode = provider_options.get("permission_mode")
         sandbox = provider_options.get("sandbox", "workspace-write")
         approval = provider_options.get("approval_policy", "never")
-        if not isinstance(reasoning, str) or not reasoning.strip() or not isinstance(tier, str) or not tier.strip():
-            raise InvocationValidationError("provider reasoning_effort and service_tier must be non-empty strings")
-        if not isinstance(sandbox, str) or sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+        if (
+            not isinstance(reasoning, str)
+            or not reasoning.strip()
+            or not isinstance(tier, str)
+            or not tier.strip()
+        ):
+            raise InvocationValidationError(
+                "provider reasoning_effort and service_tier must be non-empty strings"
+            )
+        if not isinstance(sandbox, str) or sandbox not in {
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+        }:
             raise InvocationValidationError("provider sandbox is invalid")
-        if not isinstance(approval, str) or approval not in {"untrusted", "on-failure", "on-request", "never"}:
+        if not isinstance(approval, str) or approval not in {
+            "untrusted",
+            "on-failure",
+            "on-request",
+            "never",
+        }:
             raise InvocationValidationError("provider approval_policy is invalid")
-        allowed_tools = _string_list(provider_options.get("allowed_tools", []), "provider.allowed_tools")
-        disallowed_tools = _string_list(provider_options.get("disallowed_tools", []), "provider.disallowed_tools")
-        if permission_mode is not None and (not isinstance(permission_mode, str) or not permission_mode.strip()):
-            raise InvocationValidationError("provider.permission_mode must be a non-empty string")
+        allowed_tools = _string_list(
+            provider_options.get("allowed_tools", []), "provider.allowed_tools"
+        )
+        disallowed_tools = _string_list(
+            provider_options.get("disallowed_tools", []), "provider.disallowed_tools"
+        )
+        if permission_mode is not None and (
+            not isinstance(permission_mode, str) or not permission_mode.strip()
+        ):
+            raise InvocationValidationError(
+                "provider.permission_mode must be a non-empty string"
+            )
         component_path = bundle.components[0].path
         if component_path is None:
-            raise InvocationValidationError("canonical prompt components must be path-bound")
+            raise InvocationValidationError(
+                "canonical prompt components must be path-bound"
+            )
         overlay_receipt = None
         if canonical.overlay_receipt is not None:
             overlay_receipt = _safe_path(
@@ -692,21 +959,33 @@ def load_invocation(path: Path) -> Invocation:
         invocation = _load_firmware_invocation(raw)
     else:
         raise InvocationError(f"unsupported invocation schema: {schema}")
-    object.__setattr__(invocation, "invocation_path", path.expanduser().resolve(strict=False))
+    object.__setattr__(
+        invocation, "invocation_path", path.expanduser().resolve(strict=False)
+    )
     runtime_value = raw.get("runtime_root")
     if isinstance(runtime_value, str) and runtime_value:
-        object.__setattr__(invocation, "runtime_root", Path(runtime_value).expanduser().resolve(strict=False))
+        object.__setattr__(
+            invocation,
+            "runtime_root",
+            Path(runtime_value).expanduser().resolve(strict=False),
+        )
     else:
         object.__setattr__(invocation, "runtime_root", invocation.run_root.parent)
     return invocation
 
 
-def _identity(pid: int, *, parent: int | None = None, timeout: float = 5.0) -> ProcessInfo:
+def _identity(
+    pid: int, *, parent: int | None = None, timeout: float = 5.0
+) -> ProcessInfo:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         snapshot = process_snapshot()
         item = snapshot.by_pid.get(pid) if snapshot.complete else None
-        if item is not None and item.created_utc is not None and (parent is None or item.ppid == parent):
+        if (
+            item is not None
+            and item.created_utc is not None
+            and (parent is None or item.ppid == parent)
+        ):
             return item
         time.sleep(0.05)
     raise RuntimeError(f"cannot establish exact process identity for PID {pid}")
@@ -744,7 +1023,8 @@ def _is_launcher_descendant(
         and (
             (
                 bool(_command_tail(item.command_line))
-                and _command_tail(item.command_line) == _command_tail(parent.command_line)
+                and _command_tail(item.command_line)
+                == _command_tail(parent.command_line)
             )
             or (
                 provider_root_pid is not None
@@ -756,7 +1036,9 @@ def _is_launcher_descendant(
 
 
 def _shutdown_exact_child(
-    process: subprocess.Popen[bytes], *, timeout_seconds: float = 5.0,
+    process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float = 5.0,
     identity: ProcessInfo | None = None,
     boundary: ProcessBoundary | None = None,
 ) -> tuple[bool, dict[str, Any]]:
@@ -790,7 +1072,9 @@ def _read_prior_status(invocation: Invocation) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str, Any]] | None:
+def _read_canonical_prior_status(
+    invocation: Invocation,
+) -> tuple[Path, dict[str, Any]] | None:
     """Find the one persisted controller status owned by this canonical workspace."""
 
     workspace = invocation.workspace
@@ -800,7 +1084,9 @@ def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str
     try:
         paths = sorted(workspace.glob("*.json"), key=lambda path: path.name)
     except OSError as exc:
-        raise InvocationError(f"cannot inspect canonical workspace status: {exc}") from exc
+        raise InvocationError(
+            f"cannot inspect canonical workspace status: {exc}"
+        ) from exc
     for path in paths:
         if path.name.startswith("."):
             continue
@@ -808,7 +1094,9 @@ def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise InvocationError(f"canonical persisted status is invalid: {exc}") from exc
+                raise InvocationError(
+                    f"canonical persisted status is invalid: {exc}"
+                ) from exc
             if not isinstance(value, dict):
                 raise InvocationError("canonical persisted status must be an object")
         else:
@@ -821,11 +1109,15 @@ def _read_canonical_prior_status(invocation: Invocation) -> tuple[Path, dict[str
         if value.get("schema") == "orchestrator-lane-controller/v1":
             candidates.append((path, value))
     if len(candidates) > 1:
-        raise InvocationError("canonical workspace contains multiple persisted controller statuses")
+        raise InvocationError(
+            "canonical workspace contains multiple persisted controller statuses"
+        )
     return candidates[0] if candidates else None
 
 
-def _canonical_repository_identity(value: object, *, include_starting_commit: bool) -> object:
+def _canonical_repository_identity(
+    value: object, *, include_starting_commit: bool
+) -> object:
     if not isinstance(value, Mapping):
         return value
     normalized: dict[str, Any] = {}
@@ -894,7 +1186,9 @@ def _canonical_prior_identity_check(
         if invocation.action == "start" and field == "session_id":
             continue
         if field not in persisted_identity or field not in expected_identity:
-            raise InvocationError(f"canonical persisted status identity is missing {field}")
+            raise InvocationError(
+                f"canonical persisted status identity is missing {field}"
+            )
         persisted_value = persisted_identity[field]
         expected_value = expected_identity[field]
         if field == "repository":
@@ -906,13 +1200,18 @@ def _canonical_prior_identity_check(
                 expected_value, include_starting_commit=include_starting_commit
             )
         if persisted_value != expected_value and field not in allowed_identity_fields:
-            raise InvocationError("canonical prior task identity does not match persisted status")
+            raise InvocationError(
+                "canonical prior task identity does not match persisted status"
+            )
 
     expected_status_identity = {
         "invocation_schema": canonical.schema,
         "worker_invocation_id": canonical.worker_invocation_id,
         "cohort_id": canonical.cohort_id,
-        "workflow": {"id": canonical.workflow_id, "version": canonical.workflow_version},
+        "workflow": {
+            "id": canonical.workflow_id,
+            "version": canonical.workflow_version,
+        },
         "task_card": {
             "id": canonical.task_card_id,
             "revision": canonical.task_card_revision,
@@ -925,39 +1224,59 @@ def _canonical_prior_identity_check(
         "prompt_bundle_sha256": canonical.prompt_bundle_sha256,
         "prompt_content_sha256": canonical.prompt_content_sha256,
         "resources": list(canonical.resources),
-        "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
+        "profile": invocation.runtime_profile.to_record()
+        if invocation.runtime_profile is not None
+        else None,
     }
     for field, expected in expected_status_identity.items():
         if field not in prior_status:
-            raise InvocationError("canonical prior task identity does not match persisted status")
+            raise InvocationError(
+                "canonical prior task identity does not match persisted status"
+            )
         if field == "task_card" and "task_card_sha256" in allowed_identity_fields:
             persisted_card = prior_status.get(field)
-            if not isinstance(persisted_card, Mapping) or not isinstance(expected, Mapping):
-                raise InvocationError("canonical prior task identity does not match persisted status")
+            if not isinstance(persisted_card, Mapping) or not isinstance(
+                expected, Mapping
+            ):
+                raise InvocationError(
+                    "canonical prior task identity does not match persisted status"
+                )
             if any(
                 persisted_card.get(key) != expected.get(key)
                 for key in ("id", "revision")
             ):
-                raise InvocationError("canonical prior task identity does not match persisted status")
+                raise InvocationError(
+                    "canonical prior task identity does not match persisted status"
+                )
             continue
-        if field in {"prompt_bundle_sha256", "prompt_content_sha256"} and field in allowed_identity_fields:
+        if (
+            field in {"prompt_bundle_sha256", "prompt_content_sha256"}
+            and field in allowed_identity_fields
+        ):
             continue
         if prior_status[field] != expected:
-            raise InvocationError("canonical prior task identity does not match persisted status")
+            raise InvocationError(
+                "canonical prior task identity does not match persisted status"
+            )
     if git_identity is not None:
         include_starting_commit = invocation.action == "resume"
         persisted_repository = _canonical_repository_identity(
-            prior_status.get("repository"), include_starting_commit=include_starting_commit
+            prior_status.get("repository"),
+            include_starting_commit=include_starting_commit,
         )
         expected_repository = _canonical_repository_identity(
-            expected_identity["repository"], include_starting_commit=include_starting_commit
+            expected_identity["repository"],
+            include_starting_commit=include_starting_commit,
         )
         if persisted_repository != expected_repository:
-            raise InvocationError("canonical prior task repository identity does not match persisted status")
+            raise InvocationError(
+                "canonical prior task repository identity does not match persisted status"
+            )
 
 
 def _canonical_acceptance_status(
-    status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+    status: Mapping[str, Any],
+    acceptance_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     updated_status = dict(status)
     updated_status["terminal_acceptance_state"] = "ACCEPTED"
@@ -965,7 +1284,9 @@ def _canonical_acceptance_status(
     updated_status["acceptance_identity"] = dict(acceptance_identity)
     persisted_resume_identity = updated_status.get("resume_identity")
     if not isinstance(persisted_resume_identity, Mapping):
-        raise InvocationError("canonical accepted task requires persisted resume_identity")
+        raise InvocationError(
+            "canonical accepted task requires persisted resume_identity"
+        )
     accepted_resume_identity = dict(persisted_resume_identity)
     accepted_resume_identity["terminal_acceptance_state"] = "ACCEPTED"
     accepted_resume_identity["task_advancement_state"] = "ACCEPTED"
@@ -975,7 +1296,9 @@ def _canonical_acceptance_status(
 
 
 def _persist_canonical_acceptance(
-    path: Path, status: Mapping[str, Any], acceptance_identity: Mapping[str, Any],
+    path: Path,
+    status: Mapping[str, Any],
+    acceptance_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     updated_status = _canonical_acceptance_status(status, acceptance_identity)
     _atomic_json(path, updated_status)
@@ -1014,10 +1337,14 @@ def _canonical_prior_task_preflight(
             git_identity=git_identity,
             allowed_identity_fields=allowed_identity_fields,
         )
-    result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+    result_validation, result_valid, task_result = _canonical_result_validation(
+        invocation
+    )
     if not result_valid:
         detail = result_validation.get("detail", "canonical task result is invalid")
-        raise InvocationError(f"canonical {invocation.action} requires a valid task result: {detail}")
+        raise InvocationError(
+            f"canonical {invocation.action} requires a valid task result: {detail}"
+        )
 
     advancement = None
     if task_result is not None:
@@ -1031,10 +1358,9 @@ def _canonical_prior_task_preflight(
             raise InvocationError(
                 f"canonical {invocation.action} task advancement rejected: {exc}"
             ) from exc
-    elif (
-        (invocation.workspace / COMPLETION_REVIEW_FILENAME).exists()
-        or (invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME).exists()
-    ):
+    elif (invocation.workspace / COMPLETION_REVIEW_FILENAME).exists() or (
+        invocation.workspace / ORCHESTRATOR_ACCEPTANCE_FILENAME
+    ).exists():
         raise InvocationError(
             "canonical task advancement artifacts exist without a valid RESULT.json"
         )
@@ -1091,7 +1417,9 @@ def _event(invocation: Invocation, event: str, **fields: Any) -> dict[str, Any]:
     return value
 
 
-def _persisted_repository(invocation: Invocation, prior_status: Mapping[str, Any]) -> str:
+def _persisted_repository(
+    invocation: Invocation, prior_status: Mapping[str, Any]
+) -> str:
     assert invocation.repository is not None
     nested = prior_status.get("repository")
     if not isinstance(nested, Mapping):
@@ -1105,12 +1433,20 @@ def _persisted_repository(invocation: Invocation, prior_status: Mapping[str, Any
         persisted = nested.get(key)
         if key.endswith("dir") or key.endswith("root"):
             try:
-                if not isinstance(persisted, str) or Path(persisted).resolve(strict=False) != Path(value).resolve(strict=False):
-                    raise InvocationError(f"resume repository {key} does not match persisted status")
+                if not isinstance(persisted, str) or Path(persisted).resolve(
+                    strict=False
+                ) != Path(value).resolve(strict=False):
+                    raise InvocationError(
+                        f"resume repository {key} does not match persisted status"
+                    )
             except OSError as exc:
-                raise InvocationError(f"cannot compare persisted repository {key}: {exc}") from exc
+                raise InvocationError(
+                    f"cannot compare persisted repository {key}: {exc}"
+                ) from exc
         elif persisted != value:
-            raise InvocationError(f"resume repository {key} does not match persisted status")
+            raise InvocationError(
+                f"resume repository {key} does not match persisted status"
+            )
     if nested.get("base_commit") != invocation.repository.base_commit:
         raise InvocationError("resume base_commit does not match persisted status")
     starting_commit = nested.get("starting_commit")
@@ -1120,7 +1456,10 @@ def _persisted_repository(invocation: Invocation, prior_status: Mapping[str, Any
 
 
 def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool]:
-    assert invocation.repository is not None and invocation.worker_invocation_id is not None
+    assert (
+        invocation.repository is not None
+        and invocation.worker_invocation_id is not None
+    )
     path = invocation.workspace / "RESULT.json"
     if not path.exists():
         return {"state": "MISSING", "path": str(path)}, True
@@ -1143,8 +1482,12 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
         if invocation.finding_gate is not None:
             findings_path = Path(invocation.finding_gate["path"])
             findings = validate_findings(
-                findings_path, lane_id=invocation.lane_id, worker_invocation_id=invocation.worker_invocation_id,
-                role=invocation.finding_gate["role"], commit=identity.head_commit, outcome=value["outcome"],
+                findings_path,
+                lane_id=invocation.lane_id,
+                worker_invocation_id=invocation.worker_invocation_id,
+                role=invocation.finding_gate["role"],
+                commit=identity.head_commit,
+                outcome=value["outcome"],
             )
         return {
             "state": "VALID",
@@ -1157,18 +1500,26 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
         return invalid_result_evidence(path, str(exc), sha256=sha256), False
 
 
-def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any], bool, TaskResult | None]:
+def _canonical_result_validation(
+    invocation: Invocation,
+) -> tuple[dict[str, Any], bool, TaskResult | None]:
     """Validate canonical result shape while leaving semantic acceptance pending."""
 
     assert invocation.canonical is not None
     path = invocation.workspace / "RESULT.json"
     if not path.exists():
-        return {"state": "MISSING", "path": str(path), "acceptance_state": "PENDING"}, True, None
+        return (
+            {"state": "MISSING", "path": str(path), "acceptance_state": "PENDING"},
+            True,
+            None,
+        )
     raw_bytes: bytes | None = None
     try:
         raw_bytes = path.read_bytes()
         if len(raw_bytes) > 1024 * 1024:
-            raise TaskValidationError("canonical task result exceeds the 1 MiB controller limit")
+            raise TaskValidationError(
+                "canonical task result exceeds the 1 MiB controller limit"
+            )
         value = json.loads(raw_bytes.decode("utf-8-sig"))
         if not isinstance(value, Mapping):
             raise TaskValidationError("canonical task result root must be an object")
@@ -1189,25 +1540,57 @@ def _canonical_result_validation(invocation: Invocation) -> tuple[dict[str, Any]
             )
         else:
             result = validate_task_result(value, card=card, raw_bytes=raw_bytes)
-        if value.get("prompt_bundle_sha256") != invocation.canonical.prompt_bundle_sha256:
-            raise TaskValidationError("canonical task result prompt bundle identity does not match")
-        if value.get("prompt_content_sha256") != invocation.canonical.prompt_content_sha256:
-            raise TaskValidationError("canonical task result prompt content identity does not match")
-        return {
-            "state": "SHAPE_VALID",
-            "path": str(path),
-            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-            "result_sha256": result.content_sha256,
-            "prompt_bundle_sha256": invocation.canonical.prompt_bundle_sha256,
-            "prompt_content_sha256": invocation.canonical.prompt_content_sha256,
-            "commit": result.commit,
-            "acceptance_state": "PENDING",
-        }, True, result
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TaskValidationError, GitSafetyError) as exc:
-        return invalid_result_evidence(path, str(exc), sha256=hashlib.sha256(raw_bytes).hexdigest() if raw_bytes is not None else None), False, None
+        if (
+            value.get("prompt_bundle_sha256")
+            != invocation.canonical.prompt_bundle_sha256
+        ):
+            raise TaskValidationError(
+                "canonical task result prompt bundle identity does not match"
+            )
+        if (
+            value.get("prompt_content_sha256")
+            != invocation.canonical.prompt_content_sha256
+        ):
+            raise TaskValidationError(
+                "canonical task result prompt content identity does not match"
+            )
+        return (
+            {
+                "state": "SHAPE_VALID",
+                "path": str(path),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "result_sha256": result.content_sha256,
+                "prompt_bundle_sha256": invocation.canonical.prompt_bundle_sha256,
+                "prompt_content_sha256": invocation.canonical.prompt_content_sha256,
+                "commit": result.commit,
+                "acceptance_state": "PENDING",
+            },
+            True,
+            result,
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TaskValidationError,
+        GitSafetyError,
+    ) as exc:
+        return (
+            invalid_result_evidence(
+                path,
+                str(exc),
+                sha256=hashlib.sha256(raw_bytes).hexdigest()
+                if raw_bytes is not None
+                else None,
+            ),
+            False,
+            None,
+        )
 
 
-def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> ProviderLaunchSpec:
+def _provider_launch_spec(
+    invocation: Invocation, session_id: str | None
+) -> ProviderLaunchSpec:
     options = dict(invocation.provider_options)
     try:
         return ProviderLaunchSpec(
@@ -1223,9 +1606,19 @@ def _provider_launch_spec(invocation: Invocation, session_id: str | None) -> Pro
             sandbox=invocation.sandbox,
             approval_policy=invocation.approval_policy,
             worker_invocation_id=invocation.worker_invocation_id,
-            permission_mode=options.get("permission_mode") if isinstance(options.get("permission_mode"), str) else None,
-            allowed_tools=tuple(item for item in options.get("allowed_tools", []) if isinstance(item, str)),
-            disallowed_tools=tuple(item for item in options.get("disallowed_tools", []) if isinstance(item, str)),
+            permission_mode=options.get("permission_mode")
+            if isinstance(options.get("permission_mode"), str)
+            else None,
+            allowed_tools=tuple(
+                item
+                for item in options.get("allowed_tools", [])
+                if isinstance(item, str)
+            ),
+            disallowed_tools=tuple(
+                item
+                for item in options.get("disallowed_tools", [])
+                if isinstance(item, str)
+            ),
             mcp_config=(
                 options.get("mcp_config")
                 if isinstance(options.get("mcp_config"), (str, Mapping, list))
@@ -1247,7 +1640,14 @@ def _requested_provider_operations(
     model/reasoning/tier/configuration), even when optional override lists
     are empty.  Classification therefore precedes any adapter work.
     """
-    operations = ["launch", "prompt", "event_result", "session", "permission", "configuration"]
+    operations = [
+        "launch",
+        "prompt",
+        "event_result",
+        "session",
+        "permission",
+        "configuration",
+    ]
     if invocation.action == "resume":
         operations.append("resume")
     if spec.provider_options.get("notification") is True:
@@ -1264,7 +1664,9 @@ def _classify_provider_operations(
         if operation not in PROVIDER_OPERATION_NAMES:
             results.append(
                 unsupported_operation_result(
-                    provider_id, operation, "operation is not part of the provider contract"
+                    provider_id,
+                    operation,
+                    "operation is not part of the provider contract",
                 ).as_record()
             )
             continue
@@ -1274,7 +1676,11 @@ def _classify_provider_operations(
 
 def _provider_handoff_identity(invocation: Invocation) -> tuple[str, str]:
     """The preserved workflow role and logical task identity for a handoff."""
-    role = invocation.doer or (invocation.canonical.role if invocation.canonical is not None else None) or "coder-main"
+    role = (
+        invocation.doer
+        or (invocation.canonical.role if invocation.canonical is not None else None)
+        or "coder-main"
+    )
     logical_task_id = (
         invocation.canonical.task_card_id
         if invocation.canonical is not None and invocation.canonical.task_card_id
@@ -1296,7 +1702,9 @@ def _canonical_resume_admission_path(invocation: Invocation) -> Path:
     return path
 
 
-def _read_canonical_resume_amendment(invocation: Invocation) -> Mapping[str, Any] | None:
+def _read_canonical_resume_amendment(
+    invocation: Invocation,
+) -> Mapping[str, Any] | None:
     """Read the optional confined review; missing means an unreviewed pair."""
     path = _canonical_resume_admission_path(invocation)
     if not path.exists():
@@ -1322,8 +1730,12 @@ def _canonical_amendment_job_identity(
 ) -> dict[str, Any]:
     requested_repository = requested_identity.get("repository")
     persisted_repository = persisted_identity.get("repository")
-    repository = requested_repository if isinstance(requested_repository, Mapping) else {}
-    prior_repository = persisted_repository if isinstance(persisted_repository, Mapping) else {}
+    repository = (
+        requested_repository if isinstance(requested_repository, Mapping) else {}
+    )
+    prior_repository = (
+        persisted_repository if isinstance(persisted_repository, Mapping) else {}
+    )
     assert invocation.canonical is not None
     expected = {
         "card_id": requested_identity.get("task_card_id"),
@@ -1360,7 +1772,9 @@ def _canonical_resume_claims_accepted(
         for field in ("terminal_acceptance_state", "task_advancement_state")
     ):
         return True
-    result_evidence, result_valid, task_result = _canonical_result_validation(invocation)
+    result_evidence, result_valid, task_result = _canonical_result_validation(
+        invocation
+    )
     del result_evidence
     if not result_valid or task_result is None:
         return False
@@ -1388,7 +1802,11 @@ def run(invocation: Invocation) -> int:
     else:
         prior_status = _read_prior_status(invocation)
     prior_thread_value = prior_status.get("thread_id") if prior_status else None
-    prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
+    prior_thread = (
+        prior_thread_value
+        if isinstance(prior_thread_value, str) and prior_thread_value
+        else None
+    )
     starting_commit = None
     git_identity = None
     if invocation.repository is not None:
@@ -1436,17 +1854,34 @@ def run(invocation: Invocation) -> int:
     if invocation.action == "resume":
         if invocation.canonical is not None:
             if prior_status is None:
-                raise InvocationError("canonical resume requires persisted controller status")
+                raise InvocationError(
+                    "canonical resume requires persisted controller status"
+                )
             canonical_resume_mismatch: str | None = None
-            if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
-                canonical_resume_mismatch = "resume worker_invocation_id does not match persisted status"
+            if (
+                prior_status.get("worker_invocation_id")
+                != invocation.worker_invocation_id
+            ):
+                canonical_resume_mismatch = (
+                    "resume worker_invocation_id does not match persisted status"
+                )
             elif prior_status.get("invocation_schema") != invocation.invocation_schema:
-                canonical_resume_mismatch = "resume invocation schema does not match persisted status"
+                canonical_resume_mismatch = (
+                    "resume invocation schema does not match persisted status"
+                )
             if prior_thread is None:
-                prior_thread_value = prior_status.get("provider_session_id", prior_status.get("session_id"))
-                prior_thread = prior_thread_value if isinstance(prior_thread_value, str) and prior_thread_value else None
+                prior_thread_value = prior_status.get(
+                    "provider_session_id", prior_status.get("session_id")
+                )
+                prior_thread = (
+                    prior_thread_value
+                    if isinstance(prior_thread_value, str) and prior_thread_value
+                    else None
+                )
             if prior_thread is None:
-                raise InvocationError("canonical resume requires a persisted provider session ID")
+                raise InvocationError(
+                    "canonical resume requires a persisted provider session ID"
+                )
             requested_session_id = (
                 invocation.canonical.requested_session_id
                 if invocation.canonical is not None
@@ -1456,9 +1891,7 @@ def run(invocation: Invocation) -> int:
                 requested_session_id is not None
                 and requested_session_id != prior_thread
             ):
-                canonical_resume_mismatch = (
-                    "resume requested session does not match the persisted provider session"
-                )
+                canonical_resume_mismatch = "resume requested session does not match the persisted provider session"
             if canonical_resume_mismatch is None and (
                 invocation.requested_thread_id is not None
                 and invocation.requested_thread_id != prior_thread
@@ -1482,24 +1915,36 @@ def run(invocation: Invocation) -> int:
                     "HANDOFF", canonical_resume_mismatch, provider_resume_handoff
                 )
             else:
-                starting_commit = _persisted_repository(invocation, prior_status) if invocation.repository is not None else None
+                starting_commit = (
+                    _persisted_repository(invocation, prior_status)
+                    if invocation.repository is not None
+                    else None
+                )
                 thread = invocation.requested_thread_id or prior_thread
                 if not thread:
-                    raise InvocationError("resume requires the persisted provider session ID")
+                    raise InvocationError(
+                        "resume requires the persisted provider session ID"
+                    )
                 requested_identity = invocation.canonical.identity(
-                session_id=thread,
-                starting_commit=starting_commit,
-            )
+                    session_id=thread,
+                    starting_commit=starting_commit,
+                )
                 requested_identity["live_identity"] = {
                     "provider_id": invocation.provider_id,
                     "session_id": thread,
                 }
                 persisted_identity = prior_status.get("resume_identity")
                 if not isinstance(persisted_identity, Mapping):
-                    raise InvocationError("canonical resume requires persisted resume_identity")
-                raw_identity_fields = frozenset({
-                    "task_card_sha256", "prompt_bundle_sha256", "prompt_content_sha256",
-                })
+                    raise InvocationError(
+                        "canonical resume requires persisted resume_identity"
+                    )
+                raw_identity_fields = frozenset(
+                    {
+                        "task_card_sha256",
+                        "prompt_bundle_sha256",
+                        "prompt_content_sha256",
+                    }
+                )
                 raw_identity_changed = any(
                     requested_identity.get(field) != persisted_identity.get(field)
                     for field in raw_identity_fields
@@ -1548,19 +1993,32 @@ def run(invocation: Invocation) -> int:
                     thread=thread,
                     starting_commit=starting_commit,
                     git_identity=git_identity,
-                    allowed_identity_fields=(raw_identity_fields if raw_identity_changed else frozenset()),
+                    allowed_identity_fields=(
+                        raw_identity_fields if raw_identity_changed else frozenset()
+                    ),
                 )
                 resume_admission_record = admission.to_record()
         elif invocation.worker_invocation_id is not None:
             if prior_status is None:
-                raise InvocationError("coding resume requires persisted controller status")
+                raise InvocationError(
+                    "coding resume requires persisted controller status"
+                )
             coding_resume_mismatch: str | None = None
-            if prior_status.get("worker_invocation_id") != invocation.worker_invocation_id:
-                coding_resume_mismatch = "resume worker_invocation_id does not match persisted status"
+            if (
+                prior_status.get("worker_invocation_id")
+                != invocation.worker_invocation_id
+            ):
+                coding_resume_mismatch = (
+                    "resume worker_invocation_id does not match persisted status"
+                )
             elif prior_status.get("invocation_schema") != invocation.invocation_schema:
-                coding_resume_mismatch = "resume invocation schema does not match persisted status"
+                coding_resume_mismatch = (
+                    "resume invocation schema does not match persisted status"
+                )
             elif prior_thread is None:
-                raise InvocationError("coding resume requires a persisted lane thread ID")
+                raise InvocationError(
+                    "coding resume requires a persisted lane thread ID"
+                )
             else:
                 try:
                     starting_commit = _persisted_repository(invocation, prior_status)
@@ -1573,7 +2031,9 @@ def run(invocation: Invocation) -> int:
                     and invocation.requested_thread_id
                     and prior_thread != invocation.requested_thread_id
                 ):
-                    coding_resume_mismatch = "resume requires the persisted lane thread ID"
+                    coding_resume_mismatch = (
+                        "resume requires the persisted lane thread ID"
+                    )
             if coding_resume_mismatch is not None:
                 thread = invocation.requested_thread_id or prior_thread
                 provider_resume_handoff = _resume_handoff(
@@ -1635,13 +2095,20 @@ def run(invocation: Invocation) -> int:
         except GitSafetyError as exc:
             raise InvocationError(str(exc)) from exc
         if conflicts:
-            raise InvocationError("duplicate ACTIVE coding declaration: " + "; ".join(conflicts))
+            raise InvocationError(
+                "duplicate ACTIVE coding declaration: " + "; ".join(conflicts)
+            )
         try:
             launch_identity = inspect_repository(invocation.repository)
         except GitSafetyError as exc:
             raise InvocationError(str(exc)) from exc
-        if git_identity is None or launch_identity.head_commit != git_identity.head_commit:
-            raise InvocationError("coding worktree HEAD changed during pre-launch validation")
+        if (
+            git_identity is None
+            or launch_identity.head_commit != git_identity.head_commit
+        ):
+            raise InvocationError(
+                "coding worktree HEAD changed during pre-launch validation"
+            )
     controller = _identity(os.getpid())
     if provider_resume_handoff is not None:
         # A declared handoff never fabricates provider work: no adapter
@@ -1662,7 +2129,9 @@ def run(invocation: Invocation) -> int:
             invocation.provider_id, requested_operations
         )
         unsupported_operations = [
-            result for result in provider_operation_results if not result.get("supported")
+            result
+            for result in provider_operation_results
+            if not result.get("supported")
         ]
         if unsupported_operations:
             # An unsupported requested operation returns a closed actionable
@@ -1681,7 +2150,9 @@ def run(invocation: Invocation) -> int:
                 spec=launch_spec,
                 argv=argv,
                 worker_invocation_id=(
-                    invocation.worker_invocation_id or invocation.label or "unidentified-worker"
+                    invocation.worker_invocation_id
+                    or invocation.label
+                    or "unidentified-worker"
                 ),
                 session_id=thread,
             )
@@ -1690,26 +2161,36 @@ def run(invocation: Invocation) -> int:
             invocation.workspace.mkdir(exist_ok=True)
             invocation.event_log.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            raise InvocationError(f"cannot create canonical launch parents: {exc}") from exc
+            raise InvocationError(
+                f"cannot create canonical launch parents: {exc}"
+            ) from exc
     legacy_status_names = invocation.canonical is None
     running_state = "RUNNING_CODEX" if legacy_status_names else "RUNNING_PROVIDER"
     exited_state = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
     started_event = "CODEX_STARTED" if legacy_status_names else "PROVIDER_STARTED"
     exited_event = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
     state: dict[str, Any] = {
-        "schema": "orchestrator-lane-controller/v1", "state": "LAUNCH_FAILED", "started_utc": _utc(),
+        "schema": "orchestrator-lane-controller/v1",
+        "state": "LAUNCH_FAILED",
+        "started_utc": _utc(),
         "invocation_schema": invocation.invocation_schema,
         "worker_invocation_id": invocation.worker_invocation_id,
-        "controller_pid": controller.pid, "controller_started_utc": iso_utc(controller.created_utc),
+        "controller_pid": controller.pid,
+        "controller_started_utc": iso_utc(controller.created_utc),
         "controller_created_utc": iso_utc(controller.created_utc),
         "provider_id": invocation.provider_id,
         "provider_pid": None,
         "provider_started_utc": None,
         "provider_created_utc": None,
         "provider_session_id": thread,
-        "cohort_id": invocation.canonical.cohort_id if invocation.canonical is not None else None,
+        "cohort_id": invocation.canonical.cohort_id
+        if invocation.canonical is not None
+        else None,
         "workflow": (
-            {"id": invocation.canonical.workflow_id, "version": invocation.canonical.workflow_version}
+            {
+                "id": invocation.canonical.workflow_id,
+                "version": invocation.canonical.workflow_version,
+            }
             if invocation.canonical is not None
             else None
         ),
@@ -1722,46 +2203,94 @@ def run(invocation: Invocation) -> int:
             if invocation.canonical is not None
             else None
         ),
-        "completion_review_owner": "ROOT-IM" if invocation.canonical is not None else None,
-        "codex_pid": None, "codex_started_utc": None,
-        "doer": invocation.doer, "task": invocation.task, "phase": invocation.phase,
-        "declared_lane_id": invocation.lane_id, "lane_id": invocation.lane_id, "thread_id": thread, "session_id": thread, "leases": invocation.leases,
-        "board_tokens": invocation.board_tokens, "mcp_servers": invocation.mcp_servers,
-        "server_snapshot": invocation.server_snapshot, "resources": invocation.resources,
+        "completion_review_owner": "ROOT-IM"
+        if invocation.canonical is not None
+        else None,
+        "codex_pid": None,
+        "codex_started_utc": None,
+        "doer": invocation.doer,
+        "task": invocation.task,
+        "phase": invocation.phase,
+        "declared_lane_id": invocation.lane_id,
+        "lane_id": invocation.lane_id,
+        "thread_id": thread,
+        "session_id": thread,
+        "leases": invocation.leases,
+        "board_tokens": invocation.board_tokens,
+        "mcp_servers": invocation.mcp_servers,
+        "server_snapshot": invocation.server_snapshot,
+        "resources": invocation.resources,
         "exclusive_resources": invocation.resources,
-        "resource_lock_root": str(invocation.resource_lock_root) if invocation.resource_lock_root else None,
-        "held_resource_claims": [], "waiting_resource_claim": None,
+        "resource_lock_root": str(invocation.resource_lock_root)
+        if invocation.resource_lock_root
+        else None,
+        "held_resource_claims": [],
+        "waiting_resource_claim": None,
         "resource_claim_findings": [],
         "jsonl_path": str(invocation.jsonl_path),
-        "stderr_path": str(invocation.stderr_path), "last_message_path": str(invocation.last_message_path),
-        "prompt_path": str(invocation.prompt_path), "prompt_sha256": invocation.prompt_sha256,
+        "stderr_path": str(invocation.stderr_path),
+        "last_message_path": str(invocation.last_message_path),
+        "prompt_path": str(invocation.prompt_path),
+        "prompt_sha256": invocation.prompt_sha256,
         "prompt_content_sha256": invocation.prompt_sha256,
-        "prompt_bundle": invocation.prompt_bundle.to_record() if invocation.prompt_bundle is not None else None,
-        "prompt_bundle_sha256": invocation.prompt_bundle.bundle_sha256 if invocation.prompt_bundle is not None else None,
-        "policy_path": str(invocation.policy_path) if invocation.policy_path is not None else None,
+        "prompt_bundle": invocation.prompt_bundle.to_record()
+        if invocation.prompt_bundle is not None
+        else None,
+        "prompt_bundle_sha256": invocation.prompt_bundle.bundle_sha256
+        if invocation.prompt_bundle is not None
+        else None,
+        "policy_path": str(invocation.policy_path)
+        if invocation.policy_path is not None
+        else None,
         "policy_sha256": invocation.policy_sha256,
-        "resume_identity": invocation.canonical.identity(session_id=thread, starting_commit=starting_commit) if invocation.canonical is not None else None,
+        "resume_identity": invocation.canonical.identity(
+            session_id=thread, starting_commit=starting_commit
+        )
+        if invocation.canonical is not None
+        else None,
         "resume_admission": resume_admission_record,
         "provider_evidence": (
             provider_evidence.as_record() if provider_evidence is not None else None
         ),
         "provider_operation_results": provider_operation_results,
         "provider_handoff": (
-            provider_resume_handoff.as_record() if provider_resume_handoff is not None else None
+            provider_resume_handoff.as_record()
+            if provider_resume_handoff is not None
+            else None
         ),
         "provider_resume_decision": (
-            provider_resume_decision.as_record() if provider_resume_decision is not None else None
+            provider_resume_decision.as_record()
+            if provider_resume_decision is not None
+            else None
         ),
-        "terminal_acceptance_state": "PENDING" if invocation.canonical is not None else None,
-        "profile": invocation.runtime_profile.to_record() if invocation.runtime_profile is not None else None,
-        "launcher_settings": {"model": invocation.model, "model_reasoning_effort": invocation.reasoning_effort,
-            "service_tier": invocation.service_tier, "sandbox": invocation.sandbox,
+        "terminal_acceptance_state": "PENDING"
+        if invocation.canonical is not None
+        else None,
+        "profile": invocation.runtime_profile.to_record()
+        if invocation.runtime_profile is not None
+        else None,
+        "launcher_settings": {
+            "model": invocation.model,
+            "model_reasoning_effort": invocation.reasoning_effort,
+            "service_tier": invocation.service_tier,
+            "sandbox": invocation.sandbox,
             "approval_policy": invocation.approval_policy,
-            "approvals_reviewer": "user" if invocation.worker_invocation_id is None else None,
+            "approvals_reviewer": "user"
+            if invocation.worker_invocation_id is None
+            else None,
             "configuration_digest": (
-                provider_evidence.configuration_digest if provider_evidence is not None else None
+                provider_evidence.configuration_digest
+                if provider_evidence is not None
+                else None
             ),
-            "jsonl": True, "ephemeral": False, "action": invocation.action, "provider_id": invocation.provider_id, "argv": list(provider_evidence.command_provenance) if provider_evidence is not None else []},
+            "jsonl": True,
+            "ephemeral": False,
+            "action": invocation.action,
+            "provider_id": invocation.provider_id,
+            "argv": list(provider_evidence.command_provenance)
+            if provider_evidence is not None
+            else [],
+        },
     }
     registry_generation = uuid.uuid4().hex
     state["lifecycle_registry_generation"] = registry_generation
@@ -1774,22 +2303,28 @@ def run(invocation: Invocation) -> int:
     boundary: ProcessBoundary | None = None
     if git_identity is not None:
         repository = repository_status(git_identity, starting_commit=starting_commit)
-        expected_head = str(repository.get("actual_head") or git_identity.head_commit).lower()
+        expected_head = str(
+            repository.get("actual_head") or git_identity.head_commit
+        ).lower()
         branch_name = str(repository.get("branch") or git_identity.branch)
         retained_ref = f"refs/heads/{branch_name}"
-        state.update({
-            "repository": repository,
-            "repository_common_dir": repository["common_dir"],
-            "worktree_root": repository["worktree_root"],
-            "branch": repository["branch"],
-            "base_commit": repository["base_commit"],
-            "starting_commit": repository["starting_commit"],
-            "lifecycle_retained_ref": retained_ref,
-            "lifecycle_target_revision": expected_head,
-        })
+        state.update(
+            {
+                "repository": repository,
+                "repository_common_dir": repository["common_dir"],
+                "worktree_root": repository["worktree_root"],
+                "branch": repository["branch"],
+                "base_commit": repository["base_commit"],
+                "starting_commit": repository["starting_commit"],
+                "lifecycle_retained_ref": retained_ref,
+                "lifecycle_target_revision": expected_head,
+            }
+        )
         state["repository"]["expected_head"] = expected_head
         state["repository"]["starting_head"] = str(
-            repository.get("starting_head") or repository.get("starting_commit") or expected_head
+            repository.get("starting_head")
+            or repository.get("starting_commit")
+            or expected_head
         ).lower()
         state["lifecycle_registry_path"] = "canonical-common-git-coordinate"
         if invocation.canonical is not None:
@@ -1809,7 +2344,9 @@ def run(invocation: Invocation) -> int:
         if invocation.repository is None:
             return
         if invocation.invocation_path is None:
-            raise InvocationError("controller lifecycle registry requires its source invocation path")
+            raise InvocationError(
+                "controller lifecycle registry requires its source invocation path"
+            )
         worker_identity = None
         provider_pid = state.get("provider_pid")
         provider_created = state.get("provider_created_utc")
@@ -1866,36 +2403,46 @@ def run(invocation: Invocation) -> int:
         # logical task, workflow role, and state in a declared same-role
         # structured handoff with fabricated_continuity=false.  No provider is
         # launched and no successor is scheduled by this controller.
-        state.update({
-            "state": "PROVIDER_HANDOFF",
-            "ended_utc": _utc(),
-            "error": provider_resume_handoff.reason,
-        })
+        state.update(
+            {
+                "state": "PROVIDER_HANDOFF",
+                "ended_utc": _utc(),
+                "error": provider_resume_handoff.reason,
+            }
+        )
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(
-            invocation,
-            "PROVIDER_HANDOFF",
-            provider_id=invocation.provider_id,
-            reason=provider_resume_handoff.reason,
-            thread_id=state.get("thread_id"),
-            session_id=state.get("provider_session_id"),
-        ))
+        _append_event(
+            invocation.event_log,
+            _event(
+                invocation,
+                "PROVIDER_HANDOFF",
+                provider_id=invocation.provider_id,
+                reason=provider_resume_handoff.reason,
+                thread_id=state.get("thread_id"),
+                session_id=state.get("provider_session_id"),
+            ),
+        )
         return 1
     if unsupported_operations:
         # REQ-O33: an unsupported requested operation returns an actionable
         # classified result before any provider work is fabricated.
-        state.update({
-            "state": "PROVIDER_OPERATION_UNSUPPORTED",
-            "ended_utc": _utc(),
-            "error": "selected provider adapter does not support a requested operation",
-        })
+        state.update(
+            {
+                "state": "PROVIDER_OPERATION_UNSUPPORTED",
+                "ended_utc": _utc(),
+                "error": "selected provider adapter does not support a requested operation",
+            }
+        )
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(
-            invocation,
-            "LAUNCH_FAILED",
-            provider_id=invocation.provider_id,
-            error="unsupported provider operation",
-        ))
+        _append_event(
+            invocation.event_log,
+            _event(
+                invocation,
+                "LAUNCH_FAILED",
+                provider_id=invocation.provider_id,
+                error="unsupported provider operation",
+            ),
+        )
         return 1
     assert adapter is not None and argv is not None
 
@@ -1930,11 +2477,13 @@ def run(invocation: Invocation) -> int:
             "live_members": [],
         }
         if boundary is not None:
-            record.update({
-                "root_pid": getattr(boundary, "_root_pid", None),
-                "group_id": getattr(boundary, "_group_id", None),
-                "session_id": getattr(boundary, "_session_id", None),
-            })
+            record.update(
+                {
+                    "root_pid": getattr(boundary, "_root_pid", None),
+                    "group_id": getattr(boundary, "_group_id", None),
+                    "session_id": getattr(boundary, "_session_id", None),
+                }
+            )
         return record
 
     def _record_final_boundary(cleanup_result: CleanupResult | None) -> Any:
@@ -1953,9 +2502,13 @@ def run(invocation: Invocation) -> int:
             else:
                 inventory_error = "owned process boundary is unavailable"
         except BaseException as exc:
-            inventory_error = f"final boundary inventory failed: {type(exc).__name__}: {exc}"
+            inventory_error = (
+                f"final boundary inventory failed: {type(exc).__name__}: {exc}"
+            )
         if inventory_error is not None or inventory is None:
-            state["process_boundary"] = _incomplete_boundary_record(inventory_error or "final boundary inventory was unavailable")
+            state["process_boundary"] = _incomplete_boundary_record(
+                inventory_error or "final boundary inventory was unavailable"
+            )
             state["owned_boundary_empty"] = False
             state["helpers_complete"] = False
             state["resource_claim_release_safe"] = False
@@ -1964,8 +2517,11 @@ def run(invocation: Invocation) -> int:
         live_members = tuple(getattr(inventory, "processes", ()) or ())
         try:
             state["process_boundary"] = (
-                boundary.to_record(inventory) if boundary is not None
-                else _incomplete_boundary_record("no controller-owned process boundary is attached")
+                boundary.to_record(inventory)
+                if boundary is not None
+                else _incomplete_boundary_record(
+                    "no controller-owned process boundary is attached"
+                )
             )
         except BaseException as exc:
             state["process_boundary"] = _incomplete_boundary_record(
@@ -1999,10 +2555,15 @@ def run(invocation: Invocation) -> int:
         if isinstance(boundary_evidence, Mapping):
             raw_members = boundary_evidence.get("live_members")
             if isinstance(raw_members, list):
-                retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+                retained_identities = [
+                    dict(item) for item in raw_members if isinstance(item, Mapping)
+                ]
             boundary_value = dict(boundary_evidence)
         else:
-            boundary_value = {"complete": False, "errors": ["owned boundary evidence was not published"]}
+            boundary_value = {
+                "complete": False,
+                "errors": ["owned boundary evidence was not published"],
+            }
         if not direct_child_reaped:
             boundary_value["complete"] = False
         failures = resource_claims.retain_boundary(
@@ -2033,12 +2594,16 @@ def run(invocation: Invocation) -> int:
         nonlocal direct_handle_cleanup_attempted, direct_child_reaped
         if direct_handle_cleanup_attempted:
             previous = state.get("direct_handle_cleanup")
-            return dict(previous) if isinstance(previous, Mapping) else {
-                "status": "HANDLE_CLEANUP_ALREADY_ATTEMPTED",
-                "final_reap": direct_child_reaped,
-                "identity_verified": False,
-                "identity_uncertain": True,
-            }
+            return (
+                dict(previous)
+                if isinstance(previous, Mapping)
+                else {
+                    "status": "HANDLE_CLEANUP_ALREADY_ATTEMPTED",
+                    "final_reap": direct_child_reaped,
+                    "identity_verified": False,
+                    "identity_uncertain": True,
+                }
+            )
         direct_handle_cleanup_attempted = True
         record: dict[str, Any] = {
             "status": "HANDLE_CLEANUP",
@@ -2190,7 +2755,11 @@ def run(invocation: Invocation) -> int:
             direct_evidence = _direct_handle_cleanup()
             if isinstance(cleanup_evidence, dict):
                 cleanup_evidence["direct_handle_cleanup"] = direct_evidence
-        if supervisor is not None and cleanup_result is not None and cleanup_result.final_reap:
+        if (
+            supervisor is not None
+            and cleanup_result is not None
+            and cleanup_result.final_reap
+        ):
             state["direct_child_reaped"] = direct_child_reaped
         if not final_boundary_recorded:
             _record_final_boundary(cleanup_result)
@@ -2207,50 +2776,70 @@ def run(invocation: Invocation) -> int:
             )
 
             def record_wait(wait: dict[str, Any]) -> None:
-                state.update({
-                    "state": "WAITING_RESOURCE",
-                    "held_resource_claims": resource_claims.held,
-                    "waiting_resource_claim": wait,
-                    "resource_claim_findings": list(resource_claims.findings),
-                })
+                state.update(
+                    {
+                        "state": "WAITING_RESOURCE",
+                        "held_resource_claims": resource_claims.held,
+                        "waiting_resource_claim": wait,
+                        "resource_claim_findings": list(resource_claims.findings),
+                    }
+                )
                 _atomic_json(invocation.status_path, state)
 
             resource_claims.acquire_all(invocation.resources, on_wait=record_wait)
-            state.update({
-                "held_resource_claims": resource_claims.held,
-                "waiting_resource_claim": None,
-                "resource_claim_findings": list(resource_claims.findings),
-            })
+            state.update(
+                {
+                    "held_resource_claims": resource_claims.held,
+                    "waiting_resource_claim": None,
+                    "resource_claim_findings": list(resource_claims.findings),
+                }
+            )
         if resource_claims is not None:
             arming_failures = resource_claims.arm_boundary()
-            state.update({
-                "held_resource_claims": resource_claims.held,
-                "resource_claim_findings": list(resource_claims.findings),
-            })
+            state.update(
+                {
+                    "held_resource_claims": resource_claims.held,
+                    "resource_claim_findings": list(resource_claims.findings),
+                }
+            )
             if arming_failures:
-                state.update({
-                    "state": "LAUNCH_FAILED",
-                    "ended_utc": _utc(),
-                    "error": "cannot durably arm every resource claim before provider launch",
-                    "resource_arming_errors": arming_failures,
-                })
+                state.update(
+                    {
+                        "state": "LAUNCH_FAILED",
+                        "ended_utc": _utc(),
+                        "error": "cannot durably arm every resource claim before provider launch",
+                        "resource_arming_errors": arming_failures,
+                    }
+                )
                 _atomic_json(invocation.status_path, state)
                 return 1
-        with invocation.jsonl_path.open("wb") as jsonl, invocation.stderr_path.open("wb") as stderr:
+        with (
+            invocation.jsonl_path.open("wb") as jsonl,
+            invocation.stderr_path.open("wb") as stderr,
+        ):
             child_env = None
             if invocation.child_environment_isolation:
                 if invocation.runtime_profile is not None:
-                    child_env, cleared = build_child_environment(invocation.runtime_profile)
+                    child_env, cleared = build_child_environment(
+                        invocation.runtime_profile
+                    )
                     state["child_environment_isolation"] = {
                         "enabled": True,
                         "profile_id": invocation.runtime_profile.profile_id,
-                        "provider_needs": list(invocation.runtime_profile.provider_needs),
-                        "workflow_grants": list(invocation.runtime_profile.workflow_grants),
+                        "provider_needs": list(
+                            invocation.runtime_profile.provider_needs
+                        ),
+                        "workflow_grants": list(
+                            invocation.runtime_profile.workflow_grants
+                        ),
                         "cleared_variable_names": cleared,
                     }
                 else:
                     child_env, cleared = isolated_coding_child_environment()
-                    state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
+                    state["child_environment_isolation"] = {
+                        "enabled": True,
+                        "cleared_variable_names": cleared,
+                    }
             if argv is not None:
                 if invocation.overlay_receipt is not None:
                     state["overlay_receipt"] = str(invocation.overlay_receipt)
@@ -2278,14 +2867,16 @@ def run(invocation: Invocation) -> int:
                 **boundary.popen_kwargs,
             )
             child = _identity(process.pid, parent=controller.pid)
-            state.update({
-                "provider_pid": child.pid,
-                "provider_started_utc": iso_utc(child.created_utc),
-                "provider_created_utc": iso_utc(child.created_utc),
-                "codex_pid": child.pid,
-                "codex_started_utc": iso_utc(child.created_utc),
-                "codex_created_utc": iso_utc(child.created_utc),
-            })
+            state.update(
+                {
+                    "provider_pid": child.pid,
+                    "provider_started_utc": iso_utc(child.created_utc),
+                    "provider_created_utc": iso_utc(child.created_utc),
+                    "codex_pid": child.pid,
+                    "codex_started_utc": iso_utc(child.created_utc),
+                    "codex_created_utc": iso_utc(child.created_utc),
+                }
+            )
             # The captured OS boundary is established before the provider is
             # resumed.  The shared supervisor owns every later exact cleanup,
             # inventory, and final-reap stage.
@@ -2302,32 +2893,52 @@ def run(invocation: Invocation) -> int:
             # evidence alone.
             boundary.attach(process, child)
             state["process_boundary"] = boundary.to_record(boundary.inventory())
-            state.update({
-                "state": running_state,
-            })
+            state.update(
+                {
+                    "state": running_state,
+                }
+            )
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(
-                invocation,
-                started_event,
-                controller_pid=controller.pid,
-                provider_id=invocation.provider_id,
-                provider_pid=child.pid,
-                codex_pid=child.pid,
-            ))
-            assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-            process.stdin.write(adapter.encode_prompt(prompt)); process.stdin.close()
+            _append_event(
+                invocation.event_log,
+                _event(
+                    invocation,
+                    started_event,
+                    controller_pid=controller.pid,
+                    provider_id=invocation.provider_id,
+                    provider_pid=child.pid,
+                    codex_pid=child.pid,
+                ),
+            )
+            assert (
+                process.stdin is not None
+                and process.stdout is not None
+                and process.stderr is not None
+            )
+            process.stdin.write(adapter.encode_prompt(prompt))
+            process.stdin.close()
             provider_terminal_event: ProviderEvent | None = None
+
             def drain(source: Any, destination: Any, parse: bool) -> None:
                 nonlocal state, provider_terminal_event
                 for line in iter(source.readline, b""):
-                    destination.write(line); destination.flush(); os.fsync(destination.fileno())
+                    destination.write(line)
+                    destination.flush()
+                    os.fsync(destination.fileno())
                     if parse:
                         event = adapter.parse_transcript_line(line)
                         if event is not None:
                             with lock:
                                 if event.session_id:
-                                    expected_session = thread if invocation.action == "resume" else state.get("provider_session_id")
-                                    if expected_session and event.session_id != expected_session:
+                                    expected_session = (
+                                        thread
+                                        if invocation.action == "resume"
+                                        else state.get("provider_session_id")
+                                    )
+                                    if (
+                                        expected_session
+                                        and event.session_id != expected_session
+                                    ):
                                         state["thread_identity_error"] = (
                                             f"provider session identity {event.session_id!r} does not match "
                                             f"validated resume session {expected_session!r}"
@@ -2342,8 +2953,12 @@ def run(invocation: Invocation) -> int:
                                             evidence["session_id"] = event.session_id
                                             state["provider_evidence"] = evidence
                                         if invocation.canonical is not None:
-                                            resume_identity = dict(state.get("resume_identity") or {})
-                                            resume_identity["session_id"] = event.session_id
+                                            resume_identity = dict(
+                                                state.get("resume_identity") or {}
+                                            )
+                                            resume_identity["session_id"] = (
+                                                event.session_id
+                                            )
                                             resume_identity["live_identity"] = {
                                                 "provider_id": invocation.provider_id,
                                                 "session_id": event.session_id,
@@ -2352,15 +2967,25 @@ def run(invocation: Invocation) -> int:
                                 if event.is_terminal:
                                     provider_terminal_event = event
                                 _atomic_json(invocation.status_path, state)
-            out_thread = threading.Thread(target=drain, args=(process.stdout, jsonl, True), daemon=True)
-            err_thread = threading.Thread(target=drain, args=(process.stderr, stderr, False), daemon=True)
-            out_thread.start(); err_thread.start()
+
+            out_thread = threading.Thread(
+                target=drain, args=(process.stdout, jsonl, True), daemon=True
+            )
+            err_thread = threading.Thread(
+                target=drain, args=(process.stderr, stderr, False), daemon=True
+            )
+            out_thread.start()
+            err_thread.start()
             assert supervisor is not None
             exit_code = supervisor.wait_for_exit()
-            out_thread.join(); err_thread.join()
-            process.stdout.close(); process.stderr.close()
+            out_thread.join()
+            err_thread.join()
+            process.stdout.close()
+            process.stderr.close()
         if supervisor is None:
-            raise ProcessBoundaryUnsupported("provider completed without an ownership boundary")
+            raise ProcessBoundaryUnsupported(
+                "provider completed without an ownership boundary"
+            )
         # Direct Popen reap and complete owned-boundary emptiness are separate
         # facts.  ``cleanup`` performs a fresh inventory after any termination
         # request, targets escaped exact identities, and reaps adopted members
@@ -2372,20 +2997,26 @@ def run(invocation: Invocation) -> int:
         state["direct_child_reaped"] = direct_child_reaped
         boundary_inventory = _record_final_boundary(cleanup_result)
         if boundary_inventory is None:
-            state.update({
-                "state": "CONTROLLER_FAILED",
-                "ended_utc": _utc(),
-                "error": "final owned process boundary inventory failed",
-                "boundary_failure": {
-                    "complete": False,
-                    "live_helpers": [],
-                    "errors": list((state.get("process_boundary") or {}).get("errors", [])),
-                    "cleanup": cleanup_result.to_record(),
-                },
-            })
+            state.update(
+                {
+                    "state": "CONTROLLER_FAILED",
+                    "ended_utc": _utc(),
+                    "error": "final owned process boundary inventory failed",
+                    "boundary_failure": {
+                        "complete": False,
+                        "live_helpers": [],
+                        "errors": list(
+                            (state.get("process_boundary") or {}).get("errors", [])
+                        ),
+                        "cleanup": cleanup_result.to_record(),
+                    },
+                }
+            )
             _atomic_json(invocation.status_path, state)
             return 1
-        observed_by_pid = {item.pid: item for item in boundary_inventory.observed_processes}
+        observed_by_pid = {
+            item.pid: item for item in boundary_inventory.observed_processes
+        }
         owned_helpers: list[dict[str, Any]] = []
         for item in boundary_inventory.observed_processes:
             if item.pid == state.get("provider_pid") or item.created_utc is None:
@@ -2397,45 +3028,76 @@ def run(invocation: Invocation) -> int:
                 provider_root_pid=state.get("provider_pid"),
             ):
                 continue
-            owned_helpers.append({
-                "name": f"helper-{item.pid}",
-                "identity": {"pid": item.pid, "created_utc": iso_utc(item.created_utc)},
-            })
+            owned_helpers.append(
+                {
+                    "name": f"helper-{item.pid}",
+                    "identity": {
+                        "pid": item.pid,
+                        "created_utc": iso_utc(item.created_utc),
+                    },
+                }
+            )
         state["owned_helpers"] = owned_helpers
         if not release_safe:
-            state.update({
-                "state": "CONTROLLER_FAILED",
-                "ended_utc": _utc(),
-                "error": "owned process boundary is incomplete or still contains live helpers",
-                "boundary_failure": {
-                    "complete": boundary_inventory.complete,
-                    "live_helpers": [item.pid for item in boundary_inventory.processes],
-                    "errors": list(boundary_inventory.errors),
-                    "cleanup": cleanup_result.to_record(),
-                },
-            })
+            state.update(
+                {
+                    "state": "CONTROLLER_FAILED",
+                    "ended_utc": _utc(),
+                    "error": "owned process boundary is incomplete or still contains live helpers",
+                    "boundary_failure": {
+                        "complete": boundary_inventory.complete,
+                        "live_helpers": [
+                            item.pid for item in boundary_inventory.processes
+                        ],
+                        "errors": list(boundary_inventory.errors),
+                        "cleanup": cleanup_result.to_record(),
+                    },
+                }
+            )
             _atomic_json(invocation.status_path, state)
             return 1
         thread_identity_error = state.get("thread_identity_error")
         if isinstance(thread_identity_error, str):
-            state.update({
-                "state": "CONTROLLER_FAILED", "exit_code": exit_code, "ended_utc": _utc(),
-                "error": thread_identity_error,
-            })
+            state.update(
+                {
+                    "state": "CONTROLLER_FAILED",
+                    "exit_code": exit_code,
+                    "ended_utc": _utc(),
+                    "error": thread_identity_error,
+                }
+            )
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(
-                invocation, "CONTROLLER_FAILED", exit_code=exit_code, error=thread_identity_error,
-                thread_id=state.get("thread_id"),
-            ))
+            _append_event(
+                invocation.event_log,
+                _event(
+                    invocation,
+                    "CONTROLLER_FAILED",
+                    exit_code=exit_code,
+                    error=thread_identity_error,
+                    thread_id=state.get("thread_id"),
+                ),
+            )
             return 1
         if invocation.action == "start" and not state.get("provider_session_id"):
-            state.update({"state": "LAUNCH_FAILED", "exit_code": exit_code, "ended_utc": _utc(), "error": f"{invocation.provider_id} exited without a session initialization record; inspect stderr_path"})
+            state.update(
+                {
+                    "state": "LAUNCH_FAILED",
+                    "exit_code": exit_code,
+                    "ended_utc": _utc(),
+                    "error": f"{invocation.provider_id} exited without a session initialization record; inspect stderr_path",
+                }
+            )
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(invocation, "LAUNCH_FAILED", exit_code=exit_code))
+            _append_event(
+                invocation.event_log,
+                _event(invocation, "LAUNCH_FAILED", exit_code=exit_code),
+            )
             return 1
         result_valid = True
         if invocation.canonical is not None:
-            result_validation, result_valid, task_result = _canonical_result_validation(invocation)
+            result_validation, result_valid, task_result = _canonical_result_validation(
+                invocation
+            )
             advancement = None
             if result_valid and task_result is not None:
                 try:
@@ -2454,7 +3116,9 @@ def run(invocation: Invocation) -> int:
                     result_valid = False
             state["result_validation"] = result_validation
             state["result_valid"] = result_valid
-            state["task_advancement_state"] = advancement.state if advancement is not None else "PENDING"
+            state["task_advancement_state"] = (
+                advancement.state if advancement is not None else "PENDING"
+            )
             state["terminal_acceptance_state"] = "PENDING"
             if advancement is not None:
                 result_validation["acceptance_state"] = advancement.state
@@ -2488,116 +3152,172 @@ def run(invocation: Invocation) -> int:
                 f"{terminal_outcome!r} outside the closed provider-neutral vocabulary "
                 "COMPLETED/FAILED/CANCELLED"
             )
-            state.update({
-                "state": "CONTROLLER_FAILED",
+            state.update(
+                {
+                    "state": "CONTROLLER_FAILED",
+                    "provider_terminal_outcome": terminal_outcome,
+                    "exit_code": exit_code,
+                    "ended_utc": _utc(),
+                    "error": terminal_error,
+                    "terminal_outcome_invalid": {
+                        "returned": terminal_outcome,
+                        "allowed": sorted(PROVIDER_TERMINAL_OUTCOMES),
+                    },
+                }
+            )
+            _atomic_json(invocation.status_path, state)
+            _append_event(
+                invocation.event_log,
+                _event(
+                    invocation,
+                    "CONTROLLER_FAILED",
+                    provider_id=invocation.provider_id,
+                    provider_terminal_outcome=terminal_outcome,
+                    exit_code=exit_code,
+                    thread_id=state.get("thread_id"),
+                    session_id=state.get("provider_session_id"),
+                    result_validation=state.get("result_validation"),
+                    error=terminal_error,
+                ),
+            )
+            return 1
+        state.update(
+            {
+                "state": exited_state,
                 "provider_terminal_outcome": terminal_outcome,
                 "exit_code": exit_code,
                 "ended_utc": _utc(),
-                "error": terminal_error,
-                "terminal_outcome_invalid": {
-                    "returned": terminal_outcome,
-                    "allowed": sorted(PROVIDER_TERMINAL_OUTCOMES),
-                },
-            })
-            _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(
+            }
+        )
+        _atomic_json(invocation.status_path, state)
+        _append_event(
+            invocation.event_log,
+            _event(
                 invocation,
-                "CONTROLLER_FAILED",
+                exited_event,
                 provider_id=invocation.provider_id,
                 provider_terminal_outcome=terminal_outcome,
                 exit_code=exit_code,
                 thread_id=state.get("thread_id"),
                 session_id=state.get("provider_session_id"),
                 result_validation=state.get("result_validation"),
-                error=terminal_error,
-            ))
-            return 1
-        state.update({"state": exited_state, "provider_terminal_outcome": terminal_outcome, "exit_code": exit_code, "ended_utc": _utc()})
-        _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(
-            invocation,
-            exited_event,
-            provider_id=invocation.provider_id,
-            provider_terminal_outcome=terminal_outcome,
-            exit_code=exit_code,
-            thread_id=state.get("thread_id"),
-            session_id=state.get("provider_session_id"),
-            result_validation=state.get("result_validation"),
-        ))
-        return 1 if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid else exit_code
+            ),
+        )
+        return (
+            1
+            if terminal_outcome in {"FAILED", "CANCELLED"} or not result_valid
+            else exit_code
+        )
     except KeyboardInterrupt:
         cleanup_evidence = _postlaunch_cleanup() if process is not None else None
         if process is not None and not release_safe:
             _ = _retain_unresolved_claims()
-            retained_claims = resource_claims.held if resource_claims is not None else []
+            retained_claims = (
+                resource_claims.held if resource_claims is not None else []
+            )
             error = "controller interrupted; exact provider child shutdown could not be proven"
-            state.update({
-                "state": "COORDINATION_FAILED",
-                "ended_utc": _utc(),
-                "error": error,
-                "coordination_failure": {
+            state.update(
+                {
+                    "state": "COORDINATION_FAILED",
+                    "ended_utc": _utc(),
                     "error": error,
-                    "trigger": "KeyboardInterrupt",
-                    "child_shutdown": cleanup_evidence,
-                    "retained_claims": retained_claims,
-                },
-                "held_resource_claims": retained_claims,
-            })
+                    "coordination_failure": {
+                        "error": error,
+                        "trigger": "KeyboardInterrupt",
+                        "child_shutdown": cleanup_evidence,
+                        "retained_claims": retained_claims,
+                    },
+                    "held_resource_claims": retained_claims,
+                }
+            )
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(
-                invocation, "COORDINATION_FAILED", error=error,
-                child_shutdown=cleanup_evidence, retained_claims=retained_claims,
-            ))
+            _append_event(
+                invocation.event_log,
+                _event(
+                    invocation,
+                    "COORDINATION_FAILED",
+                    error=error,
+                    child_shutdown=cleanup_evidence,
+                    retained_claims=retained_claims,
+                ),
+            )
             return 130
         state.update({"state": "CONTROLLER_INTERRUPTED", "ended_utc": _utc()})
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED"))
+        _append_event(
+            invocation.event_log, _event(invocation, "CONTROLLER_INTERRUPTED")
+        )
         return 130
     except ResourceLockError as exc:
         cleanup_evidence = _postlaunch_cleanup() if process is not None else None
         retained_claims = resource_claims.held if resource_claims is not None else []
-        state.update({
-            "state": "COORDINATION_FAILED",
-            "ended_utc": _utc(),
-            "error": str(exc),
-            "coordination_failure": {
+        state.update(
+            {
+                "state": "COORDINATION_FAILED",
+                "ended_utc": _utc(),
                 "error": str(exc),
-                "child_shutdown": cleanup_evidence,
-                "retained_claims": retained_claims,
-            },
-            "held_resource_claims": retained_claims,
-        })
+                "coordination_failure": {
+                    "error": str(exc),
+                    "child_shutdown": cleanup_evidence,
+                    "retained_claims": retained_claims,
+                },
+                "held_resource_claims": retained_claims,
+            }
+        )
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(invocation, "COORDINATION_FAILED", error=str(exc)))
+        _append_event(
+            invocation.event_log,
+            _event(invocation, "COORDINATION_FAILED", error=str(exc)),
+        )
         return 1
     except Exception as exc:
         cleanup_evidence = _postlaunch_cleanup() if process is not None else None
         if process is not None and not release_safe:
             _ = _retain_unresolved_claims()
-            retained_claims = resource_claims.held if resource_claims is not None else []
+            retained_claims = (
+                resource_claims.held if resource_claims is not None else []
+            )
             error = f"{exc}; exact provider child shutdown could not be proven"
-            state.update({
-                "state": "COORDINATION_FAILED",
-                "ended_utc": _utc(),
-                "error": error,
-                "coordination_failure": {
+            state.update(
+                {
+                    "state": "COORDINATION_FAILED",
+                    "ended_utc": _utc(),
                     "error": error,
-                    "trigger": type(exc).__name__,
-                    "trigger_error": str(exc),
-                    "child_shutdown": cleanup_evidence,
-                    "retained_claims": retained_claims,
-                },
-                "held_resource_claims": retained_claims,
-            })
+                    "coordination_failure": {
+                        "error": error,
+                        "trigger": type(exc).__name__,
+                        "trigger_error": str(exc),
+                        "child_shutdown": cleanup_evidence,
+                        "retained_claims": retained_claims,
+                    },
+                    "held_resource_claims": retained_claims,
+                }
+            )
             _atomic_json(invocation.status_path, state)
-            _append_event(invocation.event_log, _event(
-                invocation, "COORDINATION_FAILED", error=error,
-                child_shutdown=cleanup_evidence, retained_claims=retained_claims,
-            ))
+            _append_event(
+                invocation.event_log,
+                _event(
+                    invocation,
+                    "COORDINATION_FAILED",
+                    error=error,
+                    child_shutdown=cleanup_evidence,
+                    retained_claims=retained_claims,
+                ),
+            )
             return 1
-        state.update({"state": "CONTROLLER_FAILED" if state.get("provider_pid", state.get("codex_pid")) else "LAUNCH_FAILED", "ended_utc": _utc(), "error": str(exc)})
+        state.update(
+            {
+                "state": "CONTROLLER_FAILED"
+                if state.get("provider_pid", state.get("codex_pid"))
+                else "LAUNCH_FAILED",
+                "ended_utc": _utc(),
+                "error": str(exc),
+            }
+        )
         _atomic_json(invocation.status_path, state)
-        _append_event(invocation.event_log, _event(invocation, state["state"], error=str(exc)))
+        _append_event(
+            invocation.event_log, _event(invocation, state["state"], error=str(exc))
+        )
         return 1
     finally:
         if process is not None and not final_boundary_recorded:
@@ -2615,7 +3335,11 @@ def run(invocation: Invocation) -> int:
                 if isinstance(boundary_evidence, Mapping):
                     raw_members = boundary_evidence.get("live_members")
                     if isinstance(raw_members, list):
-                        retained_identities = [dict(item) for item in raw_members if isinstance(item, Mapping)]
+                        retained_identities = [
+                            dict(item)
+                            for item in raw_members
+                            if isinstance(item, Mapping)
+                        ]
                 if not isinstance(boundary_evidence, Mapping):
                     boundary_evidence = {
                         "complete": False,
@@ -2637,34 +3361,44 @@ def run(invocation: Invocation) -> int:
                 _atomic_json(invocation.status_path, state)
             except OSError:
                 pass
-        if invocation.repository is not None and provider_resume_handoff is None and not unsupported_operations:
+        if (
+            invocation.repository is not None
+            and provider_resume_handoff is None
+            and not unsupported_operations
+        ):
             try:
                 _publish_registry()
             except Exception as exc:
-                state.update({
-                    "state": "CONTROLLER_FAILED",
-                    "ended_utc": state.get("ended_utc") or _utc(),
-                    "error": f"final lifecycle registry publication failed: {exc}",
-                    "lifecycle_publication_failure": {
-                        "type": type(exc).__name__,
-                        "detail": str(exc),
-                        "terminal_authority": False,
-                    },
-                    "helpers_complete": False,
-                })
+                state.update(
+                    {
+                        "state": "CONTROLLER_FAILED",
+                        "ended_utc": state.get("ended_utc") or _utc(),
+                        "error": f"final lifecycle registry publication failed: {exc}",
+                        "lifecycle_publication_failure": {
+                            "type": type(exc).__name__,
+                            "detail": str(exc),
+                            "terminal_authority": False,
+                        },
+                        "helpers_complete": False,
+                    }
+                )
                 try:
                     _atomic_json(invocation.status_path, state)
                 except Exception:
                     pass
                 if boundary is not None:
                     boundary.close()
-                raise InvocationError(f"final lifecycle registry publication failed: {exc}") from exc
+                raise InvocationError(
+                    f"final lifecycle registry publication failed: {exc}"
+                ) from exc
         if boundary is not None:
             boundary.close()
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Launch one observable Codex lane turn")
+    parser = argparse.ArgumentParser(
+        description="Launch one observable Codex lane turn"
+    )
     parser.add_argument("invocation", type=Path)
     args = parser.parse_args(argv)
     try:

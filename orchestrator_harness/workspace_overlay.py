@@ -12,6 +12,7 @@ used as invalidation keys.  A later re-ingest or direct cache edit affects only
 later preparations and never invalidates an already prepared worktree.  The
 harness does not create or launch an orchestrator and owns no worktree manager.
 """
+
 from __future__ import annotations
 
 import base64
@@ -74,7 +75,9 @@ def _is_reparse(path: Path) -> bool:
 def _regular_directory(value: str | Path, *, name: str) -> Path:
     path = _lexical(value)
     if _is_reparse(path) or not path.is_dir():
-        raise WorkspaceOverlayError(f"{name} must be an existing regular directory: {path}")
+        raise WorkspaceOverlayError(
+            f"{name} must be an existing regular directory: {path}"
+        )
     return path
 
 
@@ -94,15 +97,21 @@ def _walk_contents(root: Path) -> list[tuple[str, str]]:
         try:
             children = sorted(os.scandir(directory), key=lambda item: item.name)
         except OSError as exc:
-            raise WorkspaceOverlayError(f"cannot read overlay source {directory}: {exc}") from exc
+            raise WorkspaceOverlayError(
+                f"cannot read overlay source {directory}: {exc}"
+            ) from exc
         for child in children:
             child_path = directory / child.name
             if _is_reparse(child_path):
-                raise WorkspaceOverlayError(f"overlay source contains a reparse point: {child_path}")
+                raise WorkspaceOverlayError(
+                    f"overlay source contains a reparse point: {child_path}"
+                )
             try:
                 info = child_path.lstat()
             except OSError as exc:
-                raise WorkspaceOverlayError(f"cannot inspect overlay source {child_path}: {exc}") from exc
+                raise WorkspaceOverlayError(
+                    f"cannot inspect overlay source {child_path}: {exc}"
+                ) from exc
             relative = child_path.relative_to(root).as_posix()
             if stat.S_ISDIR(info.st_mode):
                 entries.append((relative, "dir"))
@@ -110,7 +119,9 @@ def _walk_contents(root: Path) -> list[tuple[str, str]]:
             elif stat.S_ISREG(info.st_mode):
                 entries.append((relative, "file"))
             else:
-                raise WorkspaceOverlayError(f"overlay source contains a non-regular file: {child_path}")
+                raise WorkspaceOverlayError(
+                    f"overlay source contains a non-regular file: {child_path}"
+                )
 
     walk(root)
     return sorted(entries)
@@ -120,18 +131,28 @@ def _verify_contents_match(source: Path, mirror: Path) -> None:
     source_entries = _walk_contents(source)
     mirror_entries = _walk_contents(mirror)
     if [kind for _, kind in source_entries] != [kind for _, kind in mirror_entries]:
-        raise WorkspaceOverlayError("refreshed cache does not match the supplied folder structure")
-    for (relative, kind), (mirror_relative, mirror_kind) in zip(source_entries, mirror_entries):
+        raise WorkspaceOverlayError(
+            "refreshed cache does not match the supplied folder structure"
+        )
+    for (relative, kind), (mirror_relative, mirror_kind) in zip(
+        source_entries, mirror_entries
+    ):
         if relative != mirror_relative or kind != mirror_kind:
-            raise WorkspaceOverlayError("refreshed cache ordering differs from the supplied folder")
+            raise WorkspaceOverlayError(
+                "refreshed cache ordering differs from the supplied folder"
+            )
         if kind == "file":
             try:
                 left = (source / relative).read_bytes()
                 right = (mirror / relative).read_bytes()
             except OSError as exc:
-                raise WorkspaceOverlayError(f"cannot verify refreshed cache entry {relative}: {exc}") from exc
+                raise WorkspaceOverlayError(
+                    f"cannot verify refreshed cache entry {relative}: {exc}"
+                ) from exc
             if left != right:
-                raise WorkspaceOverlayError(f"refreshed cache entry differs from source: {relative}")
+                raise WorkspaceOverlayError(
+                    f"refreshed cache entry differs from source: {relative}"
+                )
 
 
 def ingest_super_cache(
@@ -156,7 +177,9 @@ def ingest_super_cache(
     source_identity = _path_identity(source)
     cache_identity = _path_identity(cache)
     if source_identity == cache_identity:
-        raise WorkspaceOverlayError("source folder and super-cache must be different directories")
+        raise WorkspaceOverlayError(
+            "source folder and super-cache must be different directories"
+        )
     if _inside(cache, source):
         raise WorkspaceOverlayError("super-cache must not be inside the source folder")
     if _inside(source, cache):
@@ -180,7 +203,9 @@ def ingest_super_cache(
                 )
         _verify_contents_match(source, staging)
         if cache.exists():
-            previous = _lexical(harness / f".{SUPER_CACHE_NAME}.previous-{uuid.uuid4().hex}")
+            previous = _lexical(
+                harness / f".{SUPER_CACHE_NAME}.previous-{uuid.uuid4().hex}"
+            )
             mutation_rename(
                 harness,
                 cache.name,
@@ -204,7 +229,11 @@ def ingest_super_cache(
             # the prior contents so no partially successful refresh remains.
             try:
                 if cache.exists() and not _is_reparse(cache):
-                    remove_tree(harness, cache.name, expected=capture_target(harness, cache.name))
+                    remove_tree(
+                        harness,
+                        cache.name,
+                        expected=capture_target(harness, cache.name),
+                    )
             except (MutationError, OSError, WorkspaceOverlayError):
                 pass
             if previous is not None and previous.exists() and not cache.exists():
@@ -222,7 +251,11 @@ def ingest_super_cache(
         else:
             try:
                 if staging.exists() and not _is_reparse(staging):
-                    remove_tree(harness, staging.name, expected=capture_target(harness, staging.name))
+                    remove_tree(
+                        harness,
+                        staging.name,
+                        expected=capture_target(harness, staging.name),
+                    )
             except (MutationError, OSError, WorkspaceOverlayError):
                 pass
         if previous is not None and previous.exists() and not cache.exists():
@@ -236,12 +269,16 @@ def ingest_super_cache(
                 )
             except (MutationError, OSError, WorkspaceOverlayError):
                 pass
-        raise WorkspaceOverlayError(f"super-cache refresh failed and was not reported complete: {exc}") from exc
+        raise WorkspaceOverlayError(
+            f"super-cache refresh failed and was not reported complete: {exc}"
+        ) from exc
 
     removed_previous = True
     if previous is not None and previous.exists():
         try:
-            remove_tree(harness, previous.name, expected=capture_target(harness, previous.name))
+            remove_tree(
+                harness, previous.name, expected=capture_target(harness, previous.name)
+            )
         except (MutationError, OSError, WorkspaceOverlayError):
             removed_previous = False
     return {
@@ -262,6 +299,8 @@ def _inside(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
 def _read_declaration(cache: Path) -> dict[str, Any] | None:
     declaration = cache / DECLARATION_NAME
     if not os.path.lexists(declaration):
@@ -272,7 +311,9 @@ def _read_declaration(cache: Path) -> dict[str, Any] | None:
         data = declaration.read_bytes()
         value = json.loads(data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WorkspaceOverlayError(f"{DECLARATION_NAME} is not valid UTF-8 JSON: {exc}") from exc
+        raise WorkspaceOverlayError(
+            f"{DECLARATION_NAME} is not valid UTF-8 JSON: {exc}"
+        ) from exc
     if not isinstance(value, dict) or set(value) != {"schema", "append_text"}:
         raise WorkspaceOverlayError(
             f"{DECLARATION_NAME} must contain only schema and append_text"
@@ -283,13 +324,17 @@ def _read_declaration(cache: Path) -> dict[str, Any] | None:
     if not isinstance(append_text, list) or any(
         not isinstance(item, str) or not item.strip() for item in append_text
     ):
-        raise WorkspaceOverlayError(f"{DECLARATION_NAME} append_text must be a list of paths")
+        raise WorkspaceOverlayError(
+            f"{DECLARATION_NAME} append_text must be a list of paths"
+        )
     normalized: list[str] = []
     for item in append_text:
         relative = safe_relative_path(item.strip())
         normalized.append(relative.as_posix())
     if len(set(normalized)) != len(normalized):
-        raise WorkspaceOverlayError(f"{DECLARATION_NAME} append_text contains duplicates")
+        raise WorkspaceOverlayError(
+            f"{DECLARATION_NAME} append_text contains duplicates"
+        )
     return {"schema": SUPER_CACHE_CONTROL_SCHEMA, "append_text": normalized}
 
 
@@ -380,7 +425,9 @@ def _rollback_applied(
     for relative, operation, pre_bytes in reversed(applied_files):
         try:
             if operation == "create_file":
-                mutation_delete(target, relative, expected=capture_target(target, relative))
+                mutation_delete(
+                    target, relative, expected=capture_target(target, relative)
+                )
             else:
                 mutation_replace(
                     target,
@@ -390,12 +437,20 @@ def _rollback_applied(
                 )
         except (MutationError, OSError) as exc:
             errors.append(f"{relative}: {type(exc).__name__}")
-    for directory in sorted(created_dirs, key=lambda item: len(item.split("/")), reverse=True):
+    for directory in sorted(
+        created_dirs, key=lambda item: len(item.split("/")), reverse=True
+    ):
         directory_path = target / directory
-        if directory_path.exists() and not _is_reparse(directory_path) and directory_path.is_dir():
+        if (
+            directory_path.exists()
+            and not _is_reparse(directory_path)
+            and directory_path.is_dir()
+        ):
             try:
                 if next(os.scandir(directory_path), None) is None:
-                    remove_tree(target, directory, expected=capture_target(target, directory))
+                    remove_tree(
+                        target, directory, expected=capture_target(target, directory)
+                    )
             except (MutationError, OSError):
                 pass
     return errors
@@ -422,8 +477,14 @@ def prepare_worktree(
     target = _regular_directory(target_worktree, name="target worktree")
     cache_identity = _path_identity(cache)
     target_identity = _path_identity(target)
-    if cache_identity == target_identity or _inside(cache, target) or _inside(target, cache):
-        raise WorkspaceOverlayError("super-cache and target worktree must be separate directories")
+    if (
+        cache_identity == target_identity
+        or _inside(cache, target)
+        or _inside(target, cache)
+    ):
+        raise WorkspaceOverlayError(
+            "super-cache and target worktree must be separate directories"
+        )
     receipt = _lexical(receipt_path)
 
     declaration = _read_declaration(cache)
@@ -435,9 +496,13 @@ def prepare_worktree(
             current = current / part
             if os.path.lexists(current):
                 if _is_reparse(current):
-                    raise OverlayCollisionError(f"target path component is a reparse point: {current}")
+                    raise OverlayCollisionError(
+                        f"target path component is a reparse point: {current}"
+                    )
                 if not current.is_dir():
-                    raise OverlayCollisionError(f"target path parent is not a directory: {current}")
+                    raise OverlayCollisionError(
+                        f"target path parent is not a directory: {current}"
+                    )
 
     # Complete collision preflight passed; only now may any mutation occur.
     try:
@@ -509,7 +574,10 @@ def prepare_worktree(
         mutation_replace(
             receipt.parent,
             receipt.name,
-            (json.dumps(receipt_record, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            (
+                json.dumps(receipt_record, sort_keys=True, indent=2, ensure_ascii=False)
+                + "\n"
+            ).encode("utf-8"),
             expected=capture_target(receipt.parent, receipt.name),
         )
     except (MutationError, OSError) as exc:
@@ -537,12 +605,16 @@ def prepare_worktree(
 def _read_receipt(receipt_path: str | Path) -> dict[str, Any]:
     path = _lexical(receipt_path)
     if _is_reparse(path) or not path.is_file():
-        raise WorkspaceOverlayError("overlay receipt is missing or is not a regular file")
+        raise WorkspaceOverlayError(
+            "overlay receipt is missing or is not a regular file"
+        )
     try:
         data = path.read_bytes()
         value = json.loads(data.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WorkspaceOverlayError(f"overlay receipt is not valid UTF-8 JSON: {exc}") from exc
+        raise WorkspaceOverlayError(
+            f"overlay receipt is not valid UTF-8 JSON: {exc}"
+        ) from exc
     if not isinstance(value, dict) or value.get("schema") != OVERLAY_RECEIPT_SCHEMA:
         raise WorkspaceOverlayError("overlay receipt schema is invalid")
     return value
@@ -554,8 +626,15 @@ def _validate_receipt(
     str, str, list[str], dict[str, str], list[str], dict[str, str], dict[str, str]
 ]:
     required = {
-        "schema", "target_worktree_id", "role", "completed", "prepared_utc",
-        "affected_paths", "operations", "created_paths", "pre_overlay_bytes",
+        "schema",
+        "target_worktree_id",
+        "role",
+        "completed",
+        "prepared_utc",
+        "affected_paths",
+        "operations",
+        "created_paths",
+        "pre_overlay_bytes",
         "post_prepare_bytes",
     }
     if set(value) != required:
@@ -587,29 +666,43 @@ def _validate_receipt(
     if set(operations) != set(normalized_affected) or any(
         operation not in _APPLIED_OPERATIONS for operation in operations.values()
     ):
-        raise WorkspaceOverlayError("overlay receipt operations do not match affected paths")
+        raise WorkspaceOverlayError(
+            "overlay receipt operations do not match affected paths"
+        )
     normalized_created: list[str] = []
     for item in created:
         normalized_created.append(safe_relative_path(item).as_posix())
     if not set(normalized_created).issubset(normalized_affected):
-        raise WorkspaceOverlayError("overlay receipt created paths are not affected paths")
+        raise WorkspaceOverlayError(
+            "overlay receipt created paths are not affected paths"
+        )
     pre_bytes = value.get("pre_overlay_bytes")
     post_bytes = value.get("post_prepare_bytes")
     if not isinstance(pre_bytes, dict) or not isinstance(post_bytes, dict):
         raise WorkspaceOverlayError("overlay receipt byte maps are invalid")
-    if not set(pre_bytes).issubset(normalized_affected) or not set(post_bytes).issubset(normalized_affected):
-        raise WorkspaceOverlayError("overlay receipt byte map keys are not affected paths")
+    if not set(pre_bytes).issubset(normalized_affected) or not set(post_bytes).issubset(
+        normalized_affected
+    ):
+        raise WorkspaceOverlayError(
+            "overlay receipt byte map keys are not affected paths"
+        )
     for relative in pre_bytes:
         _decode_bytes(pre_bytes[relative], name="pre_overlay_bytes")
         if operations[relative] != "append":
-            raise WorkspaceOverlayError("overlay receipt pre-overlay bytes exist for a non-append path")
+            raise WorkspaceOverlayError(
+                "overlay receipt pre-overlay bytes exist for a non-append path"
+            )
     for relative in post_bytes:
         _decode_bytes(post_bytes[relative], name="post_prepare_bytes")
         if operations[relative] not in {"append", "create_file"}:
-            raise WorkspaceOverlayError("overlay receipt post-prepare bytes exist for a non-file path")
+            raise WorkspaceOverlayError(
+                "overlay receipt post-prepare bytes exist for a non-file path"
+            )
     for relative, operation in operations.items():
         if operation in {"append", "create_file"} and relative not in post_bytes:
-            raise WorkspaceOverlayError("overlay receipt is missing post-prepare bytes for a file path")
+            raise WorkspaceOverlayError(
+                "overlay receipt is missing post-prepare bytes for a file path"
+            )
     return (
         target_id,
         str(role),
@@ -695,7 +788,10 @@ def restore_worktree(*, receipt_path: str | Path) -> dict[str, Any]:
             continue
         expected_post = _decode_bytes(post_bytes[relative], name="post_prepare_bytes")
         if current != expected_post:
-            blocked_entry(relative, "later edit detected (current bytes differ from post-prepare bytes)")
+            blocked_entry(
+                relative,
+                "later edit detected (current bytes differ from post-prepare bytes)",
+            )
             continue
         try:
             if operation == "append":
@@ -707,7 +803,9 @@ def restore_worktree(*, receipt_path: str | Path) -> dict[str, Any]:
                 )
                 restored_paths.append(relative)
             else:
-                mutation_delete(target, relative, expected=capture_target(target, relative))
+                mutation_delete(
+                    target, relative, expected=capture_target(target, relative)
+                )
                 removed_paths.append(relative)
         except (MutationError, OSError) as exc:
             blocked_entry(relative, f"restoration failed: {exc}")
@@ -727,7 +825,9 @@ def restore_worktree(*, receipt_path: str | Path) -> dict[str, Any]:
         try:
             if next(os.scandir(directory_path), None) is not None:
                 left_directories.append(directory)
-                blocked.append(f"{directory}: non-empty created directory (later work preserved)")
+                blocked.append(
+                    f"{directory}: non-empty created directory (later work preserved)"
+                )
                 continue
             remove_tree(target, directory, expected=capture_target(target, directory))
             removed_paths.append(directory)
@@ -765,7 +865,11 @@ def verify_overlay_receipt(
     performed here.
     """
     if receipt_path is None:
-        return {"present": False, "verified": True, "reason": "no overlay was requested"}
+        return {
+            "present": False,
+            "verified": True,
+            "reason": "no overlay was requested",
+        }
     expected = _path_identity(expected_target_worktree_id)
     try:
         raw = _read_receipt(receipt_path)

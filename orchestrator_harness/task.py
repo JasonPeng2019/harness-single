@@ -5,6 +5,7 @@ the work is good: that judgment arrives as a separately owned acceptance
 record whose references must match the exact card, result, revision, and
 commit.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -80,7 +81,9 @@ def _validate_declared_content_hash(value: Mapping[str, Any], name: str) -> None
     declared = _digest(value.get("content_sha256"), f"{name}.content_sha256")
     canonical = record_sha256(_without_declared_content_hash(value))
     if declared != canonical:
-        raise TaskValidationError(f"{name} content hash does not match canonical content")
+        raise TaskValidationError(
+            f"{name} content hash does not match canonical content"
+        )
 
 
 def _text(value: object, name: str) -> str:
@@ -96,7 +99,9 @@ def _digest(value: object, name: str) -> str:
     return result
 
 
-def _closed(value: object, required: set[str], optional: set[str], name: str) -> Mapping[str, Any]:
+def _closed(
+    value: object, required: set[str], optional: set[str], name: str
+) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TaskValidationError(f"{name} must be an object")
     keys = set(value)
@@ -106,7 +111,9 @@ def _closed(value: object, required: set[str], optional: set[str], name: str) ->
 
 
 def _strings(value: object, name: str) -> list[str]:
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
         raise TaskValidationError(f"{name} must be a list of non-empty strings")
     return [item.strip() for item in value]
 
@@ -180,12 +187,21 @@ def task_card_from_identity(
     )
 
 
-def validate_task_card(value: Mapping[str, Any], *, raw_bytes: bytes | None = None) -> TaskCard:
+def validate_task_card(
+    value: Mapping[str, Any], *, raw_bytes: bytes | None = None
+) -> TaskCard:
     if not isinstance(value, Mapping):
         raise TaskValidationError("task card must be an object")
     if value.get("schema") != TASK_CARD_SCHEMA:
         raise TaskValidationError("task card schema must be orchestrator-task-card/v1")
-    required = {"schema", "card_id", "lane_id", "stage_cohort_id", "worker_invocation_id", "objective"}
+    required = {
+        "schema",
+        "card_id",
+        "lane_id",
+        "stage_cohort_id",
+        "worker_invocation_id",
+        "objective",
+    }
     _closed(value, required, _TASK_CARD_ALLOWED - required, "task card")
     card_id = _text(value.get("card_id"), "task card.card_id")
     lane_id = _text(value.get("lane_id"), "task card.lane_id")
@@ -195,15 +211,29 @@ def validate_task_card(value: Mapping[str, Any], *, raw_bytes: bytes | None = No
     revision_value = value.get("revision")
     if revision_value is None:
         starting = value.get("starting_state")
-        revision_value = starting.get("starting_commit") if isinstance(starting, Mapping) else None
+        revision_value = (
+            starting.get("starting_commit") if isinstance(starting, Mapping) else None
+        )
     revision = _text(revision_value or "1", "task card.revision")
     actual_content_sha256 = _content_sha256(value, raw_bytes)
     supplied = value.get("content_sha256")
-    if supplied is not None and _digest(supplied, "task card.content_sha256") != actual_content_sha256:
+    if (
+        supplied is not None
+        and _digest(supplied, "task card.content_sha256") != actual_content_sha256
+    ):
         raise TaskValidationError("task card content hash does not match bytes")
     owner = value.get("completion_review_owner", value.get("owner", "ROOT-IM"))
     owner_text = _text(owner, "task card.completion_review_owner")
-    return TaskCard(card_id, lane_id, worker, cohort, revision, actual_content_sha256, owner_text, dict(value))
+    return TaskCard(
+        card_id,
+        lane_id,
+        worker,
+        cohort,
+        revision,
+        actual_content_sha256,
+        owner_text,
+        dict(value),
+    )
 
 
 @dataclass(frozen=True)
@@ -247,7 +277,12 @@ def validate_task_result(
         "summary",
         "checks",
     }
-    optional = {"content_sha256", "prompt_bundle_sha256", "prompt_content_sha256", "acceptance_state"}
+    optional = {
+        "content_sha256",
+        "prompt_bundle_sha256",
+        "prompt_content_sha256",
+        "acceptance_state",
+    }
     _closed(value, required, optional, "task result")
     if value.get("schema") != TASK_RESULT_SCHEMA:
         raise TaskValidationError("task result schema is invalid")
@@ -260,25 +295,41 @@ def validate_task_result(
     }
     if any(value.get(key) != expected for key, expected in expected_identity.items()):
         raise TaskValidationError("task result task/card identity does not match")
-    if _digest(value.get("task_card_sha256"), "task result.task_card_sha256") != card.content_sha256:
-        raise TaskValidationError("task result task card content identity does not match")
+    if (
+        _digest(value.get("task_card_sha256"), "task result.task_card_sha256")
+        != card.content_sha256
+    ):
+        raise TaskValidationError(
+            "task result task card content identity does not match"
+        )
     branch = _text(value.get("branch"), "task result.branch")
     commit = _text(value.get("commit"), "task result.commit").lower()
     if _HEX_COMMIT.fullmatch(commit) is None:
-        raise TaskValidationError("task result.commit must be a full hexadecimal commit ID")
+        raise TaskValidationError(
+            "task result.commit must be a full hexadecimal commit ID"
+        )
     outcome = value.get("outcome")
     if outcome not in {"PASS", "FAIL", "BLOCKED"}:
         raise TaskValidationError("task result.outcome is invalid")
     summary = _text(value.get("summary"), "task result.summary")
     checks = value.get("checks")
-    if not isinstance(checks, list) or len(checks) > 64 or any(not isinstance(item, Mapping) for item in checks):
+    if (
+        not isinstance(checks, list)
+        or len(checks) > 64
+        or any(not isinstance(item, Mapping) for item in checks)
+    ):
         raise TaskValidationError("task result.checks is invalid")
     for check in checks:
         if set(check) - {"name", "command", "outcome", "status", "summary"}:
             raise TaskValidationError("task result check has an invalid shape")
         if "name" not in check and "command" not in check:
             raise TaskValidationError("task result check requires name or command")
-        if check.get("outcome", check.get("status")) not in {"PASS", "FAIL", "SKIP", "NOT_RUN"}:
+        if check.get("outcome", check.get("status")) not in {
+            "PASS",
+            "FAIL",
+            "SKIP",
+            "NOT_RUN",
+        }:
             raise TaskValidationError("task result check outcome is invalid")
     if "prompt_bundle_sha256" in value:
         _digest(value.get("prompt_bundle_sha256"), "task result.prompt_bundle_sha256")
@@ -289,7 +340,16 @@ def validate_task_result(
     acceptance_state = value.get("acceptance_state", "PENDING")
     if acceptance_state not in {"PENDING", "ACCEPTED", "REJECTED"}:
         raise TaskValidationError("task result.acceptance_state is invalid")
-    return TaskResult(card, branch, commit, str(outcome), summary, tuple(dict(item) for item in checks), actual_hash, str(acceptance_state))
+    return TaskResult(
+        card,
+        branch,
+        commit,
+        str(outcome),
+        summary,
+        tuple(dict(item) for item in checks),
+        actual_hash,
+        str(acceptance_state),
+    )
 
 
 @dataclass(frozen=True)
@@ -332,8 +392,13 @@ def validate_completion_review(
         "revision": card.revision,
     }.items():
         if value.get(key) != expected:
-            raise TaskValidationError("completion review task/card identity does not match")
-    if _digest(value.get("result_sha256"), "completion review.result_sha256") != result.content_sha256:
+            raise TaskValidationError(
+                "completion review task/card identity does not match"
+            )
+    if (
+        _digest(value.get("result_sha256"), "completion review.result_sha256")
+        != result.content_sha256
+    ):
         raise TaskValidationError("completion review result identity does not match")
     owner = _text(value.get("owner"), "completion review.owner")
     if owner != card.completion_review_owner:
@@ -344,7 +409,9 @@ def validate_completion_review(
     evidence = tuple(_strings(value.get("evidence"), "completion review.evidence"))
     _validate_declared_content_hash(value, "completion review")
     actual_hash = _content_sha256(value, raw_bytes)
-    return CompletionReview(card, result.content_sha256, owner, str(verdict), evidence, actual_hash)
+    return CompletionReview(
+        card, result.content_sha256, owner, str(verdict), evidence, actual_hash
+    )
 
 
 @dataclass(frozen=True)
@@ -393,25 +460,60 @@ def validate_orchestrator_acceptance(
     }.items():
         if value.get(key) != expected:
             raise TaskValidationError("orchestrator acceptance identity does not match")
-    if _digest(value.get("card_sha256"), "orchestrator acceptance.card_sha256") != card.content_sha256:
-        raise TaskValidationError("orchestrator acceptance card identity does not match")
-    if _digest(value.get("result_sha256"), "orchestrator acceptance.result_sha256") != result.content_sha256:
-        raise TaskValidationError("orchestrator acceptance result identity does not match")
+    if (
+        _digest(value.get("card_sha256"), "orchestrator acceptance.card_sha256")
+        != card.content_sha256
+    ):
+        raise TaskValidationError(
+            "orchestrator acceptance card identity does not match"
+        )
+    if (
+        _digest(value.get("result_sha256"), "orchestrator acceptance.result_sha256")
+        != result.content_sha256
+    ):
+        raise TaskValidationError(
+            "orchestrator acceptance result identity does not match"
+        )
     expected_review_sha = review.content_sha256
-    if review_record is not None and _content_sha256(review_record, None) != expected_review_sha:
-        raise TaskValidationError("orchestrator acceptance review record does not match review")
-    if _digest(value.get("completion_review_sha256"), "orchestrator acceptance.completion_review_sha256") != expected_review_sha:
-        raise TaskValidationError("orchestrator acceptance review identity does not match")
-    accepted_commit = _text(value.get("accepted_commit"), "orchestrator acceptance.accepted_commit").lower()
+    if (
+        review_record is not None
+        and _content_sha256(review_record, None) != expected_review_sha
+    ):
+        raise TaskValidationError(
+            "orchestrator acceptance review record does not match review"
+        )
+    if (
+        _digest(
+            value.get("completion_review_sha256"),
+            "orchestrator acceptance.completion_review_sha256",
+        )
+        != expected_review_sha
+    ):
+        raise TaskValidationError(
+            "orchestrator acceptance review identity does not match"
+        )
+    accepted_commit = _text(
+        value.get("accepted_commit"), "orchestrator acceptance.accepted_commit"
+    ).lower()
     if accepted_commit != result.commit:
-        raise TaskValidationError("orchestrator acceptance commit does not match result")
+        raise TaskValidationError(
+            "orchestrator acceptance commit does not match result"
+        )
     accepted_by = _text(value.get("accepted_by"), "orchestrator acceptance.accepted_by")
     verdict = value.get("verdict")
     if verdict not in {"ACCEPTED", "REJECTED"}:
         raise TaskValidationError("orchestrator acceptance.verdict is invalid")
     _validate_declared_content_hash(value, "orchestrator acceptance")
     actual_hash = _content_sha256(value, raw_bytes)
-    return OrchestratorAcceptance(card, result.content_sha256, expected_review_sha, accepted_commit, accepted_by, str(verdict), actual_hash)
+    return OrchestratorAcceptance(
+        card,
+        result.content_sha256,
+        expected_review_sha,
+        accepted_commit,
+        accepted_by,
+        str(verdict),
+        actual_hash,
+    )
 
 
 @dataclass(frozen=True)
@@ -434,7 +536,11 @@ class TaskAdvancementEvidence:
 
     @property
     def state(self) -> str:
-        return "PENDING" if self.advancement.state == "ACCEPTANCE_PENDING" else self.advancement.state
+        return (
+            "PENDING"
+            if self.advancement.state == "ACCEPTANCE_PENDING"
+            else self.advancement.state
+        )
 
     @property
     def terminal(self) -> bool:
@@ -471,8 +577,17 @@ def advance_task(
     if result.card.identity != card.identity:
         raise TaskValidationError("result is not for the supplied task card")
     if review is None or acceptance is None:
-        return TaskAdvancement("ACCEPTANCE_PENDING", False, card.card_id, card.revision, result.content_sha256)
-    if review.card.identity != card.identity or acceptance.card.identity != card.identity:
+        return TaskAdvancement(
+            "ACCEPTANCE_PENDING",
+            False,
+            card.card_id,
+            card.revision,
+            result.content_sha256,
+        )
+    if (
+        review.card.identity != card.identity
+        or acceptance.card.identity != card.identity
+    ):
         raise TaskValidationError("review/acceptance is not for the supplied task card")
     if review.result_sha256 != result.content_sha256:
         raise TaskValidationError("completion review result identity does not match")
@@ -493,26 +608,40 @@ def advance_task(
     )
 
 
-def _read_fixed_artifact(workspace: Path, filename: str) -> tuple[Mapping[str, Any], bytes] | None:
+def _read_fixed_artifact(
+    workspace: Path, filename: str
+) -> tuple[Mapping[str, Any], bytes] | None:
     path = workspace / filename
     if path.is_symlink():
-        raise TaskValidationError(f"task advancement artifact {filename} must be a regular file")
+        raise TaskValidationError(
+            f"task advancement artifact {filename} must be a regular file"
+        )
     if not path.exists():
         return None
     if not path.is_file():
-        raise TaskValidationError(f"task advancement artifact {filename} must be a regular file")
+        raise TaskValidationError(
+            f"task advancement artifact {filename} must be a regular file"
+        )
     try:
         raw_bytes = path.read_bytes()
     except OSError as exc:
-        raise TaskValidationError(f"cannot read task advancement artifact {filename}: {exc}") from exc
+        raise TaskValidationError(
+            f"cannot read task advancement artifact {filename}: {exc}"
+        ) from exc
     if len(raw_bytes) > 1024 * 1024:
-        raise TaskValidationError(f"task advancement artifact {filename} exceeds the 1 MiB limit")
+        raise TaskValidationError(
+            f"task advancement artifact {filename} exceeds the 1 MiB limit"
+        )
     try:
         value = json.loads(raw_bytes.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TaskValidationError(f"task advancement artifact {filename} is not valid UTF-8 JSON: {exc}") from exc
+        raise TaskValidationError(
+            f"task advancement artifact {filename} is not valid UTF-8 JSON: {exc}"
+        ) from exc
     if not isinstance(value, Mapping):
-        raise TaskValidationError(f"task advancement artifact {filename} must contain an object")
+        raise TaskValidationError(
+            f"task advancement artifact {filename} must contain an object"
+        )
     return value, raw_bytes
 
 
@@ -529,12 +658,18 @@ def read_task_advancement(
     """
 
     review_artifact = _read_fixed_artifact(workspace, COMPLETION_REVIEW_FILENAME)
-    acceptance_artifact = _read_fixed_artifact(workspace, ORCHESTRATOR_ACCEPTANCE_FILENAME)
+    acceptance_artifact = _read_fixed_artifact(
+        workspace, ORCHESTRATOR_ACCEPTANCE_FILENAME
+    )
     if review_artifact is None and acceptance_artifact is None:
         advancement = advance_task(card, result)
         return TaskAdvancementEvidence(advancement, None, None)
     if review_artifact is None or acceptance_artifact is None:
-        missing = COMPLETION_REVIEW_FILENAME if review_artifact is None else ORCHESTRATOR_ACCEPTANCE_FILENAME
+        missing = (
+            COMPLETION_REVIEW_FILENAME
+            if review_artifact is None
+            else ORCHESTRATOR_ACCEPTANCE_FILENAME
+        )
         raise TaskValidationError(
             f"task advancement chain is incomplete: {missing} is missing; publish both fixed artifacts together"
         )

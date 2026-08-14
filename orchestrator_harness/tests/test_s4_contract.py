@@ -64,7 +64,9 @@ class S4ContractTests(unittest.TestCase):
                         self.fail("root reproduction read the named hook resource")
                     return data
 
-                with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+                with patch.object(
+                    codex_adapter, "_package_resource", side_effect=substitute
+                ):
                     with self.assertRaises(CodexAdapterError):
                         codex_adapter.packaged_codex_assets()
                 self.assertEqual(["manifest.json"], calls)
@@ -84,18 +86,28 @@ class S4ContractTests(unittest.TestCase):
                 )
             return data
 
-        with patch.object(codex_adapter, "_package_resource", side_effect=crlf_resource):
+        with patch.object(
+            codex_adapter, "_package_resource", side_effect=crlf_resource
+        ):
             assets = codex_adapter.packaged_codex_assets()
         for relative, resource in (
-            (Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), "orchestrator_harness_post_tool_use.py"),
-            (Path(".codex/hooks/orchestrator_harness_stop.py"), "orchestrator_harness_stop.py"),
+            (
+                Path(".codex/hooks/orchestrator_harness_post_tool_use.py"),
+                "orchestrator_harness_post_tool_use.py",
+            ),
+            (
+                Path(".codex/hooks/orchestrator_harness_stop.py"),
+                "orchestrator_harness_stop.py",
+            ),
         ):
             expected = original_resource(resource)
             self.assertEqual(expected, assets[relative])
             self.assertNotIn(b"\r\n", assets[relative])
             self.assertNotIn(b"\r", assets[relative])
 
-    def test_S4_CODEX_PACKAGED_ASSET_INTEGRITY_REJECTS_NONCANONICAL_INPUT_001(self) -> None:
+    def test_S4_CODEX_PACKAGED_ASSET_INTEGRITY_REJECTS_NONCANONICAL_INPUT_001(
+        self,
+    ) -> None:
         original_resource = codex_adapter._package_resource
         resource_name = "orchestrator_harness_post_tool_use.py"
         original = original_resource(resource_name)
@@ -105,7 +117,9 @@ class S4ContractTests(unittest.TestCase):
                 data = original_resource(name)
                 return transform(data) if name == resource_name else data
 
-            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+            with patch.object(
+                codex_adapter, "_package_resource", side_effect=substitute
+            ):
                 with self.assertRaises(CodexAdapterError):
                     codex_adapter.packaged_codex_assets()
 
@@ -135,7 +149,9 @@ class S4ContractTests(unittest.TestCase):
                     entry["content_mode"] = mode_marker
                 return json.dumps(manifest).encode("utf-8")
 
-            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+            with patch.object(
+                codex_adapter, "_package_resource", side_effect=substitute
+            ):
                 with self.assertRaises(CodexAdapterError):
                     codex_adapter.packaged_codex_assets()
 
@@ -164,7 +180,9 @@ class S4ContractTests(unittest.TestCase):
                     self.fail(f"unsafe {field} was read as a hook resource: {value!r}")
                 return data
 
-            with patch.object(codex_adapter, "_package_resource", side_effect=substitute):
+            with patch.object(
+                codex_adapter, "_package_resource", side_effect=substitute
+            ):
                 with self.assertRaises(CodexAdapterError):
                     codex_adapter.packaged_codex_assets()
             self.assertEqual(["manifest.json"], calls)
@@ -190,9 +208,13 @@ class S4ContractTests(unittest.TestCase):
                     expect_rejected(field, value)
 
         assets = codex_adapter.packaged_codex_assets()
-        self.assertIn(Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), assets)
+        self.assertIn(
+            Path(".codex/hooks/orchestrator_harness_post_tool_use.py"), assets
+        )
         self.assertIn(Path(".codex/hooks/orchestrator_harness_stop.py"), assets)
-        self.assertEqual(Path("nested/file.py"), mutation.safe_relative_path("nested/file.py"))
+        self.assertEqual(
+            Path("nested/file.py"), mutation.safe_relative_path("nested/file.py")
+        )
 
     def test_S4_R10_SHARED_RELATIVE_CLASSIFIER_AND_ABSOLUTE_CONTROLS_001(self) -> None:
         dangerous = (
@@ -243,9 +265,15 @@ class S4ContractTests(unittest.TestCase):
                 raise AssertionError("dangerous mutation reached a filesystem seam")
 
             with ExitStack() as stack:
-                stack.enter_context(patch.object(mutation, "_validate_chain", side_effect=observed))
-                stack.enter_context(patch.object(mutation, "_capture_path", side_effect=observed))
-                stack.enter_context(patch.object(mutation, "open_append_file", side_effect=observed))
+                stack.enter_context(
+                    patch.object(mutation, "_validate_chain", side_effect=observed)
+                )
+                stack.enter_context(
+                    patch.object(mutation, "_capture_path", side_effect=observed)
+                )
+                stack.enter_context(
+                    patch.object(mutation, "open_append_file", side_effect=observed)
+                )
                 for value in dangerous:
                     with self.subTest(value=value):
                         with self.assertRaises(mutation.MutationConflict):
@@ -272,7 +300,9 @@ class S4ContractTests(unittest.TestCase):
             guard = codex_adapter._ProjectMutationGuard(project)
 
             def observed(*args, **kwargs):
-                raise AssertionError("dangerous guard path reached an observation or mutation seam")
+                raise AssertionError(
+                    "dangerous guard path reached an observation or mutation seam"
+                )
 
             operations = (
                 ("path", lambda value: guard.path(value)),
@@ -285,12 +315,28 @@ class S4ContractTests(unittest.TestCase):
                 ("restore", lambda value: guard.restore(value, b"data")),
             )
             with ExitStack() as stack:
-                stack.enter_context(patch.object(guard, "_check_project_identity", side_effect=observed))
-                stack.enter_context(patch.object(codex_adapter.os.path, "lexists", side_effect=observed))
-                stack.enter_context(patch.object(codex_adapter, "capture_target", side_effect=observed))
-                stack.enter_context(patch.object(codex_adapter, "ensure_directory_path", side_effect=observed))
-                stack.enter_context(patch.object(codex_adapter, "mutation_replace", side_effect=observed))
-                stack.enter_context(patch.object(codex_adapter, "mutation_delete", side_effect=observed))
+                stack.enter_context(
+                    patch.object(guard, "_check_project_identity", side_effect=observed)
+                )
+                stack.enter_context(
+                    patch.object(codex_adapter.os.path, "lexists", side_effect=observed)
+                )
+                stack.enter_context(
+                    patch.object(codex_adapter, "capture_target", side_effect=observed)
+                )
+                stack.enter_context(
+                    patch.object(
+                        codex_adapter, "ensure_directory_path", side_effect=observed
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        codex_adapter, "mutation_replace", side_effect=observed
+                    )
+                )
+                stack.enter_context(
+                    patch.object(codex_adapter, "mutation_delete", side_effect=observed)
+                )
                 for operation, invoke in operations:
                     for value in dangerous:
                         with self.subTest(operation=operation, value=value):
@@ -298,8 +344,13 @@ class S4ContractTests(unittest.TestCase):
                                 invoke(value)
 
             (project / "nested").mkdir()
-            self.assertEqual(project / "nested" / "file.py", guard.path(project / "nested" / "file.py"))
-            self.assertEqual(Path("nested/file.py"), guard._relative(project / "nested" / "file.py"))
+            self.assertEqual(
+                project / "nested" / "file.py",
+                guard.path(project / "nested" / "file.py"),
+            )
+            self.assertEqual(
+                Path("nested/file.py"), guard._relative(project / "nested" / "file.py")
+            )
 
     def _router(self, root: Path, *, session: str = "session-s4") -> ManagerEventRouter:
         return ManagerEventRouter(
@@ -311,14 +362,18 @@ class S4ContractTests(unittest.TestCase):
             registration_id="registration-s4",
         )
 
-    def _adapter(self, root: Path, *, session: str = "session-s4") -> tuple[CodexAdapter, DeliveryCoordinator, SyntheticCodexTransport]:
+    def _adapter(
+        self, root: Path, *, session: str = "session-s4"
+    ) -> tuple[CodexAdapter, DeliveryCoordinator, SyntheticCodexTransport]:
         router = self._router(root, session=session)
         transport = SyntheticCodexTransport()
         adapter = create_codex_adapter(router, transport=transport)
         return adapter, adapter.coordinator, transport
 
     @staticmethod
-    def _event(event_id: str, *, priority: int = 2, severity: str = "warning") -> dict[str, object]:
+    def _event(
+        event_id: str, *, priority: int = 2, severity: str = "warning"
+    ) -> dict[str, object]:
         return {
             "event_id": event_id,
             "type": "MANAGER_SIGNAL",
@@ -346,16 +401,42 @@ class S4ContractTests(unittest.TestCase):
 
         workspace = lane / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
-        common = Path(subprocess.run(["git", "-C", str(lane), "rev-parse", "--git-common-dir"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
+        common = Path(
+            subprocess.run(
+                ["git", "-C", str(lane), "rev-parse", "--git-common-dir"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+        )
         if not common.is_absolute():
             common = (lane / common).resolve()
-        branch = subprocess.run(["git", "-C", str(lane), "symbolic-ref", "--short", "HEAD"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
-        exclude = Path(subprocess.run(["git", "-C", str(lane), "rev-parse", "--git-path", "info/exclude"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
+        branch = subprocess.run(
+            ["git", "-C", str(lane), "symbolic-ref", "--short", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        exclude = Path(
+            subprocess.run(
+                ["git", "-C", str(lane), "rev-parse", "--git-path", "info/exclude"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+        )
         if not exclude.is_absolute():
             exclude = lane / exclude
-        existing_exclude = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        existing_exclude = (
+            exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        )
         if ".agent-workspace/" not in existing_exclude:
-            exclude.write_text(existing_exclude + ".agent-workspace/\n", encoding="utf-8")
+            exclude.write_text(
+                existing_exclude + ".agent-workspace/\n", encoding="utf-8"
+            )
         prompt = workspace / "repair-004-prompt.md"
         prompt.write_text("synthetic production lifecycle prompt\n", encoding="utf-8")
         fake = root / "fake-provider.py"
@@ -390,13 +471,19 @@ class S4ContractTests(unittest.TestCase):
             },
             "exclusive_resources": [],
             "repository": {
-                "common_dir": str(common.resolve()), "worktree_root": str(lane.resolve()),
-                "branch": branch, "base_commit": revision,
+                "common_dir": str(common.resolve()),
+                "worktree_root": str(lane.resolve()),
+                "branch": branch,
+                "base_commit": revision,
             },
             "codex": {
-                "model": "synthetic", "reasoning_effort": "medium", "service_tier": "priority",
-                "command": [sys.executable, str(fake)], "config_overrides": [],
-                "sandbox": "workspace-write", "approval_policy": "never",
+                "model": "synthetic",
+                "reasoning_effort": "medium",
+                "service_tier": "priority",
+                "command": [sys.executable, str(fake)],
+                "config_overrides": [],
+                "sandbox": "workspace-write",
+                "approval_policy": "never",
             },
         }
         invocation.write_text(json.dumps(value), encoding="utf-8")
@@ -418,7 +505,9 @@ class S4ContractTests(unittest.TestCase):
             router = self._router(root / "manager", session="installed-session")
             activate_codex_binding(project, router)
             router.admit(self._event("installed-hook"))
-            hook = project / ".codex" / "hooks" / "orchestrator_harness_post_tool_use.py"
+            hook = (
+                project / ".codex" / "hooks" / "orchestrator_harness_post_tool_use.py"
+            )
             env = os.environ.copy()
             repo_root = str(Path(__file__).resolve().parents[2])
             env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
@@ -513,8 +602,12 @@ class S4ContractTests(unittest.TestCase):
                 coordinator.notice_for_wake(wrong)
             receipt = coordinator.deliver_at_boundary(notice)
             self.assertEqual("DELIVERED", receipt.outcome)
-            self.assertEqual(["replay"], [item["event_id"] for item in coordinator.pending_events()])
-            restored = create_codex_adapter(self._router(manager), transport=SyntheticCodexTransport()).coordinator
+            self.assertEqual(
+                ["replay"], [item["event_id"] for item in coordinator.pending_events()]
+            )
+            restored = create_codex_adapter(
+                self._router(manager), transport=SyntheticCodexTransport()
+            ).coordinator
             restored.register()
             replayed = restored.notice_for_wake()
             self.assertEqual(notice.notice_id, replayed.notice_id)
@@ -526,10 +619,23 @@ class S4ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             _, coordinator, _ = self._adapter(Path(raw) / "manager")
             coordinator.register()
-            self.assertIsNone(coordinator.router.admit({"event_id": "observed", "type": "RAW_OUTPUT", "identity": "raw", "data": {}}))
-            coordinator.router.admit(self._event("routine", priority=5, severity="info"))
+            self.assertIsNone(
+                coordinator.router.admit(
+                    {
+                        "event_id": "observed",
+                        "type": "RAW_OUTPUT",
+                        "identity": "raw",
+                        "data": {},
+                    }
+                )
+            )
+            coordinator.router.admit(
+                self._event("routine", priority=5, severity="info")
+            )
             notice = coordinator.notice_for_wake()
-            coordinator.router.admit(self._event("urgent", priority=0, severity="critical"))
+            coordinator.router.admit(
+                self._event("urgent", priority=0, severity="critical")
+            )
             coalesced = coordinator.notice_for_wake()
             self.assertEqual(notice.notice_id, coalesced.notice_id)
             self.assertEqual(2, coalesced.pending_count)
@@ -555,20 +661,26 @@ class S4ContractTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["watch", "--managed"])
-        recovery = watcher_recovery_projection([
-            {"alert_id": "a", "state": "open"},
-            {"alert_id": "a", "state": "acknowledged"},
-            {"alert_id": "b", "state": "resolved"},
-        ])
+        recovery = watcher_recovery_projection(
+            [
+                {"alert_id": "a", "state": "open"},
+                {"alert_id": "a", "state": "acknowledged"},
+                {"alert_id": "b", "state": "resolved"},
+            ]
+        )
         self.assertEqual(["a"], recovery["actionable"])
 
     def test_S4_CONFIG_MIGRATION_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "config.json"
-            path.write_text(json.dumps({"request_warning_seconds": 1.5}), encoding="utf-8")
+            path.write_text(
+                json.dumps({"request_warning_seconds": 1.5}), encoding="utf-8"
+            )
             with self.assertRaises(ConfigError):
                 load_config(path, harness_root=Path(raw))
-            path.write_text(json.dumps({"manager_heartbeat_timeout_seconds": 420}), encoding="utf-8")
+            path.write_text(
+                json.dumps({"manager_heartbeat_timeout_seconds": 420}), encoding="utf-8"
+            )
             config = load_config(path, harness_root=Path(raw))
             self.assertTrue(config.migration_diagnostics)
 
@@ -577,8 +689,16 @@ class S4ContractTests(unittest.TestCase):
             root = Path(raw)
             source = root / "source"
             source.mkdir()
+
             def git(*args: str) -> str:
-                return subprocess.run(["git", "-C", str(source), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+                return subprocess.run(
+                    ["git", "-C", str(source), *args],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+
             git("init", "--initial-branch", "main")
             git("config", "user.email", "s4@example.invalid")
             git("config", "user.name", "S4")
@@ -606,8 +726,16 @@ class S4ContractTests(unittest.TestCase):
             root = Path(raw)
             main = root / "main"
             main.mkdir()
+
             def git(cwd: Path, *args: str) -> str:
-                return subprocess.run(["git", "-C", str(cwd), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+                return subprocess.run(
+                    ["git", "-C", str(cwd), *args],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+
             git(main, "init", "--initial-branch", "main")
             git(main, "config", "user.email", "s4@example.invalid")
             git(main, "config", "user.name", "S4")
@@ -620,7 +748,14 @@ class S4ContractTests(unittest.TestCase):
             refs = []
             evidence = root / "evidence"
             evidence.mkdir()
-            for name in ("task", "result", "findings", "acceptance", "transcript", "dependency"):
+            for name in (
+                "task",
+                "result",
+                "findings",
+                "acceptance",
+                "transcript",
+                "dependency",
+            ):
                 path = evidence / f"{name}.json"
                 path.write_text("{}\n", encoding="utf-8")
                 refs.append(path)
@@ -631,7 +766,10 @@ class S4ContractTests(unittest.TestCase):
                 exclude = lane / exclude
             exclude.write_text(".agent-workspace/\n", encoding="utf-8")
             self._publish_lifecycle_record(
-                root, lane, lane_id="S4.P", revision=revision,
+                root,
+                lane,
+                lane_id="S4.P",
+                revision=revision,
             )
             with patch(
                 "orchestrator_harness.lane_lifecycle.process_snapshot",
@@ -641,18 +779,27 @@ class S4ContractTests(unittest.TestCase):
                     lane,
                     root / "archive",
                     lane_id="S4.P",
-                    task_ref=refs[0], result_ref=refs[1], findings_ref=refs[2],
-                    acceptance_ref=refs[3], transcript_ref=refs[4], dependency_ref=refs[5],
+                    task_ref=refs[0],
+                    result_ref=refs[1],
+                    findings_ref=refs[2],
+                    acceptance_ref=refs[3],
+                    transcript_ref=refs[4],
+                    dependency_ref=refs[5],
                 )
             self.assertEqual("CLOSED", result.outcome)
             self.assertFalse(lane.exists())
-            self.assertEqual("orchestrator-lane-archive/v1", validate_lane_archive(result.archive_path)["schema"])
+            self.assertEqual(
+                "orchestrator-lane-archive/v1",
+                validate_lane_archive(result.archive_path)["schema"],
+            )
 
             dirty = root / "dirty"
             git(main, "worktree", "add", "-b", "s4-dirty", str(dirty), "HEAD")
             (dirty / "tracked.txt").write_text("dirty\n", encoding="utf-8")
             blocked = retire_terminal_lane(
-                dirty, root / "archive-dirty", lane_id="dirty",
+                dirty,
+                root / "archive-dirty",
+                lane_id="dirty",
             )
             self.assertEqual("VISIBLE", blocked.outcome)
             self.assertTrue(dirty.exists())
@@ -665,7 +812,9 @@ class S4ContractTests(unittest.TestCase):
             _, coordinator, _ = self._adapter(manager)
             coordinator.register()
             coordinator.router.admit(self._event("helper"))
-            restarted = create_codex_adapter(self._router(manager), transport=SyntheticCodexTransport()).coordinator
+            restarted = create_codex_adapter(
+                self._router(manager), transport=SyntheticCodexTransport()
+            ).coordinator
             restarted.register()
             self.assertEqual(1, len(restarted.pending_events()))
             self.assertFalse(restarted.close_binding())

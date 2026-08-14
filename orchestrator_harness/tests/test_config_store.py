@@ -7,7 +7,12 @@ import unittest
 from unittest.mock import patch
 
 from orchestrator_harness.cli import _store
-from orchestrator_harness.config import ConfigError, load_config, path_identity, same_path
+from orchestrator_harness.config import (
+    ConfigError,
+    load_config,
+    path_identity,
+    same_path,
+)
 from orchestrator_harness.stable_io import (
     PathSafetyError,
     SafeOutput,
@@ -33,7 +38,9 @@ class ConfigAndStoreTests(unittest.TestCase):
         if os.name == "nt":
             self.assertTrue(same_path(str(left).upper(), str(left).lower()))
         else:
-            self.assertNotEqual(path_identity(str(left).upper()), path_identity(str(left).lower()))
+            self.assertNotEqual(
+                path_identity(str(left).upper()), path_identity(str(left).lower())
+            )
 
     def test_config_accepts_bounded_record_declarations(self) -> None:
         write_json(
@@ -45,7 +52,9 @@ class ConfigAndStoreTests(unittest.TestCase):
                 "record_manifests": ["record-manifest.json"],
             },
         )
-        config = load_config(self.fixture.config_path, harness_root=self.fixture.harness_root)
+        config = load_config(
+            self.fixture.config_path, harness_root=self.fixture.harness_root
+        )
         self.assertEqual(("nested/helper.json",), config.record_paths)
         self.assertEqual(("record-manifest.json",), config.record_manifests)
 
@@ -82,9 +91,15 @@ class ConfigAndStoreTests(unittest.TestCase):
         allowed = self.fixture.suite_root / "multi-agent-logs" / "epoch"
         write_json(
             self.fixture.config_path,
-            {"suite_root": str(self.fixture.suite_root), "run_globs": ["runs/*"], "output_dir": str(allowed)},
+            {
+                "suite_root": str(self.fixture.suite_root),
+                "run_globs": ["runs/*"],
+                "output_dir": str(allowed),
+            },
         )
-        config = load_config(self.fixture.config_path, harness_root=self.fixture.harness_root)
+        config = load_config(
+            self.fixture.config_path, harness_root=self.fixture.harness_root
+        )
         self.assertEqual(allowed, _store(config).output_root)
 
         for forbidden in (
@@ -93,9 +108,15 @@ class ConfigAndStoreTests(unittest.TestCase):
         ):
             write_json(
                 self.fixture.config_path,
-                {"suite_root": str(self.fixture.suite_root), "run_globs": ["runs/*"], "output_dir": str(forbidden)},
+                {
+                    "suite_root": str(self.fixture.suite_root),
+                    "run_globs": ["runs/*"],
+                    "output_dir": str(forbidden),
+                },
             )
-            config = load_config(self.fixture.config_path, harness_root=self.fixture.harness_root)
+            config = load_config(
+                self.fixture.config_path, harness_root=self.fixture.harness_root
+            )
             with self.assertRaises(PathSafetyError):
                 _store(config)
 

@@ -88,19 +88,19 @@ class SuiteFixture:
     ) -> Path:
         path = self.workspace(run) / f"{label}_controller.status.json"
         value = {
-                "state": state,
-                "controller_pid": controller_pid,
-                "codex_pid": codex_pid,
-                "doer": doer,
-                "task": task,
-                "phase": "synthetic",
-                "thread_id": f"thread-{doer.lower()}",
-                "started_utc": iso_utc(started),
-                "controller_started_utc": iso_utc(started),
-                "codex_started_utc": iso_utc(started),
-                "board_tokens": board_tokens or [],
-                "mcp_servers": mcp_servers or [],
-            }
+            "state": state,
+            "controller_pid": controller_pid,
+            "codex_pid": codex_pid,
+            "doer": doer,
+            "task": task,
+            "phase": "synthetic",
+            "thread_id": f"thread-{doer.lower()}",
+            "started_utc": iso_utc(started),
+            "controller_started_utc": iso_utc(started),
+            "codex_started_utc": iso_utc(started),
+            "board_tokens": board_tokens or [],
+            "mcp_servers": mcp_servers or [],
+        }
         if declared_lane_id is not None:
             value["declared_lane_id"] = declared_lane_id
         write_json(
@@ -193,7 +193,9 @@ class TemporaryGitRepository:
     def common_dir(self) -> Path:
         value = self.git("rev-parse", "--git-common-dir")
         path = Path(value)
-        return (self.root / path).resolve() if not path.is_absolute() else path.resolve()
+        return (
+            (self.root / path).resolve() if not path.is_absolute() else path.resolve()
+        )
 
     @property
     def head(self) -> str:

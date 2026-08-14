@@ -230,7 +230,10 @@ class HandoffPreflightTests(unittest.TestCase):
         write_json(review_path, review)
         self.assertGreater(review_path.stat().st_size, 2 * 1024 * 1024)
         review_hash = hashlib.sha256(review_path.read_bytes()).hexdigest()
-        dependency_map = cast(dict[str, object], json.loads(self.dependency_map_path.read_text(encoding="utf-8")))
+        dependency_map = cast(
+            dict[str, object],
+            json.loads(self.dependency_map_path.read_text(encoding="utf-8")),
+        )
         dependency_map["amendment"] = {
             "review_path": str(review_path),
             "review_sha256": review_hash,

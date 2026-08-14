@@ -74,7 +74,9 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _json_object(path: Path, *, max_bytes: int | None = 2 * 1024 * 1024) -> tuple[dict[str, object], str]:
+def _json_object(
+    path: Path, *, max_bytes: int | None = 2 * 1024 * 1024
+) -> tuple[dict[str, object], str]:
     if path.is_symlink() or not path.is_file():
         raise ValueError("path is not a regular non-symlink file")
     data = path.read_bytes()
@@ -264,9 +266,17 @@ def _check_amendment_identity(
     review_path = Path(review_path_value).expanduser().resolve(strict=False)
     try:
         review, actual_hash = _json_object(review_path, max_bytes=None)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         failures.append(
-            _failure("RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc))
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc)
+            )
         )
         return
     if actual_hash != review_hash.lower():
@@ -302,7 +312,9 @@ def _check_amendment_identity(
             )
         )
     declared_disposition = _text(amendment.get("disposition"))
-    if declared_disposition is not None and declared_disposition != _text(review.get("disposition")):
+    if declared_disposition is not None and declared_disposition != _text(
+        review.get("disposition")
+    ):
         failures.append(
             _failure(
                 "RESUME_AMENDMENT_IDENTITY",
@@ -320,7 +332,9 @@ def _check_amendment_identity(
         )
     except (OSError, TypeError, ValueError) as exc:
         failures.append(
-            _failure("RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc))
+            _failure(
+                "RESUME_AMENDMENT_IDENTITY", REPORT_ONLY_ERROR, "amendment", str(exc)
+            )
         )
 
 

@@ -1,4 +1,5 @@
 """Exact, reusable child cleanup for coding lane controllers."""
+
 from __future__ import annotations
 
 import ctypes
@@ -49,10 +50,21 @@ def _windows_job_api() -> tuple[Any, ...]:
     assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     assign.restype = wintypes.BOOL
     set_info = kernel32.SetInformationJobObject
-    set_info.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    set_info.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
     set_info.restype = wintypes.BOOL
     query = kernel32.QueryInformationJobObject
-    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    query.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
     query.restype = wintypes.BOOL
     terminate = kernel32.TerminateJobObject
     terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -75,19 +87,32 @@ def _enable_linux_subreaper() -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         prctl = libc.prctl
-        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
         prctl.restype = ctypes.c_int
         if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
             error = ctypes.get_errno()
             raise ProcessBoundaryUnsupported(f"PR_SET_CHILD_SUBREAPER failed ({error})")
         value = ctypes.c_ulong(0)
-        if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(value), 0, 0, 0) != 0 or value.value != 1:
+        if (
+            prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(value), 0, 0, 0) != 0
+            or value.value != 1
+        ):
             error = ctypes.get_errno()
-            raise ProcessBoundaryUnsupported(f"PR_GET_CHILD_SUBREAPER did not confirm adoption ({error})")
+            raise ProcessBoundaryUnsupported(
+                f"PR_GET_CHILD_SUBREAPER did not confirm adoption ({error})"
+            )
     except ProcessBoundaryUnsupported:
         raise
     except Exception as exc:
-        raise ProcessBoundaryUnsupported(f"Linux subreaper setup failed: {exc}") from exc
+        raise ProcessBoundaryUnsupported(
+            f"Linux subreaper setup failed: {exc}"
+        ) from exc
 
 
 class ProcessBoundary:
@@ -118,7 +143,9 @@ class ProcessBoundary:
                 create, _, set_info, _, _, close, _, wintypes = _windows_job_api()
                 handle = create(None, None)
                 if not handle or handle == ctypes.c_void_p(-1).value:
-                    raise ProcessBoundaryUnsupported(f"CreateJobObjectW failed ({ctypes.get_last_error()})")
+                    raise ProcessBoundaryUnsupported(
+                        f"CreateJobObjectW failed ({ctypes.get_last_error()})"
+                    )
 
                 class _BasicLimitInformation(ctypes.Structure):
                     _fields_ = [
@@ -134,7 +161,14 @@ class ProcessBoundary:
                     ]
 
                 class _IoCounters(ctypes.Structure):
-                    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong), ("WriteOperationCount", ctypes.c_ulonglong), ("OtherOperationCount", ctypes.c_ulonglong), ("ReadTransferCount", ctypes.c_ulonglong), ("WriteTransferCount", ctypes.c_ulonglong), ("OtherTransferCount", ctypes.c_ulonglong)]
+                    _fields_ = [
+                        ("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong),
+                    ]
 
                 class _ExtendedLimitInformation(ctypes.Structure):
                     _fields_ = [
@@ -147,11 +181,15 @@ class ProcessBoundary:
                     ]
 
                 limits = _ExtendedLimitInformation()
-                limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                limits.BasicLimitInformation.LimitFlags = (
+                    0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                )
                 if not set_info(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
                     error = ctypes.get_last_error()
                     close(handle)
-                    raise ProcessBoundaryUnsupported(f"SetInformationJobObject failed ({error})")
+                    raise ProcessBoundaryUnsupported(
+                        f"SetInformationJobObject failed ({error})"
+                    )
                 boundary._job_handle = handle
                 boundary.identity = f"job:{int(handle):x}"
                 return boundary
@@ -163,7 +201,9 @@ class ProcessBoundary:
                         _windows_job_api()[5](boundary._job_handle)
                     except Exception:
                         pass
-                raise ProcessBoundaryUnsupported(f"Windows Job Object setup failed: {exc}") from exc
+                raise ProcessBoundaryUnsupported(
+                    f"Windows Job Object setup failed: {exc}"
+                ) from exc
         if os.name == "posix" and os.path.isdir("/proc"):
             _enable_linux_subreaper()
             boundary = cls(kind="linux-subreaper")
@@ -175,10 +215,14 @@ class ProcessBoundary:
                     break
                 time.sleep(0.01)
             if snapshot is None:
-                raise ProcessBoundaryUnsupported("complete Linux process baseline is unavailable")
+                raise ProcessBoundaryUnsupported(
+                    "complete Linux process baseline is unavailable"
+                )
             boundary._baseline = snapshot
             return boundary
-        raise ProcessBoundaryUnsupported("no complete process boundary is supported on this host")
+        raise ProcessBoundaryUnsupported(
+            "no complete process boundary is supported on this host"
+        )
 
     @property
     def popen_kwargs(self) -> dict[str, Any]:
@@ -198,11 +242,17 @@ class ProcessBoundary:
             raise ProcessBoundaryUnsupported("provider PID is invalid")
         if self.kind == "windows-job":
             if self._job_handle is None:
-                raise ProcessBoundaryUnsupported("Windows Job Object handle is unavailable")
+                raise ProcessBoundaryUnsupported(
+                    "Windows Job Object handle is unavailable"
+                )
             _, assign, _, _, _, _, resume, wintypes = _windows_job_api()
             process_handle = getattr(process, "_handle", None)
-            if process_handle is None or not assign(self._job_handle, wintypes.HANDLE(process_handle)):
-                raise ProcessBoundaryUnsupported(f"AssignProcessToJobObject failed ({ctypes.get_last_error()})")
+            if process_handle is None or not assign(
+                self._job_handle, wintypes.HANDLE(process_handle)
+            ):
+                raise ProcessBoundaryUnsupported(
+                    f"AssignProcessToJobObject failed ({ctypes.get_last_error()})"
+                )
             status = resume(wintypes.HANDLE(process_handle))
             if status != 0:
                 raise ProcessBoundaryUnsupported(f"NtResumeProcess failed ({status})")
@@ -212,7 +262,9 @@ class ProcessBoundary:
                 self._group_id = os.getpgid(pid)
                 self._session_id = os.getsid(pid)
             except OSError as exc:
-                raise ProcessBoundaryUnsupported(f"process group/session identity unavailable: {exc}") from exc
+                raise ProcessBoundaryUnsupported(
+                    f"process group/session identity unavailable: {exc}"
+                ) from exc
             if self._session_id <= 0:
                 raise ProcessBoundaryUnsupported("provider session identity is invalid")
             self.identity = f"subreaper:pgid:{self._group_id}:sid:{self._session_id}"
@@ -228,11 +280,22 @@ class ProcessBoundary:
 
     @property
     def history(self) -> tuple[ProcessInfo, ...]:
-        return tuple(sorted(self._history.values(), key=lambda item: (item.pid, iso_utc(item.created_utc) or "")))
+        return tuple(
+            sorted(
+                self._history.values(),
+                key=lambda item: (item.pid, iso_utc(item.created_utc) or ""),
+            )
+        )
 
     def inventory(self) -> ProcessBoundaryInventory:
         if self._closed:
-            return ProcessBoundaryInventory(False, self.kind, self.identity, errors=("boundary is closed",), source="controller")
+            return ProcessBoundaryInventory(
+                False,
+                self.kind,
+                self.identity,
+                errors=("boundary is closed",),
+                source="controller",
+            )
         if self.kind == "windows-job":
             try:
                 _, _, _, query, _, _, _, wintypes = _windows_job_api()
@@ -241,7 +304,9 @@ class ProcessBoundary:
                 max_attempts = 8
                 capacity = 64
 
-                def incomplete(error: str, *, source: str = "job-object") -> ProcessBoundaryInventory:
+                def incomplete(
+                    error: str, *, source: str = "job-object"
+                ) -> ProcessBoundaryInventory:
                     self._inventory_errors.append(error)
                     result = ProcessBoundaryInventory(
                         False,
@@ -276,7 +341,9 @@ class ProcessBoundary:
                                 f"{max_capacity}: assigned={assigned_count}, listed={ids_count}"
                             )
                         if ids_count > capacity:
-                            next_capacity = min(max_capacity, max(capacity * 2, ids_count + 16))
+                            next_capacity = min(
+                                max_capacity, max(capacity * 2, ids_count + 16)
+                            )
                             if next_capacity <= capacity:
                                 return incomplete(
                                     "Job process-list declared count cannot grow capacity "
@@ -288,7 +355,11 @@ class ProcessBoundary:
                             if attempt + 1 < max_attempts:
                                 next_capacity = min(
                                     max_capacity,
-                                    max(capacity * 2, assigned_count + 16, ids_count + 16),
+                                    max(
+                                        capacity * 2,
+                                        assigned_count + 16,
+                                        ids_count + 16,
+                                    ),
                                 )
                                 if next_capacity <= capacity:
                                     return incomplete(
@@ -309,7 +380,13 @@ class ProcessBoundary:
                                 f"{ids_count} PID slots ({returned_size} < {required_bytes})"
                             )
                         pids = [
-                            int.from_bytes(buffer.raw[8 + index * pointer_size:8 + (index + 1) * pointer_size], "little")
+                            int.from_bytes(
+                                buffer.raw[
+                                    8 + index * pointer_size : 8
+                                    + (index + 1) * pointer_size
+                                ],
+                                "little",
+                            )
                             for index in range(ids_count)
                         ]
                         if ids_count == 0:
@@ -328,7 +405,13 @@ class ProcessBoundary:
                         snapshot = process_snapshot()
                         if not snapshot.complete:
                             self._inventory_errors.extend(snapshot.errors)
-                            return ProcessBoundaryInventory(False, self.kind, self.identity, errors=tuple(snapshot.errors), source="job-object+CIM")
+                            return ProcessBoundaryInventory(
+                                False,
+                                self.kind,
+                                self.identity,
+                                errors=tuple(snapshot.errors),
+                                source="job-object+CIM",
+                            )
                         by_pid = snapshot.by_pid
                         member_pids = set(pids)
                         # CIM's Job Object list is authoritative for
@@ -340,7 +423,10 @@ class ProcessBoundary:
                         while changed:
                             changed = False
                             for item in snapshot.processes:
-                                if item.ppid in member_pids and item.pid not in member_pids:
+                                if (
+                                    item.ppid in member_pids
+                                    and item.pid not in member_pids
+                                ):
                                     member_pids.add(item.pid)
                                     changed = True
                         members: list[ProcessInfo] = []
@@ -374,25 +460,64 @@ class ProcessBoundary:
                                     # process, so do not turn normal reaping
                                     # into a false retained claim.
                                     continue
-                                if item is None and pid in history_by_pid and history_by_pid[pid].created_utc is not None:
+                                if (
+                                    item is None
+                                    and pid in history_by_pid
+                                    and history_by_pid[pid].created_utc is not None
+                                ):
                                     # A job can retain a recently reaped PID
                                     # for one query.  It is safe to classify
                                     # that member absent only after this
                                     # boundary observed its exact creation
                                     # identity earlier.
                                     continue
-                                errors.append(f"job member {pid} is absent or lacks creation identity")
+                                errors.append(
+                                    f"job member {pid} is absent or lacks creation identity"
+                                )
                             else:
-                                marked = ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
+                                marked = ProcessInfo(
+                                    item.pid,
+                                    item.ppid,
+                                    item.name,
+                                    item.command_line,
+                                    item.created_utc,
+                                    item.process_group_id,
+                                    item.session_id,
+                                    self.identity,
+                                )
                                 members.append(marked)
                                 self._record(marked)
                         if errors:
                             failure_errors = tuple(errors)
                             self._inventory_errors.extend(failure_errors)
-                            return ProcessBoundaryInventory(False, self.kind, self.identity, tuple(members), self.history, failure_errors, "job-object+CIM")
+                            return ProcessBoundaryInventory(
+                                False,
+                                self.kind,
+                                self.identity,
+                                tuple(members),
+                                self.history,
+                                failure_errors,
+                                "job-object+CIM",
+                            )
                         if self._inventory_errors:
-                            return ProcessBoundaryInventory(False, self.kind, self.identity, tuple(sorted(members, key=lambda item: item.pid)), self.history, tuple(self._inventory_errors), "job-object+CIM")
-                        return ProcessBoundaryInventory(True, self.kind, self.identity, tuple(sorted(members, key=lambda item: item.pid)), self.history, (), "job-object+CIM")
+                            return ProcessBoundaryInventory(
+                                False,
+                                self.kind,
+                                self.identity,
+                                tuple(sorted(members, key=lambda item: item.pid)),
+                                self.history,
+                                tuple(self._inventory_errors),
+                                "job-object+CIM",
+                            )
+                        return ProcessBoundaryInventory(
+                            True,
+                            self.kind,
+                            self.identity,
+                            tuple(sorted(members, key=lambda item: item.pid)),
+                            self.history,
+                            (),
+                            "job-object+CIM",
+                        )
                     last_error = ctypes.get_last_error()
                     if last_error in {24, 122} and attempt + 1 < max_attempts:
                         next_capacity = min(max_capacity, capacity * 2)
@@ -412,11 +537,26 @@ class ProcessBoundary:
                 )
             except ProcessBoundaryUnsupported as exc:
                 self._inventory_errors.append(str(exc))
-                return ProcessBoundaryInventory(False, self.kind, self.identity, errors=(str(exc),), source="job-object")
+                return ProcessBoundaryInventory(
+                    False,
+                    self.kind,
+                    self.identity,
+                    errors=(str(exc),),
+                    source="job-object",
+                )
             except Exception as exc:
                 self._inventory_errors.append(f"job inventory failed: {exc}")
-                return ProcessBoundaryInventory(False, self.kind, self.identity, errors=(f"job inventory failed: {exc}",), source="job-object")
-        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
+                return ProcessBoundaryInventory(
+                    False,
+                    self.kind,
+                    self.identity,
+                    errors=(f"job inventory failed: {exc}",),
+                    source="job-object",
+                )
+        if (
+            self.kind in {"linux-process-group", "linux-subreaper"}
+            and self._group_id is not None
+        ):
             inventory = process_group_inventory(
                 self._group_id,
                 boundary_identity=self.identity,
@@ -427,7 +567,16 @@ class ProcessBoundary:
                 owned_history=self.history,
             )
             for item in inventory.observed_processes + inventory.processes:
-                marked = ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
+                marked = ProcessInfo(
+                    item.pid,
+                    item.ppid,
+                    item.name,
+                    item.command_line,
+                    item.created_utc,
+                    item.process_group_id,
+                    item.session_id,
+                    self.identity,
+                )
                 self._record(marked)
             if inventory.errors:
                 self._inventory_errors.extend(inventory.errors)
@@ -436,7 +585,16 @@ class ProcessBoundary:
                 inventory.boundary_kind,
                 inventory.boundary_identity,
                 tuple(
-                    ProcessInfo(item.pid, item.ppid, item.name, item.command_line, item.created_utc, item.process_group_id, item.session_id, self.identity)
+                    ProcessInfo(
+                        item.pid,
+                        item.ppid,
+                        item.name,
+                        item.command_line,
+                        item.created_utc,
+                        item.process_group_id,
+                        item.session_id,
+                        self.identity,
+                    )
                     for item in inventory.processes
                 ),
                 self.history,
@@ -445,7 +603,13 @@ class ProcessBoundary:
                 self._cleanup_result,
             )
             return self._last_inventory
-        return ProcessBoundaryInventory(False, self.kind, self.identity, errors=("boundary identity is unavailable",), source="controller")
+        return ProcessBoundaryInventory(
+            False,
+            self.kind,
+            self.identity,
+            errors=("boundary identity is unavailable",),
+            source="controller",
+        )
 
     def terminate_owned(self) -> str:
         if self._closed:
@@ -456,13 +620,18 @@ class ProcessBoundary:
             try:
                 _, _, _, _, terminate, _, _, _ = _windows_job_api()
                 if not terminate(self._job_handle, 1):
-                    self._cleanup_result = f"job-termination-failed:{ctypes.get_last_error()}"
+                    self._cleanup_result = (
+                        f"job-termination-failed:{ctypes.get_last_error()}"
+                    )
                 else:
                     self._cleanup_result = "job-terminated"
             except Exception as exc:
                 self._cleanup_result = f"job-termination-failed:{exc}"
             return self._cleanup_result
-        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
+        if (
+            self.kind in {"linux-process-group", "linux-subreaper"}
+            and self._group_id is not None
+        ):
             try:
                 os.killpg(self._group_id, signal.SIGTERM)
                 self._cleanup_result = "process-group-terminated"
@@ -474,7 +643,9 @@ class ProcessBoundary:
         self._cleanup_result = "boundary-identity-unavailable"
         return self._cleanup_result
 
-    def _signal_exact_members(self, inventory: ProcessBoundaryInventory, signum: int) -> None:
+    def _signal_exact_members(
+        self, inventory: ProcessBoundaryInventory, signum: int
+    ) -> None:
         """Signal only members whose current creation identity still matches."""
 
         if os.name != "posix":
@@ -507,7 +678,9 @@ class ProcessBoundary:
             except (ChildProcessError, ProcessLookupError, PermissionError, OSError):
                 continue
 
-    def cleanup_owned(self, *, graceful_timeout_seconds: float, force_timeout_seconds: float) -> ProcessBoundaryInventory:
+    def cleanup_owned(
+        self, *, graceful_timeout_seconds: float, force_timeout_seconds: float
+    ) -> ProcessBoundaryInventory:
         """Terminate, wait, re-inventory, and reap the complete boundary."""
 
         inventory = self.inventory()
@@ -533,7 +706,10 @@ class ProcessBoundary:
             time.sleep(0.05)
 
         self._cleanup_stages.append("BOUNDARY_FORCE_STOP_REQUESTED")
-        if self.kind in {"linux-process-group", "linux-subreaper"} and self._group_id is not None:
+        if (
+            self.kind in {"linux-process-group", "linux-subreaper"}
+            and self._group_id is not None
+        ):
             try:
                 os.killpg(self._group_id, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
@@ -551,7 +727,9 @@ class ProcessBoundary:
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-        self._cleanup_result = "boundary-incomplete" if not inventory.complete else "boundary-not-empty"
+        self._cleanup_result = (
+            "boundary-incomplete" if not inventory.complete else "boundary-not-empty"
+        )
         self._cleanup_stages.append("BOUNDARY_EMPTY_UNPROVEN")
         return inventory
 
@@ -566,7 +744,9 @@ class ProcessBoundary:
                 pass
             self._job_handle = None
 
-    def to_record(self, inventory: ProcessBoundaryInventory | None = None) -> dict[str, Any]:
+    def to_record(
+        self, inventory: ProcessBoundaryInventory | None = None
+    ) -> dict[str, Any]:
         observed = inventory or self.inventory()
         return {
             "schema": PROCESS_BOUNDARY_SCHEMA,
@@ -580,11 +760,19 @@ class ProcessBoundary:
             "group_id": self._group_id,
             "session_id": self._session_id,
             "members": [
-                {"pid": item.pid, "created_utc": iso_utc(item.created_utc), "name": item.name}
+                {
+                    "pid": item.pid,
+                    "created_utc": iso_utc(item.created_utc),
+                    "name": item.name,
+                }
                 for item in observed.observed_processes
             ],
             "live_members": [
-                {"pid": item.pid, "created_utc": iso_utc(item.created_utc), "name": item.name}
+                {
+                    "pid": item.pid,
+                    "created_utc": iso_utc(item.created_utc),
+                    "name": item.name,
+                }
                 for item in observed.processes
             ],
         }
@@ -599,12 +787,21 @@ def _identity_from(value: ProcessInfo | Mapping[str, Any] | None) -> ProcessInfo
     ppid = value.get("ppid", 0)
     created = parse_utc(value.get("created_utc"))
     if (
-        not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-        or not isinstance(ppid, int) or isinstance(ppid, bool)
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(ppid, int)
+        or isinstance(ppid, bool)
         or created is None
     ):
         return None
-    return ProcessInfo(pid, ppid, str(value.get("name") or ""), str(value.get("command_line") or ""), created)
+    return ProcessInfo(
+        pid,
+        ppid,
+        str(value.get("name") or ""),
+        str(value.get("command_line") or ""),
+        created,
+    )
 
 
 @dataclass(frozen=True)
@@ -681,7 +878,9 @@ class ProcessSupervisor:
     _exit_code: int | None = field(init=False, default=None, repr=False)
     _result: CleanupResult | None = field(init=False, default=None, repr=False)
     _boundary_checked: bool = field(init=False, default=False, repr=False)
-    _boundary_inventory: ProcessBoundaryInventory | None = field(init=False, default=None, repr=False)
+    _boundary_inventory: ProcessBoundaryInventory | None = field(
+        init=False, default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.graceful_timeout_seconds < 0:
@@ -695,11 +894,17 @@ class ProcessSupervisor:
     @property
     def pid(self) -> int:
         value = getattr(self.process, "pid", 0)
-        return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+        return (
+            int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+        )
 
     @property
     def creation_identity(self) -> str | None:
-        return iso_utc(self._identity_record.created_utc) if self._identity_record is not None else None
+        return (
+            iso_utc(self._identity_record.created_utc)
+            if self._identity_record is not None
+            else None
+        )
 
     def _observation(self) -> tuple[bool, str | None]:
         """Return whether external exact observation corroborates the bound child."""
@@ -713,7 +918,10 @@ class ProcessSupervisor:
         except TypeError:
             query = self.observer(self.pid)
         except BaseException as exc:
-            return False, f"exact process observation failed: {type(exc).__name__}: {exc}"
+            return (
+                False,
+                f"exact process observation failed: {type(exc).__name__}: {exc}",
+            )
         if not isinstance(query, ProcessQuery):
             return False, "exact process observation returned an invalid result"
         if not query.complete:
@@ -724,14 +932,23 @@ class ProcessSupervisor:
         if query.process is None:
             try:
                 if self.process.poll() is None:
-                    return False, "exact observation says child is absent while owned handle is live"
+                    return (
+                        False,
+                        "exact observation says child is absent while owned handle is live",
+                    )
             except BaseException as exc:
-                return False, f"cannot reconcile absent child observation: {type(exc).__name__}: {exc}"
+                return (
+                    False,
+                    f"cannot reconcile absent child observation: {type(exc).__name__}: {exc}",
+                )
             return True, None
         if query.process.pid != identity.pid:
             return False, "observed child PID does not match owned Popen PID"
         if query.process.created_utc != identity.created_utc:
-            return False, "observed child creation identity does not match owned Popen identity"
+            return (
+                False,
+                "observed child creation identity does not match owned Popen identity",
+            )
         if self.parent_pid is not None and query.process.ppid != self.parent_pid:
             return False, "observed child parent does not match controller identity"
         return True, None
@@ -763,7 +980,9 @@ class ProcessSupervisor:
             boundary_inventory = self._boundary_inventory
             if boundary_inventory is not None:
                 boundary_complete = boundary_inventory.complete
-                owned_boundary_empty = boundary_inventory.complete and not boundary_inventory.processes
+                owned_boundary_empty = (
+                    boundary_inventory.complete and not boundary_inventory.processes
+                )
                 boundary_cleanup = boundary_inventory.cleanup
                 boundary_errors = tuple(boundary_inventory.errors)
                 if boundary_errors:
@@ -776,7 +995,10 @@ class ProcessSupervisor:
             terminate_attempted=terminate_attempted,
             kill_attempted=kill_attempted,
             final_reap=final_reap,
-            cleanup_confirmed=final_reap and owned_boundary_empty and boundary_complete and not identity_uncertain,
+            cleanup_confirmed=final_reap
+            and owned_boundary_empty
+            and boundary_complete
+            and not identity_uncertain,
             identity_verified=identity_verified,
             identity_uncertain=identity_uncertain,
             exit_code=self._exit_code,
@@ -843,16 +1065,28 @@ class ProcessSupervisor:
             errors.append(observation_note)
         if self._identity_record is None or self.pid <= 0:
             self._result = self._result_for(
-                status="IDENTITY_UNCERTAIN", stages=stages,
-                terminate_attempted=False, kill_attempted=False, final_reap=False,
-                identity_verified=False, identity_uncertain=True, reaped_after=None, errors=errors,
+                status="IDENTITY_UNCERTAIN",
+                stages=stages,
+                terminate_attempted=False,
+                kill_attempted=False,
+                final_reap=False,
+                identity_verified=False,
+                identity_uncertain=True,
+                reaped_after=None,
+                errors=errors,
             )
             return self._result
         if not identity_ok:
             self._result = self._result_for(
-                status="IDENTITY_UNCERTAIN", stages=stages,
-                terminate_attempted=False, kill_attempted=False, final_reap=False,
-                identity_verified=False, identity_uncertain=True, reaped_after=None, errors=errors,
+                status="IDENTITY_UNCERTAIN",
+                stages=stages,
+                terminate_attempted=False,
+                kill_attempted=False,
+                final_reap=False,
+                identity_verified=False,
+                identity_uncertain=True,
+                reaped_after=None,
+                errors=errors,
             )
             return self._result
         try:
@@ -867,14 +1101,21 @@ class ProcessSupervisor:
                 self._reaped = True
                 stages.append("FINAL_REAP")
                 self._result = self._result_for(
-                    status="REAPED", stages=stages,
-                    terminate_attempted=False, kill_attempted=False, final_reap=True,
-                    identity_verified=identity_verified, identity_uncertain=identity_uncertain,
-                    reaped_after="already_exited", errors=errors,
+                    status="REAPED",
+                    stages=stages,
+                    terminate_attempted=False,
+                    kill_attempted=False,
+                    final_reap=True,
+                    identity_verified=identity_verified,
+                    identity_uncertain=identity_uncertain,
+                    reaped_after="already_exited",
+                    errors=errors,
                 )
                 return self._result
             except BaseException as exc:
-                errors.append(f"already-exited reap failed: {type(exc).__name__}: {exc}")
+                errors.append(
+                    f"already-exited reap failed: {type(exc).__name__}: {exc}"
+                )
 
         stages.append("GRACEFUL_STOP_REQUESTED")
         terminate_attempted = True
@@ -888,10 +1129,15 @@ class ProcessSupervisor:
             stages.append("GRACEFUL_WAIT")
             stages.append("FINAL_REAP")
             self._result = self._result_for(
-                status="REAPED", stages=stages,
-                terminate_attempted=terminate_attempted, kill_attempted=False, final_reap=True,
-                identity_verified=identity_verified, identity_uncertain=identity_uncertain,
-                reaped_after="graceful_stop", errors=errors,
+                status="REAPED",
+                stages=stages,
+                terminate_attempted=terminate_attempted,
+                kill_attempted=False,
+                final_reap=True,
+                identity_verified=identity_verified,
+                identity_uncertain=identity_uncertain,
+                reaped_after="graceful_stop",
+                errors=errors,
             )
             return self._result
         except subprocess.TimeoutExpired:
@@ -910,10 +1156,15 @@ class ProcessSupervisor:
             self._reaped = True
             stages.append("FINAL_REAP")
             self._result = self._result_for(
-                status="REAPED", stages=stages,
-                terminate_attempted=terminate_attempted, kill_attempted=kill_attempted, final_reap=True,
-                identity_verified=identity_verified, identity_uncertain=identity_uncertain,
-                reaped_after="force_stop", errors=errors,
+                status="REAPED",
+                stages=stages,
+                terminate_attempted=terminate_attempted,
+                kill_attempted=kill_attempted,
+                final_reap=True,
+                identity_verified=identity_verified,
+                identity_uncertain=identity_uncertain,
+                reaped_after="force_stop",
+                errors=errors,
             )
             return self._result
         except subprocess.TimeoutExpired:
@@ -922,9 +1173,14 @@ class ProcessSupervisor:
             errors.append(f"final reap failed: {type(exc).__name__}: {exc}")
         self._result = self._result_for(
             status="IDENTITY_UNCERTAIN" if identity_uncertain else "UNREAPED",
-            stages=stages, terminate_attempted=terminate_attempted, kill_attempted=kill_attempted,
-            final_reap=False, identity_verified=identity_verified, identity_uncertain=identity_uncertain,
-            reaped_after=None, errors=errors,
+            stages=stages,
+            terminate_attempted=terminate_attempted,
+            kill_attempted=kill_attempted,
+            final_reap=False,
+            identity_verified=identity_verified,
+            identity_uncertain=identity_uncertain,
+            reaped_after=None,
+            errors=errors,
         )
         return self._result
 

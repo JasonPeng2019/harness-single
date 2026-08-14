@@ -7,6 +7,7 @@ launches a process, or dispatches an action.  The harness provides no default
 pack, fixture, action, manifest, policy, path, hash, server revision,
 provider, or machine value.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,12 +34,28 @@ class FirmwareAction:
     def __post_init__(self) -> None:
         if not isinstance(self.mcp_tool, str) or not self.mcp_tool:
             raise ValueError("firmware action MCP tool must be a non-empty string")
-        if isinstance(self.method_version, bool) or not isinstance(self.method_version, int) or self.method_version <= 0:
-            raise ValueError("firmware action method version must be a positive integer")
-        if isinstance(self.maximum_duration_seconds, bool) or not isinstance(self.maximum_duration_seconds, int) or self.maximum_duration_seconds <= 0:
-            raise ValueError("firmware action maximum duration must be a positive integer")
-        if not isinstance(self.required_arguments, tuple) or any(not isinstance(item, str) or not item for item in self.required_arguments):
-            raise ValueError("firmware action required arguments must be a tuple of non-empty names")
+        if (
+            isinstance(self.method_version, bool)
+            or not isinstance(self.method_version, int)
+            or self.method_version <= 0
+        ):
+            raise ValueError(
+                "firmware action method version must be a positive integer"
+            )
+        if (
+            isinstance(self.maximum_duration_seconds, bool)
+            or not isinstance(self.maximum_duration_seconds, int)
+            or self.maximum_duration_seconds <= 0
+        ):
+            raise ValueError(
+                "firmware action maximum duration must be a positive integer"
+            )
+        if not isinstance(self.required_arguments, tuple) or any(
+            not isinstance(item, str) or not item for item in self.required_arguments
+        ):
+            raise ValueError(
+                "firmware action required arguments must be a tuple of non-empty names"
+            )
         if len(set(self.required_arguments)) != len(self.required_arguments):
             raise ValueError("firmware action required arguments must be unique")
 
@@ -71,12 +88,35 @@ class FirmwareCampaignPack:
     ) -> None:
         if not isinstance(capability, str) or not capability:
             raise ValueError("campaign capability must be a non-empty string")
-        if not isinstance(actions, Mapping) or not actions or any(not isinstance(name, str) or not name or not isinstance(action, FirmwareAction) for name, action in actions.items()):
-            raise ValueError("campaign actions must be a non-empty mapping of action names to FirmwareAction declarations")
+        if (
+            not isinstance(actions, Mapping)
+            or not actions
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(action, FirmwareAction)
+                for name, action in actions.items()
+            )
+        ):
+            raise ValueError(
+                "campaign actions must be a non-empty mapping of action names to FirmwareAction declarations"
+            )
         if len(set(actions)) != len(actions):
             raise ValueError("campaign action names must be unique")
-        if not isinstance(resources, Mapping) or not resources or any(not isinstance(name, str) or not name or not isinstance(identity, Mapping) or not identity for name, identity in resources.items()):
-            raise ValueError("campaign resources must be a non-empty mapping of canonical resource names to non-empty identities")
+        if (
+            not isinstance(resources, Mapping)
+            or not resources
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not isinstance(identity, Mapping)
+                or not identity
+                for name, identity in resources.items()
+            )
+        ):
+            raise ValueError(
+                "campaign resources must be a non-empty mapping of canonical resource names to non-empty identities"
+            )
         if len(set(resources)) != len(resources):
             raise ValueError("campaign resource names must be unique")
         if not isinstance(policy, Mapping) or not policy:
@@ -96,18 +136,28 @@ class FirmwareCampaignPack:
         board/resource ID.
         """
         if request.capability != self.capability:
-            raise CapabilityAdapterUnavailable("firmware campaign capability is not declared")
+            raise CapabilityAdapterUnavailable(
+                "firmware campaign capability is not declared"
+            )
         action = self.actions.get(request.action)
         if action is None:
-            raise CapabilityAdapterUnavailable("firmware campaign action is not declared")
+            raise CapabilityAdapterUnavailable(
+                "firmware campaign action is not declared"
+            )
         if len(request.resources) != 1:
-            raise CapabilityAdapterUnavailable("firmware campaign requires exactly one canonical resource")
+            raise CapabilityAdapterUnavailable(
+                "firmware campaign requires exactly one canonical resource"
+            )
         canonical_resource = request.resources[0]
         resource_identity = self.resources.get(canonical_resource)
         if resource_identity is None:
-            raise CapabilityAdapterUnavailable("firmware campaign resource is not declared")
+            raise CapabilityAdapterUnavailable(
+                "firmware campaign resource is not declared"
+            )
         if set(request.arguments) != set(action.required_arguments):
-            raise CapabilityAdapterUnavailable("firmware campaign arguments are not the declared closed keys")
+            raise CapabilityAdapterUnavailable(
+                "firmware campaign arguments are not the declared closed keys"
+            )
         return FirmwareOperation(
             capability=self.capability,
             action=request.action,
@@ -127,7 +177,12 @@ class FirmwareCampaignPack:
         except CapabilityAdapterUnavailable:
             return False
 
-    def approval_policy(self, request: CapabilityRequest, operation: FirmwareOperation, approval: CapabilityApproval) -> bool:
+    def approval_policy(
+        self,
+        request: CapabilityRequest,
+        operation: FirmwareOperation,
+        approval: CapabilityApproval,
+    ) -> bool:
         """Bind the approval policy to the declared pack facts.
 
         The binding covers the declared policy, capability, action, MCP tool,
@@ -147,11 +202,19 @@ class FirmwareCampaignPack:
         }
         if dict(approval.policy) != expected:
             return False
-        if request.capability != self.capability or request.resources != (operation.canonical_resource,):
+        if request.capability != self.capability or request.resources != (
+            operation.canonical_resource,
+        ):
             return False
         return True
 
-    def effective_duration(self, request: CapabilityRequest, operation: FirmwareOperation, *, now_monotonic: float) -> float:
+    def effective_duration(
+        self,
+        request: CapabilityRequest,
+        operation: FirmwareOperation,
+        *,
+        now_monotonic: float,
+    ) -> float:
         return now_monotonic + operation.maximum_duration_seconds
 
     def as_record(self) -> dict[str, Any]:
@@ -167,7 +230,9 @@ class FirmwareCampaignPack:
                 }
                 for name, action in self.actions.items()
             },
-            "resources": {name: dict(identity) for name, identity in self.resources.items()},
+            "resources": {
+                name: dict(identity) for name, identity in self.resources.items()
+            },
             "policy": dict(self.policy),
         }
 

@@ -60,7 +60,10 @@ def _store(config: HarnessConfig) -> SafeOutput:
         harness_root=config.harness_root,
         output_root=config.output_dir,
         forbidden_roots=config.forbidden_output_roots,
-        allowed_output_roots=(config.suite_root / "runtime", config.suite_root / "multi-agent-logs"),
+        allowed_output_roots=(
+            config.suite_root / "runtime",
+            config.suite_root / "multi-agent-logs",
+        ),
     )
     store.prepare()
     return store
@@ -97,8 +100,13 @@ def _is_actionable(event: Mapping[str, Any]) -> bool:
     if isinstance(data, Mapping) and data.get("manager_actionable") is True:
         return True
     return event.get("type") in {
-        "MANAGER_SIGNAL", "RESOURCE_CONFLICT", "RESOURCE_AMBIGUOUS",
-        "REQUEST_EXPIRING", "REQUEST_STALE", "RELAY_READY", "LANE_STAGE_REPEAT",
+        "MANAGER_SIGNAL",
+        "RESOURCE_CONFLICT",
+        "RESOURCE_AMBIGUOUS",
+        "REQUEST_EXPIRING",
+        "REQUEST_STALE",
+        "RELAY_READY",
+        "LANE_STAGE_REPEAT",
     }
 
 
@@ -138,10 +146,14 @@ def watch_until_event(
     store = None if no_write else store_factory(config)
     prior = store.load_cursor() if store else None
     previous = prior.get("conditions") if isinstance(prior, Mapping) else None
-    timeout = config.watch_timeout_seconds if timeout_seconds is None else timeout_seconds
+    timeout = (
+        config.watch_timeout_seconds if timeout_seconds is None else timeout_seconds
+    )
     deadline = monotonic() + timeout
     while True:
-        snapshot, observed = observe(config, process_provider=process_provider, clock=clock)
+        snapshot, observed = observe(
+            config, process_provider=process_provider, clock=clock
+        )
         conditions = _diagnostic_conditions(snapshot)
         events = diff_conditions(previous, conditions, observed_at=observed)
         if events:
@@ -150,11 +162,19 @@ def watch_until_event(
             _print_events(events, stream=stream)
             return EXIT_OK
         if monotonic() >= deadline:
-            _print_events([{
-                "event_id": "WATCH_TIMEOUT", "identity": "watch:timeout", "type": "WATCH_TIMEOUT",
-                "severity": "info", "observed_utc": observed.isoformat(),
-                "data": {"timeout_seconds": timeout},
-            }], stream=stream)
+            _print_events(
+                [
+                    {
+                        "event_id": "WATCH_TIMEOUT",
+                        "identity": "watch:timeout",
+                        "type": "WATCH_TIMEOUT",
+                        "severity": "info",
+                        "observed_utc": observed.isoformat(),
+                        "data": {"timeout_seconds": timeout},
+                    }
+                ],
+                stream=stream,
+            )
             return EXIT_TIMEOUT
         sleeper(min(config.poll_interval_seconds, max(0.0, deadline - monotonic())))
 
@@ -175,10 +195,14 @@ def watch_until_actionable(
     store = store_factory(config)
     prior = store.load_cursor()
     previous = prior.get("conditions") if isinstance(prior, Mapping) else None
-    timeout = config.watch_timeout_seconds if timeout_seconds is None else timeout_seconds
+    timeout = (
+        config.watch_timeout_seconds if timeout_seconds is None else timeout_seconds
+    )
     deadline = monotonic() + timeout
     while True:
-        snapshot, observed = observe(config, process_provider=process_provider, clock=clock)
+        snapshot, observed = observe(
+            config, process_provider=process_provider, clock=clock
+        )
         conditions = _diagnostic_conditions(snapshot)
         events = diff_conditions(previous, conditions, observed_at=observed)
         actionable = [event for event in events if _is_actionable(event)]
@@ -189,11 +213,19 @@ def watch_until_actionable(
         store.commit(snapshot=snapshot, events=events, conditions=conditions)
         previous = conditions
         if monotonic() >= deadline:
-            _print_events([{
-                "event_id": "WATCH_TIMEOUT", "identity": "watch:timeout", "type": "WATCH_TIMEOUT",
-                "severity": "info", "observed_utc": observed.isoformat(),
-                "data": {"timeout_seconds": timeout},
-            }], stream=stream)
+            _print_events(
+                [
+                    {
+                        "event_id": "WATCH_TIMEOUT",
+                        "identity": "watch:timeout",
+                        "type": "WATCH_TIMEOUT",
+                        "severity": "info",
+                        "observed_utc": observed.isoformat(),
+                        "data": {"timeout_seconds": timeout},
+                    }
+                ],
+                stream=stream,
+            )
             return EXIT_TIMEOUT
         sleeper(min(config.poll_interval_seconds, max(0.0, deadline - monotonic())))
 
@@ -203,7 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m orchestrator_harness",
         description="Durable diagnostic observation and safe lane lifecycle boundaries",
     )
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "config.example.json"))
+    parser.add_argument(
+        "--config", default=str(Path(__file__).resolve().parent / "config.example.json")
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     scan = subparsers.add_parser("scan", help="print one reconciled snapshot")
     scan.add_argument("--no-write", action="store_true")
@@ -215,10 +249,21 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--timeout", type=float, default=None)
     watch.add_argument("--no-write", action="store_true")
     preflight = subparsers.add_parser("handoff-preflight")
-    for name in ("task-card", "invocation", "result", "dependency-map", "worktree", "evidence-root"):
+    for name in (
+        "task-card",
+        "invocation",
+        "result",
+        "dependency-map",
+        "worktree",
+        "evidence-root",
+    ):
         preflight.add_argument(f"--{name}", required=True, type=Path)
-    preflight.add_argument("--required-evidence", action="append", default=[], type=Path)
-    adapter = subparsers.add_parser("adapter", help="install or inspect a project-local host adapter")
+    preflight.add_argument(
+        "--required-evidence", action="append", default=[], type=Path
+    )
+    adapter = subparsers.add_parser(
+        "adapter", help="install or inspect a project-local host adapter"
+    )
     adapter_modes = adapter.add_subparsers(dest="adapter_action", required=True)
     for action in ("install", "check", "upgrade", "uninstall", "self-test"):
         command = adapter_modes.add_parser(action)
@@ -231,8 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--project-root", required=True, type=Path)
     hook.add_argument("--boundary", choices=("post_tool_use", "stop"), required=True)
 
-    def add_view_commands(parent: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-        view = parent.add_parser("view", help="allocate an exact retained-ref immutable source view")
+    def add_view_commands(
+        parent: argparse._SubParsersAction[argparse.ArgumentParser],
+    ) -> None:
+        view = parent.add_parser(
+            "view", help="allocate an exact retained-ref immutable source view"
+        )
         modes = view.add_subparsers(dest="view_action", required=True)
         allocate = modes.add_parser("allocate")
         allocate.add_argument("--source-root", required=True, type=Path)
@@ -242,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
         allocate.add_argument("--result-root", required=True, type=Path)
         allocate.add_argument("--cache-root", required=True, type=Path)
         allocate.add_argument("--view-id", default="immutable-view")
+
     add_view_commands(subparsers)
     source = subparsers.add_parser("source")
     modes = source.add_subparsers(dest="source_action", required=True)
@@ -260,18 +310,35 @@ def build_parser() -> argparse.ArgumentParser:
     retire.add_argument("--lane-root", required=True, type=Path)
     retire.add_argument("--archive-root", required=True, type=Path)
     retire.add_argument("--lane-id", required=True)
-    for name in ("task-ref", "result-ref", "findings-ref", "acceptance-ref", "transcript-ref", "dependency-ref"):
+    for name in (
+        "task-ref",
+        "result-ref",
+        "findings-ref",
+        "acceptance-ref",
+        "transcript-ref",
+        "dependency-ref",
+    ):
         retire.add_argument(f"--{name}", required=True, type=Path)
     retire.add_argument("--overlay-receipt", type=Path, default=None)
 
-    workspace = subparsers.add_parser("workspace", help="provider-neutral workspace overlay lifecycle")
+    workspace = subparsers.add_parser(
+        "workspace", help="provider-neutral workspace overlay lifecycle"
+    )
     workspace_modes = workspace.add_subparsers(dest="workspace_action", required=True)
-    super_cache = workspace_modes.add_parser("super-cache", help="manage the editable harness super-cache")
-    super_cache_modes = super_cache.add_subparsers(dest="super_cache_action", required=True)
-    ingest = super_cache_modes.add_parser("ingest", help="refresh super-cache to exactly the source folder contents")
+    super_cache = workspace_modes.add_parser(
+        "super-cache", help="manage the editable harness super-cache"
+    )
+    super_cache_modes = super_cache.add_subparsers(
+        dest="super_cache_action", required=True
+    )
+    ingest = super_cache_modes.add_parser(
+        "ingest", help="refresh super-cache to exactly the source folder contents"
+    )
     ingest.add_argument("--source", required=True, type=Path, dest="source_folder")
     ingest.add_argument("--harness-worktree", required=True, type=Path)
-    prepare = workspace_modes.add_parser("prepare", help="prepare one identified worktree from current cache contents")
+    prepare = workspace_modes.add_parser(
+        "prepare", help="prepare one identified worktree from current cache contents"
+    )
     prepare.add_argument("--super-cache", required=True, type=Path)
     prepare.add_argument("--worktree", required=True, type=Path)
     prepare.add_argument("--role", required=True, choices=("orchestrator", "subagent"))
@@ -284,7 +351,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "adapter":
             if args.host != "codex":
-                raise CodexAdapterError("only the implemented codex host supports this command")
+                raise CodexAdapterError(
+                    "only the implemented codex host supports this command"
+                )
             if args.adapter_action == "install":
                 _print_json(install_codex_adapter(args.project_root))
             elif args.adapter_action == "check":
@@ -294,24 +363,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.adapter_action == "uninstall":
                 _print_json(uninstall_codex_adapter(args.project_root))
             elif args.adapter_action == "self-test":
-                _print_json(synthetic_wake_self_test(args.project_root, queue_root=args.queue_root))
+                _print_json(
+                    synthetic_wake_self_test(
+                        args.project_root, queue_root=args.queue_root
+                    )
+                )
             else:
-                _print_json(run_codex_hook(args.boundary, project_root=args.project_root))
+                _print_json(
+                    run_codex_hook(args.boundary, project_root=args.project_root)
+                )
             return EXIT_OK
         if args.command in {"view", "source"}:
             result = allocate_immutable_source_view(
-                args.source_root, revision=args.revision, retained_ref=args.retained_ref,
-                view_root=args.view_root, result_root=args.result_root, cache_root=args.cache_root,
+                args.source_root,
+                revision=args.revision,
+                retained_ref=args.retained_ref,
+                view_root=args.view_root,
+                result_root=args.result_root,
+                cache_root=args.cache_root,
                 view_id=args.view_id,
             )
             _print_json(result.as_record())
             return EXIT_OK
         if args.command == "lane":
             result = retire_terminal_lane(
-                args.lane_root, args.archive_root, lane_id=args.lane_id,
-                task_ref=args.task_ref, result_ref=args.result_ref, findings_ref=args.findings_ref,
-                acceptance_ref=args.acceptance_ref, transcript_ref=args.transcript_ref,
-                dependency_ref=args.dependency_ref, overlay_receipt=args.overlay_receipt,
+                args.lane_root,
+                args.archive_root,
+                lane_id=args.lane_id,
+                task_ref=args.task_ref,
+                result_ref=args.result_ref,
+                findings_ref=args.findings_ref,
+                acceptance_ref=args.acceptance_ref,
+                transcript_ref=args.transcript_ref,
+                dependency_ref=args.dependency_ref,
+                overlay_receipt=args.overlay_receipt,
             )
             _print_json(result.as_record())
             return EXIT_OK if result.outcome.startswith("CLOSED") else EXIT_ERROR
@@ -319,25 +404,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.workspace_action == "super-cache":
                 if args.super_cache_action != "ingest":
                     raise ValueError("super-cache action must be ingest")
-                _print_json(ingest_super_cache(
-                    source_folder=args.source_folder,
-                    harness_worktree=args.harness_worktree,
-                ))
+                _print_json(
+                    ingest_super_cache(
+                        source_folder=args.source_folder,
+                        harness_worktree=args.harness_worktree,
+                    )
+                )
             elif args.workspace_action == "prepare":
-                _print_json(prepare_worktree(
-                    super_cache=args.super_cache,
-                    target_worktree=args.worktree,
-                    role=args.role,
-                    receipt_path=args.receipt,
-                ))
+                _print_json(
+                    prepare_worktree(
+                        super_cache=args.super_cache,
+                        target_worktree=args.worktree,
+                        role=args.role,
+                        receipt_path=args.receipt,
+                    )
+                )
             else:
                 raise ValueError("workspace action must be super-cache or prepare")
             return EXIT_OK
         if args.command == "handoff-preflight":
             result = preflight_handoff(
-                task_card_path=args.task_card, invocation_path=args.invocation,
-                result_path=args.result, dependency_map_path=args.dependency_map,
-                worktree=args.worktree, evidence_root=args.evidence_root,
+                task_card_path=args.task_card,
+                invocation_path=args.invocation,
+                result_path=args.result,
+                dependency_map_path=args.dependency_map,
+                worktree=args.worktree,
+                evidence_root=args.evidence_root,
                 required_evidence=args.required_evidence,
             )
             _print_json(result)
@@ -351,7 +443,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.no_write:
                 raise ValueError("--until-actionable requires its diagnostic cursor")
             return watch_until_actionable(config, timeout_seconds=args.timeout)
-        return watch_until_event(config, no_write=args.no_write, timeout_seconds=args.timeout)
+        return watch_until_event(
+            config, no_write=args.no_write, timeout_seconds=args.timeout
+        )
     except (ConfigError, PathSafetyError, OSError, ValueError) as exc:
         sys.stderr.write(f"orchestrator_harness: {exc}\n")
         return EXIT_ERROR

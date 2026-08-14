@@ -91,15 +91,12 @@ def _declared_relative_paths(
                 break
     if value is None:
         return ()
-    if (
-        not isinstance(value, list)
-        or any(
-            not isinstance(item, str)
-            or not item.strip()
-            or Path(item).is_absolute()
-            or ".." in Path(item).parts
-            for item in value
-        )
+    if not isinstance(value, list) or any(
+        not isinstance(item, str)
+        or not item.strip()
+        or Path(item).is_absolute()
+        or ".." in Path(item).parts
+        for item in value
     ):
         raise ConfigError(f"{key} must be a list of safe relative paths")
     return tuple(item.strip() for item in value)
@@ -144,9 +141,7 @@ def load_config(
     ):
         raise ConfigError("workspace_relpath must be a safe relative path")
 
-    record_paths = _declared_relative_paths(
-        raw, "record_paths", ("observation_paths",)
-    )
+    record_paths = _declared_relative_paths(raw, "record_paths", ("observation_paths",))
     record_manifests = _declared_relative_paths(
         raw, "record_manifests", ("record_manifest_paths",)
     )

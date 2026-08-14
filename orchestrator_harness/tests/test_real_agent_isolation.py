@@ -32,7 +32,11 @@ minimal_auth = driver_module.minimal_auth
 
 def jwt(expiry: datetime) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": int(expiry.timestamp())}).encode()).rstrip(b"=").decode()
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": int(expiry.timestamp())}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     return f"{header}.{payload}.signature"
 
 
@@ -89,8 +93,12 @@ class RealAgentIsolationTests(unittest.TestCase):
             proxy = AllowlistProxy("127.0.0.1", {("allowed.invalid", 443)}, audit)
             proxy.start()
             try:
-                with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
-                    client.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                with socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=2
+                ) as client:
+                    client.sendall(
+                        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                    )
                     self.assertTrue(client.recv(128).startswith(b"HTTP/1.1 403"))
             finally:
                 proxy.close()
@@ -116,9 +124,13 @@ class RealAgentIsolationTests(unittest.TestCase):
             proxy = AllowlistProxy("127.0.0.1", {("127.0.0.1", upstream_port)}, audit)
             proxy.start()
             try:
-                with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
+                with socket.create_connection(
+                    ("127.0.0.1", proxy.port), timeout=2
+                ) as client:
                     target = f"127.0.0.1:{upstream_port}"
-                    client.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                    client.sendall(
+                        f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode()
+                    )
                     response = bytearray()
                     while b"\r\n\r\n" not in response:
                         chunk = client.recv(128)

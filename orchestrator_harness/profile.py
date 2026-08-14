@@ -1,4 +1,5 @@
 """Explicit role/provider/environment profiles for child processes."""
+
 from __future__ import annotations
 
 import os
@@ -84,7 +85,9 @@ def _text(value: object, name: str) -> str:
 
 
 def _strings(value: object, name: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() for item in value
+    ):
         raise ProfileError(f"{name} must be a list of non-empty strings")
     normalized = tuple(item.strip() for item in value)
     if len(normalized) != len(set(normalized)):
@@ -98,14 +101,18 @@ def _env_names(value: object, name: str) -> tuple[str, ...]:
         if _ENV_NAME.fullmatch(item) is None:
             raise ProfileError(f"{name} contains an invalid environment variable name")
         if _denied_name(item):
-            raise ProfileError(f"{name} cannot grant physical, MCP, or credential variable {item}")
+            raise ProfileError(
+                f"{name} cannot grant physical, MCP, or credential variable {item}"
+            )
     return names
 
 
 def _capability_names(value: object, name: str) -> tuple[str, ...]:
     names = _strings(value, name)
     if any(_denied_name(item) for item in names):
-        raise ProfileError(f"{name} cannot grant physical, MCP, or credential capability")
+        raise ProfileError(
+            f"{name} cannot grant physical, MCP, or credential capability"
+        )
     return names
 
 
@@ -138,7 +145,16 @@ class RuntimeProfile:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "RuntimeProfile":
-        required = {"schema", "id", "role", "provider", "model", "tools", "capabilities", "resources"}
+        required = {
+            "schema",
+            "id",
+            "role",
+            "provider",
+            "model",
+            "tools",
+            "capabilities",
+            "resources",
+        }
         optional = {"provider_needs", "workflow_grants"}
         if set(value) - required - optional or not required.issubset(value):
             raise ProfileError("profile has an invalid closed shape")
@@ -151,8 +167,12 @@ class RuntimeProfile:
             tools=_strings(value.get("tools"), "profile.tools"),
             capabilities=_strings(value.get("capabilities"), "profile.capabilities"),
             resources=_strings(value.get("resources"), "profile.resources"),
-            provider_needs=_env_names(value.get("provider_needs", []), "profile.provider_needs"),
-            workflow_grants=_capability_names(value.get("workflow_grants", []), "profile.workflow_grants"),
+            provider_needs=_env_names(
+                value.get("provider_needs", []), "profile.provider_needs"
+            ),
+            workflow_grants=_capability_names(
+                value.get("workflow_grants", []), "profile.workflow_grants"
+            ),
         )
 
     def to_record(self) -> dict[str, object]:
@@ -177,9 +197,11 @@ def build_child_environment(
     """Allow only base runtime variables plus explicit safe profile grants."""
 
     source = dict(os.environ if inherited is None else inherited)
-    allowed_names = _BASE_ENV_ALLOW | set(profile.provider_needs) | {
-        item for item in profile.workflow_grants if _ENV_NAME.fullmatch(item)
-    }
+    allowed_names = (
+        _BASE_ENV_ALLOW
+        | set(profile.provider_needs)
+        | {item for item in profile.workflow_grants if _ENV_NAME.fullmatch(item)}
+    )
     allowed: dict[str, str] = {}
     cleared: list[str] = []
     for key, value in source.items():

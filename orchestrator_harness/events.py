@@ -81,8 +81,12 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             "codex_started_utc": lane.get("codex_started_utc"),
             "provider_id": lane.get("provider_id", "codex"),
             "provider_pid": lane.get("provider_pid", lane.get("codex_pid")),
-            "provider_started_utc": lane.get("provider_started_utc", lane.get("codex_started_utc")),
-            "provider_session_id": lane.get("provider_session_id", lane.get("session_id", lane.get("thread_id"))),
+            "provider_started_utc": lane.get(
+                "provider_started_utc", lane.get("codex_started_utc")
+            ),
+            "provider_session_id": lane.get(
+                "provider_session_id", lane.get("session_id", lane.get("thread_id"))
+            ),
             "invocation_schema": lane.get("invocation_schema"),
             "worker_invocation_id": lane.get("worker_invocation_id"),
             "repository": lane.get("repository"),
@@ -96,15 +100,12 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
         identity = f"lane:{lane_id}:process"
         conditions[identity] = _condition(identity, kind, severity, data)
         coordination_failure = lane.get("coordination_failure")
-        if (
-            lane.get("invocation_schema") in {
-                "orchestrator-coding-invocation/v1",
-                "orchestrator-worker-invocation/v1",
-            }
-            and (
-                lane.get("declared_state") == "coordination_failed"
-                or isinstance(coordination_failure, dict)
-            )
+        if lane.get("invocation_schema") in {
+            "orchestrator-coding-invocation/v1",
+            "orchestrator-worker-invocation/v1",
+        } and (
+            lane.get("declared_state") == "coordination_failed"
+            or isinstance(coordination_failure, dict)
         ):
             identity = f"lane:{lane_id}:coordination-failure"
             conditions[identity] = _condition(
@@ -137,14 +138,18 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
             resource = finding.get("resource")
             identity = f"lane:{lane_id}:resource-claim:{resource}"
             conditions[identity] = _condition(
-                identity, "RESOURCE_CLAIM_STALE", "warning",
+                identity,
+                "RESOURCE_CLAIM_STALE",
+                "warning",
                 {"lane_id": lane_id, **finding},
             )
         invalid_result = lane.get("invalid_result")
         if isinstance(invalid_result, dict):
             identity = f"lane:{lane_id}:invalid-result"
             conditions[identity] = _condition(
-                identity, "CODING_RESULT_INVALID", "error",
+                identity,
+                "CODING_RESULT_INVALID",
+                "error",
                 {
                     "lane_id": lane_id,
                     "worker_invocation_id": lane.get("worker_invocation_id"),
@@ -197,7 +202,9 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
                     "lane_id": lane_id,
                     "result_path": lane.get("result_path"),
                     "result_sha256": lane.get("result_sha256"),
-                    "result_acceptance_state": lane.get("result_acceptance_state", "PENDING"),
+                    "result_acceptance_state": lane.get(
+                        "result_acceptance_state", "PENDING"
+                    ),
                 },
             )
         if lane.get("provider_wait"):
@@ -356,7 +363,10 @@ def conditions_from_snapshot(snapshot: dict[str, Any]) -> dict[str, dict[str, An
     for conflict in snapshot.get("coding_conflicts", []):
         identity = f"coding:{conflict['type']}:{conflict['identity']}"
         conditions[identity] = _condition(
-            identity, conflict["type"], "error", conflict,
+            identity,
+            conflict["type"],
+            "error",
+            conflict,
         )
 
     for signal in snapshot.get("manager_signals", []):

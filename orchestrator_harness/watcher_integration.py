@@ -24,13 +24,19 @@ def watcher_recovery_projection(records: Iterable[Mapping[str, Any]]) -> dict[st
             continue
         state = record.get("state", "open")
         alert_id = record.get("alert_id")
-        if not isinstance(alert_id, str) or not alert_id.strip() or state not in WATCHER_RECOVERY_STATES:
+        if (
+            not isinstance(alert_id, str)
+            or not alert_id.strip()
+            or state not in WATCHER_RECOVERY_STATES
+        ):
             continue
-        rows.append({
-            "alert_id": alert_id,
-            "state": state,
-            "observed_utc": record.get("observed_utc"),
-        })
+        rows.append(
+            {
+                "alert_id": alert_id,
+                "state": state,
+                "observed_utc": record.get("observed_utc"),
+            }
+        )
     return {
         "schema": WATCHER_RECOVERY_SCHEMA,
         "states": rows,

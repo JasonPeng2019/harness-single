@@ -124,9 +124,7 @@ def _fake_worker(argv: Sequence[str]) -> int:
         f"# {lane} checkpoint\n\nFake worker started.\n", encoding="utf-8"
     )
     if release_signal is not None:
-        deadline = (
-            time.monotonic() + 2 * FIXTURE_CONTROLLER_COMPLETION_SECONDS
-        )
+        deadline = time.monotonic() + 2 * FIXTURE_CONTROLLER_COMPLETION_SECONDS
         while not release_signal.is_file():
             if time.monotonic() >= deadline:
                 raise FixtureError(
@@ -152,7 +150,13 @@ def _fake_worker(argv: Sequence[str]) -> int:
         commit = _git(Path.cwd(), "rev-parse", "HEAD")
         _write_json(
             workspace / "RESULT.json",
-            _result(lane, worker_invocation_id, branch, commit, f"{lane} fixture work passed"),
+            _result(
+                lane,
+                worker_invocation_id,
+                branch,
+                commit,
+                f"{lane} fixture work passed",
+            ),
         )
     last_message_index = next(
         (index for index, value in enumerate(argv) if value == "--output-last-message"),
@@ -296,11 +300,14 @@ def _finish_controller(receipt: Mapping[str, Any]) -> dict[str, Any]:
                 status_path = Path(str(receipt["expected_state_path"]))
                 return _wait_for_status(
                     status_path,
-                    lambda value: value.get("state") in {
-                        "CODEX_EXITED",
-                        "CONTROLLER_FAILED",
-                        "LAUNCH_FAILED",
-                    },
+                    lambda value: (
+                        value.get("state")
+                        in {
+                            "CODEX_EXITED",
+                            "CONTROLLER_FAILED",
+                            "LAUNCH_FAILED",
+                        }
+                    ),
                 )
         time.sleep(0.05)
     raise FixtureError(
@@ -451,7 +458,9 @@ def run_fixture(root: Path) -> dict[str, object]:
         or beta_success_value.get("exit_code") != 0
         or beta_success_value.get("result_valid") is not True
     ):
-        raise FixtureError("beta-success controller did not validate a distinct successful result")
+        raise FixtureError(
+            "beta-success controller did not validate a distinct successful result"
+        )
     scan = json.loads(_harness(config, "scan", "--no-write").stdout)
     lanes = scan.get("lanes", [])
     coding_lanes = [lane for lane in lanes if lane.get("lane_id") in {"alpha", "beta"}]
@@ -528,7 +537,12 @@ def run_fixture(root: Path) -> dict[str, object]:
     return {
         "schema": "orchestrator-disposable-coding-fixture/v1",
         "base_commit": base_commit,
-        "branches": ["lane/alpha", "lane/beta", "lane/beta-success", "integration/merge"],
+        "branches": [
+            "lane/alpha",
+            "lane/beta",
+            "lane/beta-success",
+            "integration/merge",
+        ],
         "coding_lane_count": 4,
         "contention_observed": True,
         "stale_result_rejected": True,

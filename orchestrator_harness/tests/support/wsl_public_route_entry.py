@@ -11,7 +11,9 @@ import argparse
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Retired: public controller is host-native")
+    parser = argparse.ArgumentParser(
+        description="Retired: public controller is host-native"
+    )
     parser.parse_args()
     raise RuntimeError(
         "public controller route is Windows-native; WSL may launch only the provider bridge"

@@ -5,6 +5,7 @@ older routes are parsed by their existing contracts and can be represented as
 an internal :class:`CanonicalInvocation` for shared checks, but their input
 schemas are never silently merged with the canonical record.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -24,62 +25,68 @@ CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
 
 # This is the single public top-level coding-v1 contract.  Keep the aliases
 # here, rather than in either consumer, so adapters cannot silently diverge.
-CODING_V1_CANONICAL_ONLY_FIELDS = frozenset({
-    "provider",
-    "profile",
-    "prompt_bundle",
-    "workflow",
-    "task_card",
-    "cohort_id",
-})
-CODING_V1_FIRMWARE_ONLY_FIELDS = frozenset({
-    "policy_sha256",
-    "leases",
-    "board_tokens",
-    "mcp_servers",
-    "server_snapshot",
-})
+CODING_V1_CANONICAL_ONLY_FIELDS = frozenset(
+    {
+        "provider",
+        "profile",
+        "prompt_bundle",
+        "workflow",
+        "task_card",
+        "cohort_id",
+    }
+)
+CODING_V1_FIRMWARE_ONLY_FIELDS = frozenset(
+    {
+        "policy_sha256",
+        "leases",
+        "board_tokens",
+        "mcp_servers",
+        "server_snapshot",
+    }
+)
 CODING_V1_ALIAS_GROUPS = (
     ("codex", "codex_settings", "model_settings"),
     ("repository", "git"),
     ("event_log_path", "event_log", "lane_event_log"),
     ("resume_identity", "resume"),
 )
-CODING_V1_ALLOWED_FIELDS = frozenset({
-    "schema",
-    "action",
-    "run_root",
-    "runtime_root",
-    "prompt_path",
-    "prompt_sha256",
-    "output_paths",
-    "event_log_path",
-    "event_log",
-    "lane_event_log",
-    "worker_invocation_id",
-    "lane_id",
-    "declared_lane_id",
-    "task",
-    "phase",
-    "repository",
-    "git",
-    "resources",
-    "exclusive_resources",
-    "resource_lock_root",
-    "codex",
-    "codex_settings",
-    "model_settings",
-    "codex_command",
-    "config_overrides",
-    "resume_thread_id",
-    "resume_identity",
-    "resume",
-    "label",
-    "doer",
-    "finding_gate",
-    "child_environment_isolation",
-    "overlay_receipt",
-})
+CODING_V1_ALLOWED_FIELDS = frozenset(
+    {
+        "schema",
+        "action",
+        "run_root",
+        "runtime_root",
+        "prompt_path",
+        "prompt_sha256",
+        "output_paths",
+        "event_log_path",
+        "event_log",
+        "lane_event_log",
+        "worker_invocation_id",
+        "lane_id",
+        "declared_lane_id",
+        "task",
+        "phase",
+        "repository",
+        "git",
+        "resources",
+        "exclusive_resources",
+        "resource_lock_root",
+        "codex",
+        "codex_settings",
+        "model_settings",
+        "codex_command",
+        "config_overrides",
+        "resume_thread_id",
+        "resume_identity",
+        "resume",
+        "label",
+        "doer",
+        "finding_gate",
+        "child_environment_isolation",
+        "overlay_receipt",
+    }
+)
 
 
 class InvocationValidationError(ValueError):
@@ -96,7 +103,8 @@ def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
     canonical = sorted(CODING_V1_CANONICAL_ONLY_FIELDS & set(raw), key=str)
     if canonical:
         raise InvocationValidationError(
-            "coding v1 record contains canonical-only fields: " + ", ".join(map(str, canonical))
+            "coding v1 record contains canonical-only fields: "
+            + ", ".join(map(str, canonical))
         )
     firmware = sorted(CODING_V1_FIRMWARE_ONLY_FIELDS & set(raw), key=str)
     if firmware:
@@ -107,7 +115,8 @@ def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
     unknown = sorted(set(raw) - CODING_V1_ALLOWED_FIELDS, key=str)
     if unknown:
         raise InvocationValidationError(
-            "coding v1 record contains unknown top-level fields: " + ", ".join(map(str, unknown))
+            "coding v1 record contains unknown top-level fields: "
+            + ", ".join(map(str, unknown))
         )
     for aliases in CODING_V1_ALIAS_GROUPS:
         present = [alias for alias in aliases if alias in raw]
@@ -115,10 +124,22 @@ def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
             raise InvocationValidationError(
                 "coding v1 contains ambiguous aliases: " + ", ".join(present)
             )
-    if "lane_id" in raw and "declared_lane_id" in raw and raw["lane_id"] != raw["declared_lane_id"]:
-        raise InvocationValidationError("coding v1 lane_id and declared_lane_id conflict")
-    if "resources" in raw and "exclusive_resources" in raw and raw["resources"] != raw["exclusive_resources"]:
-        raise InvocationValidationError("coding v1 resources and exclusive_resources conflict")
+    if (
+        "lane_id" in raw
+        and "declared_lane_id" in raw
+        and raw["lane_id"] != raw["declared_lane_id"]
+    ):
+        raise InvocationValidationError(
+            "coding v1 lane_id and declared_lane_id conflict"
+        )
+    if (
+        "resources" in raw
+        and "exclusive_resources" in raw
+        and raw["resources"] != raw["exclusive_resources"]
+    ):
+        raise InvocationValidationError(
+            "coding v1 resources and exclusive_resources conflict"
+        )
 
 
 _LEGACY_FIELDS = frozenset(
@@ -173,7 +194,9 @@ def _strings(value: object, name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value)
 
 
-def _closed(value: object, required: set[str], optional: set[str], name: str) -> Mapping[str, Any]:
+def _closed(
+    value: object, required: set[str], optional: set[str], name: str
+) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise InvocationValidationError(f"{name} must be an object")
     keys = set(value)
@@ -185,7 +208,9 @@ def _closed(value: object, required: set[str], optional: set[str], name: str) ->
             detail.append("missing " + ", ".join(missing))
         if extra:
             detail.append("unknown " + ", ".join(extra))
-        raise InvocationValidationError(f"{name} has an invalid closed shape ({'; '.join(detail)})")
+        raise InvocationValidationError(
+            f"{name} has an invalid closed shape ({'; '.join(detail)})"
+        )
     return value
 
 
@@ -233,7 +258,10 @@ class CanonicalInvocation:
             raise InvocationValidationError("canonical invocation schema is invalid")
         if self.action not in {"start", "resume"}:
             raise InvocationValidationError("action must be start or resume")
-        if self.requested_session_id is not None and not self.requested_session_id.strip():
+        if (
+            self.requested_session_id is not None
+            and not self.requested_session_id.strip()
+        ):
             raise InvocationValidationError("requested session ID cannot be empty")
 
     @property
@@ -282,7 +310,9 @@ class CanonicalInvocation:
             canonical_json(self.provider_launch_record()).encode("utf-8")
         ).hexdigest()
 
-    def identity(self, *, session_id: str | None = None, starting_commit: str | None = None) -> dict[str, Any]:
+    def identity(
+        self, *, session_id: str | None = None, starting_commit: str | None = None
+    ) -> dict[str, Any]:
         repository = dict(self.repository or {})
         if starting_commit is not None:
             repository["starting_commit"] = starting_commit
@@ -313,7 +343,11 @@ class CanonicalInvocation:
             "revision": self.task_card_revision,
             "sha256": self.task_card_sha256,
         }
-        provider = {"id": self.provider_id, "model": self.provider_model, **dict(self.provider_options)}
+        provider = {
+            "id": self.provider_id,
+            "model": self.provider_model,
+            **dict(self.provider_options),
+        }
         record: dict[str, Any] = {
             "schema": self.schema,
             "action": self.action,
@@ -373,9 +407,15 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
     for key in ("allowed_tools", "disallowed_tools", "config_overrides"):
         if key in provider:
             _strings(provider.get(key), f"provider.{key}")
-    if "mcp_config" in provider and not isinstance(provider.get("mcp_config"), (str, dict, list)):
-        raise InvocationValidationError("provider.mcp_config must be a path or JSON value")
-    if "notification" in provider and not isinstance(provider.get("notification"), bool):
+    if "mcp_config" in provider and not isinstance(
+        provider.get("mcp_config"), (str, dict, list)
+    ):
+        raise InvocationValidationError(
+            "provider.mcp_config must be a path or JSON value"
+        )
+    if "notification" in provider and not isinstance(
+        provider.get("notification"), bool
+    ):
         raise InvocationValidationError("provider.notification must be boolean")
     return provider_id, model, _immutable(provider)
 
@@ -410,17 +450,36 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         "event_log_path",
         "resources",
     }
-    optional = {"repository", "resume", "resume_admission_path", "overlay_receipt", "label", "task", "phase"}
+    optional = {
+        "repository",
+        "resume",
+        "resume_admission_path",
+        "overlay_receipt",
+        "label",
+        "task",
+        "phase",
+    }
     _closed(raw, required, optional, "canonical invocation")
     action = _text(raw.get("action"), "action").lower()
     if action not in {"start", "resume"}:
         raise InvocationValidationError("action must be start or resume")
     workflow = _closed(raw.get("workflow"), {"id", "version"}, set(), "workflow")
-    task_card = _closed(raw.get("task_card"), {"id", "revision", "sha256"}, set(), "task_card")
+    task_card = _closed(
+        raw.get("task_card"), {"id", "revision", "sha256"}, set(), "task_card"
+    )
     provider_id, provider_model, provider_options = _provider(raw.get("provider"))
     profile = _closed(
         raw.get("profile"),
-        {"schema", "id", "role", "provider", "model", "tools", "capabilities", "resources"},
+        {
+            "schema",
+            "id",
+            "role",
+            "provider",
+            "model",
+            "tools",
+            "capabilities",
+            "resources",
+        },
         {"provider_needs", "workflow_grants"},
         "profile",
     )
@@ -455,14 +514,23 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         set(),
         "prompt_bundle",
     )
-    if prompt_bundle.get("schema") != PROMPT_BUNDLE_SCHEMA or prompt_bundle.get("version") != 1:
+    if (
+        prompt_bundle.get("schema") != PROMPT_BUNDLE_SCHEMA
+        or prompt_bundle.get("version") != 1
+    ):
         raise InvocationValidationError("prompt_bundle schema/version is invalid")
     if prompt_bundle.get("workflow_id") != workflow.get("id"):
-        raise InvocationValidationError("prompt_bundle.workflow_id does not match workflow")
+        raise InvocationValidationError(
+            "prompt_bundle.workflow_id does not match workflow"
+        )
     if prompt_bundle.get("task_card_id") != task_card.get("id"):
-        raise InvocationValidationError("prompt_bundle.task_card_id does not match task_card")
+        raise InvocationValidationError(
+            "prompt_bundle.task_card_id does not match task_card"
+        )
     if prompt_bundle.get("profile_id") != profile_id:
-        raise InvocationValidationError("prompt_bundle.profile_id does not match profile")
+        raise InvocationValidationError(
+            "prompt_bundle.profile_id does not match profile"
+        )
     _digest(task_card.get("sha256"), "task_card.sha256")
     output_paths_value = raw.get("output_paths")
     output_paths = _closed(
@@ -476,7 +544,12 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
     resources = _strings(raw.get("resources"), "resources")
     repository = raw.get("repository")
     if repository is not None:
-        _closed(repository, {"common_dir", "worktree_root", "branch", "base_commit"}, {"starting_commit"}, "repository")
+        _closed(
+            repository,
+            {"common_dir", "worktree_root", "branch", "base_commit"},
+            {"starting_commit"},
+            "repository",
+        )
     requested_session_id: str | None = None
     if action == "resume":
         resume = _closed(raw.get("resume"), {"session_id"}, set(), "resume")
@@ -499,7 +572,9 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         run_root=Path(_text(raw.get("run_root"), "run_root")),
         runtime_root=Path(_text(raw.get("runtime_root"), "runtime_root")),
         lane_id=_text(raw.get("lane_id"), "lane_id"),
-        worker_invocation_id=_text(raw.get("worker_invocation_id"), "worker_invocation_id"),
+        worker_invocation_id=_text(
+            raw.get("worker_invocation_id"), "worker_invocation_id"
+        ),
         cohort_id=_text(raw.get("cohort_id"), "cohort_id"),
         workflow_id=_text(workflow.get("id"), "workflow.id"),
         workflow_version=_text(workflow.get("version"), "workflow.version"),
@@ -526,7 +601,12 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
 
 
 def _legacy_bundle_record(
-    *, prompt_path: str, prompt_sha256: str, workflow_id: str, task_card_id: str, profile_id: str
+    *,
+    prompt_path: str,
+    prompt_sha256: str,
+    workflow_id: str,
+    task_card_id: str,
+    profile_id: str,
 ) -> dict[str, Any]:
     """Create an identity-only record for a legacy adapter.
 
@@ -556,11 +636,15 @@ def _legacy_bundle_record(
     }
     return {
         **manifest,
-        "bundle_sha256": hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest(),
+        "bundle_sha256": hashlib.sha256(
+            canonical_json(manifest).encode("utf-8")
+        ).hexdigest(),
     }
 
 
-def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> CanonicalInvocation:
+def adapt_coding_v1(
+    raw: Mapping[str, Any], *, run_root: Path | None = None
+) -> CanonicalInvocation:
     """Adapt coding v1 without accepting firmware-only fields."""
 
     validate_coding_v1_fields(raw)
@@ -576,8 +660,12 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
     card_id = _text(raw.get("task", "coding-v1-task"), "task")
     profile_id = f"legacy-coding-v1:{lane_id}"
     options = dict(settings)
-    options["command"] = list(settings.get("command", raw.get("codex_command", ["codex"])))
-    options["config_overrides"] = list(settings.get("config_overrides", raw.get("config_overrides", [])))
+    options["command"] = list(
+        settings.get("command", raw.get("codex_command", ["codex"]))
+    )
+    options["config_overrides"] = list(
+        settings.get("config_overrides", raw.get("config_overrides", []))
+    )
     profile = {
         "id": profile_id,
         "role": _text(raw.get("doer", lane_id), "doer"),
@@ -592,21 +680,35 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
     output = raw.get("output_paths")
     if not isinstance(output, Mapping):
         raise InvocationValidationError("coding v1 output_paths are missing")
-    output_paths = {key: Path(_text(output.get(key), f"output_paths.{key}")) for key in ("status", "jsonl", "stderr", "last_message")}
+    output_paths = {
+        key: Path(_text(output.get(key), f"output_paths.{key}"))
+        for key in ("status", "jsonl", "stderr", "last_message")
+    }
     repository = raw.get("repository", raw.get("git"))
-    requested_thread = _text(raw.get("resume_thread_id"), "resume_thread_id") if raw.get("resume_thread_id") is not None else None
+    requested_thread = (
+        _text(raw.get("resume_thread_id"), "resume_thread_id")
+        if raw.get("resume_thread_id") is not None
+        else None
+    )
     resume_identity = raw.get("resume_identity", raw.get("resume"))
     if resume_identity is not None:
         if not isinstance(resume_identity, Mapping):
             raise InvocationValidationError("resume_identity must be an object")
         identity_worker = resume_identity.get("worker_invocation_id")
         if identity_worker is not None and identity_worker != worker_id:
-            raise InvocationValidationError("resume identity worker_invocation_id mismatch")
+            raise InvocationValidationError(
+                "resume identity worker_invocation_id mismatch"
+            )
         identity_thread = resume_identity.get("thread_id")
         if identity_thread is not None:
             identity_thread_text = _text(identity_thread, "resume_identity.thread_id")
-            if requested_thread is not None and requested_thread != identity_thread_text:
-                raise InvocationValidationError("conflicting requested resume thread IDs")
+            if (
+                requested_thread is not None
+                and requested_thread != identity_thread_text
+            ):
+                raise InvocationValidationError(
+                    "conflicting requested resume thread IDs"
+                )
             requested_thread = requested_thread or identity_thread_text
     return CanonicalInvocation(
         CANONICAL_INVOCATION_SCHEMA,
@@ -626,9 +728,24 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
         model,
         _immutable(options),
         _immutable(profile),
-        _immutable(_legacy_bundle_record(prompt_path=prompt_path, prompt_sha256=prompt_sha256, workflow_id="coding-v1", task_card_id=card_id, profile_id=profile_id)),
+        _immutable(
+            _legacy_bundle_record(
+                prompt_path=prompt_path,
+                prompt_sha256=prompt_sha256,
+                workflow_id="coding-v1",
+                task_card_id=card_id,
+                profile_id=profile_id,
+            )
+        ),
         output_paths,
-        Path(_text(raw.get("event_log_path", raw.get("event_log", raw.get("lane_event_log"))), "event_log_path")),
+        Path(
+            _text(
+                raw.get(
+                    "event_log_path", raw.get("event_log", raw.get("lane_event_log"))
+                ),
+                "event_log_path",
+            )
+        ),
         tuple(profile["resources"]),
         dict(repository) if isinstance(repository, Mapping) else None,
         requested_thread,
@@ -649,7 +766,9 @@ def adapt_legacy_firmware(raw: Mapping[str, Any]) -> CanonicalInvocation:
     """Represent the schema-less firmware route without migrating its policy."""
 
     if "schema" in raw:
-        raise InvocationValidationError("legacy firmware adapter requires a schema-less record")
+        raise InvocationValidationError(
+            "legacy firmware adapter requires a schema-less record"
+        )
     forbidden = {
         "worker_invocation_id",
         "runtime_root",
@@ -670,13 +789,17 @@ def adapt_legacy_firmware(raw: Mapping[str, Any]) -> CanonicalInvocation:
     }
     present = sorted(forbidden & set(raw))
     if present:
-        raise InvocationValidationError("schema-less firmware record contains coding aliases: " + ", ".join(present))
+        raise InvocationValidationError(
+            "schema-less firmware record contains coding aliases: " + ", ".join(present)
+        )
     prompt_sha256 = _digest(raw.get("prompt_sha256"), "prompt_sha256")
     lane_id = _text(raw.get("declared_lane_id"), "declared_lane_id")
     label = _text(raw.get("label"), "label")
     settings = raw.get("model_settings")
     if not isinstance(settings, Mapping):
-        raise InvocationValidationError("schema-less firmware model_settings are missing")
+        raise InvocationValidationError(
+            "schema-less firmware model_settings are missing"
+        )
     profile_id = f"legacy-firmware:{lane_id}"
     profile = {
         "id": profile_id,
@@ -703,21 +826,40 @@ def adapt_legacy_firmware(raw: Mapping[str, Any]) -> CanonicalInvocation:
         _text(raw.get("doer"), "doer"),
         "codex",
         _text(settings.get("model"), "model_settings.model"),
-        _immutable({
-            "command": list(raw.get("codex_command", ["codex"])),
-            "config_overrides": list(raw.get("config_overrides", [])),
-            "reasoning_effort": _text(settings.get("reasoning_effort"), "reasoning_effort"),
-            "service_tier": _text(settings.get("service_tier"), "service_tier"),
-            "sandbox": "danger-full-access",
-            "approval_policy": "never",
-        }),
+        _immutable(
+            {
+                "command": list(raw.get("codex_command", ["codex"])),
+                "config_overrides": list(raw.get("config_overrides", [])),
+                "reasoning_effort": _text(
+                    settings.get("reasoning_effort"), "reasoning_effort"
+                ),
+                "service_tier": _text(settings.get("service_tier"), "service_tier"),
+                "sandbox": "danger-full-access",
+                "approval_policy": "never",
+            }
+        ),
         _immutable(profile),
-        _immutable(_legacy_bundle_record(prompt_path=_text(raw.get("prompt_path"), "prompt_path"), prompt_sha256=prompt_sha256, workflow_id="legacy-firmware", task_card_id=_text(raw.get("task"), "task"), profile_id=profile_id)),
-        {key: Path(_text((raw.get("output_paths") or {}).get(key), f"output_paths.{key}")) for key in ("status", "jsonl", "stderr", "last_message")},
+        _immutable(
+            _legacy_bundle_record(
+                prompt_path=_text(raw.get("prompt_path"), "prompt_path"),
+                prompt_sha256=prompt_sha256,
+                workflow_id="legacy-firmware",
+                task_card_id=_text(raw.get("task"), "task"),
+                profile_id=profile_id,
+            )
+        ),
+        {
+            key: Path(
+                _text((raw.get("output_paths") or {}).get(key), f"output_paths.{key}")
+            )
+            for key in ("status", "jsonl", "stderr", "last_message")
+        },
         Path(_text(raw.get("lane_event_log"), "lane_event_log")),
         tuple(profile["resources"]),
         None,
-        _text(raw.get("resume_thread_id"), "resume_thread_id") if raw.get("resume_thread_id") is not None else None,
+        _text(raw.get("resume_thread_id"), "resume_thread_id")
+        if raw.get("resume_thread_id") is not None
+        else None,
         label,
         _text(raw.get("task"), "task"),
         _text(raw.get("phase"), "phase"),

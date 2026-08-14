@@ -37,7 +37,9 @@ def _sandbox_arguments(arguments: list[str]) -> list[str]:
             index += 2
             continue
         if value == "--output-last-message" and index + 1 < len(arguments):
-            rewritten.extend((value, "/workspace/.agent-workspace/real_agent_last_message.txt"))
+            rewritten.extend(
+                (value, "/workspace/.agent-workspace/real_agent_last_message.txt")
+            )
             index += 2
             continue
         rewritten.append(value)
@@ -61,7 +63,9 @@ def _linux_creation_identity(pid: int) -> str:
     fields = stat[close + 2 :].split()
     if len(fields) <= 19:
         raise RuntimeError("Linux process stat lacks a start identity")
-    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    boot_id = (
+        Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    )
     return f"{boot_id}:{fields[19]}"
 
 
@@ -78,7 +82,9 @@ def _fork_provider(command: list[str]) -> int:
 
 
 def _parse() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run one prepared Codex provider bridge")
+    parser = argparse.ArgumentParser(
+        description="Run one prepared Codex provider bridge"
+    )
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--nonce", required=True)
     parser.add_argument("--invocation-id", required=True)
@@ -128,17 +134,28 @@ def main() -> int:
     )
     pinned = Path(state["pinned_codex"]).resolve(strict=True)
     pinned_stat = pinned.stat()
-    if pinned_stat.st_dev != state.get("pinned_codex_device") or pinned_stat.st_ino != state.get("pinned_codex_inode"):
+    if pinned_stat.st_dev != state.get(
+        "pinned_codex_device"
+    ) or pinned_stat.st_ino != state.get("pinned_codex_inode"):
         raise RuntimeError("prepared pinned Codex device/inode changed")
     base = bwrap_base(
-        Path(state["bwrap"]), Path(state["release"]), Path(state["workspace"]),
-        Path(state["codex_home"]), str(state["proxy_url"]),
+        Path(state["bwrap"]),
+        Path(state["release"]),
+        Path(state["workspace"]),
+        Path(state["codex_home"]),
+        str(state["proxy_url"]),
     )
     provider_argv = _provider_argv(args.command, base)
     cgroup_launcher = Path(state["cgroup_launcher"])
     launch_command = [
-        "/usr/bin/python3", str(cgroup_launcher), "--cgroup", str(state["cgroup"]),
-        "--network-namespace", str(state["network_namespace"]), "--", *provider_argv,
+        "/usr/bin/python3",
+        str(cgroup_launcher),
+        "--cgroup",
+        str(state["cgroup"]),
+        "--network-namespace",
+        str(state["network_namespace"]),
+        "--",
+        *provider_argv,
     ]
     linux_bridge_pid = _fork_provider(launch_command)
     linux_bridge_created = _linux_creation_identity(linux_bridge_pid)
@@ -177,9 +194,11 @@ def main() -> int:
             "invocation_id": args.invocation_id,
             "prepared_claim": claim,
             "linux_bridge": {
-                "platform": "linux", "pid": linux_bridge_pid,
+                "platform": "linux",
+                "pid": linux_bridge_pid,
                 "created_utc": linux_bridge_created,
-                "nonce": args.nonce, "invocation_id": args.invocation_id,
+                "nonce": args.nonce,
+                "invocation_id": args.invocation_id,
             },
             "codex": {
                 "pid": codex_pid,
@@ -190,9 +209,12 @@ def main() -> int:
                 "ancestry": codex_chain,
             },
             "sandbox": {
-                "workspace_target": "/workspace", "codex_target": "/opt/codex",
-                "host_auth_target": "/home/agent/.codex", "mnt_c_exposed": False,
-                "usb_exposed": False, "capabilities_dropped": True,
+                "workspace_target": "/workspace",
+                "codex_target": "/opt/codex",
+                "host_auth_target": "/home/agent/.codex",
+                "mnt_c_exposed": False,
+                "usb_exposed": False,
+                "capabilities_dropped": True,
                 "network_namespace": state["network_namespace"],
             },
             "exit_code": exit_code,
@@ -206,7 +228,9 @@ def main() -> int:
         # The preparation waiter owns the namespace/cgroup cleanup.  This
         # marker is intentionally only a control signal, never a transcript.
         release_signal = Path(str(state["release_signal"]))
-        atomic_json(release_signal, {"nonce": args.nonce, "invocation_id": args.invocation_id})
+        atomic_json(
+            release_signal, {"nonce": args.nonce, "invocation_id": args.invocation_id}
+        )
     if failure is not None:
         raise failure
     return 0

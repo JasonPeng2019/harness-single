@@ -32,7 +32,11 @@ ALLOWED_OPENAI_ENDPOINTS = {("chatgpt.com", 443)}
 PREPARED_STATE_SCHEMA = "orchestrator-wsl-prepared-state/v1"
 PREPARED_CLAIM_SCHEMA = "orchestrator-wsl-prepared-claim/v1"
 FORBIDDEN_COMMAND_MARKERS = (
-    "byo-firmware-mcp", "pyocd", "jlink", "openocd", "st-util",
+    "byo-firmware-mcp",
+    "pyocd",
+    "jlink",
+    "openocd",
+    "st-util",
 )
 
 
@@ -41,12 +45,21 @@ def utc_now() -> str:
 
 
 def run(
-    argv: list[str], *, check: bool = True, input_text: str | None = None,
+    argv: list[str],
+    *,
+    check: bool = True,
+    input_text: str | None = None,
     timeout: float = 30,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
-        argv, check=False, input=input_text, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=timeout,
+        argv,
+        check=False,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
     )
     if check and completed.returncode != 0:
         raise RuntimeError(
@@ -61,7 +74,9 @@ def run(
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(temporary, path)
 
 
@@ -83,7 +98,8 @@ def copy_harness_source(source_root: Path, destination: Path) -> Path:
 
     def ignored(_directory: str, names: list[str]) -> set[str]:
         return {
-            name for name in names
+            name
+            for name in names
             if name in {".real-agent", "test-evidence", "__pycache__", ".pytest_cache"}
             or name.endswith(".pyc")
         }
@@ -102,7 +118,11 @@ def token_expiry(token: str) -> str:
         raise RuntimeError("access token is not a JWT")
     payload = parts[1] + "=" * (-len(parts[1]) % 4)
     value = json.loads(base64.urlsafe_b64decode(payload))
-    return datetime.fromtimestamp(int(value["exp"]), timezone.utc).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(int(value["exp"]), timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def minimal_auth(source: Path, destination: Path) -> tuple[list[str], str, str]:
@@ -120,10 +140,16 @@ def minimal_auth(source: Path, destination: Path) -> tuple[list[str], str, str]:
         raise RuntimeError("source Codex auth lacks token/account/ID fields")
     expiry = token_expiry(access)
     id_expiry = token_expiry(id_token)
-    if datetime.fromisoformat(expiry.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+    if datetime.fromisoformat(expiry.replace("Z", "+00:00")) <= datetime.now(
+        timezone.utc
+    ):
         raise RuntimeError("source Codex access token is expired")
-    if datetime.fromisoformat(id_expiry.replace("Z", "+00:00")) > datetime.now(timezone.utc):
-        raise RuntimeError("Codex ID-format field is not expired; refusing to expose it")
+    if datetime.fromisoformat(id_expiry.replace("Z", "+00:00")) > datetime.now(
+        timezone.utc
+    ):
+        raise RuntimeError(
+            "Codex ID-format field is not expired; refusing to expose it"
+        )
     minimized = {
         "auth_mode": value.get("auth_mode", "chatgpt"),
         "OPENAI_API_KEY": None,
@@ -138,7 +164,9 @@ def minimal_auth(source: Path, destination: Path) -> tuple[list[str], str, str]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(minimized, indent=2) + "\n", encoding="utf-8")
     os.chmod(destination, 0o600)
-    secrets = [item for item in (access, id_token, refresh) if isinstance(item, str) and item]
+    secrets = [
+        item for item in (access, id_token, refresh) if isinstance(item, str) and item
+    ]
     api_key = value.get("OPENAI_API_KEY")
     if isinstance(api_key, str) and api_key:
         secrets.append(api_key)
@@ -170,7 +198,13 @@ def proc_ppid(pid: int) -> int:
 
 def proc_command(pid: int) -> str:
     try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        return (
+            Path(f"/proc/{pid}/cmdline")
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode("utf-8", "replace")
+            .strip()
+        )
     except OSError:
         return ""
 
@@ -192,13 +226,15 @@ def ancestry(pid: int, stop_pid: int) -> list[dict[str, Any]]:
     current = pid
     while current > 0 and current not in seen:
         seen.add(current)
-        result.append({
-            "pid": current,
-            "ppid": proc_ppid(current),
-            "exe": str(proc_exe(current) or ""),
-            "command": proc_command(current),
-            "nspid": proc_nspid(current),
-        })
+        result.append(
+            {
+                "pid": current,
+                "ppid": proc_ppid(current),
+                "exe": str(proc_exe(current) or ""),
+                "command": proc_command(current),
+                "nspid": proc_nspid(current),
+            }
+        )
         if current == stop_pid:
             return result
         current = int(result[-1]["ppid"])
@@ -206,7 +242,10 @@ def ancestry(pid: int, stop_pid: int) -> list[dict[str, Any]]:
 
 
 def discover_codex(
-    cgroup: Path, pinned_codex: Path, root_pid: int, timeout: float,
+    cgroup: Path,
+    pinned_codex: Path,
+    root_pid: int,
+    timeout: float,
 ) -> tuple[int, list[dict[str, Any]]]:
     deadline = time.monotonic() + timeout
     pinned_stat = pinned_codex.resolve(strict=True).stat()
@@ -219,7 +258,10 @@ def discover_codex(
                 candidate = os.stat(f"/proc/{pid}/exe")
             except OSError:
                 continue
-            if candidate.st_dev == pinned_stat.st_dev and candidate.st_ino == pinned_stat.st_ino:
+            if (
+                candidate.st_dev == pinned_stat.st_dev
+                and candidate.st_ino == pinned_stat.st_ino
+            ):
                 chain = ancestry(pid, root_pid)
                 if len(chain) < 2:
                     raise RuntimeError("pinned Codex has no containment supervisor")
@@ -242,7 +284,20 @@ def make_network_namespace(identifier: str, proxy_audit: Path) -> dict[str, Any]
         run(["ip", "addr", "add", f"{host_ip}/30", "dev", host_if])
         run(["ip", "link", "set", host_if, "up"])
         run(["ip", "netns", "exec", namespace, "ip", "link", "set", "lo", "up"])
-        run(["ip", "netns", "exec", namespace, "ip", "addr", "add", f"{inner_ip}/30", "dev", inner_if])
+        run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                namespace,
+                "ip",
+                "addr",
+                "add",
+                f"{inner_ip}/30",
+                "dev",
+                inner_if,
+            ]
+        )
         run(["ip", "netns", "exec", namespace, "ip", "link", "set", inner_if, "up"])
     except BaseException:
         run(["ip", "netns", "del", namespace], check=False)
@@ -268,39 +323,129 @@ table inet harness {{
         run(["ip", "netns", "del", namespace], check=False)
         raise
     return {
-        "name": namespace, "host_if": host_if, "inner_if": inner_if,
-        "host_ip": host_ip, "inner_ip": inner_ip, "proxy_port": proxy.port,
+        "name": namespace,
+        "host_if": host_if,
+        "inner_if": inner_if,
+        "host_ip": host_ip,
+        "inner_ip": inner_ip,
+        "proxy_port": proxy.port,
         "proxy": proxy,
     }
 
 
 def bwrap_base(
-    bwrap: Path, release: Path, workspace: Path, codex_home: Path, proxy_url: str,
+    bwrap: Path,
+    release: Path,
+    workspace: Path,
+    codex_home: Path,
+    proxy_url: str,
 ) -> list[str]:
     """Return the complete audited sandbox mount/environment manifest."""
 
     return [
-        "setpriv", f"--reuid={NOBODY}", f"--regid={NOBODY}", "--clear-groups",
-        str(bwrap), "--unshare-user", "--unshare-ipc", "--unshare-pid",
-        "--unshare-uts", "--unshare-cgroup", "--die-with-parent", "--new-session",
-        "--tmpfs", "/", "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
-        "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
-        "--dir", "/etc", "--ro-bind", "/etc/ssl", "/etc/ssl",
-        "--ro-bind", "/etc/passwd", "/etc/passwd", "--ro-bind", "/etc/group", "/etc/group",
-        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/opt",
-        "--ro-bind", str(release), "/opt/codex", "--dir", "/home", "--dir", "/home/agent",
-        "--bind", str(codex_home), "/home/agent/.codex", "--bind", str(workspace), "/workspace",
-        "--chdir", "/workspace", "--clearenv", "--setenv", "HOME", "/home/agent",
-        "--setenv", "CODEX_HOME", "/home/agent/.codex", "--setenv", "PATH", "/opt/codex/bin:/usr/bin:/bin",
-        "--setenv", "SSL_CERT_DIR", "/etc/ssl/certs", "--setenv", "PYTHONNOUSERSITE", "1",
-        "--setenv", "HTTP_PROXY", proxy_url, "--setenv", "HTTPS_PROXY", proxy_url,
-        "--setenv", "http_proxy", proxy_url, "--setenv", "https_proxy", proxy_url,
-        "--setenv", "NO_PROXY", "", "--setenv", "no_proxy", "", "--cap-drop", "ALL",
+        "setpriv",
+        f"--reuid={NOBODY}",
+        f"--regid={NOBODY}",
+        "--clear-groups",
+        str(bwrap),
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--die-with-parent",
+        "--new-session",
+        "--tmpfs",
+        "/",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--symlink",
+        "usr/bin",
+        "/bin",
+        "--symlink",
+        "usr/lib",
+        "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+        "--dir",
+        "/etc",
+        "--ro-bind",
+        "/etc/ssl",
+        "/etc/ssl",
+        "--ro-bind",
+        "/etc/passwd",
+        "/etc/passwd",
+        "--ro-bind",
+        "/etc/group",
+        "/etc/group",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/opt",
+        "--ro-bind",
+        str(release),
+        "/opt/codex",
+        "--dir",
+        "/home",
+        "--dir",
+        "/home/agent",
+        "--bind",
+        str(codex_home),
+        "/home/agent/.codex",
+        "--bind",
+        str(workspace),
+        "/workspace",
+        "--chdir",
+        "/workspace",
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/home/agent",
+        "--setenv",
+        "CODEX_HOME",
+        "/home/agent/.codex",
+        "--setenv",
+        "PATH",
+        "/opt/codex/bin:/usr/bin:/bin",
+        "--setenv",
+        "SSL_CERT_DIR",
+        "/etc/ssl/certs",
+        "--setenv",
+        "PYTHONNOUSERSITE",
+        "1",
+        "--setenv",
+        "HTTP_PROXY",
+        proxy_url,
+        "--setenv",
+        "HTTPS_PROXY",
+        proxy_url,
+        "--setenv",
+        "http_proxy",
+        proxy_url,
+        "--setenv",
+        "https_proxy",
+        proxy_url,
+        "--setenv",
+        "NO_PROXY",
+        "",
+        "--setenv",
+        "no_proxy",
+        "",
+        "--cap-drop",
+        "ALL",
     ]
 
 
-def preflight(namespace: str, base: list[str], proxy_host: str, proxy_port: int) -> dict[str, Any]:
-    script = r'''
+def preflight(
+    namespace: str, base: list[str], proxy_host: str, proxy_port: int
+) -> dict[str, Any]:
+    script = r"""
 import json, os, pathlib, socket, subprocess
 def connect(host, port):
     try:
@@ -357,21 +502,37 @@ value = {
  },
 }
 print(json.dumps(value, sort_keys=True))
-'''.replace("PROXY_HOST", repr(proxy_host)).replace("PROXY_PORT", str(proxy_port))
-    completed = run(["ip", "netns", "exec", namespace, *base, "/usr/bin/python3", "-c", script], timeout=30)
+""".replace("PROXY_HOST", repr(proxy_host)).replace("PROXY_PORT", str(proxy_port))
+    completed = run(
+        ["ip", "netns", "exec", namespace, *base, "/usr/bin/python3", "-c", script],
+        timeout=30,
+    )
     result = json.loads(completed.stdout.splitlines()[-1])
     codex_probe = result.pop("codex_probe")
     if codex_probe.get("started") is not True or not codex_probe.get("version"):
-        raise RuntimeError(f"pinned Codex did not start in the prepared sandbox: {codex_probe}")
+        raise RuntimeError(
+            f"pinned Codex did not start in the prepared sandbox: {codex_probe}"
+        )
     expected = {
-        "uid": NOBODY, "gid": NOBODY, "cap_eff": "0000000000000000", "mnt_c_present": False,
-        "usb_present": False, "repo_marker_present": False, "workspace_writable": True,
-        "usr_writable": False, "default_route_present": False, "metadata_direct": False,
-        "internet_direct": False, "host_other_port": False,
+        "uid": NOBODY,
+        "gid": NOBODY,
+        "cap_eff": "0000000000000000",
+        "mnt_c_present": False,
+        "usb_present": False,
+        "repo_marker_present": False,
+        "workspace_writable": True,
+        "usr_writable": False,
+        "default_route_present": False,
+        "metadata_direct": False,
+        "internet_direct": False,
+        "host_other_port": False,
         "denied_proxy_status": "HTTP/1.1 403 Forbidden",
         "allowed_proxy_status": "HTTP/1.1 200 Connection Established",
         "git_proof": {
-            "base_present": True, "committed": True, "reset_clean": True, "head_restored": True,
+            "base_present": True,
+            "committed": True,
+            "reset_clean": True,
+            "head_restored": True,
         },
     }
     if result != expected:
@@ -396,15 +557,20 @@ def redact_tree(root: Path, secrets: list[str]) -> None:
 
 
 def copy_evidence(
-    temp_root: Path, evidence: Path, secrets: list[str],
+    temp_root: Path,
+    evidence: Path,
+    secrets: list[str],
     state_path: Path | None = None,
 ) -> None:
     """Copy only the explicitly redacted isolation summaries."""
 
     evidence.mkdir(parents=True, exist_ok=True)
     for name in (
-        "isolation-preflight.json", "proxy-audit.jsonl", "cgroup-evidence.json",
-        "prepared-state.json", "driver-failure.txt",
+        "isolation-preflight.json",
+        "proxy-audit.jsonl",
+        "cgroup-evidence.json",
+        "prepared-state.json",
+        "driver-failure.txt",
     ):
         source = temp_root / name
         if source.exists():
@@ -433,7 +599,9 @@ def _valid_hex(value: str, length: int, label: str) -> None:
         raise RuntimeError(f"{label} must be lowercase hexadecimal of length {length}")
 
 
-def validate_prepared_state(value: object, *, nonce: str, invocation_id: str) -> dict[str, Any]:
+def validate_prepared_state(
+    value: object, *, nonce: str, invocation_id: str
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError("prepared state is not an object")
     if value.get("schema") != PREPARED_STATE_SCHEMA or value.get("status") != "READY":
@@ -444,7 +612,18 @@ def validate_prepared_state(value: object, *, nonce: str, invocation_id: str) ->
         raise RuntimeError("prepared state invocation mismatch")
     if value.get("consumed") is not False:
         raise RuntimeError("prepared state was already consumed")
-    for key in ("cgroup", "network_namespace", "proxy_url", "workspace", "codex_home", "release", "pinned_codex", "bwrap", "cgroup_launcher", "release_signal"):
+    for key in (
+        "cgroup",
+        "network_namespace",
+        "proxy_url",
+        "workspace",
+        "codex_home",
+        "release",
+        "pinned_codex",
+        "bwrap",
+        "cgroup_launcher",
+        "release_signal",
+    ):
         if not isinstance(value.get(key), str) or not value[key]:
             raise RuntimeError(f"prepared state lacks {key}")
     if value["network_namespace"] != f"oh-{str(value['run_id'])[:8]}":
@@ -452,12 +631,17 @@ def validate_prepared_state(value: object, *, nonce: str, invocation_id: str) ->
     return value
 
 
-def claim_prepared_state(claim_path: Path, *, nonce: str, invocation_id: str) -> dict[str, Any]:
+def claim_prepared_state(
+    claim_path: Path, *, nonce: str, invocation_id: str
+) -> dict[str, Any]:
     """Claim the preparation exactly once with O_EXCL."""
 
     claim = {
-        "schema": PREPARED_CLAIM_SCHEMA, "nonce": nonce, "invocation_id": invocation_id,
-        "linux_bridge_pid": os.getpid(), "claimed_utc": utc_now(),
+        "schema": PREPARED_CLAIM_SCHEMA,
+        "nonce": nonce,
+        "invocation_id": invocation_id,
+        "linux_bridge_pid": os.getpid(),
+        "claimed_utc": utc_now(),
     }
     claim_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -516,40 +700,69 @@ def _prepare(args: argparse.Namespace) -> int:
     ready_state: dict[str, Any] | None = None
     try:
         codex_home = temp_root / "codex-home"
-        secrets, access_expiry, id_expiry = minimal_auth(Path(args.auth_json).resolve(strict=True), codex_home / "auth.json")
+        secrets, access_expiry, id_expiry = minimal_auth(
+            Path(args.auth_json).resolve(strict=True), codex_home / "auth.json"
+        )
         chown_tree(workspace)
         os.chown(codex_home, NOBODY, NOBODY)
         os.chown(codex_home / "auth.json", NOBODY, NOBODY)
         cgroup.mkdir()
         (cgroup / "pids.max").write_text("64\n", encoding="ascii")
-        (cgroup / "memory.max").write_text(str(1024 * 1024 * 1024) + "\n", encoding="ascii")
+        (cgroup / "memory.max").write_text(
+            str(1024 * 1024 * 1024) + "\n", encoding="ascii"
+        )
         if (cgroup / "memory.swap.max").exists():
             (cgroup / "memory.swap.max").write_text("0\n", encoding="ascii")
         (cgroup / "cpu.max").write_text("200000 100000\n", encoding="ascii")
         network = make_network_namespace(args.run_id, temp_root / "proxy-audit.jsonl")
         proxy_url = f"http://{network['host_ip']}:{network['proxy_port']}"
-        isolation = preflight(network["name"], bwrap_base(bwrap, release, workspace, codex_home, proxy_url), network["host_ip"], network["proxy_port"])
-        atomic_json(temp_root / "isolation-preflight.json", {
-            **isolation, "network_namespace": network["name"],
-            "allowed_endpoints": sorted(f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS),
-            "access_token_expiry_utc": access_expiry, "id_token_format": "expired-format-only",
-            "captured_utc": utc_now(),
-        })
+        isolation = preflight(
+            network["name"],
+            bwrap_base(bwrap, release, workspace, codex_home, proxy_url),
+            network["host_ip"],
+            network["proxy_port"],
+        )
+        atomic_json(
+            temp_root / "isolation-preflight.json",
+            {
+                **isolation,
+                "network_namespace": network["name"],
+                "allowed_endpoints": sorted(
+                    f"{host}:{port}" for host, port in ALLOWED_OPENAI_ENDPOINTS
+                ),
+                "access_token_expiry_utc": access_expiry,
+                "id_token_format": "expired-format-only",
+                "captured_utc": utc_now(),
+            },
+        )
         pinned_stat = pinned_codex.stat()
         ready_state = {
-            "schema": PREPARED_STATE_SCHEMA, "status": "READY", "consumed": False,
-            "run_id": args.run_id, "nonce": args.nonce, "invocation_id": args.invocation_id,
-            "workspace": str(workspace), "cgroup": str(cgroup),
-            "network_namespace": network["name"], "proxy_host": network["host_ip"],
-            "proxy_port": network["proxy_port"], "proxy_url": proxy_url,
-            "codex_home": str(codex_home), "release": str(release),
-            "pinned_codex": str(pinned_codex), "pinned_codex_device": pinned_stat.st_dev,
-            "pinned_codex_inode": pinned_stat.st_ino, "bwrap": str(bwrap),
+            "schema": PREPARED_STATE_SCHEMA,
+            "status": "READY",
+            "consumed": False,
+            "run_id": args.run_id,
+            "nonce": args.nonce,
+            "invocation_id": args.invocation_id,
+            "workspace": str(workspace),
+            "cgroup": str(cgroup),
+            "network_namespace": network["name"],
+            "proxy_host": network["host_ip"],
+            "proxy_port": network["proxy_port"],
+            "proxy_url": proxy_url,
+            "codex_home": str(codex_home),
+            "release": str(release),
+            "pinned_codex": str(pinned_codex),
+            "pinned_codex_device": pinned_stat.st_dev,
+            "pinned_codex_inode": pinned_stat.st_ino,
+            "bwrap": str(bwrap),
             "cgroup_launcher": str(Path(args.cgroup_launcher).resolve(strict=True)),
             "provider_entry": str(Path(args.provider_entry).resolve(strict=True)),
-            "release_signal": str(release_signal), "bwrap_source": bwrap_source,
-            "prepared_linux_pid": os.getpid(), "prepared_utc": utc_now(),
-            "credentials_in_state": False, "preflight": isolation,
+            "release_signal": str(release_signal),
+            "bwrap_source": bwrap_source,
+            "prepared_linux_pid": os.getpid(),
+            "prepared_utc": utc_now(),
+            "credentials_in_state": False,
+            "preflight": isolation,
         }
         atomic_json(state_path, ready_state)
         # The Windows host decides when the provider attempt is over.  This
@@ -562,12 +775,21 @@ def _prepare(args: argparse.Namespace) -> int:
             raise TimeoutError("Windows route did not release prepared Linux resources")
     except BaseException as exc:
         failure = exc
-        atomic_json(state_path, {
-            "schema": PREPARED_STATE_SCHEMA, "status": "FAILED", "run_id": args.run_id,
-            "nonce": args.nonce, "invocation_id": args.invocation_id,
-            "credentials_in_state": False, "error_type": type(exc).__name__,
-        })
-        (temp_root / "driver-failure.txt").write_text(type(exc).__name__ + "\n", encoding="utf-8")
+        atomic_json(
+            state_path,
+            {
+                "schema": PREPARED_STATE_SCHEMA,
+                "status": "FAILED",
+                "run_id": args.run_id,
+                "nonce": args.nonce,
+                "invocation_id": args.invocation_id,
+                "credentials_in_state": False,
+                "error_type": type(exc).__name__,
+            },
+        )
+        (temp_root / "driver-failure.txt").write_text(
+            type(exc).__name__ + "\n", encoding="utf-8"
+        )
     finally:
         try:
             kill_cgroup(cgroup)
@@ -580,18 +802,27 @@ def _prepare(args: argparse.Namespace) -> int:
                 for name in ("pids.max", "memory.max", "memory.swap.max", "cpu.max")
                 if (cgroup / name).exists()
             },
-            "remaining_pids": sorted(cgroup_processes(cgroup)), "captured_utc": utc_now(),
+            "remaining_pids": sorted(cgroup_processes(cgroup)),
+            "captured_utc": utc_now(),
         }
         atomic_json(temp_root / "cgroup-evidence.json", cgroup_evidence)
         if network is not None:
             network["proxy"].close()
             run(["ip", "netns", "del", network["name"]], check=False)
-        atomic_json(state_path, {
-            **(ready_state or {}), "status": "CLEANED", "consumed": True,
-            "cleanup_complete": not cgroup_evidence["remaining_pids"],
-            "cleaned_utc": utc_now(), "credentials_in_state": False,
-            "preparation_error_type": type(failure).__name__ if failure is not None else None,
-        })
+        atomic_json(
+            state_path,
+            {
+                **(ready_state or {}),
+                "status": "CLEANED",
+                "consumed": True,
+                "cleanup_complete": not cgroup_evidence["remaining_pids"],
+                "cleaned_utc": utc_now(),
+                "credentials_in_state": False,
+                "preparation_error_type": type(failure).__name__
+                if failure is not None
+                else None,
+            },
+        )
         copy_evidence(temp_root, evidence, secrets, state_path=state_path)
         shutil.rmtree(temp_root, ignore_errors=True)
         try:
@@ -604,7 +835,9 @@ def _prepare(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Prepare one Linux provider-isolation side")
+    parser = argparse.ArgumentParser(
+        description="Prepare one Linux provider-isolation side"
+    )
     parser.add_argument("--mode", choices=("prepare",), required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--nonce", required=True)

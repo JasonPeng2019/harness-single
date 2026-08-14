@@ -23,7 +23,12 @@ def decode_historical_attention_record(value: Mapping[str, Any]) -> dict[str, An
         raise ValueError("historical attention record is oversized or malformed")
     event_id = value.get("event_id")
     kind = value.get("kind")
-    if not isinstance(event_id, str) or not event_id.strip() or not isinstance(kind, str) or not kind.strip():
+    if (
+        not isinstance(event_id, str)
+        or not event_id.strip()
+        or not isinstance(kind, str)
+        or not kind.strip()
+    ):
         raise ValueError("historical attention record has no bounded identity")
     return {
         "schema": HISTORICAL_ATTENTION_SCHEMA,

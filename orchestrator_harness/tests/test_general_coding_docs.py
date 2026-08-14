@@ -43,9 +43,9 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
 
         root_readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
-        package_readme = (REPOSITORY_ROOT / "orchestrator_harness" / "README.md").read_text(
-            encoding="utf-8"
-        )
+        package_readme = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "README.md"
+        ).read_text(encoding="utf-8")
         self.assertIn("## Start here", root_readme)
         self.assertIn("QUICK_START.md", root_readme)
         self.assertIn("# Quick Start: Ordinary Coding", quick_start)
@@ -65,16 +65,18 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
     def test_legacy_firmware_compatibility_is_explicit_and_scoped(self) -> None:
         root_readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
-        package_readme = (REPOSITORY_ROOT / "orchestrator_harness" / "README.md").read_text(
-            encoding="utf-8"
-        )
+        package_readme = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "README.md"
+        ).read_text(encoding="utf-8")
         self.assertIn("## Supported firmware compatibility path", root_readme)
         self.assertIn("separate compatibility path", root_readme)
         self.assertIn("not part of this quick start", quick_start)
         self.assertIn("## Legacy firmware suite use", package_readme)
         self.assertIn("schema-less legacy firmware", package_readme)
         for document in PRIMARY_DOCS:
-            self.assertNotIn("MCP-Trial", document.read_text(encoding="utf-8"), document)
+            self.assertNotIn(
+                "MCP-Trial", document.read_text(encoding="utf-8"), document
+            )
 
     def test_schema_less_firmware_invocation_still_parses(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -129,7 +131,10 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
                     "service_tier": "priority",
                 },
                 "lane_event_log": str(
-                    root / "multi-agent-logs" / "orchestrator-harness" / "LANE_EVENTS.jsonl"
+                    root
+                    / "multi-agent-logs"
+                    / "orchestrator-harness"
+                    / "LANE_EVENTS.jsonl"
                 ),
             }
             invocation_path = workspace / "legacy.invocation.json"

@@ -15,9 +15,9 @@ class CandidateSafeguardTests(unittest.TestCase):
         script = (
             REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
         ).read_text(encoding="utf-8")
-        core = (
-            REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
-        ).read_text(encoding="utf-8")
+        core = (REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("C:/Users/", script)
         self.assertIn("RepositoryRoot", script)
         self.assertIn("ExpectedTip", script)

@@ -12,6 +12,7 @@ only initial exclusions, so lane-managed orchestration sessions receive no
 bounded-test deadline while every non-excluded covered nested command launched
 inside an agent worktree still requires the one supervisor.
 """
+
 from __future__ import annotations
 
 import json
@@ -58,20 +59,28 @@ def load_launchers(policy_root: str | Path) -> dict[str, frozenset[str]]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise BoundedPolicyError(f"cannot read valid bounded launcher policy {path}: {exc}") from exc
+        raise BoundedPolicyError(
+            f"cannot read valid bounded launcher policy {path}: {exc}"
+        ) from exc
     if not isinstance(value, dict) or set(value) != {"schema", "launcher_categories"}:
-        raise BoundedPolicyError("bounded launcher policy must contain only schema and launcher_categories")
+        raise BoundedPolicyError(
+            "bounded launcher policy must contain only schema and launcher_categories"
+        )
     if value.get("schema") != LAUNCHERS_SCHEMA:
         raise BoundedPolicyError("bounded launcher policy has the wrong schema")
     categories = value.get("launcher_categories")
     if not isinstance(categories, dict) or set(categories) != EXPECTED_CATEGORIES:
-        raise BoundedPolicyError("bounded launcher policy must declare the three supported categories")
+        raise BoundedPolicyError(
+            "bounded launcher policy must declare the three supported categories"
+        )
     result: dict[str, frozenset[str]] = {}
     for category, raw_names in categories.items():
         if not isinstance(raw_names, list) or any(
             not isinstance(name, str) or not name.strip() for name in raw_names
         ):
-            raise BoundedPolicyError(f"bounded launcher category {category} must be a string list")
+            raise BoundedPolicyError(
+                f"bounded launcher category {category} must be a string list"
+            )
         result[category] = frozenset(_launcher_name(name) for name in raw_names)
     return result
 
@@ -83,7 +92,9 @@ def validate_exclusions(policy_root: str | Path) -> Path:
     try:
         path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        raise BoundedPolicyError(f"cannot read valid bounded exclusion policy {path}: {exc}") from exc
+        raise BoundedPolicyError(
+            f"cannot read valid bounded exclusion policy {path}: {exc}"
+        ) from exc
     return path
 
 
@@ -143,7 +154,9 @@ def _covered_segment(
 
     first_name = _launcher_name(values[0])
     if first_name == "uv" and any(value.casefold() == "run" for value in values[1:]):
-        run_index = next(index for index, value in enumerate(values) if value.casefold() == "run")
+        run_index = next(
+            index for index, value in enumerate(values) if value.casefold() == "run"
+        )
         for index in range(run_index + 1, len(values)):
             if _launcher_name(values[index]) in launchers["python_script"]:
                 return CoveredInvocation(_python_script(values[index + 1 :]))
@@ -196,7 +209,11 @@ def command_segments(command: str) -> list[str]:
             current.append(character)
             index += 1
             current.append(command[index])
-            if command[index] == "\r" and index + 1 < len(command) and command[index + 1] == "\n":
+            if (
+                command[index] == "\r"
+                and index + 1 < len(command)
+                and command[index + 1] == "\n"
+            ):
                 index += 1
                 current.append(command[index])
             index += 1
@@ -208,7 +225,9 @@ def command_segments(command: str) -> list[str]:
             continue
         separator_length = 0
         if character in {";", "|", "\r", "\n"}:
-            separator_length = 2 if character == "|" and command[index : index + 2] == "||" else 1
+            separator_length = (
+                2 if character == "|" and command[index : index + 2] == "||" else 1
+            )
         elif command[index : index + 2] == "&&":
             separator_length = 2
         if separator_length:
@@ -229,7 +248,11 @@ def _working_directory(payload: Mapping[str, Any], policy_root: Path) -> Path:
     raw = tool_input.get("workdir") if isinstance(tool_input, Mapping) else None
     if not isinstance(raw, str) or not raw:
         raw = payload.get("cwd")
-    return Path(raw).resolve(strict=False) if isinstance(raw, str) and raw else policy_root
+    return (
+        Path(raw).resolve(strict=False) if isinstance(raw, str) and raw else policy_root
+    )
+
+
 def is_excluded(
     script: str,
     *,
@@ -272,7 +295,9 @@ def is_excluded(
             check=False,
         )
     except OSError as exc:
-        raise BoundedPolicyError(f"git could not start to evaluate bounded exclusions: {exc}") from exc
+        raise BoundedPolicyError(
+            f"git could not start to evaluate bounded exclusions: {exc}"
+        ) from exc
     if completed.returncode not in {0, 1}:
         raise BoundedPolicyError(
             f"git could not evaluate bounded exclusions: {completed.stderr.strip()}"
@@ -283,7 +308,9 @@ def is_excluded(
     if match is None:
         raise BoundedPolicyError("git returned an unreadable bounded-exclusion match")
     source = Path(match.group(1).strip("\"'")).resolve(strict=False)
-    return source == exclusions.resolve(strict=False) and not match.group(3).startswith("!")
+    return source == exclusions.resolve(strict=False) and not match.group(3).startswith(
+        "!"
+    )
 
 
 def guard_pre_tool_use(

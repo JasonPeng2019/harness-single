@@ -86,41 +86,59 @@ controller:
 import sys
 from orchestrator_harness.lane_controller import main
 from orchestrator_harness.provider import (
-    BaseProviderAdapter, ProviderCapabilities, ProviderEvent,
-    ProviderLaunchSpec, register_provider_adapter,
+    BaseProviderAdapter,
+    ProviderCapabilities,
+    ProviderEvent,
+    ProviderLaunchSpec,
+    register_provider_adapter,
 )
+
 
 class MyCliProviderAdapter(BaseProviderAdapter):
     provider_id = "my-cli"
+
     def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
         return [*spec.command, "--run", "--model", spec.model]
+
     def encode_prompt(self, prompt: bytes) -> bytes:
         return prompt
+
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         return None
+
     def terminal_outcome(self, event, exit_code) -> str:
         return "COMPLETED" if exit_code == 0 else "FAILED"
+
     def redact_argv(self, argv):
         # Own every credential spelling; the generic core never guesses.
         redacted, redact_next = [], False
         for token in argv:
             if redact_next:
-                redacted.append("<redacted>"); redact_next = False
+                redacted.append("<redacted>")
+                redact_next = False
             elif token == "--auth":
-                redacted.append("<redacted>"); redact_next = True
+                redacted.append("<redacted>")
+                redact_next = True
             else:
                 redacted.append(token)
         if redact_next:
             redacted.append("<redacted>")
         return tuple(redacted)
 
+
 register_provider_adapter(
     "my-cli",
     MyCliProviderAdapter(),
     version="my-cli-v1",
     capabilities=ProviderCapabilities(
-        launch=True, prompt=True, event_result=True, session=True,
-        resume=True, permission=True, configuration=True, notification=False,
+        launch=True,
+        prompt=True,
+        event_result=True,
+        session=True,
+        resume=True,
+        permission=True,
+        configuration=True,
+        notification=False,
     ),
 )
 sys.exit(main([sys.argv[1]]))

@@ -1,4 +1,4 @@
-# Board-free canary guide — final
+# Board-free canary guide â€” final
 
 Run:
 

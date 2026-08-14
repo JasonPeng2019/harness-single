@@ -174,10 +174,12 @@ class CheckSpec:
             _relative_path(path, f"{self.stable_id}.dependency_paths")
         for scope in self.input_scopes:
             if not isinstance(scope, InputScope):
-                raise SelectionError(f"{self.stable_id}.input_scopes must contain InputScope values")
-        if len({(scope.kind, scope.path.casefold()) for scope in self.input_scopes}) != len(
-            self.input_scopes
-        ):
+                raise SelectionError(
+                    f"{self.stable_id}.input_scopes must contain InputScope values"
+                )
+        if len(
+            {(scope.kind, scope.path.casefold()) for scope in self.input_scopes}
+        ) != len(self.input_scopes):
             raise SelectionError(f"{self.stable_id}.input_scopes must not be ambiguous")
         _string_tuple(
             self.external_requirements, f"{self.stable_id}.external_requirements"
@@ -386,7 +388,9 @@ def _scope_matches(scope: InputScope, relative: str) -> bool:
         return True
     if pattern.startswith("**/"):
         short = pattern[3:]
-        if PurePosixPath(normalized).match(short) or fnmatch.fnmatchcase(normalized, short):
+        if PurePosixPath(normalized).match(short) or fnmatch.fnmatchcase(
+            normalized, short
+        ):
             return True
     if "/**/" in pattern:
         prefix, suffix = pattern.split("/**/", 1)
@@ -416,7 +420,9 @@ def _tracked_paths(root: Path) -> tuple[str, ...]:
         values = completed.stdout.decode("utf-8").split("\0")
     except UnicodeDecodeError as exc:
         raise SelectionError(f"tracked input paths are not UTF-8: {exc}") from exc
-    paths = tuple(sorted({_relative_path(value, "tracked_path") for value in values if value}))
+    paths = tuple(
+        sorted({_relative_path(value, "tracked_path") for value in values if value})
+    )
     return paths
 
 
@@ -447,11 +453,17 @@ def resolve_input_scope(spec: CheckSpec, root: str | Path) -> tuple[str, ...]:
             directory = root_path / Path(scope.path)
             if directory.is_symlink() or not directory.is_dir():
                 if scope.required:
-                    raise SelectionError(f"required input tree is unavailable: {scope.path}")
+                    raise SelectionError(
+                        f"required input tree is unavailable: {scope.path}"
+                    )
                 continue
-        matches = tuple(relative for relative in tracked if _scope_matches(scope, relative))
+        matches = tuple(
+            relative for relative in tracked if _scope_matches(scope, relative)
+        )
         if scope.required and not matches:
-            raise SelectionError(f"required input scope matched no tracked files: {scope.path}")
+            raise SelectionError(
+                f"required input scope matched no tracked files: {scope.path}"
+            )
         for relative in matches:
             _validated_input_path(root_path, relative, scope=scope)
             resolved.append(relative)
@@ -707,7 +719,10 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.RELEASE.ATTENTION",
             "attention-retention practical",
             "release",
-            ("python", "harness_watcher_implementation/tests/run_attention_practical.py"),
+            (
+                "python",
+                "harness_watcher_implementation/tests/run_attention_practical.py",
+            ),
             ("release-attention",),
             (
                 "harness_watcher_implementation/tests/run_attention_practical.py",
@@ -991,7 +1006,15 @@ def _is_ancestor(root: Path, origin_tip: str, current_tip: str) -> bool:
         return False
     try:
         completed = subprocess.run(
-            ["git", "-C", str(root), "merge-base", "--is-ancestor", origin_tip, current_tip],
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge-base",
+                "--is-ancestor",
+                origin_tip,
+                current_tip,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

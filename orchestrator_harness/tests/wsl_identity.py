@@ -31,13 +31,24 @@ def validate_cross_os_identity_relation(
     identity.
     """
 
-    if not isinstance(nonce, str) or not nonce or not isinstance(invocation_id, str) or not invocation_id:
+    if (
+        not isinstance(nonce, str)
+        or not nonce
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+    ):
         raise RuntimeError("cross-OS relation requires a nonce and invocation ID")
-    if host_identity.get("platform") != "windows" or linux_identity.get("platform") != "linux":
+    if (
+        host_identity.get("platform") != "windows"
+        or linux_identity.get("platform") != "linux"
+    ):
         raise RuntimeError("cross-OS relation has invalid platform labels")
     if host_identity.get("nonce") != nonce or linux_identity.get("nonce") != nonce:
         raise RuntimeError("cross-OS relation nonce mismatch")
-    if host_identity.get("invocation_id") != invocation_id or linux_identity.get("invocation_id") != invocation_id:
+    if (
+        host_identity.get("invocation_id") != invocation_id
+        or linux_identity.get("invocation_id") != invocation_id
+    ):
         raise RuntimeError("cross-OS relation invocation mismatch")
     _positive_pid(host_identity.get("pid"), "host PID")
     _creation(host_identity.get("created_utc"), "host creation identity")
@@ -85,7 +96,9 @@ def validate_codex_identity(
     if not ancestry_chain or ancestry_chain[0].get("pid") != codex_pid:
         raise RuntimeError("Codex ancestry does not start at the observed Codex PID")
     if ancestry_chain[-1].get("pid") != provider_pid:
-        raise RuntimeError("Codex ancestry does not terminate at the controller-owned provider")
+        raise RuntimeError(
+            "Codex ancestry does not terminate at the controller-owned provider"
+        )
     pids = [item.get("pid") for item in ancestry_chain]
     if any(not isinstance(pid, int) for pid in pids) or len(set(pids)) != len(pids):
         raise RuntimeError("Codex ancestry contains invalid or repeated identities")
@@ -105,7 +118,9 @@ def validate_codex_identity(
         observed_stat.st_dev != pinned_stat.st_dev
         or observed_stat.st_ino != pinned_stat.st_ino
     ):
-        raise RuntimeError("observed Codex executable is not the pinned installed Codex")
+        raise RuntimeError(
+            "observed Codex executable is not the pinned installed Codex"
+        )
 
 
 __all__ = [

@@ -101,10 +101,16 @@ def _file_signature(path: Path) -> tuple[tuple[int, int], int, int] | None:
         info = path.stat()
     except FileNotFoundError:
         return None
-    return (int(info.st_dev), int(info.st_ino)), int(info.st_size), int(info.st_mtime_ns)
+    return (
+        (int(info.st_dev), int(info.st_ino)),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+    )
 
 
-def _cache_put(cache: dict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any) -> None:
+def _cache_put(
+    cache: dict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any
+) -> None:
     if len(cache) >= _RECORD_CACHE_MAX:
         cache.pop(next(iter(cache)))
     cache[key] = value
@@ -164,7 +170,12 @@ def _terminal_event(
     signature = _file_signature(path)
     if signature is None:
         raise FileNotFoundError(path)
-    cache_key = (path_identity(path), signature, config.max_jsonl_tail_bytes, provider_id)
+    cache_key = (
+        path_identity(path),
+        signature,
+        config.max_jsonl_tail_bytes,
+        provider_id,
+    )
     cached = _TERMINAL_EVENT_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -177,7 +188,9 @@ def _terminal_event(
     try:
         adapter = provider_adapter(provider_id or "codex")
     except ProviderAdapterError as exc:
-        raise ValueError(f"unsupported provider in transcript status: {provider_id}") from exc
+        raise ValueError(
+            f"unsupported provider in transcript status: {provider_id}"
+        ) from exc
     terminal = None
     for raw_line in stable.data.decode("utf-8", errors="replace").splitlines():
         event = adapter.parse_transcript_line((raw_line + "\n").encode("utf-8"))
@@ -216,7 +229,10 @@ def _is_reparse_or_link(path: Path) -> bool:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
         return True
-    return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
 
 
 def _is_utc_timestamp(value: object) -> bool:
@@ -227,14 +243,21 @@ def _is_utc_timestamp(value: object) -> bool:
     )
 
 
-def _manager_signal(path: Path, signals_root: Path, config: HarnessConfig) -> ManagerSignalRecord:
+def _manager_signal(
+    path: Path, signals_root: Path, config: HarnessConfig
+) -> ManagerSignalRecord:
     """Read one signal without following a link outside the signal directory."""
     if _is_reparse_or_link(path) or path.resolve().parent != signals_root.resolve():
-        raise ValueError("signal path is not a regular file directly under manager-signals")
+        raise ValueError(
+            "signal path is not a regular file directly under manager-signals"
+        )
     record = _json_record(path, config)
     value = record.value
     required = ("schema", "signal_id", "kind", "created_utc", "lane_id", "summary")
-    if any(not isinstance(value.get(key), str) or not value[key].strip() for key in required):
+    if any(
+        not isinstance(value.get(key), str) or not value[key].strip()
+        for key in required
+    ):
         raise ValueError("signal has missing or invalid required fields")
     if value["schema"] != "manager-signal/v1":
         raise ValueError("unsupported signal schema")
@@ -252,7 +275,9 @@ def _manager_signal(path: Path, signals_root: Path, config: HarnessConfig) -> Ma
     if "agent_blocked" in value and not isinstance(value["agent_blocked"], bool):
         raise ValueError("agent_blocked must be a boolean")
     evidence = value.get("evidence_paths", [])
-    if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+    if not isinstance(evidence, list) or any(
+        not isinstance(item, str) for item in evidence
+    ):
         raise ValueError("evidence_paths must be a list of strings")
     return ManagerSignalRecord(path, record.stable, value)
 
@@ -281,16 +306,22 @@ def _manager_root_records(
                     or _is_reparse_or_link(path)
                     or resolved.parent != resolved_root
                 ):
-                    raise ValueError("manager record path is not a regular file directly under its root")
+                    raise ValueError(
+                        "manager record path is not a regular file directly under its root"
+                    )
                 sidecar = Path(str(path) + ".sha256")
                 if sidecar.exists() and (
                     _is_reparse_or_link(sidecar)
                     or sidecar.resolve().parent != resolved_root
                 ):
-                    raise ValueError("manager record sidecar is not confined to its root")
+                    raise ValueError(
+                        "manager record sidecar is not confined to its root"
+                    )
                 record = _json_record(path, config, check_sidecar=True)
                 if sidecar.exists() and record.sidecar_matches is not True:
-                    raise ValueError("manager record sidecar is invalid or does not match record bytes")
+                    raise ValueError(
+                        "manager record sidecar is invalid or does not match record bytes"
+                    )
                 seen_paths.add(resolved)
                 records.append(record)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -422,7 +453,8 @@ def _record_kind(path: Path, value: Mapping[str, Any], declared: set[str]) -> st
         return "mcp"
     schema = str(value.get("schema") or "").lower()
     if "mcp" in schema or any(
-        key in value for key in ("mcp_server", "mcp_name", "mcp_process", "mcp_processes")
+        key in value
+        for key in ("mcp_server", "mcp_name", "mcp_process", "mcp_processes")
     ):
         return "mcp"
     return "helper"
@@ -565,7 +597,9 @@ def _validate_coding_result_cached(
         validate_coding_result(
             candidate.value,
             lane_id=str(coding_status.status.value["declared_lane_id"]),
-            worker_invocation_id=str(coding_status.status.value["worker_invocation_id"]),
+            worker_invocation_id=str(
+                coding_status.status.value["worker_invocation_id"]
+            ),
             declaration=declaration,
         )
     except (GitSafetyError, OSError, ValueError) as exc:
@@ -593,7 +627,9 @@ def _validate_task_result_cached(
         cohort_id=coding_status.status.value.get("cohort_id"),
         revision=raw_card.get("revision"),
         content_sha256=raw_card.get("sha256"),
-        completion_review_owner=coding_status.status.value.get("completion_review_owner", "ROOT-IM"),
+        completion_review_owner=coding_status.status.value.get(
+            "completion_review_owner", "ROOT-IM"
+        ),
     )
     prompt_bundle_sha = coding_status.status.value.get("prompt_bundle_sha256")
     prompt_content_sha = coding_status.status.value.get("prompt_content_sha256")
@@ -608,12 +644,18 @@ def _validate_task_result_cached(
             raw_bytes=candidate.stable.data,
         )
         if declaration is not None
-        else validate_task_result(candidate.value, card=card, raw_bytes=candidate.stable.data)
+        else validate_task_result(
+            candidate.value, card=card, raw_bytes=candidate.stable.data
+        )
     )
     if candidate.value.get("prompt_bundle_sha256") != prompt_bundle_sha:
-        raise TaskValidationError("canonical result prompt bundle identity does not match status")
+        raise TaskValidationError(
+            "canonical result prompt bundle identity does not match status"
+        )
     if candidate.value.get("prompt_content_sha256") != prompt_content_sha:
-        raise TaskValidationError("canonical result prompt content identity does not match status")
+        raise TaskValidationError(
+            "canonical result prompt content identity does not match status"
+        )
     advancement = read_task_advancement(
         coding_status.workspace,
         card=card,
@@ -657,7 +699,11 @@ def discover_run(
                 )
             )
             configured_jsonl = status.value.get("jsonl_path")
-            configured_path = Path(configured_jsonl).resolve(strict=False) if isinstance(configured_jsonl, str) else None
+            configured_path = (
+                Path(configured_jsonl).resolve(strict=False)
+                if isinstance(configured_jsonl, str)
+                else None
+            )
             safe_configured = (
                 configured_path
                 if configured_path is not None and configured_path.parent == workspace
@@ -817,7 +863,8 @@ def discover_run(
                     )
                 if (
                     coding_owner is None
-                    or coding_owner.status.value.get("worker_invocation_id") != worker_id
+                    or coding_owner.status.value.get("worker_invocation_id")
+                    != worker_id
                 ):
                     raise GitSafetyError(
                         "coding result does not match a current coding lane and worker invocation"
@@ -840,12 +887,18 @@ def discover_run(
                         run_root=run_root,
                         revalidate=revalidate_results or revalidate,
                     )
-                    result_acceptance_state = "ACCEPTED" if candidate.value.get("acceptance_state") == "ACCEPTED" else None
+                    result_acceptance_state = (
+                        "ACCEPTED"
+                        if candidate.value.get("acceptance_state") == "ACCEPTED"
+                        else None
+                    )
                 result = candidate
                 result_status_path = coding_owner.status.path
             else:
                 if len(firmware_controllers) > 1:
-                    raise ValueError("legacy firmware result has ambiguous controller ownership")
+                    raise ValueError(
+                        "legacy firmware result has ambiguous controller ownership"
+                    )
                 if not firmware_controllers and coding_controllers:
                     coding_route = True
                     if len(coding_controllers) == 1:
@@ -858,9 +911,7 @@ def discover_run(
                     result_status_path = firmware_controllers[0].status.path
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             code = "CODING_RESULT_INVALID" if coding_route else "RESULT_READ_ERROR"
-            errors.append(
-                ObservationError(str(result_path), code, str(exc)[:500])
-            )
+            errors.append(ObservationError(str(result_path), code, str(exc)[:500]))
             if coding_route:
                 sha256 = candidate.stable.sha256 if candidate is not None else None
                 if sha256 is None:
@@ -874,7 +925,9 @@ def discover_run(
                         sha256 = stable.sha256
                     except OSError:
                         pass
-                invalid_result = invalid_result_evidence(result_path, str(exc), sha256=sha256)
+                invalid_result = invalid_result_evidence(
+                    result_path, str(exc), sha256=sha256
+                )
                 invalid_result_status_path = (
                     coding_owner.status.path if coding_owner is not None else None
                 )
@@ -890,9 +943,17 @@ def discover_run(
                 signal_id = str(signal.value["signal_id"])
                 signal_ids.setdefault(signal_id, []).append(signal)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
-                errors.append(ObservationError(str(path), "MANAGER_SIGNAL_READ_ERROR", str(exc)))
+                errors.append(
+                    ObservationError(str(path), "MANAGER_SIGNAL_READ_ERROR", str(exc))
+                )
     elif signals_root.exists():
-        errors.append(ObservationError(str(signals_root), "MANAGER_SIGNAL_READ_ERROR", "manager-signals is not a safe directory"))
+        errors.append(
+            ObservationError(
+                str(signals_root),
+                "MANAGER_SIGNAL_READ_ERROR",
+                "manager-signals is not a safe directory",
+            )
+        )
 
     manager_signals: list[ManagerSignalRecord] = []
     for signal_id, records in sorted(signal_ids.items()):

@@ -16,7 +16,7 @@ from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.tests.support import TemporaryGitRepository
 
 
-FAKE_CODEX = r'''
+FAKE_CODEX = r"""
 import json, os, sys
 argv = sys.argv[1:]
 capture = os.environ.get("CODING_CONTROLLER_CAPTURE")
@@ -27,7 +27,7 @@ if os.environ.get("CODING_CONTROLLER_NO_THREAD") != "1":
     print(json.dumps({"type": "thread.started", "thread_id": os.environ.get("CODING_CONTROLLER_THREAD", "coding-thread")}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
 raise SystemExit(int(os.environ.get("CODING_CONTROLLER_EXIT", "0")))
-'''
+"""
 
 
 class CodingLaneControllerTests(unittest.TestCase):
@@ -47,11 +47,18 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.capture = self.root / "argv.json"
 
     def tearDown(self) -> None:
-        for key in ("CODING_CONTROLLER_CAPTURE", "CODING_CONTROLLER_NO_THREAD", "CODING_CONTROLLER_THREAD", "CODING_CONTROLLER_EXIT"):
+        for key in (
+            "CODING_CONTROLLER_CAPTURE",
+            "CODING_CONTROLLER_NO_THREAD",
+            "CODING_CONTROLLER_THREAD",
+            "CODING_CONTROLLER_EXIT",
+        ):
             os.environ.pop(key, None)
         self.temporary.cleanup()
 
-    def invocation(self, *, action: str = "start", worker_id: str = "worker-1") -> tuple[Path, dict[str, object]]:
+    def invocation(
+        self, *, action: str = "start", worker_id: str = "worker-1"
+    ) -> tuple[Path, dict[str, object]]:
         outputs = {
             "status": str(self.workspace / "controller.status.json"),
             "jsonl": str(self.workspace / "codex.jsonl"),
@@ -106,27 +113,43 @@ class CodingLaneControllerTests(unittest.TestCase):
         path, raw = self.invocation()
         raw["codex_settings"] = raw.pop("codex")
         self._write(path, raw)
-        self.assertEqual(controller.CODING_INVOCATION_SCHEMA, controller.load_invocation(path).invocation_schema)
+        self.assertEqual(
+            controller.CODING_INVOCATION_SCHEMA,
+            controller.load_invocation(path).invocation_schema,
+        )
 
-    def test_unknown_schema_and_prompt_integrity_or_confinement_are_rejected(self) -> None:
+    def test_unknown_schema_and_prompt_integrity_or_confinement_are_rejected(
+        self,
+    ) -> None:
         path, raw = self.invocation()
         raw["schema"] = "unknown/v1"
         self._write(path, raw)
-        with self.assertRaisesRegex(controller.InvocationError, "unsupported invocation schema"):
+        with self.assertRaisesRegex(
+            controller.InvocationError, "unsupported invocation schema"
+        ):
             controller.load_invocation(path)
         path, raw = self.invocation()
-        raw["output_paths"] = {**raw["output_paths"], "jsonl": str(self.root / "escape.jsonl")}  # type: ignore[arg-type]
+        raw["output_paths"] = {
+            **raw["output_paths"],
+            "jsonl": str(self.root / "escape.jsonl"),
+        }  # type: ignore[arg-type]
         self._write(path, raw)
-        with self.assertRaisesRegex(controller.InvocationError, "escapes its allowed root"):
+        with self.assertRaisesRegex(
+            controller.InvocationError, "escapes its allowed root"
+        ):
             controller.load_invocation(path)
         path, raw = self.invocation()
         raw["event_log_path"] = str(self.root / "outside-events.jsonl")
         self._write(path, raw)
-        with self.assertRaisesRegex(controller.InvocationError, "escapes its allowed root"):
+        with self.assertRaisesRegex(
+            controller.InvocationError, "escapes its allowed root"
+        ):
             controller.load_invocation(path)
         path, _ = self.invocation()
         self.prompt.write_text("mutated after invocation", encoding="utf-8")
-        with self.assertRaisesRegex(controller.InvocationError, "prompt bytes do not match"):
+        with self.assertRaisesRegex(
+            controller.InvocationError, "prompt bytes do not match"
+        ):
             controller.load_invocation(path)
 
     def test_coding_rejects_every_firmware_only_discriminator(self) -> None:
@@ -152,60 +175,96 @@ class CodingLaneControllerTests(unittest.TestCase):
         path, _ = self.invocation()
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
         self.assertEqual(0, controller.main([str(path)]))
-        status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        status = json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
         self.assertEqual("orchestrator-lane-controller/v1", status["schema"])
         self.assertEqual("CODEX_EXITED", status["state"])
         self.assertEqual("worker-1", status["worker_invocation_id"])
-        self.assertEqual(controller.CODING_INVOCATION_SCHEMA, status["invocation_schema"])
+        self.assertEqual(
+            controller.CODING_INVOCATION_SCHEMA, status["invocation_schema"]
+        )
         self.assertEqual("coding-thread", status["thread_id"])
         argv = json.loads(self.capture.read_text(encoding="utf-8"))
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertNotIn("--sandbox", argv)
-        self.assertIn('approval_policy="never"', argv); self.assertIn("gpt-5.6-codex", argv)
-        self.assertIn('model_reasoning_effort="high"', argv); self.assertIn('service_tier="priority"', argv)
+        self.assertIn('approval_policy="never"', argv)
+        self.assertIn("gpt-5.6-codex", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertIn('service_tier="priority"', argv)
         self.assertIn("feature_flag=true", argv)
-        events = [json.loads(line) for line in (self.runtime_root / "events" / "controller.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(["CODEX_STARTED", "CODEX_EXITED"], [event["event"] for event in events])
-        self.assertTrue(all(event["worker_invocation_id"] == "worker-1" for event in events))
+        events = [
+            json.loads(line)
+            for line in (self.runtime_root / "events" / "controller.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(
+            ["CODEX_STARTED", "CODEX_EXITED"], [event["event"] for event in events]
+        )
+        self.assertTrue(
+            all(event["worker_invocation_id"] == "worker-1" for event in events)
+        )
 
     def test_start_publishes_fixed_controller_lifecycle_registry(self) -> None:
         path, _ = self.invocation()
         self.assertEqual(0, controller.main([str(path)]))
-        registry_path = lifecycle_registry_path(self.run_root, "coding:worker-1", "worker-1")
+        registry_path = lifecycle_registry_path(
+            self.run_root, "coding:worker-1", "worker-1"
+        )
         record = json.loads(registry_path.read_text(encoding="utf-8"))
         self.assertEqual("orchestrator-lifecycle-registry/v1", record["schema"])
-        self.assertEqual("controller-admitted-canonical-coordinate", record["authority"])
+        self.assertEqual(
+            "controller-admitted-canonical-coordinate", record["authority"]
+        )
         self.assertTrue(record["lifecycle"]["complete"])
         self.assertEqual([], record["identities"]["helpers"])
         self.assertEqual("worker-1", record["run"]["worker_invocation_id"])
-        self.assertEqual(str(self.run_root.resolve()), record["repository"]["worktree_root"])
-        self.assertEqual(record["coordinate"]["common_dir"], record["repository"]["common_dir"])
+        self.assertEqual(
+            str(self.run_root.resolve()), record["repository"]["worktree_root"]
+        )
+        self.assertEqual(
+            record["coordinate"]["common_dir"], record["repository"]["common_dir"]
+        )
 
-    def test_start_without_thread_is_failure_and_resume_identity_mismatches_are_rejected(self) -> None:
+    def test_start_without_thread_is_failure_and_resume_identity_mismatches_are_rejected(
+        self,
+    ) -> None:
         path, raw = self.invocation()
         os.environ["CODING_CONTROLLER_NO_THREAD"] = "1"
         self.assertEqual(1, controller.main([str(path)]))
-        status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        status = json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
         self.assertEqual("LAUNCH_FAILED", status["state"])
         os.environ.pop("CODING_CONTROLLER_NO_THREAD")
         path, raw = self.invocation(action="resume")
-        raw["resume_identity"] = {"worker_invocation_id": "another-worker", "thread_id": "coding-thread"}
+        raw["resume_identity"] = {
+            "worker_invocation_id": "another-worker",
+            "thread_id": "coding-thread",
+        }
         self._write(path, raw)
-        with self.assertRaisesRegex(controller.InvocationError, "resume identity worker_invocation_id mismatch"):
+        with self.assertRaisesRegex(
+            controller.InvocationError, "resume identity worker_invocation_id mismatch"
+        ):
             controller.load_invocation(path)
         path, _ = self.invocation(action="resume", worker_id="worker-2")
         # REQ-O35: identity-mismatched resume emits a declared same-role
         # structured handoff with fabricated_continuity=false instead of
         # silently rejecting and losing the logical task.
         self.assertEqual(1, controller.main([str(path)]))
-        status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        status = json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
         self.assertEqual("PROVIDER_HANDOFF", status["state"])
         handoff = status["provider_handoff"]
         self.assertIsNotNone(handoff)
         self.assertFalse(handoff["fabricated_continuity"])
         self.assertIn("worker_invocation_id", handoff["reason"])
 
-    def test_resource_acquisition_publishes_running_only_after_child_launch_and_popen_failure_releases_claim(self) -> None:
+    def test_resource_acquisition_publishes_running_only_after_child_launch_and_popen_failure_releases_claim(
+        self,
+    ) -> None:
         path, _ = self.invocation()
         status_path = self.workspace / "controller.status.json"
         lock_root = self.runtime_root / "coding-resource-locks"
@@ -214,30 +273,47 @@ class CodingLaneControllerTests(unittest.TestCase):
         original_popen: Any = controller.subprocess.Popen
 
         def record(path: Path, value: dict[str, object]) -> None:
-            published.append(dict(value)); original_atomic_json(path, value)
+            published.append(dict(value))
+            original_atomic_json(path, value)
 
         def launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
             command = args[0] if args else None
-            if isinstance(command, list) and command[:2] == [sys.executable, str(self.fake)]:
+            if isinstance(command, list) and command[:2] == [
+                sys.executable,
+                str(self.fake),
+            ]:
                 self.assertTrue(status_path.exists())
                 self.assertTrue(any(lock_root.iterdir()))
             return original_popen(*args, **kwargs)
 
-        with patch.object(controller, "_atomic_json", side_effect=record), patch.object(controller.subprocess, "Popen", side_effect=launch):
+        with (
+            patch.object(controller, "_atomic_json", side_effect=record),
+            patch.object(controller.subprocess, "Popen", side_effect=launch),
+        ):
             self.assertEqual(0, controller.main([str(path)]))
         self.assertTrue(any(item["state"] == "RUNNING_CODEX" for item in published))
-        first_registry = lifecycle_registry_path(self.run_root, "coding:worker-1", "worker-1")
+        first_registry = lifecycle_registry_path(
+            self.run_root, "coding:worker-1", "worker-1"
+        )
         first_registry.unlink()
         first_registry.parent.rmdir()
 
         path, _ = self.invocation(worker_id="worker-popen-failure")
-        def fail_codex_launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+
+        def fail_codex_launch(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
             command = args[0] if args else None
-            if isinstance(command, list) and command[:2] == [sys.executable, str(self.fake)]:
+            if isinstance(command, list) and command[:2] == [
+                sys.executable,
+                str(self.fake),
+            ]:
                 raise OSError("synthetic Popen failure")
             return original_popen(*args, **kwargs)
 
-        with patch.object(controller.subprocess, "Popen", side_effect=fail_codex_launch):
+        with patch.object(
+            controller.subprocess, "Popen", side_effect=fail_codex_launch
+        ):
             self.assertEqual(1, controller.main([str(path)]))
         status = json.loads(status_path.read_text(encoding="utf-8"))
         self.assertEqual("LAUNCH_FAILED", status["state"])
@@ -252,7 +328,9 @@ class CodingLaneControllerTests(unittest.TestCase):
         self._write(resume, raw)
         os.environ["CODING_CONTROLLER_THREAD"] = "wrong-thread"
         self.assertEqual(1, controller.main([str(resume)]))
-        status = json.loads((self.workspace / "controller.status.json").read_text(encoding="utf-8"))
+        status = json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
         self.assertEqual("CONTROLLER_FAILED", status["state"])
         self.assertIn("does not match", status["error"])
 

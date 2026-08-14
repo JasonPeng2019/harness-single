@@ -1,4 +1,5 @@
 """Exercise a synthetic meaningful loop through alert delivery and safe recovery."""
+
 from __future__ import annotations
 
 import json
@@ -25,10 +26,15 @@ def main() -> None:
     shutil.rmtree(DESTINATION, ignore_errors=True)
     DESTINATION.mkdir(parents=True)
     log = DESTINATION / "synthetic-agent.jsonl"
-    log.write_text('{"stage":"build"}\n{"stage":"test"}\n{"stage":"build","meaning":"regression loop"}\n', encoding="utf-8")
+    log.write_text(
+        '{"stage":"build"}\n{"stage":"test"}\n{"stage":"build","meaning":"regression loop"}\n',
+        encoding="utf-8",
+    )
     observed_sha = hashlib.sha256(log.read_bytes()).hexdigest()
     verdict = {
-        "defect": True, "kind": "loop", "severity": "error",
+        "defect": True,
+        "kind": "loop",
+        "severity": "error",
         "summary": "synthetic agent regressed build -> test -> build",
         "implicated": ["synthetic-board-free-agent"],
         "evidence": [{"path": str(log), "sha256": observed_sha, "offset": 0}],
@@ -38,26 +44,38 @@ def main() -> None:
         alert = outcome["alert"]
         conditions = merge_watcher_conditions({"lanes": [], "requests": []})
         selected = select_actionable(
-            conditions, {"lanes": [], "requests": []},
-            observed_at=datetime.now(timezone.utc), acknowledged_event_ids=set(),
+            conditions,
+            {"lanes": [], "requests": []},
+            observed_at=datetime.now(timezone.utc),
+            acknowledged_event_ids=set(),
         )
         history = []
-        for state in ("STOP_ASSIGNING", "CHECKPOINT_REQUESTED", "PAUSED", "REPAIRED", "RESUMED", "RESOLVED"):
+        for state in (
+            "STOP_ASSIGNING",
+            "CHECKPOINT_REQUESTED",
+            "PAUSED",
+            "REPAIRED",
+            "RESUMED",
+            "RESOLVED",
+        ):
             transition(RUNTIME, alert["alert_id"], state)
             history.append(state)
         final_conditions = merge_watcher_conditions({"lanes": [], "requests": []})
         result = {
-            "alert_id": alert["alert_id"], "event_id": alert["event_id"],
+            "alert_id": alert["alert_id"],
+            "event_id": alert["event_id"],
             "selected_type": selected and selected["type"],
             "selected_priority": "highest (HARNESS_WATCHER_ALERT)",
             "recovery_history": history,
-            "resolved_alert_absent_from_harness_conditions": alert["event_id"] not in {
-                item.get("event_id") for item in final_conditions.values()
-            },
-            "hardware_actions": 0, "subagent_process_actions": 0,
+            "resolved_alert_absent_from_harness_conditions": alert["event_id"]
+            not in {item.get("event_id") for item in final_conditions.values()},
+            "hardware_actions": 0,
+            "subagent_process_actions": 0,
         }
         shutil.copytree(RUNTIME, DESTINATION / "runtime")
-        (DESTINATION / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        (DESTINATION / "result.json").write_text(
+            json.dumps(result, indent=2) + "\n", encoding="utf-8"
+        )
         print(json.dumps(result, indent=2))
     finally:
         shutil.rmtree(RUNTIME, ignore_errors=True)

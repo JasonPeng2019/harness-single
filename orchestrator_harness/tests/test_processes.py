@@ -35,7 +35,11 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertIs(snapshot.process_for(11), index[11])
         self.assertTrue(snapshot.parent_matches(11, 10))
         self.assertFalse(snapshot.parent_matches(11, 1))
-        self.assertIsNone(ProcessSnapshot(False, snapshot.processes, ("partial",), "linux-proc").parent_matches(99, 10))
+        self.assertIsNone(
+            ProcessSnapshot(
+                False, snapshot.processes, ("partial",), "linux-proc"
+            ).parent_matches(99, 10)
+        )
 
     def test_windows_known_pid_query_does_not_use_full_inventory(self) -> None:
         captured = {}
@@ -56,10 +60,10 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertTrue(query.complete)
         self.assertEqual(11, query.process.pid if query.process else None)
         self.assertIn("ProcessId = 11", captured["argv"][-1])
-        self.assertNotIn("Get-CimInstance Win32_Process | ForEach-Object", captured["argv"][-1])
-        self.assertEqual(
-            WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"]
+        self.assertNotIn(
+            "Get-CimInstance Win32_Process | ForEach-Object", captured["argv"][-1]
         )
+        self.assertEqual(WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"])
 
     def test_windows_provider_uses_only_fixed_command(self) -> None:
         captured = {}
@@ -84,9 +88,7 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertEqual(WINDOWS_CIM_SCRIPT, captured["argv"][-1])
         self.assertEqual("-Command", captured["argv"][-2])
         self.assertNotIn("shell", captured["kwargs"])
-        self.assertEqual(
-            WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"]
-        )
+        self.assertEqual(WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"])
 
     def test_windows_provider_boundary_suppresses_console_window(self) -> None:
         boundary = ProcessBoundary(kind="windows-job")

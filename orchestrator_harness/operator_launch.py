@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -59,7 +59,9 @@ def _finalize(path: Path, receipt: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _creation_identity(pid: int, *, attempts: int = 12, delay_seconds: float = 0.05) -> str | None:
+def _creation_identity(
+    pid: int, *, attempts: int = 12, delay_seconds: float = 0.05
+) -> str | None:
     for _ in range(attempts):
         query = targeted_process_query(pid)
         item = query.process if query.complete else None
@@ -89,7 +91,10 @@ def detached_owner_snapshot() -> list[dict[str, Any]]:
         if observed is None:
             stale.append(key)
             continue
-        if observed.created_utc is None or iso_utc(observed.created_utc) != record["created_utc"]:
+        if (
+            observed.created_utc is None
+            or iso_utc(observed.created_utc) != record["created_utc"]
+        ):
             stale.append(key)
             continue
         live.append(dict(record, state="live"))
@@ -107,7 +112,10 @@ def _cleanup_exact_posix(pid: int, created_utc: str) -> tuple[bool, str | None]:
         query = targeted_process_query(pid)
         if query.process is None:
             return True, None
-        if query.process.created_utc is None or iso_utc(query.process.created_utc) != created_utc:
+        if (
+            query.process.created_utc is None
+            or iso_utc(query.process.created_utc) != created_utc
+        ):
             return False, "POSIX process identity was reused"
         os.kill(pid, 15)
         deadline = time.monotonic() + 5.0
@@ -115,7 +123,10 @@ def _cleanup_exact_posix(pid: int, created_utc: str) -> tuple[bool, str | None]:
             current = targeted_process_query(pid)
             if current.process is None:
                 return True, None
-            if current.process.created_utc is None or iso_utc(current.process.created_utc) != created_utc:
+            if (
+                current.process.created_utc is None
+                or iso_utc(current.process.created_utc) != created_utc
+            ):
                 return False, "POSIX process identity changed during cleanup"
             time.sleep(0.05)
         return False, "POSIX process remained live after exact cleanup"
@@ -123,7 +134,9 @@ def _cleanup_exact_posix(pid: int, created_utc: str) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def _spawn_posix_detached(argv: Sequence[str], cwd: Path, environment: dict[str, str]) -> int:
+def _spawn_posix_detached(
+    argv: Sequence[str], cwd: Path, environment: dict[str, str]
+) -> int:
     """Spawn through a native double-fork handoff.
 
     The short intermediary is synchronously reaped so it cannot become a
@@ -152,14 +165,22 @@ def _spawn_posix_detached(argv: Sequence[str], cwd: Path, environment: dict[str,
                     os.execvpe(argv[0], list(argv), environment)
                 except BaseException as exc:
                     try:
-                        os.write(write_fd, f"ERROR {type(exc).__name__}: {exc}".encode("utf-8", "replace"))
+                        os.write(
+                            write_fd,
+                            f"ERROR {type(exc).__name__}: {exc}".encode(
+                                "utf-8", "replace"
+                            ),
+                        )
                     except OSError:
                         pass
                     os._exit(127)
             os.write(write_fd, f"{child}\n".encode("ascii"))
         except BaseException as exc:
             try:
-                os.write(write_fd, f"ERROR {type(exc).__name__}: {exc}".encode("utf-8", "replace"))
+                os.write(
+                    write_fd,
+                    f"ERROR {type(exc).__name__}: {exc}".encode("utf-8", "replace"),
+                )
             except OSError:
                 pass
         finally:
@@ -188,7 +209,9 @@ def _spawn_posix_detached(argv: Sequence[str], cwd: Path, environment: dict[str,
 
 
 def _create_windows_native(
-    argv: Sequence[str], cwd: Path, environment: dict[str, str] | None,
+    argv: Sequence[str],
+    cwd: Path,
+    environment: dict[str, str] | None,
 ) -> tuple[object, object, int, str | None, int]:
     """Create a suspended, detached Windows process without constructing Popen."""
 
@@ -225,7 +248,9 @@ def _create_windows_native(
     return process_handle, thread_handle, pid, created_utc, flags
 
 
-def _terminate_windows_exact(process_handle: object, pid: int) -> tuple[bool, str | None]:
+def _terminate_windows_exact(
+    process_handle: object, pid: int
+) -> tuple[bool, str | None]:
     import _winapi  # type: ignore[import-not-found]
 
     try:
@@ -234,7 +259,10 @@ def _terminate_windows_exact(process_handle: object, pid: int) -> tuple[bool, st
         if result != _winapi.WAIT_OBJECT_0:
             return False, "Windows exact process handle did not signal"
         query = targeted_process_query(pid)
-        return query.process is None, None if query.process is None else "Windows process remained observable"
+        return (
+            query.process is None,
+            None if query.process is None else "Windows process remained observable",
+        )
     except Exception as exc:
         return False, str(exc)
 
@@ -254,8 +282,13 @@ def _resume_windows_thread(thread_handle: object) -> None:
 
 
 def launch_process(
-    *, receipt: str | Path, label: str, role: str, cwd: str | Path,
-    argv: Sequence[str], expected_state_path: str | Path | None = None,
+    *,
+    receipt: str | Path,
+    label: str,
+    role: str,
+    cwd: str | Path,
+    argv: Sequence[str],
+    expected_state_path: str | Path | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Launch one detached manager-owned process and atomically prove its identity.
@@ -265,13 +298,20 @@ def launch_process(
     double-fork handoff and synchronously reaps only the short intermediary;
     the long-lived controller is naturally reaped by the system owner.
     """
-    if not isinstance(label, str) or not label.strip() or not isinstance(role, str) or not role.strip():
+    if (
+        not isinstance(label, str)
+        or not label.strip()
+        or not isinstance(role, str)
+        or not role.strip()
+    ):
         raise ValueError("label and role are required")
     if not argv or any(not isinstance(item, str) or not item for item in argv):
         raise ValueError("argv must contain nonempty strings")
     receipt_path = _validate_path(str(receipt), directory=False)
     cwd_path = _validate_path(str(cwd), directory=True)
-    expected = Path(expected_state_path).resolve(strict=False) if expected_state_path else None
+    expected = (
+        Path(expected_state_path).resolve(strict=False) if expected_state_path else None
+    )
     _reserve_receipt(receipt_path)
     launched_at = _utc_now()
     if environment is not None and any(
@@ -286,13 +326,17 @@ def launch_process(
     thread_handle: object | None = None
     pid: int | None = None
     created_utc: str | None = None
-    ownership_strategy = "windows-native-detached-no-wait" if os.name == "nt" else "posix-double-fork-system-reaped"
+    ownership_strategy = (
+        "windows-native-detached-no-wait"
+        if os.name == "nt"
+        else "posix-double-fork-system-reaped"
+    )
     try:
         if os.name == "nt":
             import _winapi  # type: ignore[import-not-found]
 
-            process_handle, thread_handle, pid, created_utc, flags = _create_windows_native(
-                argv, cwd_path, inherited_environment
+            process_handle, thread_handle, pid, created_utc, flags = (
+                _create_windows_native(argv, cwd_path, inherited_environment)
             )
         else:
             pid = _spawn_posix_detached(argv, cwd_path, inherited_environment)
@@ -300,10 +344,17 @@ def launch_process(
         if pid is None or created_utc is None:
             raise RuntimeError("child identity could not be proved live")
         result = {
-            "schema": _RECEIPT_SCHEMA, "status": "launched", "label": label,
-            "role": role, "argv": list(argv), "cwd": str(cwd_path), "pid": pid,
-            "created_utc": created_utc, "launched_utc": iso_utc(launched_at),
-            "platform": platform, "creationflags": flags,
+            "schema": _RECEIPT_SCHEMA,
+            "status": "launched",
+            "label": label,
+            "role": role,
+            "argv": list(argv),
+            "cwd": str(cwd_path),
+            "pid": pid,
+            "created_utc": created_utc,
+            "launched_utc": iso_utc(launched_at),
+            "platform": platform,
+            "creationflags": flags,
             "ownership_strategy": ownership_strategy,
             "expected_state_path": str(expected) if expected else None,
         }
@@ -332,7 +383,9 @@ def launch_process(
         cleanup_confirmed: bool | None = None
         cleanup_error: str | None = None
         if os.name == "nt" and process_handle is not None and pid is not None:
-            cleanup_confirmed, cleanup_error = _terminate_windows_exact(process_handle, pid)
+            cleanup_confirmed, cleanup_error = _terminate_windows_exact(
+                process_handle, pid
+            )
         elif pid is not None and created_utc is not None:
             cleanup_confirmed, cleanup_error = _cleanup_exact_posix(pid, created_utc)
         if os.name == "nt":
@@ -346,10 +399,16 @@ def launch_process(
             with _DETACHED_RECORDS_LOCK:
                 _DETACHED_RECORDS.pop((pid, created_utc), None)
         failure = {
-            "schema": _RECEIPT_SCHEMA, "status": "failed", "label": label,
-            "role": role, "argv": list(argv), "cwd": str(cwd_path),
-            "launched_utc": iso_utc(launched_at), "platform": platform,
-            "creationflags": flags, "error": str(exc),
+            "schema": _RECEIPT_SCHEMA,
+            "status": "failed",
+            "label": label,
+            "role": role,
+            "argv": list(argv),
+            "cwd": str(cwd_path),
+            "launched_utc": iso_utc(launched_at),
+            "platform": platform,
+            "creationflags": flags,
+            "error": str(exc),
             "ownership_strategy": ownership_strategy,
             "child_pid": pid,
             "cleanup_confirmed": cleanup_confirmed,
@@ -364,7 +423,9 @@ def launch_process(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Launch one detached manager-owned process")
+    parser = argparse.ArgumentParser(
+        description="Launch one detached manager-owned process"
+    )
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--role", required=True)
@@ -381,8 +442,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = command[1:]
     try:
         result = launch_process(
-            receipt=args.receipt, label=args.label, role=args.role, cwd=args.cwd,
-            argv=command, expected_state_path=args.expected_state_path,
+            receipt=args.receipt,
+            label=args.label,
+            role=args.role,
+            cwd=args.cwd,
+            argv=command,
+            expected_state_path=args.expected_state_path,
         )
     except Exception as exc:
         print(json.dumps({"launched": False, "error": str(exc)}), file=sys.stderr)

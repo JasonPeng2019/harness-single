@@ -57,7 +57,9 @@ def _lane_id(run: RunRecords, controller: ControllerRecord) -> str:
 def _attempt_group_id(run: RunRecords, controller: ControllerRecord) -> str:
     """Identify persistent attempts before choosing the public lane label."""
     status = controller.status.value
-    thread_id = status.get("provider_session_id", status.get("session_id", status.get("thread_id")))
+    thread_id = status.get(
+        "provider_session_id", status.get("session_id", status.get("thread_id"))
+    )
     task = str(status.get("task") or run.run_root.name.split("_", 1)[0])
     if isinstance(thread_id, str) and thread_id.strip():
         return f"thread:{run.run_root.name}:{task}:{thread_id.strip()}"
@@ -100,7 +102,9 @@ def _controller_observation(
     raw = controller.status.value
     started = parse_utc(raw.get("started_utc"))
     controller_started = parse_utc(raw.get("controller_started_utc"))
-    codex_started = parse_utc(raw.get("provider_started_utc") or raw.get("codex_started_utc"))
+    codex_started = parse_utc(
+        raw.get("provider_started_utc") or raw.get("codex_started_utc")
+    )
     controller_pid_value = raw.get("controller_pid")
     try:
         controller_pid = (
@@ -248,7 +252,9 @@ def _controller_observation(
         "task": str(raw.get("task") or ""),
         "phase": str(raw.get("phase") or ""),
         "thread_id": raw.get("thread_id"),
-        "session_id": raw.get("session_id", raw.get("provider_session_id", raw.get("thread_id"))),
+        "session_id": raw.get(
+            "session_id", raw.get("provider_session_id", raw.get("thread_id"))
+        ),
         "started_utc": iso_utc(started),
         "ended_utc": raw.get("ended_utc"),
         "controller_pid": controller_pid,
@@ -273,7 +279,9 @@ def _controller_observation(
             codex_process.created_utc if codex_process else None
         ),
         "provider_started_utc": iso_utc(codex_started),
-        "provider_session_id": raw.get("provider_session_id", raw.get("session_id", raw.get("thread_id"))),
+        "provider_session_id": raw.get(
+            "provider_session_id", raw.get("session_id", raw.get("thread_id"))
+        ),
         "parent_state": parent_state,
         "parent_reason": parent_reason,
         "terminal_event": terminal,
@@ -285,7 +293,9 @@ def _controller_observation(
         "task_card": raw.get("task_card"),
         "prompt_bundle": raw.get("prompt_bundle"),
         "prompt_bundle_sha256": raw.get("prompt_bundle_sha256"),
-        "prompt_content_sha256": raw.get("prompt_content_sha256", raw.get("prompt_sha256")),
+        "prompt_content_sha256": raw.get(
+            "prompt_content_sha256", raw.get("prompt_sha256")
+        ),
         "terminal_acceptance_state": raw.get("terminal_acceptance_state"),
         "repository": raw.get("repository"),
         "declared_resources": list(raw.get("resources", []))
@@ -398,7 +408,10 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             return
         processes = item.get(field)
-        if not isinstance(processes, list) or len(processes) > _MAX_DECLARED_PROCESS_LIST:
+        if (
+            not isinstance(processes, list)
+            or len(processes) > _MAX_DECLARED_PROCESS_LIST
+        ):
             return
         for index, child in enumerate(processes):
             if isinstance(child, dict):
@@ -452,7 +465,9 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
     for container_name in ("live_lifetime", "lifetime_binding"):
         container = value.get(container_name)
         if isinstance(container, dict):
-            add_container(container, f"{prefix + '.' if prefix else ''}{container_name}")
+            add_container(
+                container, f"{prefix + '.' if prefix else ''}{container_name}"
+            )
     return found
 
 
@@ -505,7 +520,9 @@ def _record_lifetime_observations(
             snapshot.complete or snapshot.provider == "linux-proc"
         ):
             operational = running_state
-        elif snapshot.complete and all(state in {"absent", "mismatch"} for state in states):
+        elif snapshot.complete and all(
+            state in {"absent", "mismatch"} for state in states
+        ):
             operational = exited_state
         else:
             operational = unknown_state
@@ -527,7 +544,8 @@ def _record_lifetime_observations(
                 ),
                 "session_id": _request_identity_fields(record.value).get("session_id"),
                 "declared_lane_id": next(
-                    iter(_nested_values(record.value, {"lane_id", "declared_lane_id"})), None
+                    iter(_nested_values(record.value, {"lane_id", "declared_lane_id"})),
+                    None,
                 ),
             }
         )
@@ -629,10 +647,16 @@ def _mcp_lifetime_proven(
         expected = parse_utc(binding.get("creation_utc"))
         declared_value = value.get("mcp_server")
         if isinstance(declared_value, str):
-            declared = {declared_value.strip().lower()} if declared_value.strip() else set()
+            declared = (
+                {declared_value.strip().lower()} if declared_value.strip() else set()
+            )
         elif isinstance(declared_value, dict):
             name = declared_value.get("name") or declared_value.get("server_name")
-            declared = {name.strip().lower()} if isinstance(name, str) and name.strip() else set()
+            declared = (
+                {name.strip().lower()}
+                if isinstance(name, str) and name.strip()
+                else set()
+            )
         else:
             declared = set()
         normalized_server = server.strip().lower() if isinstance(server, str) else ""
@@ -665,16 +689,15 @@ def _mcp_lifetime_proven(
     )
     lifetime_identities = _request_identity_fields(lifetime)
     same_identity = all(
-        identities.get(key)
-        and lifetime_identities.get(key) == identities.get(key)
+        identities.get(key) and lifetime_identities.get(key) == identities.get(key)
         for key in ("run_id", "session_id")
     )
     lifetime_servers = {
         name.strip().lower() for name in _mcp_server_names(lifetime) if name.strip()
     }
-    same_server = bool(lifetime_servers.intersection(
-        {name.strip().lower() for name in server_names}
-    ))
+    same_server = bool(
+        lifetime_servers.intersection({name.strip().lower() for name in server_names})
+    )
     live_process = any(
         item.get("state") == "live"
         and str(item.get("role") or "").startswith("live_lifetime")
@@ -706,9 +729,7 @@ def _relay_state(
     explicit = _resolve_explicit_relay(request, run)
     candidates = list(run.relays)
     if explicit is not None:
-        candidates.sort(
-            key=lambda item: 0 if same_path(item.path, explicit) else 1
-        )
+        candidates.sort(key=lambda item: 0 if same_path(item.path, explicit) else 1)
     saw_candidate = False
     candidate_observed_utc: str | None = None
     candidate_sha256: str | None = None
@@ -716,7 +737,9 @@ def _relay_state(
         if explicit is not None and same_path(relay.path, explicit):
             saw_candidate = True
             candidate_observed_utc = iso_utc(
-                datetime.fromtimestamp(relay.stable.mtime_ns / 1_000_000_000, tz=timezone.utc)
+                datetime.fromtimestamp(
+                    relay.stable.mtime_ns / 1_000_000_000, tz=timezone.utc
+                )
             )
             candidate_sha256 = relay.stable.sha256
         hashes = {
@@ -728,7 +751,9 @@ def _relay_state(
             continue
         saw_candidate = True
         candidate_observed_utc = iso_utc(
-            datetime.fromtimestamp(relay.stable.mtime_ns / 1_000_000_000, tz=timezone.utc)
+            datetime.fromtimestamp(
+                relay.stable.mtime_ns / 1_000_000_000, tz=timezone.utc
+            )
         )
         candidate_sha256 = relay.stable.sha256
         manager_binding = _manager_relay_binding_state(request, relay, now)
@@ -774,7 +799,13 @@ def _relay_state(
             candidate_observed_utc,
             candidate_sha256,
         )
-    return "ABSENT", str(explicit) if explicit else None, "no relay candidate", None, None
+    return (
+        "ABSENT",
+        str(explicit) if explicit else None,
+        "no relay candidate",
+        None,
+        None,
+    )
 
 
 def _manager_relay_binding_state(
@@ -793,7 +824,10 @@ def _manager_relay_binding_state(
         and relay_value.get("request_id") == value.get("request_id")
         and relay_value.get("request_sha256") == request.stable.sha256
         and relay_value.get("declared_lane_id", relay_value.get("lane_id")) == lane_id
-        and (relay_value.get("tool_argument_sha256") or relay_value.get("tool_arguments_sha256"))
+        and (
+            relay_value.get("tool_argument_sha256")
+            or relay_value.get("tool_arguments_sha256")
+        )
         == (value.get("tool_argument_sha256") or value.get("tool_arguments_sha256"))
         and relay_value.get("server_snapshot") == value.get("server_snapshot")
         and isinstance(exact_call, dict)
@@ -896,12 +930,16 @@ def _request_observation(
                 "actual_created_utc": iso_utc(process.created_utc if process else None),
             }
         )
-    if states and all(state == "live" for state in states) and (
-        snapshot.complete or snapshot.provider == "linux-proc"
+    if (
+        states
+        and all(state == "live" for state in states)
+        and (snapshot.complete or snapshot.provider == "linux-proc")
     ):
         lifetime = "LIVE"
-    elif snapshot.complete and states and all(
-        state in {"absent", "mismatch"} for state in states
+    elif (
+        snapshot.complete
+        and states
+        and all(state in {"absent", "mismatch"} for state in states)
     ):
         lifetime = "ABSENT"
     else:
@@ -960,9 +998,7 @@ def _request_observation(
         "RELAY_READY",
         "RELAY_UNBOUND",
         "REQUEST_AMBIGUOUS",
-    } and (
-        lifetime == "LIVE" or (lifetime == "UNKNOWN" and expiry_bucket != "EXPIRED")
-    )
+    } and (lifetime == "LIVE" or (lifetime == "UNKNOWN" and expiry_bucket != "EXPIRED"))
 
     return {
         "path": str(request.path),
@@ -975,9 +1011,8 @@ def _request_observation(
         "expiry_bucket": expiry_bucket,
         "remaining_seconds": round(remaining, 3) if remaining is not None else None,
         "producer_identities": identities,
-        "declared_lane_id": request.value.get("declared_lane_id") or next(
-            iter(_nested_values(request.value, {"lane_id"})), None
-        ),
+        "declared_lane_id": request.value.get("declared_lane_id")
+        or next(iter(_nested_values(request.value, {"lane_id"})), None),
         "explicit_mcp_lifetime": {
             "is_explicit": explicit_mcp,
             "server_name": mcp_servers[0] if mcp_declared else None,
@@ -1004,7 +1039,9 @@ def _request_observation(
     }
 
 
-def _signal_request_match(raw: dict[str, Any], request: dict[str, Any], run: RunRecords) -> bool:
+def _signal_request_match(
+    raw: dict[str, Any], request: dict[str, Any], run: RunRecords
+) -> bool:
     """Correlate only durable manager-request IDs or exact request file paths."""
     if raw.get("request_id") == request.get("request_id") and request.get("request_id"):
         return True
@@ -1065,9 +1102,13 @@ def _resource_set(
     resources: set[str] = set()
     ambiguity: list[str] = []
     active_lane = _lane_is_active_or_unknown(lane)
-    if active_lane and lane.get("invocation_schema") == "orchestrator-coding-invocation/v1":
+    if (
+        active_lane
+        and lane.get("invocation_schema") == "orchestrator-coding-invocation/v1"
+    ):
         resources.update(
-            item for item in lane.get("declared_resources", [])
+            item
+            for item in lane.get("declared_resources", [])
             if isinstance(item, str) and item
         )
     if active_lane:
@@ -1117,15 +1158,11 @@ def _record_belongs_to_lane(record: dict[str, Any], lane: dict[str, Any]) -> boo
     declared_lane_id = record.get("declared_lane_id")
     if isinstance(declared_lane_id, str) and declared_lane_id:
         return declared_lane_id == lane.get("lane_id")
-    session_id = record.get("producer_identities", {}).get(
+    session_id = record.get("producer_identities", {}).get("session_id") or record.get(
         "session_id"
-    ) or record.get("session_id")
-    thread_id = lane.get("thread_id")
-    return (
-        isinstance(session_id, str)
-        and bool(session_id)
-        and session_id == thread_id
     )
+    thread_id = lane.get("thread_id")
+    return isinstance(session_id, str) and bool(session_id) and session_id == thread_id
 
 
 def _request_belongs_to_lane(request: dict[str, Any], lane: dict[str, Any]) -> bool:
@@ -1134,9 +1171,7 @@ def _request_belongs_to_lane(request: dict[str, Any], lane: dict[str, Any]) -> b
 
 
 def _has_unresolved_record_observation(run: RunRecords) -> bool:
-    return any(
-        error.code in _RESOURCE_OBSERVATION_ERROR_CODES for error in run.errors
-    )
+    return any(error.code in _RESOURCE_OBSERVATION_ERROR_CODES for error in run.errors)
 
 
 def reconcile(
@@ -1194,7 +1229,11 @@ def reconcile(
         for signal in run.manager_signals:
             raw = signal.value
             correlated = next(
-                (item for item in run_requests if _signal_request_match(raw, item, run)),
+                (
+                    item
+                    for item in run_requests
+                    if _signal_request_match(raw, item, run)
+                ),
                 None,
             )
             manager_signals.append(
@@ -1206,15 +1245,31 @@ def reconcile(
                     "kind": raw["kind"],
                     "created_utc": iso_utc(parse_utc(raw["created_utc"])),
                     "deadline_utc": iso_utc(parse_utc(raw.get("deadline_utc"))),
-                    **({"delivery_deadline_utc": iso_utc(parse_utc(raw["delivery_deadline_utc"]))} if "delivery_deadline_utc" in raw else {}),
-                    **({"agent_blocked": raw["agent_blocked"]} if "agent_blocked" in raw else {}),
+                    **(
+                        {
+                            "delivery_deadline_utc": iso_utc(
+                                parse_utc(raw["delivery_deadline_utc"])
+                            )
+                        }
+                        if "delivery_deadline_utc" in raw
+                        else {}
+                    ),
+                    **(
+                        {"agent_blocked": raw["agent_blocked"]}
+                        if "agent_blocked" in raw
+                        else {}
+                    ),
                     "lane_id": raw["lane_id"],
                     "task": raw.get("task"),
                     "phase": raw.get("phase"),
                     "summary": raw["summary"],
                     "evidence_paths": list(raw.get("evidence_paths", [])),
-                    "correlated_request_id": correlated.get("request_id") if correlated else None,
-                    "correlated_request_path": correlated.get("path") if correlated else None,
+                    "correlated_request_id": correlated.get("request_id")
+                    if correlated
+                    else None,
+                    "correlated_request_path": correlated.get("path")
+                    if correlated
+                    else None,
                     "correlated_request_answered": bool(
                         correlated
                         and correlated.get("relay_state") in {"BOUND", "BOUND_EXPIRED"}
@@ -1295,9 +1350,7 @@ def reconcile(
                         lane["provider_wait"] = True
             thread = lane.get("thread_id")
             matching_requests = [
-                item
-                for item in run_requests
-                if _request_belongs_to_lane(item, lane)
+                item for item in run_requests if _request_belongs_to_lane(item, lane)
             ]
             if any(
                 item["operational_state"] == "RELAY_READY" for item in matching_requests
@@ -1313,9 +1366,7 @@ def reconcile(
                 str(name).strip().lower() for name in declared_mcp_values
             }
             correlated_mcps = [
-                item
-                for item in run_mcps
-                if _record_belongs_to_lane(item, lane)
+                item for item in run_mcps if _record_belongs_to_lane(item, lane)
             ]
             matching_mcps = [
                 item
@@ -1399,33 +1450,44 @@ def reconcile(
 
     coding_conflicts: list[dict[str, Any]] = []
     active_coding = [
-        lane for lane in lanes
+        lane
+        for lane in lanes
         if _lane_is_active_or_unknown(lane)
-        and lane.get("invocation_schema") in {
+        and lane.get("invocation_schema")
+        in {
             "orchestrator-coding-invocation/v1",
             "orchestrator-worker-invocation/v1",
         }
         and isinstance(lane.get("repository"), dict)
     ]
-    for field, kind in (("worktree_root", "DUPLICATE_CODING_WORKTREE"), ("branch", "DUPLICATE_CODING_BRANCH")):
+    for field, kind in (
+        ("worktree_root", "DUPLICATE_CODING_WORKTREE"),
+        ("branch", "DUPLICATE_CODING_BRANCH"),
+    ):
         groups: dict[str, list[str]] = defaultdict(list)
         for lane in active_coding:
             repository = lane["repository"]
             value = repository.get(field)
             if field == "branch":
                 common = repository.get("common_dir")
-                key = f"{common}::{value}" if isinstance(common, str) and isinstance(value, str) else ""
+                key = (
+                    f"{common}::{value}"
+                    if isinstance(common, str) and isinstance(value, str)
+                    else ""
+                )
             else:
                 key = path_identity(value) if isinstance(value, str) and value else ""
             if key:
                 groups[key].append(lane["lane_id"])
         for key, lane_ids in groups.items():
             if len(set(lane_ids)) > 1:
-                coding_conflicts.append({
-                    "type": kind,
-                    "identity": key,
-                    "lanes": sorted(set(lane_ids)),
-                })
+                coding_conflicts.append(
+                    {
+                        "type": kind,
+                        "identity": key,
+                        "lanes": sorted(set(lane_ids)),
+                    }
+                )
 
     return {
         "schema": "orchestrator-watcher-snapshot/v1",
@@ -1438,7 +1500,9 @@ def reconcile(
         "requests": sorted(requests, key=lambda item: item["path"]),
         "helpers": sorted(helpers, key=lambda item: item["path"]),
         "mcps": sorted(mcps, key=lambda item: item["path"]),
-        "manager_signals": sorted(manager_signals, key=lambda item: (item["signal_id"], item["path"])),
+        "manager_signals": sorted(
+            manager_signals, key=lambda item: (item["signal_id"], item["path"])
+        ),
         "resource_conflicts": sorted(conflicts, key=lambda item: item["resource"]),
         "coding_conflicts": sorted(
             coding_conflicts, key=lambda item: (item["type"], item["identity"])

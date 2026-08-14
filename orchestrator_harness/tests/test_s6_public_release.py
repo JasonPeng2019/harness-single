@@ -127,7 +127,9 @@ def _make_directory_link(link: Path, target: Path) -> None:
     if os.name == "nt":
         result = subprocess.run(
             ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            capture_output=True, text=True, shell=False,
+            capture_output=True,
+            text=True,
+            shell=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"junction creation failed: {result.stderr}")
@@ -307,10 +309,14 @@ class S6SelectorTests(unittest.TestCase):
             spec = self._custom_specs()[0]
             with patch.object(release_checks, "CHECK_REGISTRY", (spec,)):
                 origin = release_checks.credit_record(spec, repository.root)
-                (repository.root / "unrelated.txt").write_text("descendant-1\n", encoding="utf-8")
+                (repository.root / "unrelated.txt").write_text(
+                    "descendant-1\n", encoding="utf-8"
+                )
                 repository.git("add", "unrelated.txt")
                 repository.git("commit", "-m", "unrelated descendant one")
-                (repository.root / "unrelated-two.txt").write_text("descendant-2\n", encoding="utf-8")
+                (repository.root / "unrelated-two.txt").write_text(
+                    "descendant-2\n", encoding="utf-8"
+                )
                 repository.git("add", "unrelated-two.txt")
                 repository.git("commit", "-m", "unrelated descendant two")
                 preserved = release_checks.select_checks(
@@ -322,7 +328,9 @@ class S6SelectorTests(unittest.TestCase):
                 self.assertEqual((), preserved.selected_ids)
                 self.assertEqual((spec.stable_id,), preserved.preserved_credit_ids)
 
-                (repository.root / "tracked.txt").write_text("changed dependency\n", encoding="utf-8")
+                (repository.root / "tracked.txt").write_text(
+                    "changed dependency\n", encoding="utf-8"
+                )
                 repository.git("add", "tracked.txt")
                 repository.git("commit", "-m", "dependency mutation")
                 changed = release_checks.select_checks(
@@ -336,8 +344,12 @@ class S6SelectorTests(unittest.TestCase):
 
                 repository.git("checkout", "--orphan", "divergent")
                 repository.git("rm", "-rf", ".")
-                (repository.root / "tracked.txt").write_text("divergent dependency\n", encoding="utf-8")
-                (repository.root / "divergent.txt").write_text("divergent\n", encoding="utf-8")
+                (repository.root / "tracked.txt").write_text(
+                    "divergent dependency\n", encoding="utf-8"
+                )
+                (repository.root / "divergent.txt").write_text(
+                    "divergent\n", encoding="utf-8"
+                )
                 repository.git("add", "divergent.txt")
                 repository.git("commit", "-m", "divergent identity")
                 repository.git("branch", "-D", "test")
@@ -350,7 +362,9 @@ class S6SelectorTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
-    def test_release_scope_mutations_invalidate_the_broad_component_credit(self) -> None:
+    def test_release_scope_mutations_invalidate_the_broad_component_credit(
+        self,
+    ) -> None:
         broad_specs = tuple(
             spec
             for spec in release_checks.registry()
@@ -371,7 +385,9 @@ class S6SelectorTests(unittest.TestCase):
                 try:
                     with patch.object(release_checks, "CHECK_REGISTRY", (spec,)):
                         credit = release_checks.credit_record(spec, REPOSITORY_ROOT)
-                        path.write_bytes(original + b"\n# audited release-scope mutation\n")
+                        path.write_bytes(
+                            original + b"\n# audited release-scope mutation\n"
+                        )
                         decision = release_checks.select_checks(
                             "release",
                             REPOSITORY_ROOT,
@@ -399,18 +415,26 @@ class S6SelectorTests(unittest.TestCase):
                     path = REPOSITORY_ROOT / relative
                     original = path.read_bytes()
                     credit = release_checks.credit_record(spec, REPOSITORY_ROOT)
-                    original_fingerprint = release_checks.dependency_fingerprint(spec, REPOSITORY_ROOT)
+                    original_fingerprint = release_checks.dependency_fingerprint(
+                        spec, REPOSITORY_ROOT
+                    )
                     try:
-                        path.write_bytes(original + b"\n# audited actual-input mutation\n")
+                        path.write_bytes(
+                            original + b"\n# audited actual-input mutation\n"
+                        )
                         decision = release_checks.select_checks(
                             "release" if spec.tier == "release" else "affected",
-                            REPOSITORY_ROOT, credits=[credit], changed_paths=[relative],
+                            REPOSITORY_ROOT,
+                            credits=[credit],
+                            changed_paths=[relative],
                         )
                         self.assertIn(stable_id, decision.selected_ids)
                         self.assertIn(stable_id, decision.invalidated_credit_ids)
                         self.assertNotEqual(
                             original_fingerprint,
-                            release_checks.dependency_fingerprint(spec, REPOSITORY_ROOT),
+                            release_checks.dependency_fingerprint(
+                                spec, REPOSITORY_ROOT
+                            ),
                         )
                     finally:
                         path.write_bytes(original)
@@ -420,7 +444,9 @@ class S6SelectorTests(unittest.TestCase):
                     )
                     preserved = release_checks.select_checks(
                         "release" if spec.tier == "release" else "affected",
-                        REPOSITORY_ROOT, credits=[credit], changed_paths=[".gitattributes"],
+                        REPOSITORY_ROOT,
+                        credits=[credit],
+                        changed_paths=[".gitattributes"],
                     )
                     self.assertIn(stable_id, preserved.preserved_credit_ids)
                     self.assertNotIn(stable_id, preserved.invalidated_credit_ids)
@@ -437,14 +463,17 @@ class S6SelectorTests(unittest.TestCase):
             (),
             input_scopes=(release_checks.InputScope("file", "required.py"),),
         )
-        with self.assertRaisesRegex(release_checks.SelectionError, "required input scope"):
+        with self.assertRaisesRegex(
+            release_checks.SelectionError, "required input scope"
+        ):
             release_checks.resolve_input_scope(spec, REPOSITORY_ROOT)
 
     def test_real_route_manifest_mutations_invalidate_public_consumers(self) -> None:
         specs = tuple(
             spec
             for spec in release_checks.registry()
-            if spec.stable_id in {
+            if spec.stable_id
+            in {
                 "S6.AFFECTED.PUBLIC-E2E",
                 "S6.AFFECTED.REAL-AGENT",
             }
@@ -497,7 +526,9 @@ class S6SelectorTests(unittest.TestCase):
 
     def test_release_components_are_stable_and_nonrecursive(self) -> None:
         decision = release_checks.select_checks(
-            "release", REPOSITORY_ROOT, exclude_ids=(release_checks.RELEASE_AGGREGATE_ID,)
+            "release",
+            REPOSITORY_ROOT,
+            exclude_ids=(release_checks.RELEASE_AGGREGATE_ID,),
         )
         selected = [item.spec.stable_id for item in decision.selected]
         expected = {
@@ -505,17 +536,19 @@ class S6SelectorTests(unittest.TestCase):
             for spec in release_checks.registry()
             if spec.stable_id != release_checks.RELEASE_AGGREGATE_ID
         }
-        expected.update({
-            "S6.RELEASE.RUFF",
-            "S6.RELEASE.FORMAT",
-            "S6.RELEASE.BASEDPYRIGHT",
-            "S6.RELEASE.COMPILE",
-            "S6.RELEASE.ORCHESTRATOR-UNIT",
-            "S6.RELEASE.WATCHER-UNIT",
-            "S6.RELEASE.ATTENTION",
-            "S6.RELEASE.SYNTHETIC-CLEANUP",
-            "S6.AFFECTED.REAL-AGENT",
-        })
+        expected.update(
+            {
+                "S6.RELEASE.RUFF",
+                "S6.RELEASE.FORMAT",
+                "S6.RELEASE.BASEDPYRIGHT",
+                "S6.RELEASE.COMPILE",
+                "S6.RELEASE.ORCHESTRATOR-UNIT",
+                "S6.RELEASE.WATCHER-UNIT",
+                "S6.RELEASE.ATTENTION",
+                "S6.RELEASE.SYNTHETIC-CLEANUP",
+                "S6.AFFECTED.REAL-AGENT",
+            }
+        )
         self.assertEqual(expected, set(selected))
         self.assertEqual(len(selected), len(set(selected)))
         self.assertNotIn(release_checks.RELEASE_AGGREGATE_ID, selected)
@@ -532,12 +565,14 @@ class S6SelectorTests(unittest.TestCase):
         # repository-relative copies.
         canonical = tuple(
             f"orchestrator_harness/{relative}"
-            for relative in manifest["examples"] + manifest["release_evidence_templates"]
+            for relative in manifest["examples"]
+            + manifest["release_evidence_templates"]
             if f"orchestrator_harness/{relative}" in scoped
             and f"orchestrator_harness/{relative}" not in excluded
         )
         checkout = tuple(
-            relative for relative in manifest["checkout_copies"]
+            relative
+            for relative in manifest["checkout_copies"]
             if relative in scoped and relative not in excluded
         )
         self.assertTrue(canonical)
@@ -545,12 +580,20 @@ class S6SelectorTests(unittest.TestCase):
         for relative in canonical + checkout:
             with self.subTest(relative=relative):
                 decision = release_checks.select_checks(
-                    "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[relative],
+                    "affected",
+                    REPOSITORY_ROOT,
+                    credits=[credit],
+                    changed_paths=[relative],
                 )
                 self.assertIn(spec.stable_id, decision.invalidated_credit_ids, relative)
-                self.assertNotIn(spec.stable_id, decision.preserved_credit_ids, relative)
+                self.assertNotIn(
+                    spec.stable_id, decision.preserved_credit_ids, relative
+                )
         preserved = release_checks.select_checks(
-            "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[".gitattributes"],
+            "affected",
+            REPOSITORY_ROOT,
+            credits=[credit],
+            changed_paths=[".gitattributes"],
         )
         self.assertIn(spec.stable_id, preserved.preserved_credit_ids)
         self.assertNotIn(spec.stable_id, preserved.invalidated_credit_ids)
@@ -561,66 +604,132 @@ class S6SelectorTests(unittest.TestCase):
         scoped = set(release_checks.resolve_input_scope(spec, REPOSITORY_ROOT))
         excluded = set(spec.dependency_paths)
         candidates = tuple(
-            relative for relative in scoped
+            relative
+            for relative in scoped
             if relative not in excluded and not relative.endswith(".py")
         )
         self.assertTrue(candidates)
         for relative in candidates[:3]:
             with self.subTest(relative=relative):
                 decision = release_checks.select_checks(
-                    "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[relative],
+                    "affected",
+                    REPOSITORY_ROOT,
+                    credits=[credit],
+                    changed_paths=[relative],
                 )
                 self.assertIn(spec.stable_id, decision.invalidated_credit_ids, relative)
-                self.assertNotIn(spec.stable_id, decision.preserved_credit_ids, relative)
+                self.assertNotIn(
+                    spec.stable_id, decision.preserved_credit_ids, relative
+                )
         preserved = release_checks.select_checks(
-            "affected", REPOSITORY_ROOT, credits=[credit], changed_paths=[".gitattributes"],
+            "affected",
+            REPOSITORY_ROOT,
+            credits=[credit],
+            changed_paths=[".gitattributes"],
         )
         self.assertIn(spec.stable_id, preserved.preserved_credit_ids)
         self.assertNotIn(spec.stable_id, preserved.invalidated_credit_ids)
 
-    def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-foreign-selection-") as raw:
+    def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-foreign-selection-"
+        ) as raw:
             raw_path = Path(raw)
             root = raw_path / "candidate"
             shutil.copytree(
-                REPOSITORY_ROOT, root,
+                REPOSITORY_ROOT,
+                root,
                 ignore=shutil.ignore_patterns(
                     ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
                 ),
             )
-            subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "foreign@example.invalid"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "Foreign Selection"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-m", "candidate"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "foreign@example.invalid",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Foreign Selection"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "."], check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "candidate"],
+                check=True,
+                capture_output=True,
+            )
             head = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
-                capture_output=True, text=True,
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             environment = dict(os.environ)
             environment["PYTHONPATH"] = str(root) + (
-                os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+                os.pathsep + environment["PYTHONPATH"]
+                if environment.get("PYTHONPATH")
+                else ""
             )
             real = subprocess.run(
                 [
-                    sys.executable, "-m", "orchestrator_harness.release_checks", "select",
-                    "--intent", "release", "--root", str(root),
-                    "--expected-branch", "firmware/v2-candidate", "--expected-tip", head,
-                    "--exclude-id", "S6.RELEASE.ACCUMULATED-SAFEGUARD",
+                    sys.executable,
+                    "-m",
+                    "orchestrator_harness.release_checks",
+                    "select",
+                    "--intent",
+                    "release",
+                    "--root",
+                    str(root),
+                    "--expected-branch",
+                    "firmware/v2-candidate",
+                    "--expected-tip",
+                    head,
+                    "--exclude-id",
+                    "S6.RELEASE.ACCUMULATED-SAFEGUARD",
                 ],
-                cwd=root, env=environment, capture_output=True, text=True, check=False,
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             self.assertEqual(0, real.returncode, real.stdout + real.stderr)
             selection = json.loads(real.stdout)
             tampered = False
             for item in selection["selected"]:
                 if item["stable_id"].startswith("S6.RELEASE.RUFF"):
-                    item["command"] = ["python", "-m", "ruff", "check", "--foreign", "."]
+                    item["command"] = [
+                        "python",
+                        "-m",
+                        "ruff",
+                        "check",
+                        "--foreign",
+                        ".",
+                    ]
                     tampered = True
                     break
             self.assertTrue(tampered)
             crafted = raw_path / "crafted-selection.json"
-            crafted.write_text(json.dumps(selection, separators=(",", ":")), encoding="utf-8")
+            crafted.write_text(
+                json.dumps(selection, separators=(",", ":")), encoding="utf-8"
+            )
             shim_dir = raw_path / "shim"
             shim_dir.mkdir()
             shim = shim_dir / "python.cmd"
@@ -641,16 +750,31 @@ class S6SelectorTests(unittest.TestCase):
             credit_file = raw_path / "credits.json"
             credit_file.write_text('{"credits": []}\n', encoding="utf-8")
             shim_environment = dict(os.environ)
-            shim_environment["PATH"] = str(shim_dir) + os.pathsep + shim_environment.get("PATH", "")
+            shim_environment["PATH"] = (
+                str(shim_dir) + os.pathsep + shim_environment.get("PATH", "")
+            )
             completed = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
                     str(root / "tools" / "Invoke-CandidateSafeguard.ps1"),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-ExpectedTip", head, "-CreditFile", str(credit_file),
+                    "-RepositoryRoot",
+                    str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
+                    "-ExpectedTip",
+                    head,
+                    "-CreditFile",
+                    str(credit_file),
                 ],
-                cwd=REPOSITORY_ROOT, env=shim_environment,
-                capture_output=True, text=True, check=False,
+                cwd=REPOSITORY_ROOT,
+                env=shim_environment,
+                capture_output=True,
+                text=True,
+                check=False,
                 creationflags=_WINDOWLESS_CREATION_FLAGS,
             )
             self.assertNotEqual(0, completed.returncode)
@@ -707,7 +831,9 @@ class S6LocalIsolationTests(unittest.TestCase):
         assert created_text is not None
         receipt = {"pid": 101, "created_utc": created_text}
         status = {"controller_pid": 101, "controller_created_utc": created_text}
-        self.assertEqual((101, created_text), _validate_controller_receipt_identity(receipt, status))
+        self.assertEqual(
+            (101, created_text), _validate_controller_receipt_identity(receipt, status)
+        )
         for changed in (
             {**status, "controller_pid": 102},
             {**status, "controller_created_utc": "2026-08-13T01:00:01Z"},
@@ -716,34 +842,52 @@ class S6LocalIsolationTests(unittest.TestCase):
                 _validate_controller_receipt_identity(receipt, changed)
 
         process = ProcessInfo(
-            pid=202, ppid=101, name="wsl.exe",
-            command_line="wsl.exe -d Ubuntu -- provider", created_utc=created,
+            pid=202,
+            ppid=101,
+            name="wsl.exe",
+            command_line="wsl.exe -d Ubuntu -- provider",
+            created_utc=created,
         )
         identity = _provider_identity_from_query(
-            ProcessQuery(True, process), provider_pid=202,
-            provider_created=created_text, controller_pid=101,
-            nonce="nonce", invocation_id="invocation",
+            ProcessQuery(True, process),
+            provider_pid=202,
+            provider_created=created_text,
+            controller_pid=101,
+            nonce="nonce",
+            invocation_id="invocation",
         )
         self.assertEqual(101, identity["parent_pid"])
         invalid_queries = (
             ProcessQuery(False, process),
             ProcessQuery(True, process, ("parent mismatch",)),
             ProcessQuery(True, None),
-            ProcessQuery(True, ProcessInfo(
-                pid=202, ppid=999, name="wsl.exe",
-                command_line="wsl.exe -d Ubuntu -- provider", created_utc=created,
-            )),
+            ProcessQuery(
+                True,
+                ProcessInfo(
+                    pid=202,
+                    ppid=999,
+                    name="wsl.exe",
+                    command_line="wsl.exe -d Ubuntu -- provider",
+                    created_utc=created,
+                ),
+            ),
         )
         for query in invalid_queries:
             with self.subTest(query=query), self.assertRaises(RuntimeError):
                 _provider_identity_from_query(
-                    query, provider_pid=202, provider_created=created_text,
-                    controller_pid=101, nonce="nonce", invocation_id="invocation",
+                    query,
+                    provider_pid=202,
+                    provider_created=created_text,
+                    controller_pid=101,
+                    nonce="nonce",
+                    invocation_id="invocation",
                 )
 
     def test_real_agent_failure_retains_only_safe_out_of_source_summary(self) -> None:
         sentinel = "PROVIDER_TRANSCRIPT_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-safe-evidence-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-safe-evidence-"
+        ) as raw:
             root = Path(raw)
             source = root / "source"
             source.mkdir()
@@ -754,7 +898,10 @@ class S6LocalIsolationTests(unittest.TestCase):
                 return_value=str(root / "detected-temp"),
             ):
                 detected = _resolve_evidence_root(None, repository_root=source)
-            self.assertEqual((root / "detected-temp" / DEFAULT_EVIDENCE_DIRECTORY).resolve(), detected)
+            self.assertEqual(
+                (root / "detected-temp" / DEFAULT_EVIDENCE_DIRECTORY).resolve(),
+                detected,
+            )
             with self.assertRaisesRegex(RuntimeError, "outside the source"):
                 _resolve_evidence_root(source / "runtime", repository_root=source)
 
@@ -763,16 +910,26 @@ class S6LocalIsolationTests(unittest.TestCase):
                 workspace = temp_root / "synthetic-repository" / ".agent-workspace"
                 workspace.mkdir(parents=True)
                 for name in (
-                    "real_agent_codex.jsonl", "real_agent_codex.stderr.log",
+                    "real_agent_codex.jsonl",
+                    "real_agent_codex.stderr.log",
                     "real_agent_last_message.txt",
                 ):
                     (workspace / name).write_text(sentinel, encoding="utf-8")
-                (workspace / "real_agent_controller.status.json").write_text(json.dumps({
-                    "state": "CONTROLLER_FAILED", "exit_code": 1, "task": sentinel,
-                    "launcher_settings": {"argv": [sentinel]}, "held_resource_claims": [],
-                }), encoding="utf-8")
+                (workspace / "real_agent_controller.status.json").write_text(
+                    json.dumps(
+                        {
+                            "state": "CONTROLLER_FAILED",
+                            "exit_code": 1,
+                            "task": sentinel,
+                            "launcher_settings": {"argv": [sentinel]},
+                            "held_resource_claims": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 (temp_root / "bridge-evidence.json").write_text(
-                    json.dumps({"status": "FAIL", "provider_output": sentinel}), encoding="utf-8",
+                    json.dumps({"status": "FAIL", "provider_output": sentinel}),
+                    encoding="utf-8",
                 )
                 prepared_evidence = temp_root / "prepared-evidence"
                 prepared_evidence.mkdir()
@@ -785,11 +942,17 @@ class S6LocalIsolationTests(unittest.TestCase):
                 root_binding = _open_evidence_root_handle(outside)
                 attempt_name = "forced-failure"
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "PROVIDER_TRANSCRIPT_SENTINEL"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "PROVIDER_TRANSCRIPT_SENTINEL"
+                    ):
                         _terminal_finalize(
-                            root_binding=root_binding, attempt_name=attempt_name,
-                            temp_root=temp_root, failure=RuntimeError(sentinel),
-                            result=None, prep_process=None, release_signal=None,
+                            root_binding=root_binding,
+                            attempt_name=attempt_name,
+                            temp_root=temp_root,
+                            failure=RuntimeError(sentinel),
+                            result=None,
+                            prep_process=None,
+                            release_signal=None,
                         )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -799,7 +962,8 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertEqual([attempt_name], [p.name for p in outside.iterdir()])
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
                 text = (published / retained[0]).read_text(encoding="utf-8")
@@ -810,9 +974,12 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertFalse(result["transcript_persisted"])
                 self.assertEqual(1, result["retained_file_count"])
                 self.assertTrue(result["host_temp_cleanup_complete"])
-                self.assertTrue(result["source_artifact_facts"]["provider_event_stream"]["present"])
+                self.assertTrue(
+                    result["source_artifact_facts"]["provider_event_stream"]["present"]
+                )
                 self.assertNotIn(
-                    ".real-agent/", (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8"),
+                    ".real-agent/",
+                    (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8"),
                 )
             finally:
                 if temp_root.exists():
@@ -824,7 +991,9 @@ class S6LocalIsolationTests(unittest.TestCase):
         created_text = iso_utc(created)
         assert created_text is not None
         commit = "0" * 40
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-success-evidence-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-success-evidence-"
+        ) as raw:
             root = Path(raw)
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
             try:
@@ -843,17 +1012,29 @@ class S6LocalIsolationTests(unittest.TestCase):
                 prompt_path = workspace / "real_agent_prompt.md"
                 lifecycle_path = workspace / "lifecycle.json"
                 receipt_path.write_text(
-                    json.dumps({"pid": 101, "created_utc": created_text}), encoding="utf-8",
+                    json.dumps({"pid": 101, "created_utc": created_text}),
+                    encoding="utf-8",
                 )
-                status_path.write_text(json.dumps({
-                    "controller_pid": 101, "controller_created_utc": created_text,
-                    "state": "CODEX_EXITED", "exit_code": 0, "result_valid": True,
-                    "result_validation": {"state": "VALID", "commit": commit},
-                    "helpers_complete": True, "direct_child_reaped": True,
-                    "resource_claim_release_safe": True, "held_resource_claims": [],
-                    "process_boundary": {"complete": True, "live_members": []},
-                    "task": sentinel, "launcher_settings": {"argv": [sentinel]},
-                }), encoding="utf-8")
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "controller_pid": 101,
+                            "controller_created_utc": created_text,
+                            "state": "CODEX_EXITED",
+                            "exit_code": 0,
+                            "result_valid": True,
+                            "result_validation": {"state": "VALID", "commit": commit},
+                            "helpers_complete": True,
+                            "direct_child_reaped": True,
+                            "resource_claim_release_safe": True,
+                            "held_resource_claims": [],
+                            "process_boundary": {"complete": True, "live_members": []},
+                            "task": sentinel,
+                            "launcher_settings": {"argv": [sentinel]},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 poisoned_result = {
                     "schema": "orchestrator-lane-result/v1",
                     "lane_id": "real-agent",
@@ -862,82 +1043,132 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "commit": commit,
                     "outcome": "PASS",
                     "summary": f"public route task passed {sentinel}",
-                    "checks": [{
-                        "name": "synthetic public route",
-                        "outcome": "PASS",
-                        "summary": f"marker committed {sentinel}",
-                        "command": f"provider check command {sentinel}",
-                    }],
+                    "checks": [
+                        {
+                            "name": "synthetic public route",
+                            "outcome": "PASS",
+                            "summary": f"marker committed {sentinel}",
+                            "command": f"provider check command {sentinel}",
+                        }
+                    ],
                 }
                 result_path.write_text(json.dumps(poisoned_result), encoding="utf-8")
-                lifecycle_path.write_text(json.dumps({
-                    "lifecycle": {"complete": True, "helpers_complete": True},
-                    "record": sentinel,
-                }), encoding="utf-8")
+                lifecycle_path.write_text(
+                    json.dumps(
+                        {
+                            "lifecycle": {"complete": True, "helpers_complete": True},
+                            "record": sentinel,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 bridge_evidence = temp_root / "bridge-evidence.json"
                 state_path = temp_root / "prepared-state.json"
                 claim_path = temp_root / "prepared-claim.json"
-                bridge_evidence.write_text(json.dumps({
-                    "status": "PASS", "cleanup_complete": True,
-                    "sandbox": {"mnt_c_exposed": False, "usb_exposed": False},
-                    "provider_output": sentinel,
-                }), encoding="utf-8")
-                state_path.write_text(json.dumps({
-                    "status": "CLEANED", "cleanup_complete": True,
-                    "credentials_in_state": False, "evidence": sentinel,
-                }), encoding="utf-8")
+                bridge_evidence.write_text(
+                    json.dumps(
+                        {
+                            "status": "PASS",
+                            "cleanup_complete": True,
+                            "sandbox": {"mnt_c_exposed": False, "usb_exposed": False},
+                            "provider_output": sentinel,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "CLEANED",
+                            "cleanup_complete": True,
+                            "credentials_in_state": False,
+                            "evidence": sentinel,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 claim_path.write_text(json.dumps({"claim": sentinel}), encoding="utf-8")
                 prepared_evidence = temp_root / "prepared-evidence"
                 prepared_evidence.mkdir()
-                (prepared_evidence / "proxy-audit.jsonl").write_text(sentinel, encoding="utf-8")
-                (prepared_evidence / "prepared-state.json").write_text(sentinel, encoding="utf-8")
+                (prepared_evidence / "proxy-audit.jsonl").write_text(
+                    sentinel, encoding="utf-8"
+                )
+                (prepared_evidence / "prepared-state.json").write_text(
+                    sentinel, encoding="utf-8"
+                )
                 evidence_root = root / "evidence"
                 evidence_root.mkdir()
                 root_binding = _open_evidence_root_handle(evidence_root)
                 attempt_name = "success-attempt"
                 try:
-                    expected_result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+                    expected_result_sha = hashlib.sha256(
+                        result_path.read_bytes()
+                    ).hexdigest()
                     record = _safe_success_record(
                         completed_utc="2026-08-13T01:00:05Z",
                         route="public_launch -> operator_launch -> lane_controller -> wsl.exe provider bridge",
-                        distro="Ubuntu", codex_root="/opt/orchestrator-harness-codex",
-                        nonce="nonce", invocation_id="real-agent-001",
-                        controller_pid=101, controller_created=created_text,
+                        distro="Ubuntu",
+                        codex_root="/opt/orchestrator-harness-codex",
+                        nonce="nonce",
+                        invocation_id="real-agent-001",
+                        controller_pid=101,
+                        controller_created=created_text,
                         provider_identity={
-                            "platform": "windows", "pid": 202, "created_utc": created_text,
-                            "nonce": "nonce", "invocation_id": "real-agent-001",
+                            "platform": "windows",
+                            "pid": 202,
+                            "created_utc": created_text,
+                            "nonce": "nonce",
+                            "invocation_id": "real-agent-001",
                             "parent_pid": 101,
                         },
                         linux_bridge_identity={
-                            "platform": "linux", "pid": 303, "created_utc": created_text,
-                            "nonce": "nonce", "invocation_id": "real-agent-001",
+                            "platform": "linux",
+                            "pid": 303,
+                            "created_utc": created_text,
+                            "nonce": "nonce",
+                            "invocation_id": "real-agent-001",
                         },
                         status=json.loads(status_path.read_text(encoding="utf-8")),
                         result_value=poisoned_result,
-                        lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8")),
+                        lifecycle=json.loads(
+                            lifecycle_path.read_text(encoding="utf-8")
+                        ),
                         bridge=json.loads(bridge_evidence.read_text(encoding="utf-8")),
                         prepared=json.loads(state_path.read_text(encoding="utf-8")),
                         event_types=[
-                            "CONTROLLER_ACTIVE", "CONTROLLER_EXITED", "RESOURCE_RELEASE_POSSIBLE",
+                            "CONTROLLER_ACTIVE",
+                            "CONTROLLER_EXITED",
+                            "RESOURCE_RELEASE_POSSIBLE",
                         ],
                         workspace=workspace,
-                        receipt_path=receipt_path, result_path=result_path,
-                        lifecycle_path=lifecycle_path, bridge_evidence=bridge_evidence,
-                        state_path=state_path, claim_path=claim_path, prompt_path=prompt_path,
+                        receipt_path=receipt_path,
+                        result_path=result_path,
+                        lifecycle_path=lifecycle_path,
+                        bridge_evidence=bridge_evidence,
+                        state_path=state_path,
+                        claim_path=claim_path,
+                        prompt_path=prompt_path,
                     )
                     published = _terminal_finalize(
-                        root_binding=root_binding, attempt_name=attempt_name,
-                        temp_root=temp_root, failure=None, result=record,
-                        prep_process=None, release_signal=None,
+                        root_binding=root_binding,
+                        attempt_name=attempt_name,
+                        temp_root=temp_root,
+                        failure=None,
+                        result=record,
+                        prep_process=None,
+                        release_signal=None,
                     )
                 finally:
                     _close_evidence_root_handle(root_binding)
                 self.assertEqual(evidence_root / attempt_name, published)
                 self.assertFalse(temp_root.exists())
-                self.assertEqual([attempt_name], [p.name for p in evidence_root.iterdir()])
+                self.assertEqual(
+                    [attempt_name], [p.name for p in evidence_root.iterdir()]
+                )
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
                 text = (published / retained[0]).read_text(encoding="utf-8")
@@ -949,7 +1180,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertNotIn("bridge-evidence.json", text)
                 self.assertNotIn("prepared-state.json", text)
                 result = json.loads(text)
-                self.assertEqual("orchestrator-real-agent-evidence/v1", result["schema"])
+                self.assertEqual(
+                    "orchestrator-real-agent-evidence/v1", result["schema"]
+                )
                 self.assertEqual("PASS", result["status"])
                 self.assertEqual(1, result["retained_file_count"])
                 self.assertFalse(result["credentials_persisted"])
@@ -958,7 +1191,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertEqual("real-agent", result["result_identity"]["lane_id"])
                 self.assertEqual(commit, result["result_identity"]["commit"])
                 self.assertEqual("PASS", result["result_identity"]["outcome"])
-                self.assertEqual("VALID", result["controller_summary"]["result_validation_state"])
+                self.assertEqual(
+                    "VALID", result["controller_summary"]["result_validation_state"]
+                )
                 self.assertFalse(result["bridge_summary"]["mnt_c_exposed"])
                 self.assertTrue(result["prepared_summary"]["cleanup_complete"])
                 self.assertEqual(
@@ -1024,37 +1259,53 @@ class S6LocalIsolationTests(unittest.TestCase):
             (
                 "non_timeout_wait",
                 None,
-                _FakePrepProcess(running=True, wait_fault=OSError("initial wait fault")),
+                _FakePrepProcess(
+                    running=True, wait_fault=OSError("initial wait fault")
+                ),
             ),
             (
                 "timeout_kill",
                 None,
-                _FakePrepProcess(running=True, kill_fault=OSError("timeout kill fault")),
+                _FakePrepProcess(
+                    running=True, kill_fault=OSError("timeout kill fault")
+                ),
             ),
             (
                 "post_kill_wait",
                 None,
                 _FakePrepProcess(
-                    running=True, post_kill_wait_fault=OSError("post-kill wait fault"),
+                    running=True,
+                    post_kill_wait_fault=OSError("post-kill wait fault"),
                 ),
             ),
         )
         for name, release_signal, prep_process in scenarios:
             with self.subTest(operation=name):
-                with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-fault-") as raw:
+                with tempfile.TemporaryDirectory(
+                    prefix="orchestrator-s6-cleanup-fault-"
+                ) as raw:
                     root = Path(raw)
-                    temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+                    temp_root = Path(
+                        tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-")
+                    )
                     try:
-                        workspace = temp_root / "synthetic-repository" / ".agent-workspace"
+                        workspace = (
+                            temp_root / "synthetic-repository" / ".agent-workspace"
+                        )
                         workspace.mkdir(parents=True)
                         (workspace / "real_agent_codex.jsonl").write_text(
-                            sentinel, encoding="utf-8",
+                            sentinel,
+                            encoding="utf-8",
                         )
                         (workspace / "real_agent_controller.status.json").write_text(
-                            json.dumps({
-                                "state": "CONTROLLER_FAILED", "exit_code": 1,
-                                "task": sentinel, "held_resource_claims": [],
-                            }),
+                            json.dumps(
+                                {
+                                    "state": "CONTROLLER_FAILED",
+                                    "exit_code": 1,
+                                    "task": sentinel,
+                                    "held_resource_claims": [],
+                                }
+                            ),
                             encoding="utf-8",
                         )
                         evidence_root = root / "evidence"
@@ -1072,9 +1323,13 @@ class S6LocalIsolationTests(unittest.TestCase):
                         try:
                             with self.assertRaises(OSError):
                                 _terminal_finalize(
-                                    root_binding=root_binding, attempt_name=attempt_name,
-                                    temp_root=temp_root, failure=None, result=success_record,
-                                    prep_process=prep_process, release_signal=release_signal,
+                                    root_binding=root_binding,
+                                    attempt_name=attempt_name,
+                                    temp_root=temp_root,
+                                    failure=None,
+                                    result=success_record,
+                                    prep_process=prep_process,
+                                    release_signal=release_signal,
                                 )
                         finally:
                             _close_evidence_root_handle(root_binding)
@@ -1082,43 +1337,56 @@ class S6LocalIsolationTests(unittest.TestCase):
                         published = evidence_root / attempt_name
                         retained = tuple(
                             path.relative_to(published).as_posix()
-                            for path in published.rglob("*") if path.is_file()
+                            for path in published.rglob("*")
+                            if path.is_file()
                         )
                         self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
                         text = (published / retained[0]).read_text(encoding="utf-8")
                         self.assertNotIn(sentinel, text)
                         record = json.loads(text)
                         self.assertEqual("FAIL", record["status"])
-                        self.assertEqual("OSError", record["preparation_cleanup_failure_type"])
+                        self.assertEqual(
+                            "OSError", record["preparation_cleanup_failure_type"]
+                        )
                         self.assertTrue(record["host_temp_cleanup_complete"])
                         self.assertEqual(1, record["retained_file_count"])
                     finally:
                         if temp_root.exists():
                             shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_cleanup_fault_on_failure_route_preserves_original_failure(self) -> None:
+    def test_real_agent_cleanup_fault_on_failure_route_preserves_original_failure(
+        self,
+    ) -> None:
         sentinel = "ORIGINAL_FAILURE_TRANSCRIPT_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-fault-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-cleanup-fault-"
+        ) as raw:
             root = Path(raw)
             temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
             try:
                 workspace = temp_root / "synthetic-repository" / ".agent-workspace"
                 workspace.mkdir(parents=True)
                 (workspace / "real_agent_codex.jsonl").write_text(
-                    sentinel, encoding="utf-8",
+                    sentinel,
+                    encoding="utf-8",
                 )
                 evidence_root = root / "evidence"
                 evidence_root.mkdir()
                 root_binding = _open_evidence_root_handle(evidence_root)
                 attempt_name = "failure-route"
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "original product failure"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "original product failure"
+                    ):
                         _terminal_finalize(
-                            root_binding=root_binding, attempt_name=attempt_name,
-                            temp_root=temp_root, failure=RuntimeError("original product failure"),
+                            root_binding=root_binding,
+                            attempt_name=attempt_name,
+                            temp_root=temp_root,
+                            failure=RuntimeError("original product failure"),
                             result=None,
                             prep_process=_FakePrepProcess(
-                                running=True, kill_fault=OSError("kill fault"),
+                                running=True,
+                                kill_fault=OSError("kill fault"),
                             ),
                             release_signal=None,
                         )
@@ -1128,10 +1396,13 @@ class S6LocalIsolationTests(unittest.TestCase):
                 published = evidence_root / attempt_name
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
-                record = json.loads((published / retained[0]).read_text(encoding="utf-8"))
+                record = json.loads(
+                    (published / retained[0]).read_text(encoding="utf-8")
+                )
                 self.assertEqual("FAIL", record["status"])
                 self.assertEqual("RuntimeError", record["failure_type"])
                 self.assertEqual("OSError", record["preparation_cleanup_failure_type"])
@@ -1222,32 +1493,44 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                        real_agent_test_module,
+                        "_PUBLICATION_INTERPOSITION_HOOK",
+                        interpose,
                     ):
                         published = _terminal_finalize(
-                            root_binding=root_binding, attempt_name=attempt_name,
-                            temp_root=temp_root, failure=None, result=record,
-                            prep_process=None, release_signal=None,
+                            root_binding=root_binding,
+                            attempt_name=attempt_name,
+                            temp_root=temp_root,
+                            failure=None,
+                            result=record,
+                            prep_process=None,
+                            release_signal=None,
                         )
                 finally:
                     _close_evidence_root_handle(root_binding)
                 self.assertEqual(
-                    ["rename-denied", "rmdir-denied", "link-refused"], observed,
+                    ["rename-denied", "rmdir-denied", "link-refused"],
+                    observed,
                 )
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
                 self.assertEqual(evidence_root / attempt_name, published)
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
             finally:
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_final_check_use_interval_refuses_staging_substitution(self) -> None:
+    def test_real_agent_final_check_use_interval_refuses_staging_substitution(
+        self,
+    ) -> None:
         sentinel = "FINAL_CHECK_USE_SENTINEL"
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-final-check-") as raw:
             root = Path(raw)
@@ -1288,27 +1571,37 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                        real_agent_test_module,
+                        "_PUBLICATION_INTERPOSITION_HOOK",
+                        interpose,
                     ):
                         published = _terminal_finalize(
-                            root_binding=root_binding, attempt_name=attempt_name,
-                            temp_root=temp_root, failure=None, result=record,
-                            prep_process=None, release_signal=None,
+                            root_binding=root_binding,
+                            attempt_name=attempt_name,
+                            temp_root=temp_root,
+                            failure=None,
+                            result=record,
+                            prep_process=None,
+                            release_signal=None,
                         )
                 finally:
                     _close_evidence_root_handle(root_binding)
                 self.assertEqual(
-                    ["rename-refused", "junction-refused", "rmdir-refused"], observed,
+                    ["rename-refused", "junction-refused", "rmdir-refused"],
+                    observed,
                 )
                 self.assertEqual(evidence_root / attempt_name, published)
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
                 text = (published / retained[0]).read_text(encoding="utf-8")
                 self.assertNotIn(sentinel, text)
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
             finally:
                 if temp_root.exists():
@@ -1365,13 +1658,19 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                        real_agent_test_module,
+                        "_PUBLICATION_INTERPOSITION_HOOK",
+                        interpose,
                     ):
                         with self.assertRaisesRegex(RuntimeError, "already exists"):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1410,18 +1709,26 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", interpose,
+                        real_agent_test_module,
+                        "_PUBLICATION_INTERPOSITION_HOOK",
+                        interpose,
                     ):
                         with self.assertRaisesRegex(RuntimeError, "already exists"):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
                 self.assertTrue(_is_directory_link(destination))
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
             finally:
@@ -1430,9 +1737,13 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_staging_record_substitution_is_detected_and_fails_closed(self) -> None:
+    def test_real_agent_staging_record_substitution_is_detected_and_fails_closed(
+        self,
+    ) -> None:
         sentinel = "STAGING_RECORD_SUBSTITUTION_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-staging-record-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-staging-record-"
+        ) as raw:
             root = Path(raw)
             evidence_root = root / "evidence"
             evidence_root.mkdir()
@@ -1459,13 +1770,21 @@ class S6LocalIsolationTests(unittest.TestCase):
                 }
                 try:
                     with patch.object(
-                        real_agent_test_module, "_PRE_FINAL_STAGING_VALIDATION_HOOK", interpose,
+                        real_agent_test_module,
+                        "_PRE_FINAL_STAGING_VALIDATION_HOOK",
+                        interpose,
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "cleanup failed closed"
+                        ):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1474,12 +1793,16 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertTrue(
                     _is_directory_link(staging_path / "REAL_AGENT_TEST_RESULT.json")
                 )
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertFalse((outside / "REAL_AGENT_TEST_RESULT.json").exists())
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
                 self.assertFalse((evidence_root / attempt_name).exists())
                 self.assertFalse(
-                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                    (
+                        evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json"
+                    ).exists()
                 )
             finally:
                 if staging_path is not None and staging_path.exists():
@@ -1490,7 +1813,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_publication_event_order_verifies_then_hooks_then_renames(self) -> None:
+    def test_real_agent_publication_event_order_verifies_then_hooks_then_renames(
+        self,
+    ) -> None:
         module = real_agent_test_module
         record = {
             "schema": "orchestrator-real-agent-evidence/v1",
@@ -1523,32 +1848,54 @@ class S6LocalIsolationTests(unittest.TestCase):
                     order.append("publication-hook")
 
                 try:
-                    with patch.object(module, "_verify_staging_via_handles", tracked_verify), \
-                         patch.object(module, "_rename_attempt_relative", tracked_rename), \
-                         patch.object(module, "_PRE_FINAL_STAGING_VALIDATION_HOOK", pre_final_hook), \
-                         patch.object(module, "_PUBLICATION_INTERPOSITION_HOOK", publication_hook):
+                    with (
+                        patch.object(
+                            module, "_verify_staging_via_handles", tracked_verify
+                        ),
+                        patch.object(
+                            module, "_rename_attempt_relative", tracked_rename
+                        ),
+                        patch.object(
+                            module, "_PRE_FINAL_STAGING_VALIDATION_HOOK", pre_final_hook
+                        ),
+                        patch.object(
+                            module, "_PUBLICATION_INTERPOSITION_HOOK", publication_hook
+                        ),
+                    ):
                         published = _terminal_finalize(
-                            root_binding=root_binding, attempt_name="attempt",
-                            temp_root=temp_root, failure=None, result=record,
-                            prep_process=None, release_signal=None,
+                            root_binding=root_binding,
+                            attempt_name="attempt",
+                            temp_root=temp_root,
+                            failure=None,
+                            result=record,
+                            prep_process=None,
+                            release_signal=None,
                         )
                 finally:
                     _close_evidence_root_handle(root_binding)
                 self.assertEqual(
-                    ["pre-final-hook", "final-verify", "publication-hook", "native-rename"],
+                    [
+                        "pre-final-hook",
+                        "final-verify",
+                        "publication-hook",
+                        "native-rename",
+                    ],
                     order,
                 )
                 self.assertEqual(evidence_root / "attempt", published)
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
             finally:
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_file_rename_information_layout_derives_native_offset(self) -> None:
+    def test_real_agent_file_rename_information_layout_derives_native_offset(
+        self,
+    ) -> None:
         module = real_agent_test_module
         self.assertEqual(
             module._FILE_RENAME_INFO_HEADER_SIZE,
@@ -1605,9 +1952,13 @@ class S6LocalIsolationTests(unittest.TestCase):
                 root_binding = _open_evidence_root_handle(evidence_root)
                 try:
                     published = _terminal_finalize(
-                        root_binding=root_binding, attempt_name=long_name,
-                        temp_root=temp_root, failure=None, result=record,
-                        prep_process=None, release_signal=None,
+                        root_binding=root_binding,
+                        attempt_name=long_name,
+                        temp_root=temp_root,
+                        failure=None,
+                        result=record,
+                        prep_process=None,
+                        release_signal=None,
                     )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1615,17 +1966,24 @@ class S6LocalIsolationTests(unittest.TestCase):
                 self.assertTrue(published.is_dir())
                 retained = tuple(
                     path.relative_to(published).as_posix()
-                    for path in published.rglob("*") if path.is_file()
+                    for path in published.rglob("*")
+                    if path.is_file()
                 )
                 self.assertEqual(("REAL_AGENT_TEST_RESULT.json",), retained)
 
                 root_binding = _open_evidence_root_handle(evidence_root)
                 try:
-                    with self.assertRaisesRegex(RuntimeError, "publication failed closed"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "publication failed closed"
+                    ):
                         _terminal_finalize(
-                            root_binding=root_binding, attempt_name=huge_name,
-                            temp_root=temp_root, failure=None, result=record,
-                            prep_process=None, release_signal=None,
+                            root_binding=root_binding,
+                            attempt_name=huge_name,
+                            temp_root=temp_root,
+                            failure=None,
+                            result=record,
+                            prep_process=None,
+                            release_signal=None,
                         )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1634,7 +1992,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_cleanup_refuses_staging_substitution_and_disposes_exact(self) -> None:
+    def test_real_agent_cleanup_refuses_staging_substitution_and_disposes_exact(
+        self,
+    ) -> None:
         sentinel = "CLEANUP_SWAP_SENTINEL"
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-swap-") as raw:
             root = Path(raw)
@@ -1676,30 +2036,49 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "retained_file_count": 1,
                 }
                 try:
-                    with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
-                    ), patch.object(
-                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    with (
+                        patch.object(
+                            real_agent_test_module,
+                            "_PUBLICATION_INTERPOSITION_HOOK",
+                            publication_interpose,
+                        ),
+                        patch.object(
+                            real_agent_test_module,
+                            "_CLEANUP_INTERPOSITION_HOOK",
+                            cleanup_interpose,
+                        ),
                     ):
                         with self.assertRaisesRegex(RuntimeError, "already exists"):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
-                self.assertEqual(["rename-refused", "junction-refused"], cleanup_refusals)
+                self.assertEqual(
+                    ["rename-refused", "junction-refused"], cleanup_refusals
+                )
                 self.assertIsNotNone(staging_path)
                 self.assertFalse(staging_path.exists())
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
                 self.assertEqual(
                     sentinel,
-                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                    (evidence_root / attempt_name / "marker.txt").read_text(
+                        encoding="utf-8"
+                    ),
                 )
                 self.assertFalse(
-                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                    (
+                        evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json"
+                    ).exists()
                 )
             finally:
                 if temp_root.exists():
@@ -1707,7 +2086,9 @@ class S6LocalIsolationTests(unittest.TestCase):
 
     def test_real_agent_cleanup_leaves_untouched_when_stage_gains_entries(self) -> None:
         sentinel = "CLEANUP_ENTRY_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-entry-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-cleanup-entry-"
+        ) as raw:
             root = Path(raw)
             evidence_root = root / "evidence"
             evidence_root.mkdir()
@@ -1728,7 +2109,9 @@ class S6LocalIsolationTests(unittest.TestCase):
                 def cleanup_interpose(staging):
                     nonlocal staging_path
                     staging_path = Path(staging["path"])
-                    (staging_path / "attacker.txt").write_text(sentinel, encoding="utf-8")
+                    (staging_path / "attacker.txt").write_text(
+                        sentinel, encoding="utf-8"
+                    )
 
                 record = {
                     "schema": "orchestrator-real-agent-evidence/v1",
@@ -1736,16 +2119,29 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "retained_file_count": 1,
                 }
                 try:
-                    with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
-                    ), patch.object(
-                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    with (
+                        patch.object(
+                            real_agent_test_module,
+                            "_PUBLICATION_INTERPOSITION_HOOK",
+                            publication_interpose,
+                        ),
+                        patch.object(
+                            real_agent_test_module,
+                            "_CLEANUP_INTERPOSITION_HOOK",
+                            cleanup_interpose,
+                        ),
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "cleanup failed closed"
+                        ):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1756,13 +2152,18 @@ class S6LocalIsolationTests(unittest.TestCase):
                     {p.name for p in staging_path.iterdir()},
                 )
                 self.assertEqual(
-                    sentinel, (staging_path / "attacker.txt").read_text(encoding="utf-8")
+                    sentinel,
+                    (staging_path / "attacker.txt").read_text(encoding="utf-8"),
                 )
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
                 self.assertEqual(
                     sentinel,
-                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                    (evidence_root / attempt_name / "marker.txt").read_text(
+                        encoding="utf-8"
+                    ),
                 )
             finally:
                 if staging_path is not None and staging_path.exists():
@@ -1770,9 +2171,13 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if temp_root.exists():
                     shutil.rmtree(temp_root, ignore_errors=True)
 
-    def test_real_agent_cleanup_hook_fault_closes_handle_and_leaves_stage_exact(self) -> None:
+    def test_real_agent_cleanup_hook_fault_closes_handle_and_leaves_stage_exact(
+        self,
+    ) -> None:
         sentinel = "CLEANUP_HOOK_FAULT_SENTINEL"
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cleanup-hook-fault-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-cleanup-hook-fault-"
+        ) as raw:
             root = Path(raw)
             evidence_root = root / "evidence"
             evidence_root.mkdir()
@@ -1803,16 +2208,29 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "retained_file_count": 1,
                 }
                 try:
-                    with patch.object(
-                        real_agent_test_module, "_PUBLICATION_INTERPOSITION_HOOK", publication_interpose,
-                    ), patch.object(
-                        real_agent_test_module, "_CLEANUP_INTERPOSITION_HOOK", cleanup_interpose,
+                    with (
+                        patch.object(
+                            real_agent_test_module,
+                            "_PUBLICATION_INTERPOSITION_HOOK",
+                            publication_interpose,
+                        ),
+                        patch.object(
+                            real_agent_test_module,
+                            "_CLEANUP_INTERPOSITION_HOOK",
+                            cleanup_interpose,
+                        ),
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "cleanup failed closed"):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "cleanup failed closed"
+                        ):
                             _terminal_finalize(
-                                root_binding=root_binding, attempt_name=attempt_name,
-                                temp_root=temp_root, failure=None, result=record,
-                                prep_process=None, release_signal=None,
+                                root_binding=root_binding,
+                                attempt_name=attempt_name,
+                                temp_root=temp_root,
+                                failure=None,
+                                result=record,
+                                prep_process=None,
+                                release_signal=None,
                             )
                 finally:
                     _close_evidence_root_handle(root_binding)
@@ -1832,14 +2250,20 @@ class S6LocalIsolationTests(unittest.TestCase):
                     "orchestrator-real-agent-evidence/v1",
                     json.loads(retained_text)["schema"],
                 )
-                self.assertEqual(sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    sentinel, (outside / "sentinel.txt").read_text(encoding="utf-8")
+                )
                 self.assertEqual(["sentinel.txt"], [p.name for p in outside.iterdir()])
                 self.assertEqual(
                     sentinel,
-                    (evidence_root / attempt_name / "marker.txt").read_text(encoding="utf-8"),
+                    (evidence_root / attempt_name / "marker.txt").read_text(
+                        encoding="utf-8"
+                    ),
                 )
                 self.assertFalse(
-                    (evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json").exists()
+                    (
+                        evidence_root / attempt_name / "REAL_AGENT_TEST_RESULT.json"
+                    ).exists()
                 )
             finally:
                 if staging_path is not None and staging_path.exists():
@@ -1877,32 +2301,62 @@ class S6LocalIsolationTests(unittest.TestCase):
                         closed.append(handle)
                     return real_close(handle)
 
-                with tempfile.TemporaryDirectory(prefix="orchestrator-s6-closure-") as raw:
+                with tempfile.TemporaryDirectory(
+                    prefix="orchestrator-s6-closure-"
+                ) as raw:
                     root = Path(raw)
                     evidence_root = root / "evidence"
                     evidence_root.mkdir()
-                    temp_root = Path(tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-"))
+                    temp_root = Path(
+                        tempfile.mkdtemp(prefix="orchestrator-s6-real-agent-")
+                    )
                     try:
-                        with patch.object(module, "_open_directory_handle", side_effect=track_open_dir), \
-                             patch.object(module, "_open_regular_file_handle", side_effect=track_open_file), \
-                             patch.object(module, "_close_handle", side_effect=track_close):
+                        with (
+                            patch.object(
+                                module,
+                                "_open_directory_handle",
+                                side_effect=track_open_dir,
+                            ),
+                            patch.object(
+                                module,
+                                "_open_regular_file_handle",
+                                side_effect=track_open_file,
+                            ),
+                            patch.object(
+                                module, "_close_handle", side_effect=track_close
+                            ),
+                        ):
                             root_binding = _open_evidence_root_handle(evidence_root)
                             try:
                                 if scenario == "success":
                                     published = _terminal_finalize(
-                                        root_binding=root_binding, attempt_name="attempt",
-                                        temp_root=temp_root, failure=None, result=record,
-                                        prep_process=None, release_signal=None,
+                                        root_binding=root_binding,
+                                        attempt_name="attempt",
+                                        temp_root=temp_root,
+                                        failure=None,
+                                        result=record,
+                                        prep_process=None,
+                                        release_signal=None,
                                     )
                                     self.assertTrue(
-                                        (published / "REAL_AGENT_TEST_RESULT.json").is_file()
+                                        (
+                                            published / "REAL_AGENT_TEST_RESULT.json"
+                                        ).is_file()
                                     )
                                 else:
-                                    with self.assertRaisesRegex(RuntimeError, "original product failure"):
+                                    with self.assertRaisesRegex(
+                                        RuntimeError, "original product failure"
+                                    ):
                                         _terminal_finalize(
-                                            root_binding=root_binding, attempt_name="attempt",
-                                            temp_root=temp_root, failure=RuntimeError("original product failure"),
-                                            result=None, prep_process=None, release_signal=None,
+                                            root_binding=root_binding,
+                                            attempt_name="attempt",
+                                            temp_root=temp_root,
+                                            failure=RuntimeError(
+                                                "original product failure"
+                                            ),
+                                            result=None,
+                                            prep_process=None,
+                                            release_signal=None,
                                         )
                             finally:
                                 _close_evidence_root_handle(root_binding)
@@ -1919,9 +2373,7 @@ class S6LocalIsolationTests(unittest.TestCase):
         read_only = disposable / "nested" / "provider-output.jsonl"
         try:
             (disposable / "nested").mkdir()
-            read_only.write_text(
-                "disposable\n", encoding="utf-8"
-            )
+            read_only.write_text("disposable\n", encoding="utf-8")
             os.chmod(read_only, 0o444)
             remove_tree = shutil.rmtree
             attempts = 0
@@ -1945,10 +2397,11 @@ class S6LocalIsolationTests(unittest.TestCase):
                 if read_only.exists():
                     os.chmod(read_only, 0o666)
                 shutil.rmtree(disposable)
-        with tempfile.TemporaryDirectory(
-            prefix="orchestrator-s6-unrelated-"
-        ) as unrelated, self.assertRaisesRegex(
-            RuntimeError, "unexpected real-agent"
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="orchestrator-s6-unrelated-"
+            ) as unrelated,
+            self.assertRaisesRegex(RuntimeError, "unexpected real-agent"),
         ):
             _remove_disposable_temp_root(Path(unrelated))
         legacy = Path(
@@ -1975,16 +2428,32 @@ class S6LocalIsolationTests(unittest.TestCase):
             REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
         ).read_text(encoding="utf-8")
         driver = (
-            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_real_agent_driver.py"
+            REPOSITORY_ROOT
+            / "orchestrator_harness"
+            / "tests"
+            / "support"
+            / "wsl_real_agent_driver.py"
         ).read_text(encoding="utf-8")
         route = (
-            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
+            REPOSITORY_ROOT
+            / "orchestrator_harness"
+            / "tests"
+            / "support"
+            / "wsl_public_route_entry.py"
         ).read_text(encoding="utf-8")
-        mutation = (REPOSITORY_ROOT / "orchestrator_harness" / "mutation.py").read_text(encoding="utf-8")
+        mutation = (REPOSITORY_ROOT / "orchestrator_harness" / "mutation.py").read_text(
+            encoding="utf-8"
+        )
         provider = (
-            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
+            REPOSITORY_ROOT
+            / "orchestrator_harness"
+            / "tests"
+            / "support"
+            / "wsl_codex_provider.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("public_launch -> operator_launch -> lane_controller", host_driver)
+        self.assertIn(
+            "public_launch -> operator_launch -> lane_controller", host_driver
+        )
         self.assertIn("launch_lane_controller", host_driver)
         self.assertIn("wsl.exe", host_driver)
         self.assertIn("prepared-state", driver)
@@ -1993,7 +2462,10 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertNotIn("wsl_public_route_entry.py", driver + host_driver)
         self.assertNotIn("synthetic_controller.status", driver + host_driver)
         self.assertNotIn("/opt/codex/bin/codex", driver)
-        self.assertLess(driver.index("chown_tree(workspace)"), driver.index("isolation = preflight("))
+        self.assertLess(
+            driver.index("chown_tree(workspace)"),
+            driver.index("isolation = preflight("),
+        )
         self.assertIn("validate_cross_os_identity_relation", host_driver)
         self.assertIn("discover_codex", driver)
         self.assertIn("validate_prepared_state", driver)
@@ -2006,19 +2478,29 @@ class S6LocalIsolationTests(unittest.TestCase):
         self.assertEqual(
             tuple(release_checks.PUBLIC_ROUTE_DEPENDENCIES),
             tuple(
-                release_checks.get_check("S6.AFFECTED.PUBLIC-E2E").dependency_paths[: len(release_checks.PUBLIC_ROUTE_DEPENDENCIES)]
+                release_checks.get_check("S6.AFFECTED.PUBLIC-E2E").dependency_paths[
+                    : len(release_checks.PUBLIC_ROUTE_DEPENDENCIES)
+                ]
             ),
         )
         real_dependencies = set(
             release_checks.get_check("S6.AFFECTED.REAL-AGENT").dependency_paths
         )
-        self.assertTrue(set(release_checks.REAL_AGENT_ROUTE_DEPENDENCIES).issubset(real_dependencies))
+        self.assertTrue(
+            set(release_checks.REAL_AGENT_ROUTE_DEPENDENCIES).issubset(
+                real_dependencies
+            )
+        )
 
-    def test_real_agent_identity_helpers_reject_mixed_or_unpinned_processes(self) -> None:
+    def test_real_agent_identity_helpers_reject_mixed_or_unpinned_processes(
+        self,
+    ) -> None:
         self.assertTrue(provider_identity_matches(11, "created", 11, "created"))
         self.assertFalse(provider_identity_matches(11, "created", 12, "created"))
         self.assertFalse(provider_identity_matches(11, "created", 11, "reused"))
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-codex-identity-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-codex-identity-"
+        ) as raw:
             root = Path(raw)
             pinned = root / "codex"
             other = root / "other-codex"
@@ -2045,34 +2527,73 @@ class S6LocalIsolationTests(unittest.TestCase):
                     observed_executable=pinned,
                 )
         validate_cross_os_identity_relation(
-            {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"},
-            {"platform": "linux", "pid": 17, "created_utc": "linux-created", "nonce": "n", "invocation_id": "i"},
-            nonce="n", invocation_id="i",
+            {
+                "platform": "windows",
+                "pid": 17,
+                "created_utc": "host-created",
+                "nonce": "n",
+                "invocation_id": "i",
+            },
+            {
+                "platform": "linux",
+                "pid": 17,
+                "created_utc": "linux-created",
+                "nonce": "n",
+                "invocation_id": "i",
+            },
+            nonce="n",
+            invocation_id="i",
         )
         with self.assertRaisesRegex(RuntimeError, "nonce"):
             validate_cross_os_identity_relation(
-                {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"},
-                {"platform": "linux", "pid": 18, "created_utc": "linux-created", "nonce": "different", "invocation_id": "i"},
-                nonce="n", invocation_id="i",
+                {
+                    "platform": "windows",
+                    "pid": 17,
+                    "created_utc": "host-created",
+                    "nonce": "n",
+                    "invocation_id": "i",
+                },
+                {
+                    "platform": "linux",
+                    "pid": 18,
+                    "created_utc": "linux-created",
+                    "nonce": "different",
+                    "invocation_id": "i",
+                },
+                nonce="n",
+                invocation_id="i",
             )
 
     def test_prepared_state_is_one_use_and_rejects_negative_identity(self) -> None:
         state = {
-            "schema": PREPARED_STATE_SCHEMA, "status": "READY", "consumed": False,
-            "run_id": "a" * 32, "nonce": "b" * 64, "invocation_id": "invocation",
+            "schema": PREPARED_STATE_SCHEMA,
+            "status": "READY",
+            "consumed": False,
+            "run_id": "a" * 32,
+            "nonce": "b" * 64,
+            "invocation_id": "invocation",
             "cgroup": "/sys/fs/cgroup/orchestrator-harness-aaaaaaaa",
-            "network_namespace": "oh-aaaaaaaa", "proxy_url": "http://10.0.0.1:1",
-            "workspace": "/mnt/c/synthetic", "codex_home": "/tmp/codex-home",
-            "release": "/opt/codex", "pinned_codex": "/opt/codex/bin/codex",
+            "network_namespace": "oh-aaaaaaaa",
+            "proxy_url": "http://10.0.0.1:1",
+            "workspace": "/mnt/c/synthetic",
+            "codex_home": "/tmp/codex-home",
+            "release": "/opt/codex",
+            "pinned_codex": "/opt/codex/bin/codex",
             "bwrap": "/opt/codex/codex-resources/bwrap",
-            "cgroup_launcher": "/mnt/c/cgroup_exec.py", "release_signal": "/mnt/c/release",
+            "cgroup_launcher": "/mnt/c/cgroup_exec.py",
+            "release_signal": "/mnt/c/release",
         }
-        self.assertEqual(state, validate_prepared_state(state, nonce="b" * 64, invocation_id="invocation"))
+        self.assertEqual(
+            state,
+            validate_prepared_state(state, nonce="b" * 64, invocation_id="invocation"),
+        )
         with self.assertRaisesRegex(RuntimeError, "nonce"):
             validate_prepared_state(state, nonce="c" * 64, invocation_id="invocation")
         with tempfile.TemporaryDirectory(prefix="orchestrator-s6-claim-") as raw:
             claim = Path(raw) / "claim.json"
-            first = claim_prepared_state(claim, nonce="b" * 64, invocation_id="invocation")
+            first = claim_prepared_state(
+                claim, nonce="b" * 64, invocation_id="invocation"
+            )
             self.assertEqual("orchestrator-wsl-prepared-claim/v1", first["schema"])
             with self.assertRaisesRegex(RuntimeError, "more than once"):
                 claim_prepared_state(claim, nonce="b" * 64, invocation_id="invocation")
@@ -2083,58 +2604,109 @@ class S6LocalIsolationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ProcessStartInfo", installer)
         self.assertIn("UTF8.GetBytes", installer)
-        self.assertIn("replace \"`r`n?\", \"`n\"", installer)
+        self.assertIn('replace "`r`n?", "`n"', installer)
         self.assertIn("requested %s", installer.lower())
         self.assertIn("already installed", installer.lower())
         self.assertNotIn("$script | wsl.exe", installer)
 
-    def test_prepared_protocol_state_machine_rejects_foreign_or_reused_state(self) -> None:
+    def test_prepared_protocol_state_machine_rejects_foreign_or_reused_state(
+        self,
+    ) -> None:
         state = {
-            "schema": PREPARED_STATE_SCHEMA, "status": "READY", "consumed": False,
-            "run_id": "a" * 32, "nonce": "b" * 64, "invocation_id": "invocation",
+            "schema": PREPARED_STATE_SCHEMA,
+            "status": "READY",
+            "consumed": False,
+            "run_id": "a" * 32,
+            "nonce": "b" * 64,
+            "invocation_id": "invocation",
             "cgroup": "/sys/fs/cgroup/orchestrator-harness-aaaaaaaa",
-            "network_namespace": "oh-aaaaaaaa", "proxy_url": "http://10.0.0.1:1",
-            "workspace": "/mnt/c/synthetic", "codex_home": "/tmp/codex-home",
-            "release": "/opt/codex", "pinned_codex": "/opt/codex/bin/codex",
+            "network_namespace": "oh-aaaaaaaa",
+            "proxy_url": "http://10.0.0.1:1",
+            "workspace": "/mnt/c/synthetic",
+            "codex_home": "/tmp/codex-home",
+            "release": "/opt/codex",
+            "pinned_codex": "/opt/codex/bin/codex",
             "bwrap": "/opt/codex/codex-resources/bwrap",
-            "cgroup_launcher": "/mnt/c/cgroup_exec.py", "release_signal": "/mnt/c/release",
+            "cgroup_launcher": "/mnt/c/cgroup_exec.py",
+            "release_signal": "/mnt/c/release",
         }
         with self.assertRaisesRegex(RuntimeError, "invocation"):
             validate_prepared_state(state, nonce="b" * 64, invocation_id="foreign")
         with self.assertRaisesRegex(RuntimeError, "consumed"):
-            validate_prepared_state(dict(state, consumed=True), nonce="b" * 64, invocation_id="invocation")
+            validate_prepared_state(
+                dict(state, consumed=True), nonce="b" * 64, invocation_id="invocation"
+            )
         with self.assertRaisesRegex(RuntimeError, "not READY"):
-            validate_prepared_state(dict(state, status="FAILED"), nonce="b" * 64, invocation_id="invocation")
+            validate_prepared_state(
+                dict(state, status="FAILED"), nonce="b" * 64, invocation_id="invocation"
+            )
         with self.assertRaisesRegex(RuntimeError, "namespace"):
-            validate_prepared_state(dict(state, network_namespace="oh-zzzzzzzz"), nonce="b" * 64, invocation_id="invocation")
+            validate_prepared_state(
+                dict(state, network_namespace="oh-zzzzzzzz"),
+                nonce="b" * 64,
+                invocation_id="invocation",
+            )
         with self.assertRaisesRegex(RuntimeError, "namespace"):
-            validate_prepared_state(dict(state, run_id="z" * 32), nonce="b" * 64, invocation_id="invocation")
+            validate_prepared_state(
+                dict(state, run_id="z" * 32), nonce="b" * 64, invocation_id="invocation"
+            )
 
     def test_cross_os_identity_relation_never_asserts_pid_equality(self) -> None:
-        host = {"platform": "windows", "pid": 17, "created_utc": "host-created", "nonce": "n", "invocation_id": "i"}
-        linux = {"platform": "linux", "pid": 17, "created_utc": "linux-created", "nonce": "n", "invocation_id": "i"}
+        host = {
+            "platform": "windows",
+            "pid": 17,
+            "created_utc": "host-created",
+            "nonce": "n",
+            "invocation_id": "i",
+        }
+        linux = {
+            "platform": "linux",
+            "pid": 17,
+            "created_utc": "linux-created",
+            "nonce": "n",
+            "invocation_id": "i",
+        }
         # Equal PIDs across the two domains are deliberately not a relation:
         # the nonce and invocation are the only binding, so equality neither
         # validates nor invalidates the pairing.
         validate_cross_os_identity_relation(host, linux, nonce="n", invocation_id="i")
-        validate_cross_os_identity_relation(dict(host, pid=18), linux, nonce="n", invocation_id="i")
+        validate_cross_os_identity_relation(
+            dict(host, pid=18), linux, nonce="n", invocation_id="i"
+        )
         with self.assertRaisesRegex(RuntimeError, "nonce"):
-            validate_cross_os_identity_relation(host, dict(linux, nonce="foreign"), nonce="n", invocation_id="i")
+            validate_cross_os_identity_relation(
+                host, dict(linux, nonce="foreign"), nonce="n", invocation_id="i"
+            )
         with self.assertRaisesRegex(RuntimeError, "invocation"):
-            validate_cross_os_identity_relation(host, dict(linux, invocation_id="foreign"), nonce="n", invocation_id="i")
+            validate_cross_os_identity_relation(
+                host, dict(linux, invocation_id="foreign"), nonce="n", invocation_id="i"
+            )
         with self.assertRaisesRegex(RuntimeError, "platform"):
-            validate_cross_os_identity_relation(dict(host, platform="linux"), linux, nonce="n", invocation_id="i")
+            validate_cross_os_identity_relation(
+                dict(host, platform="linux"), linux, nonce="n", invocation_id="i"
+            )
         with self.assertRaisesRegex(RuntimeError, "host PID"):
-            validate_cross_os_identity_relation(dict(host, pid=0), linux, nonce="n", invocation_id="i")
+            validate_cross_os_identity_relation(
+                dict(host, pid=0), linux, nonce="n", invocation_id="i"
+            )
         with self.assertRaisesRegex(RuntimeError, "creation identity"):
-            validate_cross_os_identity_relation(dict(host, created_utc=""), linux, nonce="n", invocation_id="i")
+            validate_cross_os_identity_relation(
+                dict(host, created_utc=""), linux, nonce="n", invocation_id="i"
+            )
         with self.assertRaisesRegex(RuntimeError, "nonce and invocation"):
-            validate_cross_os_identity_relation(host, linux, nonce="", invocation_id="i")
+            validate_cross_os_identity_relation(
+                host, linux, nonce="", invocation_id="i"
+            )
 
-    def test_bwrap_manifest_binds_only_declared_roots_and_drops_capabilities(self) -> None:
+    def test_bwrap_manifest_binds_only_declared_roots_and_drops_capabilities(
+        self,
+    ) -> None:
         argv = _support_module.bwrap_base(
-            Path("/pinned/bwrap"), Path("/pinned/release"), Path("/synthetic/workspace"),
-            Path("/synthetic/home"), "http://10.0.0.1:1234",
+            Path("/pinned/bwrap"),
+            Path("/pinned/release"),
+            Path("/synthetic/workspace"),
+            Path("/synthetic/home"),
+            "http://10.0.0.1:1234",
         )
         rendered = "\0".join(argv).replace("\\", "/")
         self.assertNotIn("/mnt/c", rendered)
@@ -2152,23 +2724,38 @@ class S6LocalIsolationTests(unittest.TestCase):
 
     def test_retired_linux_controller_route_fails_closed_when_executed(self) -> None:
         route = (
-            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_public_route_entry.py"
+            REPOSITORY_ROOT
+            / "orchestrator_harness"
+            / "tests"
+            / "support"
+            / "wsl_public_route_entry.py"
         )
         completed = subprocess.run(
-            [sys.executable, str(route)], cwd=REPOSITORY_ROOT,
-            capture_output=True, text=True, check=False,
+            [sys.executable, str(route)],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("Windows-native", completed.stderr)
 
-    def test_bridge_evidence_linux_identity_carries_nonce_for_cross_os_relation(self) -> None:
+    def test_bridge_evidence_linux_identity_carries_nonce_for_cross_os_relation(
+        self,
+    ) -> None:
         provider = (
-            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "support" / "wsl_codex_provider.py"
+            REPOSITORY_ROOT
+            / "orchestrator_harness"
+            / "tests"
+            / "support"
+            / "wsl_codex_provider.py"
         ).read_text(encoding="utf-8")
         # The provider's linux_bridge identity must carry the one-use nonce and
         # invocation so the Windows host can bind the two halves without ever
         # asserting PID equality across the two identity domains.
-        self.assertIn('"nonce": args.nonce, "invocation_id": args.invocation_id', provider)
+        self.assertIn(
+            '"nonce": args.nonce, "invocation_id": args.invocation_id', provider
+        )
         bridge_evidence = {
             "status": "PASS",
             "nonce": "n" * 64,
@@ -2204,14 +2791,22 @@ class S6LocalIsolationTests(unittest.TestCase):
             )
 
     def test_provider_bridge_argv_is_the_only_wsl_route_element(self) -> None:
-        host = (REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py").read_text(encoding="utf-8")
-        controller = (REPOSITORY_ROOT / "orchestrator_harness" / "public_launch.py").read_text(encoding="utf-8")
-        operator = (REPOSITORY_ROOT / "orchestrator_harness" / "operator_launch.py").read_text(encoding="utf-8")
+        host = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "tests" / "real_agent_test.py"
+        ).read_text(encoding="utf-8")
+        controller = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "public_launch.py"
+        ).read_text(encoding="utf-8")
+        operator = (
+            REPOSITORY_ROOT / "orchestrator_harness" / "operator_launch.py"
+        ).read_text(encoding="utf-8")
         # The provider shim argv is the only WSL element on the route: the
         # controller command stays a native Python lane-controller invocation.
         self.assertIn('"wsl.exe"', host)
         self.assertIn("provider_command = [", host)
-        self.assertIn('"-m",\n            "orchestrator_harness.lane_controller"', controller)
+        self.assertIn(
+            '"-m",\n            "orchestrator_harness.lane_controller"', controller
+        )
         self.assertNotIn("wsl.exe", controller)
         self.assertNotIn("wsl.exe", operator)
 
@@ -2239,24 +2834,35 @@ class S6PublicJourneyTests(unittest.TestCase):
                 any(json.loads(line)["event"] == "CODEX_EXITED" for line in event_lines)
             )
             successful_runs = (
-                ("alpha", "fixture_operator_launch.json", "fixture_controller.status.json", "alpha-001"),
-                ("beta-success", "fixture_operator_launch-success.json", "fixture_controller-success.status.json", "beta-success-001"),
-                ("merge", "fixture_operator_launch.json", "fixture_controller.status.json", "merge-001"),
+                (
+                    "alpha",
+                    "fixture_operator_launch.json",
+                    "fixture_controller.status.json",
+                    "alpha-001",
+                ),
+                (
+                    "beta-success",
+                    "fixture_operator_launch-success.json",
+                    "fixture_controller-success.status.json",
+                    "beta-success-001",
+                ),
+                (
+                    "merge",
+                    "fixture_operator_launch.json",
+                    "fixture_controller.status.json",
+                    "merge-001",
+                ),
             )
             for lane, receipt_name, status_name, worker_id in successful_runs:
                 workspace = root / "worktrees" / lane / ".agent-workspace"
                 receipt = json.loads(
-                    (workspace / receipt_name).read_text(
-                        encoding="utf-8"
-                    )
+                    (workspace / receipt_name).read_text(encoding="utf-8")
                 )
                 self.assertEqual(
                     ["-m", "orchestrator_harness.lane_controller"], receipt["argv"][1:3]
                 )
                 status = json.loads(
-                    (workspace / status_name).read_text(
-                        encoding="utf-8"
-                    )
+                    (workspace / status_name).read_text(encoding="utf-8")
                 )
                 self.assertEqual(receipt["pid"], status["controller_pid"])
                 self.assertEqual(
@@ -2274,7 +2880,13 @@ class S6PublicJourneyTests(unittest.TestCase):
                 self.assertTrue(status["process_boundary"]["complete"])
                 self.assertEqual([], status["process_boundary"]["live_members"])
                 branch = subprocess.run(
-                    ["git", "-C", str(root / "worktrees" / lane), "branch", "--show-current"],
+                    [
+                        "git",
+                        "-C",
+                        str(root / "worktrees" / lane),
+                        "branch",
+                        "--show-current",
+                    ],
                     capture_output=True,
                     text=True,
                     check=True,
@@ -2285,7 +2897,9 @@ class S6PublicJourneyTests(unittest.TestCase):
                     text=True,
                     check=True,
                 ).stdout.strip()
-                result_value = json.loads((workspace / "RESULT.json").read_text(encoding="utf-8"))
+                result_value = json.loads(
+                    (workspace / "RESULT.json").read_text(encoding="utf-8")
+                )
                 self.assertEqual(lane, result_value["lane_id"])
                 self.assertEqual(worker_id, result_value["worker_invocation_id"])
                 self.assertEqual(branch, result_value["branch"])
@@ -2304,14 +2918,18 @@ class S6PublicJourneyTests(unittest.TestCase):
                 )
             stale_workspace = root / "worktrees" / "beta" / ".agent-workspace"
             stale_status = json.loads(
-                (stale_workspace / "fixture_controller.status.json").read_text(encoding="utf-8")
+                (stale_workspace / "fixture_controller.status.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual("CODEX_EXITED", stale_status["state"])
             self.assertFalse(stale_status["result_valid"])
             self.assertEqual("INVALID", stale_status["result_validation"]["state"])
             self.assertEqual(0, stale_status["exit_code"])
             stale_receipt = json.loads(
-                (stale_workspace / "fixture_operator_launch.json").read_text(encoding="utf-8")
+                (stale_workspace / "fixture_operator_launch.json").read_text(
+                    encoding="utf-8"
+                )
             )
             stale_process = process_snapshot().by_pid.get(stale_receipt["pid"])
             self.assertTrue(
@@ -2337,9 +2955,9 @@ class S6SafeguardTests(unittest.TestCase):
         script = (
             REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
         ).read_text(encoding="utf-8")
-        core = (
-            REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
-        ).read_text(encoding="utf-8")
+        core = (REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("C:/Users/", script)
         self.assertIn("RepositoryRoot", script)
         self.assertIn("ExpectedTip", script)
@@ -2362,7 +2980,9 @@ class S6SafeguardTests(unittest.TestCase):
         self.assertIn("--untracked-files=all", core)
 
     def test_non_candidate_branch_is_rejected_before_selector_or_checks(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-non-candidate-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-non-candidate-"
+        ) as raw:
             root = Path(raw) / "candidate"
             shutil.copytree(
                 REPOSITORY_ROOT,
@@ -2373,24 +2993,39 @@ class S6SafeguardTests(unittest.TestCase):
             )
             subprocess.run(
                 ["git", "-C", str(root), "init", "-b", "firmware/v2-postjoin-fixture"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
             subprocess.run(
-                ["git", "-C", str(root), "config", "user.email", "postjoin@example.invalid"],
-                check=True, capture_output=True,
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "postjoin@example.invalid",
+                ],
+                check=True,
+                capture_output=True,
             )
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Postjoin Fixture"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "."], check=True, capture_output=True
+            )
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-m", "non-candidate fixture"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
             branch = subprocess.run(
-                ["git", "-C", str(root), "branch", "--show-current"], check=True,
-                capture_output=True, text=True,
+                ["git", "-C", str(root), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             self.assertNotEqual("firmware/v2-candidate", branch)
             script = root / "tools" / "Invoke-CandidateSafeguard.ps1"
@@ -2418,7 +3053,9 @@ class S6SafeguardTests(unittest.TestCase):
             self.assertIn("unexpected branch", completed.stderr)
 
     def test_safeguard_rejects_injection_and_uses_native_credit_selection(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-selector-forward-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-selector-forward-"
+        ) as raw:
             root = Path(raw) / "candidate"
             shutil.copytree(
                 REPOSITORY_ROOT,
@@ -2427,11 +3064,32 @@ class S6SafeguardTests(unittest.TestCase):
                     ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
                 ),
             )
-            subprocess.run(["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.email", "selector@example.invalid"], check=True)
-            subprocess.run(["git", "-C", str(root), "config", "user.name", "Selector Test"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "selector@example.invalid",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Selector Test"],
+                check=True,
+            )
             subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-m", "selector candidate"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-m", "selector candidate"],
+                check=True,
+                capture_output=True,
+            )
             credit_file = Path(raw) / "credits.json"
             credit_file.write_text('{"credits": []}\n', encoding="utf-8")
             candidate_script = root / "tools" / "Invoke-CandidateSafeguard.ps1"
@@ -2440,9 +3098,18 @@ class S6SafeguardTests(unittest.TestCase):
             # running it from a foreign cwd is fine, a foreign script is not.
             completed = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate_script),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-CreditFile", str(credit_file),
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(candidate_script),
+                    "-RepositoryRoot",
+                    str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
+                    "-CreditFile",
+                    str(credit_file),
                 ],
                 cwd=REPOSITORY_ROOT,
                 capture_output=True,
@@ -2450,15 +3117,24 @@ class S6SafeguardTests(unittest.TestCase):
                 check=False,
                 creationflags=_WINDOWLESS_CREATION_FLAGS,
             )
-            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
             self.assertIn("READY S6.RELEASE.", completed.stdout)
             self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
 
             foreign_script = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
                     str(REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
+                    "-RepositoryRoot",
+                    str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
                 ],
                 cwd=REPOSITORY_ROOT,
                 capture_output=True,
@@ -2467,13 +3143,24 @@ class S6SafeguardTests(unittest.TestCase):
                 creationflags=_WINDOWLESS_CREATION_FLAGS,
             )
             self.assertNotEqual(0, foreign_script.returncode)
-            self.assertIn("candidate RepositoryRoot tools directory", foreign_script.stderr)
+            self.assertIn(
+                "candidate RepositoryRoot tools directory", foreign_script.stderr
+            )
 
             injected = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate_script),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-SelectionFile", str(Path(raw) / "selection.json"),
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(candidate_script),
+                    "-RepositoryRoot",
+                    str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
+                    "-SelectionFile",
+                    str(Path(raw) / "selection.json"),
                 ],
                 cwd=REPOSITORY_ROOT,
                 capture_output=True,
@@ -2485,7 +3172,9 @@ class S6SafeguardTests(unittest.TestCase):
             self.assertIn("parameter", (injected.stdout + injected.stderr).lower())
 
     def test_safeguard_reaches_ready_from_candidate_owned_prerequisites(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-candidate-owned-") as raw:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-candidate-owned-"
+        ) as raw:
             root = Path(raw) / "candidate"
             shutil.copytree(
                 REPOSITORY_ROOT,
@@ -2500,31 +3189,54 @@ class S6SafeguardTests(unittest.TestCase):
             self.assertTrue(pyright_config.is_file())
             subprocess.run(
                 ["git", "-C", str(root), "init", "-b", "firmware/v2-candidate"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
             subprocess.run(
-                ["git", "-C", str(root), "config", "user.email", "candidate@example.invalid"],
-                check=True, capture_output=True,
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "candidate@example.invalid",
+                ],
+                check=True,
+                capture_output=True,
             )
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.name", "Candidate Test"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
-            subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "."], check=True, capture_output=True
+            )
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-m", "candidate tree"],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
             head = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
-                capture_output=True, text=True,
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             completed = subprocess.run(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
                     str(root / "tools" / "Invoke-CandidateSafeguard.ps1"),
-                    "-RepositoryRoot", str(root), "-ExpectedBranch", "firmware/v2-candidate",
-                    "-ExpectedTip", head,
+                    "-RepositoryRoot",
+                    str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
+                    "-ExpectedTip",
+                    head,
                 ],
                 cwd=REPOSITORY_ROOT,
                 capture_output=True,
@@ -2532,14 +3244,22 @@ class S6SafeguardTests(unittest.TestCase):
                 check=False,
                 creationflags=_WINDOWLESS_CREATION_FLAGS,
             )
-            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
             self.assertIn("READY S6.RELEASE.", completed.stdout)
             self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
 
-    def test_safeguard_stops_before_second_component_after_identity_failure(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-safeguard-core-") as raw:
+    def test_safeguard_stops_before_second_component_after_identity_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-safeguard-core-"
+        ) as raw:
             root = Path(raw) / "candidate"
-            repository = TemporaryGitRepository.create(root, branch="firmware/v2-candidate")
+            repository = TemporaryGitRepository.create(
+                root, branch="firmware/v2-candidate"
+            )
             baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
             baseline.parent.mkdir(parents=True)
             baseline.write_text("{}\n", encoding="utf-8")
@@ -2584,14 +3304,23 @@ try {{
                 encoding="utf-8",
             )
             completed = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(driver),
+                ],
                 cwd=root,
                 capture_output=True,
                 text=True,
                 check=False,
                 creationflags=_WINDOWLESS_CREATION_FLAGS,
             )
-            self.assertEqual(17, completed.returncode, completed.stdout + completed.stderr)
+            self.assertEqual(
+                17, completed.returncode, completed.stdout + completed.stderr
+            )
             self.assertIn("dirty", (completed.stdout + completed.stderr).lower())
             self.assertTrue((root / "first-ran.txt").is_file())
             self.assertFalse((root / "second-ran.txt").exists())
@@ -2711,10 +3440,15 @@ class S6PackageTests(unittest.TestCase):
             with zipfile.ZipFile(wheel) as archive:
                 names = set(archive.namelist())
             self.assertTrue(
-                any(name.endswith("orchestrator_harness/assets/release/manifest.json") for name in names)
+                any(
+                    name.endswith("orchestrator_harness/assets/release/manifest.json")
+                    for name in names
+                )
             )
             self.assertTrue(any(".data/data/examples/" in name for name in names))
-            self.assertTrue(any(".data/data/release_evidence_templates/" in name for name in names))
+            self.assertTrue(
+                any(".data/data/release_evidence_templates/" in name for name in names)
+            )
             probe = (
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
@@ -2744,6 +3478,7 @@ class S6PackageTests(unittest.TestCase):
 
     def test_package_exports_optional_firmware_seam_types(self) -> None:
         import orchestrator_harness as harness
+
         for name in (
             "FirmwareAction",
             "FirmwareCampaignPack",

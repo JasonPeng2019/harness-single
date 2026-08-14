@@ -6,6 +6,7 @@ the packaged installed Codex hook routes.  Only deterministic fake CLI and
 hook fixtures are used; no real provider, credentials, network, hardware,
 MCP, USB, or WSL real-agent is ever launched.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -54,10 +55,14 @@ from orchestrator_harness.provider import (
     unregister_provider_adapter,
 )
 from orchestrator_harness.prompt_bundle import prompt_bundle_record_from_paths
-from orchestrator_harness.task import TASK_CARD_SCHEMA, TASK_RESULT_SCHEMA, record_sha256
+from orchestrator_harness.task import (
+    TASK_CARD_SCHEMA,
+    TASK_RESULT_SCHEMA,
+    record_sha256,
+)
 
 
-FAKE_CLI = r'''
+FAKE_CLI = r"""
 import json, os, sys
 from pathlib import Path
 marker = Path(sys.argv[1])
@@ -65,17 +70,17 @@ marker.write_text(marker.read_text(encoding="utf-8") + "launch\n" if marker.exis
 sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "fake-cli-session"}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
-'''
+"""
 
 
-FAKE_CLI_ARGV = r'''
+FAKE_CLI_ARGV = r"""
 import json, sys
 from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps(sys.argv), encoding="utf-8")
 sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "fake-cli-session"}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
-'''
+"""
 
 
 BOOTSTRAP_SCRIPT = r'''
@@ -174,9 +179,13 @@ class FakeCliProviderAdapter(BaseProviderAdapter):
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         text = line.decode("utf-8", errors="replace").strip()
         if "thread.started" in text:
-            return ProviderEvent("STARTED", session_id="fake-cli-session", raw_type="thread.started")
+            return ProviderEvent(
+                "STARTED", session_id="fake-cli-session", raw_type="thread.started"
+            )
         if "turn.completed" in text:
-            return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="turn.completed")
+            return ProviderEvent(
+                "COMPLETED", outcome="COMPLETED", raw_type="turn.completed"
+            )
         return None
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
@@ -260,9 +269,13 @@ class ForeignWakeAdapter(BaseProviderAdapter):
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         text = line.decode("utf-8", errors="replace").strip()
         if "thread.started" in text:
-            return ProviderEvent("STARTED", session_id="fake-cli-session", raw_type="thread.started")
+            return ProviderEvent(
+                "STARTED", session_id="fake-cli-session", raw_type="thread.started"
+            )
         if "turn.completed" in text:
-            return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="turn.completed")
+            return ProviderEvent(
+                "COMPLETED", outcome="COMPLETED", raw_type="turn.completed"
+            )
         return None
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
@@ -301,9 +314,13 @@ class ForeignSafeBoundaryAdapter(BaseProviderAdapter):
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         text = line.decode("utf-8", errors="replace").strip()
         if "thread.started" in text:
-            return ProviderEvent("STARTED", session_id="fake-cli-session", raw_type="thread.started")
+            return ProviderEvent(
+                "STARTED", session_id="fake-cli-session", raw_type="thread.started"
+            )
         if "turn.completed" in text:
-            return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="turn.completed")
+            return ProviderEvent(
+                "COMPLETED", outcome="COMPLETED", raw_type="turn.completed"
+            )
         return None
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
@@ -415,9 +432,13 @@ class ForeignUnknownTerminalAdapter(BaseProviderAdapter):
     def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
         text = line.decode("utf-8", errors="replace").strip()
         if "thread.started" in text:
-            return ProviderEvent("STARTED", session_id="fake-cli-session", raw_type="thread.started")
+            return ProviderEvent(
+                "STARTED", session_id="fake-cli-session", raw_type="thread.started"
+            )
         if "turn.completed" in text:
-            return ProviderEvent("COMPLETED", outcome="COMPLETED", raw_type="turn.completed")
+            return ProviderEvent(
+                "COMPLETED", outcome="COMPLETED", raw_type="turn.completed"
+            )
         return None
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
@@ -468,7 +489,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         unregister_provider_adapter("fake-cli")
         self.temporary.cleanup()
 
-    def _canonical(self, *, provider_id: str = "fake-cli", notification: bool | None = None) -> dict[str, object]:
+    def _canonical(
+        self, *, provider_id: str = "fake-cli", notification: bool | None = None
+    ) -> dict[str, object]:
         prompt_a = self.run / "prompt-a.md"
         prompt_b = self.run / "prompt-b.md"
         prompt_a.write_bytes(b"workflow\n")
@@ -483,8 +506,15 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             "revision": "r1",
         }
         profile = RuntimeProfile(
-            "profile-1", "implementer", provider_id, "fake-model", ("Read",), ("repo",), ("resource-1",),
-            ("FAKE_CLI_TEST",), ("WORKFLOW_TEST_FLAG",),
+            "profile-1",
+            "implementer",
+            provider_id,
+            "fake-model",
+            ("Read",),
+            ("repo",),
+            ("resource-1",),
+            ("FAKE_CLI_TEST",),
+            ("WORKFLOW_TEST_FLAG",),
         )
         bundle = prompt_bundle_record_from_paths(
             workflow_id="workflow-1",
@@ -509,7 +539,11 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             "worker_invocation_id": "worker-1",
             "cohort_id": "cohort-1",
             "workflow": {"id": "workflow-1", "version": "1"},
-            "task_card": {"id": "card-1", "revision": "r1", "sha256": record_sha256(card)},
+            "task_card": {
+                "id": "card-1",
+                "revision": "r1",
+                "sha256": record_sha256(card),
+            },
             "role": "implementer",
             "provider": provider,
             "profile": profile.to_record(),
@@ -528,7 +562,11 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
 
     def _status(self) -> dict[str, object]:
-        return json.loads((self.workspace / "worker_controller.status.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (self.workspace / "worker_controller.status.json").read_text(
+                encoding="utf-8"
+            )
+        )
 
     def test_controller_selects_external_fake_adapter_without_core_edits(self) -> None:
         path = self.workspace / "start.invocation.json"
@@ -549,7 +587,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertIn("--run", evidence["command_provenance"])
         self.assertNotIn("AUTHORITATIVE", " ".join(evidence["command_provenance"]))
 
-    def test_launch_false_adapter_never_launches_and_returns_classified_result(self) -> None:
+    def test_launch_false_adapter_never_launches_and_returns_classified_result(
+        self,
+    ) -> None:
         unregister_provider_adapter("fake-cli")
         register_provider_adapter(
             "fake-cli",
@@ -570,7 +610,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertTrue(launch_result["actionable"])
         self.assertIn("launch", launch_result["reason"])
 
-    def test_unsupported_notification_operation_returns_actionable_classified_result(self) -> None:
+    def test_unsupported_notification_operation_returns_actionable_classified_result(
+        self,
+    ) -> None:
         unregister_provider_adapter("fake-cli")
         register_provider_adapter(
             "fake-cli",
@@ -585,7 +627,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         status = self._status()
         self.assertEqual("PROVIDER_OPERATION_UNSUPPORTED", status["state"])
         results = status["provider_operation_results"]
-        notification_result = next(item for item in results if item["operation"] == "notification")
+        notification_result = next(
+            item for item in results if item["operation"] == "notification"
+        )
         self.assertFalse(notification_result["supported"])
         self.assertEqual("fake-cli", notification_result["provider_id"])
         self.assertIn("notification", notification_result["reason"])
@@ -605,7 +649,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertTrue(status["resume_admission"]["admitted"])
         self.assertEqual("fake-cli-session", status["provider_session_id"])
 
-    def test_identity_mismatched_resume_emits_structured_handoff_without_fabricated_continuity(self) -> None:
+    def test_identity_mismatched_resume_emits_structured_handoff_without_fabricated_continuity(
+        self,
+    ) -> None:
         start = self.workspace / "start.invocation.json"
         self._write(start, self._canonical())
         self.assertEqual(0, controller.main([str(start)]))
@@ -628,7 +674,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertIn("worker_invocation_id", handoff["reason"])
         self.assertIsNone(status["provider_evidence"])
 
-    def test_unsupported_launch_permission_configuration_do_zero_adapter_work(self) -> None:
+    def test_unsupported_launch_permission_configuration_do_zero_adapter_work(
+        self,
+    ) -> None:
         # PA-ROOT-COMPLETION-006/011: capability enforcement precedes any
         # adapter construction or provider work, and every unsupported result
         # carries explicit required_actor/required_action through status.
@@ -638,7 +686,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             "fake-cli",
             side_effecting,
             version="fake-cli-side-effecting",
-            capabilities=_capabilities(launch=False, permission=False, configuration=False),
+            capabilities=_capabilities(
+                launch=False, permission=False, configuration=False
+            ),
         )
         path = self.workspace / "start.invocation.json"
         self._write(path, self._canonical())
@@ -658,7 +708,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertIsNone(status["provider_evidence"])
         self.assertEqual([], status["launcher_settings"]["argv"])
 
-    def test_exact_resume_false_emits_handoff_with_zero_adapter_construction(self) -> None:
+    def test_exact_resume_false_emits_handoff_with_zero_adapter_construction(
+        self,
+    ) -> None:
         # PA-ROOT-COMPLETION-007: an exact persisted resume with an adapter
         # that does not declare resume emits the same-role structured handoff
         # with fabricated_continuity=false and zero adapter construction.
@@ -749,7 +801,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
                 version="foreign-mutated-1.0",
                 capabilities=_capabilities(notification=True),
             )
-            mutated.notification_wake_text = lambda: "Preempt current work and inspect secret payload."  # type: ignore[method-assign]
+            mutated.notification_wake_text = lambda: (
+                "Preempt current work and inspect secret payload."
+            )  # type: ignore[method-assign]
             mutated_mode = notification_mode("foreign-mutated")
             self.assertEqual(NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY, mutated_mode["mode"])
             self.assertIsNone(mutated_mode["wake_text"])
@@ -772,7 +826,13 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         raw = self._canonical()
         raw["provider"] = {
             **raw["provider"],
-            "command": [sys.executable, str(fake_argv), str(self.marker), "--secret", sentinel],
+            "command": [
+                sys.executable,
+                str(fake_argv),
+                str(self.marker),
+                "--secret",
+                sentinel,
+            ],
         }
         path = self.workspace / "start.invocation.json"
         self._write(path, raw)
@@ -824,7 +884,13 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         raw = self._canonical()
         raw["provider"] = {
             **raw["provider"],
-            "command": [sys.executable, str(fake_fail), str(self.marker), "--secret", sentinel],
+            "command": [
+                sys.executable,
+                str(fake_fail),
+                str(self.marker),
+                "--secret",
+                sentinel,
+            ],
         }
         path = self.workspace / "start.invocation.json"
         self._write(path, raw)
@@ -846,7 +912,16 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertEqual("fake-cli", evidence["provider_id"])
         self.assertEqual("fake-cli-1.0", evidence["adapter_version"])
         capabilities = evidence["capabilities"]
-        for name in ("launch", "prompt", "event_result", "session", "resume", "permission", "configuration", "notification"):
+        for name in (
+            "launch",
+            "prompt",
+            "event_result",
+            "session",
+            "resume",
+            "permission",
+            "configuration",
+            "notification",
+        ):
             self.assertTrue(capabilities[name])
         self.assertTrue(evidence["configuration_digest"])
         self.assertEqual("worker-1", evidence["attempt_identity"])
@@ -861,16 +936,22 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.assertIn("--model", provenance)
         self.assertEqual("fake-model", provenance[7])
         settings = status["launcher_settings"]
-        self.assertEqual(evidence["configuration_digest"], settings["configuration_digest"])
+        self.assertEqual(
+            evidence["configuration_digest"], settings["configuration_digest"]
+        )
         self.assertEqual(provenance, settings["argv"])
         self.assertNotIn("config_overrides", settings)
         # The arbitrary payload was exercised through the real transcript
         # drain, while the sentinel never reaches the transcript.
-        transcript = (self.workspace / "worker_provider.jsonl").read_text(encoding="utf-8")
+        transcript = (self.workspace / "worker_provider.jsonl").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(payload, transcript)
         self.assertNotIn(sentinel, transcript)
 
-    def test_unknown_terminal_outcome_fails_closed_with_controller_failure(self) -> None:
+    def test_unknown_terminal_outcome_fails_closed_with_controller_failure(
+        self,
+    ) -> None:
         # REL.R1-001: the selected adapter's provider-neutral terminal outcome
         # must be in the closed COMPLETED/FAILED/CANCELLED vocabulary before
         # the generic controller may publish PROVIDER_EXITED or return
@@ -973,7 +1054,13 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         raw = self._canonical()
         raw["provider"] = {
             **raw["provider"],
-            "command": [sys.executable, str(fake_argv), str(self.marker), "--auth", sentinel],
+            "command": [
+                sys.executable,
+                str(fake_argv),
+                str(self.marker),
+                "--auth",
+                sentinel,
+            ],
         }
         path = self.workspace / "start.invocation.json"
         self._write(path, raw)
@@ -1006,7 +1093,16 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         # PA-R1-001: Codex and Claude Code preserve their existing
         # command/provenance results under the required adapter-owned
         # operation.
-        codex_sample = ["codex", "exec", "--api-key", "sk-live", "--token", "abc", "--model", "m"]
+        codex_sample = [
+            "codex",
+            "exec",
+            "--api-key",
+            "sk-live",
+            "--token",
+            "abc",
+            "--model",
+            "m",
+        ]
         self.assertEqual(
             redact_command(codex_sample),
             CodexProviderAdapter().redact_argv(codex_sample),
@@ -1017,7 +1113,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             ClaudeCodeProviderAdapter().redact_argv(claude_sample),
         )
 
-    def test_foreign_notification_true_reaches_production_safe_boundary_seam(self) -> None:
+    def test_foreign_notification_true_reaches_production_safe_boundary_seam(
+        self,
+    ) -> None:
         # PA-R1-002: a foreign notification=true adapter selected through a
         # real canonical controller invocation reaches the production
         # safe-boundary delivery seam and emits only the exact content-free
@@ -1030,7 +1128,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         )
         try:
             path = self.workspace / "start.invocation.json"
-            self._write(path, self._canonical(provider_id="foreign-wake", notification=True))
+            self._write(
+                path, self._canonical(provider_id="foreign-wake", notification=True)
+            )
             self.assertEqual(0, controller.main([str(path)]))
             status = self._status()
             self.assertEqual("foreign-wake", status["provider_id"])
@@ -1055,7 +1155,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             notice = coordinator.notice_for_wake()
             self.assertIsNotNone(notice)
             adapter = provider_adapter("foreign-wake")
-            receipt = adapter.deliver_notification(coordinator, notice, boundary="post_tool_use")
+            receipt = adapter.deliver_notification(
+                coordinator, notice, boundary="post_tool_use"
+            )
             self.assertIsNotNone(receipt)
             self.assertEqual("DELIVERED", receipt.outcome)
             mode = notification_mode("foreign-wake")
@@ -1088,7 +1190,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             )
             blocked_decision = coordinator.notification_stop_request()
             self.assertFalse(blocked_decision.permitted)
-            self.assertEqual(NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED, blocked_decision.reason)
+            self.assertEqual(
+                NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED, blocked_decision.reason
+            )
             coordinator.record_notification_final_response(
                 [
                     {
@@ -1100,7 +1204,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             )
             declared_decision = coordinator.notification_stop_request()
             self.assertTrue(declared_decision.permitted)
-            self.assertEqual(NOTIFICATION_STOP_EXTERNAL_DECLARED, declared_decision.reason)
+            self.assertEqual(
+                NOTIFICATION_STOP_EXTERNAL_DECLARED, declared_decision.reason
+            )
             self.assertEqual(1, len(coordinator.notification_items()))
         finally:
             unregister_provider_adapter("foreign-wake")
@@ -1138,7 +1244,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             notice = coordinator.notice_for_wake()
             self.assertIsNotNone(notice)
             adapter = provider_adapter("foreign-safe")
-            receipt = adapter.deliver_notification(coordinator, notice, boundary="post_tool_use")
+            receipt = adapter.deliver_notification(
+                coordinator, notice, boundary="post_tool_use"
+            )
             self.assertIsNone(receipt)
             self.assertEqual(1, len(router.pending_events()))
         finally:
@@ -1169,7 +1277,13 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             raw = self._canonical(provider_id="my-cli")
             raw["provider"] = {
                 **raw["provider"],
-                "command": [sys.executable, str(fake_argv), str(self.marker), "--auth", sentinel],
+                "command": [
+                    sys.executable,
+                    str(fake_argv),
+                    str(self.marker),
+                    "--auth",
+                    sentinel,
+                ],
             }
             path = self.workspace / "start.invocation.json"
             self._write(path, raw)
@@ -1228,7 +1342,9 @@ class ManagerQueuePublicSeamTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _router(self, root: Path, *, session: str = "session-seam") -> ManagerEventRouter:
+    def _router(
+        self, root: Path, *, session: str = "session-seam"
+    ) -> ManagerEventRouter:
         return ManagerEventRouter(
             root,
             run_id="run-seam",
@@ -1258,9 +1374,14 @@ class ManagerQueuePublicSeamTests(unittest.TestCase):
         self.assertEqual(NOTIFICATION_WAKE_TEXT, mode["wake_text"])
         self.assertNotIn("payload", mode)
         self.assertNotIn("notification_id", mode)
-        self.assertEqual(NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY, notification_mode("claude-code")["mode"])
+        self.assertEqual(
+            NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY,
+            notification_mode("claude-code")["mode"],
+        )
 
-    def test_transport_receipt_alone_never_acknowledges_and_ack_removes_atomically(self) -> None:
+    def test_transport_receipt_alone_never_acknowledges_and_ack_removes_atomically(
+        self,
+    ) -> None:
         router = self._router(self.root / "manager")
         coordinator = self._coordinator(router)
         coordinator.admit_notification(notification_id="notice-1")
@@ -1290,7 +1411,9 @@ class ManagerQueuePublicSeamTests(unittest.TestCase):
         self.assertEqual("notice-1", items[0]["notification_id"])
         self.assertEqual(NOTIFICATION_OPEN, items[0]["state"])
 
-    def test_externally_blocked_items_remain_active_and_worker_ack_is_rejected(self) -> None:
+    def test_externally_blocked_items_remain_active_and_worker_ack_is_rejected(
+        self,
+    ) -> None:
         router = self._router(self.root / "manager")
         coordinator = self._coordinator(router)
         coordinator.admit_notification(
@@ -1332,7 +1455,9 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _run_hook(self, name: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+    def _run_hook(
+        self, name: str, payload: dict[str, object] | None = None
+    ) -> dict[str, object]:
         hook = self.project / ".codex" / "hooks" / name
         env = os.environ.copy()
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -1355,7 +1480,9 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
         ).coordinator
         coordinator.register()
         coordinator.admit_notification(notification_id="notice-1")
-        evidence = self._run_hook("orchestrator_harness_post_tool_use.py", {"provider_payload": "ignored"})
+        evidence = self._run_hook(
+            "orchestrator_harness_post_tool_use.py", {"provider_payload": "ignored"}
+        )
         self.assertEqual("orchestrator-codex-installed-hook/v1", evidence["schema"])
         wake = evidence["wake"]
         self.assertEqual(NOTIFICATION_MODE_WAKE, wake["mode"])
@@ -1373,7 +1500,9 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
         ).coordinator
         coordinator.register()
         coordinator.admit_notification(notification_id="notice-1")
-        evidence = self._run_hook("orchestrator_harness_stop.py", {"secret_payload": "do-not-leak"})
+        evidence = self._run_hook(
+            "orchestrator_harness_stop.py", {"secret_payload": "do-not-leak"}
+        )
         decision = evidence["stop_decision"]
         self.assertFalse(decision["permitted"])
         self.assertEqual(NOTIFICATION_STOP_OPEN_ITEMS_REMAIN, decision["reason"])
@@ -1382,7 +1511,9 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
         self.assertNotIn("do-not-leak", json.dumps(decision))
         self.assertTrue(evidence["continuation_requested"])
         self.assertIs(True, evidence["continuation_result"])
-        self.assertEqual([{"method": "Stop.continue", "continue": True}], evidence["transport_calls"])
+        self.assertEqual(
+            [{"method": "Stop.continue", "continue": True}], evidence["transport_calls"]
+        )
         self.assertEqual(1, evidence["pending_count"])
 
     def test_installed_stop_hook_empty_queue_permits(self) -> None:
@@ -1395,7 +1526,9 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
         self.assertEqual([], evidence["transport_calls"])
         self.assertEqual(0, evidence["pending_count"])
 
-    def test_installed_stop_hook_externally_blocked_requires_exact_final_response(self) -> None:
+    def test_installed_stop_hook_externally_blocked_requires_exact_final_response(
+        self,
+    ) -> None:
         coordinator = create_codex_adapter(
             self.router, state_root=self.root / "manager" / "codex-coordinator"
         ).coordinator
@@ -1409,22 +1542,44 @@ class InstalledHookPublicSeamTests(unittest.TestCase):
         rejected = self._run_hook("orchestrator_harness_stop.py")
         decision = rejected["stop_decision"]
         self.assertFalse(decision["permitted"])
-        self.assertEqual(NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED, decision["reason"])
+        self.assertEqual(
+            NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED, decision["reason"]
+        )
         self.assertEqual(1, decision["externally_blocked_count"])
         self.assertTrue(rejected["continuation_requested"])
         self.assertIs(True, rejected["continuation_result"])
-        self.assertEqual([{"method": "Stop.continue", "continue": True}], rejected["transport_calls"])
+        self.assertEqual(
+            [{"method": "Stop.continue", "continue": True}], rejected["transport_calls"]
+        )
         partial = self._run_hook(
             "orchestrator_harness_stop.py",
-            {"orchestrator_final_response": [{"notification_id": "notice-1", "required_actor": "WRONG", "required_action": "approve the external dependency"}]},
+            {
+                "orchestrator_final_response": [
+                    {
+                        "notification_id": "notice-1",
+                        "required_actor": "WRONG",
+                        "required_action": "approve the external dependency",
+                    }
+                ]
+            },
         )
         self.assertFalse(partial["stop_decision"]["permitted"])
         self.assertTrue(partial["continuation_requested"])
         self.assertIs(True, partial["continuation_result"])
-        self.assertEqual([{"method": "Stop.continue", "continue": True}], partial["transport_calls"])
+        self.assertEqual(
+            [{"method": "Stop.continue", "continue": True}], partial["transport_calls"]
+        )
         exact = self._run_hook(
             "orchestrator_harness_stop.py",
-            {"orchestrator_final_response": [{"notification_id": "notice-1", "required_actor": "ROOT-IM", "required_action": "approve the external dependency"}]},
+            {
+                "orchestrator_final_response": [
+                    {
+                        "notification_id": "notice-1",
+                        "required_actor": "ROOT-IM",
+                        "required_action": "approve the external dependency",
+                    }
+                ]
+            },
         )
         decision = exact["stop_decision"]
         self.assertTrue(decision["permitted"])

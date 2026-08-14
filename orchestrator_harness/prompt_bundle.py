@@ -5,6 +5,7 @@ bundle is deliberately a small value object instead of a prompt templating
 system: callers provide the ordered components and the resulting bytes are
 bound by both their individual hashes and a manifest hash.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -40,7 +41,9 @@ def _text(value: object, name: str) -> str:
 
 def _digest_text(value: object, name: str) -> str:
     result = _text(value, name).lower()
-    if len(result) != _SHA256_LENGTH or any(c not in "0123456789abcdef" for c in result):
+    if len(result) != _SHA256_LENGTH or any(
+        c not in "0123456789abcdef" for c in result
+    ):
         raise PromptBundleError(f"{name} must be a SHA-256 hex digest")
     return result
 
@@ -57,7 +60,9 @@ def _safe_component_path(path: Path, root: Path) -> Path:
     except ValueError as exc:
         raise PromptBundleError("prompt component path escapes run root") from exc
     if not candidate.is_file():
-        raise PromptBundleError("prompt component path must be an existing regular file")
+        raise PromptBundleError(
+            "prompt component path must be an existing regular file"
+        )
     return candidate
 
 
@@ -120,7 +125,9 @@ class PromptBundle:
             raise PromptBundleError("prompt component IDs must be unique")
         composed = b"".join(component.content for component in self.components)
         if composed != self.final_bytes:
-            raise PromptBundleError("prompt final bytes do not match ordered components")
+            raise PromptBundleError(
+                "prompt final bytes do not match ordered components"
+            )
         if _sha256(self.final_bytes) != self.final_sha256:
             raise PromptBundleError("prompt final SHA-256 does not match bytes")
         if self.bundle_sha256 != self.manifest_sha256():
@@ -180,7 +187,9 @@ def compose_prompt_bundle(
         elif isinstance(item, tuple) and len(item) == 2:
             normalized.append(PromptComponent(item[0], item[1]))
         else:
-            raise PromptBundleError("components must be PromptComponent values or (id, bytes) pairs")
+            raise PromptBundleError(
+                "components must be PromptComponent values or (id, bytes) pairs"
+            )
     final_bytes = b"".join(component.content for component in normalized)
     final_sha256 = _sha256(final_bytes)
     provisional = PromptBundle.__new__(PromptBundle)
@@ -222,31 +231,51 @@ def bundle_from_record(record: Mapping[str, Any], *, run_root: Path) -> PromptBu
         raise PromptBundleError("prompt bundle components must be a non-empty list")
     components: list[PromptComponent] = []
     for ordinal, raw in enumerate(components_value):
-        if not isinstance(raw, Mapping) or set(raw) != {"id", "ordinal", "path", "sha256", "size"}:
-            raise PromptBundleError("prompt bundle component has an invalid closed shape")
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "id",
+            "ordinal",
+            "path",
+            "sha256",
+            "size",
+        }:
+            raise PromptBundleError(
+                "prompt bundle component has an invalid closed shape"
+            )
         if raw.get("ordinal") != ordinal:
             raise PromptBundleError("prompt bundle component order is not contiguous")
         path_value = raw.get("path")
         if not isinstance(path_value, str) or not path_value:
-            raise PromptBundleError("prompt bundle components require path-bound sources")
+            raise PromptBundleError(
+                "prompt bundle components require path-bound sources"
+            )
         path = _safe_component_path(Path(path_value), run_root)
         try:
             content = path.read_bytes()
         except OSError as exc:
             raise PromptBundleError(f"cannot read prompt component: {exc}") from exc
         expected_size = raw.get("size")
-        if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size != len(content):
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size != len(content)
+        ):
             raise PromptBundleError("prompt component size does not match bytes")
-        if _digest_text(raw.get("sha256"), "prompt component sha256") != _sha256(content):
+        if _digest_text(raw.get("sha256"), "prompt component sha256") != _sha256(
+            content
+        ):
             raise PromptBundleError("prompt component bytes do not match sha256")
-        components.append(PromptComponent(_text(raw.get("id"), "prompt component id"), content, path))
+        components.append(
+            PromptComponent(_text(raw.get("id"), "prompt component id"), content, path)
+        )
     bundle = compose_prompt_bundle(
         workflow_id=_text(record.get("workflow_id"), "workflow_id"),
         task_card_id=_text(record.get("task_card_id"), "task_card_id"),
         profile_id=_text(record.get("profile_id"), "profile_id"),
         components=components,
     )
-    if not isinstance(record.get("final_size"), int) or record["final_size"] != len(bundle.final_bytes):
+    if not isinstance(record.get("final_size"), int) or record["final_size"] != len(
+        bundle.final_bytes
+    ):
         raise PromptBundleError("prompt final size does not match bytes")
     if bundle.to_record() != dict(record):
         raise PromptBundleError("prompt bundle manifest is stale or tampered")

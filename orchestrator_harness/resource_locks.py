@@ -1,4 +1,5 @@
 """Local named-resource claims for coding controller launch coordination."""
+
 from __future__ import annotations
 
 import hashlib
@@ -15,7 +16,12 @@ from typing import Any, Iterator, Sequence, cast
 from harness_common.process_identity import exact_process_identity
 
 from .models import ProcessInfo, ProcessSnapshot, iso_utc
-from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    capture_target,
+    replace as mutation_replace,
+)
 from .processes import process_snapshot
 
 CLAIM_SCHEMA = "orchestrator-coding-resource-claim/v1"
@@ -37,7 +43,9 @@ def _kernel_resource_lock(path: Path) -> Iterator[None]:
     # already been released by the kernel.
     claim_root = path.parent.absolute()
     lock_root = claim_root.parent / f".{claim_root.name}.resource-locks"
-    digest = hashlib.sha256(os.path.normcase(str(path.absolute())).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(
+        os.path.normcase(str(path.absolute())).encode("utf-8")
+    ).hexdigest()
     lock_path = lock_root / f"{digest}.lock"
     handle: Any | None = None
     windows_locked = False
@@ -84,7 +92,9 @@ def claim_filename(resource: str) -> str:
 
 
 def _claim_bytes(claim: Mapping[str, object]) -> bytes:
-    return (json.dumps(claim, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return (json.dumps(claim, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
 
 
 def _read_claim_evidence(path: Path) -> tuple[Claim | None, str | None, bytes | None]:
@@ -171,13 +181,22 @@ def _retained_state(
     processes: ProcessSnapshot,
     identity_provider: IdentityProvider,
 ) -> tuple[str, str]:
-    if claim.get("boundary_may_exist") is True or claim.get("boundary_state") == BOUNDARY_ARMED_STATE:
-        return "INVENTORY_UNKNOWN", "provider boundary may exist but retained evidence is not complete"
+    if (
+        claim.get("boundary_may_exist") is True
+        or claim.get("boundary_state") == BOUNDARY_ARMED_STATE
+    ):
+        return (
+            "INVENTORY_UNKNOWN",
+            "provider boundary may exist but retained evidence is not complete",
+        )
     retained_boundary = claim.get("retained_boundary")
     retained = claim.get("retained_processes", [])
     if retained_boundary is None:
         return "PROVEN_STALE", "complete process inventory proves owner PID absent"
-    if not isinstance(retained_boundary, Mapping) or retained_boundary.get("complete") is not True:
+    if (
+        not isinstance(retained_boundary, Mapping)
+        or retained_boundary.get("complete") is not True
+    ):
         return "INVENTORY_UNKNOWN", "retained owned-boundary evidence is incomplete"
     if not isinstance(retained, list):
         return "INVENTORY_UNKNOWN", "retained process identities are malformed"
@@ -188,29 +207,48 @@ def _retained_state(
         expected_created = item.get("created_utc")
         expected_exact = item.get("creation_identity")
         if (
-            not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-            or not isinstance(expected_created, str) or not expected_created
-            or not isinstance(expected_exact, str) or not expected_exact
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(expected_created, str)
+            or not expected_created
+            or not isinstance(expected_exact, str)
+            or not expected_exact
         ):
             return "INVENTORY_UNKNOWN", "retained process identity is incomplete"
         process = processes.by_pid.get(pid)
         try:
             fresh = identity_provider(pid)
         except Exception:
-            return "RETAINED_IDENTITY_UNKNOWN", f"retained PID {pid} identity is unavailable"
+            return (
+                "RETAINED_IDENTITY_UNKNOWN",
+                f"retained PID {pid} identity is unavailable",
+            )
         fresh_created = fresh.get("created_utc") if fresh is not None else None
         if process is not None:
             actual_created = iso_utc(process.created_utc)
             if actual_created != expected_created:
-                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} has a different creation identity"
+                return (
+                    "RETAINED_IDENTITY_REUSED",
+                    f"retained PID {pid} has a different creation identity",
+                )
             if not isinstance(fresh_created, str):
-                return "RETAINED_IDENTITY_UNKNOWN", f"retained PID {pid} exact identity is unavailable"
+                return (
+                    "RETAINED_IDENTITY_UNKNOWN",
+                    f"retained PID {pid} exact identity is unavailable",
+                )
             if fresh_created != expected_exact:
-                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} exact identity changed"
+                return (
+                    "RETAINED_IDENTITY_REUSED",
+                    f"retained PID {pid} exact identity changed",
+                )
             return "RETAINED_PROCESS_LIVE", f"retained PID {pid} is still live"
         if fresh is not None:
             if fresh_created != expected_exact:
-                return "RETAINED_IDENTITY_REUSED", f"retained PID {pid} exact identity changed"
+                return (
+                    "RETAINED_IDENTITY_REUSED",
+                    f"retained PID {pid} exact identity changed",
+                )
             return "RETAINED_PROCESS_LIVE", f"retained PID {pid} is still live"
     return "PROVEN_STALE", "owner and every retained process identity are absent"
 
@@ -234,26 +272,44 @@ def _owner_state(
         try:
             exact = identity_provider(pid)
         except Exception:
-            return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
+            return (
+                "OWNER_IDENTITY_UNKNOWN",
+                "fresh exact owner creation identity is unavailable",
+            )
         if exact is not None:
-            return "OWNER_IDENTITY_UNKNOWN", "process inventory and exact identity provider contradict"
+            return (
+                "OWNER_IDENTITY_UNKNOWN",
+                "process inventory and exact identity provider contradict",
+            )
         return _retained_state(claim, processes, identity_provider)
     expected = typed_owner.get("created_utc")
     actual = iso_utc(process.created_utc)
     if not isinstance(expected, str) or actual is None:
         return "OWNER_IDENTITY_UNKNOWN", "owner creation identity cannot be compared"
     if expected != actual:
-        return "OWNER_IDENTITY_REUSED", "owner PID exists with a different creation identity"
+        return (
+            "OWNER_IDENTITY_REUSED",
+            "owner PID exists with a different creation identity",
+        )
     expected_exact = typed_owner.get("creation_identity")
     try:
         fresh = identity_provider(pid)
     except Exception:
-        return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
+        return (
+            "OWNER_IDENTITY_UNKNOWN",
+            "fresh exact owner creation identity is unavailable",
+        )
     fresh_exact = fresh.get("created_utc") if fresh is not None else None
     if not isinstance(fresh_exact, str):
-        return "OWNER_IDENTITY_UNKNOWN", "fresh exact owner creation identity is unavailable"
+        return (
+            "OWNER_IDENTITY_UNKNOWN",
+            "fresh exact owner creation identity is unavailable",
+        )
     if fresh_exact != expected_exact:
-        return "OWNER_IDENTITY_REUSED", "fresh exact owner creation identity does not match the claim"
+        return (
+            "OWNER_IDENTITY_REUSED",
+            "fresh exact owner creation identity does not match the claim",
+        )
     return "CONTENDED", "the exact owning process is live"
 
 
@@ -277,7 +333,9 @@ class ResourceClaims:
             cast(object, identity.get("created_utc")) if identity is not None else None
         )
         if not isinstance(creation_identity, str):
-            raise ResourceLockError("cannot establish controller creation identity for resource claims")
+            raise ResourceLockError(
+                "cannot establish controller creation identity for resource claims"
+            )
         self.root.mkdir(parents=True, exist_ok=True)
         self._owner = {
             "pid": self.controller.pid,
@@ -339,7 +397,9 @@ class ResourceClaims:
                 current, error = _read_claim(path)
                 if error is not None or current is None:
                     return False
-                comparable = {key: value for key, value in expected.items() if key != "path"}
+                comparable = {
+                    key: value for key, value in expected.items() if key != "path"
+                }
                 if current != comparable:
                     return False
                 path.unlink()
@@ -378,8 +438,15 @@ class ResourceClaims:
                         failures.append(resource)
                         continue
                     current, error, current_bytes = _read_claim_evidence(path)
-                    comparable = {key: value for key, value in expected.items() if key != "path"}
-                    if error is not None or current is None or current_bytes is None or current != comparable:
+                    comparable = {
+                        key: value for key, value in expected.items() if key != "path"
+                    }
+                    if (
+                        error is not None
+                        or current is None
+                        or current_bytes is None
+                        or current != comparable
+                    ):
                         failures.append(resource)
                         continue
                     updated = dict(current)
@@ -387,10 +454,16 @@ class ResourceClaims:
                     updated["boundary_may_exist"] = True
                     data = _claim_bytes(updated)
                     expected_target = capture_target(path.parent, path.name)
-                    if expected_target.kind != "file" or expected_target.content_sha256 != hashlib.sha256(current_bytes).hexdigest():
+                    if (
+                        expected_target.kind != "file"
+                        or expected_target.content_sha256
+                        != hashlib.sha256(current_bytes).hexdigest()
+                    ):
                         failures.append(resource)
                         continue
-                    mutation_replace(path.parent, path.name, data, expected=expected_target)
+                    mutation_replace(
+                        path.parent, path.name, data, expected=expected_target
+                    )
                     updated["path"] = str(path)
                     self._held[resource] = updated
             except (MutationConflict, MutationUnsupported, OSError):
@@ -411,12 +484,18 @@ class ResourceClaims:
             created = item.get("created_utc")
             exact = item.get("creation_identity", created)
             if (
-                not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-                or not isinstance(created, str) or not created
-                or not isinstance(exact, str) or not exact
+                not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or not isinstance(created, str)
+                or not created
+                or not isinstance(exact, str)
+                or not exact
             ):
                 continue
-            retained.append({"pid": pid, "created_utc": created, "creation_identity": exact})
+            retained.append(
+                {"pid": pid, "created_utc": created, "creation_identity": exact}
+            )
         failures: list[str] = []
         for resource in sorted(self._held, reverse=True):
             expected = self._held.get(resource)
@@ -432,21 +511,40 @@ class ResourceClaims:
                         failures.append(resource)
                         continue
                     current, error, current_bytes = _read_claim_evidence(path)
-                    comparable = {key: value for key, value in expected.items() if key != "path"}
-                    if error is not None or current is None or current_bytes is None or current != comparable:
+                    comparable = {
+                        key: value for key, value in expected.items() if key != "path"
+                    }
+                    if (
+                        error is not None
+                        or current is None
+                        or current_bytes is None
+                        or current != comparable
+                    ):
                         failures.append(resource)
                         continue
                     updated = dict(current)
                     updated["retained_processes"] = retained
-                    updated["retained_boundary"] = dict(boundary or {"complete": False, "errors": ["boundary evidence unavailable"]})
+                    updated["retained_boundary"] = dict(
+                        boundary
+                        or {
+                            "complete": False,
+                            "errors": ["boundary evidence unavailable"],
+                        }
+                    )
                     updated["boundary_state"] = "RETAINED"
                     updated["boundary_may_exist"] = False
                     data = _claim_bytes(updated)
                     expected_target = capture_target(path.parent, path.name)
-                    if expected_target.kind != "file" or expected_target.content_sha256 != hashlib.sha256(current_bytes).hexdigest():
+                    if (
+                        expected_target.kind != "file"
+                        or expected_target.content_sha256
+                        != hashlib.sha256(current_bytes).hexdigest()
+                    ):
                         failures.append(resource)
                         continue
-                    mutation_replace(path.parent, path.name, data, expected=expected_target)
+                    mutation_replace(
+                        path.parent, path.name, data, expected=expected_target
+                    )
                     updated["path"] = str(path)
                     self._held[resource] = updated
             except (MutationConflict, MutationUnsupported, OSError):
@@ -487,7 +585,10 @@ class ResourceClaims:
                     current, self.process_provider(), self.identity_provider
                 )
                 if state != "PROVEN_STALE":
-                    return False, f"stale reclaim revalidation changed to {state}: {reason}"
+                    return (
+                        False,
+                        f"stale reclaim revalidation changed to {state}: {reason}",
+                    )
                 # Unlink only the exact bytes that were revalidated under the
                 # lock.  No reclaim marker or process-name operation is used.
                 path.unlink()
@@ -516,14 +617,27 @@ class ResourceClaims:
                 path = self.root / claim_filename(resource)
                 existing, malformed, existing_bytes = _read_claim_evidence(path)
                 if malformed is not None or existing is None:
-                    state, reason, actionable = "MALFORMED", malformed or "claim is unreadable", True
+                    state, reason, actionable = (
+                        "MALFORMED",
+                        malformed or "claim is unreadable",
+                        True,
+                    )
                 elif existing.get("resource") != resource:
-                    state, reason, actionable = "MALFORMED", "hashed claim contains a different resource name", True
+                    state, reason, actionable = (
+                        "MALFORMED",
+                        "hashed claim contains a different resource name",
+                        True,
+                    )
                 else:
                     state, reason = _owner_state(
                         existing, self.process_provider(), self.identity_provider
                     )
-                    actionable = state in {"MALFORMED", "PROVEN_STALE", "OWNER_IDENTITY_REUSED", "OWNER_IDENTITY_UNKNOWN"}
+                    actionable = state in {
+                        "MALFORMED",
+                        "PROVEN_STALE",
+                        "OWNER_IDENTITY_REUSED",
+                        "OWNER_IDENTITY_UNKNOWN",
+                    }
                     if state == "PROVEN_STALE" and existing_bytes is not None:
                         reclaimed, reason = self._reclaim_stale(
                             resource=resource,
@@ -546,15 +660,17 @@ class ResourceClaims:
                 if elapsed >= self.wait_excess_seconds:
                     state, actionable = "EXCESSIVE_WAIT", True
                     reason = f"resource wait exceeded {self.wait_excess_seconds:g} seconds; last state: {reason}"
-                on_wait({
-                    "resource": resource,
-                    "path": str(path),
-                    "state": state,
-                    "reason": reason,
-                    "actionable": actionable,
-                    "wait_seconds": round(elapsed, 3),
-                    "claim": existing,
-                })
+                on_wait(
+                    {
+                        "resource": resource,
+                        "path": str(path),
+                        "state": state,
+                        "reason": reason,
+                        "actionable": actionable,
+                        "wait_seconds": round(elapsed, 3),
+                        "claim": existing,
+                    }
+                )
                 time.sleep(self.poll_seconds)
                 break
             else:

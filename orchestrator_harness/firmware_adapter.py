@@ -5,6 +5,7 @@ transport state, raw response interpretation, and exact cleanup.  The generic
 broker receives only public capability facts.  Server, provider, command, and
 endpoint details stay private inside the caller-supplied seams.
 """
+
 from __future__ import annotations
 
 import time
@@ -105,22 +106,32 @@ class FirmwareHardwareAdapter:
     def observe(self, request: CapabilityRequest) -> CapabilitySnapshot:
         operation = self._operation(request)
         value = self.snapshot_provider(request)
-        snapshot = CapabilitySnapshot.from_record(value.to_record() if isinstance(value, CapabilitySnapshot) else value)
+        snapshot = CapabilitySnapshot.from_record(
+            value.to_record() if isinstance(value, CapabilitySnapshot) else value
+        )
         if snapshot.adapter_identity != dict(self.ADAPTER_IDENTITY):
             raise CapabilityAdapterError("snapshot belongs to another adapter")
         if (
             snapshot.resources != (operation.canonical_resource,)
-            or snapshot.resource_identities.get(operation.canonical_resource) != operation.resource_identity
-            or snapshot.identity.get("canonical_resource") != operation.canonical_resource
+            or snapshot.resource_identities.get(operation.canonical_resource)
+            != operation.resource_identity
+            or snapshot.identity.get("canonical_resource")
+            != operation.canonical_resource
             or snapshot.identity.get("resource_identity") != operation.resource_identity
         ):
-            raise CapabilityAdapterError("snapshot does not bind the exact firmware resource")
+            raise CapabilityAdapterError(
+                "snapshot does not bind the exact firmware resource"
+            )
         return snapshot
 
-    def verify_approval(self, request: CapabilityRequest, snapshot: CapabilitySnapshot, approval: Any) -> bool:
+    def verify_approval(
+        self, request: CapabilityRequest, snapshot: CapabilitySnapshot, approval: Any
+    ) -> bool:
         try:
             operation = self._operation(request)
-            return hasattr(approval, "policy") and self.campaign_pack.approval_policy(request, operation, approval)
+            return hasattr(approval, "policy") and self.campaign_pack.approval_policy(
+                request, operation, approval
+            )
         except Exception:
             return False
 
@@ -133,21 +144,31 @@ class FirmwareHardwareAdapter:
     ) -> float:
         operation = self._operation(request)
         if not hasattr(approval, "issued_monotonic"):
-            raise CapabilityAdapterUnavailable("approval duration identity is unavailable")
+            raise CapabilityAdapterUnavailable(
+                "approval duration identity is unavailable"
+            )
         return min(
             request.expires_monotonic,
             float(approval.expires_monotonic),
-            self.campaign_pack.effective_duration(request, operation, now_monotonic=now_monotonic),
+            self.campaign_pack.effective_duration(
+                request, operation, now_monotonic=now_monotonic
+            ),
         )
 
     @staticmethod
-    def _child_identity(pid: int, exact: Mapping[str, Any], process: ProcessInfo | None) -> dict[str, Any]:
+    def _child_identity(
+        pid: int, exact: Mapping[str, Any], process: ProcessInfo | None
+    ) -> dict[str, Any]:
         exact_created = exact.get("created_utc")
         if not isinstance(exact_created, str) or not exact_created:
-            raise CapabilityAdapterError("adapter child creation identity is unavailable")
+            raise CapabilityAdapterError(
+                "adapter child creation identity is unavailable"
+            )
         created = iso_utc(process.created_utc) if process is not None else exact_created
         if not isinstance(created, str) or not created:
-            raise CapabilityAdapterError("adapter child process timestamp is unavailable")
+            raise CapabilityAdapterError(
+                "adapter child process timestamp is unavailable"
+            )
         return {"pid": pid, "created_utc": created, "creation_identity": exact_created}
 
     def dispatch(self, permit: CapabilityPermit) -> AdapterResult:
@@ -156,7 +177,14 @@ class FirmwareHardwareAdapter:
             raise CapabilityAdapterError("adapter permit expired before launch")
         boundary = self.boundary_factory()
         key = self._operation_key(permit)
-        active = _ActiveOperation(process=None, identity=None, supervisor_identity=None, transport=None, boundary=boundary, operation=operation)
+        active = _ActiveOperation(
+            process=None,
+            identity=None,
+            supervisor_identity=None,
+            transport=None,
+            boundary=boundary,
+            operation=operation,
+        )
         self._active[key] = active
         try:
             config = self.config_provider(permit.request, operation)
@@ -172,7 +200,9 @@ class FirmwareHardwareAdapter:
                 raise CapabilityAdapterError("adapter child identity has no valid PID")
             exact = self.identity_provider(pid)
             if not isinstance(exact, Mapping) or exact.get("pid") != pid:
-                raise CapabilityAdapterError("adapter child creation identity is unavailable")
+                raise CapabilityAdapterError(
+                    "adapter child creation identity is unavailable"
+                )
             process_info = process_snapshot().by_pid.get(pid)
             active.identity = self._child_identity(pid, exact, process_info)
             active.supervisor_identity = process_info or active.identity
@@ -181,11 +211,15 @@ class FirmwareHardwareAdapter:
             authority_check = lambda: self.clock() < permit.expires_monotonic
             transport_config = dict(launch_config)
             transport_config["_authority_check"] = authority_check
-            active.transport = self.transport_factory(process, remaining, permit.request.request_id, transport_config)
+            active.transport = self.transport_factory(
+                process, remaining, permit.request.request_id, transport_config
+            )
 
             def send_checked(value: dict[str, Any], label: str) -> None:
                 if not authority_check():
-                    raise CapabilityAdapterError("adapter permit expired before transport enqueue")
+                    raise CapabilityAdapterError(
+                        "adapter permit expired before transport enqueue"
+                    )
                 active.transport.send(value, label)
 
             send_checked(
@@ -196,30 +230,46 @@ class FirmwareHardwareAdapter:
                     "params": {
                         "protocolVersion": self.mcp_protocol_version,
                         "capabilities": {},
-                        "clientInfo": {"name": "orchestrator-harness", "version": "0.1.0"},
+                        "clientInfo": {
+                            "name": "orchestrator-harness",
+                            "version": "0.1.0",
+                        },
                     },
                 },
                 "initialize",
             )
             active.transport.receive(1)
-            send_checked({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, "initialized")
+            send_checked(
+                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                "initialized",
+            )
             send_checked(
                 {
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
-                    "params": {"name": operation.mcp_tool, "arguments": dict(operation.arguments)},
+                    "params": {
+                        "name": operation.mcp_tool,
+                        "arguments": dict(operation.arguments),
+                    },
                 },
                 "dispatch",
             )
             raw = active.transport.receive(2)
-            if not isinstance(raw, Mapping) or not isinstance(raw.get("result"), Mapping):
-                raise CapabilityAdapterError("adapter response is not a structured result")
+            if not isinstance(raw, Mapping) or not isinstance(
+                raw.get("result"), Mapping
+            ):
+                raise CapabilityAdapterError(
+                    "adapter response is not a structured result"
+                )
             result_payload = dict(raw["result"])
             failed = result_payload.get("isError") is True or "error" in raw
             return AdapterResult(
                 succeeded=not failed,
-                raw_result={"status": "FAIL" if failed else "completed", "payload": result_payload},
+                raw_result={
+                    "status": "FAIL" if failed else "completed",
+                    "payload": result_payload,
+                },
                 interpreted_result={"status": "FAIL" if failed else "PASS"},
                 adapter_identity=dict(self.ADAPTER_IDENTITY),
             )
@@ -232,21 +282,44 @@ class FirmwareHardwareAdapter:
     def _public_child_cleanup(result: Any) -> dict[str, Any]:
         record = result.to_record() if hasattr(result, "to_record") else {}
         allowed = {
-            "status", "stages", "terminate_attempted", "kill_attempted", "final_reap",
-            "cleanup_confirmed", "identity_verified", "identity_uncertain", "exit_code",
-            "reaped_after", "errors", "owned_boundary_empty", "boundary_complete",
-            "boundary_cleanup", "boundary_errors",
+            "status",
+            "stages",
+            "terminate_attempted",
+            "kill_attempted",
+            "final_reap",
+            "cleanup_confirmed",
+            "identity_verified",
+            "identity_uncertain",
+            "exit_code",
+            "reaped_after",
+            "errors",
+            "owned_boundary_empty",
+            "boundary_complete",
+            "boundary_cleanup",
+            "boundary_errors",
         }
         return {key: value for key, value in record.items() if key in allowed}
 
     @staticmethod
     def _public_io_cleanup(value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
-            return {"closed": False, "helpers_stopped": False, "errors": ["invalid transport cleanup"]}
+            return {
+                "closed": False,
+                "helpers_stopped": False,
+                "errors": ["invalid transport cleanup"],
+            }
         allowed = {
-            "closed", "helpers_stopped", "stderr_sha256", "stderr_log_complete",
-            "stderr_log_sha256", "stderr_log_partial_sha256", "stderr_eof",
-            "stderr_forced_close", "helper_threads", "stream_close_errors", "error_type",
+            "closed",
+            "helpers_stopped",
+            "stderr_sha256",
+            "stderr_log_complete",
+            "stderr_log_sha256",
+            "stderr_log_partial_sha256",
+            "stderr_eof",
+            "stderr_forced_close",
+            "helper_threads",
+            "stream_close_errors",
+            "error_type",
         }
         return {key: value[key] for key in value if key in allowed}
 
@@ -260,8 +333,21 @@ class FirmwareHardwareAdapter:
         """
 
         if not isinstance(value, Mapping):
-            return {"complete": False, "members": [], "live_members": [], "errors": ["invalid boundary cleanup"]}
-        allowed = {"kind", "complete", "inventory_source", "cleanup", "errors", "members", "live_members"}
+            return {
+                "complete": False,
+                "members": [],
+                "live_members": [],
+                "errors": ["invalid boundary cleanup"],
+            }
+        allowed = {
+            "kind",
+            "complete",
+            "inventory_source",
+            "cleanup",
+            "errors",
+            "members",
+            "live_members",
+        }
         result = {key: value[key] for key in value if key in allowed}
         result.setdefault("complete", False)
         live_members = result.get("live_members", [])
@@ -288,7 +374,10 @@ class FirmwareHardwareAdapter:
                 proved=True,
                 boundary={"complete": True, "members": [], "live_members": []},
                 identities=(),
-                details={"launch_started": False, "dispatch_failed": failure is not None},
+                details={
+                    "launch_started": False,
+                    "dispatch_failed": failure is not None,
+                },
             )
             self._cleanup_results[key] = result
             return result
@@ -301,9 +390,16 @@ class FirmwareHardwareAdapter:
                     cleanup_error = "child identity was unavailable"
             elif self.supervisor_factory is not None:
                 try:
-                    supervisor = self.supervisor_factory(active.process, active.identity, permit.request.request_id, active.boundary)
+                    supervisor = self.supervisor_factory(
+                        active.process,
+                        active.identity,
+                        permit.request.request_id,
+                        active.boundary,
+                    )
                 except TypeError:
-                    supervisor = self.supervisor_factory(active.process, active.identity, permit.request.request_id)
+                    supervisor = self.supervisor_factory(
+                        active.process, active.identity, permit.request.request_id
+                    )
                 cleanup_result = supervisor.cleanup()
             else:
                 supervisor = ProcessSupervisor(
@@ -317,12 +413,24 @@ class FirmwareHardwareAdapter:
         except Exception as exc:
             cleanup_error = type(exc).__name__
 
-        boundary_record: dict[str, Any] = {"complete": False, "members": [], "live_members": [], "errors": ["boundary evidence unavailable"]}
+        boundary_record: dict[str, Any] = {
+            "complete": False,
+            "members": [],
+            "live_members": [],
+            "errors": ["boundary evidence unavailable"],
+        }
         try:
             inventory = active.boundary.inventory()
-            boundary_record = self._public_boundary_cleanup(active.boundary.to_record(inventory))
+            boundary_record = self._public_boundary_cleanup(
+                active.boundary.to_record(inventory)
+            )
         except Exception as exc:
-            boundary_record = {"complete": False, "members": [], "live_members": [], "errors": [f"boundary inventory failed: {type(exc).__name__}"]}
+            boundary_record = {
+                "complete": False,
+                "members": [],
+                "live_members": [],
+                "errors": [f"boundary inventory failed: {type(exc).__name__}"],
+            }
 
         io_record = {"closed": True, "helpers_stopped": True}
         if active.transport is not None:
@@ -333,22 +441,47 @@ class FirmwareHardwareAdapter:
                     io_record["closed"] = bool(closed[0])
                     io_record["helpers_stopped"] = bool(closed[0])
                 else:
-                    io_record = {"closed": False, "helpers_stopped": False, "errors": ["invalid transport cleanup"]}
+                    io_record = {
+                        "closed": False,
+                        "helpers_stopped": False,
+                        "errors": ["invalid transport cleanup"],
+                    }
             except Exception as exc:
-                io_record = {"closed": False, "helpers_stopped": False, "error_type": type(exc).__name__}
+                io_record = {
+                    "closed": False,
+                    "helpers_stopped": False,
+                    "error_type": type(exc).__name__,
+                }
 
-        child_record = self._public_child_cleanup(cleanup_result) if cleanup_result is not None else {}
-        child_ok = (
-            cleanup_error is None
-            and (
-                (not active.launch_attempted and active.process is None)
-                or (cleanup_result is not None and bool(getattr(cleanup_result, "proved_reap", False)))
+        child_record = (
+            self._public_child_cleanup(cleanup_result)
+            if cleanup_result is not None
+            else {}
+        )
+        child_ok = cleanup_error is None and (
+            (not active.launch_attempted and active.process is None)
+            or (
+                cleanup_result is not None
+                and bool(getattr(cleanup_result, "proved_reap", False))
             )
         )
-        boundary_ok = boundary_record.get("complete") is True and not boundary_record.get("live_members") and not boundary_record.get("errors")
-        io_ok = io_record.get("closed") is True and io_record.get("helpers_stopped") is True and not io_record.get("error_type") and not io_record.get("errors")
+        boundary_ok = (
+            boundary_record.get("complete") is True
+            and not boundary_record.get("live_members")
+            and not boundary_record.get("errors")
+        )
+        io_ok = (
+            io_record.get("closed") is True
+            and io_record.get("helpers_stopped") is True
+            and not io_record.get("error_type")
+            and not io_record.get("errors")
+        )
         proved = child_ok and boundary_ok and io_ok
-        identities: tuple[dict[str, Any], ...] = () if proved else (() if active.identity is None else (dict(active.identity),))
+        identities: tuple[dict[str, Any], ...] = (
+            ()
+            if proved
+            else (() if active.identity is None else (dict(active.identity),))
+        )
         details: dict[str, Any] = {
             "launch_started": active.launch_attempted,
             "child_cleanup": child_record,
@@ -357,7 +490,12 @@ class FirmwareHardwareAdapter:
         }
         if cleanup_error is not None:
             details["cleanup_error"] = cleanup_error
-        result = CleanupEvidence(proved=proved, boundary=boundary_record, identities=identities, details=details)
+        result = CleanupEvidence(
+            proved=proved,
+            boundary=boundary_record,
+            identities=identities,
+            details=details,
+        )
         if proved:
             try:
                 active.boundary.close()

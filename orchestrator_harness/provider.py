@@ -9,6 +9,7 @@ built-ins; a separately registered external CLI adapter becomes selectable
 without edits to generic dispatch, workflow, task, event, supervisor, or
 cleanup code.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -213,7 +214,9 @@ class ProviderCapabilities:
     def __post_init__(self) -> None:
         for name in PROVIDER_OPERATION_NAMES:
             if not isinstance(getattr(self, name), bool):
-                raise ProviderAdapterError(f"provider capability {name} must be boolean")
+                raise ProviderAdapterError(
+                    f"provider capability {name} must be boolean"
+                )
 
     def supports(self, operation: str) -> bool:
         if operation not in PROVIDER_OPERATION_NAMES:
@@ -288,7 +291,9 @@ class ProviderAdapterRegistration:
     provider_id: str = ""
     version: str = ""
     adapter_class: str = ""
-    capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities.codex)
+    capabilities: ProviderCapabilities = field(
+        default_factory=ProviderCapabilities.codex
+    )
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -442,7 +447,9 @@ class CodexProviderAdapter(BaseProviderAdapter):
             "turn.cancelled",
         }:
             return None
-        session_id = _nonempty(value.get("thread_id")) or _nonempty(value.get("threadId"))
+        session_id = _nonempty(value.get("thread_id")) or _nonempty(
+            value.get("threadId")
+        )
         if raw_type == "thread.started":
             return ProviderEvent("STARTED", session_id=session_id, raw_type=raw_type)
         kind = {
@@ -450,7 +457,9 @@ class CodexProviderAdapter(BaseProviderAdapter):
             "turn.failed": "FAILED",
             "turn.cancelled": "CANCELLED",
         }[raw_type]
-        return ProviderEvent(kind, session_id=session_id, outcome=kind, raw_type=raw_type)
+        return ProviderEvent(
+            kind, session_id=session_id, outcome=kind, raw_type=raw_type
+        )
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
         if event is not None and event.kind in {"FAILED", "CANCELLED"}:
@@ -480,7 +489,11 @@ class CodexProviderAdapter(BaseProviderAdapter):
 
     def last_message_path(self, run_root: Path, last_message_path: Path) -> Path | None:
         workspace = run_root.expanduser().resolve(strict=False) / ".agent-workspace"
-        effective = last_message_path if last_message_path.is_absolute() else workspace / last_message_path
+        effective = (
+            last_message_path
+            if last_message_path.is_absolute()
+            else workspace / last_message_path
+        )
         return effective.expanduser().resolve(strict=False)
 
 
@@ -524,7 +537,9 @@ class ClaudeCodeProviderAdapter(BaseProviderAdapter):
         if value is None:
             return None
         raw_type = _nonempty(value.get("type"))
-        session_id = _nonempty(value.get("session_id")) or _nonempty(value.get("sessionId"))
+        session_id = _nonempty(value.get("session_id")) or _nonempty(
+            value.get("sessionId")
+        )
         if raw_type == "system" and value.get("subtype") == "init":
             return ProviderEvent("STARTED", session_id=session_id, raw_type=raw_type)
         if raw_type != "result":
@@ -542,7 +557,9 @@ class ClaudeCodeProviderAdapter(BaseProviderAdapter):
                 raw_type=raw_type,
                 detail=_nonempty(value.get("result")) or subtype,
             )
-        return ProviderEvent("COMPLETED", session_id=session_id, outcome="COMPLETED", raw_type=raw_type)
+        return ProviderEvent(
+            "COMPLETED", session_id=session_id, outcome="COMPLETED", raw_type=raw_type
+        )
 
     def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
         if event is not None and event.kind in {"FAILED", "CANCELLED"}:
@@ -636,7 +653,9 @@ def register_provider_adapter(
     if not version or not version.strip():
         raise ProviderAdapterError("adapter version must be a non-empty string")
     if not isinstance(capabilities, ProviderCapabilities):
-        raise ProviderAdapterError("adapter capabilities must be a ProviderCapabilities record")
+        raise ProviderAdapterError(
+            "adapter capabilities must be a ProviderCapabilities record"
+        )
     _validate_adapter_contract(provider_id, adapter)
     if capabilities.notification:
         wake = getattr(adapter, "notification_wake_text", None)
@@ -668,7 +687,10 @@ def register_provider_adapter(
                 f"provider adapter {provider_id!r} declares notification but has no "
                 "deliver_notification safe-boundary binding"
             )
-        if getattr(deliver, "__func__", None) is BaseProviderAdapter.deliver_notification:
+        if (
+            getattr(deliver, "__func__", None)
+            is BaseProviderAdapter.deliver_notification
+        ):
             raise ProviderAdapterError(
                 f"provider adapter {provider_id!r} declares notification without a real "
                 "safe-boundary delivery binding; declare notification=False instead"
@@ -692,7 +714,9 @@ def unregister_provider_adapter(provider_id: str) -> bool:
     """Remove a foreign registration (test isolation); built-ins are retained."""
     provider_id = provider_id.strip()
     if provider_id in _BUILTIN_PROVIDER_IDS:
-        raise ProviderAdapterError(f"built-in provider {provider_id!r} cannot be unregistered")
+        raise ProviderAdapterError(
+            f"built-in provider {provider_id!r} cannot be unregistered"
+        )
     removed = _REGISTRY.pop(provider_id, None)
     _ADAPTERS.pop(provider_id, None)
     return removed is not None
@@ -828,8 +852,15 @@ def redact_command(argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         if any(lowered.startswith(marker) for marker in _CREDENTIAL_FLAG_MARKERS):
             redacted.append("<redacted>")
             if lowered in {
-                "--api-key", "--apikey", "--access-key", "--accesskey",
-                "--private-key", "--password", "--secret", "--token", "--credential",
+                "--api-key",
+                "--apikey",
+                "--access-key",
+                "--accesskey",
+                "--private-key",
+                "--password",
+                "--secret",
+                "--token",
+                "--credential",
             }:
                 # Exact flag form: the following value is also redacted.
                 redact_next = True
@@ -863,7 +894,9 @@ def build_provider_evidence(
     # with the complete argv length) but never guesses provider credential
     # spellings.
     redacted = adapter.redact_argv(argv)
-    if not isinstance(redacted, tuple) or not all(isinstance(item, str) for item in redacted):
+    if not isinstance(redacted, tuple) or not all(
+        isinstance(item, str) for item in redacted
+    ):
         raise ProviderAdapterError(
             f"provider adapter {provider_id!r} redact_argv must return a tuple of strings"
         )
@@ -1045,7 +1078,9 @@ def decide_resume_or_handoff(
                 reason="requested session does not match the persisted session",
             ),
         )
-    return ProviderResumeDecision("RESUME", "adapter supports resume and identity matches")
+    return ProviderResumeDecision(
+        "RESUME", "adapter supports resume and identity matches"
+    )
 
 
 CodexAdapter = CodexProviderAdapter

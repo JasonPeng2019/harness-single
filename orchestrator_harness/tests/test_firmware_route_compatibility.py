@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.discovery import discover_run
-from orchestrator_harness.tests.support import SuiteFixture, TemporaryGitRepository, write_json
+from orchestrator_harness.tests.support import (
+    SuiteFixture,
+    TemporaryGitRepository,
+    write_json,
+)
 
 
 class FirmwareRouteCompatibilityTests(unittest.TestCase):
@@ -74,19 +78,27 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
                 "service_tier": "priority",
             },
             "codex_command": ["codex"],
-            "config_overrides": ["model_reasoning_effort=\"medium\""],
+            "config_overrides": ['model_reasoning_effort="medium"'],
             "resume_thread_id": "retained-firmware-thread",
             "lane_event_log": str(
-                self.root / "multi-agent-logs" / "orchestrator-harness" / "s1" / "LANE_EVENTS.jsonl"
+                self.root
+                / "multi-agent-logs"
+                / "orchestrator-harness"
+                / "s1"
+                / "LANE_EVENTS.jsonl"
             ),
         }
         path = self.workspace / "retained-firmware.invocation.json"
         write_json(path, value)
         return path, value
 
-    def test_retained_schema_less_policy_bound_shape_preserves_firmware_contract(self) -> None:
+    def test_retained_schema_less_policy_bound_shape_preserves_firmware_contract(
+        self,
+    ) -> None:
         path, raw = self._firmware_invocation()
-        with patch.object(controller, "__file__", str(self.root / "package" / "lane_controller.py")):
+        with patch.object(
+            controller, "__file__", str(self.root / "package" / "lane_controller.py")
+        ):
             parsed = controller.load_invocation(path)
 
         self.assertIsNone(parsed.invocation_schema)
@@ -94,7 +106,9 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
         self.assertEqual(["board:stm-a", "serial:stm-a"], parsed.leases)
         self.assertEqual(["STM-A"], parsed.board_tokens)
         self.assertEqual(["byo-firmware-stm-a"], parsed.mcp_servers)
-        self.assertEqual({"commit": "f003f84", "profile": "stm32l476rg"}, parsed.server_snapshot)
+        self.assertEqual(
+            {"commit": "f003f84", "profile": "stm32l476rg"}, parsed.server_snapshot
+        )
         self.assertEqual(self.policy, parsed.policy_path)
         self.assertEqual(self.policy_sha256, parsed.policy_sha256)
         self.assertEqual("stm_a_bringup", parsed.label)
@@ -102,12 +116,20 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
         self.assertEqual("medium", parsed.reasoning_effort)
         self.assertEqual("priority", parsed.service_tier)
         self.assertEqual(["codex"], parsed.codex_command)
-        self.assertEqual(["model_reasoning_effort=\"medium\""], parsed.config_overrides)
+        self.assertEqual(['model_reasoning_effort="medium"'], parsed.config_overrides)
         self.assertEqual("retained-firmware-thread", parsed.requested_thread_id)
-        self.assertEqual(self.workspace / "stm_a_bringup_controller.status.json", parsed.status_path)
-        self.assertEqual(self.workspace / "stm_a_bringup_codex.jsonl", parsed.jsonl_path)
         self.assertEqual(
-            self.root / "multi-agent-logs" / "orchestrator-harness" / "s1" / "LANE_EVENTS.jsonl",
+            self.workspace / "stm_a_bringup_controller.status.json", parsed.status_path
+        )
+        self.assertEqual(
+            self.workspace / "stm_a_bringup_codex.jsonl", parsed.jsonl_path
+        )
+        self.assertEqual(
+            self.root
+            / "multi-agent-logs"
+            / "orchestrator-harness"
+            / "s1"
+            / "LANE_EVENTS.jsonl",
             parsed.event_log,
         )
         self.assertEqual("danger-full-access", parsed.sandbox)
@@ -163,8 +185,12 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
         self.assertEqual("coding:parser", parsed.lane_id)
         self.assertEqual(["service:parser"], parsed.resources)
         self.assertIsNotNone(parsed.repository)
-        self.assertEqual(coding_root, parsed.repository.worktree_root if parsed.repository else None)
-        self.assertEqual(repository.branch, parsed.repository.branch if parsed.repository else None)
+        self.assertEqual(
+            coding_root, parsed.repository.worktree_root if parsed.repository else None
+        )
+        self.assertEqual(
+            repository.branch, parsed.repository.branch if parsed.repository else None
+        )
         self.assertEqual("workspace-write", parsed.sandbox)
         self.assertIsNone(parsed.policy_path)
         self.assertEqual([], parsed.board_tokens)
@@ -184,7 +210,9 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
                 },
             )
             write_json(coding_workspace / "RESULT.json", {"status": "PASS"})
-            coding = discover_run(coding_workspace.parent, coding_workspace, fixture.config)
+            coding = discover_run(
+                coding_workspace.parent, coding_workspace, fixture.config
+            )
             self.assertIsNone(coding.result)
             self.assertEqual("CODING_RESULT_INVALID", coding.errors[0].code)
 
@@ -201,7 +229,9 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
                     "worker_invocation_id": "coding-001",
                 },
             )
-            firmware = discover_run(firmware_workspace.parent, firmware_workspace, fixture.config)
+            firmware = discover_run(
+                firmware_workspace.parent, firmware_workspace, fixture.config
+            )
             self.assertIsNone(firmware.result)
             self.assertEqual("CODING_RESULT_INVALID", firmware.errors[0].code)
         finally:

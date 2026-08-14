@@ -40,7 +40,9 @@ NOTIFICATION_OPEN = "OPEN"
 NOTIFICATION_EXTERNALLY_BLOCKED = "EXTERNALLY_BLOCKED"
 NOTIFICATION_STOP_OPEN_ITEMS_REMAIN = "OPEN_ITEMS_REMAIN"
 NOTIFICATION_STOP_QUEUE_EMPTY = "QUEUE_EMPTY"
-NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED = "EXTERNALLY_BLOCKED_FINAL_RESPONSE_REQUIRED"
+NOTIFICATION_STOP_EXTERNAL_RESPONSE_REQUIRED = (
+    "EXTERNALLY_BLOCKED_FINAL_RESPONSE_REQUIRED"
+)
 NOTIFICATION_STOP_EXTERNAL_DECLARED = "EXTERNALLY_BLOCKED_DECLARED"
 
 _CAPABILITY_NAMES = (
@@ -234,10 +236,20 @@ class DeliveryNotice:
         if value.get("schema") != DELIVERY_NOTICE_SCHEMA:
             raise HostAdapterError("invalid delivery notice schema")
         allowed = {
-            "schema", "notice_id", "run_id", "queue_id", "manager_session_id",
-            "manager_thread_id", "registration_id", "registration_generation",
-            "observed_queue_revision", "pending_count", "highest_class",
-            "highest_severity", "observed_utc", "adapter_profile",
+            "schema",
+            "notice_id",
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "registration_id",
+            "registration_generation",
+            "observed_queue_revision",
+            "pending_count",
+            "highest_class",
+            "highest_severity",
+            "observed_utc",
+            "adapter_profile",
         }
         if set(value) != allowed:
             raise HostAdapterError("delivery notice has an invalid closed shape")
@@ -294,12 +306,20 @@ class DeliveryReceipt:
         ):
             _text(value, name)
         if self.outcome not in _RECEIPT_OUTCOMES:
-            raise HostAdapterError(f"unsupported delivery receipt outcome: {self.outcome}")
+            raise HostAdapterError(
+                f"unsupported delivery receipt outcome: {self.outcome}"
+            )
         if self.boundary not in _SAFE_BOUNDARIES:
-            raise HostAdapterError(f"unsupported delivery receipt boundary: {self.boundary}")
+            raise HostAdapterError(
+                f"unsupported delivery receipt boundary: {self.boundary}"
+            )
         _nonnegative_int(self.registration_generation, "registration_generation")
         _nonnegative_int(self.observed_queue_revision, "observed_queue_revision")
-        if not isinstance(self.attempt, int) or isinstance(self.attempt, bool) or self.attempt < 1:
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+        ):
             raise HostAdapterError("receipt attempt must be a positive integer")
         if self.error_class is not None:
             _text(self.error_class, "error_class", limit=128)
@@ -313,13 +333,28 @@ class DeliveryReceipt:
         if value.get("schema") != DELIVERY_RECEIPT_SCHEMA:
             raise HostAdapterError("invalid delivery receipt schema")
         allowed = {
-            "schema", "receipt_id", "notice_id", "run_id", "queue_id",
-            "manager_session_id", "manager_thread_id", "registration_id",
-            "registration_generation", "observed_queue_revision", "boundary",
-            "outcome", "delivered_utc", "adapter_profile", "attempt",
+            "schema",
+            "receipt_id",
+            "notice_id",
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "registration_id",
+            "registration_generation",
+            "observed_queue_revision",
+            "boundary",
+            "outcome",
+            "delivered_utc",
+            "adapter_profile",
+            "attempt",
             "error_class",
         }
-        if set(value) - allowed or "error_class" in value and value["error_class"] is None:
+        if (
+            set(value) - allowed
+            or "error_class" in value
+            and value["error_class"] is None
+        ):
             raise HostAdapterError("delivery receipt has an invalid closed shape")
         required = allowed - {"schema", "error_class"}
         if set(value) & required != required:
@@ -405,12 +440,17 @@ class NotificationStopDecision:
             raise HostAdapterError("stop decision permitted must be boolean")
         _text(self.reason, "stop decision reason")
         _nonnegative_int(self.open_count, "stop decision open_count")
-        _nonnegative_int(self.externally_blocked_count, "stop decision externally_blocked_count")
+        _nonnegative_int(
+            self.externally_blocked_count, "stop decision externally_blocked_count"
+        )
         if not isinstance(self.declarations, tuple) or not all(
-            isinstance(item, dict) and set(item) == {"notification_id", "required_actor", "required_action"}
+            isinstance(item, dict)
+            and set(item) == {"notification_id", "required_actor", "required_action"}
             for item in self.declarations
         ):
-            raise HostAdapterError("stop decision declarations have an invalid closed shape")
+            raise HostAdapterError(
+                "stop decision declarations have an invalid closed shape"
+            )
 
     def as_record(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -437,7 +477,9 @@ class HostAdapter(ABC):
         return self.profile.capabilities
 
     @abstractmethod
-    def deliver_notice(self, notice: DeliveryNotice, *, boundary: str) -> DeliveryReceipt:
+    def deliver_notice(
+        self, notice: DeliveryNotice, *, boundary: str
+    ) -> DeliveryReceipt:
         """Deliver one bounded notice at a host-confirmed safe boundary."""
 
     def finalization_backstop(self, notice: DeliveryNotice | None) -> bool:
@@ -461,7 +503,9 @@ class FutureHostFixture(HostAdapter):
     def profile(self) -> HostProfile:
         return self._profile
 
-    def deliver_notice(self, notice: DeliveryNotice, *, boundary: str) -> DeliveryReceipt:
+    def deliver_notice(
+        self, notice: DeliveryNotice, *, boundary: str
+    ) -> DeliveryReceipt:
         del notice, boundary
         raise UnsupportedHostAdapterError(
             f"future host fixture {self.profile.kind!r} has no installed implementation"
@@ -494,7 +538,9 @@ def _severity_for(record: Mapping[str, Any]) -> tuple[int, str]:
     facts = record.get("facts") if isinstance(record.get("facts"), Mapping) else {}
     value = facts.get("severity")
     if isinstance(value, str) and value.strip():
-        rank = {"critical": 0, "error": 1, "warning": 2, "info": 3}.get(value.lower(), 4)
+        rank = {"critical": 0, "error": 1, "warning": 2, "info": 3}.get(
+            value.lower(), 4
+        )
         return rank, value.lower()
     priority = record.get("priority")
     try:
@@ -521,7 +567,9 @@ def _highest_pending(pending: list[dict[str, Any]]) -> tuple[str, str]:
         ),
     )
     selected = ordered[0]
-    return _text(selected.get("event_type"), "highest_class", limit=128), _severity_for(selected)[1]
+    return _text(selected.get("event_type"), "highest_class", limit=128), _severity_for(
+        selected
+    )[1]
 
 
 def _adapter_profile_text(adapter: HostAdapter) -> str:
@@ -549,7 +597,9 @@ class DeliveryCoordinator:
             raise HostAdapterError("coordinator requires one HostAdapter instance")
         if self.max_attempts < 1 or self.max_attempts > 8:
             raise HostAdapterError("max_attempts must be between one and eight")
-        self.state_root = Path(self.state_root or (self.router.root / "coordinator")).absolute()
+        self.state_root = Path(
+            self.state_root or (self.router.root / "coordinator")
+        ).absolute()
         self._transaction = PreparedOutputTransaction(
             self.state_root,
             allowed_roots=(self.state_root.parent,),
@@ -573,10 +623,18 @@ class DeliveryCoordinator:
         state = self.load_state()
         binding = state["binding"]
         return {
-            **{key: binding[key] for key in (
-                "run_id", "queue_id", "manager_session_id", "manager_thread_id",
-                "registration_id", "manager_invocation_id", "binding_digest",
-            )},
+            **{
+                key: binding[key]
+                for key in (
+                    "run_id",
+                    "queue_id",
+                    "manager_session_id",
+                    "manager_thread_id",
+                    "registration_id",
+                    "manager_invocation_id",
+                    "binding_digest",
+                )
+            },
             "registration_generation": state["registration_generation"],
         }
 
@@ -595,7 +653,9 @@ class DeliveryCoordinator:
                 return prior
         return 1
 
-    def _new_state(self, *, generation: int, status: str = "REGISTERED") -> dict[str, Any]:
+    def _new_state(
+        self, *, generation: int, status: str = "REGISTERED"
+    ) -> dict[str, Any]:
         return {
             "schema": DELIVERY_COORDINATOR_SCHEMA,
             "binding": self.binding,
@@ -636,16 +696,23 @@ class DeliveryCoordinator:
 
     def load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
-            return self._new_state(generation=self._default_generation(None), status="UNREGISTERED")
+            return self._new_state(
+                generation=self._default_generation(None), status="UNREGISTERED"
+            )
         self._transaction.revalidate(self.state_path)
         try:
             value = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HostAdapterError(f"cannot read coordinator state: {exc}") from exc
-        if not isinstance(value, dict) or value.get("schema") != DELIVERY_COORDINATOR_SCHEMA:
+        if (
+            not isinstance(value, dict)
+            or value.get("schema") != DELIVERY_COORDINATOR_SCHEMA
+        ):
             raise HostAdapterError("invalid delivery coordinator state")
         binding = value.get("binding")
-        if not isinstance(binding, Mapping) or _binding_digest(binding) != value.get("binding_digest"):
+        if not isinstance(binding, Mapping) or _binding_digest(binding) != value.get(
+            "binding_digest"
+        ):
             raise HostAdapterError("coordinator binding digest is invalid")
         return dict(value)
 
@@ -655,14 +722,26 @@ class DeliveryCoordinator:
         if not isinstance(actual, Mapping):
             raise DeliveryBindingError("coordinator has no binding")
         for key in (
-            "run_id", "queue_id", "manager_session_id", "manager_thread_id",
-            "registration_id", "binding_digest",
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "registration_id",
+            "binding_digest",
         ):
-            expected_value = expected.get(key) if key != "binding_digest" else _binding_digest(expected)
+            expected_value = (
+                expected.get(key)
+                if key != "binding_digest"
+                else _binding_digest(expected)
+            )
             if actual.get(key) != expected_value:
                 raise DeliveryBindingError(f"coordinator binding mismatch in {key}")
         generation = state.get("registration_generation")
-        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+        ):
             raise DeliveryBindingError("coordinator registration generation is invalid")
         if state.get("adapter") != self.adapter.profile.as_record():
             raise DeliveryBindingError("coordinator adapter profile mismatch")
@@ -677,7 +756,9 @@ class DeliveryCoordinator:
         if prior is not None:
             prior_generation = prior.get("registration_generation")
             if prior_generation != generation and prior.get("status") != "RELEASED":
-                raise DeliveryBindingError("registration generation changed while coordinator was active")
+                raise DeliveryBindingError(
+                    "registration generation changed while coordinator was active"
+                )
         state = dict(prior or self._new_state(generation=generation))
         state["status"] = "REGISTERED"
         state["registration_generation"] = generation
@@ -716,18 +797,34 @@ class DeliveryCoordinator:
         else:
             expected = self.binding
             for key in (
-                "run_id", "queue_id", "manager_session_id", "manager_thread_id",
-                "registration_id", "binding_digest",
+                "run_id",
+                "queue_id",
+                "manager_session_id",
+                "manager_thread_id",
+                "registration_id",
+                "binding_digest",
             ):
-                if wake.get(key) != (expected.get(key) if key != "binding_digest" else _binding_digest(expected)):
+                if wake.get(key) != (
+                    expected.get(key)
+                    if key != "binding_digest"
+                    else _binding_digest(expected)
+                ):
                     raise DeliveryBindingError(f"wake binding mismatch in {key}")
             revision = wake.get("wake_revision")
-            if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+            ):
                 raise DeliveryBindingError("wake revision is invalid")
             if revision > self.router.wake_revision:
-                raise DeliveryBindingError("wake revision was not published by this queue")
+                raise DeliveryBindingError(
+                    "wake revision was not published by this queue"
+                )
             wake_generation = wake.get("registration_generation")
-            if wake_generation is not None and wake_generation != state.get("registration_generation"):
+            if wake_generation is not None and wake_generation != state.get(
+                "registration_generation"
+            ):
                 raise DeliveryBindingError("wake registration generation is stale")
         return revision
 
@@ -735,7 +832,9 @@ class DeliveryCoordinator:
         self._state_or_register()
         return self.router.pending_events()
 
-    def notice_for_wake(self, wake: Mapping[str, Any] | None = None) -> DeliveryNotice | None:
+    def notice_for_wake(
+        self, wake: Mapping[str, Any] | None = None
+    ) -> DeliveryNotice | None:
         state = self._state_or_register()
         revision = self._validate_wake(wake)
         pending = self.router.pending_events()
@@ -743,7 +842,9 @@ class DeliveryCoordinator:
         if not isinstance(state_revision, int) or state_revision < 0:
             raise HostAdapterError("coordinator last wake revision is invalid")
         if revision < state_revision:
-            raise DeliveryBindingError("stale wake revision cannot replay across coordinator state")
+            raise DeliveryBindingError(
+                "stale wake revision cannot replay across coordinator state"
+            )
         if not pending:
             state["last_seen_wake_revision"] = revision
             state["outstanding_notice"] = None
@@ -764,14 +865,21 @@ class DeliveryCoordinator:
             else:
                 notice_id = "notice-" + uuid.uuid4().hex
         else:
-            notice_id = "notice-" + hashlib.sha256(
-                canonical_json({**binding, "generation": generation}).encode("utf-8")
-            ).hexdigest()[:32]
+            notice_id = (
+                "notice-"
+                + hashlib.sha256(
+                    canonical_json({**binding, "generation": generation}).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:32]
+            )
         notice = DeliveryNotice(
             notice_id=notice_id,
             run_id=_text(binding["run_id"], "run_id"),
             queue_id=_text(binding["queue_id"], "queue_id"),
-            manager_session_id=_text(binding["manager_session_id"], "manager_session_id"),
+            manager_session_id=_text(
+                binding["manager_session_id"], "manager_session_id"
+            ),
             manager_thread_id=_text(binding["manager_thread_id"], "manager_thread_id"),
             registration_id=_text(binding["registration_id"], "registration_id"),
             registration_generation=generation,
@@ -852,7 +960,11 @@ class DeliveryCoordinator:
         state = self._state_or_register()
         if notice is None:
             stored = state.get("outstanding_notice")
-            notice = DeliveryNotice.from_record(stored) if isinstance(stored, Mapping) else self.notice_for_wake()
+            notice = (
+                DeliveryNotice.from_record(stored)
+                if isinstance(stored, Mapping)
+                else self.notice_for_wake()
+            )
         if notice is None:
             return None
         self._assert_notice_binding(notice, state)
@@ -893,11 +1005,19 @@ class DeliveryCoordinator:
             receipt = self._receipt(
                 notice,
                 boundary=boundary,
-                outcome="DELIVERY_REJECTED" if isinstance(exc, DeliveryBindingError) else (
-                    "DELIVERY_FAILED" if attempt < self.max_attempts else "DELIVERY_DEGRADED"
+                outcome="DELIVERY_REJECTED"
+                if isinstance(exc, DeliveryBindingError)
+                else (
+                    "DELIVERY_FAILED"
+                    if attempt < self.max_attempts
+                    else "DELIVERY_DEGRADED"
                 ),
                 attempt=attempt,
-                error_class=("RECEIPT_BINDING_MISMATCH" if isinstance(exc, DeliveryBindingError) else type(exc).__name__),
+                error_class=(
+                    "RECEIPT_BINDING_MISMATCH"
+                    if isinstance(exc, DeliveryBindingError)
+                    else type(exc).__name__
+                ),
             )
         # S3's delivery journal is transport evidence.  Passing an empty event
         # list is intentional: no transport receipt can acknowledge queue work.
@@ -933,21 +1053,33 @@ class DeliveryCoordinator:
                 else None
             )
         state["last_receipt"] = receipt.as_record()
-        state["status"] = "DELIVERED" if receipt.outcome == "DELIVERED" else receipt.outcome
+        state["status"] = (
+            "DELIVERED" if receipt.outcome == "DELIVERED" else receipt.outcome
+        )
         self._write_state(state)
         return receipt
 
     deliver = deliver_at_boundary
 
-    def _assert_notice_binding(self, notice: DeliveryNotice, state: Mapping[str, Any]) -> None:
+    def _assert_notice_binding(
+        self, notice: DeliveryNotice, state: Mapping[str, Any]
+    ) -> None:
         expected = self.binding_identity
         actual = notice.binding
-        for key in ("run_id", "queue_id", "manager_session_id", "manager_thread_id", "registration_id"):
+        for key in (
+            "run_id",
+            "queue_id",
+            "manager_session_id",
+            "manager_thread_id",
+            "registration_id",
+        ):
             if actual.get(key) != expected.get(key):
                 raise DeliveryBindingError(f"notice binding mismatch in {key}")
         if notice.adapter_profile != _adapter_profile_text(self.adapter):
             raise DeliveryBindingError("notice adapter profile mismatch")
-        if notice.registration_generation != expected.get("registration_generation") or notice.registration_generation != state.get("registration_generation"):
+        if notice.registration_generation != expected.get(
+            "registration_generation"
+        ) or notice.registration_generation != state.get("registration_generation"):
             raise DeliveryBindingError("notice registration generation mismatch")
 
     def _validate_receipt(
@@ -973,11 +1105,23 @@ class DeliveryCoordinator:
             ("notice_id", receipt.notice_id, notice.notice_id),
             ("run_id", receipt.run_id, notice.run_id),
             ("queue_id", receipt.queue_id, notice.queue_id),
-            ("manager_session_id", receipt.manager_session_id, notice.manager_session_id),
+            (
+                "manager_session_id",
+                receipt.manager_session_id,
+                notice.manager_session_id,
+            ),
             ("manager_thread_id", receipt.manager_thread_id, notice.manager_thread_id),
             ("registration_id", receipt.registration_id, notice.registration_id),
-            ("registration_generation", receipt.registration_generation, notice.registration_generation),
-            ("observed_queue_revision", receipt.observed_queue_revision, notice.observed_queue_revision),
+            (
+                "registration_generation",
+                receipt.registration_generation,
+                notice.registration_generation,
+            ),
+            (
+                "observed_queue_revision",
+                receipt.observed_queue_revision,
+                notice.observed_queue_revision,
+            ),
             ("adapter_profile", receipt.adapter_profile, notice.adapter_profile),
             ("boundary", receipt.boundary, boundary),
         )
@@ -985,7 +1129,9 @@ class DeliveryCoordinator:
             if actual != expected_value:
                 raise DeliveryBindingError(f"adapter receipt mismatch in {name}")
         if receipt.registration_generation != expected.get("registration_generation"):
-            raise DeliveryBindingError("adapter receipt registration generation is stale")
+            raise DeliveryBindingError(
+                "adapter receipt registration generation is stale"
+            )
         if receipt.run_id != expected.get("run_id"):
             raise DeliveryBindingError("adapter receipt run binding is stale")
         if receipt.queue_id != expected.get("queue_id"):
@@ -997,23 +1143,37 @@ class DeliveryCoordinator:
         if receipt.registration_id != expected.get("registration_id"):
             raise DeliveryBindingError("adapter receipt registration ID is stale")
         if receipt.observed_queue_revision > self.router.wake_revision:
-            raise DeliveryBindingError("adapter receipt references an unpublished wake revision")
-        if not isinstance(state.get("registration_generation"), int) or receipt.registration_generation != state["registration_generation"]:
+            raise DeliveryBindingError(
+                "adapter receipt references an unpublished wake revision"
+            )
+        if (
+            not isinstance(state.get("registration_generation"), int)
+            or receipt.registration_generation != state["registration_generation"]
+        ):
             raise DeliveryBindingError("adapter receipt state generation is stale")
         if receipt.outcome != "DELIVERED":
-            raise DeliveryBindingError("successful journal requires a delivered receipt")
+            raise DeliveryBindingError(
+                "successful journal requires a delivered receipt"
+            )
         if parse_utc(receipt.delivered_utc) is None:
             raise DeliveryBindingError("adapter receipt timestamp is invalid")
 
-    def acknowledge_event(self, event_id: str, *, action: str = "ACKNOWLEDGED") -> ManagerEventAck:
+    def acknowledge_event(
+        self, event_id: str, *, action: str = "ACKNOWLEDGED"
+    ) -> ManagerEventAck:
         if isinstance(event_id, DeliveryReceipt):
-            raise HostAdapterError("a delivery receipt is not a manager event acknowledgement")
+            raise HostAdapterError(
+                "a delivery receipt is not a manager event acknowledgement"
+            )
         event_id = _text(event_id, "event_id")
         state = self._state_or_register()
         policy = dict(state.get("notification_policy") or {})
         items_map = dict(policy.get("items") or {})
         entry = items_map.get(event_id)
-        if isinstance(entry, Mapping) and entry.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED:
+        if (
+            isinstance(entry, Mapping)
+            and entry.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED
+        ):
             raise HostAdapterError(
                 "EXTERNALLY_BLOCKED notification items cannot be acknowledged by the worker"
             )
@@ -1028,8 +1188,14 @@ class DeliveryCoordinator:
         state["attempt_count"] = 0
         state["retry_backoff_seconds"] = 0.0
         state["next_retry_utc"] = None
-        state["outstanding_notice"] = None if not self.router.pending_events() else state.get("outstanding_notice")
-        state["status"] = "ACKNOWLEDGED" if not self.router.pending_events() else "NOTICE_READY"
+        state["outstanding_notice"] = (
+            None
+            if not self.router.pending_events()
+            else state.get("outstanding_notice")
+        )
+        state["status"] = (
+            "ACKNOWLEDGED" if not self.router.pending_events() else "NOTICE_READY"
+        )
         self._write_state(state)
         return ack
 
@@ -1070,7 +1236,9 @@ class DeliveryCoordinator:
             "data": data,
             "binding": self.binding,
         }
-        admitted = self.router.admit(event, priority=priority, payload_ref=payload_ref, binding=self.binding)
+        admitted = self.router.admit(
+            event, priority=priority, payload_ref=payload_ref, binding=self.binding
+        )
         if admitted is not None and externally_blocked:
             if required_actor is None or required_action is None:
                 raise HostAdapterError(
@@ -1098,25 +1266,34 @@ class DeliveryCoordinator:
             event_id = record.get("event_id")
             if not isinstance(event_id, str) or not event_id:
                 continue
-            decoration = items_map.get(event_id) if isinstance(items_map, Mapping) else None
-            if isinstance(decoration, Mapping) and decoration.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED:
-                items.append({
-                    "schema": NOTIFICATION_ITEM_SCHEMA,
-                    "notification_id": event_id,
-                    "state": NOTIFICATION_EXTERNALLY_BLOCKED,
-                    "required_actor": decoration.get("required_actor"),
-                    "required_action": decoration.get("required_action"),
-                    "external_block_reason": decoration.get("reason"),
-                })
+            decoration = (
+                items_map.get(event_id) if isinstance(items_map, Mapping) else None
+            )
+            if (
+                isinstance(decoration, Mapping)
+                and decoration.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED
+            ):
+                items.append(
+                    {
+                        "schema": NOTIFICATION_ITEM_SCHEMA,
+                        "notification_id": event_id,
+                        "state": NOTIFICATION_EXTERNALLY_BLOCKED,
+                        "required_actor": decoration.get("required_actor"),
+                        "required_action": decoration.get("required_action"),
+                        "external_block_reason": decoration.get("reason"),
+                    }
+                )
             else:
-                items.append({
-                    "schema": NOTIFICATION_ITEM_SCHEMA,
-                    "notification_id": event_id,
-                    "state": NOTIFICATION_OPEN,
-                    "required_actor": None,
-                    "required_action": None,
-                    "external_block_reason": None,
-                })
+                items.append(
+                    {
+                        "schema": NOTIFICATION_ITEM_SCHEMA,
+                        "notification_id": event_id,
+                        "state": NOTIFICATION_OPEN,
+                        "required_actor": None,
+                        "required_action": None,
+                        "external_block_reason": None,
+                    }
+                )
         return items
 
     def mark_externally_blocked(
@@ -1134,7 +1311,9 @@ class DeliveryCoordinator:
         state = self._state_or_register()
         pending_ids = {item.get("event_id") for item in self.router.pending_events()}
         if event_id not in pending_ids:
-            raise HostAdapterError("external block references an item that is not active")
+            raise HostAdapterError(
+                "external block references an item that is not active"
+            )
         policy = dict(state.get("notification_policy") or {})
         items_map = dict(policy.get("items") or {})
         entry = {
@@ -1159,7 +1338,11 @@ class DeliveryCoordinator:
         """
         items = self.notification_items()
         open_items = [item for item in items if item.get("state") == NOTIFICATION_OPEN]
-        blocked = [item for item in items if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED]
+        blocked = [
+            item
+            for item in items
+            if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED
+        ]
         if open_items:
             return NotificationStopDecision(
                 permitted=False,
@@ -1179,7 +1362,8 @@ class DeliveryCoordinator:
         items_map = policy.get("items") if isinstance(policy, Mapping) else {}
         complete = all(
             isinstance(items_map.get(item["notification_id"]), Mapping)
-            and items_map[item["notification_id"]].get("final_response_declared") is True
+            and items_map[item["notification_id"]].get("final_response_declared")
+            is True
             for item in blocked
         )
         if complete:
@@ -1219,7 +1403,11 @@ class DeliveryCoordinator:
         ):
             raise HostAdapterError("final response must be a list of declarations")
         items = self.notification_items()
-        blocked = [item for item in items if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED]
+        blocked = [
+            item
+            for item in items
+            if item.get("state") == NOTIFICATION_EXTERNALLY_BLOCKED
+        ]
         expected = {
             (item["notification_id"], item["required_actor"], item["required_action"])
             for item in blocked
@@ -1230,12 +1418,21 @@ class DeliveryCoordinator:
             required_actor = declaration.get("required_actor")
             required_action = declaration.get("required_action")
             if (
-                not isinstance(notification_id, str) or not notification_id.strip()
-                or not isinstance(required_actor, str) or not required_actor.strip()
-                or not isinstance(required_action, str) or not required_action.strip()
+                not isinstance(notification_id, str)
+                or not notification_id.strip()
+                or not isinstance(required_actor, str)
+                or not required_actor.strip()
+                or not isinstance(required_action, str)
+                or not required_action.strip()
             ):
                 raise HostAdapterError("final response declaration is incomplete")
-            provided.add((notification_id.strip(), required_actor.strip(), required_action.strip()))
+            provided.add(
+                (
+                    notification_id.strip(),
+                    required_actor.strip(),
+                    required_action.strip(),
+                )
+            )
         if provided != expected:
             raise HostAdapterError(
                 "final response must name every active EXTERNALLY_BLOCKED notification ID "
@@ -1318,7 +1515,9 @@ class DeliveryCoordinator:
             supervisor_kwargs["observer"] = observer
         if parent_pid is not None:
             supervisor_kwargs["parent_pid"] = parent_pid
-        self._helper_supervisor = ProcessSupervisor(process, identity, **supervisor_kwargs)
+        self._helper_supervisor = ProcessSupervisor(
+            process, identity, **supervisor_kwargs
+        )
         state = self._state_or_register()
         state["helper"] = {
             "state": "OWNED",

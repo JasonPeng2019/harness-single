@@ -55,7 +55,10 @@ class DiscoveryTests(unittest.TestCase):
     def test_declared_record_rejects_arbitrary_nested_pid_ownership(self) -> None:
         workspace = self.fixture.workspace()
         unrelated = workspace / "nested" / "metadata.json"
-        write_json(unrelated, {"metadata": {"pid": 9001, "created_utc": "2026-07-30T12:00:00Z"}})
+        write_json(
+            unrelated,
+            {"metadata": {"pid": 9001, "created_utc": "2026-07-30T12:00:00Z"}},
+        )
         write_json(
             workspace / "record-manifest.json",
             {
@@ -68,7 +71,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual((), records.helper_records)
         self.assertEqual((), records.mcp_records)
 
-    def test_record_cache_hits_unchanged_identity_and_invalidates_on_file_change(self) -> None:
+    def test_record_cache_hits_unchanged_identity_and_invalidates_on_file_change(
+        self,
+    ) -> None:
         path = self.fixture.workspace() / "helper_process.json"
         write_json(path, {"kind": "helper", "version": 1})
         _clear_observation_caches()
@@ -84,7 +89,9 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(2, read.call_count)
             self.assertNotEqual(first.stable.sha256, changed.stable.sha256)
 
-    def test_poisoned_git_environment_clean_then_dirty_invalidates_cached_coding_result(self) -> None:
+    def test_poisoned_git_environment_clean_then_dirty_invalidates_cached_coding_result(
+        self,
+    ) -> None:
         run_root = self.fixture.workspace().parent
         repository = TemporaryGitRepository.create(run_root)
         (run_root / ".gitignore").write_text(".agent-workspace/\n", encoding="utf-8")
@@ -117,21 +124,28 @@ class DiscoveryTests(unittest.TestCase):
             },
         )
         _clear_observation_caches()
-        with patch(
-            "orchestrator_harness.discovery.validate_coding_result",
-            wraps=validate_coding_result,
-        ) as validate, patch.dict(
-            os.environ,
-            {
-                "GIT_DIR": str(run_root / "poisoned-git"),
-                "GIT_COMMON_DIR": str(run_root / "poisoned-common"),
-                "GIT_INDEX_FILE": str(run_root / "poisoned-index"),
-                "GIT_WORK_TREE": str(run_root / "poisoned-worktree"),
-            },
-            clear=False,
+        with (
+            patch(
+                "orchestrator_harness.discovery.validate_coding_result",
+                wraps=validate_coding_result,
+            ) as validate,
+            patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(run_root / "poisoned-git"),
+                    "GIT_COMMON_DIR": str(run_root / "poisoned-common"),
+                    "GIT_INDEX_FILE": str(run_root / "poisoned-index"),
+                    "GIT_WORK_TREE": str(run_root / "poisoned-worktree"),
+                },
+                clear=False,
+            ),
         ):
-            self.assertIsNotNone(discover_run(run_root, workspace, self.fixture.config).result)
-            self.assertIsNotNone(discover_run(run_root, workspace, self.fixture.config).result)
+            self.assertIsNotNone(
+                discover_run(run_root, workspace, self.fixture.config).result
+            )
+            self.assertIsNotNone(
+                discover_run(run_root, workspace, self.fixture.config).result
+            )
             self.assertEqual(1, validate.call_count)
             self.assertIsNotNone(
                 discover_run(
@@ -147,7 +161,9 @@ class DiscoveryTests(unittest.TestCase):
             self.assertIsNone(dirty.result)
             self.assertEqual(3, validate.call_count)
 
-    def test_canonical_result_task_card_digest_is_checked_at_discovery_boundary(self) -> None:
+    def test_canonical_result_task_card_digest_is_checked_at_discovery_boundary(
+        self,
+    ) -> None:
         workspace = self.fixture.workspace("S2_digest")
         status = workspace / "worker_controller.status.json"
         card_digest = "a" * 64

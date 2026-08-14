@@ -160,7 +160,9 @@ def windows_process_query(
         return ProcessQuery(
             False,
             None,
-            (f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",),
+            (
+                f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",
+            ),
         )
     try:
         raw = json.loads(completed.stdout.lstrip("\ufeff") or "[]")
@@ -262,7 +264,10 @@ def targeted_process_query(
         query = _linux_process_query(pid)
     else:
         return ProcessQuery(False, None, ("unsupported process platform",))
-    if expected_parent_pid is not None and query.parent_matches(expected_parent_pid) is False:
+    if (
+        expected_parent_pid is not None
+        and query.parent_matches(expected_parent_pid) is False
+    ):
         return ProcessQuery(
             query.complete,
             query.process,
@@ -337,23 +342,33 @@ def process_group_inventory(
     deliberately incomplete: group-only emptiness is not terminal evidence.
     """
 
-    valid_group = (
-        process_group_id is None
-        or (isinstance(process_group_id, int) and not isinstance(process_group_id, bool) and process_group_id > 0)
+    valid_group = process_group_id is None or (
+        isinstance(process_group_id, int)
+        and not isinstance(process_group_id, bool)
+        and process_group_id > 0
     )
-    valid_session = (
-        session_id is None
-        or (isinstance(session_id, int) and not isinstance(session_id, bool) and session_id > 0)
+    valid_session = session_id is None or (
+        isinstance(session_id, int)
+        and not isinstance(session_id, bool)
+        and session_id > 0
     )
-    valid_root = (
-        root_pid is None
-        or (isinstance(root_pid, int) and not isinstance(root_pid, bool) and root_pid > 0)
+    valid_root = root_pid is None or (
+        isinstance(root_pid, int) and not isinstance(root_pid, bool) and root_pid > 0
     )
     if not valid_group or not valid_session or not valid_root:
         return ProcessBoundaryInventory(
-            False, "linux-subreaper", boundary_identity, errors=("process boundary identity is invalid",), source="/proc"
+            False,
+            "linux-subreaper",
+            boundary_identity,
+            errors=("process boundary identity is invalid",),
+            source="/proc",
         )
-    if root_pid is None or root_identity is None or root_identity.created_utc is None or (process_group_id is None and session_id is None):
+    if (
+        root_pid is None
+        or root_identity is None
+        or root_identity.created_utc is None
+        or (process_group_id is None and session_id is None)
+    ):
         return ProcessBoundaryInventory(
             False,
             "linux-subreaper",
@@ -372,7 +387,9 @@ def process_group_inventory(
             False,
             "linux-subreaper",
             boundary_identity or f"pgid:{process_group_id}",
-            errors=tuple(getattr(snapshot, "errors", ("process snapshot is incomplete",))),
+            errors=tuple(
+                getattr(snapshot, "errors", ("process snapshot is incomplete",))
+            ),
             source="/proc",
         )
 
@@ -387,7 +404,10 @@ def process_group_inventory(
     current_root = by_pid.get(root_pid)
     if current_root is not None and current_root.created_utc is None:
         errors.append(f"provider root {root_pid} lacks a creation identity")
-    elif current_root is not None and (current_root.pid, iso_utc(current_root.created_utc) or "") != root_key:
+    elif (
+        current_root is not None
+        and (current_root.pid, iso_utc(current_root.created_utc) or "") != root_key
+    ):
         errors.append(f"provider root {root_pid} creation identity was reused")
 
     selected: dict[tuple[int, str], ProcessInfo] = {}
@@ -400,9 +420,8 @@ def process_group_inventory(
 
     for item in snapshot.processes:
         if (
-            (process_group_id is not None and item.process_group_id == process_group_id)
-            or (session_id is not None and item.session_id == session_id)
-        ):
+            process_group_id is not None and item.process_group_id == process_group_id
+        ) or (session_id is not None and item.session_id == session_id):
             select(item)
         if (item.pid, iso_utc(item.created_utc) or "") in known_by_key:
             select(item)
@@ -421,8 +440,13 @@ def process_group_inventory(
             if item.ppid not in selected_pids:
                 continue
             parent = by_pid.get(item.ppid)
-            if parent is None or (parent.pid, iso_utc(parent.created_utc) or "") not in selected:
-                errors.append(f"descendant PID {item.pid} has no exact owned parent observation")
+            if (
+                parent is None
+                or (parent.pid, iso_utc(parent.created_utc) or "") not in selected
+            ):
+                errors.append(
+                    f"descendant PID {item.pid} has no exact owned parent observation"
+                )
                 continue
             before = len(selected)
             select(item)
@@ -436,15 +460,22 @@ def process_group_inventory(
             if key in known_by_key:
                 select(item)
             else:
-                errors.append(f"adopted PID {item.pid} is outside the known ownership history")
+                errors.append(
+                    f"adopted PID {item.pid} is outside the known ownership history"
+                )
 
     # A process still claiming the provider root as parent after the root has
     # disappeared must have been captured in history before adoption.  Refuse
     # the snapshot if it was not, rather than losing a daemonizing child.
     if current_root is None:
         for item in snapshot.processes:
-            if item.ppid == root_pid and (item.pid, iso_utc(item.created_utc) or "") not in known_by_key:
-                errors.append(f"unobserved descendant PID {item.pid} cannot be attributed after root exit")
+            if (
+                item.ppid == root_pid
+                and (item.pid, iso_utc(item.created_utc) or "") not in known_by_key
+            ):
+                errors.append(
+                    f"unobserved descendant PID {item.pid} cannot be attributed after root exit"
+                )
 
     members = tuple(sorted(selected.values(), key=lambda item: item.pid))
     observed: dict[tuple[int, str], ProcessInfo] = dict(known_by_key)
@@ -457,7 +488,12 @@ def process_group_inventory(
             "linux-subreaper",
             boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
             processes=members,
-            observed_processes=tuple(sorted(observed.values(), key=lambda item: (item.pid, iso_utc(item.created_utc) or ""))),
+            observed_processes=tuple(
+                sorted(
+                    observed.values(),
+                    key=lambda item: (item.pid, iso_utc(item.created_utc) or ""),
+                )
+            ),
             errors=tuple(errors),
             source="/proc",
         )
@@ -466,6 +502,11 @@ def process_group_inventory(
         "linux-subreaper",
         boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
         processes=members,
-        observed_processes=tuple(sorted(observed.values(), key=lambda item: (item.pid, iso_utc(item.created_utc) or ""))),
+        observed_processes=tuple(
+            sorted(
+                observed.values(),
+                key=lambda item: (item.pid, iso_utc(item.created_utc) or ""),
+            )
+        ),
         source="/proc",
     )

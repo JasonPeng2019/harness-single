@@ -46,7 +46,9 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
                 ),
             }
 
-            self.assertEqual("orchestrator-disposable-coding-fixture/v1", result["schema"])
+            self.assertEqual(
+                "orchestrator-disposable-coding-fixture/v1", result["schema"]
+            )
             self.assertEqual(3, result["coding_lane_count"])
             self.assertEqual(0, result["firmware_records"])
             self.assertTrue(result["contention_observed"])
@@ -83,12 +85,12 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
             self.assertLessEqual(alpha_ended, beta_started)
 
             for lane, workspace in (("alpha", alpha), ("beta", beta), ("merge", merge)):
-                result_record = _read_json(workspace / ".agent-workspace" / "RESULT.json")
+                result_record = _read_json(
+                    workspace / ".agent-workspace" / "RESULT.json"
+                )
                 self.assertEqual(lane, result_record["lane_id"])
                 self.assertEqual("PASS", result_record["outcome"])
-                self.assertEqual(
-                    statuses[lane]["branch"], result_record["branch"]
-                )
+                self.assertEqual(statuses[lane]["branch"], result_record["branch"])
                 self.assertEqual(40, len(result_record["commit"]))
                 if lane != "beta":
                     self.assertEqual(
@@ -102,7 +104,9 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
             queue_root = Path(result["s3_queue_root"])
             self.assertTrue((queue_root / "QUEUE.jsonl").is_file())
             self.assertTrue((queue_root / "STATE.json").is_file())
-            self.assertEqual([], list((root / "runtime" / "coding-resource-locks").glob("*.json")))
+            self.assertEqual(
+                [], list((root / "runtime" / "coding-resource-locks").glob("*.json"))
+            )
         finally:
             shutil.rmtree(root, onerror=_remove_readonly)
         self.assertFalse(root.exists())

@@ -1,4 +1,5 @@
 """One immutable, fail-closed continuation admission decision."""
+
 from __future__ import annotations
 
 import hashlib
@@ -36,7 +37,9 @@ _TERMINAL_STATES = {"ACCEPTED", "ACCEPTED_TERMINAL", "TERMINAL_ACCEPTED"}
 class ResumeAdmissionError(ValueError):
     """Raised when continuation identity cannot be admitted."""
 
-    def __init__(self, message: str, admission: "ResumeAdmission | None" = None) -> None:
+    def __init__(
+        self, message: str, admission: "ResumeAdmission | None" = None
+    ) -> None:
         super().__init__(message)
         self.admission = admission
 
@@ -65,7 +68,9 @@ def _normalized_path(value: object) -> object:
 
 
 def _normalize(value: Any, *, key: str = "") -> Any:
-    if key in {"common_dir", "worktree_root", "starting_commit"} and isinstance(value, str):
+    if key in {"common_dir", "worktree_root", "starting_commit"} and isinstance(
+        value, str
+    ):
         return _normalized_path(value) if key != "starting_commit" else value.lower()
     if isinstance(value, Mapping):
         return {str(k): _normalize(v, key=str(k)) for k, v in value.items()}
@@ -141,7 +146,9 @@ def _review_card_payload(path_value: object, name: str) -> Mapping[str, Any]:
 def _validate_review_diff_command(
     diff: Mapping[str, Any], *, old_path: object, new_path: object, name: str
 ) -> None:
-    working_directory_text = _review_text(diff["working_directory"], f"{name}.working_directory")
+    working_directory_text = _review_text(
+        diff["working_directory"], f"{name}.working_directory"
+    )
     working_directory = Path(working_directory_text)
     if not working_directory.is_absolute():
         raise ValueError(f"{name}.working_directory must be absolute")
@@ -175,7 +182,9 @@ def _review_normalize(field: str, value: object) -> object:
         "worktree_root",
     } and isinstance(value, str):
         return _normalized_path(value)
-    if field in {"original_base_commit", "continuation_start_commit"} and isinstance(value, str):
+    if field in {"original_base_commit", "continuation_start_commit"} and isinstance(
+        value, str
+    ):
         return value.lower()
     return value
 
@@ -185,8 +194,12 @@ def _review_job_identity(
 ) -> dict[str, Any]:
     requested_repository = requested.get("repository")
     persisted_repository = persisted.get("repository")
-    repository = requested_repository if isinstance(requested_repository, Mapping) else {}
-    prior_repository = persisted_repository if isinstance(persisted_repository, Mapping) else {}
+    repository = (
+        requested_repository if isinstance(requested_repository, Mapping) else {}
+    )
+    prior_repository = (
+        persisted_repository if isinstance(persisted_repository, Mapping) else {}
+    )
     expected: dict[str, Any] = {
         "card_id": requested.get("task_card_id"),
         "stage_cohort_id": requested.get("cohort_id"),
@@ -219,11 +232,22 @@ def validate_resume_amendment_review(
 
     record = _closed_mapping(
         review,
-        required=frozenset({
-            "schema", "run_id", "stage_id", "lane_id", "recorded_utc", "recorded_by",
-            "disposition", "job_state", "same_job_identity", "reviewed_pairs",
-            "semantic_impact", "route",
-        }),
+        required=frozenset(
+            {
+                "schema",
+                "run_id",
+                "stage_id",
+                "lane_id",
+                "recorded_utc",
+                "recorded_by",
+                "disposition",
+                "job_state",
+                "same_job_identity",
+                "reviewed_pairs",
+                "semantic_impact",
+                "route",
+            }
+        ),
         name="resume amendment review",
     )
     if record["schema"] != RESUME_AMENDMENT_REVIEW_SCHEMA:
@@ -242,30 +266,53 @@ def validate_resume_amendment_review(
 
     same_job = _closed_mapping(
         record["same_job_identity"],
-        required=frozenset({
-            "card_id", "stage_cohort_id", "worker_invocation_id", "lane_id", "task_kind",
-            "provider_session_id", "repository_common_dir", "worktree_root", "branch",
-            "original_base_commit", "continuation_start_commit", "exclusive_resources",
-        }),
+        required=frozenset(
+            {
+                "card_id",
+                "stage_cohort_id",
+                "worker_invocation_id",
+                "lane_id",
+                "task_kind",
+                "provider_session_id",
+                "repository_common_dir",
+                "worktree_root",
+                "branch",
+                "original_base_commit",
+                "continuation_start_commit",
+                "exclusive_resources",
+            }
+        ),
         name="review.same_job_identity",
     )
     for field, value in same_job.items():
         if field == "exclusive_resources":
-            if not isinstance(value, list) or any(
-                not isinstance(item, str) or not item.strip() for item in value
-            ) or len(value) != len(set(value)):
-                raise ValueError("review.same_job_identity.exclusive_resources is invalid")
+            if (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) or not item.strip() for item in value)
+                or len(value) != len(set(value))
+            ):
+                raise ValueError(
+                    "review.same_job_identity.exclusive_resources is invalid"
+                )
         else:
             _review_text(value, f"review.same_job_identity.{field}")
     if record["lane_id"] != same_job["lane_id"]:
-        raise ValueError("resume amendment review lane does not match same-job identity")
-    expected_job = dict(expected_job_identity or _review_job_identity(requested, persisted))
+        raise ValueError(
+            "resume amendment review lane does not match same-job identity"
+        )
+    expected_job = dict(
+        expected_job_identity or _review_job_identity(requested, persisted)
+    )
     for field, expected in expected_job.items():
         if expected is None:
-            raise ValueError(f"resume identity cannot establish amendment field {field}")
+            raise ValueError(
+                f"resume identity cannot establish amendment field {field}"
+            )
         if field not in same_job:
             raise ValueError(f"review.same_job_identity is missing {field}")
-        if _review_normalize(field, same_job[field]) != _review_normalize(field, expected):
+        if _review_normalize(field, same_job[field]) != _review_normalize(
+            field, expected
+        ):
             raise ValueError(f"resume amendment same-job identity mismatch: {field}")
 
     pairs = _closed_mapping(
@@ -275,21 +322,47 @@ def validate_resume_amendment_review(
     )
     pair_records: dict[str, dict[str, Any]] = {}
     pair_keys = frozenset({"old_path", "old_sha256", "new_path", "new_sha256", "diff"})
-    diff_keys = frozenset({
-        "command", "working_directory", "exit_code", "stdout_encoding", "stdout_sha256",
-        "stdout_bytes", "stderr_sha256", "stderr_bytes",
-    })
+    diff_keys = frozenset(
+        {
+            "command",
+            "working_directory",
+            "exit_code",
+            "stdout_encoding",
+            "stdout_sha256",
+            "stdout_bytes",
+            "stderr_sha256",
+            "stderr_bytes",
+        }
+    )
     for name in ("task_card", "prompt"):
-        pair = _closed_mapping(pairs[name], required=pair_keys, name=f"reviewed_pairs.{name}")
+        pair = _closed_mapping(
+            pairs[name], required=pair_keys, name=f"reviewed_pairs.{name}"
+        )
         _review_text(pair["old_path"], f"reviewed_pairs.{name}.old_path")
         _review_text(pair["new_path"], f"reviewed_pairs.{name}.new_path")
-        old_digest = _review_digest(pair["old_sha256"], f"reviewed_pairs.{name}.old_sha256")
-        new_digest = _review_digest(pair["new_sha256"], f"reviewed_pairs.{name}.new_sha256")
-        if _review_path_digest(pair["old_path"], f"reviewed_pairs.{name}.old_path") != old_digest:
-            raise ValueError(f"reviewed_pairs.{name} old raw identity does not match its path")
-        if _review_path_digest(pair["new_path"], f"reviewed_pairs.{name}.new_path") != new_digest:
-            raise ValueError(f"reviewed_pairs.{name} new raw identity does not match its path")
-        diff = _closed_mapping(pair["diff"], required=diff_keys, name=f"reviewed_pairs.{name}.diff")
+        old_digest = _review_digest(
+            pair["old_sha256"], f"reviewed_pairs.{name}.old_sha256"
+        )
+        new_digest = _review_digest(
+            pair["new_sha256"], f"reviewed_pairs.{name}.new_sha256"
+        )
+        if (
+            _review_path_digest(pair["old_path"], f"reviewed_pairs.{name}.old_path")
+            != old_digest
+        ):
+            raise ValueError(
+                f"reviewed_pairs.{name} old raw identity does not match its path"
+            )
+        if (
+            _review_path_digest(pair["new_path"], f"reviewed_pairs.{name}.new_path")
+            != new_digest
+        ):
+            raise ValueError(
+                f"reviewed_pairs.{name} new raw identity does not match its path"
+            )
+        diff = _closed_mapping(
+            pair["diff"], required=diff_keys, name=f"reviewed_pairs.{name}.diff"
+        )
         _validate_review_diff_command(
             diff,
             old_path=pair["old_path"],
@@ -299,22 +372,40 @@ def validate_resume_amendment_review(
         if diff["exit_code"] != 1:
             raise ValueError(f"reviewed_pairs.{name}.diff.exit_code must be 1")
         if diff["stdout_encoding"] != "utf-8":
-            raise ValueError(f"reviewed_pairs.{name}.diff.stdout_encoding must be utf-8")
-        _review_digest(diff["stdout_sha256"], f"reviewed_pairs.{name}.diff.stdout_sha256")
-        _review_digest(diff["stderr_sha256"], f"reviewed_pairs.{name}.diff.stderr_sha256")
+            raise ValueError(
+                f"reviewed_pairs.{name}.diff.stdout_encoding must be utf-8"
+            )
+        _review_digest(
+            diff["stdout_sha256"], f"reviewed_pairs.{name}.diff.stdout_sha256"
+        )
+        _review_digest(
+            diff["stderr_sha256"], f"reviewed_pairs.{name}.diff.stderr_sha256"
+        )
         for field in ("stdout_bytes", "stderr_bytes"):
-            if not isinstance(diff[field], int) or isinstance(diff[field], bool) or diff[field] < 0:
+            if (
+                not isinstance(diff[field], int)
+                or isinstance(diff[field], bool)
+                or diff[field] < 0
+            ):
                 raise ValueError(f"reviewed_pairs.{name}.diff.{field} is invalid")
         pair_records[name] = pair
 
     if persisted.get("task_card_sha256") != pair_records["task_card"]["old_sha256"]:
-        raise ValueError("reviewed task-card old identity does not match persisted resume identity")
+        raise ValueError(
+            "reviewed task-card old identity does not match persisted resume identity"
+        )
     if requested.get("task_card_sha256") != pair_records["task_card"]["new_sha256"]:
-        raise ValueError("reviewed task-card new identity does not match requested resume identity")
+        raise ValueError(
+            "reviewed task-card new identity does not match requested resume identity"
+        )
     if persisted.get("prompt_content_sha256") != pair_records["prompt"]["old_sha256"]:
-        raise ValueError("reviewed prompt old identity does not match persisted resume identity")
+        raise ValueError(
+            "reviewed prompt old identity does not match persisted resume identity"
+        )
     if requested.get("prompt_content_sha256") != pair_records["prompt"]["new_sha256"]:
-        raise ValueError("reviewed prompt new identity does not match requested resume identity")
+        raise ValueError(
+            "reviewed prompt new identity does not match requested resume identity"
+        )
 
     old_card_payload = _review_card_payload(
         pair_records["task_card"]["old_path"], "reviewed_pairs.task_card.old_path"
@@ -336,7 +427,9 @@ def validate_resume_amendment_review(
         new_value = new_card_payload.get(card_field)
         if old_present and new_present and old_value != new_value:
             if disposition == "NO_CONTINUATION_REQUIRED":
-                raise ValueError(f"reviewed task-card {card_field} changed across the pair")
+                raise ValueError(
+                    f"reviewed task-card {card_field} changed across the pair"
+                )
             if requested.get(identity_field) != new_value:
                 raise ValueError(
                     f"reviewed task-card {card_field} does not match requested resume identity"
@@ -344,14 +437,18 @@ def validate_resume_amendment_review(
             continue
         if old_present != new_present:
             if disposition == "NO_CONTINUATION_REQUIRED":
-                raise ValueError(f"reviewed task-card {card_field} changed across the pair")
+                raise ValueError(
+                    f"reviewed task-card {card_field} changed across the pair"
+                )
             if new_present and requested.get(identity_field) != new_value:
                 raise ValueError(
                     f"reviewed task-card {card_field} does not match requested resume identity"
                 )
             continue
         if old_present and requested.get(identity_field) != old_value:
-            raise ValueError(f"reviewed task-card {card_field} does not match resume identity")
+            raise ValueError(
+                f"reviewed task-card {card_field} does not match resume identity"
+            )
     task_kind_values = [
         payload.get("task_kind")
         for payload in (old_card_payload, new_card_payload)
@@ -362,49 +459,79 @@ def validate_resume_amendment_review(
         or task_kind_values[0] != task_kind_values[1]
         or same_job["task_kind"] != task_kind_values[0]
     ):
-        raise ValueError("reviewed task-card task_kind does not match the same-job review")
+        raise ValueError(
+            "reviewed task-card task_kind does not match the same-job review"
+        )
 
     semantic = _closed_mapping(
         record["semantic_impact"],
-        required=frozenset({"classification", "rationale", "affected_scope", "preserved_credit"}),
+        required=frozenset(
+            {"classification", "rationale", "affected_scope", "preserved_credit"}
+        ),
         name="review.semantic_impact",
     )
-    classification = _review_text(semantic["classification"], "review.semantic_impact.classification")
+    classification = _review_text(
+        semantic["classification"], "review.semantic_impact.classification"
+    )
     _review_text(semantic["rationale"], "review.semantic_impact.rationale")
     for field in ("affected_scope", "preserved_credit"):
         values = semantic[field]
-        if not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values):
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item.strip() for item in values
+        ):
             raise ValueError(f"review.semantic_impact.{field} is invalid")
     harmless_classes = {"HARMLESS", "NO_CONTINUATION_REQUIRED", "NO_MATERIAL_CHANGE"}
     material_classes = {"MATERIAL", "UNCERTAIN", "CONTINUATION_REQUIRED"}
-    if disposition == "NO_CONTINUATION_REQUIRED" and classification not in harmless_classes:
+    if (
+        disposition == "NO_CONTINUATION_REQUIRED"
+        and classification not in harmless_classes
+    ):
         raise ValueError("NO_CONTINUATION_REQUIRED review is not classified harmless")
-    if disposition == "CONTINUATION_REQUIRED" and classification not in material_classes:
-        raise ValueError("CONTINUATION_REQUIRED review is not classified material or uncertain")
+    if (
+        disposition == "CONTINUATION_REQUIRED"
+        and classification not in material_classes
+    ):
+        raise ValueError(
+            "CONTINUATION_REQUIRED review is not classified material or uncertain"
+        )
 
     route = _closed_mapping(
         record["route"],
-        required=frozenset({
-            "kind", "resume_same_worker", "resume_same_provider_session", "reopen_accepted_tasks",
-            "rerun_only_affected_checks", "require_fresh_affected_review",
-        }),
+        required=frozenset(
+            {
+                "kind",
+                "resume_same_worker",
+                "resume_same_provider_session",
+                "reopen_accepted_tasks",
+                "rerun_only_affected_checks",
+                "require_fresh_affected_review",
+            }
+        ),
         name="review.route",
     )
     _review_text(route["kind"], "review.route.kind")
     for field in (
-        "resume_same_worker", "resume_same_provider_session", "reopen_accepted_tasks",
-        "rerun_only_affected_checks", "require_fresh_affected_review",
+        "resume_same_worker",
+        "resume_same_provider_session",
+        "reopen_accepted_tasks",
+        "rerun_only_affected_checks",
+        "require_fresh_affected_review",
     ):
         if not isinstance(route[field], bool):
             raise ValueError(f"review.route.{field} must be boolean")
     if not route["resume_same_worker"] or not route["resume_same_provider_session"]:
-        raise ValueError("resume amendment review does not preserve worker/provider session")
+        raise ValueError(
+            "resume amendment review does not preserve worker/provider session"
+        )
     if route["reopen_accepted_tasks"]:
         raise ValueError("resume amendment review cannot reopen an accepted task")
 
     allowed: set[str] = set()
     if disposition == "NO_CONTINUATION_REQUIRED":
-        if pair_records["task_card"]["old_sha256"] != pair_records["task_card"]["new_sha256"]:
+        if (
+            pair_records["task_card"]["old_sha256"]
+            != pair_records["task_card"]["new_sha256"]
+        ):
             allowed.add("task_card_sha256")
         if pair_records["prompt"]["old_sha256"] != pair_records["prompt"]["new_sha256"]:
             allowed.update({"prompt_bundle_sha256", "prompt_content_sha256"})
@@ -417,7 +544,9 @@ def validate_resume_amendment_review(
 
 def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+        return MappingProxyType(
+            {str(key): _freeze(item) for key, item in value.items()}
+        )
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, tuple):
@@ -454,9 +583,13 @@ class ResumeAdmission:
             value = getattr(self, field_name)
             object.__setattr__(self, field_name, _freeze(_thaw(value)))
         if self.amendment_review is not None:
-            object.__setattr__(self, "amendment_review", _freeze(_thaw(self.amendment_review)))
+            object.__setattr__(
+                self, "amendment_review", _freeze(_thaw(self.amendment_review))
+            )
         if self.decision_sha256 != _digest(self._decision_payload()):
-            raise ResumeAdmissionError("resume admission decision hash is not content-bound")
+            raise ResumeAdmissionError(
+                "resume admission decision hash is not content-bound"
+            )
 
     def _decision_payload(self) -> dict[str, Any]:
         payload = {
@@ -490,7 +623,8 @@ def _compare_identity(
             reasons.append(f"persisted identity missing {field}")
             continue
         if (
-            _normalize(requested[field], key=field) != _normalize(persisted[field], key=field)
+            _normalize(requested[field], key=field)
+            != _normalize(persisted[field], key=field)
             and field not in allowed_mismatches
         ):
             reasons.append(f"resume identity mismatch: {field}")
@@ -539,7 +673,11 @@ def make_resume_admission(
     )
     if amendment_review is None and any(
         requested_value.get(field) != persisted_value.get(field)
-        for field in ("task_card_sha256", "prompt_bundle_sha256", "prompt_content_sha256")
+        for field in (
+            "task_card_sha256",
+            "prompt_bundle_sha256",
+            "prompt_content_sha256",
+        )
     ):
         reasons.append(
             "resume amendment review is required for changed task-card or prompt identity"
@@ -553,7 +691,9 @@ def make_resume_admission(
         reasons.append("live process/session identity mismatch")
     requested_repository = requested_value.get("repository")
     live_repository = live_value.get("repository")
-    if requested_repository is not None and _normalize(requested_repository) != _normalize(live_repository):
+    if requested_repository is not None and _normalize(
+        requested_repository
+    ) != _normalize(live_repository):
         reasons.append("live repository identity mismatch")
     admitted = not reasons
     payload = {
@@ -593,7 +733,9 @@ def require_resume_admission(
         expected_job_identity=expected_job_identity,
     )
     if not admission.admitted:
-        raise ResumeAdmissionError("resume admission rejected: " + "; ".join(admission.reasons), admission)
+        raise ResumeAdmissionError(
+            "resume admission rejected: " + "; ".join(admission.reasons), admission
+        )
     return admission
 
 

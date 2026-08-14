@@ -48,7 +48,9 @@ def manifest_asset_paths() -> tuple[str, ...]:
     paths: list[str] = []
     for field in ("examples", "release_evidence_templates"):
         values = manifest.get(field)
-        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) for item in values
+        ):
             raise RuntimeError(f"release asset manifest field {field} is invalid")
         paths.extend(values)
     if len(set(paths)) != len(paths):
