@@ -3339,6 +3339,100 @@ try {{
             self.assertTrue((root / "first-ran.txt").is_file())
             self.assertFalse((root / "second-ran.txt").exists())
 
+    def test_safeguard_core_delivers_one_argument_command_tail_as_array(
+        self,
+    ) -> None:
+        # Behavioral regression oracle for RELEASE-FINAL-002-F01: the command
+        # tail held by Invoke-ReleaseChecks must be a string array so a
+        # one-argument command reaches the runner intact. The command shape is
+        # exactly S6.RELEASE.SYNTHETIC-CLEANUP's ("python",
+        # "orchestrator_harness/tests/wsl_cleanup_guard_test.py"); the fixture
+        # script is a synthetic stand-in that proves the whole argument arrives
+        # once (the real script requires WSL and is never executed here).
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-argv-oracle-") as raw:
+            root = Path(raw) / "candidate"
+            repository = TemporaryGitRepository.create(
+                root, branch="firmware/v2-candidate"
+            )
+            baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
+            baseline.parent.mkdir(parents=True)
+            baseline.write_text("{}\n", encoding="utf-8")
+            pyright_config = root / "pyrightconfig.json"
+            pyright_config.write_text(
+                '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n',
+                encoding="utf-8",
+            )
+            probe = (
+                root / "orchestrator_harness" / "tests" / "wsl_cleanup_guard_test.py"
+            )
+            probe.parent.mkdir(parents=True)
+            probe.write_text(
+                "from __future__ import annotations\n"
+                "import sys\n"
+                "\n"
+                'EXPECTED = "orchestrator_harness/tests/wsl_cleanup_guard_test.py"\n'
+                "\n"
+                "def main() -> int:\n"
+                "    # The single command argument is the script path, so Python\n"
+                "    # delivers it as the sole argv entry. If the safeguard core\n"
+                "    # splatted a scalar instead of a string array, Python would\n"
+                "    # receive each character separately and fail to open 'o'.\n"
+                "    if len(sys.argv) != 1 or sys.argv[0] != EXPECTED:\n"
+                "        raise AssertionError(\n"
+                '            f"expected sole argv entry {EXPECTED!r}, '
+                'received {sys.argv!r}"\n'
+                "        )\n"
+                '    print("ARGV-ORACLE: PASS")\n'
+                "    return 0\n"
+                "\n"
+                'if __name__ == "__main__":\n'
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".")
+            repository.git("commit", "-m", "safeguard argv oracle fixture")
+            module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+            driver = Path(raw) / "invoke-core.ps1"
+            driver.write_text(
+                f"""Import-Module -Force '{module}'
+$baselineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath '{baseline}').Hash
+$configHash = (Get-FileHash -Algorithm SHA256 -LiteralPath '{pyright_config}').Hash
+$checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.ARGV-ORACLE'; command = @('python', 'orchestrator_harness/tests/wsl_cleanup_guard_test.py') }}
+)
+try {{
+    Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+        -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+        -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+        -BaselineHash $baselineHash -ConfigHash $configHash
+    exit 0
+}} catch {{
+    Write-Error $_
+    exit 17
+}}
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(driver),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
+            self.assertIn("ARGV-ORACLE: PASS", completed.stdout)
+
 
 class S6DocumentationTests(unittest.TestCase):
     def test_current_examples_and_docs_name_the_real_public_apis(self) -> None:

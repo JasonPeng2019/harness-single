@@ -81,7 +81,10 @@ function Invoke-ReleaseChecks {
             throw "selected check has no command: $stableId"
         }
         $program = [string]$command[0]
-        $arguments = if ($command.Count -gt 1) { @($command[1..($command.Count - 1)]) } else { @() }
+        $arguments = [string[]]@()
+        if ($command.Count -gt 1) {
+            $arguments = [string[]]@($command[1..($command.Count - 1)])
+        }
         Push-Location $RepositoryRoot
         try {
             if ($program -eq 'python') {
