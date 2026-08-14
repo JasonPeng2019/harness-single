@@ -35,6 +35,7 @@ from .mutation import (
     replace as mutation_replace,
 )
 from .processes import WINDOWS_CREATE_NO_WINDOW, process_snapshot
+from .workspace_overlay import OVERLAY_RECEIPT_SCHEMA, restore_worktree
 
 IMMUTABLE_VIEW_SCHEMA = "orchestrator-immutable-source-view/v1"
 LANE_ARCHIVE_SCHEMA = "orchestrator-lane-archive/v1"
@@ -1304,6 +1305,7 @@ def retire_terminal_lane(
     transcript_ref: object = None,
     dependency_ref: object = None,
     discarded_cache: Sequence[object] = (),
+    overlay_receipt: object = None,
 ) -> RetirementResult:
     """Copy and validate all evidence, then close only a mechanically safe lane."""
 
@@ -1334,6 +1336,32 @@ def retire_terminal_lane(
         target_revision = binding["target_revision"]
     except ArchiveFailed as exc:
         return _visible_result(lane, f"ARCHIVE_EVIDENCE_INCOMPLETE:{str(exc)[:160]}")
+
+    # Overlay restoration precedes the git-clean binding proof: preparation
+    # leaves receipt-recorded untracked files in the worktree until
+    # retirement.  Restore first; any later edit, missing/malformed receipt,
+    # or unsafe target keeps the lane visible with its later work intact.
+    overlay_restoration: dict[str, Any] | None = None
+    if overlay_receipt is not None:
+        try:
+            overlay_restoration = restore_worktree(receipt_path=_lexical(overlay_receipt))
+        except Exception as exc:
+            overlay_restoration = {
+                "schema": OVERLAY_RECEIPT_SCHEMA,
+                "receipt_path": str(_lexical(overlay_receipt)),
+                "outcome": "BLOCKED",
+                "reason": f"restore failed: {type(exc).__name__}: {exc}",
+                "restored_paths": [],
+                "removed_paths": [],
+                "preserved_paths": [],
+                "left_directories": [],
+            }
+        if overlay_restoration.get("outcome") != "RESTORED":
+            return _visible_result(
+                lane,
+                "OVERLAY_RESTORE_BLOCKED:" + str(overlay_restoration.get("reason", "unknown")),
+                revision=retained_revision,
+            )
 
     try:
         git_state, git_reason = _validate_lane_binding(
@@ -1417,6 +1445,22 @@ def retire_terminal_lane(
         except (OSError, MutationConflict, MutationUnsupported):
             pass
         return _visible_result(lane, f"ARCHIVE_FAILED:{type(exc).__name__}", revision=actual_head)
+
+    if overlay_restoration is not None:
+        try:
+            archived = json.loads(archive_path.read_text(encoding="utf-8"))
+            archived["overlay_restoration"] = overlay_restoration
+            archived["archive_content_sha256"] = ""
+            archived["archive_content_sha256"] = _archive_digest(archived)
+            _atomic_json(archive_path, archived)
+            validate_lane_archive(archive_path)
+        except Exception as exc:
+            return _visible_result(
+                lane,
+                f"OVERLAY_RECORD_FAILED:{type(exc).__name__}",
+                archive=archive_path,
+                revision=actual_head,
+            )
 
     blocks = [block for block in _git_text(lane, "worktree", "list", "--porcelain").split("\n\n") if block.strip()]
     admin_roots: list[Path] = []

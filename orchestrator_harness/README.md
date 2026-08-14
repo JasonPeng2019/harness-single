@@ -242,6 +242,59 @@ task/result/findings/acceptance/transcript/dependency/process evidence and
 content hashes before normal `git worktree remove`. Dirty, live, ambiguous,
 unretained, unmerged, or archive-failed lanes remain visible.
 
+## Workspace overlay and bounded policy readback
+
+One provider-neutral overlay owner prepares identified worktrees from an
+ordinary editable `super-cache` folder before a provider launch and restores
+them exactly at retirement:
+
+```powershell
+python -m orchestrator_harness workspace super-cache ingest --source <folder> --harness-worktree <harness>
+python -m orchestrator_harness workspace prepare --super-cache <harness>/super-cache `
+  --worktree <target> --role subagent --receipt <receipt.json>
+```
+
+Ingest refreshes `HARNESS_WORKTREE/super-cache` to exactly the supplied
+folder contents (never the container folder itself) and is never reported
+complete on failure. Preparation copies the cache contents current for that
+call: directories merge recursively without overwriting, missing paths are
+created, and an existing-file collision is rejected unless its relative path
+is declared in the optional root `.super-cache.json` `append_text` list,
+in which case the payload's exact bytes are appended to the existing regular
+UTF-8 text file. The complete operation is preflighted before any mutation and
+writes a minimal no-hash receipt (target worktree ID, role, completed state,
+affected paths, operations, created paths, and exact pre/post bytes for
+affected files). The cache and declaration stay mutable; a later re-ingest or
+direct cache edit affects only later preparations.
+
+The lane controller verifies the receipt immediately before launch (present
+receipts must be completed and name that worktree and the `subagent` role;
+absence is allowed), and subagent lane retirement calls the same restoration
+function. Restoration compares each affected file's current bytes with the
+receipt's exact post-prepare bytes, restores appended preimages or removes
+receipt-created files, removes only empty receipt-created directories, and
+preserves later edits while reporting retirement blocked. The external owner
+of an orchestrator worktree calls the same function from its own retirement
+path. Preparation must complete before process creation; it cannot
+retroactively change an already-running session.
+
+The Codex adapter packages an editable launcher JSON and Git-ignore exclusion
+file under the project's `.codex/policies`. Git evaluates ordinary
+file/directory/wildcard/negation patterns for resolved script paths; an
+exclusion is accepted only when Git's winning verbose match came from the
+provider's declared exclusion file and is not negated. The supervisor
+entrypoint and the approved stable-runner script are the only initial
+exclusions, so the lane-managed provider session receives no bounded-test
+deadline while non-excluded covered nested commands launched inside agent
+worktrees still require the one supervisor. Configuration and Git failures
+fail closed with an actionable denial. Read the installed policy with:
+
+```powershell
+python -m orchestrator_harness adapter check --host codex --project-root <project>
+```
+
+The check result includes `bounded_policy` launcher/exclusion readback.
+
 ## Configuration migration
 
 Retained configuration covers discovery, bounded reads, and diagnostic waits.

@@ -52,6 +52,11 @@ from .provider import (
     notification_mode,
     provider_adapter,
 )
+from .codex_bounded_policy import (
+    EXCLUSIONS_RELATIVE,
+    LAUNCHERS_RELATIVE,
+    bounded_policy_status,
+)
 from .stable_io import canonical_json
 
 
@@ -59,8 +64,8 @@ CODEX_ADAPTER_SCHEMA = "orchestrator-codex-adapter/v1"
 CODEX_INSTALL_MANIFEST_SCHEMA = "orchestrator-codex-installation/v1"
 CODEX_BINDING_SCHEMA = "orchestrator-codex-binding/v1"
 CODEX_ADAPTER_VERSION = "codex-v1"
-CODEX_PACKAGE_REVISION = "codex-assets-v2"
-CODEX_SUPPORTED_LEGACY_REVISIONS = frozenset({"codex-assets-v1"})
+CODEX_PACKAGE_REVISION = "codex-assets-v3"
+CODEX_SUPPORTED_LEGACY_REVISIONS = frozenset({"codex-assets-v1", "codex-assets-v2"})
 INSTALL_MANIFEST_RELATIVE = Path(".codex") / "orchestrator-harness-adapter.json"
 CODEX_BINDING_RELATIVE = Path(".codex") / "orchestrator-harness-binding.json"
 HOOKS_RELATIVE = Path(".codex") / "hooks.json"
@@ -68,10 +73,11 @@ _HOOK_RELATIVES = (
     Path(".codex") / "hooks" / "orchestrator_harness_post_tool_use.py",
     Path(".codex") / "hooks" / "orchestrator_harness_stop.py",
 )
-_HOOK_EVENT_NAMES = ("PostToolUse", "Stop")
+_HOOK_EVENT_NAMES = ("PreToolUse", "PostToolUse", "Stop")
 _MAX_MANIFEST_BYTES = 512_000
 _MAX_BINDING_BYTES = 128_000
 _MANAGED_HOOK_IDS = {
+    "orchestrator-harness-bounded-policy",
     "orchestrator-harness-post-tool-use",
     "orchestrator-harness-stop",
 }
@@ -402,6 +408,7 @@ class _ProjectMutationGuard:
         if prepare_codex:
             self.ensure_directory(Path(".codex"))
             self.ensure_directory(Path(".codex") / "hooks")
+            self.ensure_directory(Path(".codex") / "policies")
 
     @staticmethod
     def _validate_project_chain(project: Path) -> None:
@@ -653,6 +660,20 @@ def _legacy_asset_hashes() -> dict[str, str]:
     }
 
 
+def _legacy_v2_asset_hashes() -> dict[str, str]:
+    """The codex-assets-v2 packaged byte identities (two owned hook scripts)."""
+    return {
+        ".codex/hooks/orchestrator_harness_post_tool_use.py": "1cf1592c1829fb953e927b5dd6727f946e3239be59838028ede04fe2ef335a71",
+        ".codex/hooks/orchestrator_harness_stop.py": "616390ecec117df2db33dd6f84b5d826b523ec873e4c53f88c21426b5d92e469",
+    }
+
+
+def _legacy_assets_for(revision: str) -> dict[str, str]:
+    if revision == "codex-assets-v2":
+        return _legacy_v2_asset_hashes()
+    return _legacy_asset_hashes()
+
+
 def _validate_manifest_identity(
     manifest: Mapping[str, Any],
     project: Path,
@@ -673,7 +694,8 @@ def _validate_manifest_identity(
     revision = manifest.get("package_revision")
     if revision not in {CODEX_PACKAGE_REVISION, *CODEX_SUPPORTED_LEGACY_REVISIONS}:
         raise CodexInstallConflict("installation manifest revision is unsupported")
-    expected_paths = _managed_paths(packaged_codex_assets())
+    packaged = packaged_codex_assets()
+    expected_paths = _managed_paths(packaged)
     if revision == CODEX_PACKAGE_REVISION:
         expected_fragment = _managed_hook_fragment()
         if manifest.get("managed_paths") != expected_paths:
@@ -712,9 +734,9 @@ def _validate_manifest_identity(
             raise CodexInstallConflict("installation manifest content identity is invalid")
         return revision
 
-    # The only accepted legacy revision is the exact v1 packaged path set.  Its
-    # historical byte map is opaque metadata and never becomes an authority for
-    # uninstall or rollback.
+    # Accepted legacy revisions are the exact v1/v2 packaged path sets.  Their
+    # historical byte maps are opaque metadata and never become an authority
+    # for uninstall or rollback.
     legacy_fields = {
         "schema", "adapter", "adapter_version", "package_revision", "project_root",
         "owned_paths", "prior_managed_revision", "prior_content",
@@ -722,10 +744,11 @@ def _validate_manifest_identity(
     }
     if set(manifest) != legacy_fields:
         raise CodexInstallConflict("legacy installation manifest has an unsupported field")
-    if manifest.get("owned_paths") != expected_paths:
+    old_assets = _legacy_assets_for(revision)
+    legacy_paths = sorted(set(old_assets) | {HOOKS_RELATIVE.as_posix(), INSTALL_MANIFEST_RELATIVE.as_posix()})
+    if manifest.get("owned_paths") != legacy_paths:
         raise CodexInstallConflict("legacy installation manifest managed path set is not supported")
     installed = manifest.get("installed_content_sha256")
-    old_assets = _legacy_asset_hashes()
     if not isinstance(installed, Mapping) or any(installed.get(path) != digest for path, digest in old_assets.items()):
         raise CodexInstallConflict("legacy installation manifest asset identities are not supported")
     if manifest.get("hooks_path", HOOKS_RELATIVE.as_posix()) != HOOKS_RELATIVE.as_posix():
@@ -857,9 +880,13 @@ def check_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     packaged = packaged_codex_assets()
     expected_assets = (
         {path.as_posix(): _hash(data) for path, data in packaged.items()}
-        if revision == CODEX_PACKAGE_REVISION else _legacy_asset_hashes()
+        if revision == CODEX_PACKAGE_REVISION else _legacy_assets_for(revision)
     )
     installed_hashes = manifest.get("installed_content_sha256", {})
+    editable_relatives = {
+        LAUNCHERS_RELATIVE.as_posix(),
+        EXCLUSIONS_RELATIVE.as_posix(),
+    }
     rows: list[dict[str, Any]] = []
     current = manifest_current and revision == CODEX_PACKAGE_REVISION
     for relative in _managed_paths(packaged):
@@ -871,16 +898,31 @@ def check_codex_adapter(project_root: str | Path) -> dict[str, Any]:
             actual = _hash(data)
             expected = expected_assets.get(relative) if relative in expected_assets else installed_hashes.get(relative)
         same = actual == expected
-        if relative in expected_assets and not same:
+        # The launcher JSON and exclusion file are editable provider policy:
+        # editing them changes guard behavior but does not break ownership.
+        editable = relative in editable_relatives
+        if relative in expected_assets and not same and not editable:
             current = False
-        rows.append({"path": relative, "installed_sha256": expected, "current_sha256": actual, "unchanged": same})
+        rows.append({
+            "path": relative,
+            "installed_sha256": expected,
+            "current_sha256": actual,
+            "unchanged": same,
+            "editable": editable,
+        })
     try:
         _, hook_present, hook_conflicts = _hook_state(guard.read(HOOKS_RELATIVE))
         managed_hooks_present = hook_present and not hook_conflicts and _subtract_hooks(guard.read(HOOKS_RELATIVE))[1] == sorted(_MANAGED_HOOK_IDS)
     except CodexInstallConflict:
         managed_hooks_present = False
     current = current and managed_hooks_present
-    result.update({"managed_paths": rows, "owned_paths": rows, "current": current, "manifest_current": manifest_current})
+    result.update({
+        "managed_paths": rows,
+        "owned_paths": rows,
+        "current": current,
+        "manifest_current": manifest_current,
+        "bounded_policy": bounded_policy_status(project),
+    })
     return result
 
 
@@ -904,7 +946,7 @@ def install_codex_adapter(project_root: str | Path, *, upgrade: bool = False) ->
             return current
         if existing_revision != CODEX_PACKAGE_REVISION and not upgrade:
             raise CodexInstallConflict("an older owned Codex adapter requires explicit upgrade")
-        old_assets = _legacy_asset_hashes() if existing_revision != CODEX_PACKAGE_REVISION else {
+        old_assets = _legacy_assets_for(existing_revision) if existing_revision != CODEX_PACKAGE_REVISION else {
             path.as_posix(): _hash(data) for path, data in packaged.items()
         }
         for relative, expected in old_assets.items():
@@ -1004,7 +1046,7 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     if not _manifest_is_unchanged(manifest_path, manifest, guard=guard):
         raise CodexInstallConflict("installation manifest was modified; refusing uninstall")
     packaged = packaged_codex_assets()
-    expected_assets = ({path.as_posix(): _hash(data) for path, data in packaged.items()} if revision == CODEX_PACKAGE_REVISION else _legacy_asset_hashes())
+    expected_assets = ({path.as_posix(): _hash(data) for path, data in packaged.items()} if revision == CODEX_PACKAGE_REVISION else _legacy_assets_for(revision))
     removed: list[str] = []
     preserved: list[str] = []
     original_states = {

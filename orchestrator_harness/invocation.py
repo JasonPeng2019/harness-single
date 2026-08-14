@@ -78,6 +78,7 @@ CODING_V1_ALLOWED_FIELDS = frozenset({
     "doer",
     "finding_gate",
     "child_environment_isolation",
+    "overlay_receipt",
 })
 
 
@@ -225,6 +226,7 @@ class CanonicalInvocation:
     legacy_route: str | None = None
     legacy_policy_sha256: str | None = None
     resume_admission_path: Path | None = None
+    overlay_receipt: Path | None = None
 
     def __post_init__(self) -> None:
         if self.schema != CANONICAL_INVOCATION_SCHEMA:
@@ -336,6 +338,8 @@ class CanonicalInvocation:
             record["resume"] = {"session_id": self.requested_session_id}
         if self.resume_admission_path is not None:
             record["resume_admission_path"] = str(self.resume_admission_path)
+        if self.overlay_receipt is not None:
+            record["overlay_receipt"] = str(self.overlay_receipt)
         return record
 
 
@@ -406,7 +410,7 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         "event_log_path",
         "resources",
     }
-    optional = {"repository", "resume", "resume_admission_path", "label", "task", "phase"}
+    optional = {"repository", "resume", "resume_admission_path", "overlay_receipt", "label", "task", "phase"}
     _closed(raw, required, optional, "canonical invocation")
     action = _text(raw.get("action"), "action").lower()
     if action not in {"start", "resume"}:
@@ -484,6 +488,11 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         if "resume_admission_path" in raw
         else None
     )
+    overlay_receipt = (
+        Path(_text(raw.get("overlay_receipt"), "overlay_receipt"))
+        if "overlay_receipt" in raw
+        else None
+    )
     return CanonicalInvocation(
         schema=CANONICAL_INVOCATION_SCHEMA,
         action=action,
@@ -512,6 +521,7 @@ def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
         task=_text(raw.get("task", task_card.get("id")), "task"),
         phase=_text(raw.get("phase", "implementation"), "phase"),
         resume_admission_path=resume_admission_path,
+        overlay_receipt=overlay_receipt,
     )
 
 
@@ -627,6 +637,11 @@ def adapt_coding_v1(raw: Mapping[str, Any], *, run_root: Path | None = None) -> 
         _text(raw.get("phase", "implementation"), "phase"),
         "coding-v1",
         None,
+        overlay_receipt=(
+            Path(_text(raw.get("overlay_receipt"), "overlay_receipt"))
+            if raw.get("overlay_receipt") is not None
+            else None
+        ),
     )
 
 

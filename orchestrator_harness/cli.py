@@ -36,6 +36,7 @@ from .processes import process_snapshot
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput, canonical_json
 from .watcher_integration import merge_watcher_conditions
+from .workspace_overlay import ingest_super_cache, prepare_worktree
 
 
 EXIT_OK = 0
@@ -261,6 +262,20 @@ def build_parser() -> argparse.ArgumentParser:
     retire.add_argument("--lane-id", required=True)
     for name in ("task-ref", "result-ref", "findings-ref", "acceptance-ref", "transcript-ref", "dependency-ref"):
         retire.add_argument(f"--{name}", required=True, type=Path)
+    retire.add_argument("--overlay-receipt", type=Path, default=None)
+
+    workspace = subparsers.add_parser("workspace", help="provider-neutral workspace overlay lifecycle")
+    workspace_modes = workspace.add_subparsers(dest="workspace_action", required=True)
+    super_cache = workspace_modes.add_parser("super-cache", help="manage the editable harness super-cache")
+    super_cache_modes = super_cache.add_subparsers(dest="super_cache_action", required=True)
+    ingest = super_cache_modes.add_parser("ingest", help="refresh super-cache to exactly the source folder contents")
+    ingest.add_argument("--source", required=True, type=Path, dest="source_folder")
+    ingest.add_argument("--harness-worktree", required=True, type=Path)
+    prepare = workspace_modes.add_parser("prepare", help="prepare one identified worktree from current cache contents")
+    prepare.add_argument("--super-cache", required=True, type=Path)
+    prepare.add_argument("--worktree", required=True, type=Path)
+    prepare.add_argument("--role", required=True, choices=("orchestrator", "subagent"))
+    prepare.add_argument("--receipt", required=True, type=Path)
     return parser
 
 
@@ -296,10 +311,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.lane_root, args.archive_root, lane_id=args.lane_id,
                 task_ref=args.task_ref, result_ref=args.result_ref, findings_ref=args.findings_ref,
                 acceptance_ref=args.acceptance_ref, transcript_ref=args.transcript_ref,
-                dependency_ref=args.dependency_ref,
+                dependency_ref=args.dependency_ref, overlay_receipt=args.overlay_receipt,
             )
             _print_json(result.as_record())
             return EXIT_OK if result.outcome.startswith("CLOSED") else EXIT_ERROR
+        if args.command == "workspace":
+            if args.workspace_action == "super-cache":
+                if args.super_cache_action != "ingest":
+                    raise ValueError("super-cache action must be ingest")
+                _print_json(ingest_super_cache(
+                    source_folder=args.source_folder,
+                    harness_worktree=args.harness_worktree,
+                ))
+            elif args.workspace_action == "prepare":
+                _print_json(prepare_worktree(
+                    super_cache=args.super_cache,
+                    target_worktree=args.worktree,
+                    role=args.role,
+                    receipt_path=args.receipt,
+                ))
+            else:
+                raise ValueError("workspace action must be super-cache or prepare")
+            return EXIT_OK
         if args.command == "handoff-preflight":
             result = preflight_handoff(
                 task_card_path=args.task_card, invocation_path=args.invocation,

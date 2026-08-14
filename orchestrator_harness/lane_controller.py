@@ -63,6 +63,7 @@ from .provider import (
 )
 from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
+from .workspace_overlay import verify_overlay_receipt
 from .stable_io import append_jsonl_record
 from .lane_lifecycle import LaneLifecycleError, _LifecycleAdmission, _admit_lifecycle_registry, _update_lifecycle_registry
 from .mutation import MutationConflict, MutationUnsupported, capture_target, replace as mutation_replace
@@ -293,6 +294,7 @@ class Invocation:
     runtime_profile: RuntimeProfile | None = None
     runtime_root: Path | None = None
     invocation_path: Path | None = None
+    overlay_receipt: Path | None = None
 
 
 def _common_paths(raw: dict[str, Any]) -> tuple[str, Path, Path, Path, str, bytes, dict[str, Path]]:
@@ -534,6 +536,12 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     isolation = raw.get("child_environment_isolation", False)
     if not isinstance(isolation, bool):
         raise InvocationError("child_environment_isolation must be boolean")
+    overlay_value = raw.get("overlay_receipt")
+    overlay_receipt = None
+    if overlay_value is not None:
+        if not isinstance(overlay_value, str) or not overlay_value.strip():
+            raise InvocationError("overlay_receipt must be a non-empty path string")
+        overlay_receipt = _safe_path(overlay_value, root=workspace, name="overlay_receipt")
     return Invocation(
         CODING_INVOCATION_SCHEMA, worker_invocation_id, action, run_root, workspace, prompt_path,
         prompt_sha256, prompt_bytes, None, None, label_value.strip(), doer_value.strip(), _string(raw, "task"),
@@ -541,6 +549,7 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         model, reasoning, tier, command,
         overrides, sandbox, approval, requested_thread, repository, outputs["status"], outputs["jsonl"],
         outputs["stderr"], outputs["last_message"], event_log, normalized_gate, isolation,
+        overlay_receipt=overlay_receipt,
     )
 
 
@@ -611,6 +620,11 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         component_path = bundle.components[0].path
         if component_path is None:
             raise InvocationValidationError("canonical prompt components must be path-bound")
+        overlay_receipt = None
+        if canonical.overlay_receipt is not None:
+            overlay_receipt = _safe_path(
+                str(canonical.overlay_receipt), root=workspace, name="overlay_receipt"
+            )
         return Invocation(
             canonical.schema,
             canonical.worker_invocation_id,
@@ -654,6 +668,7 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
             provider_options,
             bundle,
             profile,
+            overlay_receipt=overlay_receipt,
         )
     except (InvocationValidationError, PromptBundleError, ProfileError, OSError) as exc:
         raise InvocationError(str(exc)) from exc
@@ -2236,6 +2251,22 @@ def run(invocation: Invocation) -> int:
                 else:
                     child_env, cleared = isolated_coding_child_environment()
                     state["child_environment_isolation"] = {"enabled": True, "cleared_variable_names": cleared}
+            if argv is not None:
+                if invocation.overlay_receipt is not None:
+                    state["overlay_receipt"] = str(invocation.overlay_receipt)
+                    overlay_verification = verify_overlay_receipt(
+                        receipt_path=invocation.overlay_receipt,
+                        expected_target_worktree_id=invocation.run_root,
+                        role="subagent",
+                    )
+                    if not overlay_verification.get("verified"):
+                        raise InvocationError(
+                            "overlay receipt is not completed for this subagent worktree: "
+                            + str(overlay_verification.get("reason"))
+                        )
+                    state["overlay_receipt_verified"] = True
+                else:
+                    state["overlay_receipt"] = None
             boundary = ProcessBoundary.prepare()
             process = subprocess.Popen(
                 argv,
