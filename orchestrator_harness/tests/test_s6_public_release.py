@@ -2346,6 +2346,9 @@ class S6SafeguardTests(unittest.TestCase):
         self.assertIn("orchestrator_harness.release_checks", script)
         self.assertIn("--root", script)
         self.assertIn("--expected-tip", script)
+        self.assertIn("ExpectedBranch", script)
+        self.assertIn("Mandatory", script)
+        self.assertNotIn("firmware/v2-candidate", script)
         self.assertIn("S6.RELEASE.ACCUMULATED-SAFEGUARD", script)
         self.assertNotIn("@{ Name = 'ruff'", script)
         self.assertIn("CreditFile", script)
@@ -2402,6 +2405,8 @@ class S6SafeguardTests(unittest.TestCase):
                     str(script),
                     "-RepositoryRoot",
                     str(root),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
                 ],
                 cwd=root,
                 capture_output=True,
@@ -2736,6 +2741,17 @@ class S6PackageTests(unittest.TestCase):
             check=True,
         ).stdout
         self.assertEqual(before, after)
+
+    def test_package_exports_optional_firmware_seam_types(self) -> None:
+        import orchestrator_harness as harness
+        for name in (
+            "FirmwareAction",
+            "FirmwareCampaignPack",
+            "FirmwareOperation",
+            "FirmwareHardwareAdapter",
+            "HardwareCapabilityAdapter",
+        ):
+            self.assertTrue(hasattr(harness, name), name)
 
 
 if __name__ == "__main__":

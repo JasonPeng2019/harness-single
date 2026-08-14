@@ -318,7 +318,6 @@ _PYRIGHT_INPUT_SCOPES = (
 _COMPILE_INPUT_SCOPES = (
     InputScope("glob", "orchestrator_harness/**/*.py"),
     InputScope("glob", "harness_watcher_implementation/**/*.py"),
-    InputScope("glob", "firmware_acceptance/**/*.py"),
 )
 _SYNTHETIC_CLEANUP_INPUT_SCOPES = (
     InputScope("glob", "orchestrator_harness/**/*.py"),
@@ -361,7 +360,6 @@ _RELEASE_AGGREGATE_INPUT_SCOPES = (
     InputScope("tree", "orchestrator_harness"),
     InputScope("tree", "harness_common"),
     InputScope("tree", "harness_watcher_implementation"),
-    InputScope("tree", "firmware_acceptance"),
     InputScope("tree", "examples"),
     InputScope("tree", "release_evidence_templates"),
     InputScope("tree", "tools"),
@@ -650,13 +648,11 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "-q",
                 "orchestrator_harness",
                 "harness_watcher_implementation",
-                "firmware_acceptance",
             ),
             ("release-compile",),
             (
                 "orchestrator_harness/pyproject.toml",
                 "harness_watcher_implementation/__init__.py",
-                "firmware_acceptance/__init__.py",
             ),
             estimated_duration_seconds=10.0,
             input_scopes=_COMPILE_INPUT_SCOPES,

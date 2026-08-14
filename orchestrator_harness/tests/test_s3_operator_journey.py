@@ -141,28 +141,13 @@ class S3OperatorJourneyTests(unittest.TestCase):
         self,
     ) -> None:
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
+        root_readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         recipe = (
             REPOSITORY_ROOT / "examples" / "dual-path-manager.example.md"
         ).read_text(encoding="utf-8")
         safeguard = (
             REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
         ).read_text(encoding="utf-8")
-        registry_candidates = (
-            REPOSITORY_ROOT.parent / "firmware-v2" / "passed-tests.json",
-            REPOSITORY_ROOT.parents[2] / "passed-tests.json",
-            REPOSITORY_ROOT.parents[0]
-            / "plans"
-            / "general-coding-harness"
-            / "runtime"
-            / "firmware-v2"
-            / "passed-tests.json",
-        )
-        registry_path = next(
-            (path for path in registry_candidates if path.is_file()), None
-        )
-        self.assertIsNotNone(registry_path)
-        assert registry_path is not None
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
 
         for text in (quick_start, recipe):
             self.assertIn("scan --no-write", text)
@@ -170,22 +155,26 @@ class S3OperatorJourneyTests(unittest.TestCase):
             self.assertIn("top-level-event-id", text)
         for required in (
             "resume_thread_id",
-            "passed-tests.json",
             "PID-plus-creation",
-            "evaluator_enabled: false",
-            "C3-HARNESS",
-            'service_tier="priority"',
+            "FirmwareCampaignPack",
+            "FirmwareHardwareAdapter",
         ):
             self.assertIn(required, quick_start)
-        self.assertEqual([], registry["invalidated_groups"])
-        self.assertIn(
-            "tests/test_general_coding_docs.py::GeneralCodingDocumentationTests::test_documented_harness_examples_parse",
-            registry["green_test_ids"],
-        )
-        self.assertIn(
-            "tests/test_general_coding_docs.py::GeneralCodingDocumentationTests::test_schema_less_firmware_invocation_still_parses",
-            registry["green_test_ids"],
-        )
+        self.assertIn("FirmwareCampaignPack", root_readme)
+        self.assertIn("FirmwareHardwareAdapter", root_readme)
+        # Generic public facts: no external passed-tests registry, no C3 roles,
+        # and no defaulted candidate branch in the safeguard.
+        for text in (quick_start, root_readme):
+            self.assertNotIn("passed-tests.json", text)
+            self.assertNotIn("C3-HARNESS", text)
+            self.assertNotIn("F.C3.O", text)
+        self.assertIn("orchestrator_harness.release_checks", safeguard)
+        self.assertIn("--expected-tip", safeguard)
+        self.assertNotIn("C:/Users/", safeguard)
+        self.assertIn("ExpectedBranch", safeguard)
+        self.assertIn("Mandatory", safeguard)
+        self.assertNotIn("firmware/v2-candidate", safeguard)
+        self.assertIn("if (-not $Run)", safeguard)
         for template in (
             "FINAL_REVIEW.md",
             "ACCEPTANCE_WATCHER.md",
@@ -199,12 +188,6 @@ class S3OperatorJourneyTests(unittest.TestCase):
                 (REPOSITORY_ROOT / "release_evidence_templates" / template).is_file(),
                 template,
             )
-        self.assertIn("orchestrator_harness.release_checks", safeguard)
-        self.assertIn("--expected-tip", safeguard)
-        self.assertNotIn("C:/Users/", safeguard)
-        self.assertIn("firmware/v2-candidate", safeguard)
-        self.assertIn("if (-not $Run)", safeguard)
-
 
 if __name__ == "__main__":
     unittest.main()

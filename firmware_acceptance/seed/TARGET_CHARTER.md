@@ -1,3 +1,0 @@
-# Four-Board Dual-Family Firmware Lab
-
-The disposable target proves STM32 I2C/UART, nRF52 BLE, DIO2-independent legal-band LoRa, and one concurrent STM/NRF campaign using only controller-brokered MCP calls. Behavioral protocol evidence, not flash success, is the pass oracle. Each selected ID has deterministic input, machine-readable observation, cleanup, and a dependency fingerprint in `TEST_CONTRACT.json`. One target-code-only injected failure is routed as `TARGET_LOCAL_REPAIR`; candidate/watcher invariant failures are `HARNESS_WATCHER_ABORT`; a reproduced pinned-server source failure is `AUTHORIZED_SERVER_LIMITATION`, with an independently assigned substitute and the physical portion `NOT_CERTIFIED`, never PASS. No hardware action is authorized by this charter.

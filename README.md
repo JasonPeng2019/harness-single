@@ -282,13 +282,38 @@ observation remain supported. They are a separate compatibility path and are not
 `orchestrator-coding-invocation/v1`. Firmware work must continue to follow its existing policy,
 authorization, lease, relay, and physical cleanup rules.
 
-The firmware-v2 static acceptance material is in `firmware_acceptance/`. The retained
-`examples/legacy-firmware.invocation.example.json` and
+The optional firmware seam is caller-declared and installed with the package:
+
+- `orchestrator_harness.firmware_campaign` declares a validated `FirmwareAction` (MCP tool name,
+  positive method version, positive maximum duration, and the exact required argument names) and
+  builds a `FirmwareCampaignPack` only from a caller-declared capability name, action
+  declarations, canonical resource identities, and a nonempty public policy binding. There is no
+  default pack, fixture, action, manifest, policy, path, hash, server revision, provider, or
+  machine value. `resolve()` requires the requested capability and action, exactly one declared
+  resource, and exactly the action's declared argument keys, and passes caller arguments through
+  unchanged. A lane ID is never assumed to be a board/resource ID. The approval policy binds the
+  declared policy, capability, action, MCP tool, method version, maximum duration, canonical
+  resource, and resource identity; a caller may deliberately include a revision/hash in its policy
+  binding, and the harness never generates one.
+- `orchestrator_harness.firmware_adapter` provides the broker-compatible `FirmwareHardwareAdapter`,
+  which requires the pack plus caller-supplied snapshot, launch/configuration, child-identity, and
+  transport seams. It reuses `ProcessBoundary` and `ProcessSupervisor` and sends exact MCP traffic
+  (`initialize` with the caller-declared protocol version, `notifications/initialized`, then
+  `tools/call` with the declared tool and unchanged arguments). Permit-expiry checks precede
+  launch, enqueue, and dispatch; public results never leak private launch/configuration data; and
+  cleanup retains the claim until both the owned process boundary and transport are proven closed.
+- The public types are exported from `orchestrator_harness` (`FirmwareAction`,
+  `FirmwareCampaignPack`, `FirmwareOperation`, `FirmwareHardwareAdapter`,
+  `HardwareCapabilityAdapter`). The pack/adapter plus the existing `CapabilityBroker` is the
+  complete optional firmware seam; it is not connected to the lane controller and introduces no
+  controller or runtime protocol.
+
+The retained `examples/legacy-firmware.invocation.example.json` and
 `examples/dual-path-manager.example.md` show how legacy firmware and coding V1 coexist without a
-schema migration or an alternate event loop. `QUICK_START.md` contains the release-role assignments,
-fresh-epoch/operator commands, exact identity cleanup procedure, and the candidate-only safeguard
-entry point. Release record shells are intentionally small and live in `release_evidence_templates/`;
-the packaged canonical copies are listed by `orchestrator_harness.release_assets`.
+schema migration or an alternate event loop. `QUICK_START.md` contains the fresh-epoch/operator
+commands, exact identity cleanup procedure, and the candidate-only safeguard entry point. Release
+record shells are intentionally small and live in `release_evidence_templates/`; the packaged
+canonical copies are listed by `orchestrator_harness.release_assets`.
 
 ## Documentation
 

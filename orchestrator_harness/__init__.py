@@ -64,6 +64,8 @@ from .capability_broker import (
     CleanupEvidence,
     FakeCapabilityAdapter,
 )
+from .firmware_campaign import FirmwareAction, FirmwareCampaignPack, FirmwareOperation
+from .firmware_adapter import FirmwareHardwareAdapter, HardwareCapabilityAdapter
 
 __all__ = [
     "CANONICAL_INVOCATION_SCHEMA",
@@ -122,6 +124,11 @@ __all__ = [
     "CapabilitySnapshot",
     "CleanupEvidence",
     "FakeCapabilityAdapter",
+    "FirmwareAction",
+    "FirmwareCampaignPack",
+    "FirmwareHardwareAdapter",
+    "FirmwareOperation",
+    "HardwareCapabilityAdapter",
     "run_installed_codex_hook",
     "SyntheticCodexTransport",
 ]

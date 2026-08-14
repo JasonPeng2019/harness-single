@@ -3,7 +3,8 @@ param(
     [switch]$Run,
     [Alias('Root')]
     [string]$RepositoryRoot,
-    [string]$ExpectedBranch = 'firmware/v2-candidate',
+    [Parameter(Mandatory = $true)]
+    [string]$ExpectedBranch,
     [string]$ExpectedTip,
     [string[]]$ChangedPath = @(),
     [string[]]$ChangedDomain = @(),

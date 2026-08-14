@@ -1,1 +1,0 @@
-{"schema_version":"target-pinned-inputs/v1","c1_binding_required":true,"harness_commit":"bound externally by C1; never self-referential","mcp_commit":"f003f84a7df51cd8595a3203c62e225b21da2a22","boards":["STM-A","STM-B","NRF-A","NRF-B"],"p05":"DIO2-independent","build_provenance":["source_commit","toolchain_lock_sha256","artifact_sha256","build_command_sha256"]}

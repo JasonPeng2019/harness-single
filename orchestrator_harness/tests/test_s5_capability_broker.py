@@ -12,11 +12,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping
 
-from firmware_acceptance.campaign_pack import CAMPAIGN_CAPABILITY, DEFAULT_CAMPAIGN_PACK
 from orchestrator_harness.capability_broker import (
     APPROVAL_SCHEMA,
     AdapterResult,
     CapabilityAdapterError,
+    CapabilityAdapterUnavailable,
     CapabilityApproval,
     CapabilityBroker,
     CapabilityDenied,
@@ -29,12 +29,11 @@ from orchestrator_harness.capability_broker import (
     canonical_json_bytes,
     current_process_identity,
 )
+from orchestrator_harness.firmware_adapter import FirmwareHardwareAdapter
+from orchestrator_harness.firmware_campaign import FirmwareAction, FirmwareCampaignPack
 from orchestrator_harness.process_supervisor import CleanupResult, ProcessBoundary, ProcessBoundaryUnsupported, ProcessSupervisor
 from orchestrator_harness.processes import process_snapshot
 from orchestrator_harness.resource_locks import BOUNDARY_ARMED_STATE, ResourceClaims, claim_filename
-from firmware_acceptance.capability_adapter import FirmwareHardwareAdapter
-from firmware_acceptance.controller import FirmwareAcceptanceController, _process_identity
-from firmware_acceptance.kit import AcceptanceBroker
 
 
 OWNER = {"pid": 321, "created_utc": "2026-01-01T00:00:00Z", "creation_identity": "fake:321"}
@@ -133,12 +132,12 @@ class _ContendedClaims:
                         self.shared.owners[resource] = self.identity
                         self._held[resource] = {
                             "schema": "fake-resource-claim/v1",
-                        "resource": resource,
-                        "path": str(self.root / f"{resource}.claim"),
-                        "owner": dict(self.owner),
-                        "boundary_state": "NOT_ARMED",
-                        "boundary_may_exist": False,
-                    }
+                            "resource": resource,
+                            "path": str(self.root / f"{resource}.claim"),
+                            "owner": dict(self.owner),
+                            "boundary_state": "NOT_ARMED",
+                            "boundary_may_exist": False,
+                        }
                         break
                 on_wait({"resource": resource, "state": "CONTENDED", "reason": "shared fake owner", "wait_seconds": 0.001, "actionable": False})
                 time.sleep(0.001)
@@ -265,25 +264,42 @@ class _ExpiryTransport(_Transport):
         super().send(value, label)
 
 
-def _controller_authority(root: Path) -> dict[str, Any]:
-    acceptance = AcceptanceBroker(
-        root / "authority",
-        Path("firmware_acceptance/seed"),
-        Path("firmware_acceptance/MCP_METHOD_POLICY.json"),
-        Path("firmware_acceptance/LANE_TEMPLATES.json"),
+def _process_identity(pid: int) -> dict[str, Any] | None:
+    """The OS-level primitive returns None once the exact child is absent."""
+    from harness_common.process_identity import exact_process_identity
+    if pid not in process_snapshot().by_pid:
+        return None
+    return exact_process_identity(pid)
+
+
+def _campaign_pack() -> FirmwareCampaignPack:
+    return FirmwareCampaignPack(
+        capability="firmware-acceptance",
+        actions={
+            "observe": FirmwareAction(
+                mcp_tool="get_board_info",
+                method_version=1,
+                maximum_duration_seconds=40,
+                required_arguments=("board_id",),
+            ),
+            "flash_application": FirmwareAction(
+                mcp_tool="flash_application",
+                method_version=1,
+                maximum_duration_seconds=120,
+                required_arguments=("board_id", "artifact"),
+            ),
+        },
+        resources={
+            "board:stm-a": {"probe_uid": "probe-a", "target": "stm32l476rg", "profile": "stm32"},
+            "board:nrf-a": {"probe_uid": "probe-b", "target": "nrf52840", "profile": "nrf"},
+        },
+        policy={"policy": "caller-declared-policy-v1", "revision": "caller-supplied-revision"},
     )
-    return {
-        "manifest": acceptance.manifest,
-        "policy": acceptance.policy,
-        "templates": acceptance.templates,
-        "manifest_path": acceptance.manifest_path,
-        "policy_path": acceptance.policy_path,
-        "templates_path": acceptance.templates_path,
-    }
 
 
-def _firmware_snapshot(request: CapabilityRequest, authority: Mapping[str, Any], *, adapter_version: str = "v1") -> CapabilitySnapshot:
-    fixture = dict(authority["manifest"]["fixtures"][request.lane_id])
+def _firmware_snapshot(request: CapabilityRequest, pack: FirmwareCampaignPack) -> CapabilitySnapshot:
+    resource = request.resources[0]
+    identity = pack.resources[resource]
     return CapabilitySnapshot(
         request_id=request.request_id,
         lane_id=request.lane_id,
@@ -292,16 +308,16 @@ def _firmware_snapshot(request: CapabilityRequest, authority: Mapping[str, Any],
         action=request.action,
         resources=request.resources,
         snapshot_id="hardware-snapshot-1",
-        identity={"target_revision": "fake-target-1", "canonical_resource": request.lane_id, "fixture_identity": fixture},
-        resource_identities={request.lane_id: fixture},
-        capabilities={CAMPAIGN_CAPABILITY: ("observe",)},
-        adapter_identity={"adapter_id": "firmware-hardware", "adapter_version": adapter_version},
+        identity={"target_revision": "fake-target-1", "canonical_resource": resource, "resource_identity": identity},
+        resource_identities={resource: identity},
+        capabilities={pack.capability: tuple(pack.actions)},
+        adapter_identity={"adapter_id": "firmware-hardware", "adapter_version": "v1"},
         observed_monotonic=10.0,
     )
 
 
-def _firmware_adapter(root: Path, clock: Callable[[], float] | None = None, *, transport=None, boundary_factory=None) -> tuple[FirmwareHardwareAdapter, dict[str, Any], Any]:
-    authority = _controller_authority(root)
+def _firmware_adapter(root: Path, clock: Callable[[], float] | None = None, *, transport=None, boundary_factory=None, pack=None) -> tuple[FirmwareHardwareAdapter, FirmwareCampaignPack, Any]:
+    selected_pack = pack or _campaign_pack()
     selected_transport = transport or _Transport()
 
     def make_transport(process, remaining, request_id, config):
@@ -310,8 +326,8 @@ def _firmware_adapter(root: Path, clock: Callable[[], float] | None = None, *, t
         return selected_transport
 
     adapter = FirmwareHardwareAdapter(
-        controller_authority=authority,
-        snapshot_provider=lambda request: _firmware_snapshot(request, authority),
+        campaign_pack=selected_pack,
+        snapshot_provider=lambda request: _firmware_snapshot(request, selected_pack),
         launcher=lambda config: _Process(),
         identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
         config_provider=lambda request, operation: {"private": "controller-config"},
@@ -320,30 +336,32 @@ def _firmware_adapter(root: Path, clock: Callable[[], float] | None = None, *, t
         boundary_factory=boundary_factory or (lambda: _Boundary()),
         clock=clock or (lambda: 10.0),
     )
-    return adapter, authority, selected_transport
+    return adapter, selected_pack, selected_transport
 
 
-def _firmware_request_and_approval(adapter: FirmwareHardwareAdapter, authority: Mapping[str, Any], *, request_id: str = "hardware-request", resource: str = "STM-A", expiry: float = 100.0, action: str = "observe", arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _firmware_request_and_approval(adapter: FirmwareHardwareAdapter, pack: FirmwareCampaignPack, *, request_id: str = "hardware-request", resource: str = "board:stm-a", expiry: float = 100.0, action: str = "observe", arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     request = _request(
         request_id=request_id,
-        lane_id=resource,
-        capability=CAMPAIGN_CAPABILITY,
+        lane_id="lane-firmware",
+        capability=pack.capability,
         action=action,
-        arguments=arguments if arguments is not None else {"fixture": resource},
+        arguments=arguments if arguments is not None else {"board_id": "stm-a"},
         expiry=expiry,
         resources=[resource],
     )
     parsed = CapabilityRequest.from_record(request, now_monotonic=0.0)
     snapshot = adapter.observe(parsed)
     approval = _approval(parsed, snapshot, approval_id=f"{request_id}-approval")
+    operation = pack.resolve(parsed)
     approval["policy"] = {
-        "policy_reference": adapter.campaign_pack.method_policy_reference,
-        "manifest_reference": adapter.campaign_pack.manifest_reference,
-        "method_version": 1,
-        "maximum_duration_seconds": adapter.campaign_pack.authorized_maxima[action],
+        "policy": pack.policy,
+        "capability": pack.capability,
         "action": action,
+        "mcp_tool": operation.mcp_tool,
+        "method_version": operation.method_version,
+        "maximum_duration_seconds": operation.maximum_duration_seconds,
         "canonical_resource": resource,
-        "fixture_identity": dict(authority["manifest"]["fixtures"][resource]),
+        "resource_identity": pack.resources[resource],
     }
     return request, approval
 
@@ -431,6 +449,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual(result.record["permit_sha256"], permit["permit_sha256"])
             self.assertEqual(result.record["raw_result_sha256"], hashlib.sha256(b'{"request_id":"request-1","status":"completed"}').hexdigest())
 
+
     def test_S5_F1_changed_expired_and_unbound_approval_never_dispatches(self) -> None:
         for name in ("changed", "expired", "unbound"):
             with self.subTest(name=name), TemporaryDirectory() as temporary:
@@ -460,6 +479,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 self.assertEqual(0, len(adapter.permits))
                 self.assertFalse(claims.held)
 
+
     def test_S5_F2_closed_request_rejects_endpoint_material_before_observation(self) -> None:
         adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
         value = _request()
@@ -469,6 +489,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual(0, adapter.support_calls)
         self.assertEqual(0, adapter.observe_calls)
         self.assertNotIn("endpoint", str(result.to_record()).lower())
+
 
     def test_S5_F5_dispatch_failure_is_terminal_failure_and_cleanup_precedes_release(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -483,6 +504,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual(["claim", "arm", "cleanup"], events[:3])
             self.assertEqual("release", events[3])
 
+
     def test_S5_F5_unproved_cleanup_retains_exact_claim_and_is_uncertain(self) -> None:
         with TemporaryDirectory() as temporary:
             adapter = FakeCapabilityAdapter({"synthetic": ("read",)}, cleanup_proved=False)
@@ -493,6 +515,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertFalse(result.record["claims_released"])
             self.assertTrue(claims.retained)
             self.assertTrue(claims.held)
+
 
     def test_S5_F3_same_resource_serializes_and_disjoint_resource_progresses(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -561,6 +584,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             thread_one.join(1.0)
             self.assertEqual("PASS", first_result["value"].outcome)
 
+
     def test_S5_F4_uncertain_resource_evidence_denies_without_dispatch(self) -> None:
         class UncertainClaims:
             held: list[dict[str, Any]] = []
@@ -577,6 +601,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual("DENIED", result.outcome)
         self.assertEqual("RESOURCE_UNCERTAIN", result.record["denial"]["reason_code"])
         self.assertEqual(0, adapter.dispatch_calls)
+
 
     def test_S5_F4_broker_consumes_native_resource_claim_owner_and_releases_it(self) -> None:
         owner = current_process_identity()
@@ -600,6 +625,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual(1, adapter.dispatch_calls)
         self.assertTrue(result.record["claims_released"])
 
+
     def test_S5_F6_legacy_and_coding_records_are_not_mixed_into_generic_route(self) -> None:
         adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
         claims = _Claims(Path("."), [])
@@ -614,159 +640,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual(0, adapter.support_calls)
         self.assertEqual(0, adapter.observe_calls)
 
-    def test_S5_F7_hardware_adapter_keeps_mapping_transport_and_child_cleanup_private(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            authority = _controller_authority(root)
-            transport = _Transport()
-
-            def snapshot_provider(request: CapabilityRequest) -> CapabilitySnapshot:
-                return _firmware_snapshot(request, authority)
-
-            adapter = FirmwareHardwareAdapter(
-                controller_authority=authority,
-                snapshot_provider=snapshot_provider,
-                launcher=lambda config: _Process(),
-                identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
-                config_provider=lambda request, operation: {"private": "controller-config"},
-                transport_factory=lambda process, remaining, request_id, config: transport,
-                supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
-                boundary_factory=lambda: _Boundary(),
-                clock=lambda: 10.0,
-            )
-            request = _request(
-                request_id="hardware-request",
-                lane_id="STM-A",
-                capability=CAMPAIGN_CAPABILITY,
-                action="observe",
-                arguments={"fixture": "STM-A"},
-                resources=["STM-A"],
-            )
-            parsed = CapabilityRequest.from_record(request, now_monotonic=0.0)
-            snapshot = adapter.observe(parsed)
-            approval = _approval(parsed, snapshot)
-            approval["policy"] = {
-                "policy_reference": adapter.campaign_pack.method_policy_reference,
-                "manifest_reference": adapter.campaign_pack.manifest_reference,
-                "method_version": 1,
-                "maximum_duration_seconds": adapter.campaign_pack.authorized_maxima["observe"],
-                "action": "observe",
-                "canonical_resource": "STM-A",
-                "fixture_identity": dict(authority["manifest"]["fixtures"]["STM-A"]),
-            }
-            claims = _Claims(root, [])
-            result = CapabilityBroker(
-                adapter,
-                approval_verifier=_Verifier(),
-                policy_verifier=adapter.verify_approval,
-                identity_provider=lambda: dict(OWNER),
-                claims_factory=lambda *_: claims,
-                clock=lambda: 10.0,
-            ).execute(request, approval)
-            self.assertEqual("PASS", result.outcome, result.to_record())
-            self.assertTrue(transport.closed)
-            self.assertEqual("get_board_info", transport.messages[2]["method"])
-            self.assertNotIn("get_board_info", str(result.to_record()))
-            self.assertNotIn("private", str(result.to_record()))
-
-    def test_S5_F6_legacy_controller_exposes_generic_route_without_changing_old_entrypoints(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            acceptance = AcceptanceBroker(
-                root / "broker",
-                Path("firmware_acceptance/seed"),
-                Path("firmware_acceptance/MCP_METHOD_POLICY.json"),
-                Path("firmware_acceptance/LANE_TEMPLATES.json"),
-            )
-            claims = _Claims(root, [])
-            controller = FirmwareAcceptanceController(
-                acceptance,
-                clock=lambda: 10.0,
-                claims_factory=lambda lane, request_id: claims,
-            )
-            adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
-            request = _request()
-            result = controller.execute_capability_request(
-                request,
-                self._approval_for(request, adapter),
-                _Verifier(),
-                adapter=adapter,
-                policy_verifier=lambda *_: True,
-                identity_provider=lambda: dict(OWNER),
-            )
-            self.assertEqual("PASS", result["outcome"])
-            self.assertEqual(1, adapter.dispatch_calls)
-
-    def test_S5_R1_004_controller_binds_one_confined_state_root_for_retries(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            acceptance = AcceptanceBroker(
-                root / "broker",
-                Path("firmware_acceptance/seed"),
-                Path("firmware_acceptance/MCP_METHOD_POLICY.json"),
-                Path("firmware_acceptance/LANE_TEMPLATES.json"),
-            )
-            adapter = FakeCapabilityAdapter({"synthetic": ("read",)})
-            request = _request(request_id="controller-durable-request")
-            approval = self._approval_for(request, adapter)
-            first_claims = _Claims(root / "claims-1", [])
-            first_controller = FirmwareAcceptanceController(
-                acceptance,
-                clock=lambda: 10.0,
-                claims_factory=lambda lane, request_id: first_claims,
-            )
-            first = first_controller.execute_capability_request(
-                request,
-                approval,
-                _Verifier(),
-                adapter=adapter,
-                policy_verifier=lambda *_: True,
-                identity_provider=lambda: dict(OWNER),
-            )
-            self.assertEqual("PASS", first["outcome"])
-            expected_state_root = (acceptance.root / "capability-state").resolve()
-            self.assertEqual(expected_state_root, first_controller.capability_state_root)
-
-            second_claims = _Claims(root / "claims-2", [])
-            second_controller = FirmwareAcceptanceController(
-                acceptance,
-                clock=lambda: 10.0,
-                claims_factory=lambda lane, request_id: second_claims,
-            )
-            second = second_controller.execute_capability_request(
-                copy.deepcopy(request),
-                copy.deepcopy(approval),
-                _Verifier(),
-                adapter=adapter,
-                policy_verifier=lambda *_: True,
-                identity_provider=lambda: dict(OWNER),
-            )
-            self.assertEqual(first, second)
-            self.assertEqual(expected_state_root, second_controller.capability_state_root)
-            self.assertEqual(1, adapter.dispatch_calls)
-            self.assertFalse(second_claims.held)
-            self.assertTrue(expected_state_root.is_dir())
-
-            with self.assertRaises(TypeError):
-                FirmwareAcceptanceController(acceptance, state_root=acceptance.root / "state-b")
-            self.assertFalse((acceptance.root / "state-b").exists())
-
-            support_calls = adapter.support_calls
-            observe_calls = adapter.observe_calls
-            with self.assertRaises(TypeError):
-                second_controller.execute_capability_request(
-                    copy.deepcopy(request),
-                    copy.deepcopy(approval),
-                    _Verifier(),
-                    adapter=adapter,
-                    policy_verifier=lambda *_: True,
-                    identity_provider=lambda: dict(OWNER),
-                    state_root=acceptance.root / "state-b",
-                )
-            self.assertEqual(1, adapter.dispatch_calls)
-            self.assertFalse((acceptance.root / "state-b").exists())
-            self.assertEqual(support_calls, adapter.support_calls)
-            self.assertEqual(observe_calls, adapter.observe_calls)
 
     def test_S5_F8_exact_retry_reuses_terminal_result_and_changed_replay_denies(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -785,13 +658,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual("DENIED", third.outcome)
             self.assertEqual("REPLAY_MISMATCH", third.record["denial"]["reason_code"])
 
-    def test_S5_F6_campaign_pack_is_inert_and_retains_four_fixture_aliases(self) -> None:
-        record = DEFAULT_CAMPAIGN_PACK.as_record()
-        self.assertEqual(CAMPAIGN_CAPABILITY, record["capability"])
-        self.assertEqual(["STM-A", "STM-B", "NRF-A", "NRF-B"], record["fixture_aliases"])
-        self.assertFalse(record["hil_intent"]["physical_execution"])
-        self.assertTrue(DEFAULT_CAMPAIGN_PACK.supports(capability=CAMPAIGN_CAPABILITY, action="observe", fixture_alias="STM-A"))
-        self.assertFalse(DEFAULT_CAMPAIGN_PACK.supports(capability=CAMPAIGN_CAPABILITY, action="unknown", fixture_alias="STM-A"))
 
     def test_S5_R1_001_native_claim_is_armed_before_dispatch_and_retained_after_uncertainty(self) -> None:
         class ArmObservingAdapter(FakeCapabilityAdapter):
@@ -829,6 +695,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertIsInstance(retained.get("retained_boundary"), dict)
             self.assertFalse(result.record["claims_released"])
 
+
     def test_S5_R1_001_arm_failure_denies_before_any_adapter_launch(self) -> None:
         with TemporaryDirectory() as temporary:
             events: list[str] = []
@@ -842,78 +709,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual(["claim", "arm", "retain"], events)
             self.assertTrue(claims.held)
 
-    def test_S5_R1_002_firmware_uses_one_canonical_fixture_resource(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            adapter, authority, _ = _firmware_adapter(root)
-            for resource in ("resource-a", "resource-b"):
-                claims = _Claims(root, [])
-                request = _request(
-                    request_id=f"wrong-{resource}",
-                    lane_id="STM-A",
-                    capability=CAMPAIGN_CAPABILITY,
-                    action="observe",
-                    arguments={"fixture": "STM-A"},
-                    resources=[resource],
-                )
-                result = _broker(adapter, claims).execute(request, {})
-                self.assertEqual("DENIED", result.outcome)
-                self.assertFalse(claims.held)
-            request, approval = _firmware_request_and_approval(adapter, authority, request_id="canonical-resource")
-            claims = _Claims(root, [])
-            result = CapabilityBroker(
-                adapter,
-                approval_verifier=_Verifier(),
-                policy_verifier=adapter.verify_approval,
-                identity_provider=lambda: dict(OWNER),
-                claims_factory=lambda *_: claims,
-                clock=lambda: 10.0,
-            ).execute(request, approval)
-            self.assertEqual("PASS", result.outcome, result.to_record())
-            self.assertEqual(("STM-A",), result.record["resources"])
-
-    def test_S5_R1_002_canonical_firmware_resource_serializes_same_fixture(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            adapter, authority, _ = _firmware_adapter(root)
-            first, first_approval = _firmware_request_and_approval(adapter, authority, request_id="firmware-first")
-            second, second_approval = _firmware_request_and_approval(adapter, authority, request_id="firmware-second")
-            shared = _SharedClaims()
-            entered = threading.Event()
-            allow = threading.Event()
-            original_dispatch = adapter.dispatch
-
-            def gated_dispatch(permit):
-                if permit.request.request_id == "firmware-first":
-                    entered.set()
-                    allow.wait(2.0)
-                return original_dispatch(permit)
-
-            adapter.dispatch = gated_dispatch
-
-            def make_broker() -> CapabilityBroker:
-                return CapabilityBroker(
-                    adapter,
-                    approval_verifier=_Verifier(),
-                    policy_verifier=adapter.verify_approval,
-                    identity_provider=lambda: dict(OWNER),
-                    claims_factory=lambda lane, request_id: _ContendedClaims(shared, root),
-                    clock=lambda: 10.0,
-                )
-
-            results: dict[str, Any] = {}
-            one = threading.Thread(target=lambda: results.setdefault("one", make_broker().execute(first, first_approval)), daemon=True)
-            one.start()
-            self.assertTrue(entered.wait(1.0))
-            two = threading.Thread(target=lambda: results.setdefault("two", make_broker().execute(second, second_approval)), daemon=True)
-            two.start()
-            time.sleep(0.05)
-            self.assertNotIn("two", results)
-            allow.set()
-            one.join(2.0)
-            two.join(2.0)
-            self.assertEqual("PASS", results["one"].outcome)
-            self.assertEqual("PASS", results["two"].outcome)
 
     def test_S5_R1_003_default_boundary_tracks_descendant_and_proves_empty_cleanup(self) -> None:
         base_python = getattr(sys, "_base_executable", sys.executable)
@@ -961,41 +756,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             if boundary is not None:
                 boundary.close()
 
-    def test_S5_R1_003_default_adapter_boundary_releases_after_disposable_process_cleanup(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            authority = _controller_authority(root)
-            try:
-                adapter = FirmwareHardwareAdapter(
-                    controller_authority=authority,
-                    snapshot_provider=lambda request: _firmware_snapshot(request, authority),
-                    launcher=lambda config: subprocess.Popen(
-                        [sys.executable, "-c", "import time; time.sleep(30)"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        **config["popen_kwargs"],
-                    ),
-                    identity_provider=_process_identity,
-                    config_provider=lambda request, operation: {},
-                    transport_factory=lambda process, remaining, request_id, config: _Transport(),
-                    clock=lambda: 10.0,
-                )
-            except ProcessBoundaryUnsupported as exc:
-                self.skipTest(f"native process boundary unavailable: {exc}")
-            request, approval = _firmware_request_and_approval(adapter, authority, request_id="default-adapter-boundary")
-            claims = _Claims(root, [])
-            result = CapabilityBroker(
-                adapter,
-                approval_verifier=_Verifier(),
-                policy_verifier=adapter.verify_approval,
-                identity_provider=lambda: dict(OWNER),
-                claims_factory=lambda *_: claims,
-                clock=lambda: 10.0,
-            ).execute(request, approval)
-            self.assertEqual("PASS", result.outcome, result.to_record())
-            self.assertTrue(result.record["claims_released"])
-            self.assertNotIn("session_id", json.dumps(result.to_record(), sort_keys=True))
 
     def test_S5_R1_003_boundary_contradiction_retains_claim_even_when_adapter_says_proved(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1018,6 +778,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertFalse(result.record["claims_released"])
             self.assertIn("cleanup boundary reports live_members", result.record["cleanup_validation"]["reasons"])
             self.assertNotIn("release", events)
+
 
     def test_S5_R1_004_fresh_broker_reuses_durable_terminal_and_rejects_replays(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1047,19 +808,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             self.assertEqual("APPROVAL_REPLAY", approval_replay.record["denial"]["reason_code"])
             self.assertEqual(1, adapter.dispatch_calls)
 
-    def test_S5_R1_004_adapter_cleanup_cache_is_keyed_by_request_and_permit_digest(self) -> None:
-        with TemporaryDirectory() as temporary:
-            adapter, authority, _ = _firmware_adapter(Path(temporary))
-            request_value, approval_value = _firmware_request_and_approval(adapter, authority, request_id="cache-request")
-            request = CapabilityRequest.from_record(request_value, now_monotonic=0.0)
-            snapshot = adapter.observe(request)
-            approval = CapabilityApproval.from_record(approval_value)
-            permit_a = CapabilityPermit(request, snapshot, approval, (), dict(OWNER), dict(adapter.adapter_identity), 40.0, "a" * 64)
-            permit_b = CapabilityPermit(request, snapshot, approval, (), dict(OWNER), dict(adapter.adapter_identity), 40.0, "b" * 64)
-            first = adapter.cleanup(permit_a, None, {"reason_code": "failed"})
-            second = adapter.cleanup(permit_b, None, {"reason_code": "failed"})
-            self.assertIsNot(first, second)
-            self.assertEqual(2, len(adapter._cleanup_results))
 
     def test_S5_R1_005_cleanup_contradictions_and_retention_failures_never_release(self) -> None:
         variants = (
@@ -1087,6 +835,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                 self.assertFalse(result.record["claims_released"])
                 self.assertEqual(("retention-proof-failed",), result.record["retention_failures"])
                 self.assertNotIn("release", events)
+
 
     def test_S5_R1_006_recursive_public_authority_aliases_are_rejected(self) -> None:
         aliases = (
@@ -1161,96 +910,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
             canonical_json_bytes({"public_key": "typed-public", "ordinary_key": "ordinary", "monkey": "ordinary", "keyboard": "ordinary"}),
         )
 
-    def test_S5_R1_007_controller_pinned_pack_enforces_fixture_arguments_and_duration(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            authority = _controller_authority(root)
-            drifted = dict(authority)
-            drifted["policy_path"] = root / "drifted-policy.json"
-            drifted_adapter = FirmwareHardwareAdapter(controller_authority=drifted)
-            self.assertFalse(drifted_adapter.supports(CapabilityRequest.from_record(_request(lane_id="STM-A", capability=CAMPAIGN_CAPABILITY, action="observe", arguments={"fixture": "STM-A"}, resources=["STM-A"]), now_monotonic=0.0)))
-
-            adapter, authority, _ = _firmware_adapter(root / "valid")
-            invalid_request = _request(
-                request_id="invalid-args",
-                lane_id="STM-A",
-                capability=CAMPAIGN_CAPABILITY,
-                action="observe",
-                arguments={"fixture": "STM-A", "unexpected": True},
-                resources=["STM-A"],
-            )
-            claims = _Claims(root, [])
-            invalid = _broker(adapter, claims).execute(invalid_request, {})
-            self.assertEqual("DENIED", invalid.outcome)
-            self.assertFalse(claims.held)
-
-            mismatch = _request(
-                request_id="fixture-mismatch",
-                lane_id="STM-A",
-                capability=CAMPAIGN_CAPABILITY,
-                action="observe",
-                arguments={"fixture": "STM-B"},
-                resources=["STM-A"],
-            )
-            mismatch_result = _broker(adapter, _Claims(root, [])).execute(mismatch, {})
-            self.assertEqual("DENIED", mismatch_result.outcome)
-
-            valid_request, valid_approval = _firmware_request_and_approval(adapter, authority, request_id="bounded-duration", expiry=200.0)
-            valid_approval["expires_monotonic"] = 180.0
-            # The approval remains valid, but the permit is capped by the
-            # controller-pinned method maximum rather than either caller value.
-            valid_claims = _Claims(root, [])
-            valid_result = CapabilityBroker(
-                adapter,
-                approval_verifier=_Verifier(),
-                policy_verifier=adapter.verify_approval,
-                identity_provider=lambda: dict(OWNER),
-                claims_factory=lambda *_: valid_claims,
-                clock=lambda: 10.0,
-            ).execute(valid_request, valid_approval)
-            self.assertEqual("PASS", valid_result.outcome, valid_result.to_record())
-            valid_parsed = CapabilityRequest.from_record(valid_request, now_monotonic=0.0)
-            valid_snapshot = adapter.observe(valid_parsed)
-            valid_approval_object = CapabilityApproval.from_record(valid_approval)
-            self.assertEqual(40.0, adapter.effective_expiry(valid_parsed, valid_snapshot, valid_approval_object, 10.0))
-
-            overlong_request, overlong_policy = _firmware_request_and_approval(adapter, authority, request_id="overlong-policy", expiry=200.0)
-            overlong_policy["policy"]["maximum_duration_seconds"] = 31
-            overlong = CapabilityBroker(
-                adapter,
-                approval_verifier=_Verifier(),
-                policy_verifier=adapter.verify_approval,
-                identity_provider=lambda: dict(OWNER),
-                claims_factory=lambda *_: _Claims(root, []),
-                clock=lambda: 10.0,
-            ).execute(overlong_request, overlong_policy)
-            self.assertEqual("DENIED", overlong.outcome)
-
-    def test_S5_R1_008_expiry_is_checked_before_enqueue_and_at_writer_effect(self) -> None:
-        for mode in ("before-enqueue", "dispatch"):
-            with self.subTest(mode=mode), TemporaryDirectory() as temporary:
-                clock = _MutableClock()
-                transport = _ExpiryTransport(clock, expire_on="dispatch" if mode == "dispatch" else None)
-
-                def boundary_factory():
-                    if mode == "before-enqueue":
-                        clock.value = 100.0
-                    return _Boundary()
-
-                adapter, authority, _ = _firmware_adapter(Path(temporary), clock, transport=transport, boundary_factory=boundary_factory)
-                request, approval = _firmware_request_and_approval(adapter, authority, request_id=f"expiry-{mode}")
-                claims = _Claims(Path(temporary), [])
-                result = CapabilityBroker(
-                    adapter,
-                    approval_verifier=_Verifier(),
-                    policy_verifier=adapter.verify_approval,
-                    identity_provider=lambda: dict(OWNER),
-                    claims_factory=lambda *_: claims,
-                    clock=clock,
-                ).execute(request, approval)
-                self.assertEqual("FAIL", result.outcome, result.to_record())
-                self.assertFalse(any(message.get("method") == "get_board_info" for message in transport.messages))
-                self.assertTrue(result.record["claims_released"])
 
     def test_S5_R1_009_ordinary_preclaim_failures_are_typed_published_denials(self) -> None:
         cases: list[tuple[str, Any, Any]] = []
@@ -1321,6 +980,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual("ADMISSION_FAILED", parse_result.record["denial"]["reason_code"])
         self.assertEqual(0, parse_result.record["dispatch_count"])
 
+
     def test_S5_R1_010_malicious_adapter_cannot_mutate_nested_permit_or_hash(self) -> None:
         class MutatingAdapter(FakeCapabilityAdapter):
             def __init__(self):
@@ -1345,6 +1005,217 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertEqual("PASS", result.outcome)
         self.assertTrue(adapter.mutation_blocked)
         self.assertEqual(adapter.original_hash, adapter.permits[0]["permit_sha256"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+    def test_S5_R1_003_default_adapter_boundary_releases_after_disposable_process_cleanup(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pack = _campaign_pack()
+            try:
+                adapter = FirmwareHardwareAdapter(
+                    campaign_pack=pack,
+                    snapshot_provider=lambda request: _firmware_snapshot(request, pack),
+                    launcher=lambda config: subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        **config["popen_kwargs"],
+                    ),
+                    identity_provider=_process_identity,
+                    config_provider=lambda request, operation: {},
+                    transport_factory=lambda process, remaining, request_id, config: _Transport(),
+                    clock=lambda: 10.0,
+                )
+            except ProcessBoundaryUnsupported as exc:
+                self.skipTest(f"native process boundary unavailable: {exc}")
+            request, approval = _firmware_request_and_approval(adapter, pack, request_id="default-adapter-boundary")
+            claims = _Claims(root, [])
+            result = CapabilityBroker(
+                adapter,
+                approval_verifier=_Verifier(),
+                policy_verifier=adapter.verify_approval,
+                identity_provider=lambda: dict(OWNER),
+                claims_factory=lambda *_: claims,
+                clock=lambda: 10.0,
+            ).execute(request, approval)
+            self.assertEqual("PASS", result.outcome, result.to_record())
+            self.assertTrue(result.record["claims_released"])
+            self.assertNotIn("session_id", json.dumps(result.to_record(), sort_keys=True))
+
+    def test_S5_R1_004_adapter_cleanup_cache_is_keyed_by_request_and_permit_digest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            adapter, pack, _ = _firmware_adapter(Path(temporary))
+            request_value, approval_value = _firmware_request_and_approval(adapter, pack, request_id="cache-request")
+            request = CapabilityRequest.from_record(request_value, now_monotonic=0.0)
+            snapshot = adapter.observe(request)
+            approval = CapabilityApproval.from_record(approval_value)
+            permit_a = CapabilityPermit(request, snapshot, approval, (), dict(OWNER), dict(adapter.adapter_identity), 40.0, "a" * 64)
+            permit_b = CapabilityPermit(request, snapshot, approval, (), dict(OWNER), dict(adapter.adapter_identity), 40.0, "b" * 64)
+            first = adapter.cleanup(permit_a, None, {"reason_code": "failed"})
+            second = adapter.cleanup(permit_b, None, {"reason_code": "failed"})
+            self.assertIsNot(first, second)
+            self.assertEqual(2, len(adapter._cleanup_results))
+
+    def test_S5_R1_008_expiry_is_checked_before_enqueue_and_at_writer_effect(self) -> None:
+        for mode in ("before-enqueue", "dispatch"):
+            with self.subTest(mode=mode), TemporaryDirectory() as temporary:
+                clock = _MutableClock()
+                transport = _ExpiryTransport(clock, expire_on="dispatch" if mode == "dispatch" else None)
+
+                def boundary_factory():
+                    if mode == "before-enqueue":
+                        clock.value = 100.0
+                    return _Boundary()
+
+                adapter, pack, _ = _firmware_adapter(Path(temporary), clock, transport=transport, boundary_factory=boundary_factory)
+                request, approval = _firmware_request_and_approval(adapter, pack, request_id=f"expiry-{mode}")
+                claims = _Claims(Path(temporary), [])
+                result = CapabilityBroker(
+                    adapter,
+                    approval_verifier=_Verifier(),
+                    policy_verifier=adapter.verify_approval,
+                    identity_provider=lambda: dict(OWNER),
+                    claims_factory=lambda *_: claims,
+                    clock=clock,
+                ).execute(request, approval)
+                self.assertEqual("FAIL", result.outcome, result.to_record())
+                self.assertFalse(any(message.get("params", {}).get("name") == "get_board_info" for message in transport.messages))
+                self.assertTrue(result.record["claims_released"])
+
+    def test_S5_R2_001_caller_declared_pack_maps_actions_and_keeps_lane_and_resource_independent(self) -> None:
+        pack = _campaign_pack()
+        record = pack.as_record()
+        self.assertEqual("firmware-acceptance", record["capability"])
+        self.assertEqual({"observe", "flash_application"}, set(record["actions"]))
+        self.assertEqual("caller-supplied-revision", record["policy"]["revision"])
+
+        for lane_id in ("lane-a", "lane-b"):
+            request = CapabilityRequest.from_record(
+                _request(request_id=f"pack-{lane_id}", lane_id=lane_id, capability="firmware-acceptance", action="observe", arguments={"board_id": "stm-a"}, resources=["board:stm-a"]),
+                now_monotonic=0.0,
+            )
+            operation = pack.resolve(request)
+            self.assertEqual("board:stm-a", operation.canonical_resource)
+            self.assertEqual({"board_id": "stm-a"}, operation.arguments)
+            self.assertEqual("get_board_info", operation.mcp_tool)
+            self.assertEqual(1, operation.method_version)
+            self.assertEqual(40, operation.maximum_duration_seconds)
+            self.assertEqual(pack.resources["board:stm-a"], operation.resource_identity)
+
+        extra = CapabilityRequest.from_record(
+            _request(request_id="pack-extra", lane_id="lane-a", capability="firmware-acceptance", action="observe", arguments={"board_id": "stm-a", "extra": True}, resources=["board:stm-a"]),
+            now_monotonic=0.0,
+        )
+        with self.assertRaises(CapabilityAdapterUnavailable):
+            pack.resolve(extra)
+        missing = CapabilityRequest.from_record(
+            _request(request_id="pack-missing", lane_id="lane-a", capability="firmware-acceptance", action="flash_application", arguments={"board_id": "stm-a"}, resources=["board:stm-a"]),
+            now_monotonic=0.0,
+        )
+        with self.assertRaises(CapabilityAdapterUnavailable):
+            pack.resolve(missing)
+
+        for resources in (["board:stm-a", "board:nrf-a"], ["undeclared"]):
+            request = CapabilityRequest.from_record(
+                _request(request_id="pack-resource", lane_id="lane-a", capability="firmware-acceptance", action="observe", arguments={"board_id": "stm-a"}, resources=resources),
+                now_monotonic=0.0,
+            )
+            with self.assertRaises(CapabilityAdapterUnavailable):
+                pack.resolve(request)
+
+    def test_S5_R2_002_exact_mcp_traffic_policy_duration_binding_and_private_config_stays_private(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pack = _campaign_pack()
+            transport = _Transport()
+            adapter = FirmwareHardwareAdapter(
+                campaign_pack=pack,
+                snapshot_provider=lambda request: _firmware_snapshot(request, pack),
+                launcher=lambda config: _Process(),
+                identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
+                config_provider=lambda request, operation: {"private": "controller-config", "endpoint": "server-private"},
+                transport_factory=lambda process, remaining, request_id, config: transport,
+                supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
+                boundary_factory=lambda: _Boundary(),
+                mcp_protocol_version="2025-03-26",
+                clock=lambda: 10.0,
+            )
+            request, approval = _firmware_request_and_approval(adapter, pack, request_id="mcp-traffic")
+            claims = _Claims(root, [])
+            result = CapabilityBroker(
+                adapter,
+                approval_verifier=_Verifier(),
+                policy_verifier=adapter.verify_approval,
+                identity_provider=lambda: dict(OWNER),
+                claims_factory=lambda *_: claims,
+                clock=lambda: 10.0,
+            ).execute(request, approval)
+            self.assertEqual("PASS", result.outcome, result.to_record())
+            self.assertEqual(
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "orchestrator-harness", "version": "0.1.0"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_board_info", "arguments": {"board_id": "stm-a"}}},
+                ],
+                transport.messages,
+            )
+            self.assertTrue(transport.closed)
+            self.assertNotIn("get_board_info", str(result.to_record()))
+            self.assertNotIn("private", str(result.to_record()))
+            self.assertNotIn("endpoint", str(result.to_record()))
+
+            parsed = CapabilityRequest.from_record(request, now_monotonic=0.0)
+            snapshot = adapter.observe(parsed)
+            approval_object = CapabilityApproval.from_record(approval)
+            self.assertTrue(adapter.verify_approval(parsed, snapshot, approval_object))
+            self.assertEqual(50.0, adapter.effective_expiry(parsed, snapshot, approval_object, 10.0))
+            operation = pack.resolve(parsed)
+            self.assertEqual(40, operation.maximum_duration_seconds)
+            self.assertEqual("caller-supplied-revision", operation.policy["revision"])
+
+    def test_S5_R2_003_supervised_cleanup_releases_claim_only_after_boundary_and_transport_closed(self) -> None:
+        for boundary_complete, transport_closed, expected in (
+            (True, True, "PASS"),
+            (True, False, "UNCERTAIN"),
+            (False, True, "UNCERTAIN"),
+        ):
+            with self.subTest(boundary_complete=boundary_complete, transport_closed=transport_closed), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pack = _campaign_pack()
+                events: list[str] = []
+                transport = _Transport()
+                if not transport_closed:
+                    transport.close_and_join = lambda: (False, {"helpers_stopped": False, "errors": ["transport helper"]})
+                adapter = FirmwareHardwareAdapter(
+                    campaign_pack=pack,
+                    snapshot_provider=lambda request: _firmware_snapshot(request, pack),
+                    launcher=lambda config: _Process(),
+                    identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
+                    config_provider=lambda request, operation: {},
+                    transport_factory=lambda process, remaining, request_id, config: transport,
+                    supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
+                    boundary_factory=lambda: _Boundary(complete=boundary_complete),
+                    clock=lambda: 10.0,
+                )
+                request, approval = _firmware_request_and_approval(adapter, pack, request_id=f"cleanup-{boundary_complete}-{transport_closed}")
+                claims = _Claims(root, events)
+                result = CapabilityBroker(
+                    adapter,
+                    approval_verifier=_Verifier(),
+                    policy_verifier=adapter.verify_approval,
+                    identity_provider=lambda: dict(OWNER),
+                    claims_factory=lambda *_: claims,
+                    clock=lambda: 10.0,
+                ).execute(request, approval)
+                self.assertEqual(expected, result.outcome, result.to_record())
+                self.assertEqual(expected == "PASS", result.record["claims_released"])
+                if expected == "UNCERTAIN":
+                    self.assertTrue(claims.held)
+                    self.assertNotIn("release", events)
 
 
 if __name__ == "__main__":

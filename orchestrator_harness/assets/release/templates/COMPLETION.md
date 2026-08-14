@@ -1,7 +1,7 @@
 # Completion record
 
-- Candidate/server/target revisions and final runtime identity:
-- Required model/role/tier and concurrency evidence:
-- Acceptance, watcher, topology, criteria, safeguard, and promotion record links:
-- Hardware outcome and cleanup evidence (when applicable):
+- Candidate coordinate (branch, commit, worktree root) and attempt ID:
+- Caller/workflow roles and their decisions:
+- Selected checks, findings/decision, and record links (watcher, topology, criteria, review, promotion):
+- Promotion/readback/rollback outcome and exact cleanup evidence:
 - Remaining non-gating work / out-of-scope ledger:

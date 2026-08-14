@@ -15,16 +15,21 @@ class CandidateSafeguardTests(unittest.TestCase):
         script = (
             REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
         ).read_text(encoding="utf-8")
+        core = (
+            REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("C:/Users/", script)
         self.assertIn("RepositoryRoot", script)
         self.assertIn("ExpectedTip", script)
         self.assertIn("orchestrator_harness.release_checks", script)
         self.assertIn("--root", script)
         self.assertIn("--expected-tip", script)
-        self.assertIn("firmware/v2-candidate", script)
+        self.assertIn("ExpectedBranch", script)
+        self.assertIn("Mandatory", script)
+        self.assertNotIn("firmware/v2-candidate", script)
         self.assertIn("refusing dirty repository root", script)
         self.assertIn("4699d27bd5bf7c0b41bbed9ddb6b0b7d019e215f", script)
-        self.assertIn("baseline changed during safeguard", script)
+        self.assertIn("baseline changed during safeguard", core)
 
     def test_launcher_rejects_this_non_candidate_lane_without_running_checks(
         self,
@@ -45,7 +50,7 @@ class CandidateSafeguardTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(0, completed.returncode)
-        self.assertIn("unexpected branch", completed.stderr)
+        self.assertIn("ExpectedBranch", completed.stderr)
 
     def test_launcher_rejects_different_same_suffix_root(self) -> None:
         script = REPOSITORY_ROOT / "tools" / "Invoke-CandidateSafeguard.ps1"
@@ -63,6 +68,10 @@ class CandidateSafeguardTests(unittest.TestCase):
             copied_script = same_suffix_root / "tools" / script.name
             copied_script.parent.mkdir(parents=True)
             shutil.copy2(script, copied_script)
+            shutil.copy2(
+                REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1",
+                same_suffix_root / "tools" / "CandidateSafeguard.Core.psm1",
+            )
             completed = subprocess.run(
                 [
                     "powershell",
@@ -71,6 +80,8 @@ class CandidateSafeguardTests(unittest.TestCase):
                     "Bypass",
                     "-File",
                     str(copied_script),
+                    "-ExpectedBranch",
+                    "firmware/v2-candidate",
                 ],
                 text=True,
                 capture_output=True,

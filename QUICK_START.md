@@ -115,36 +115,30 @@ python examples/disposable_coding_fixture.py
 
 The legacy policy-bound firmware path remains supported but is not part of this quick start.
 
-## Firmware V2 acceptance and dual-path operation
+## Optional firmware seam and dual-path operation
 
-The acceptance kit is static, host-only input: read `firmware_acceptance/README.md` and its
-`ACCEPTANCE_MANIFEST.json` before configuring a firmware acceptance attempt. It launches neither
-MCP nor hardware. Keep `examples/coding.invocation.example.json` unchanged for coding V1. For an
-existing policy-bound firmware lane, start from
-`examples/legacy-firmware.invocation.example.json`; it intentionally has no `schema` field and no
-coding V1 Git/runtime/resource fields. Do not migrate a schema-less firmware fixture just to share
-an observer epoch.
+The legacy policy-bound firmware path remains supported but is not part of this quick start. For an
+existing policy-bound firmware lane, start from `examples/legacy-firmware.invocation.example.json`;
+it intentionally has no `schema` field and no coding V1 Git/runtime/resource fields. Do not migrate
+a schema-less firmware fixture just to share an observer epoch.
 
 `examples/dual-path-manager.example.md` is the copyable native-manager sequence for one coding and
 one legacy firmware lane. It uses a fresh config/runtime, `scan --no-write`, and one native
 `watch --until-actionable` call. Its acknowledgement is the returned envelope's top-level
 `event_id`, never `data.signal_id`.
 
-For a firmware-v2 implementation epoch, create fresh ignored paths first (replace the placeholders
-with a unique epoch and the actual suite root), then inspect the frozen registry rather than
-rewriting it:
-
-```powershell
-$epoch = "firmware-v2-$(Get-Date -Format yyyyMMdd-HHmmss)"
-New-Item -ItemType Directory -Force local-config, "runtime/orchestrator-harness/$epoch" | Out-Null
-Copy-Item examples/harness.example.json "local-config/$epoch.json"
-# Set suite_root, run_globs, and output_dir to this epoch's real paths.
-python -m orchestrator_harness --config "local-config/$epoch.json" scan --no-write
-python -m orchestrator_harness --config "local-config/$epoch.json" watch --until-actionable --timeout 60
-# In the bound manager router, acknowledge the returned envelope only:
-router.acknowledge("<top-level-event-id>", binding=router.registration)
-Get-Content <accepted-evidence>/passed-tests.json
-```
+The optional firmware seam is caller-declared and installed with the package. A caller builds a
+`FirmwareCampaignPack` from a declared capability name, `FirmwareAction` declarations (MCP tool
+name, positive method version, positive maximum duration, exact required argument names), canonical
+resource identities, and a nonempty public policy binding; there is no default pack or built-in
+fixture. The broker-compatible `FirmwareHardwareAdapter` takes that pack plus caller-supplied
+snapshot, launch/configuration, child-identity, and transport seams, reuses `ProcessBoundary` and
+`ProcessSupervisor`, and sends exact MCP traffic (`initialize` with the caller-declared protocol
+version, `notifications/initialized`, then `tools/call`). Permit-expiry checks precede launch,
+enqueue, and dispatch; public results never leak private launch/configuration data; and cleanup
+retains the claim until both the owned process boundary and transport are proven closed. The
+pack/adapter plus the existing `CapabilityBroker` is the complete optional firmware seam; it is not
+connected to the lane controller and introduces no controller or runtime protocol.
 
 Resume a coding controller only with its persisted identity and output paths; the controller, not a
 new wrapper, verifies that resume identity:
@@ -174,43 +168,19 @@ Treat a missing process as absence only after the recorded PID-plus-creation ide
 a reused PID is a different process and must never be stopped. Confirm named claims and pending
 events in the epoch runtime before removing a clean, preserved worktree.
 
-## Firmware V2 release roles
-
-`ROOT-IM` is the outside implementation coordinator: it decides implementation findings, starts
-the acceptance topology, and never receives the subagent model/tier assignment. `F.C3.O` is the
-fresh acceptance orchestrator: it decides only final target-project work and submits assignments to
-`C3-HARNESS`. `C3-HARNESS` is the candidate control plane under test, not an agent; it alone launches
-target workers and owns their lifecycle. `F.C3.W` is a separately launched read-only watcher.
-
-Every headless child role uses the exact assigned model with no substitution, explicit reasoning effort,
-explicit `service_tier="priority"`, isolated `-C` root, `--dangerously-bypass-approvals-and-sandbox`,
-`--dangerously-bypass-hook-trust`, `--ignore-user-config`, and `--json`. Fast means exactly
-`service_tier="priority"`; default-tier roles must not set it. The required assignments are:
-
-| Role | Model / effort | Tier |
-| --- | --- | --- |
-| Acceptance orchestrator (`F.C3.O`) | GPT-5.6 Sol / high | Fast (`priority`) |
-| Production coder | GPT-5.6 Terra / medium | Fast (`priority`) |
-| Reviewer or test writer | GPT-5.6 Terra / medium | Fast (`priority`) |
-| Doer or test executor | GPT-5.6 Luna / high | Fast (`priority`) |
-| Acceptance watcher (`F.C3.W`) | GPT-5.6 Terra / medium | Fast (`priority`) |
-
-Production coding remains singleton/serial. At most three agents may exist beside `ROOT-IM`; actual
-role fan-out is one through three and only for independent review, test-writing, or test-execution
-slices. The deterministic watcher remains diagnostic-only with `evaluator_enabled: false`.
-
 ## Candidate-only final safeguard
 
-After C4 and pre-safeguard admission—not now—run the launcher from the reserved candidate worktree:
+After acceptance and pre-safeguard admission, run the launcher from the reserved candidate
+worktree with the caller-supplied expected branch (there is no default branch):
 
 ```powershell
 $candidateRoot = "<candidate-root>"
-& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot
-& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -Run
+& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -ExpectedBranch "<candidate-branch>"
+& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -ExpectedBranch "<candidate-branch>" -Run
 ```
 
 The first command prints its bound checks. The second runs the selector-owned Ruff, formatting,
 retained non-expanded BasedPyright baseline, compilation, orchestrator and watcher unit
-discoveries, attention retention, and synthetic cleanup components. It refuses any non-reserved, ambiguous, dirty,
-stable-runner, or wrong-branch root; it is a safeguard launcher, not a scheduler, retry controller,
-or alternate harness.
+discoveries, attention retention, and synthetic cleanup components. It refuses any non-reserved,
+ambiguous, dirty, stable-runner, or wrong-branch root; it is a safeguard launcher, not a scheduler,
+retry controller, or alternate harness.

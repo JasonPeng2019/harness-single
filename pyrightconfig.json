@@ -3,7 +3,6 @@
     "orchestrator_harness",
     "harness_common",
     "harness_watcher_implementation",
-    "firmware_acceptance",
     "examples"
   ],
   "exclude": [

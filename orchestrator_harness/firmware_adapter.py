@@ -1,16 +1,17 @@
-"""Firmware-specific capability adapter.
+"""Broker-compatible firmware hardware adapter with injected seams.
 
 The adapter owns controller-private campaign mapping, process boundaries,
 transport state, raw response interpretation, and exact cleanup.  The generic
-broker receives only public capability facts.
+broker receives only public capability facts.  Server, provider, command, and
+endpoint details stay private inside the caller-supplied seams.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from orchestrator_harness.capability_broker import (
+from .capability_broker import (
     AdapterResult,
     CapabilityAdapterError,
     CapabilityAdapterUnavailable,
@@ -19,11 +20,10 @@ from orchestrator_harness.capability_broker import (
     CapabilitySnapshot,
     CleanupEvidence,
 )
-from orchestrator_harness.models import ProcessInfo, iso_utc
-from orchestrator_harness.process_supervisor import ProcessBoundary, ProcessSupervisor
-from orchestrator_harness.processes import process_snapshot
-
-from .campaign_pack import DEFAULT_CAMPAIGN_PACK, FirmwareCampaignPack, FirmwareOperation
+from .firmware_campaign import FirmwareCampaignPack, FirmwareOperation
+from .models import ProcessInfo, iso_utc
+from .process_supervisor import ProcessBoundary, ProcessSupervisor
+from .processes import process_snapshot
 
 
 Launcher = Callable[[Mapping[str, Any]], Any]
@@ -48,50 +48,45 @@ class _ActiveOperation:
 
 
 class FirmwareHardwareAdapter:
-    """Controller-owned adapter for the controller-pinned campaign."""
+    """Caller-declared firmware adapter for the generic capability broker."""
 
     ADAPTER_IDENTITY = {"adapter_id": "firmware-hardware", "adapter_version": "v1"}
 
     def __init__(
         self,
         *,
-        campaign_pack: FirmwareCampaignPack = DEFAULT_CAMPAIGN_PACK,
-        controller_authority: Mapping[str, Any] | None = None,
-        snapshot_provider: SnapshotProvider | None = None,
-        launcher: Launcher | None = None,
-        identity_provider: ChildIdentityProvider | None = None,
-        config_provider: ConfigProvider | None = None,
-        transport_factory: TransportFactory | None = None,
+        campaign_pack: FirmwareCampaignPack,
+        snapshot_provider: SnapshotProvider,
+        launcher: Launcher,
+        identity_provider: ChildIdentityProvider,
+        config_provider: ConfigProvider,
+        transport_factory: TransportFactory,
+        mcp_protocol_version: str = "2024-11-05",
         supervisor_factory: SupervisorFactory | None = None,
         boundary_factory: BoundaryFactory = ProcessBoundary.prepare,
         graceful_timeout_seconds: float = 5.0,
         force_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
-        io_timeout: float = 5.0,
     ) -> None:
+        if not isinstance(campaign_pack, FirmwareCampaignPack):
+            raise TypeError("campaign_pack must be a FirmwareCampaignPack")
+        if not isinstance(mcp_protocol_version, str) or not mcp_protocol_version:
+            raise ValueError("MCP protocol version must be a non-empty string")
         self.campaign_pack = campaign_pack
         self.snapshot_provider = snapshot_provider
         self.launcher = launcher
         self.identity_provider = identity_provider
         self.config_provider = config_provider
         self.transport_factory = transport_factory
+        self.mcp_protocol_version = mcp_protocol_version
         self.supervisor_factory = supervisor_factory
         self.boundary_factory = boundary_factory
         self.graceful_timeout_seconds = graceful_timeout_seconds
         self.force_timeout_seconds = force_timeout_seconds
         self.clock = clock
-        self.io_timeout = io_timeout
         self._active: dict[OperationKey, _ActiveOperation] = {}
         self._cleanup_results: dict[OperationKey, CleanupEvidence] = {}
         self._retained_boundaries: dict[OperationKey, Any] = {}
-        self._authority_error: str | None = None
-        if controller_authority is not None:
-            try:
-                self.campaign_pack = campaign_pack.with_controller_authority(controller_authority)
-            except Exception as exc:
-                self._authority_error = type(exc).__name__
-        elif not campaign_pack.controller_bound:
-            self._authority_error = "controller_authority_unavailable"
 
     @property
     def adapter_identity(self) -> Mapping[str, str]:
@@ -102,34 +97,24 @@ class FirmwareHardwareAdapter:
         return (permit.request.request_id, permit.permit_sha256)
 
     def _operation(self, request: CapabilityRequest) -> FirmwareOperation:
-        if self._authority_error is not None:
-            raise CapabilityAdapterUnavailable("controller campaign authority is unavailable")
-        operation = self.campaign_pack.resolve(request)
-        self.campaign_pack.validate_operation(request, operation, now_monotonic=self.clock())
-        return operation
+        return self.campaign_pack.resolve(request)
 
     def supports(self, request: CapabilityRequest) -> bool:
-        try:
-            self._operation(request)
-            return True
-        except Exception:
-            return False
+        return self.campaign_pack.supports(request)
 
     def observe(self, request: CapabilityRequest) -> CapabilitySnapshot:
         operation = self._operation(request)
-        if self.snapshot_provider is None:
-            raise CapabilityAdapterUnavailable("current target snapshot provider is unavailable")
         value = self.snapshot_provider(request)
         snapshot = CapabilitySnapshot.from_record(value.to_record() if isinstance(value, CapabilitySnapshot) else value)
         if snapshot.adapter_identity != dict(self.ADAPTER_IDENTITY):
             raise CapabilityAdapterError("snapshot belongs to another adapter")
         if (
             snapshot.resources != (operation.canonical_resource,)
-            or snapshot.resource_identities.get(operation.canonical_resource) != operation.fixture_identity
+            or snapshot.resource_identities.get(operation.canonical_resource) != operation.resource_identity
             or snapshot.identity.get("canonical_resource") != operation.canonical_resource
-            or snapshot.identity.get("fixture_identity") != operation.fixture_identity
+            or snapshot.identity.get("resource_identity") != operation.resource_identity
         ):
-            raise CapabilityAdapterError("snapshot does not bind the exact firmware fixture resource")
+            raise CapabilityAdapterError("snapshot does not bind the exact firmware resource")
         return snapshot
 
     def verify_approval(self, request: CapabilityRequest, snapshot: CapabilitySnapshot, approval: Any) -> bool:
@@ -167,8 +152,6 @@ class FirmwareHardwareAdapter:
 
     def dispatch(self, permit: CapabilityPermit) -> AdapterResult:
         operation = self._operation(permit.request)
-        if self.launcher is None or self.identity_provider is None or self.config_provider is None or self.transport_factory is None:
-            raise CapabilityAdapterUnavailable("controller-owned adapter dependencies are unavailable")
         if self.clock() >= permit.expires_monotonic:
             raise CapabilityAdapterError("adapter permit expired before launch")
         boundary = self.boundary_factory()
@@ -206,13 +189,27 @@ class FirmwareHardwareAdapter:
                 active.transport.send(value, label)
 
             send_checked(
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}, "client": {"version": "1"}}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": self.mcp_protocol_version,
+                        "capabilities": {},
+                        "clientInfo": {"name": "orchestrator-harness", "version": "0.1.0"},
+                    },
+                },
                 "initialize",
             )
             active.transport.receive(1)
             send_checked({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, "initialized")
             send_checked(
-                {"jsonrpc": "2.0", "id": 2, "method": operation.method, "params": {"arguments": dict(operation.arguments)}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": operation.mcp_tool, "arguments": dict(operation.arguments)},
+                },
                 "dispatch",
             )
             raw = active.transport.receive(2)
