@@ -362,8 +362,8 @@ def _encode_bytes(value: bytes) -> str:
 
 
 def _decode_bytes(value: object, *, name: str) -> bytes:
-    if not isinstance(value, str) or not value:
-        raise WorkspaceOverlayError(f"receipt {name} must be a non-empty base64 string")
+    if not isinstance(value, str):
+        raise WorkspaceOverlayError(f"receipt {name} must be a base64 string")
     try:
         return base64.b64decode(value, validate=True)
     except (ValueError, TypeError) as exc:

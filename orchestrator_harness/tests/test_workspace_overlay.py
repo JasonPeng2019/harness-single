@@ -466,6 +466,69 @@ class OverlayModuleTests(unittest.TestCase):
         self.assertTrue(malformed["present"])
         self.assertFalse(malformed["verified"])
 
+    def test_empty_created_file_receipt_verifies_and_restores(self) -> None:
+        # WO-R1-001: the encoder emits an empty base64 string for an empty
+        # created file; the decoder and every receipt consumer must accept it.
+        source = self._source()
+        self._write(source, "empty.txt", b"")
+        self._write(source, "shared/merged.txt", b"from cache\n")
+        self._ingest(source)
+        result = prepare_worktree(
+            super_cache=self.cache, target_worktree=self.target, role="subagent",
+            receipt_path=self.receipt,
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(b"", (self.target / "empty.txt").read_bytes())
+        raw = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual("", raw["post_prepare_bytes"]["empty.txt"])
+        self.assertEqual(b"", base64.b64decode(raw["post_prepare_bytes"]["empty.txt"]))
+        verified = verify_overlay_receipt(
+            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+        )
+        self.assertTrue(verified["verified"])
+        restored = restore_worktree(receipt_path=self.receipt)
+        self.assertEqual("RESTORED", restored["outcome"])
+        self.assertFalse((self.target / "empty.txt").exists())
+        self.assertIn("empty.txt", restored["removed_paths"])
+        self.assertFalse((self.target / "shared" / "merged.txt").exists())
+        # Non-string and malformed base64 values remain rejected.
+        for index, bad in enumerate((123, "%%%", "a b")):
+            bad_receipt = self.root / "receipts" / f"bad-empty-{index}.json"
+            tampered = json.loads(self.receipt.read_text(encoding="utf-8"))
+            tampered["post_prepare_bytes"]["empty.txt"] = bad
+            bad_receipt.write_text(json.dumps(tampered), encoding="utf-8")
+            blocked = restore_worktree(receipt_path=bad_receipt)
+            self.assertEqual("BLOCKED", blocked["outcome"])
+            self.assertIn("receipt invalid", blocked["reason"])
+
+    def test_empty_append_preimage_receipt_verifies_and_restores(self) -> None:
+        # WO-R1-001: appending to an initially empty UTF-8 target records an
+        # empty preimage; verification and exact-byte restoration must work.
+        cache = self._declared_cache(append_text=["notes.txt"])
+        self._write(self.target, "notes.txt", b"")
+        result = prepare_worktree(
+            super_cache=cache, target_worktree=self.target, role="subagent",
+            receipt_path=self.receipt,
+        )
+        self.assertEqual(["notes.txt"], result["appended_paths"])
+        self.assertEqual(b"appended-payload\n", (self.target / "notes.txt").read_bytes())
+        raw = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual("", raw["pre_overlay_bytes"]["notes.txt"])
+        self.assertEqual(b"", base64.b64decode(raw["pre_overlay_bytes"]["notes.txt"]))
+        self.assertEqual(
+            b"appended-payload\n",
+            base64.b64decode(raw["post_prepare_bytes"]["notes.txt"]),
+        )
+        verified = verify_overlay_receipt(
+            receipt_path=self.receipt, expected_target_worktree_id=self.target, role="subagent",
+        )
+        self.assertTrue(verified["verified"])
+        restored = restore_worktree(receipt_path=self.receipt)
+        self.assertEqual("RESTORED", restored["outcome"])
+        self.assertEqual(b"", (self.target / "notes.txt").read_bytes())
+        self.assertIn("notes.txt", restored["restored_paths"])
+        self.assertFalse((self.target / "created.txt").exists())
+
 
 class OverlayCliTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -598,6 +661,21 @@ class OverlayLaneSeamTests(unittest.TestCase):
         )
         return receipt
 
+    def _prepare_overlay_with_empty_file(self) -> Path:
+        source = self.root / "overlay-source-empty"
+        source.mkdir()
+        (source / "instructions.md").write_bytes(b"# overlay instructions\n")
+        (source / "empty-marker.txt").write_bytes(b"")
+        ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
+        receipt = self.workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=self.cache_root / SUPER_CACHE_NAME,
+            target_worktree=self.lane,
+            role="subagent",
+            receipt_path=receipt,
+        )
+        return receipt
+
     def _invocation(self, receipt: Path | None) -> Path:
         common = Path(_git(self.lane, "rev-parse", "--git-common-dir"))
         if not common.is_absolute():
@@ -715,6 +793,58 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertTrue(result.reason.startswith("OVERLAY_RESTORE_BLOCKED"))
         self.assertTrue(self.lane.exists())
         self.assertEqual("agent later edit\n", (self.lane / "instructions.md").read_text(encoding="utf-8"))
+
+    def test_retirement_rejects_foreign_orchestrator_receipt_before_restoration(self) -> None:
+        # WO-R1-002: a completed foreign orchestrator receipt must be rejected
+        # before any restoration, leaving both worktrees unchanged.
+        receipt = self._prepare_overlay(role="subagent")
+        path = self._invocation(receipt)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue((self.lane / "instructions.md").is_file())
+
+        foreign = self.root / "foreign"
+        _git(self.main_repo, "worktree", "add", "-b", "foreign-orchestrator", str(foreign), "HEAD")
+        (foreign / ".agent-workspace").mkdir()
+        foreign_source = self.root / "foreign-overlay-source"
+        foreign_source.mkdir()
+        (foreign_source / "orchestrator-notes.md").write_bytes(b"orchestrator overlay\n")
+        ingest_super_cache(source_folder=foreign_source, harness_worktree=self.cache_root)
+        foreign_receipt = foreign / ".agent-workspace" / "orchestrator-receipt.json"
+        prepare_worktree(
+            super_cache=self.cache_root / SUPER_CACHE_NAME,
+            target_worktree=foreign,
+            role="orchestrator",
+            receipt_path=foreign_receipt,
+        )
+        self.assertTrue((foreign / "orchestrator-notes.md").is_file())
+
+        result = self._retire(foreign_receipt)
+        self.assertEqual("VISIBLE", result.outcome)
+        self.assertTrue(result.reason.startswith("OVERLAY_RESTORE_BLOCKED"))
+        self.assertTrue(self.lane.exists())
+        self.assertTrue((self.lane / "instructions.md").is_file())
+        self.assertTrue(foreign.exists())
+        self.assertTrue((foreign / "orchestrator-notes.md").is_file())
+
+    def test_retirement_restores_matching_subagent_receipt(self) -> None:
+        # WO-R1-002: a matching completed subagent receipt still restores
+        # through ordinary lane retirement; the empty created file also proves
+        # WO-R1-001 end-to-end through the full retirement seam.
+        receipt = self._prepare_overlay_with_empty_file()
+        raw = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual("", raw["post_prepare_bytes"]["empty-marker.txt"])
+        path = self._invocation(receipt)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue((self.lane / "empty-marker.txt").is_file())
+        result = self._retire(receipt)
+        self.assertEqual("CLOSED", result.outcome, result)
+        self.assertFalse(self.lane.exists())
+        archive = json.loads(result.archive_path.read_text(encoding="utf-8"))
+        restoration = archive["overlay_restoration"]
+        self.assertEqual("RESTORED", restoration["outcome"])
+        self.assertIn("empty-marker.txt", restoration["removed_paths"])
 
 
 if __name__ == "__main__":

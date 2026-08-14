@@ -35,7 +35,7 @@ from .mutation import (
     replace as mutation_replace,
 )
 from .processes import WINDOWS_CREATE_NO_WINDOW, process_snapshot
-from .workspace_overlay import OVERLAY_RECEIPT_SCHEMA, restore_worktree
+from .workspace_overlay import OVERLAY_RECEIPT_SCHEMA, restore_worktree, verify_overlay_receipt
 
 IMMUTABLE_VIEW_SCHEMA = "orchestrator-immutable-source-view/v1"
 LANE_ARCHIVE_SCHEMA = "orchestrator-lane-archive/v1"
@@ -1339,10 +1339,32 @@ def retire_terminal_lane(
 
     # Overlay restoration precedes the git-clean binding proof: preparation
     # leaves receipt-recorded untracked files in the worktree until
-    # retirement.  Restore first; any later edit, missing/malformed receipt,
-    # or unsafe target keeps the lane visible with its later work intact.
+    # retirement.  The receipt must first prove it is completed and targets
+    # this exact lane with role subagent; a foreign/orchestrator receipt is
+    # rejected before any restoration so no worktree outside the lane's
+    # ownership boundary can be mutated.  Restore only after that proof; any
+    # later edit, missing/malformed receipt, or unsafe target keeps the lane
+    # visible with its later work intact.
     overlay_restoration: dict[str, Any] | None = None
     if overlay_receipt is not None:
+        try:
+            overlay_verification = verify_overlay_receipt(
+                receipt_path=_lexical(overlay_receipt),
+                expected_target_worktree_id=lane,
+                role="subagent",
+            )
+        except Exception as exc:
+            overlay_verification = {
+                "present": True,
+                "verified": False,
+                "reason": f"receipt verification failed: {type(exc).__name__}: {exc}",
+            }
+        if not overlay_verification.get("verified"):
+            return _visible_result(
+                lane,
+                "OVERLAY_RESTORE_BLOCKED:" + str(overlay_verification.get("reason", "unknown")),
+                revision=retained_revision,
+            )
         try:
             overlay_restoration = restore_worktree(receipt_path=_lexical(overlay_receipt))
         except Exception as exc:
