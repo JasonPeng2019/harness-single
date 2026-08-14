@@ -37,8 +37,8 @@ class FirmwareAction:
             raise ValueError("firmware action method version must be a positive integer")
         if isinstance(self.maximum_duration_seconds, bool) or not isinstance(self.maximum_duration_seconds, int) or self.maximum_duration_seconds <= 0:
             raise ValueError("firmware action maximum duration must be a positive integer")
-        if not isinstance(self.required_arguments, tuple) or not self.required_arguments or any(not isinstance(item, str) or not item for item in self.required_arguments):
-            raise ValueError("firmware action required arguments must be a non-empty tuple of non-empty names")
+        if not isinstance(self.required_arguments, tuple) or any(not isinstance(item, str) or not item for item in self.required_arguments):
+            raise ValueError("firmware action required arguments must be a tuple of non-empty names")
         if len(set(self.required_arguments)) != len(self.required_arguments):
             raise ValueError("firmware action required arguments must be unique")
 
@@ -139,7 +139,7 @@ class FirmwareCampaignPack:
             "policy": self.policy,
             "capability": self.capability,
             "action": operation.action,
-            "mcp_tool": operation.mcp_tool,
+            "tool": operation.mcp_tool,
             "method_version": operation.method_version,
             "maximum_duration_seconds": operation.maximum_duration_seconds,
             "canonical_resource": operation.canonical_resource,

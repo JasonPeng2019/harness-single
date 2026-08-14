@@ -357,7 +357,7 @@ def _firmware_request_and_approval(adapter: FirmwareHardwareAdapter, pack: Firmw
         "policy": pack.policy,
         "capability": pack.capability,
         "action": action,
-        "mcp_tool": operation.mcp_tool,
+        "tool": operation.mcp_tool,
         "method_version": operation.method_version,
         "maximum_duration_seconds": operation.maximum_duration_seconds,
         "canonical_resource": resource,
@@ -1006,10 +1006,6 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         self.assertTrue(adapter.mutation_blocked)
         self.assertEqual(adapter.original_hash, adapter.permits[0]["permit_sha256"])
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_S5_R1_003_default_adapter_boundary_releases_after_disposable_process_cleanup(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1217,6 +1213,40 @@ if __name__ == "__main__":
                     self.assertTrue(claims.held)
                     self.assertNotIn("release", events)
 
+    def test_S5_R2_004_zero_argument_declaration_accepts_only_empty_argument_map(self) -> None:
+        pack = FirmwareCampaignPack(
+            capability="firmware-acceptance",
+            actions={
+                "probe_status": FirmwareAction(
+                    mcp_tool="probe_status",
+                    method_version=1,
+                    maximum_duration_seconds=30,
+                    required_arguments=(),
+                ),
+            },
+            resources={"board:stm-a": {"probe_uid": "probe-a"}},
+            policy={"policy": "caller-declared-policy-v1"},
+        )
+        empty_value = {
+            "schema": "orchestrator-capability-request/v1",
+            "request_id": "zero-arg-request",
+            "lane_id": "lane-firmware",
+            "controller_identity": dict(OWNER),
+            "capability": pack.capability,
+            "action": "probe_status",
+            "arguments": {},
+            "resources": ["board:stm-a"],
+            "expires_monotonic": 100.0,
+            "route": "capability",
+        }
+        operation = pack.resolve(CapabilityRequest.from_record(empty_value, now_monotonic=0.0))
+        self.assertEqual({}, operation.arguments)
+        self.assertEqual("probe_status", operation.mcp_tool)
+        nonempty_value = dict(empty_value)
+        nonempty_value["request_id"] = "zero-arg-reject"
+        nonempty_value["arguments"] = {"board_id": "stm-a"}
+        with self.assertRaises(CapabilityAdapterUnavailable):
+            pack.resolve(CapabilityRequest.from_record(nonempty_value, now_monotonic=0.0))
 
 if __name__ == "__main__":
     unittest.main()
