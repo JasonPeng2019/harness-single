@@ -61,7 +61,7 @@ class FirmwareHardwareAdapter:
         identity_provider: ChildIdentityProvider,
         config_provider: ConfigProvider,
         transport_factory: TransportFactory,
-        mcp_protocol_version: str = "2024-11-05",
+        mcp_protocol_version: str,
         supervisor_factory: SupervisorFactory | None = None,
         boundary_factory: BoundaryFactory = ProcessBoundary.prepare,
         graceful_timeout_seconds: float = 5.0,

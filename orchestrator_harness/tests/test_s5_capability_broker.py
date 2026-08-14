@@ -332,6 +332,7 @@ def _firmware_adapter(root: Path, clock: Callable[[], float] | None = None, *, t
         identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
         config_provider=lambda request, operation: {"private": "controller-config"},
         transport_factory=make_transport,
+        mcp_protocol_version="2025-03-26",
         supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
         boundary_factory=boundary_factory or (lambda: _Boundary()),
         clock=clock or (lambda: 10.0),
@@ -1024,6 +1025,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                     identity_provider=_process_identity,
                     config_provider=lambda request, operation: {},
                     transport_factory=lambda process, remaining, request_id, config: _Transport(),
+                    mcp_protocol_version="2025-03-26",
                     clock=lambda: 10.0,
                 )
             except ProcessBoundaryUnsupported as exc:
@@ -1193,6 +1195,7 @@ class S5CapabilityBrokerTests(unittest.TestCase):
                     identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
                     config_provider=lambda request, operation: {},
                     transport_factory=lambda process, remaining, request_id, config: transport,
+                    mcp_protocol_version="2025-03-26",
                     supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
                     boundary_factory=lambda: _Boundary(complete=boundary_complete),
                     clock=lambda: 10.0,
@@ -1247,6 +1250,22 @@ class S5CapabilityBrokerTests(unittest.TestCase):
         nonempty_value["arguments"] = {"board_id": "stm-a"}
         with self.assertRaises(CapabilityAdapterUnavailable):
             pack.resolve(CapabilityRequest.from_record(nonempty_value, now_monotonic=0.0))
+
+
+    def test_S5_R2_005_omitted_mcp_protocol_version_is_rejected(self) -> None:
+        pack = _campaign_pack()
+        with self.assertRaises(TypeError):
+            FirmwareHardwareAdapter(
+                campaign_pack=pack,
+                snapshot_provider=lambda request: _firmware_snapshot(request, pack),
+                launcher=lambda config: _Process(),
+                identity_provider=lambda pid: {"pid": pid, "created_utc": "fake-child", "creation_identity": "fake-exact"},
+                config_provider=lambda request, operation: {},
+                transport_factory=lambda process, remaining, request_id, config: _Transport(),
+                supervisor_factory=lambda process, identity, request_id, boundary: _Supervisor(),
+                boundary_factory=lambda: _Boundary(),
+                clock=lambda: 10.0,
+            )
 
 if __name__ == "__main__":
     unittest.main()
