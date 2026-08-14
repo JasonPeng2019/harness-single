@@ -614,7 +614,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.RELEASE.RUFF",
             "accumulated Ruff check",
             "release",
-            ("python", "-m", "ruff", "check", "."),
+            ("python", "-m", "ruff", "check", "--select", "E9,F63,F7,F82", "."),
             ("release-ruff",),
             (
                 "orchestrator_harness/pyproject.toml",

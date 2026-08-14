@@ -213,6 +213,20 @@ class S6SelectorTests(unittest.TestCase):
             {item.spec.stable_id for item in release.selected},
         )
 
+    def test_release_ruff_check_selects_stable_correctness_rules(self) -> None:
+        self.assertEqual(
+            (
+                "python",
+                "-m",
+                "ruff",
+                "check",
+                "--select",
+                "E9,F63,F7,F82",
+                ".",
+            ),
+            release_checks.get_check("S6.RELEASE.RUFF").command,
+        )
+
     def test_dependency_mutation_invalidates_only_consumers_and_preserves_unrelated_credit(
         self,
     ) -> None:
