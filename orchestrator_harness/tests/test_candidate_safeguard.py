@@ -654,8 +654,13 @@ exit 0
             self._repository_fixture()
         )
         try:
+            first_pass = root / "first-pass.ps1"
             fail_dirty = root / "fail-dirty.ps1"
             second = root / "second.ps1"
+            first_pass.write_text(
+                f"Set-Content -LiteralPath '{Path(temporary.name) / 'first-pass-ran.txt'}' -Value 'first-pass'\n",
+                encoding="utf-8",
+            )
             fail_dirty.write_text(
                 "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'dirty.txt') -Value 'dirty'\n"
                 "exit 3\n",
@@ -691,6 +696,13 @@ exit 0
                 root,
                 [
                     {
+                        "stable_id": "TEST.PASSED",
+                        "tier": "affected",
+                        "command": ["powershell", "-NoProfile", "-File", "first-pass.ps1"],
+                        "output_contract": "orchestrator-check-credit/v1",
+                        "dependency_fingerprint": "0" * 64,
+                    },
+                    {
                         "stable_id": "TEST.FAILING",
                         "tier": "affected",
                         "command": ["powershell", "-NoProfile", "-File", "fail-dirty.ps1"],
@@ -721,6 +733,7 @@ exit 0
                 f"""$env:PYTHONPATH = '{REPOSITORY_ROOT}'
 Import-Module -Force '{module}'
 $checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.PASSED'; command = @('powershell', '-NoProfile', '-File', 'first-pass.ps1') }},
     [pscustomobject]@{{ stable_id = 'TEST.FAILING'; command = @('powershell', '-NoProfile', '-File', 'fail-dirty.ps1') }},
     [pscustomobject]@{{ stable_id = 'TEST.SECOND'; command = @('powershell', '-NoProfile', '-File', 'second.ps1') }}
 )
@@ -760,25 +773,36 @@ exit 0
             summary = json.loads(
                 (Path(temporary.name) / "summary.json").read_text(encoding="utf-8-sig")
             )
-            self.assertEqual(2, summary["total"])
-            self.assertEqual(1, summary["unresolved"])
+            self.assertTrue(
+                (Path(temporary.name) / "first-pass-ran.txt").is_file()
+            )
+            self.assertEqual(3, summary["total"])
+            self.assertEqual(0, summary["passed"])
+            self.assertEqual(2, summary["unresolved"])
             self.assertEqual(1, summary["skipped"])
-            self.assertEqual("TEST.FAILING", summary["first_unresolved_unit"])
+            self.assertEqual("TEST.PASSED", summary["first_unresolved_unit"])
             checkpoint = json.loads(
                 checkpoint_path.read_text(encoding="utf-8-sig")
             )
             self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
             # Identity uncertainty after the ordinary failure must never
-            # preserve an earlier PASS as trusted.
+            # preserve an earlier current-run PASS as trusted: the first
+            # identity-uncertain checkpoint has already converted it to
+            # UNRESOLVED with a reason and set the earliest unresolved unit.
             self.assertEqual([], checkpoint["credits"])
             by_id = {item["stable_id"]: item for item in checkpoint["dispositions"]}
+            self.assertEqual("UNRESOLVED", by_id["TEST.PASSED"]["status"])
+            self.assertIn("identity", by_id["TEST.PASSED"]["reason"].lower())
+            self.assertIn(
+                "invalidates this run's PASS", by_id["TEST.PASSED"]["reason"]
+            )
             self.assertEqual("UNRESOLVED", by_id["TEST.FAILING"]["status"])
             self.assertIn(
                 "ordinary nonzero exit code 3", by_id["TEST.FAILING"]["reason"]
             )
             self.assertIn("identity", by_id["TEST.FAILING"]["reason"].lower())
             self.assertEqual("SKIP", by_id["TEST.SECOND"]["status"])
-            self.assertEqual("TEST.FAILING", checkpoint["first_unresolved_unit"])
+            self.assertEqual("TEST.PASSED", checkpoint["first_unresolved_unit"])
         finally:
             temporary.cleanup()
 

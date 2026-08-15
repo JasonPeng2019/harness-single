@@ -68,6 +68,31 @@ function Add-HeldRemainder {
     }
 }
 
+function Convert-IdentityUntrustedPass {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.Generic.List[object]]$Results,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    # Repository/identity uncertainty makes every earlier current-run PASS
+    # untrustworthy: convert them before the first identity-uncertain
+    # checkpoint so no observable checkpoint can contain source-untrusted
+    # PASS.  Returns the earliest converted unit so the caller can set the
+    # earliest first-unresolved state.
+    $earliest = $null
+    foreach ($result in $Results) {
+        if ($result.status -eq 'PASS') {
+            $result.status = 'UNRESOLVED'
+            $result.reason = $Reason
+            if ($null -eq $earliest) {
+                $earliest = [string]$result.stable_id
+            }
+        }
+    }
+    return $earliest
+}
+
 function Write-CheckpointSnapshot {
     [CmdletBinding()]
     param(
@@ -178,12 +203,18 @@ function Invoke-ReleaseChecks {
                     -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
             } catch {
                 # The failing unit left the repository untrustworthy: the unit
-                # is upgraded to UNRESOLVED (a non-null first unresolved state)
-                # and every later unit is held with a recorded skip reason.
+                # is upgraded to UNRESOLVED (a non-null first unresolved state),
+                # every earlier current-run PASS is converted before the first
+                # identity-uncertain checkpoint, and every later unit is held
+                # with a recorded skip reason.
                 $last = $results[$results.Count - 1]
                 $last.status = 'UNRESOLVED'
                 $last.reason = "ordinary nonzero exit code $exitCode; candidate identity check failed after unit: $($_.Exception.Message)"
-                if ($null -eq $firstUnresolved) {
+                $untrustedReason = "candidate identity uncertainty after unit ${stableId} invalidates this run's PASS: $($_.Exception.Message)"
+                $earliestUntrusted = Convert-IdentityUntrustedPass -Results $results -Reason $untrustedReason
+                if ($null -ne $earliestUntrusted) {
+                    $firstUnresolved = $earliestUntrusted
+                } elseif ($null -eq $firstUnresolved) {
                     $firstUnresolved = $stableId
                 }
                 Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `
@@ -203,14 +234,20 @@ function Invoke-ReleaseChecks {
                 -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
         } catch {
             # Identity, source, registry, or environment uncertainty never
-            # becomes PASS: this unit is UNRESOLVED and every later unit is
-            # skipped with a recorded reason because it cannot truthfully run.
+            # becomes PASS: this unit is UNRESOLVED, every earlier current-run
+            # PASS is converted before the first identity-uncertain
+            # checkpoint, and every later unit is skipped with a recorded
+            # reason because it cannot truthfully run.
             $results.Add([ordered]@{
                 stable_id = $stableId
                 status = 'UNRESOLVED'
                 reason = "candidate identity check failed after unit: $($_.Exception.Message)"
             })
-            if ($null -eq $firstUnresolved) {
+            $untrustedReason = "candidate identity uncertainty after unit ${stableId} invalidates this run's PASS: $($_.Exception.Message)"
+            $earliestUntrusted = Convert-IdentityUntrustedPass -Results $results -Reason $untrustedReason
+            if ($null -ne $earliestUntrusted) {
+                $firstUnresolved = $earliestUntrusted
+            } elseif ($null -eq $firstUnresolved) {
                 $firstUnresolved = $stableId
             }
             Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `

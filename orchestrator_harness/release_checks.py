@@ -21,6 +21,7 @@ import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -934,12 +935,21 @@ def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
     return _sha256(_canonical_json({"check": spec.to_record(), "inputs": inputs}))
 
 
+def _installed_distribution_version(distribution: str) -> str | None:
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return None
+
+
 def runner_coordinate() -> dict[str, Any]:
     """Compact actual runner coordinate for the executing environment.
 
-    PASS credit is reusable only while this coordinate is unchanged, so a
-    Python interpreter or version change conservatively invalidates prior
-    PASS instead of trusting it.
+    PASS credit is reusable only while the components a check's command
+    directly invokes are unchanged: the Python interpreter/version for
+    every Python unit and the installed distribution version for directly
+    invoked external modules (Ruff, BasedPyright).  A tool change
+    invalidates only the checks that consume it.
     """
 
     version = ".".join(str(part) for part in sys.version_info[:3])
@@ -947,23 +957,53 @@ def runner_coordinate() -> dict[str, Any]:
         "python": {
             "executable": os.path.normcase(os.path.normpath(sys.executable)),
             "version": version,
-        }
+        },
+        "ruff": _installed_distribution_version("ruff"),
+        "basedpyright": _installed_distribution_version("basedpyright"),
     }
 
 
-def _runner_matches(value: object) -> bool:
-    """True only when a credit's runner coordinate equals the current one."""
+_EXTERNAL_RUNNER_MODULES = ("ruff", "basedpyright")
+
+
+def _command_runner_keys(command: Sequence[str]) -> tuple[str, ...]:
+    """Runner components a check command directly invokes, in order."""
+
+    tokens = [str(part) for part in command]
+    keys = ["python"]
+    for index, token in enumerate(tokens):
+        if token == "-m" and index + 1 < len(tokens):
+            module = tokens[index + 1]
+            if module in _EXTERNAL_RUNNER_MODULES:
+                keys.append(module)
+    return tuple(dict.fromkeys(keys))
+
+
+def _runner_matches(value: object, command: Sequence[str]) -> bool:
+    """True only when the credit's runner matches for this check's command.
+
+    Only the runner components the command directly invokes are compared,
+    so a change to one tool invalidates only the checks that consume it
+    while unrelated credit stays reusable.
+    """
 
     if not isinstance(value, Mapping):
         return False
-    python = value.get("python")
-    if not isinstance(python, Mapping):
-        return False
-    current = runner_coordinate()["python"]
-    return (
-        python.get("executable") == current["executable"]
-        and python.get("version") == current["version"]
-    )
+    current = runner_coordinate()
+    for key in _command_runner_keys(command):
+        recorded = value.get(key)
+        wanted = current.get(key)
+        if key == "python":
+            if (
+                not isinstance(recorded, Mapping)
+                or not isinstance(wanted, Mapping)
+                or recorded.get("executable") != wanted.get("executable")
+                or recorded.get("version") != wanted.get("version")
+            ):
+                return False
+        elif recorded != wanted:
+            return False
+    return True
 
 
 def credit_record(
@@ -1551,7 +1591,7 @@ def select_checks(
             and disposition is None
             and _valid_credit_shape(credit)
             and _source_matches(credit.get("source"), source, Path(source.source_root))
-            and _runner_matches(credit.get("runner"))
+            and _runner_matches(credit.get("runner"), spec.command)
             and not spec.external_requirements
             and credit.get("tier") == spec.tier
             and credit.get("command") == list(spec.command)

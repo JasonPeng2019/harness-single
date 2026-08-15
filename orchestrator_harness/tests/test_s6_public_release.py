@@ -462,8 +462,15 @@ class S6SelectorTests(unittest.TestCase):
                         credits=[credit],
                         changed_paths=[".gitattributes"],
                     )
-                    self.assertIn(stable_id, preserved.preserved_credit_ids)
-                    self.assertNotIn(stable_id, preserved.invalidated_credit_ids)
+                    if spec.external_requirements:
+                        # External-requirement checks never reuse PASS without
+                        # an explicit unchanged external coordinate, so even
+                        # an unrelated change conservatively re-selects them.
+                        self.assertNotIn(stable_id, preserved.preserved_credit_ids)
+                        self.assertIn(stable_id, preserved.selected_ids)
+                    else:
+                        self.assertIn(stable_id, preserved.preserved_credit_ids)
+                        self.assertNotIn(stable_id, preserved.invalidated_credit_ids)
 
     def test_scope_validation_rejects_escape_and_missing_required_inputs(self) -> None:
         with self.assertRaises(release_checks.SelectionError):
@@ -520,8 +527,11 @@ class S6SelectorTests(unittest.TestCase):
                 },
                 set(unrelated.selected_ids),
             )
+            # REAL-AGENT declares external requirements and has no explicit
+            # unchanged external coordinate surface, so its PASS is never
+            # reused; only the ordinary PUBLIC-E2E credit is preserved.
             self.assertEqual(
-                tuple(sorted(spec.stable_id for spec in specs)),
+                ("S6.AFFECTED.PUBLIC-E2E",),
                 unrelated.preserved_credit_ids,
             )
             for relative in release_checks.PUBLIC_ROUTE_DEPENDENCIES:
@@ -884,7 +894,10 @@ class S6SelectorTests(unittest.TestCase):
                     input_checkpoint,
                 )
             self.assertEqual(release_checks.CHECKPOINT_SCHEMA, merged["schema"])
-            self.assertEqual(("TEST.A",), tuple(item["stable_id"] for item in merged["credits"]))
+            # The run ended in identity uncertainty (TEST.C UNRESOLVED), which
+            # never preserves an earlier PASS as trusted, so no credit from
+            # the input checkpoint survives the merge.
+            self.assertEqual((), tuple(item["stable_id"] for item in merged["credits"]))
             self.assertEqual(
                 ("TEST.D", "TEST.B", "TEST.C"),
                 tuple(item["stable_id"] for item in merged["dispositions"]),
@@ -1016,6 +1029,81 @@ class S6SelectorTests(unittest.TestCase):
                 )
                 self.assertEqual((), legacy_decision.preserved_credit_ids)
                 self.assertIn(specs[0].stable_id, legacy_decision.selected_ids)
+                # The runner coordinate is command-specific: a Ruff or
+                # BasedPyright version change invalidates only the checks
+                # that directly invoke that module, while unrelated Python
+                # unit credit stays reusable.
+                tool_specs = (
+                    release_checks.CheckSpec(
+                        "TEST.RUFF",
+                        "ruff",
+                        "affected",
+                        ("python", "-m", "ruff", "check", "."),
+                        ("domain-ruff",),
+                        ("tracked.txt",),
+                    ),
+                    release_checks.CheckSpec(
+                        "TEST.BASEDPYRIGHT",
+                        "basedpyright",
+                        "affected",
+                        (
+                            "python",
+                            "-m",
+                            "basedpyright",
+                            "--project",
+                            "pyrightconfig.json",
+                        ),
+                        ("domain-basedpyright",),
+                        ("tracked.txt",),
+                    ),
+                    release_checks.CheckSpec(
+                        "TEST.UNIT",
+                        "unit",
+                        "affected",
+                        ("python", "-m", "unittest", "discover"),
+                        ("domain-unit",),
+                        ("tracked.txt",),
+                    ),
+                )
+                with patch.object(release_checks, "CHECK_REGISTRY", tool_specs):
+                    ruff_credit = release_checks.credit_record(
+                        tool_specs[0], repository.root
+                    )
+                    unit_credit = release_checks.credit_record(
+                        tool_specs[2], repository.root
+                    )
+                    matching = release_checks.select_checks(
+                        "affected",
+                        repository.root,
+                        credits=[ruff_credit, unit_credit],
+                    )
+                    self.assertEqual(
+                        ("TEST.RUFF", "TEST.UNIT"), matching.preserved_credit_ids
+                    )
+                    changed_ruff = dict(ruff_credit)
+                    changed_ruff["runner"] = dict(ruff_credit["runner"])
+                    changed_ruff["runner"]["ruff"] = "999.0.0"
+                    tool_changed = release_checks.select_checks(
+                        "affected",
+                        repository.root,
+                        credits=[changed_ruff, unit_credit],
+                    )
+                    self.assertEqual(
+                        ("TEST.UNIT",), tool_changed.preserved_credit_ids
+                    )
+                    self.assertIn("TEST.RUFF", tool_changed.invalidated_credit_ids)
+                    self.assertIn("TEST.RUFF", tool_changed.selected_ids)
+                    changed_based = dict(ruff_credit)
+                    changed_based["runner"] = dict(ruff_credit["runner"])
+                    changed_based["runner"]["basedpyright"] = "9.9.9"
+                    based_changed = release_checks.select_checks(
+                        "affected",
+                        repository.root,
+                        credits=[changed_based, unit_credit],
+                    )
+                    self.assertEqual(
+                        ("TEST.RUFF", "TEST.UNIT"), based_changed.preserved_credit_ids
+                    )
         finally:
             temporary.cleanup()
 
