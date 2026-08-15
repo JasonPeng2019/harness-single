@@ -53,7 +53,9 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
             self.assertEqual(0, result["firmware_records"])
             self.assertTrue(result["contention_observed"])
             self.assertTrue(result["stale_result_rejected"])
-            self.assertEqual(["alpha", "beta-success", "merge"], result["valid_results"])
+            self.assertEqual(
+                ["alpha", "beta-success", "merge"], result["valid_results"]
+            )
             self.assertEqual("PASS", result["python_tests"])
             self.assertEqual(0, result["resource_claims_remaining"])
 
