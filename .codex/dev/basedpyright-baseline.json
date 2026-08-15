@@ -194,30 +194,6 @@
             {
                 "code": "reportOptionalSubscript",
                 "range": {
-                    "startColumn": 50,
-                    "endColumn": 58,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportOptionalSubscript",
-                "range": {
-                    "startColumn": 40,
-                    "endColumn": 48,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 20,
-                    "endColumn": 31,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportOptionalSubscript",
-                "range": {
                     "startColumn": 12,
                     "endColumn": 26,
                     "lineCount": 1
