@@ -1062,6 +1062,37 @@ class S6SelectorTests(unittest.TestCase):
                     )
             with self.assertRaises(release_checks.SelectionError):
                 release_checks.write_checkpoint(Path(raw), credits=[], dispositions=[])
+            # A relative nested target is normalized to one absolute lexical
+            # path before the transaction: only the caller-requested file is
+            # created and admitted, never a duplicated parent segment.
+            with tempfile.TemporaryDirectory(
+                prefix="orchestrator-s6-checkpoint-relative-"
+            ) as relative_raw:
+                previous = Path.cwd()
+                try:
+                    os.chdir(relative_raw)
+                    with patch.object(
+                        release_checks,
+                        "PreparedOutputTransaction",
+                        RecordingTransaction,
+                    ):
+                        release_checks.write_checkpoint(
+                            Path("relative") / "checkpoint.json",
+                            credits=[],
+                            dispositions=[],
+                        )
+                    requested = Path(relative_raw) / "relative" / "checkpoint.json"
+                    doubled = (
+                        Path(relative_raw) / "relative" / "relative" / "checkpoint.json"
+                    )
+                    self.assertTrue(requested.is_file())
+                    self.assertFalse(doubled.exists())
+                    # The transaction received the single absolute requested
+                    # target for both admission and publication.
+                    self.assertIn(("admit", requested), calls)
+                    self.assertIn(("atomic_json", requested), calls)
+                finally:
+                    os.chdir(previous)
 
     def test_runner_change_invalidates_pass_credit(self) -> None:
         temporary, repository = self._repository()

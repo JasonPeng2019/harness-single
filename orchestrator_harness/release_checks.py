@@ -1163,7 +1163,7 @@ def write_checkpoint(
     being bypassed, and a missing parent or file is a cold creation.
     """
 
-    target = Path(path).expanduser()
+    target = Path(path).expanduser().absolute()
     if target.is_dir():
         raise SelectionError("checkpoint path must be a file, not a directory")
     record = checkpoint_record(
