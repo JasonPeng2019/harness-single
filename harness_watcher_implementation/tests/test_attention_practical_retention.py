@@ -2,6 +2,8 @@ from __future__ import annotations
 import json, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
+from orchestrator_harness.host_adapters import DELIVERY_NOTICE_SCHEMA
+
 
 class RetentionTests(unittest.TestCase):
     def test_retained_wake_and_quiet_evidence(self):
@@ -23,53 +25,36 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             wake = json.loads((evidence / "wake-result.json").read_text())
             quiet = json.loads((evidence / "quiet-result.json").read_text())
-            self.assertEqual("COMPLETE", wake["wake_evidence"]["status"])
-            wake_id = wake["wake_id"]
+            # Wake half: one sparse notice, one DELIVERED boundary receipt,
+            # and queue work left pending until explicit acknowledgement.
+            self.assertEqual("orchestrator-practical-wake/v1", wake["schema"])
+            notice = wake["notice"]
+            self.assertEqual(DELIVERY_NOTICE_SCHEMA, notice["schema"])
+            for forbidden in ("event_id", "event_ids", "data", "payload"):
+                self.assertNotIn(forbidden, notice)
+            self.assertEqual(1, notice["pending_count"])
+            receipt = wake["receipt"]
+            self.assertEqual("DELIVERED", receipt["outcome"])
+            self.assertEqual("post_tool_use", receipt["boundary"])
+            self.assertEqual(notice["notice_id"], receipt["notice_id"])
             self.assertEqual(
-                [
-                    "AGENT_SIGNAL_CREATED",
-                    "AGENT_SIGNAL_PUBLISHED",
-                    "HARNESS_SIGNAL_OBSERVED",
-                    "MANAGER_WAKE_ATTEMPTED",
-                    "MANAGER_WAKE_DELIVERED",
-                    "MANAGER_WAKE_RECEIVED",
-                    "MANAGER_EVENT_CLAIMED",
-                ],
-                [record["kind"] for record in wake["records"]],
+                notice["observed_queue_revision"], receipt["observed_queue_revision"]
             )
+            self.assertEqual(["wake"], wake["pending_event_ids"])
+            self.assertEqual(1, wake["pending_after_delivery"])
+            self.assertFalse(wake["acknowledged_by_delivery"])
             self.assertEqual(
-                {wake_id},
-                {
-                    record.get("wake_id")
-                    for record in wake["records"]
-                    if record.get("wake_id")
-                },
+                ["PostToolUse"], [call["method"] for call in wake["transport_calls"]]
             )
-            self.assertEqual(
-                sorted(record["source_timestamp_utc"] for record in wake["records"]),
-                [record["source_timestamp_utc"] for record in wake["records"]],
-            )
-            self.assertTrue(
-                all(
-                    record["epoch_id"] == "A00_test" and record["event_id"] == "wake"
-                    for record in wake["records"]
-                )
-            )
-            self.assertNotIn("wake_id", quiet["timeout_event"])
-            self.assertEqual([], quiet["wake_records"])
-            raw = []
-            for path in evidence.rglob("*.jsonl"):
-                if "quiet-" in str(path):
-                    raw.extend(
-                        json.loads(line)
-                        for line in path.read_text().splitlines()
-                        if line
-                    )
-            self.assertFalse(
-                any(
-                    record.get("kind", "").startswith("MANAGER_WAKE_") for record in raw
-                )
-            )
+            self.assertNotIn("event_id", wake["transport_calls"][0]["notice"])
+            self.assertEqual([], wake["delivery_journal"][0]["event_ids"])
+            # Quiet half: a fresh empty queue/coordinator emits no notice and
+            # makes no transport call; it is not a drained wake queue.
+            self.assertEqual("orchestrator-practical-quiet/v1", quiet["schema"])
+            self.assertIsNone(quiet["notice"])
+            self.assertIsNone(quiet["receipt"])
+            self.assertEqual(0, quiet["pending_count"])
+            self.assertEqual([], quiet["transport_calls"])
             self.assertIn("attention practical host-only check: PASS", result.stdout)
 
 

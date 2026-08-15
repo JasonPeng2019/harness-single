@@ -65,20 +65,32 @@ For a blocked request, harness-observation latency is measured from the single m
 depends on this boundary, missing, duplicate, mismatched, reversed, or post-deadline publication
 evidence fails closed as `INSUFFICIENT_EVIDENCE`; it must never be reported as harness delay.
 
-## Production blocking wake
+## Current host-adapter delivery
 
-For an attention-enabled blocking wait, invoke the harness with the root manager identity:
+The harness CLI no longer accepts the retired manager-session and
+manager-invocation flags on `watch`, and the diagnostic watch no longer emits
+`wake_id`, `wake_transport`, `wake_component`, or `MANAGER_WAKE_*` records.
+Those manager-flag and diagnostic-watch wake semantics were retired with the
+attention-sprint policy they served.
 
-```powershell
-python -m orchestrator_harness --config <config-under-multi-agent-logs> watch --until-actionable --timeout 60 --manager-session-id <session> --manager-invocation-id <invocation>
-```
+Current production delivery is host-adapter based and payload-free.  A
+`ManagerEventRouter` queue is the active-queue authority for one exact manager
+binding; the harness-owned `DeliveryCoordinator` consumes the queue's wake edge
+and produces one sparse `DeliveryNotice` (schema
+`orchestrator-delivery-notice/v1`) that contains no event ID, event IDs, data,
+or payload.  The implemented `CodexAdapter` (or another `HostAdapter`) delivers
+that notice at a safe lifecycle boundary and returns a `DeliveryReceipt`
+(schema `orchestrator-delivery-receipt/v1`) whose `outcome` is `DELIVERED`.
+A transport receipt is evidence only: it never acknowledges queue work.  The
+event stays pending in the router until the manager explicitly acknowledges it
+through `acknowledge_event`; a quiet empty queue produces no notice and no
+transport call.
 
-The returned JSON has `wake_id`, `wake_transport`, and `wake_component`. Before any scan, claim, decision, or response, the root records `MANAGER_WAKE_RECEIVED` through `record-attention`, using that wake ID and transport. It then records its matching `MANAGER_WAIT_FINISHED` with the same fields and preceding wait activity ID, then may claim the event. The harness records attempted/delivered or explicit failed stdout transport; quiet `WATCH_TIMEOUT` returns no wake fields or wake records. Historical `WATCHER_NOTIFICATION_SENT` relay records remain readable but are not production blocking-wake proof.
-
-`MANAGER_WAKE_DELIVERED` means the native harness successfully emitted the blocking-wait result on
-stdout. It is not a claim that the model has noticed it. The later root-authored
-`MANAGER_WAKE_RECEIVED` timestamp is the distinct receipt/noticing stage; the interval between the
-two is intentionally preserved for manager-attention analysis.
+The retained attention-timeline decoder in `harness_watcher_implementation`
+still reads historical `MANAGER_WAKE_*`, `wake_id`, and `wake_transport`
+records for preserved pre-adapter evidence, but current production does not
+generate them.  Historical `WATCHER_NOTIFICATION_SENT` relay records remain
+readable but are not production delivery proof.
 
 ## Pending-work snapshots
 
@@ -110,11 +122,14 @@ python -m harness_watcher_implementation --config CONFIG record-attention --role
 
 
 For a blocked signal with a delivery deadline, source creation and harness observation are not proof
-that the manager received the event. The production proof is the native harness chain:
-`MANAGER_WAKE_ATTEMPTED` -> `MANAGER_WAKE_DELIVERED` -> `MANAGER_WAKE_RECEIVED` -> matching
-`MANAGER_WAIT_FINISHED`, all bound to the exact event, wake, session, invocation, component, and
-`blocking_harness_wait_stdout` transport. Without a complete successful native chain, the analyzer
-reports `INSUFFICIENT_EVIDENCE` or an explicit harness delivery failure; it never invents busy or
+that the manager received the event. In the retained attention-timeline decoder, the historical
+production proof was the native harness chain: `MANAGER_WAKE_ATTEMPTED` ->
+`MANAGER_WAKE_DELIVERED` -> `MANAGER_WAKE_RECEIVED` -> matching `MANAGER_WAIT_FINISHED`, all
+bound to the exact event, wake, session, invocation, component, and
+`blocking_harness_wait_stdout` transport. Current production no longer generates that chain (see
+"Current host-adapter delivery" above); the decoder still applies this rule to preserved
+historical records. Without a complete successful native chain, the analyzer reports
+`INSUFFICIENT_EVIDENCE` or an explicit harness delivery failure; it never invents busy or
 idle manager state.
 
 Historical `WATCHER_NOTIFICATION_SENT` records using `collaboration.send_message` remain readable
@@ -139,7 +154,7 @@ actionable transition. A valid record produces `INSUFFICIENT_EVIDENCE` rather th
 claim `HARNESS_DELIVERY_DELAY`. Missing, stale, duplicated, mismatched, unsupported, or
 actionability-contradicted evidence cannot suppress a supported delivery-delay diagnosis.
 
-A healthy blocked path is `NO_BLOCKING_IMPACT` when the exact event has the canonical successful native harness wake chain, manager claim, and manager response at or before its response deadline. The claim must precede or equal the response; both must use the same session/invocation; a matching `MANAGER_INVOCATION_STARTED` must precede the claim; and no matching invocation finish may precede the response. Agent receipt and work-resume may occur later: they stay visible as metrics but do not change the manager-response result. A missing or late native delivery cannot use this healthy branch; late delivery keeps harness-delivery precedence, while a late or missing claim follows the explicit busy/idle/insufficient causal analysis.
+A healthy blocked path is `NO_BLOCKING_IMPACT` when the exact event has the canonical successful native harness wake chain, manager claim, and manager response at or before its response deadline. This is a retained attention-timeline decoder rule for preserved historical records; current production delivery is the host-adapter notice/receipt path described under "Current host-adapter delivery" above. The claim must precede or equal the response; both must use the same session/invocation; a matching `MANAGER_INVOCATION_STARTED` must precede the claim; and no matching invocation finish may precede the response. Agent receipt and work-resume may occur later: they stay visible as metrics but do not change the manager-response result. A missing or late native delivery cannot use this healthy branch; late delivery keeps harness-delivery precedence, while a late or missing claim follows the explicit busy/idle/insufficient causal analysis.
 
 ## Outputs, report, and recovery
 
@@ -171,23 +186,23 @@ Run the host-only practical check:
 python -m harness_watcher_implementation.tests.run_attention_practical
 ```
 
-## Sprint boundary procedure
+The practical admits one actionable event into a fresh manager queue, produces
+one sparse delivery notice, obtains one `DELIVERED` boundary receipt from the
+synthetic Codex adapter, proves delivery leaves the event pending, and proves a
+fresh empty queue emits no notice and no transport call, alongside the retained
+attention-analysis scenarios and the CLI disabled-producer gate.  It prints the
+`attention practical host-only check: PASS` marker.
 
-Before an attention sprint starts, its launcher must call
-`orchestrator_harness.attention_sprint.validate_sprint_boundary` with the fresh
-epoch, the declared bounded sprint lifetime, review interval, and heartbeat
-timeout. The timeout must exceed both the lifetime and review interval. This
-helper emits no heartbeat or manager-activity records.
+## Retired sprint-boundary policy helpers
 
-Use `invocation_snapshot`, `formal_baseline_snapshot`, and
-`event_selection_snapshot` to write `complete:true` snapshots through the normal
-metadata-file recorder: invocation start/finish, an initial baseline and one
-after every review, and an exact selection snapshot immediately before each
-claim. At finalize call `validate_sprint_finalize`. Every blocking gate must end
-with both `AGENT_RESPONSE_RECEIVED` and `AGENT_WORK_RESUMED`, or a subagent
-`AGENT_GATE_EXPIRED` record with `{"terminal_gate_expired":true}`. A controller
-exit is not a terminal gate record and cannot satisfy finalize.
+The attention-sprint boundary policy helpers (boundary validation, snapshot
+building, and finalize validation) were retired with the product policy they
+served.  They are intentionally absent from current source and are not called,
+imported, or advertised by any current workflow or verification asset.
 
-`FORMAL_REVIEW_BASELINE_ADVANCED` is permitted for the allowlisted orchestrator
-producer (as well as harness provenance); a subagent producer is not permitted
-to write it.
+The surviving attention verification asset is the host-only practical
+(`harness_watcher_implementation/tests/run_attention_practical.py`), invoked as
+shown above under "Outputs, report, and recovery".  It exercises only current
+production behavior: the host-adapter wake and quiet delivery paths, the
+retained attention-analysis scenarios, and the CLI disabled-producer gate, and
+it prints the `attention practical host-only check: PASS` marker.

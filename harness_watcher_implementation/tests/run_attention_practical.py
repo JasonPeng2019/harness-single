@@ -91,568 +91,133 @@ def published(signal, second):
 
 
 def production_wake_smoke(evidence_dir=None):
+    """Host-only exercise of the current public host-delivery seams.
+
+    The wake half admits one actionable event into a fresh ManagerEventRouter
+    queue, produces one sparse DeliveryNotice (no event ID or payload), obtains
+    one DELIVERED boundary receipt from the synthetic Codex adapter, and proves
+    delivery does not acknowledge the pending event.  The quiet half uses a
+    second fresh empty queue/coordinator and proves no notice and no transport
+    call.  This replaces the retired diagnostic-watch manager-flag route.
+    """
+    from orchestrator_harness.codex_adapter import (
+        CodexAdapter,
+        SyntheticCodexTransport,
+    )
+    from orchestrator_harness.host_adapters import (
+        DELIVERY_NOTICE_SCHEMA,
+        DeliveryCoordinator,
+        FutureHostFixture,
+    )
+    from orchestrator_harness.notifications import ManagerEventRouter
+
     if evidence_dir is not None:
         destination = Path(evidence_dir)
         if destination.exists() and any(destination.iterdir()):
             raise AssertionError("evidence directory must be fresh and empty")
         destination.mkdir(parents=True, exist_ok=True)
-    from orchestrator_harness.tests.support import SuiteFixture, write_json
-    from orchestrator_harness.config import load_config as load_harness_config
-    from harness_watcher_implementation.config import load_config as load_watcher_config
-    from harness_watcher_implementation.attention import ingest_attention, producer_path
 
-    root = Path(__file__).resolve().parents[2]
-    fixture = SuiteFixture.create()
-    quiet_fixture = None
-    processes = []
-    timers = []
-    try:
-        fixture.suite_root.joinpath("multi-agent-logs").mkdir(
-            parents=True, exist_ok=True
+    def build(manager_root):
+        router = ManagerEventRouter(
+            manager_root,
+            run_id="practical-run",
+            queue_id="practical-queue",
+            manager_session_id="practical-session",
+            manager_thread_id="practical-thread",
+            registration_id="practical-registration",
+            manager_invocation_id="practical-invocation",
         )
-        (root / "multi-agent-logs").mkdir(parents=True, exist_ok=True)
-        with (
-            tempfile.TemporaryDirectory(
-                prefix="attention-harness-", dir=fixture.suite_root / "multi-agent-logs"
-            ) as harness_output_name,
-            tempfile.TemporaryDirectory(
-                prefix="attention-runtime-", dir=root / "multi-agent-logs"
-            ) as runtime_name,
-        ):
-            harness_output = Path(harness_output_name).resolve()
-            runtime_root = Path(runtime_name).resolve()
-            epoch = "A00_test"
-            session = "practical-session"
-            invocation = "practical-invocation"
-            event_id = "wake"
-            lane_id = "A00_test:Atlas:A00"
-            activity_id = "blocking-wait"
+        transport = SyntheticCodexTransport()
+        coordinator = DeliveryCoordinator(
+            router=router, adapter=FutureHostFixture("codex-bootstrap")
+        )
+        CodexAdapter(transport, coordinator)
+        coordinator.register()
+        return router, coordinator, transport
 
-            # Configure the real harness and watcher before producing any attention record.
-            raw = json.loads(fixture.config_path.read_text(encoding="utf-8"))
-            raw.update(
-                {
-                    "attention_logging_enabled": True,
-                    "attention_epoch_id": epoch,
-                    "output_dir": str(harness_output),
-                }
-            )
-            write_json(fixture.config_path, raw)
-            fixture.config = load_harness_config(
-                fixture.config_path, harness_root=fixture.harness_root
-            )
-            fixture.workspace()
-            from orchestrator_harness.models import iso_utc
-            from orchestrator_harness.processes import process_snapshot
-
-            self_process = process_snapshot().by_pid.get(os.getpid())
-            assert self_process is not None and self_process.created_utc is not None, (
-                "host process identity unavailable"
-            )
-            write_json(
-                fixture.workspace() / "helper_process.json",
-                {
-                    "pid": os.getpid(),
-                    "started_utc": iso_utc(self_process.created_utc),
-                    "declared_lane_id": lane_id,
+    with tempfile.TemporaryDirectory(prefix="attention-wake-") as wake_name:
+        router, coordinator, transport = build(Path(wake_name))
+        event_id = "wake"
+        admitted = router.admit(
+            {
+                "event_id": event_id,
+                "type": "MANAGER_SIGNAL",
+                "identity": "synthetic:practical:wake",
+                "data": {
+                    "signal_id": event_id,
+                    "lane_id": "practical:lane",
+                    "manager_actionable": True,
+                    "severity": "warning",
                 },
+            },
+            priority=2,
+            binding=coordinator.binding,
+        )
+        assert admitted is not None and admitted["event_id"] == event_id, admitted
+        notice = coordinator.notice_for_wake()
+        assert notice is not None, "wake queue produced no delivery notice"
+        notice_record = notice.as_record()
+        assert notice_record["schema"] == DELIVERY_NOTICE_SCHEMA, notice_record
+        for forbidden in ("event_id", "event_ids", "data", "payload"):
+            assert forbidden not in notice_record, (
+                f"delivery notice contains {forbidden}"
             )
-            watcher_config = runtime_root / "watcher.json"
-            write_json(
-                watcher_config,
-                {
-                    "runtime_root": str(runtime_root),
-                    "attention_logging_enabled": True,
-                    "attention_epoch_id": epoch,
-                    "attention_producers": [
-                        {"role": "subagent", "source_id": "lane"},
-                        {"role": "orchestrator", "source_id": "root"},
-                    ],
-                    "observed_sources": [
-                        {
-                            "path": str(harness_output / "attention-events.jsonl"),
-                            "role": "harness",
-                            "source_id": "harness",
-                        }
-                    ],
-                },
-            )
-            watcher = load_watcher_config(watcher_config)
+        assert notice.pending_count == 1, notice_record
+        receipt = coordinator.deliver_at_boundary(notice, boundary="post_tool_use")
+        assert receipt is not None and receipt.outcome == "DELIVERED", receipt
+        assert receipt.boundary == "post_tool_use", receipt.as_record()
+        assert receipt.notice_id == notice.notice_id, receipt.as_record()
+        pending_after = router.pending_events()
+        assert [item["event_id"] for item in pending_after] == [event_id], (
+            "delivery acknowledged queue work"
+        )
+        assert len(transport.calls) == 1, transport.calls
+        call = transport.calls[0]
+        assert call["method"] == "PostToolUse", call
+        assert call["notice"]["schema"] == DELIVERY_NOTICE_SCHEMA, call
+        assert "event_id" not in call["notice"], call
+        deliveries = router.read_deliveries()
+        assert len(deliveries) == 1 and deliveries[0]["event_ids"] == [], deliveries
+        wake_evidence = {
+            "schema": "orchestrator-practical-wake/v1",
+            "notice": notice_record,
+            "receipt": receipt.as_record(),
+            "pending_after_delivery": len(pending_after),
+            "pending_event_ids": [item["event_id"] for item in pending_after],
+            "acknowledged_by_delivery": False,
+            "transport_calls": list(transport.calls),
+            "delivery_journal": deliveries,
+        }
 
-            def record_attention(role, source_id, kind, metadata):
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "harness_watcher_implementation",
-                        "--config",
-                        str(watcher_config),
-                        "record-attention",
-                        "--role",
-                        role,
-                        "--source-id",
-                        source_id,
-                        "--epoch-id",
-                        epoch,
-                        "--event-id",
-                        event_id,
-                        "--kind",
-                        kind,
-                        "--metadata",
-                        json.dumps(metadata),
-                    ],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if result.returncode != 0:
-                    raise AssertionError(
-                        f"{kind} recorder failed: rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
-                    )
-                return json.loads(result.stdout)
+    with tempfile.TemporaryDirectory(prefix="attention-quiet-") as quiet_name:
+        quiet_router, quiet_coordinator, quiet_transport = build(Path(quiet_name))
+        quiet_notice = quiet_coordinator.notice_for_wake()
+        assert quiet_notice is None, "empty queue produced a delivery notice"
+        quiet_receipt = quiet_coordinator.deliver_at_boundary(
+            quiet_notice, boundary="post_tool_use"
+        )
+        assert quiet_receipt is None, "empty queue produced a delivery receipt"
+        assert quiet_transport.calls == [], quiet_transport.calls
+        assert quiet_router.pending_events() == [], quiet_router.pending_events()
+        quiet_evidence = {
+            "schema": "orchestrator-practical-quiet/v1",
+            "notice": None,
+            "receipt": None,
+            "pending_count": 0,
+            "transport_calls": list(quiet_transport.calls),
+        }
 
-            record_attention(
-                "subagent",
-                "lane",
-                "AGENT_SIGNAL_CREATED",
-                {"lane_id": lane_id, "agent_blocked": True},
-            )
-            record_attention(
-                "orchestrator",
-                "root",
-                "MANAGER_WAIT_STARTED",
-                {
-                    "manager_session_id": session,
-                    "manager_invocation_id": invocation,
-                    "activity_id": activity_id,
-                    "manager_state": "WAITING_ON_TOOL",
-                },
-            )
-
-            signal = fixture.workspace() / "manager-signals" / "wake.json"
-            published = threading.Event()
-
-            def publish_signal():
-                write_json(
-                    signal,
-                    {
-                        "schema": "manager-signal/v1",
-                        "signal_id": event_id,
-                        "kind": "HELP",
-                        "created_utc": "2026-07-30T12:00:00Z",
-                        "lane_id": lane_id,
-                        "task": "A00",
-                        "phase": "synthetic",
-                        "summary": "wake",
-                        "evidence_paths": [],
-                        "attention_epoch_id": epoch,
-                    },
-                )
-                record_attention(
-                    "subagent",
-                    "lane",
-                    "AGENT_SIGNAL_PUBLISHED",
-                    {"lane_id": lane_id, "agent_blocked": True, "signal_id": event_id},
-                )
-                published.set()
-
-            command = [
-                sys.executable,
-                "-m",
-                "orchestrator_harness",
-                "--config",
-                str(fixture.config_path),
-                "watch",
-                "--until-actionable",
-                "--timeout",
-                "2",
-                "--manager-session-id",
-                session,
-                "--manager-invocation-id",
-                invocation,
-            ]
-            process = subprocess.Popen(
-                command,
-                cwd=root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            processes.append(process)
-            timer = threading.Timer(0.2, publish_signal)
-            timers.append(timer)
-            timer.start()
-            try:
-                stdout, stderr = process.communicate(timeout=10)
-            except subprocess.TimeoutExpired as exc:
-                process.kill()
-                stdout, stderr = process.communicate(timeout=5)
-                raise AssertionError(
-                    f"blocking wait did not return: stdout={stdout!r}, stderr={stderr!r}"
-                ) from exc
-            assert process.returncode == 0, (
-                f"blocking wait failed: rc={process.returncode}, stdout={stdout!r}, stderr={stderr!r}"
-            )
-            assert published.is_set(), (
-                "synthetic manager signal was not published while the wait ran"
-            )
-            event = json.loads(stdout)
-            assert (
-                event["data"]["signal_id"] == event_id
-                and event["wake_id"]
-                and event["wake_transport"] == "blocking_harness_wait_stdout"
-            ), event
-            wake_id = event["wake_id"]
-
-            # These are deliberately separate real recorder invocations, in manager order.
-            record_attention(
-                "orchestrator",
-                "root",
-                "MANAGER_WAKE_RECEIVED",
-                {
-                    "wake_id": wake_id,
-                    "wake_transport": event["wake_transport"],
-                    "manager_session_id": session,
-                    "manager_invocation_id": invocation,
-                },
-            )
-            record_attention(
-                "orchestrator",
-                "root",
-                "MANAGER_WAIT_FINISHED",
-                {
-                    "wake_id": wake_id,
-                    "wake_transport": event["wake_transport"],
-                    "manager_session_id": session,
-                    "manager_invocation_id": invocation,
-                    "activity_id": activity_id,
-                    "manager_state": "WAITING_ON_TOOL",
-                },
-            )
-            record_attention(
-                "orchestrator",
-                "root",
-                "MANAGER_EVENT_CLAIMED",
-                {
-                    "manager_session_id": session,
-                    "manager_invocation_id": invocation,
-                    "manager_state": "READING_EVENT",
-                },
-            )
-
-            attention_path = harness_output / "attention-events.jsonl"
-            assert attention_path.exists(), {
-                "harness_output": str(harness_output),
-                "observed_sources": [
-                    str(source.path) for source in watcher.observed_sources
-                ],
-            }
-            report = ingest_attention(watcher)
-            finding = next(
-                item for item in report["findings"] if item["event_id"] == event_id
-            )
-            evidence = finding["wake_evidence"]
-            assert (
-                evidence["status"] == "COMPLETE" and evidence["wake_id"] == wake_id
-            ), {
-                "finding": finding,
-                "report": report,
-                "harness": attention_path.read_text(encoding="utf-8"),
-            }
-            for metric in (
-                "attempted_to_delivered_seconds",
-                "delivered_to_received_seconds",
-                "received_to_claim_seconds",
-            ):
-                assert (
-                    isinstance(evidence[metric], (int, float)) and evidence[metric] >= 0
-                ), evidence
-            timeline = json.loads(
-                "["
-                + ",".join(
-                    line
-                    for line in (runtime_root / "watcher" / "attention-timeline.jsonl")
-                    .read_text(encoding="utf-8")
-                    .splitlines()
-                )
-                + "]"
-            )
-            wake_kinds = [
-                item["kind"] for item in timeline if item.get("event_id") == event_id
-            ]
-            assert (
-                "AGENT_SIGNAL_CREATED" in wake_kinds
-                and "AGENT_SIGNAL_PUBLISHED" in wake_kinds
-                and "HARNESS_SIGNAL_OBSERVED" in wake_kinds
-                and "MANAGER_WAKE_ATTEMPTED" in wake_kinds
-                and "MANAGER_WAKE_DELIVERED" in wake_kinds
-            ), wake_kinds
-            manager_records = [
-                item
-                for item in timeline
-                if item.get("event_id") == event_id
-                and item.get("source_role") == "orchestrator"
-            ]
-            assert [item["kind"] for item in manager_records] == [
-                "MANAGER_WAIT_STARTED",
-                "MANAGER_WAKE_RECEIVED",
-                "MANAGER_WAIT_FINISHED",
-                "MANAGER_EVENT_CLAIMED",
-            ], manager_records
-
-            # A fresh epoch/output must time out cleanly and never create a production wake stage.
-            quiet_fixture = SuiteFixture.create()
-            quiet_fixture.suite_root.joinpath("multi-agent-logs").mkdir(
-                parents=True, exist_ok=True
-            )
-            with (
-                tempfile.TemporaryDirectory(
-                    prefix="attention-quiet-harness-",
-                    dir=quiet_fixture.suite_root / "multi-agent-logs",
-                ) as quiet_output_name,
-                tempfile.TemporaryDirectory(
-                    prefix="attention-quiet-runtime-", dir=root / "multi-agent-logs"
-                ) as quiet_runtime_name,
-            ):
-                quiet_output = Path(quiet_output_name).resolve()
-                quiet_runtime = Path(quiet_runtime_name).resolve()
-                quiet_epoch = "A00_practical_quiet"
-                quiet_raw = json.loads(
-                    quiet_fixture.config_path.read_text(encoding="utf-8")
-                )
-                quiet_raw.update(
-                    {"attention_epoch_id": quiet_epoch, "output_dir": str(quiet_output)}
-                )
-                write_json(quiet_fixture.config_path, quiet_raw)
-                quiet_config_path = quiet_fixture.config_path
-                quiet_watcher_config = quiet_runtime / "watcher.json"
-                write_json(
-                    quiet_watcher_config,
-                    {
-                        "runtime_root": str(quiet_runtime),
-                        "attention_logging_enabled": True,
-                        "attention_epoch_id": quiet_epoch,
-                        "attention_producers": [
-                            {"role": "subagent", "source_id": "lane"},
-                            {"role": "orchestrator", "source_id": "root"},
-                        ],
-                        "observed_sources": [
-                            {
-                                "path": str(quiet_output / "attention-events.jsonl"),
-                                "role": "harness",
-                                "source_id": "harness",
-                            }
-                        ],
-                    },
-                )
-                quiet_watcher = load_watcher_config(quiet_watcher_config)
-                quiet_command = [
-                    sys.executable,
-                    "-m",
-                    "orchestrator_harness",
-                    "--config",
-                    str(quiet_config_path),
-                    "watch",
-                    "--until-actionable",
-                    "--timeout",
-                    "0.3",
-                    "--manager-session-id",
-                    session,
-                    "--manager-invocation-id",
-                    invocation,
-                ]
-                quiet_result = subprocess.run(
-                    quiet_command, cwd=root, capture_output=True, text=True, timeout=10
-                )
-                assert quiet_result.returncode == 3, (
-                    f"quiet wait expected rc=3, got {quiet_result.returncode}: {quiet_result.stderr}"
-                )
-                quiet_event = json.loads(quiet_result.stdout)
-                assert "wake_id" not in quiet_event
-                quiet_report = ingest_attention(quiet_watcher)
-                quiet_event = json.loads(quiet_result.stdout)
-                assert (
-                    quiet_event["event_id"] == "WATCH_TIMEOUT"
-                    and "wake_id" not in quiet_event
-                ), quiet_event
-                quiet_report = ingest_attention(quiet_watcher)
-                quiet_files = [
-                    quiet_output / "attention-events.jsonl",
-                    producer_path(quiet_runtime, "subagent", "lane"),
-                    producer_path(quiet_runtime, "orchestrator", "root"),
-                    quiet_runtime / "watcher" / "attention-timeline.jsonl",
-                ]
-                quiet_records = []
-                for path in quiet_files:
-                    if path.exists():
-                        quiet_records.extend(
-                            json.loads(line)
-                            for line in path.read_text(encoding="utf-8").splitlines()
-                            if line.strip()
-                        )
-                assert not any(
-                    str(item.get("kind", "")).startswith("MANAGER_WAKE_")
-                    for item in quiet_records
-                ), quiet_records
-                assert not any(
-                    str(item.get("kind", "")).startswith("MANAGER_WAKE_")
-                    for item in quiet_report.get("findings", [])
-                ), quiet_report
-                if evidence_dir is not None:
-                    shutil.copytree(harness_output, destination / "wake-harness")
-                    shutil.copytree(runtime_root, destination / "wake-watcher")
-                    shutil.copytree(quiet_output, destination / "quiet-harness")
-                    shutil.copytree(quiet_runtime, destination / "quiet-watcher")
-                    matching = sorted(
-                        (
-                            item
-                            for item in timeline
-                            if item.get("event_id") == event_id
-                            and item["kind"]
-                            in {
-                                "AGENT_SIGNAL_CREATED",
-                                "AGENT_SIGNAL_PUBLISHED",
-                                "HARNESS_SIGNAL_OBSERVED",
-                                "MANAGER_WAKE_ATTEMPTED",
-                                "MANAGER_WAKE_DELIVERED",
-                                "MANAGER_WAKE_RECEIVED",
-                                "MANAGER_EVENT_CLAIMED",
-                            }
-                        ),
-                        key=lambda item: item["source_timestamp_utc"],
-                    )
-                    (destination / "wake-result.json").write_text(
-                        json.dumps(
-                            {
-                                "event": event,
-                                "wake_id": wake_id,
-                                "wake_evidence": evidence,
-                                "records": matching,
-                            },
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-                    (destination / "quiet-result.json").write_text(
-                        json.dumps(
-                            {
-                                "timeout_event": quiet_event,
-                                "wake_records": [
-                                    item
-                                    for item in quiet_records
-                                    if str(item.get("kind", "")).startswith(
-                                        "MANAGER_WAKE_"
-                                    )
-                                ],
-                            },
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-    finally:
-        for timer in timers:
-            timer.cancel()
-        for timer in timers:
-            timer.join(timeout=2)
-        for process in processes:
-            if process.poll() is None:
-                process.kill()
-            if process.poll() is None:
-                process.wait(timeout=5)
-        if quiet_fixture is not None:
-            quiet_fixture.close()
-        fixture.close()
+    if evidence_dir is not None:
+        (destination / "wake-result.json").write_text(
+            json.dumps(wake_evidence, indent=2), encoding="utf-8"
+        )
+        (destination / "quiet-result.json").write_text(
+            json.dumps(quiet_evidence, indent=2), encoding="utf-8"
+        )
+    return wake_evidence, quiet_evidence
 
 
 def main(evidence_dir=None):
-    from orchestrator_harness.attention_sprint import (
-        event_selection_snapshot,
-        formal_baseline_snapshot,
-        invocation_snapshot,
-        validate_sprint_boundary,
-        validate_sprint_finalize,
-    )
-
-    boundary = validate_sprint_boundary(
-        epoch_id="practical-boundary",
-        heartbeat_timeout_seconds=11,
-        formal_review_interval_seconds=5,
-        bounded_lifetime_seconds=10,
-    )
-    if "kind" in boundary:
-        raise AssertionError("boundary helper emitted synthetic activity")
-    event = {
-        "event_id": "gate",
-        "type": "HELP",
-        "priority": 1,
-        "age_seconds": 0.0,
-        "agent_blocked": True,
-    }
-    inventory = invocation_snapshot([event])
-    baseline = formal_baseline_snapshot([event])
-    selection = event_selection_snapshot([event], event_id="gate")
-    finalize = [
-        {
-            "epoch_id": "practical-boundary",
-            "event_id": "start",
-            "kind": "MANAGER_INVOCATION_STARTED",
-            "pending_work_snapshot": inventory,
-        },
-        {
-            "epoch_id": "practical-boundary",
-            "event_id": "baseline",
-            "kind": "FORMAL_REVIEW_BASELINE_ADVANCED",
-            "source_role": "orchestrator",
-            "pending_work_snapshot": baseline,
-        },
-        {
-            "epoch_id": "practical-boundary",
-            "event_id": "gate",
-            "kind": "MANAGER_EVENT_CLAIMED",
-            "pending_work_snapshot": selection,
-        },
-        {
-            "epoch_id": "practical-boundary",
-            "event_id": "gate",
-            "kind": "AGENT_SIGNAL_CREATED",
-            "agent_blocked": True,
-        },
-        {
-            "epoch_id": "practical-boundary",
-            "event_id": "finish",
-            "kind": "MANAGER_INVOCATION_FINISHED",
-            "pending_work_snapshot": inventory,
-        },
-    ]
-    validate_sprint_finalize(
-        [
-            *finalize,
-            {
-                "epoch_id": "practical-boundary",
-                "event_id": "gate",
-                "kind": "AGENT_RESPONSE_RECEIVED",
-            },
-            {
-                "epoch_id": "practical-boundary",
-                "event_id": "gate",
-                "kind": "AGENT_WORK_RESUMED",
-            },
-        ],
-        epoch_id="practical-boundary",
-    )
-    validate_sprint_finalize(
-        [
-            *finalize,
-            {
-                "epoch_id": "practical-boundary",
-                "event_id": "gate",
-                "kind": "AGENT_GATE_EXPIRED",
-                "terminal_gate_expired": True,
-            },
-        ],
-        epoch_id="practical-boundary",
-    )
     try:
         make_source_record(
             recorder="practical",
