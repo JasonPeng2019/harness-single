@@ -689,7 +689,7 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "orchestrator_harness/tests/test_s6_public_release.py",
                 "orchestrator_harness/tests/test_coding_lane_controller.py",
             ),
-            estimated_duration_seconds=120.0,
+            estimated_duration_seconds=1800.0,
             input_scopes=_ORCHESTRATOR_UNIT_INPUT_SCOPES,
         ),
         CheckSpec(
@@ -765,7 +765,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             ),
             external_requirements=("ROOT release assurance",),
             platform_requirements=("windows",),
-            estimated_duration_seconds=1200.0,
+            estimated_duration_seconds=2400.0,
             producer="ROOT-IM",
             input_scopes=_RELEASE_AGGREGATE_INPUT_SCOPES,
         ),
