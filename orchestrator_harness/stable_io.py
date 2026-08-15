@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -39,12 +40,60 @@ def _path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
+class _PathLockEntry:
+    """One in-process serialization entry for one canonical path key."""
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+class _PathLockRegistry:
+    """Guarded per-path in-process lock registry with usage accounting.
+
+    One entry exists per canonical path key only while that path has active or
+    waiting users; the last release removes the entry so the registry cannot
+    grow without bound as paths become inactive.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._entries: dict[str, _PathLockEntry] = {}
+
+    def acquire(self, key: str) -> _PathLockEntry:
+        with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _PathLockEntry()
+                self._entries[key] = entry
+            entry.users += 1
+        entry.lock.acquire()
+        return entry
+
+    def release(self, key: str, entry: _PathLockEntry) -> None:
+        entry.lock.release()
+        with self._guard:
+            entry.users -= 1
+            if entry.users == 0 and self._entries.get(key) is entry:
+                del self._entries[key]
+
+
+_PATH_LOCK_REGISTRY = _PathLockRegistry()
+
+
 class PathKeyedAppendLock:
     """One kernel-owned lock for one canonical JSONL destination.
 
     The lock file is intentionally persistent.  Its contents are irrelevant; the
     operating system releases the lock when the owning process dies, which is the
     property a create-once marker cannot provide.
+
+    A per-canonical-path in-process lock is held around the kernel lock
+    lifecycle so only one thread in this process attempts or holds that path's
+    kernel lock at a time; Windows byte-range locks cannot serialize two
+    handles opened in the same process.
     """
 
     def __init__(self, path: Path, *, lock_root: Path | None = None) -> None:
@@ -56,8 +105,11 @@ class PathKeyedAppendLock:
         self._handle: Any | None = None
         self._anchored: AnchoredAppendFile | None = None
         self._windows_locked = False
+        self._local_entry: _PathLockEntry | None = None
 
     def __enter__(self) -> "PathKeyedAppendLock":
+        entry = _PATH_LOCK_REGISTRY.acquire(self.key)
+        self._local_entry = entry
         handle: Any | None = None
         anchored: AnchoredAppendFile | None = None
         try:
@@ -81,20 +133,24 @@ class PathKeyedAppendLock:
             self._anchored = anchored
             return self
         except Exception as exc:
-            if anchored is not None:
-                if os.name == "nt" and self._windows_locked:
-                    try:
-                        import msvcrt
+            try:
+                if anchored is not None:
+                    if os.name == "nt" and self._windows_locked:
+                        try:
+                            import msvcrt
 
-                        anchored.handle.seek(0)
-                        msvcrt.locking(anchored.handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    except Exception:
-                        pass
-                anchored.close()
-            elif handle is not None:
-                handle.close()
-            self._handle = None
-            self._anchored = None
+                            anchored.handle.seek(0)
+                            msvcrt.locking(anchored.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        except Exception:
+                            pass
+                    anchored.close()
+                elif handle is not None:
+                    handle.close()
+            finally:
+                self._handle = None
+                self._anchored = None
+                self._local_entry = None
+                _PATH_LOCK_REGISTRY.release(self.key, entry)
             raise AppendLockError(
                 f"cannot acquire append lock for {self.path}: {exc}"
             ) from exc
@@ -102,25 +158,31 @@ class PathKeyedAppendLock:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         handle = self._handle
         anchored = self._anchored
+        entry = self._local_entry
         self._handle = None
         self._anchored = None
-        if handle is None:
-            return
+        self._local_entry = None
         try:
-            if os.name == "nt" and self._windows_locked:
-                import msvcrt
+            if handle is None:
+                return
+            try:
+                if os.name == "nt" and self._windows_locked:
+                    import msvcrt
 
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            elif os.name != "nt":
-                import fcntl
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif os.name != "nt":
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                if anchored is not None:
+                    anchored.close()
+                else:
+                    handle.close()
         finally:
-            if anchored is not None:
-                anchored.close()
-            else:
-                handle.close()
+            if entry is not None:
+                _PATH_LOCK_REGISTRY.release(self.key, entry)
 
 
 def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:
