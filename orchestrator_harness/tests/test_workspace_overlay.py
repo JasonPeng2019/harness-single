@@ -361,7 +361,11 @@ class OverlayModuleTests(unittest.TestCase):
         calls: list[str] = []
 
         def failing_replace(
-            parent: Path, relative: str, data: bytes, *, expected: TargetState | None = None
+            parent: Path,
+            relative: str,
+            data: bytes,
+            *,
+            expected: TargetState | None = None,
         ) -> MutationReceipt:
             calls.append(relative)
             if relative == "notes.txt":
@@ -391,7 +395,11 @@ class OverlayModuleTests(unittest.TestCase):
         real_replace = overlay_module.mutation_replace
 
         def failing_receipt(
-            parent: Path, relative: str, data: bytes, *, expected: TargetState | None = None
+            parent: Path,
+            relative: str,
+            data: bytes,
+            *,
+            expected: TargetState | None = None,
         ) -> MutationReceipt:
             if relative == self.receipt.name:
                 raise MutationError("receipt write failure")
@@ -942,7 +950,9 @@ class OverlayLaneSeamTests(unittest.TestCase):
         result = self._retire(receipt)
         self.assertEqual("CLOSED", result.outcome, result)
         self.assertFalse(self.lane.exists())
-        archive = json.loads(cast(Path, result.archive_path).read_text(encoding="utf-8"))
+        archive = json.loads(
+            cast(Path, result.archive_path).read_text(encoding="utf-8")
+        )
         restoration = archive["overlay_restoration"]
         self.assertEqual("RESTORED", restoration["outcome"])
         self.assertTrue(restoration["removed_paths"])
@@ -1027,7 +1037,9 @@ class OverlayLaneSeamTests(unittest.TestCase):
         result = self._retire(receipt)
         self.assertEqual("CLOSED", result.outcome, result)
         self.assertFalse(self.lane.exists())
-        archive = json.loads(cast(Path, result.archive_path).read_text(encoding="utf-8"))
+        archive = json.loads(
+            cast(Path, result.archive_path).read_text(encoding="utf-8")
+        )
         restoration = archive["overlay_restoration"]
         self.assertEqual("RESTORED", restoration["outcome"])
         self.assertIn("empty-marker.txt", restoration["removed_paths"])

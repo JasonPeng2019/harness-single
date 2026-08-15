@@ -385,7 +385,9 @@ def _firmware_adapter(
 
     def make_transport(process, remaining, request_id, config):
         if hasattr(selected_transport, "authority_check"):
-            cast(Any, selected_transport).authority_check = config.get("_authority_check")
+            cast(Any, selected_transport).authority_check = config.get(
+                "_authority_check"
+            )
         return selected_transport
 
     adapter = FirmwareHardwareAdapter(
@@ -400,10 +402,11 @@ def _firmware_adapter(
         config_provider=lambda request, operation: {"private": "controller-config"},
         transport_factory=make_transport,
         mcp_protocol_version="2025-03-26",
-        supervisor_factory=lambda process, identity, request_id, boundary: (
-            cast(ProcessSupervisor, _Supervisor())
+        supervisor_factory=lambda process, identity, request_id, boundary: cast(
+            ProcessSupervisor, _Supervisor()
         ),
-        boundary_factory=boundary_factory or (lambda: cast(ProcessBoundary, _Boundary())),
+        boundary_factory=boundary_factory
+        or (lambda: cast(ProcessBoundary, _Boundary())),
         clock=clock or (lambda: 10.0),
     )
     return adapter, selected_pack, selected_transport

@@ -1718,7 +1718,9 @@ def _validate_lane_binding(
         return state, f"RETAINED_REF_UNKNOWN:{type(exc).__name__}"
     state["retained_ref_commit"] = retained_ref_commit
     if (
-        _git(lane, "merge-base", "--is-ancestor", actual_head, cast(str, retained_ref)).returncode
+        _git(
+            lane, "merge-base", "--is-ancestor", actual_head, cast(str, retained_ref)
+        ).returncode
         != 0
     ):
         return state, "RETAINED_REVISION_UNPROVEN"

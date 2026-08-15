@@ -834,21 +834,30 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         )
         self.assertEqual(
             "session-1",
-            cast(ProviderEvent, adapter.parse_transcript_line(
-                b'{"type":"system","subtype":"init","session_id":"session-1"}'
-            )).session_id,
+            cast(
+                ProviderEvent,
+                adapter.parse_transcript_line(
+                    b'{"type":"system","subtype":"init","session_id":"session-1"}'
+                ),
+            ).session_id,
         )  # type: ignore[union-attr]
         self.assertEqual(
             "COMPLETED",
-            cast(ProviderEvent, adapter.parse_transcript_line(
-                b'{"type":"result","subtype":"success","session_id":"session-1"}'
-            )).kind,
+            cast(
+                ProviderEvent,
+                adapter.parse_transcript_line(
+                    b'{"type":"result","subtype":"success","session_id":"session-1"}'
+                ),
+            ).kind,
         )  # type: ignore[union-attr]
         self.assertEqual(
             "FAILED",
-            cast(ProviderEvent, adapter.parse_transcript_line(
-                b'{"type":"result","subtype":"error_during_execution","session_id":"session-1"}'
-            )).kind,
+            cast(
+                ProviderEvent,
+                adapter.parse_transcript_line(
+                    b'{"type":"result","subtype":"error_during_execution","session_id":"session-1"}'
+                ),
+            ).kind,
         )  # type: ignore[union-attr]
 
         profile = RuntimeProfile(
