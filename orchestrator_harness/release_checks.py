@@ -765,7 +765,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             ),
             external_requirements=("ROOT release assurance",),
             platform_requirements=("windows",),
-            estimated_duration_seconds=600.0,
+            estimated_duration_seconds=1200.0,
             producer="ROOT-IM",
             input_scopes=_RELEASE_AGGREGATE_INPUT_SCOPES,
         ),
