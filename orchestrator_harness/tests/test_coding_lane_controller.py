@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
@@ -130,7 +130,7 @@ class CodingLaneControllerTests(unittest.TestCase):
             controller.load_invocation(path)
         path, raw = self.invocation()
         raw["output_paths"] = {
-            **raw["output_paths"],
+            **cast(dict[str, Any], raw["output_paths"]),
             "jsonl": str(self.root / "escape.jsonl"),
         }  # type: ignore[arg-type]
         self._write(path, raw)

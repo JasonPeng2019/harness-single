@@ -15,7 +15,7 @@ import unittest
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 from unittest.mock import MagicMock, patch
 
 import orchestrator_harness.lane_controller as lane_controller
@@ -1619,7 +1619,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                     _info_class: int,
                     buffer: object,
                     size: int,
-                    returned: object,
+                    returned: Any,
                 ) -> bool:
                     nonlocal calls
                     calls += 1

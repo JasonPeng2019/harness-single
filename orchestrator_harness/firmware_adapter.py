@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from .capability_broker import (
     AdapterResult,
@@ -42,7 +42,7 @@ class _ActiveOperation:
     process: Any | None
     identity: Mapping[str, Any] | None
     supervisor_identity: ProcessInfo | Mapping[str, Any] | None
-    transport: Any | None
+    transport: Any
     boundary: ProcessBoundary | Any
     operation: FirmwareOperation
     launch_attempted: bool = False
@@ -206,7 +206,7 @@ class FirmwareHardwareAdapter:
             process_info = process_snapshot().by_pid.get(pid)
             active.identity = self._child_identity(pid, exact, process_info)
             active.supervisor_identity = process_info or active.identity
-            boundary.attach(process, process_info or active.identity)
+            boundary.attach(process, process_info or cast(ProcessInfo, active.identity))
             remaining = lambda: permit.expires_monotonic - self.clock()
             authority_check = lambda: self.clock() < permit.expires_monotonic
             transport_config = dict(launch_config)

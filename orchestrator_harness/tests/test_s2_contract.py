@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 from orchestrator_harness.invocation import (
@@ -26,7 +27,11 @@ from orchestrator_harness.prompt_bundle import (
     compose_prompt_bundle,
     prompt_bundle_record_from_paths,
 )
-from orchestrator_harness.provider import ClaudeCodeProviderAdapter, ProviderLaunchSpec
+from orchestrator_harness.provider import (
+    ClaudeCodeProviderAdapter,
+    ProviderEvent,
+    ProviderLaunchSpec,
+)
 from orchestrator_harness.resume import (
     RESUME_AMENDMENT_REVIEW_SCHEMA,
     make_resume_admission,
@@ -35,8 +40,10 @@ from orchestrator_harness.resume import (
 from orchestrator_harness.task import (
     COMPLETION_REVIEW_FILENAME,
     COMPLETION_REVIEW_SCHEMA,
+    CompletionReview,
     ORCHESTRATOR_ACCEPTANCE_FILENAME,
     ORCHESTRATOR_ACCEPTANCE_SCHEMA,
+    OrchestratorAcceptance,
     TASK_CARD_SCHEMA,
     TASK_RESULT_SCHEMA,
     advance_task,
@@ -827,21 +834,21 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         )
         self.assertEqual(
             "session-1",
-            adapter.parse_transcript_line(
+            cast(ProviderEvent, adapter.parse_transcript_line(
                 b'{"type":"system","subtype":"init","session_id":"session-1"}'
-            ).session_id,
+            )).session_id,
         )  # type: ignore[union-attr]
         self.assertEqual(
             "COMPLETED",
-            adapter.parse_transcript_line(
+            cast(ProviderEvent, adapter.parse_transcript_line(
                 b'{"type":"result","subtype":"success","session_id":"session-1"}'
-            ).kind,
+            )).kind,
         )  # type: ignore[union-attr]
         self.assertEqual(
             "FAILED",
-            adapter.parse_transcript_line(
+            cast(ProviderEvent, adapter.parse_transcript_line(
                 b'{"type":"result","subtype":"error_during_execution","session_id":"session-1"}'
-            ).kind,
+            )).kind,
         )  # type: ignore[union-attr]
 
         profile = RuntimeProfile(
@@ -1188,7 +1195,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
 
             different_card = dict(raw)
             different_card["task_card"] = {
-                **different_card["task_card"],
+                **cast(dict[str, Any], different_card["task_card"]),
                 "revision": "different",
             }  # type: ignore[arg-type]
             different_path = workspace / "start-different-card.invocation.json"
@@ -1893,11 +1900,11 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             self.assertEqual("ACCEPTED", advancement.state)
             self.assertEqual(
                 hashlib.sha256(review_bytes).hexdigest(),
-                advancement.review.content_sha256,
+                cast(CompletionReview, advancement.review).content_sha256,
             )  # type: ignore[union-attr]
             self.assertEqual(
                 hashlib.sha256(acceptance_bytes).hexdigest(),
-                advancement.acceptance.content_sha256,
+                cast(OrchestratorAcceptance, advancement.acceptance).content_sha256,
             )  # type: ignore[union-attr]
 
             for original, validator, kwargs in (

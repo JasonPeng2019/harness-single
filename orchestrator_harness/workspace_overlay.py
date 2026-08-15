@@ -870,7 +870,7 @@ def verify_overlay_receipt(
             "verified": True,
             "reason": "no overlay was requested",
         }
-    expected = _path_identity(expected_target_worktree_id)
+    expected = _path_identity(Path(expected_target_worktree_id))
     try:
         raw = _read_receipt(receipt_path)
         target_id, receipt_role, _, _, _, _, _ = _validate_receipt(raw)
@@ -886,7 +886,7 @@ def verify_overlay_receipt(
             "verified": False,
             "reason": f"overlay receipt role {receipt_role!r} is not {role!r}",
         }
-    if _path_identity(target_id) != expected:
+    if _path_identity(Path(target_id)) != expected:
         return {
             "present": True,
             "verified": False,

@@ -22,13 +22,14 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.cli import build_parser, main as cli_main
-from orchestrator_harness.lane_lifecycle import retire_terminal_lane
+from orchestrator_harness.lane_lifecycle import RetirementResult, retire_terminal_lane
 from orchestrator_harness.models import ProcessSnapshot
-from orchestrator_harness.mutation import MutationError
+from orchestrator_harness.mutation import MutationError, MutationReceipt, TargetState
 from orchestrator_harness.tests.support import TemporaryGitRepository
 from orchestrator_harness.workspace_overlay import (
     DECLARATION_NAME,
@@ -360,8 +361,8 @@ class OverlayModuleTests(unittest.TestCase):
         calls: list[str] = []
 
         def failing_replace(
-            parent: Path, relative: str, data: bytes, *, expected: object
-        ) -> None:
+            parent: Path, relative: str, data: bytes, *, expected: TargetState | None = None
+        ) -> MutationReceipt:
             calls.append(relative)
             if relative == "notes.txt":
                 raise MutationError("synthetic failure")
@@ -390,8 +391,8 @@ class OverlayModuleTests(unittest.TestCase):
         real_replace = overlay_module.mutation_replace
 
         def failing_receipt(
-            parent: Path, relative: str, data: bytes, *, expected: object
-        ) -> None:
+            parent: Path, relative: str, data: bytes, *, expected: TargetState | None = None
+        ) -> MutationReceipt:
             if relative == self.receipt.name:
                 raise MutationError("receipt write failure")
             return real_replace(parent, relative, data, expected=expected)
@@ -666,7 +667,7 @@ class OverlayCliTests(unittest.TestCase):
         self.assertEqual("ingest", parsed.super_cache_action)
         from unittest import mock as _mock
 
-        emitted: list[object] = []
+        emitted: list[Any] = []
 
         def capture(value: object, **_: object) -> None:
             emitted.append(value)
@@ -878,7 +879,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
             (self.workspace / "controller.status.json").read_text(encoding="utf-8")
         )
 
-    def _retire(self, receipt: Path) -> object:
+    def _retire(self, receipt: Path) -> RetirementResult:
         evidence = self.root / "evidence"
         evidence.mkdir()
         refs: list[Path] = []
@@ -941,7 +942,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
         result = self._retire(receipt)
         self.assertEqual("CLOSED", result.outcome, result)
         self.assertFalse(self.lane.exists())
-        archive = json.loads(result.archive_path.read_text(encoding="utf-8"))
+        archive = json.loads(cast(Path, result.archive_path).read_text(encoding="utf-8"))
         restoration = archive["overlay_restoration"]
         self.assertEqual("RESTORED", restoration["outcome"])
         self.assertTrue(restoration["removed_paths"])
@@ -1026,7 +1027,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
         result = self._retire(receipt)
         self.assertEqual("CLOSED", result.outcome, result)
         self.assertFalse(self.lane.exists())
-        archive = json.loads(result.archive_path.read_text(encoding="utf-8"))
+        archive = json.loads(cast(Path, result.archive_path).read_text(encoding="utf-8"))
         restoration = archive["overlay_restoration"]
         self.assertEqual("RESTORED", restoration["outcome"])
         self.assertIn("empty-marker.txt", restoration["removed_paths"])

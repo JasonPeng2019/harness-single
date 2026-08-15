@@ -25,6 +25,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from typing import Any
+
 from orchestrator_harness.codex_adapter import install_codex_adapter
 from orchestrator_harness.codex_bounded_policy import (
     BoundedPolicyError,
@@ -94,7 +96,7 @@ class BoundedPolicyModuleTests(unittest.TestCase):
 
     def _guard(
         self, command: str, *, cwd: Path | None = None, workdir: str | None = None
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         tool_input: dict[str, object] = {"command": command}
         if workdir is not None:
             tool_input["workdir"] = workdir
@@ -564,7 +566,7 @@ class InstalledHookTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _hook_result(self, payload: dict[str, object]) -> dict[str, object]:
+    def _hook_result(self, payload: dict[str, object]) -> dict[str, Any]:
         hook = (
             self.project / ".codex" / "hooks" / "orchestrator_harness_bounded_policy.py"
         )
