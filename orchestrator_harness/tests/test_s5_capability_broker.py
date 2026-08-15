@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from orchestrator_harness.capability_broker import (
     APPROVAL_SCHEMA,
@@ -385,7 +385,7 @@ def _firmware_adapter(
 
     def make_transport(process, remaining, request_id, config):
         if hasattr(selected_transport, "authority_check"):
-            selected_transport.authority_check = config.get("_authority_check")
+            cast(Any, selected_transport).authority_check = config.get("_authority_check")
         return selected_transport
 
     adapter = FirmwareHardwareAdapter(
@@ -401,9 +401,9 @@ def _firmware_adapter(
         transport_factory=make_transport,
         mcp_protocol_version="2025-03-26",
         supervisor_factory=lambda process, identity, request_id, boundary: (
-            _Supervisor()
+            cast(ProcessSupervisor, _Supervisor())
         ),
-        boundary_factory=boundary_factory or (lambda: _Boundary()),
+        boundary_factory=boundary_factory or (lambda: cast(ProcessBoundary, _Boundary())),
         clock=clock or (lambda: 10.0),
     )
     return adapter, selected_pack, selected_transport

@@ -12,7 +12,7 @@ import subprocess
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from .models import ProcessInfo, ProcessSnapshot, iso_utc, parse_utc, utc_now
 from .mutation import (
@@ -1669,10 +1669,10 @@ def _validate_lane_binding(
             lane, binding["target_revision"], name="binding target_revision"
         )
         caller_retained = _exact_revision(
-            lane, retained_revision, name="retained_revision claim"
+            lane, cast(str, retained_revision), name="retained_revision claim"
         )
         caller_target = _exact_revision(
-            lane, target_revision, name="target_revision claim"
+            lane, cast(str, target_revision), name="target_revision claim"
         )
     except LaneLifecycleError as exc:
         return None, f"LANE_BINDING_REVISION_INVALID:{type(exc).__name__}"
@@ -1718,7 +1718,7 @@ def _validate_lane_binding(
         return state, f"RETAINED_REF_UNKNOWN:{type(exc).__name__}"
     state["retained_ref_commit"] = retained_ref_commit
     if (
-        _git(lane, "merge-base", "--is-ancestor", actual_head, retained_ref).returncode
+        _git(lane, "merge-base", "--is-ancestor", actual_head, cast(str, retained_ref)).returncode
         != 0
     ):
         return state, "RETAINED_REVISION_UNPROVEN"

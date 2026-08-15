@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.codex_adapter import (
@@ -491,7 +492,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
 
     def _canonical(
         self, *, provider_id: str = "fake-cli", notification: bool | None = None
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         prompt_a = self.run / "prompt-a.md"
         prompt_b = self.run / "prompt-b.md"
         prompt_a.write_bytes(b"workflow\n")
@@ -521,7 +522,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             task_card_id="card-1",
             profile_id="profile-1",
             paths=(("instructions", prompt_a), ("task", prompt_b)),
-            run_root=self.run,
+            run_root=cast(Path, self.run),
         )
         provider: dict[str, object] = {
             "id": provider_id,
@@ -561,7 +562,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
     def _write(self, path: Path, value: dict[str, object]) -> None:
         path.write_text(json.dumps(value), encoding="utf-8")
 
-    def _status(self) -> dict[str, object]:
+    def _status(self) -> dict[str, Any]:
         return json.loads(
             (self.workspace / "worker_controller.status.json").read_text(
                 encoding="utf-8"
