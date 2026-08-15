@@ -1085,8 +1085,12 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of order"):
             transition(self.config.runtime_root, alert["alert_id"], "PAUSED")
 
-    def test_enabled_alert_routes_to_the_harness_with_top_priority(self) -> None:
-        snapshot = {"lanes": [], "requests": []}
+    def test_enabled_watcher_alert_never_enters_native_conditions(self) -> None:
+        snapshot = {
+            "lanes": [],
+            "requests": [],
+            "process_snapshot_complete": True,
+        }
         watcher_alert = {
             "alert_id": "hwa-1",
             "event_id": "hwa-event-1",
@@ -1106,16 +1110,12 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             patch("harness_watcher_implementation.logging.log"),
         ):
             conditions = merge_watcher_conditions(snapshot)
-        selected = select_actionable(
-            conditions,
-            snapshot,
-            observed_at=__import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc
-            ),
-            acknowledged_event_ids=set(),
+        self.assertEqual(conditions_from_snapshot(snapshot), conditions)
+        self.assertEqual({}, conditions)
+        self.assertNotIn(
+            "HARNESS_WATCHER_ALERT",
+            {condition["type"] for condition in conditions.values()},
         )
-        self.assertEqual("HARNESS_WATCHER_ALERT", selected["type"])
-        self.assertEqual("hwa-event-1", selected["event_id"])
 
     def test_disabled_integration_returns_exact_original_conditions(self) -> None:
         snapshot = {"lanes": [], "requests": []}
@@ -1124,27 +1124,10 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             conditions_from_snapshot(snapshot), merge_watcher_conditions(snapshot)
         )
 
-    def test_failed_harness_ack_must_not_mark_watcher_alert_received(self) -> None:
-        """The durable harness ack is the authority; do not mutate watcher state first."""
-
-        class RejectingStore:
-            def load_notification_state(self):
-                return {"pending": None}
-
-            def acknowledge_notification(self, *args, **kwargs):
-                return False
-
-        with patch(
-            "orchestrator_harness.cli.acknowledge_watcher_event", return_value=True
-        ) as watcher_ack:
-            with self.assertRaises(ValueError):
-                cli.ack_command(
-                    object(),
-                    event_id="hwa-not-pending",
-                    stream=io.StringIO(),
-                    store_factory=lambda _: RejectingStore(),
-                )
-        watcher_ack.assert_not_called()
+    def test_cli_exposes_no_ack_command_or_watcher_acknowledgement_api(self) -> None:
+        """The diagnostic CLI owns no manager queue or acknowledgement policy."""
+        self.assertFalse(hasattr(cli, "ack_command"))
+        self.assertFalse(hasattr(cli, "acknowledge_watcher_event"))
 
     def test_poll_routes_new_manager_harness_and_lane_records_to_four_separate_trees(
         self,
