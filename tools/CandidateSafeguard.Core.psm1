@@ -68,6 +68,48 @@ function Add-HeldRemainder {
     }
 }
 
+function Write-CheckpointSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.Generic.List[object]]$Results,
+        [object]$Selection = $null,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [string]$CheckpointPath = '',
+        [string]$ResultsPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CheckpointPath) -or $null -eq $Selection -or
+        [string]::IsNullOrWhiteSpace($ResultsPath)) {
+        return
+    }
+    # Persist the current truthful unit dispositions through the release-check
+    # checkpoint owner.  The checkpoint file is the existing -CreditFile
+    # interface and is the only artifact written; a nonexistent path is an
+    # empty cold input and becomes the output here.
+    $resultsJson = '[' + (($Results | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 8 }) -join ',') + ']'
+    [IO.File]::WriteAllText($ResultsPath, $resultsJson, [Text.UTF8Encoding]::new($false))
+    $selectionJson = $Selection | ConvertTo-Json -Depth 12
+    $selectionJsonPath = Join-Path (Split-Path -Parent $ResultsPath) ('safeguard-selection-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        [IO.File]::WriteAllText($selectionJsonPath, $selectionJson, [Text.UTF8Encoding]::new($false))
+        Push-Location $RepositoryRoot
+        try {
+            $mergeOutput = & python -m orchestrator_harness.release_checks checkpoint `
+                --input $CheckpointPath --selection $selectionJsonPath `
+                --results $ResultsPath --output $CheckpointPath 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "candidate checkpoint merge failed: $mergeOutput"
+            }
+        } finally {
+            Pop-Location
+        }
+    } finally {
+        if (Test-Path -LiteralPath $selectionJsonPath -PathType Leaf) {
+            Remove-Item -LiteralPath $selectionJsonPath -Force
+        }
+    }
+}
+
 function Invoke-ReleaseChecks {
     [CmdletBinding()]
     param(
@@ -108,21 +150,19 @@ function Invoke-ReleaseChecks {
         Push-Location $RepositoryRoot
         try {
             if ($program -eq 'python') {
-                $checkOutput = & python @arguments 2>&1
+                # Stream the unit's diagnostics live instead of buffering a
+                # long unit's entire output; Write-Host keeps the text visible
+                # without leaking into this function's success stream, which
+                # the caller captures as the pool summary.
+                & python @arguments 2>&1 | ForEach-Object { Write-Host $_ }
             } elseif ($program -eq 'powershell') {
-                $checkOutput = & powershell @arguments 2>&1
+                & powershell @arguments 2>&1 | ForEach-Object { Write-Host $_ }
             } else {
                 throw "selected check uses an unsupported runner: $program"
             }
             $exitCode = $LASTEXITCODE
         } finally {
             Pop-Location
-        }
-        if ($null -ne $checkOutput) {
-            # Keep the unit's diagnostic text visible without letting it
-            # leak into this function's success stream, which the caller
-            # captures as the pool summary.
-            Write-Host $checkOutput
         }
         if ($exitCode -ne 0) {
             # An ordinary nonzero check records FAIL and never cancels later
@@ -137,12 +177,23 @@ function Invoke-ReleaseChecks {
                     -ExpectedBranch $ExpectedBranch -ExpectedCommonDirectory $ExpectedCommonDirectory `
                     -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
             } catch {
-                # The failing unit left the repository untrustworthy, so the
-                # remaining units cannot truthfully run and are held.
+                # The failing unit left the repository untrustworthy: the unit
+                # is upgraded to UNRESOLVED (a non-null first unresolved state)
+                # and every later unit is held with a recorded skip reason.
+                $last = $results[$results.Count - 1]
+                $last.status = 'UNRESOLVED'
+                $last.reason = "ordinary nonzero exit code $exitCode; candidate identity check failed after unit: $($_.Exception.Message)"
+                if ($null -eq $firstUnresolved) {
+                    $firstUnresolved = $stableId
+                }
                 Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `
                     -Reason "candidate repository became untrustworthy after failing unit ${stableId}: $($_.Exception.Message)"
+                Write-CheckpointSnapshot -Results $results -Selection $Selection -RepositoryRoot $RepositoryRoot `
+                    -CheckpointPath $CheckpointPath -ResultsPath $ResultsPath
                 break
             }
+            Write-CheckpointSnapshot -Results $results -Selection $Selection -RepositoryRoot $RepositoryRoot `
+                -CheckpointPath $CheckpointPath -ResultsPath $ResultsPath
             $index++
             continue
         }
@@ -164,9 +215,13 @@ function Invoke-ReleaseChecks {
             }
             Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `
                 -Reason 'candidate identity uncertainty holds this unit; it was not run truthfully'
+            Write-CheckpointSnapshot -Results $results -Selection $Selection -RepositoryRoot $RepositoryRoot `
+                -CheckpointPath $CheckpointPath -ResultsPath $ResultsPath
             break
         }
         $results.Add([ordered]@{ stable_id = $stableId; status = 'PASS' })
+        Write-CheckpointSnapshot -Results $results -Selection $Selection -RepositoryRoot $RepositoryRoot `
+            -CheckpointPath $CheckpointPath -ResultsPath $ResultsPath
         $index++
     }
 
@@ -188,6 +243,8 @@ function Invoke-ReleaseChecks {
                 $firstUnresolved = [string]$firstUnresolvedResult.stable_id
             }
         }
+        Write-CheckpointSnapshot -Results $results -Selection $Selection -RepositoryRoot $RepositoryRoot `
+            -CheckpointPath $CheckpointPath -ResultsPath $ResultsPath
     }
 
     if ($results.Count -ne @($Checks).Count) {
@@ -198,35 +255,6 @@ function Invoke-ReleaseChecks {
     if (@($recordedIds | Select-Object -Unique).Count -ne $recordedIds.Count -or
         (@($recordedIds | Sort-Object) -join ',') -cne (@($checkIds | Sort-Object) -join ',')) {
         throw 'candidate safeguard recorded a stable ID that was not selected or was recorded more than once'
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($CheckpointPath) -and $null -ne $Selection -and
-        -not [string]::IsNullOrWhiteSpace($ResultsPath)) {
-        # Persist the current unit dispositions through the release-check
-        # checkpoint owner; the checkpoint file is the existing -CreditFile
-        # interface and is the only artifact written.
-        $resultsJson = '[' + (($results | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 8 }) -join ',') + ']'
-        [IO.File]::WriteAllText($ResultsPath, $resultsJson, [Text.UTF8Encoding]::new($false))
-        $selectionJson = $Selection | ConvertTo-Json -Depth 12
-        $selectionJsonPath = Join-Path (Split-Path -Parent $ResultsPath) ('safeguard-selection-' + [guid]::NewGuid().ToString('N') + '.json')
-        try {
-            [IO.File]::WriteAllText($selectionJsonPath, $selectionJson, [Text.UTF8Encoding]::new($false))
-            Push-Location $RepositoryRoot
-            try {
-                $mergeOutput = & python -m orchestrator_harness.release_checks checkpoint `
-                    --input $CheckpointPath --selection $selectionJsonPath `
-                    --results $ResultsPath --output $CheckpointPath 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "candidate checkpoint merge failed: $mergeOutput"
-                }
-            } finally {
-                Pop-Location
-            }
-        } finally {
-            if (Test-Path -LiteralPath $selectionJsonPath -PathType Leaf) {
-                Remove-Item -LiteralPath $selectionJsonPath -Force
-            }
-        }
     }
 
     $passed = @($results | Where-Object { $_.status -eq 'PASS' }).Count

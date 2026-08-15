@@ -934,6 +934,38 @@ def dependency_fingerprint(spec: CheckSpec, root: str | Path) -> str:
     return _sha256(_canonical_json({"check": spec.to_record(), "inputs": inputs}))
 
 
+def runner_coordinate() -> dict[str, Any]:
+    """Compact actual runner coordinate for the executing environment.
+
+    PASS credit is reusable only while this coordinate is unchanged, so a
+    Python interpreter or version change conservatively invalidates prior
+    PASS instead of trusting it.
+    """
+
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    return {
+        "python": {
+            "executable": os.path.normcase(os.path.normpath(sys.executable)),
+            "version": version,
+        }
+    }
+
+
+def _runner_matches(value: object) -> bool:
+    """True only when a credit's runner coordinate equals the current one."""
+
+    if not isinstance(value, Mapping):
+        return False
+    python = value.get("python")
+    if not isinstance(python, Mapping):
+        return False
+    current = runner_coordinate()["python"]
+    return (
+        python.get("executable") == current["executable"]
+        and python.get("version") == current["version"]
+    )
+
+
 def credit_record(
     check: str | CheckSpec,
     root: str | Path,
@@ -957,6 +989,7 @@ def credit_record(
         "output_contract": spec.output_contract,
         "dependency_fingerprint": dependency_fingerprint(spec, root),
         "source": identity.to_record(),
+        "runner": runner_coordinate(),
         "observed_utc": observed_utc
         or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
@@ -1116,7 +1149,8 @@ def merge_checkpoint_results(
     The selection is the exact registry-reconciled decision that produced the
     run; PASS credit is preserved only from that decision, and every non-PASS
     unit is recorded as a disposition with a reason.  Identity, source,
-    registry, or environment uncertainty never becomes PASS here.
+    registry, or environment uncertainty never becomes PASS here and never
+    preserves an earlier PASS as trusted.
     """
 
     if selection.get("schema") != SELECTION_SCHEMA:
@@ -1193,6 +1227,7 @@ def merge_checkpoint_results(
                     "schema": CREDIT_SCHEMA,
                     "status": "PASS",
                     "outcome": "PASS",
+                    "runner": runner_coordinate(),
                 }
             )
         else:
@@ -1228,6 +1263,15 @@ def merge_checkpoint_results(
         preserved_ids.add(stable_id)
         preserved.append(dict(item))
 
+    # Identity, source, registry, or environment uncertainty never
+    # preserves an earlier PASS as trusted: any UNRESOLVED or SKIP unit
+    # means the run ended in uncertainty, so no preserved credit is
+    # carried forward.
+    identity_uncertain = any(
+        item.get("status") in {"UNRESOLVED", "SKIP"} for item in results
+    )
+    if identity_uncertain:
+        preserved = []
     result_ids = set(seen)
     kept_dispositions: list[dict[str, Any]] = []
     for item in _disposition_items(input_checkpoint):
@@ -1330,6 +1374,10 @@ def _valid_credit_shape(credit: Mapping[str, Any]) -> bool:
         and isinstance(credit.get("output_contract"), str)
         and isinstance(credit.get("dependency_fingerprint"), str)
         and bool(_SHA256.fullmatch(credit["dependency_fingerprint"]))
+        and isinstance(credit.get("runner"), Mapping)
+        and isinstance(credit["runner"].get("python"), Mapping)
+        and isinstance(credit["runner"]["python"].get("executable"), str)
+        and isinstance(credit["runner"]["python"].get("version"), str)
     )
 
 
@@ -1503,6 +1551,8 @@ def select_checks(
             and disposition is None
             and _valid_credit_shape(credit)
             and _source_matches(credit.get("source"), source, Path(source.source_root))
+            and _runner_matches(credit.get("runner"))
+            and not spec.external_requirements
             and credit.get("tier") == spec.tier
             and credit.get("command") == list(spec.command)
             and credit.get("output_contract") == spec.output_contract
@@ -1604,7 +1654,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 first_unresolved_unit=merged["first_unresolved_unit"],
             )
             return 0
-        checkpoint_value = _load_json(args.credit_file) if args.credit_file else None
+        checkpoint_value = None
+        if args.credit_file is not None:
+            credit_path = Path(args.credit_file)
+            if credit_path.exists() and not credit_path.is_file():
+                raise SelectionError(
+                    f"credit file path exists but is not a file: {credit_path}"
+                )
+            if credit_path.is_file():
+                checkpoint_value = _load_json(credit_path)
+            # A nonexistent -CreditFile path is an empty cold input; the
+            # checkpoint becomes the output on the first truthful persist.
         decision = select_checks(
             args.intent,
             args.root,
@@ -1653,6 +1713,7 @@ __all__ = [
     "main",
     "read_source_identity",
     "registry",
+    "runner_coordinate",
     "registry_record",
     "resolve_input_scope",
     "select_checks",

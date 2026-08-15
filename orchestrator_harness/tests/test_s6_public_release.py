@@ -987,6 +987,162 @@ class S6SelectorTests(unittest.TestCase):
                 selector_credit["stable_id"],
                 selection["preserved_credit_records"][0]["stable_id"],
             )
+    def test_runner_change_invalidates_pass_credit(self) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = self._custom_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                credit = release_checks.credit_record(specs[0], repository.root)
+                changed = dict(credit)
+                changed["runner"] = {
+                    "python": {
+                        "executable": "C:/fake/python.exe",
+                        "version": "3.99.0",
+                    }
+                }
+                decision = release_checks.select_checks(
+                    "affected", repository.root, credits=[changed]
+                )
+                # A changed runner coordinate must invalidate the PASS
+                # credit and re-select the unit conservatively.
+                self.assertEqual((), decision.preserved_credit_ids)
+                self.assertIn(specs[0].stable_id, decision.selected_ids)
+                self.assertIn(specs[0].stable_id, decision.invalidated_credit_ids)
+                # A legacy credit without any runner coordinate is also
+                # never trusted: it cannot be bound to the actual runner.
+                legacy = {key: value for key, value in credit.items() if key != "runner"}
+                legacy_decision = release_checks.select_checks(
+                    "affected", repository.root, credits=[legacy]
+                )
+                self.assertEqual((), legacy_decision.preserved_credit_ids)
+                self.assertIn(specs[0].stable_id, legacy_decision.selected_ids)
+        finally:
+            temporary.cleanup()
+
+    def test_external_requirements_check_never_reuses_pass(self) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = (
+                release_checks.CheckSpec(
+                    "TEST.EXTERNAL",
+                    "external tool check",
+                    "affected",
+                    ("python", "-c", "pass"),
+                    ("domain-external",),
+                    ("tracked.txt",),
+                    external_requirements=("external tool",),
+                ),
+            )
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                credit = release_checks.credit_record(specs[0], repository.root)
+                self.assertIn("runner", credit)
+                decision = release_checks.select_checks(
+                    "affected", repository.root, credits=[credit]
+                )
+                # No explicit unchanged external coordinate surface exists,
+                # so a check with external requirements is conservatively
+                # re-selected even with a valid runner-bound credit.
+                self.assertEqual((), decision.preserved_credit_ids)
+                self.assertIn(specs[0].stable_id, decision.selected_ids)
+        finally:
+            temporary.cleanup()
+
+    def test_cold_missing_credit_file_and_malformed_existing_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-cold-credit-"
+        ) as raw:
+            missing = Path(raw) / "checkpoint.json"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "orchestrator_harness.release_checks",
+                    "select",
+                    "--intent",
+                    "affected",
+                    "--root",
+                    str(REPOSITORY_ROOT),
+                    "--credit-file",
+                    str(missing),
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            # A nonexistent -CreditFile path is an empty cold input and
+            # must not fail selection.
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            selection = json.loads(completed.stdout)
+            self.assertEqual([], selection["preserved_credit_ids"])
+            self.assertTrue(selection["selected"])
+            # An existing malformed checkpoint still fails closed.
+            malformed = Path(raw) / "bad.json"
+            malformed.write_text("{not json", encoding="utf-8")
+            completed_bad = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "orchestrator_harness.release_checks",
+                    "select",
+                    "--intent",
+                    "affected",
+                    "--root",
+                    str(REPOSITORY_ROOT),
+                    "--credit-file",
+                    str(malformed),
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(2, completed_bad.returncode)
+            self.assertIn("cannot read JSON file", completed_bad.stderr)
+
+    def test_merge_binds_runner_and_drops_preserved_on_uncertainty(self) -> None:
+        temporary, repository = self._four_repository()
+        try:
+            specs = self._four_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                credit_a = release_checks.credit_record(specs[0], repository.root)
+                decision = release_checks.select_checks(
+                    "affected", repository.root, credits=[credit_a]
+                )
+                self.assertEqual(("TEST.B", "TEST.C", "TEST.D"), decision.selected_ids)
+                # A merged PASS record carries the actual runner coordinate
+                # so the next selection can bind and reuse it.
+                merged_ok = release_checks.merge_checkpoint_results(
+                    decision.to_record(),
+                    [{"stable_id": "TEST.B", "status": "PASS"}],
+                    None,
+                )
+                merged_credits = {
+                    item["stable_id"]: item for item in merged_ok["credits"]
+                }
+                self.assertIn("TEST.A", merged_credits)
+                self.assertEqual(
+                    release_checks.runner_coordinate(),
+                    merged_credits["TEST.B"]["runner"],
+                )
+                # Identity uncertainty drops every preserved credit and
+                # records a non-null first unresolved unit.
+                merged_bad = release_checks.merge_checkpoint_results(
+                    decision.to_record(),
+                    [
+                        {
+                            "stable_id": "TEST.B",
+                            "status": "UNRESOLVED",
+                            "reason": "candidate identity uncertainty",
+                        }
+                    ],
+                    None,
+                )
+                self.assertEqual([], merged_bad["credits"])
+                self.assertEqual("TEST.B", merged_bad["first_unresolved_unit"])
+        finally:
+            temporary.cleanup()
+
 
     def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(
         self,
