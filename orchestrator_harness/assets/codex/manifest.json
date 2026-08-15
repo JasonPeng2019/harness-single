@@ -6,7 +6,7 @@
       "content_mode": "utf8-lf",
       "destination": ".codex/hooks/orchestrator_harness_post_tool_use.py",
       "resource": "orchestrator_harness_post_tool_use.py",
-      "sha256": "1cf1592c1829fb953e927b5dd6727f946e3239be59838028ede04fe2ef335a71"
+      "sha256": "d2ac4cd87cbab1c4000746a99ba142c2e55b6aa4794ffc7a7cae8b6ad659c667"
     },
     {
       "content_mode": "utf8-lf",
