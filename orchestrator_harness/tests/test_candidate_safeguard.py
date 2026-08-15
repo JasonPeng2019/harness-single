@@ -123,9 +123,7 @@ class CandidateSafeguardCheckpointCoreTests(unittest.TestCase):
     ]:
         temporary = tempfile.TemporaryDirectory(prefix="orchestrator-csg-checkpoint-")
         root = Path(temporary.name) / "candidate"
-        repository = TemporaryGitRepository.create(
-            root, branch="firmware/v2-candidate"
-        )
+        repository = TemporaryGitRepository.create(root, branch="firmware/v2-candidate")
         baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
         baseline.parent.mkdir(parents=True)
         baseline.write_text("{}\n", encoding="utf-8")
@@ -183,7 +181,7 @@ $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -Expect
     -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
     -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
     -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}'
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / "summary.json"}' -Encoding UTF8
 if ($summary.incomplete) {{
     exit 17
 }}
@@ -263,9 +261,7 @@ exit 0
                 [],
             )
             selection_path = Path(temporary.name) / "selection.json"
-            selection_path.write_text(
-                json.dumps(selection), encoding="utf-8"
-            )
+            selection_path.write_text(json.dumps(selection), encoding="utf-8")
             checkpoint_path = Path(temporary.name) / "checkpoint.json"
             results_path = Path(temporary.name) / "results.json"
             module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
@@ -283,7 +279,7 @@ $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -Expect
     -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
     -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
     -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / "summary.json"}' -Encoding UTF8
 if ($summary.incomplete) {{
     exit 17
 }}
@@ -317,9 +313,7 @@ exit 0
             self.assertEqual(1, summary["unresolved"])
             self.assertEqual(1, summary["skipped"])
             self.assertEqual("TEST.FIRST", summary["first_unresolved_unit"])
-            checkpoint = json.loads(
-                checkpoint_path.read_text(encoding="utf-8-sig")
-            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
             self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
             self.assertEqual([], checkpoint["credits"])
             by_id = {item["stable_id"]: item for item in checkpoint["dispositions"]}
@@ -381,9 +375,7 @@ exit 0
                 [credit_a],
             )
             selection_path = Path(temporary.name) / "selection.json"
-            selection_path.write_text(
-                json.dumps(selection), encoding="utf-8"
-            )
+            selection_path.write_text(json.dumps(selection), encoding="utf-8")
             checkpoint_path = Path(temporary.name) / "checkpoint.json"
             checkpoint_path.write_text(
                 json.dumps({"credits": [credit_a], "dispositions": []}),
@@ -404,7 +396,7 @@ $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -Expect
     -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
     -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
     -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / "summary.json"}' -Encoding UTF8
 if ($summary.incomplete) {{
     exit 17
 }}
@@ -431,13 +423,9 @@ exit 0
                 0, completed.returncode, completed.stdout + completed.stderr
             )
             self.assertIn("PROBE-OK", completed.stdout)
-            checkpoint = json.loads(
-                checkpoint_path.read_text(encoding="utf-8-sig")
-            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
             self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
-            credits_by_id = {
-                item["stable_id"]: item for item in checkpoint["credits"]
-            }
+            credits_by_id = {item["stable_id"]: item for item in checkpoint["credits"]}
             self.assertIn("TEST.PRESERVED", credits_by_id)
             self.assertEqual("PASS", credits_by_id["TEST.PRESERVED"]["status"])
             self.assertIn("TEST.NEW", credits_by_id)
@@ -510,7 +498,7 @@ $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -Expect
     -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
     -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
     -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / "summary.json"}' -Encoding UTF8
 if ($summary.incomplete) {{
     exit 17
 }}
@@ -698,14 +686,24 @@ exit 0
                     {
                         "stable_id": "TEST.PASSED",
                         "tier": "affected",
-                        "command": ["powershell", "-NoProfile", "-File", "first-pass.ps1"],
+                        "command": [
+                            "powershell",
+                            "-NoProfile",
+                            "-File",
+                            "first-pass.ps1",
+                        ],
                         "output_contract": "orchestrator-check-credit/v1",
                         "dependency_fingerprint": "0" * 64,
                     },
                     {
                         "stable_id": "TEST.FAILING",
                         "tier": "affected",
-                        "command": ["powershell", "-NoProfile", "-File", "fail-dirty.ps1"],
+                        "command": [
+                            "powershell",
+                            "-NoProfile",
+                            "-File",
+                            "fail-dirty.ps1",
+                        ],
                         "output_contract": "orchestrator-check-credit/v1",
                         "dependency_fingerprint": "1" * 64,
                     },
@@ -743,7 +741,7 @@ $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -Expect
     -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
     -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
     -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / "summary.json"}' -Encoding UTF8
 if ($summary.incomplete) {{
     exit 17
 }}
@@ -773,17 +771,13 @@ exit 0
             summary = json.loads(
                 (Path(temporary.name) / "summary.json").read_text(encoding="utf-8-sig")
             )
-            self.assertTrue(
-                (Path(temporary.name) / "first-pass-ran.txt").is_file()
-            )
+            self.assertTrue((Path(temporary.name) / "first-pass-ran.txt").is_file())
             self.assertEqual(3, summary["total"])
             self.assertEqual(0, summary["passed"])
             self.assertEqual(2, summary["unresolved"])
             self.assertEqual(1, summary["skipped"])
             self.assertEqual("TEST.PASSED", summary["first_unresolved_unit"])
-            checkpoint = json.loads(
-                checkpoint_path.read_text(encoding="utf-8-sig")
-            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
             self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
             # Identity uncertainty after the ordinary failure must never
             # preserve an earlier current-run PASS as trusted: the first
@@ -793,9 +787,7 @@ exit 0
             by_id = {item["stable_id"]: item for item in checkpoint["dispositions"]}
             self.assertEqual("UNRESOLVED", by_id["TEST.PASSED"]["status"])
             self.assertIn("identity", by_id["TEST.PASSED"]["reason"].lower())
-            self.assertIn(
-                "invalidates this run's PASS", by_id["TEST.PASSED"]["reason"]
-            )
+            self.assertIn("invalidates this run's PASS", by_id["TEST.PASSED"]["reason"])
             self.assertEqual("UNRESOLVED", by_id["TEST.FAILING"]["status"])
             self.assertIn(
                 "ordinary nonzero exit code 3", by_id["TEST.FAILING"]["reason"]

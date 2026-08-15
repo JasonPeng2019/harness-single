@@ -1274,6 +1274,7 @@ def merge_checkpoint_results(
                 }
             )
         else:
+            assert isinstance(reason, str)
             record.update(
                 {
                     "schema": DISPOSITION_SCHEMA,
@@ -1601,7 +1602,7 @@ def select_checks(
             and credit.get("dependency_fingerprint") == fingerprints[spec.stable_id]
             and not changed_dependency
         )
-        if is_valid:
+        if is_valid and credit is not None:
             preserved.append(spec.stable_id)
             preserved_records.append(dict(credit))
         elif credit is not None:
