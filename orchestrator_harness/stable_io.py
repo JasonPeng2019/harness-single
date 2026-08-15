@@ -116,9 +116,6 @@ class PathKeyedAppendLock:
             ensure_directory_path(self.lock_path.parent)
             anchored = open_append_file(self.lock_path.parent, self.lock_path.name)
             handle = anchored.handle
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
             handle.seek(0)
             if os.name == "nt":
                 import msvcrt
