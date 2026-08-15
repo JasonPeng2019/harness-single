@@ -135,12 +135,12 @@ class PathKeyedAppendLock:
         except Exception as exc:
             try:
                 if anchored is not None:
-                    if os.name == "nt" and self._windows_locked:
+                    if os.name == "nt" and self._windows_locked and handle is not None:
                         try:
                             import msvcrt
 
-                            anchored.handle.seek(0)
-                            msvcrt.locking(anchored.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                         except Exception:
                             pass
                     anchored.close()
