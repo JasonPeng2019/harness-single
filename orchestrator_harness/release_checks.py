@@ -17,13 +17,14 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from .stable_io import PreparedOutputTransaction
 
 REGISTRY_SCHEMA = "orchestrator-release-check-registry/v1"
 SELECTION_SCHEMA = "orchestrator-check-selection/v1"
@@ -991,7 +992,13 @@ def _runner_matches(value: object, command: Sequence[str]) -> bool:
         return False
     current = runner_coordinate()
     for key in _command_runner_keys(command):
-        recorded = value.get(key)
+        # Every command-consumed component must be present in the stored
+        # mapping before values are compared: an omitted key is unknown and
+        # invalidates PASS, while a present null remains a truthful explicit
+        # missing-tool coordinate.
+        if key not in value:
+            return False
+        recorded = value[key]
         wanted = current.get(key)
         if key == "python":
             if (
@@ -1125,9 +1132,7 @@ def checkpoint_record(
             f"checkpoint must not hold both credit and disposition for: {sorted(overlap)}"
         )
     if first_unresolved_unit is not None:
-        normalized_first = _nonempty(
-            first_unresolved_unit, "first_unresolved_unit"
-        )
+        normalized_first = _nonempty(first_unresolved_unit, "first_unresolved_unit")
         if normalized_first not in disposition_ids:
             raise SelectionError(
                 "first_unresolved_unit must name a recorded disposition unit"
@@ -1149,33 +1154,29 @@ def write_checkpoint(
     dispositions: Iterable[Mapping[str, Any]],
     first_unresolved_unit: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically persist a checkpoint artifact next to the caller's path."""
+    """Atomically persist a checkpoint artifact through the stable-I/O seam.
+
+    The checkpoint is published with the repository's hardened
+    PreparedOutputTransaction: the target parent is prepared, the exact
+    target is admitted, and atomic_json performs the identity-bound
+    replace.  Path-safety and mutation-conflict failures surface instead of
+    being bypassed, and a missing parent or file is a cold creation.
+    """
 
     target = Path(path).expanduser()
     if target.is_dir():
         raise SelectionError("checkpoint path must be a file, not a directory")
-    target.parent.mkdir(parents=True, exist_ok=True)
     record = checkpoint_record(
         credits=credits,
         dispositions=dispositions,
         first_unresolved_unit=first_unresolved_unit,
     )
-    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            dir=target.parent,
-            prefix=target.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-        os.replace(temporary, target)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink(missing_ok=True)
+    transaction = PreparedOutputTransaction(
+        target.parent, allowed_roots=(target.parent.parent,)
+    )
+    transaction.prepare()
+    transaction.admit(target)
+    transaction.atomic_json(target, record)
     return record
 
 
@@ -1223,7 +1224,9 @@ def merge_checkpoint_results(
         stable_id = item.get("stable_id")
         status = item.get("status")
         if not isinstance(stable_id, str) or stable_id not in selected_by_id:
-            raise SelectionError(f"checkpoint result is not a selected unit: {stable_id}")
+            raise SelectionError(
+                f"checkpoint result is not a selected unit: {stable_id}"
+            )
         if stable_id in seen:
             raise SelectionError(
                 f"checkpoint results contain a duplicate stable ID: {stable_id}"
@@ -1257,9 +1260,9 @@ def merge_checkpoint_results(
             "output_contract": selected.get("output_contract"),
             "dependency_fingerprint": fingerprint,
             "source": dict(source),
-            "observed_utc": datetime.now(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            ),
+            "observed_utc": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
         }
         if status == "PASS":
             record.update(
@@ -1333,8 +1336,7 @@ def merge_checkpoint_results(
     if first_unresolved is None and isinstance(input_checkpoint, Mapping):
         prior_first = input_checkpoint.get("first_unresolved_unit")
         if isinstance(prior_first, str) and any(
-            item.get("stable_id") == prior_first
-            and item.get("status") == "UNRESOLVED"
+            item.get("stable_id") == prior_first and item.get("status") == "UNRESOLVED"
             for item in kept_dispositions
         ):
             first_unresolved = prior_first

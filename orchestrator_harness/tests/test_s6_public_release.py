@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 from examples.disposable_coding_fixture import run_fixture
 from orchestrator_harness import release_checks
+from orchestrator_harness.stable_io import PathSafetyError
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.models import ProcessInfo, ProcessQuery, iso_utc
 from orchestrator_harness.processes import process_snapshot
@@ -731,9 +732,7 @@ class S6SelectorTests(unittest.TestCase):
         try:
             specs = self._custom_specs()
             with patch.object(release_checks, "CHECK_REGISTRY", specs):
-                pass_credit = release_checks.credit_record(
-                    specs[1], repository.root
-                )
+                pass_credit = release_checks.credit_record(specs[1], repository.root)
                 failed = release_checks.disposition_record(
                     specs[2],
                     repository.root,
@@ -763,9 +762,7 @@ class S6SelectorTests(unittest.TestCase):
                 ("prior-unresolved", "prior-failed"),
                 tuple(item.reason for item in decision.selected),
             )
-            self.assertEqual(
-                ("TEST.DECISIVE-LONG",), decision.preserved_credit_ids
-            )
+            self.assertEqual(("TEST.DECISIVE-LONG",), decision.preserved_credit_ids)
             self.assertEqual(1, len(decision.preserved_credit_records))
             self.assertEqual(
                 pass_credit["stable_id"],
@@ -812,9 +809,7 @@ class S6SelectorTests(unittest.TestCase):
                 ("stale-or-invalid-credit", "prior-failed"),
                 tuple(item.reason for item in decision.selected),
             )
-            self.assertEqual(
-                ("TEST.DECISIVE-SHORT",), decision.preserved_credit_ids
-            )
+            self.assertEqual(("TEST.DECISIVE-SHORT",), decision.preserved_credit_ids)
             self.assertIn("TEST.DECISIVE-LONG", decision.invalidated_credit_ids)
         finally:
             temporary.cleanup()
@@ -826,9 +821,7 @@ class S6SelectorTests(unittest.TestCase):
         try:
             specs = self._custom_specs()
             with patch.object(release_checks, "CHECK_REGISTRY", specs):
-                pass_credit = release_checks.credit_record(
-                    specs[0], repository.root
-                )
+                pass_credit = release_checks.credit_record(specs[0], repository.root)
                 failed = release_checks.disposition_record(
                     specs[0],
                     repository.root,
@@ -878,9 +871,7 @@ class S6SelectorTests(unittest.TestCase):
                     credits=[credit_a],
                     dispositions=[disposition_d],
                 )
-                self.assertEqual(
-                    ("TEST.B", "TEST.C", "TEST.D"), decision.selected_ids
-                )
+                self.assertEqual(("TEST.B", "TEST.C", "TEST.D"), decision.selected_ids)
                 input_checkpoint = {
                     "credits": [credit_a],
                     "dispositions": [disposition_d],
@@ -888,8 +879,16 @@ class S6SelectorTests(unittest.TestCase):
                 merged = release_checks.merge_checkpoint_results(
                     decision.to_record(),
                     [
-                        {"stable_id": "TEST.B", "status": "FAIL", "reason": "ordinary nonzero exit code 7"},
-                        {"stable_id": "TEST.C", "status": "UNRESOLVED", "reason": "candidate identity uncertainty"},
+                        {
+                            "stable_id": "TEST.B",
+                            "status": "FAIL",
+                            "reason": "ordinary nonzero exit code 7",
+                        },
+                        {
+                            "stable_id": "TEST.C",
+                            "status": "UNRESOLVED",
+                            "reason": "candidate identity uncertainty",
+                        },
                     ],
                     input_checkpoint,
                 )
@@ -1000,6 +999,70 @@ class S6SelectorTests(unittest.TestCase):
                 selector_credit["stable_id"],
                 selection["preserved_credit_records"][0]["stable_id"],
             )
+
+    def test_checkpoint_writer_cold_creates_and_uses_stable_io(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-checkpoint-writer-"
+        ) as raw:
+            cold = Path(raw) / "nested" / "checkpoint.json"
+            record = release_checks.write_checkpoint(cold, credits=[], dispositions=[])
+            self.assertEqual(release_checks.CHECKPOINT_SCHEMA, record["schema"])
+            self.assertEqual([], record["credits"])
+            self.assertEqual([], record["dispositions"])
+            self.assertIsNone(record["first_unresolved_unit"])
+            # Cold creation: the missing parent was prepared and the file
+            # carries the exact public schema/JSON shape.
+            self.assertTrue(cold.is_file())
+            self.assertEqual(
+                (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                cold.read_bytes(),
+            )
+            # Publication routes through the hardened stable-I/O transaction:
+            # the parent is prepared, the exact target is admitted, and the
+            # payload is published with atomic_json.
+            real_transaction = release_checks.PreparedOutputTransaction
+            calls: list[object] = []
+
+            class RecordingTransaction(real_transaction):
+                def prepare(self) -> None:
+                    calls.append("prepare")
+                    super().prepare()
+
+                def admit(self, target: Path | str) -> Path:
+                    calls.append(("admit", Path(target)))
+                    return super().admit(target)
+
+                def atomic_json(self, path: Path, value: object) -> None:
+                    calls.append(("atomic_json", Path(path)))
+                    super().atomic_json(path, value)
+
+            routed = Path(raw) / "routed" / "checkpoint.json"
+            with patch.object(
+                release_checks, "PreparedOutputTransaction", RecordingTransaction
+            ):
+                release_checks.write_checkpoint(routed, credits=[], dispositions=[])
+            self.assertIn("prepare", calls)
+            self.assertIn(("admit", routed), calls)
+            self.assertIn(("atomic_json", routed), calls)
+            self.assertTrue(routed.is_file())
+            # Path-safety and mutation-conflict failures surface instead of
+            # being bypassed.
+            with self.assertRaises(PathSafetyError):
+                release_checks.write_checkpoint(
+                    Path(raw) / "checkpoint.txt:stream", credits=[], dispositions=[]
+                )
+            with patch.object(
+                release_checks.PreparedOutputTransaction,
+                "atomic_json",
+                side_effect=PathSafetyError("injected mutation conflict"),
+            ):
+                with self.assertRaises(PathSafetyError):
+                    release_checks.write_checkpoint(
+                        Path(raw) / "conflict.json", credits=[], dispositions=[]
+                    )
+            with self.assertRaises(release_checks.SelectionError):
+                release_checks.write_checkpoint(Path(raw), credits=[], dispositions=[])
+
     def test_runner_change_invalidates_pass_credit(self) -> None:
         temporary, repository = self._repository()
         try:
@@ -1023,7 +1086,9 @@ class S6SelectorTests(unittest.TestCase):
                 self.assertIn(specs[0].stable_id, decision.invalidated_credit_ids)
                 # A legacy credit without any runner coordinate is also
                 # never trusted: it cannot be bound to the actual runner.
-                legacy = {key: value for key, value in credit.items() if key != "runner"}
+                legacy = {
+                    key: value for key, value in credit.items() if key != "runner"
+                }
                 legacy_decision = release_checks.select_checks(
                     "affected", repository.root, credits=[legacy]
                 )
@@ -1088,9 +1153,7 @@ class S6SelectorTests(unittest.TestCase):
                         repository.root,
                         credits=[changed_ruff, unit_credit],
                     )
-                    self.assertEqual(
-                        ("TEST.UNIT",), tool_changed.preserved_credit_ids
-                    )
+                    self.assertEqual(("TEST.UNIT",), tool_changed.preserved_credit_ids)
                     self.assertIn("TEST.RUFF", tool_changed.invalidated_credit_ids)
                     self.assertIn("TEST.RUFF", tool_changed.selected_ids)
                     changed_based = dict(ruff_credit)
@@ -1104,6 +1167,78 @@ class S6SelectorTests(unittest.TestCase):
                     self.assertEqual(
                         ("TEST.RUFF", "TEST.UNIT"), based_changed.preserved_credit_ids
                     )
+                    # An omitted command-consumed key is unknown and must
+                    # invalidate PASS, while a present null is a truthful
+                    # explicit missing-tool coordinate that still matches.
+                    with patch.object(
+                        release_checks,
+                        "runner_coordinate",
+                        return_value={
+                            "python": {
+                                "executable": os.path.normcase(
+                                    os.path.normpath(sys.executable)
+                                ),
+                                "version": ".".join(
+                                    str(part) for part in sys.version_info[:3]
+                                ),
+                            },
+                            "ruff": None,
+                            "basedpyright": None,
+                        },
+                    ):
+                        null_ruff = release_checks.credit_record(
+                            tool_specs[0], repository.root
+                        )
+                        null_based = release_checks.credit_record(
+                            tool_specs[1], repository.root
+                        )
+                        null_unit = release_checks.credit_record(
+                            tool_specs[2], repository.root
+                        )
+                        explicit_null = release_checks.select_checks(
+                            "affected",
+                            repository.root,
+                            credits=[null_ruff, null_based, null_unit],
+                        )
+                        self.assertEqual(
+                            ("TEST.BASEDPYRIGHT", "TEST.RUFF", "TEST.UNIT"),
+                            explicit_null.preserved_credit_ids,
+                        )
+                        omitted_ruff = dict(null_ruff)
+                        omitted_ruff["runner"] = {
+                            key: value
+                            for key, value in null_ruff["runner"].items()
+                            if key != "ruff"
+                        }
+                        omitted = release_checks.select_checks(
+                            "affected",
+                            repository.root,
+                            credits=[omitted_ruff, null_based, null_unit],
+                        )
+                        self.assertEqual(
+                            ("TEST.BASEDPYRIGHT", "TEST.UNIT"),
+                            omitted.preserved_credit_ids,
+                        )
+                        self.assertIn("TEST.RUFF", omitted.invalidated_credit_ids)
+                        self.assertIn("TEST.RUFF", omitted.selected_ids)
+                        omitted_based = dict(null_based)
+                        omitted_based["runner"] = {
+                            key: value
+                            for key, value in null_based["runner"].items()
+                            if key != "basedpyright"
+                        }
+                        omitted_based_only = release_checks.select_checks(
+                            "affected",
+                            repository.root,
+                            credits=[omitted_based, null_unit],
+                        )
+                        self.assertEqual(
+                            ("TEST.UNIT",), omitted_based_only.preserved_credit_ids
+                        )
+                        self.assertIn(
+                            "TEST.BASEDPYRIGHT",
+                            omitted_based_only.invalidated_credit_ids,
+                        )
         finally:
             temporary.cleanup()
 
@@ -1136,9 +1271,7 @@ class S6SelectorTests(unittest.TestCase):
             temporary.cleanup()
 
     def test_cold_missing_credit_file_and_malformed_existing_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="orchestrator-s6-cold-credit-"
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix="orchestrator-s6-cold-credit-") as raw:
             missing = Path(raw) / "checkpoint.json"
             completed = subprocess.run(
                 [
@@ -1160,7 +1293,9 @@ class S6SelectorTests(unittest.TestCase):
             )
             # A nonexistent -CreditFile path is an empty cold input and
             # must not fail selection.
-            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
             selection = json.loads(completed.stdout)
             self.assertEqual([], selection["preserved_credit_ids"])
             self.assertTrue(selection["selected"])
@@ -1230,7 +1365,6 @@ class S6SelectorTests(unittest.TestCase):
                 self.assertEqual("TEST.B", merged_bad["first_unresolved_unit"])
         finally:
             temporary.cleanup()
-
 
     def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(
         self,
