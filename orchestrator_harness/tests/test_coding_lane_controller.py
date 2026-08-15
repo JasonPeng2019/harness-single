@@ -218,7 +218,17 @@ class CodingLaneControllerTests(unittest.TestCase):
             "controller-admitted-canonical-coordinate", record["authority"]
         )
         self.assertTrue(record["lifecycle"]["complete"])
-        self.assertEqual([], record["identities"]["helpers"])
+        self.assertTrue(record["lifecycle"]["helpers_complete"])
+        helpers = record["identities"]["helpers"]
+        self.assertEqual(len({item["pid"] for item in helpers}), len(helpers))
+        self.assertTrue(
+            all(
+                item["pid"] > 0 and item["created_utc"] and item["name"]
+                for item in helpers
+            )
+        )
+        self.assertTrue(record["boundary"]["complete"])
+        self.assertEqual([], record["boundary"]["live_members"])
         self.assertEqual("worker-1", record["run"]["worker_invocation_id"])
         self.assertEqual(
             str(self.run_root.resolve()), record["repository"]["worktree_root"]

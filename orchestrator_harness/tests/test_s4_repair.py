@@ -169,6 +169,7 @@ class S4RepairRegressionTests(unittest.TestCase):
         state: str = "PROVIDER_EXITED",
         worktree: Path | None = None,
         expected_code: int = 0,
+        helper_pids_path: Path | None = None,
     ) -> Path:
         """Create lifecycle authority through the real controller path."""
 
@@ -193,11 +194,23 @@ class S4RepairRegressionTests(unittest.TestCase):
         prompt.write_text("synthetic production lifecycle prompt\n", encoding="utf-8")
         fake = root / f"fake-provider-{lane_id.replace(':', '-')}.py"
         helper_count = len(helpers or [])
+        pids_path = (
+            helper_pids_path
+            if helper_pids_path is not None
+            else root / f"helper-pids-{lane_id.replace(':', '-')}.json"
+        )
+        pids_line = ""
+        if helper_count:
+            pids_line = (
+                f"open({str(pids_path)!r},'w',encoding='utf-8')"
+                ".write(json.dumps([helper.pid for helper in helpers]))\n"
+            )
         fake.write_text(
             "import json,sys,subprocess,time\n"
             "sys.stdin.read()\n"
             f"helpers=[subprocess.Popen([sys.executable,'-c','import time; time.sleep(2.0)']) for _ in range({helper_count})]\n"
-            "print(json.dumps({'type':'thread.started','thread_id':'synthetic-lifecycle-thread'}), flush=True)\n"
+            + pids_line
+            + "print(json.dumps({'type':'thread.started','thread_id':'synthetic-lifecycle-thread'}), flush=True)\n"
             "time.sleep(2.5)\n"
             "[helper.wait() for helper in helpers]\n"
             "print(json.dumps({'type':'turn.completed'}), flush=True)\n",
@@ -832,6 +845,8 @@ class S4RepairRegressionTests(unittest.TestCase):
             many = root / "many"
             self._git(main, "worktree", "add", "-b", "one-lane", str(one), "HEAD")
             self._git(main, "worktree", "add", "-b", "many-lane", str(many), "HEAD")
+            one_pids = root / "helper-pids-one.json"
+            many_pids = root / "helper-pids-many.json"
             one_path = self._lifecycle_record(
                 root,
                 one,
@@ -840,6 +855,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                 retained_ref="refs/heads/main",
                 target_revision=revision,
                 helpers=[{"name": "synthetic-one"}],
+                helper_pids_path=one_pids,
             )
             many_path = self._lifecycle_record(
                 root,
@@ -849,15 +865,33 @@ class S4RepairRegressionTests(unittest.TestCase):
                 retained_ref="refs/heads/main",
                 target_revision=revision,
                 helpers=[{"name": "synthetic-one"}, {"name": "synthetic-two"}],
+                helper_pids_path=many_pids,
             )
             one_record = json.loads(one_path.read_text(encoding="utf-8"))
             many_record = json.loads(many_path.read_text(encoding="utf-8"))
-            self.assertEqual(1, len(one_record["identities"]["helpers"]))
-            self.assertEqual(2, len(many_record["identities"]["helpers"]))
-            self.assertTrue(
-                one_record["boundary"]["complete"]
-                and many_record["boundary"]["complete"]
-            )
+            for record, pids_path in (
+                (one_record, one_pids),
+                (many_record, many_pids),
+            ):
+                expected_pids = set(json.loads(pids_path.read_text(encoding="utf-8")))
+                recorded_helpers = record["identities"]["helpers"]
+                recorded_pids = {item["pid"] for item in recorded_helpers}
+                self.assertTrue(expected_pids.issubset(recorded_pids))
+                self.assertEqual(len(recorded_pids), len(recorded_helpers))
+                self.assertTrue(
+                    all(
+                        item["pid"] > 0 and item["created_utc"] and item["name"]
+                        for item in recorded_helpers
+                    )
+                )
+                self.assertTrue(record["lifecycle"]["complete"])
+                self.assertTrue(record["lifecycle"]["helpers_complete"])
+                self.assertTrue(record["boundary"]["complete"])
+                self.assertEqual([], record["boundary"]["live_members"])
+                self.assertEqual(
+                    "job-object+CIM" if os.name == "nt" else "/proc",
+                    record["boundary"]["inventory_source"],
+                )
             self._git(main, "worktree", "remove", str(one))
             self._git(main, "worktree", "remove", str(many))
             del lane
@@ -1841,6 +1875,7 @@ class S4RepairRegressionTests(unittest.TestCase):
             root = Path(raw)
             main, lane, revision = self._git_fixture(root)
             refs = self._archive_refs(root)
+            pids_path = root / "helper-pids-helpers.json"
             runtime = self._lifecycle_record(
                 root,
                 lane,
@@ -1864,20 +1899,28 @@ class S4RepairRegressionTests(unittest.TestCase):
                         },
                     },
                 ],
+                helper_pids_path=pids_path,
             )
             value = json.loads(
                 lifecycle_registry_path(lane, "helpers", "worker-helpers").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(2, len(value["identities"]["helpers"]))
+            expected_pids = set(json.loads(pids_path.read_text(encoding="utf-8")))
+            recorded_helpers = value["identities"]["helpers"]
+            recorded_pids = {item["pid"] for item in recorded_helpers}
+            self.assertTrue(expected_pids.issubset(recorded_pids))
+            self.assertEqual(len(recorded_pids), len(recorded_helpers))
             self.assertTrue(
                 all(
-                    item["pid"] > 0 and item["created_utc"]
-                    for item in value["identities"]["helpers"]
+                    item["pid"] > 0 and item["created_utc"] and item["name"]
+                    for item in recorded_helpers
                 )
             )
+            self.assertTrue(value["lifecycle"]["complete"])
+            self.assertTrue(value["lifecycle"]["helpers_complete"])
             self.assertTrue(value["boundary"]["complete"])
+            self.assertEqual([], value["boundary"]["live_members"])
             self.assertEqual(
                 "job-object+CIM" if os.name == "nt" else "/proc",
                 value["boundary"]["inventory_source"],
