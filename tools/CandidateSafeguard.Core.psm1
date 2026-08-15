@@ -53,6 +53,21 @@ function Assert-CandidateIdentity {
     }
 }
 
+function Add-HeldRemainder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Checks,
+        [Parameter(Mandatory)][int]$StartIndex,
+        [Parameter(Mandatory)][Collections.Generic.List[object]]$Results,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    for ($i = $StartIndex; $i -lt $Checks.Count; $i++) {
+        $heldId = [string]$Checks[$i].stable_id
+        $Results.Add([ordered]@{ stable_id = $heldId; status = 'SKIP'; reason = $Reason })
+    }
+}
+
 function Invoke-ReleaseChecks {
     [CmdletBinding()]
     param(
@@ -64,16 +79,21 @@ function Invoke-ReleaseChecks {
         [Parameter(Mandatory)][string]$Baseline,
         [Parameter(Mandatory)][string]$PyrightConfig,
         [Parameter(Mandatory)][string]$BaselineHash,
-        [Parameter(Mandatory)][string]$ConfigHash
+        [Parameter(Mandatory)][string]$ConfigHash,
+        [object]$Selection = $null,
+        [string]$CheckpointPath = '',
+        [string]$ResultsPath = ''
     )
 
-    $executedIds = [Collections.Generic.List[string]]::new()
+    $results = [Collections.Generic.List[object]]::new()
+    $firstUnresolved = $null
+    $index = 0
     foreach ($check in @($Checks)) {
         $stableId = [string]$check.stable_id
         if ([string]::IsNullOrWhiteSpace($stableId) -or $stableId -eq 'S6.RELEASE.ACCUMULATED-SAFEGUARD') {
             throw 'release safeguard received an invalid or recursive stable ID'
         }
-        if ($executedIds.Contains($stableId)) {
+        if (@($results | Where-Object { [string]$_.stable_id -eq $stableId }).Count -gt 0) {
             throw "release safeguard received a duplicate stable ID: $stableId"
         }
         $command = @($check.command)
@@ -88,9 +108,9 @@ function Invoke-ReleaseChecks {
         Push-Location $RepositoryRoot
         try {
             if ($program -eq 'python') {
-                & python @arguments
+                $checkOutput = & python @arguments 2>&1
             } elseif ($program -eq 'powershell') {
-                & powershell @arguments
+                $checkOutput = & powershell @arguments 2>&1
             } else {
                 throw "selected check uses an unsupported runner: $program"
             }
@@ -98,20 +118,130 @@ function Invoke-ReleaseChecks {
         } finally {
             Pop-Location
         }
-        if ($exitCode -ne 0) {
-            throw "candidate safeguard failed: $stableId"
+        if ($null -ne $checkOutput) {
+            # Keep the unit's diagnostic text visible without letting it
+            # leak into this function's success stream, which the caller
+            # captures as the pool summary.
+            Write-Host $checkOutput
         }
-        $executedIds.Add($stableId)
+        if ($exitCode -ne 0) {
+            # An ordinary nonzero check records FAIL and never cancels later
+            # independent runnable units.
+            $results.Add([ordered]@{
+                stable_id = $stableId
+                status = 'FAIL'
+                reason = "ordinary nonzero exit code $exitCode"
+            })
+            try {
+                Assert-CandidateIdentity -RepositoryRoot $RepositoryRoot -ExpectedHead $ExpectedHead `
+                    -ExpectedBranch $ExpectedBranch -ExpectedCommonDirectory $ExpectedCommonDirectory `
+                    -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
+            } catch {
+                # The failing unit left the repository untrustworthy, so the
+                # remaining units cannot truthfully run and are held.
+                Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `
+                    -Reason "candidate repository became untrustworthy after failing unit ${stableId}: $($_.Exception.Message)"
+                break
+            }
+            $index++
+            continue
+        }
+        try {
+            Assert-CandidateIdentity -RepositoryRoot $RepositoryRoot -ExpectedHead $ExpectedHead `
+                -ExpectedBranch $ExpectedBranch -ExpectedCommonDirectory $ExpectedCommonDirectory `
+                -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
+        } catch {
+            # Identity, source, registry, or environment uncertainty never
+            # becomes PASS: this unit is UNRESOLVED and every later unit is
+            # skipped with a recorded reason because it cannot truthfully run.
+            $results.Add([ordered]@{
+                stable_id = $stableId
+                status = 'UNRESOLVED'
+                reason = "candidate identity check failed after unit: $($_.Exception.Message)"
+            })
+            if ($null -eq $firstUnresolved) {
+                $firstUnresolved = $stableId
+            }
+            Add-HeldRemainder -Checks @($Checks) -StartIndex ($index + 1) -Results $results `
+                -Reason 'candidate identity uncertainty holds this unit; it was not run truthfully'
+            break
+        }
+        $results.Add([ordered]@{ stable_id = $stableId; status = 'PASS' })
+        $index++
+    }
+
+    try {
         Assert-CandidateIdentity -RepositoryRoot $RepositoryRoot -ExpectedHead $ExpectedHead `
             -ExpectedBranch $ExpectedBranch -ExpectedCommonDirectory $ExpectedCommonDirectory `
             -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
+    } catch {
+        # A final identity failure makes every recorded PASS untrustworthy.
+        foreach ($result in $results) {
+            if ($result.status -eq 'PASS') {
+                $result.status = 'UNRESOLVED'
+                $result.reason = 'candidate identity uncertainty at pool completion: ' + $_.Exception.Message
+            }
+        }
+        if ($null -eq $firstUnresolved) {
+            $firstUnresolvedResult = $results | Where-Object { $_.status -eq 'UNRESOLVED' } | Select-Object -First 1
+            if ($null -ne $firstUnresolvedResult) {
+                $firstUnresolved = [string]$firstUnresolvedResult.stable_id
+            }
+        }
     }
-    if ($executedIds.Count -ne @($Checks).Count -or @($executedIds | Select-Object -Unique).Count -ne $executedIds.Count) {
-        throw 'candidate safeguard did not execute each selected stable ID exactly once'
+
+    if ($results.Count -ne @($Checks).Count) {
+        throw 'candidate safeguard did not record each selected stable ID exactly once'
     }
-    Assert-CandidateIdentity -RepositoryRoot $RepositoryRoot -ExpectedHead $ExpectedHead `
-        -ExpectedBranch $ExpectedBranch -ExpectedCommonDirectory $ExpectedCommonDirectory `
-        -Baseline $Baseline -PyrightConfig $PyrightConfig -BaselineHash $BaselineHash -ConfigHash $ConfigHash
+    $recordedIds = @($results | ForEach-Object { [string]$_.stable_id })
+    $checkIds = @($Checks | ForEach-Object { [string]$_.stable_id })
+    if (@($recordedIds | Select-Object -Unique).Count -ne $recordedIds.Count -or
+        (@($recordedIds | Sort-Object) -join ',') -cne (@($checkIds | Sort-Object) -join ',')) {
+        throw 'candidate safeguard recorded a stable ID that was not selected or was recorded more than once'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($CheckpointPath) -and $null -ne $Selection -and
+        -not [string]::IsNullOrWhiteSpace($ResultsPath)) {
+        # Persist the current unit dispositions through the release-check
+        # checkpoint owner; the checkpoint file is the existing -CreditFile
+        # interface and is the only artifact written.
+        $resultsJson = '[' + (($results | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 8 }) -join ',') + ']'
+        [IO.File]::WriteAllText($ResultsPath, $resultsJson, [Text.UTF8Encoding]::new($false))
+        $selectionJson = $Selection | ConvertTo-Json -Depth 12
+        $selectionJsonPath = Join-Path (Split-Path -Parent $ResultsPath) ('safeguard-selection-' + [guid]::NewGuid().ToString('N') + '.json')
+        try {
+            [IO.File]::WriteAllText($selectionJsonPath, $selectionJson, [Text.UTF8Encoding]::new($false))
+            Push-Location $RepositoryRoot
+            try {
+                $mergeOutput = & python -m orchestrator_harness.release_checks checkpoint `
+                    --input $CheckpointPath --selection $selectionJsonPath `
+                    --results $ResultsPath --output $CheckpointPath 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "candidate checkpoint merge failed: $mergeOutput"
+                }
+            } finally {
+                Pop-Location
+            }
+        } finally {
+            if (Test-Path -LiteralPath $selectionJsonPath -PathType Leaf) {
+                Remove-Item -LiteralPath $selectionJsonPath -Force
+            }
+        }
+    }
+
+    $passed = @($results | Where-Object { $_.status -eq 'PASS' }).Count
+    $failed = @($results | Where-Object { $_.status -eq 'FAIL' }).Count
+    $unresolved = @($results | Where-Object { $_.status -eq 'UNRESOLVED' }).Count
+    $skipped = @($results | Where-Object { $_.status -eq 'SKIP' }).Count
+    return [pscustomobject]@{
+        total = $results.Count
+        passed = $passed
+        failed = $failed
+        unresolved = $unresolved
+        skipped = $skipped
+        first_unresolved_unit = $firstUnresolved
+        incomplete = ($failed + $unresolved + $skipped) -gt 0
+    }
 }
 
 Export-ModuleMember -Function Assert-CandidateIdentity, Invoke-ReleaseChecks

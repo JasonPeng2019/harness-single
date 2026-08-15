@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,14 @@ from typing import Any
 REGISTRY_SCHEMA = "orchestrator-release-check-registry/v1"
 SELECTION_SCHEMA = "orchestrator-check-selection/v1"
 CREDIT_SCHEMA = "orchestrator-check-credit/v1"
+CHECKPOINT_SCHEMA = "orchestrator-checkpoint/v1"
+DISPOSITION_SCHEMA = "orchestrator-check-disposition/v1"
+DISPOSITION_STATUSES = frozenset({"FAIL", "UNRESOLVED", "SKIP"})
+_DISPOSITION_REASONS = {
+    "FAIL": "prior-failed",
+    "UNRESOLVED": "prior-unresolved",
+    "SKIP": "prior-skipped",
+}
 REGISTRY_VERSION = 1
 RELEASE_AGGREGATE_ID = "S6.RELEASE.ACCUMULATED-SAFEGUARD"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -268,6 +277,7 @@ class SelectionDecision:
     source: SourceIdentity
     selected: tuple[SelectedCheck, ...]
     preserved_credit_ids: tuple[str, ...]
+    preserved_credit_records: tuple[dict[str, Any], ...]
     invalidated_credit_ids: tuple[str, ...]
     rejected_credit_ids: tuple[str, ...]
     registry_fingerprint: str
@@ -290,6 +300,9 @@ class SelectionDecision:
             "selected": [item.to_record() for item in self.selected],
             "selected_ids": list(self.selected_ids),
             "preserved_credit_ids": list(self.preserved_credit_ids),
+            "preserved_credit_records": [
+                dict(item) for item in self.preserved_credit_records
+            ],
             "invalidated_credit_ids": list(self.invalidated_credit_ids),
             "rejected_credit_ids": list(self.rejected_credit_ids),
             "producer_must_not_run": [RELEASE_AGGREGATE_ID],
@@ -956,6 +969,305 @@ def get_check(stable_id: str) -> CheckSpec:
     raise SelectionError(f"unknown stable check ID: {stable_id}")
 
 
+def disposition_record(
+    check: str | CheckSpec,
+    root: str | Path,
+    *,
+    status: str,
+    reason: str,
+    observed_utc: str | None = None,
+) -> dict[str, Any]:
+    """Create a truthful non-PASS disposition record for one coarse unit.
+
+    FAIL, UNRESOLVED, and SKIP are the only accepted statuses; PASS is owned
+    by ``credit_record``.  A disposition keeps the same exact source identity
+    and declared-input fingerprint as credit so a later invocation can hold
+    or re-run the unit conservatively.
+    """
+
+    spec = get_check(check) if isinstance(check, str) else check
+    normalized_status = _nonempty(status, "status").upper()
+    if normalized_status not in DISPOSITION_STATUSES:
+        raise SelectionError(
+            f"disposition status must be one of {sorted(DISPOSITION_STATUSES)}"
+        )
+    normalized_reason = _nonempty(reason, "reason")
+    identity = read_source_identity(root)
+    return {
+        "schema": DISPOSITION_SCHEMA,
+        "stable_id": spec.stable_id,
+        "status": normalized_status,
+        "tier": spec.tier,
+        "command": list(spec.command),
+        "output_contract": spec.output_contract,
+        "dependency_fingerprint": dependency_fingerprint(spec, root),
+        "source": identity.to_record(),
+        "reason": normalized_reason,
+        "observed_utc": observed_utc
+        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def checkpoint_record(
+    *,
+    credits: Iterable[Mapping[str, Any]],
+    dispositions: Iterable[Mapping[str, Any]],
+    first_unresolved_unit: str | None = None,
+) -> dict[str, Any]:
+    """Build one validated checkpoint artifact record.
+
+    The checkpoint is the existing ``-CreditFile`` interface: it holds only
+    selector-validated PASS credit plus truthful non-PASS dispositions.  A
+    unit can never hold both a PASS credit and a disposition.
+    """
+
+    credit_items = [dict(item) for item in credits]
+    disposition_items = [dict(item) for item in dispositions]
+    for item in credit_items:
+        if item.get("schema") != CREDIT_SCHEMA or item.get("status") != "PASS":
+            raise SelectionError("checkpoint credits must be PASS credit records")
+        if not isinstance(item.get("stable_id"), str) or not item["stable_id"]:
+            raise SelectionError("checkpoint credit has no stable ID")
+    for item in disposition_items:
+        if (
+            item.get("schema") != DISPOSITION_SCHEMA
+            or item.get("status") not in DISPOSITION_STATUSES
+        ):
+            raise SelectionError("checkpoint dispositions must carry a non-PASS status")
+        if not isinstance(item.get("stable_id"), str) or not item["stable_id"]:
+            raise SelectionError("checkpoint disposition has no stable ID")
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+            raise SelectionError(
+                f"checkpoint disposition must carry a reason: {item.get('stable_id')}"
+            )
+    credit_ids = [item["stable_id"] for item in credit_items]
+    disposition_ids = [item["stable_id"] for item in disposition_items]
+    if len(set(credit_ids)) != len(credit_ids):
+        raise SelectionError("checkpoint credits contain duplicate stable IDs")
+    if len(set(disposition_ids)) != len(disposition_ids):
+        raise SelectionError("checkpoint dispositions contain duplicate stable IDs")
+    overlap = set(credit_ids).intersection(disposition_ids)
+    if overlap:
+        raise SelectionError(
+            f"checkpoint must not hold both credit and disposition for: {sorted(overlap)}"
+        )
+    if first_unresolved_unit is not None:
+        normalized_first = _nonempty(
+            first_unresolved_unit, "first_unresolved_unit"
+        )
+        if normalized_first not in disposition_ids:
+            raise SelectionError(
+                "first_unresolved_unit must name a recorded disposition unit"
+            )
+    else:
+        normalized_first = None
+    return {
+        "schema": CHECKPOINT_SCHEMA,
+        "credits": credit_items,
+        "dispositions": disposition_items,
+        "first_unresolved_unit": normalized_first,
+    }
+
+
+def write_checkpoint(
+    path: str | Path,
+    *,
+    credits: Iterable[Mapping[str, Any]],
+    dispositions: Iterable[Mapping[str, Any]],
+    first_unresolved_unit: str | None = None,
+) -> dict[str, Any]:
+    """Atomically persist a checkpoint artifact next to the caller's path."""
+
+    target = Path(path).expanduser()
+    if target.is_dir():
+        raise SelectionError("checkpoint path must be a file, not a directory")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    record = checkpoint_record(
+        credits=credits,
+        dispositions=dispositions,
+        first_unresolved_unit=first_unresolved_unit,
+    )
+    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=target.parent,
+            prefix=target.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink(missing_ok=True)
+    return record
+
+
+def merge_checkpoint_results(
+    selection: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+    input_checkpoint: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge one complete run's truthful unit results into a checkpoint.
+
+    The selection is the exact registry-reconciled decision that produced the
+    run; PASS credit is preserved only from that decision, and every non-PASS
+    unit is recorded as a disposition with a reason.  Identity, source,
+    registry, or environment uncertainty never becomes PASS here.
+    """
+
+    if selection.get("schema") != SELECTION_SCHEMA:
+        raise SelectionError(
+            "checkpoint merge requires an orchestrator-check-selection/v1 decision"
+        )
+    source = selection.get("source")
+    if not isinstance(source, Mapping):
+        raise SelectionError("checkpoint selection is missing its source identity")
+    selected_by_id: dict[str, Mapping[str, Any]] = {}
+    for item in selection.get("selected", ()):
+        if not isinstance(item, Mapping):
+            raise SelectionError("checkpoint selection has a malformed selected record")
+        stable_id = item.get("stable_id")
+        if not isinstance(stable_id, str) or not stable_id:
+            raise SelectionError(
+                "checkpoint selection has a selected record without a stable ID"
+            )
+        if stable_id in selected_by_id:
+            raise SelectionError(
+                f"checkpoint selection has duplicate selected IDs: {stable_id}"
+            )
+        selected_by_id[stable_id] = item
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in results:
+        if not isinstance(item, Mapping):
+            raise SelectionError("checkpoint results must be objects")
+        stable_id = item.get("stable_id")
+        status = item.get("status")
+        if not isinstance(stable_id, str) or stable_id not in selected_by_id:
+            raise SelectionError(f"checkpoint result is not a selected unit: {stable_id}")
+        if stable_id in seen:
+            raise SelectionError(
+                f"checkpoint results contain a duplicate stable ID: {stable_id}"
+            )
+        seen.add(stable_id)
+        if status not in {"PASS", "FAIL", "UNRESOLVED", "SKIP"}:
+            raise SelectionError(
+                f"checkpoint result has an invalid status: {stable_id}: {status}"
+            )
+        reason = item.get("reason")
+        if status != "PASS" and (not isinstance(reason, str) or not reason.strip()):
+            raise SelectionError(
+                f"non-PASS checkpoint result must carry a reason: {stable_id}"
+            )
+        selected = selected_by_id[stable_id]
+        command = selected.get("command")
+        fingerprint = selected.get("dependency_fingerprint")
+        if (
+            not isinstance(command, list)
+            or not command
+            or not isinstance(fingerprint, str)
+            or not _SHA256.fullmatch(fingerprint)
+        ):
+            raise SelectionError(
+                f"checkpoint selection is missing command or fingerprint for {stable_id}"
+            )
+        record: dict[str, Any] = {
+            "stable_id": stable_id,
+            "tier": selected.get("tier"),
+            "command": [str(part) for part in command],
+            "output_contract": selected.get("output_contract"),
+            "dependency_fingerprint": fingerprint,
+            "source": dict(source),
+            "observed_utc": datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            ),
+        }
+        if status == "PASS":
+            record.update(
+                {
+                    "schema": CREDIT_SCHEMA,
+                    "status": "PASS",
+                    "outcome": "PASS",
+                }
+            )
+        else:
+            record.update(
+                {
+                    "schema": DISPOSITION_SCHEMA,
+                    "status": status,
+                    "reason": reason.strip(),
+                }
+            )
+        normalized.append(record)
+
+    preserved: list[dict[str, Any]] = []
+    preserved_ids: set[str] = set()
+    for item in selection.get("preserved_credit_records", ()):
+        if not isinstance(item, Mapping):
+            raise SelectionError(
+                "checkpoint selection has a malformed preserved credit"
+            )
+        stable_id = item.get("stable_id")
+        if not isinstance(stable_id, str) or not stable_id:
+            raise SelectionError(
+                "checkpoint selection has a preserved credit without a stable ID"
+            )
+        if stable_id in preserved_ids:
+            raise SelectionError(
+                f"checkpoint selection has duplicate preserved credits: {stable_id}"
+            )
+        if stable_id in selected_by_id:
+            raise SelectionError(
+                f"preserved PASS credit was also selected for execution: {stable_id}"
+            )
+        preserved_ids.add(stable_id)
+        preserved.append(dict(item))
+
+    result_ids = set(seen)
+    kept_dispositions: list[dict[str, Any]] = []
+    for item in _disposition_items(input_checkpoint):
+        stable_id = item.get("stable_id")
+        if not isinstance(stable_id, str):
+            continue
+        if stable_id in result_ids or stable_id in preserved_ids:
+            continue
+        kept_dispositions.append(dict(item))
+
+    first_unresolved: str | None = next(
+        (
+            str(item.get("stable_id"))
+            for item in normalized
+            if item.get("status") == "UNRESOLVED"
+        ),
+        None,
+    )
+    if first_unresolved is None and isinstance(input_checkpoint, Mapping):
+        prior_first = input_checkpoint.get("first_unresolved_unit")
+        if isinstance(prior_first, str) and any(
+            item.get("stable_id") == prior_first
+            and item.get("status") == "UNRESOLVED"
+            for item in kept_dispositions
+        ):
+            first_unresolved = prior_first
+
+    credits = preserved + [
+        dict(item) for item in normalized if item.get("status") == "PASS"
+    ]
+    dispositions = kept_dispositions + [
+        dict(item) for item in normalized if item.get("status") != "PASS"
+    ]
+    return checkpoint_record(
+        credits=credits,
+        dispositions=dispositions,
+        first_unresolved_unit=first_unresolved,
+    )
+
+
 def _credit_items(value: object) -> list[Mapping[str, Any]]:
     if value is None:
         return []
@@ -980,6 +1292,26 @@ def _credit_items(value: object) -> list[Mapping[str, Any]]:
     for item in value:
         if not isinstance(item, Mapping):
             raise SelectionError("credit records must be objects")
+        result.append(item)
+    return result
+
+
+def _disposition_items(value: object) -> list[Mapping[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        if "dispositions" in value:
+            value = value["dispositions"]
+        else:
+            return []
+    if not isinstance(value, list):
+        raise SelectionError(
+            "dispositions must be a list or an object containing dispositions"
+        )
+    result: list[Mapping[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise SelectionError("disposition records must be objects")
         result.append(item)
     return result
 
@@ -1071,13 +1403,20 @@ def select_checks(
     root: str | Path,
     *,
     credits: object = None,
+    dispositions: object = None,
     changed_paths: Sequence[str] | None = None,
     changed_domains: Sequence[str] = (),
     expected_branch: str | None = None,
     expected_tip: str | None = None,
     exclude_ids: Sequence[str] = (),
 ) -> SelectionDecision:
-    """Select checks and preserve only exact, still-valid credit."""
+    """Select checks, preserve only exact still-valid PASS credit, and resume.
+
+    The returned units are the failed/unresolved/affected/uncertain union in
+    exact registry order: every eligible unit without selector-validated
+    unchanged PASS credit is selected, so a validated PASS prefix is never
+    replayed and changed or unknown inputs conservatively re-run.
+    """
 
     if intent not in _INTENTS:
         raise SelectionError(f"intent must be one of {sorted(_INTENTS)}")
@@ -1120,15 +1459,40 @@ def select_checks(
         if not _valid_credit_shape(credit):
             rejected.add(stable_id)
 
+    dispositions_by_id: dict[str, Mapping[str, Any]] = {}
+    for disposition in _disposition_items(dispositions):
+        stable_id = disposition.get("stable_id")
+        status = disposition.get("status")
+        if (
+            not isinstance(stable_id, str)
+            or stable_id not in known
+            or stable_id in dispositions_by_id
+            or not isinstance(status, str)
+            or status.upper() not in DISPOSITION_STATUSES
+        ):
+            # A malformed or unknown disposition is conservative: the unit
+            # holds no valid PASS credit and is simply re-selected.
+            continue
+        dispositions_by_id[stable_id] = disposition
+    for stable_id in sorted(set(by_id).intersection(dispositions_by_id)):
+        # A unit can never hold both PASS credit and a non-PASS disposition;
+        # the contradiction fails closed and re-runs the unit.
+        ambiguous.add(stable_id)
+        by_id.pop(stable_id, None)
+        dispositions_by_id.pop(stable_id, None)
+        rejected.add(stable_id)
+
     fingerprints = {
         spec.stable_id: dependency_fingerprint(spec, source.source_root)
         for spec in CHECK_REGISTRY
     }
     preserved: list[str] = []
+    preserved_records: list[dict[str, Any]] = []
     invalidated: list[str] = []
     selected: list[SelectedCheck] = []
     for spec in CHECK_REGISTRY:
         credit = by_id.get(spec.stable_id)
+        disposition = dispositions_by_id.get(spec.stable_id)
         changed_dependency = bool(
             (changed_paths is not None or normalized_domains)
             and spec.consumes(path_set, domain_set)
@@ -1136,6 +1500,7 @@ def select_checks(
         is_valid = bool(
             credit is not None
             and spec.stable_id not in ambiguous
+            and disposition is None
             and _valid_credit_shape(credit)
             and _source_matches(credit.get("source"), source, Path(source.source_root))
             and credit.get("tier") == spec.tier
@@ -1146,6 +1511,7 @@ def select_checks(
         )
         if is_valid:
             preserved.append(spec.stable_id)
+            preserved_records.append(dict(credit))
         elif credit is not None:
             invalidated.append(spec.stable_id)
         if spec.stable_id in excluded or not _eligible(
@@ -1154,28 +1520,24 @@ def select_checks(
             continue
         if is_valid:
             continue
-        reason = "missing-credit" if credit is None else "stale-or-invalid-credit"
+        if disposition is not None:
+            reason = _DISPOSITION_REASONS[str(disposition.get("status")).upper()]
+        elif credit is None:
+            reason = "missing-credit"
+        else:
+            reason = "stale-or-invalid-credit"
+        # Selected units keep the immutable registry order; the union begins
+        # at its earliest registry member and never replays a preserved PASS
+        # prefix.
         selected.append(SelectedCheck(spec, fingerprints[spec.stable_id], reason))
 
-    def order(item: SelectedCheck) -> tuple[int, float, int, str]:
-        decisive_bucket = 0 if item.spec.decisive else 1
-        tier_bucket = {"fast": 0, "affected": 1, "full": 2, "release": 3}[
-            item.spec.tier
-        ]
-        return (
-            decisive_bucket,
-            item.spec.estimated_duration_seconds,
-            tier_bucket,
-            item.spec.stable_id,
-        )
-
-    selected.sort(key=order)
     registry_hash = registry_record()["registry_fingerprint"]
     return SelectionDecision(
         intent=intent,
         source=source,
         selected=tuple(selected),
         preserved_credit_ids=tuple(sorted(preserved)),
+        preserved_credit_records=tuple(preserved_records),
         invalidated_credit_ids=tuple(sorted(set(invalidated).union(rejected))),
         rejected_credit_ids=tuple(sorted(rejected)),
         registry_fingerprint=registry_hash,
@@ -1188,7 +1550,7 @@ def _load_json(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SelectionError(f"cannot read credit file {path}: {exc}") from exc
+        raise SelectionError(f"cannot read JSON file {path}: {exc}") from exc
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1206,6 +1568,13 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--expected-branch")
     select.add_argument("--expected-tip")
     select.add_argument("--exclude-id", action="append", default=[])
+    checkpoint = sub.add_parser(
+        "checkpoint", help="merge a run's unit results into the checkpoint file"
+    )
+    checkpoint.add_argument("--input", type=Path)
+    checkpoint.add_argument("--selection", type=Path, required=True)
+    checkpoint.add_argument("--results", type=Path, required=True)
+    checkpoint.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -1215,11 +1584,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "registry":
             print(json.dumps(registry_record(), indent=2, sort_keys=True))
             return 0
-        credits = _load_json(args.credit_file) if args.credit_file else None
+        if args.command == "checkpoint":
+            selection = _load_json(args.selection)
+            if not isinstance(selection, Mapping):
+                raise SelectionError("checkpoint --selection must be a JSON object")
+            results = _load_json(args.results)
+            if not isinstance(results, list):
+                raise SelectionError("checkpoint --results must be a JSON array")
+            input_checkpoint = None
+            if args.input is not None and Path(args.input).is_file():
+                input_checkpoint = _load_json(args.input)
+                if not isinstance(input_checkpoint, Mapping):
+                    raise SelectionError("checkpoint --input must be a JSON object")
+            merged = merge_checkpoint_results(selection, results, input_checkpoint)
+            write_checkpoint(
+                args.output,
+                credits=merged["credits"],
+                dispositions=merged["dispositions"],
+                first_unresolved_unit=merged["first_unresolved_unit"],
+            )
+            return 0
+        checkpoint_value = _load_json(args.credit_file) if args.credit_file else None
         decision = select_checks(
             args.intent,
             args.root,
-            credits=credits,
+            credits=checkpoint_value,
+            dispositions=checkpoint_value,
             changed_paths=args.changed_path if args.changed_path else None,
             changed_domains=args.changed_domain,
             expected_branch=args.expected_branch,
@@ -1238,8 +1628,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CHECKPOINT_SCHEMA",
     "CHECK_REGISTRY",
     "CREDIT_SCHEMA",
+    "DISPOSITION_SCHEMA",
+    "DISPOSITION_STATUSES",
     "PUBLIC_ROUTE_DEPENDENCIES",
     "REAL_AGENT_ROUTE_DEPENDENCIES",
     "RELEASE_AGGREGATE_ID",
@@ -1249,7 +1642,11 @@ __all__ = [
     "SelectionDecision",
     "SelectionError",
     "SourceIdentity",
+    "checkpoint_record",
     "credit_record",
+    "disposition_record",
+    "merge_checkpoint_results",
+    "write_checkpoint",
     "dependency_fingerprint",
     "dependency_input_paths",
     "get_check",

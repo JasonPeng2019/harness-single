@@ -644,6 +644,350 @@ class S6SelectorTests(unittest.TestCase):
         self.assertIn(spec.stable_id, preserved.preserved_credit_ids)
         self.assertNotIn(spec.stable_id, preserved.invalidated_credit_ids)
 
+    def _four_specs(self) -> tuple[release_checks.CheckSpec, ...]:
+        return (
+            release_checks.CheckSpec(
+                "TEST.A",
+                "a",
+                "affected",
+                ("python", "-c", "pass"),
+                ("domain-a",),
+                ("a.txt",),
+                estimated_duration_seconds=1.0,
+            ),
+            release_checks.CheckSpec(
+                "TEST.B",
+                "b",
+                "affected",
+                ("python", "-c", "pass"),
+                ("domain-b",),
+                ("b.txt",),
+                estimated_duration_seconds=1.0,
+            ),
+            release_checks.CheckSpec(
+                "TEST.C",
+                "c",
+                "affected",
+                ("python", "-c", "pass"),
+                ("domain-c",),
+                ("c.txt",),
+                estimated_duration_seconds=1.0,
+            ),
+            release_checks.CheckSpec(
+                "TEST.D",
+                "d",
+                "affected",
+                ("python", "-c", "pass"),
+                ("domain-d",),
+                ("d.txt",),
+                estimated_duration_seconds=1.0,
+            ),
+        )
+
+    def _four_repository(
+        self,
+    ) -> tuple[tempfile.TemporaryDirectory[str], TemporaryGitRepository]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        repository = TemporaryGitRepository.create(root, branch="test")
+        for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+            (root / name).write_text(f"{name}\n", encoding="utf-8")
+        repository.git("add", "a.txt", "b.txt", "c.txt", "d.txt")
+        repository.git("commit", "-m", "four declared dependencies")
+        return temporary, repository
+
+    def test_cold_selection_is_registry_ordered_complete_pool(self) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = self._custom_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                decision = release_checks.select_checks(
+                    "affected", repository.root, changed_paths=None
+                )
+            self.assertEqual(
+                ("TEST.DECISIVE-SHORT", "TEST.DECISIVE-LONG", "TEST.NONDECISIVE"),
+                decision.selected_ids,
+            )
+            self.assertEqual((), decision.preserved_credit_ids)
+            self.assertEqual(
+                ("missing-credit",) * 3,
+                tuple(item.reason for item in decision.selected),
+            )
+        finally:
+            temporary.cleanup()
+
+    def test_checkpoint_union_preserves_pass_and_is_registry_ordered(self) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = self._custom_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                pass_credit = release_checks.credit_record(
+                    specs[1], repository.root
+                )
+                failed = release_checks.disposition_record(
+                    specs[2],
+                    repository.root,
+                    status="FAIL",
+                    reason="prior ordinary nonzero exit",
+                )
+                unresolved = release_checks.disposition_record(
+                    specs[0],
+                    repository.root,
+                    status="UNRESOLVED",
+                    reason="prior identity uncertainty",
+                )
+                decision = release_checks.select_checks(
+                    "affected",
+                    repository.root,
+                    credits=[pass_credit],
+                    dispositions=[failed, unresolved],
+                )
+            # The union is the failed/unresolved/affected/uncertain set in
+            # registry order from its earliest member; the unaffected PASS
+            # unit is preserved and never replayed.
+            self.assertEqual(
+                ("TEST.DECISIVE-SHORT", "TEST.NONDECISIVE"),
+                decision.selected_ids,
+            )
+            self.assertEqual(
+                ("prior-unresolved", "prior-failed"),
+                tuple(item.reason for item in decision.selected),
+            )
+            self.assertEqual(
+                ("TEST.DECISIVE-LONG",), decision.preserved_credit_ids
+            )
+            self.assertEqual(1, len(decision.preserved_credit_records))
+            self.assertEqual(
+                pass_credit["stable_id"],
+                decision.preserved_credit_records[0]["stable_id"],
+            )
+            for item in decision.selected:
+                self.assertEqual(list(item.spec.command), item.to_record()["command"])
+        finally:
+            temporary.cleanup()
+
+    def test_changed_input_plus_failed_union_starts_at_earliest_member(
+        self,
+    ) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = self._custom_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                credits = [
+                    release_checks.credit_record(spec, repository.root)
+                    for spec in (specs[0], specs[1])
+                ]
+                failed = release_checks.disposition_record(
+                    specs[2],
+                    repository.root,
+                    status="FAIL",
+                    reason="prior ordinary nonzero exit",
+                )
+                decision = release_checks.select_checks(
+                    "full",
+                    repository.root,
+                    credits=credits,
+                    dispositions=[failed],
+                    changed_paths=["other.txt"],
+                )
+            # TEST.DECISIVE-LONG consumed the changed input and TEST.NONDECISIVE
+            # previously failed; both re-run in registry order beginning at
+            # their earliest member while TEST.DECISIVE-SHORT's validated PASS
+            # credit is preserved.
+            self.assertEqual(
+                ("TEST.DECISIVE-LONG", "TEST.NONDECISIVE"),
+                decision.selected_ids,
+            )
+            self.assertEqual(
+                ("stale-or-invalid-credit", "prior-failed"),
+                tuple(item.reason for item in decision.selected),
+            )
+            self.assertEqual(
+                ("TEST.DECISIVE-SHORT",), decision.preserved_credit_ids
+            )
+            self.assertIn("TEST.DECISIVE-LONG", decision.invalidated_credit_ids)
+        finally:
+            temporary.cleanup()
+
+    def test_checkpoint_ambiguity_and_malformed_dispositions_fail_closed(
+        self,
+    ) -> None:
+        temporary, repository = self._repository()
+        try:
+            specs = self._custom_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                pass_credit = release_checks.credit_record(
+                    specs[0], repository.root
+                )
+                failed = release_checks.disposition_record(
+                    specs[0],
+                    repository.root,
+                    status="FAIL",
+                    reason="prior ordinary nonzero exit",
+                )
+                malformed = {
+                    "stable_id": specs[1].stable_id,
+                    "status": "MAYBE",
+                    "reason": "not a disposition",
+                }
+                decision = release_checks.select_checks(
+                    "affected",
+                    repository.root,
+                    credits=[pass_credit],
+                    dispositions=[failed, malformed],
+                )
+            # A unit holding both PASS credit and a disposition is ambiguous
+            # and fails closed; the malformed disposition is ignored.  Every
+            # unit re-runs because none holds valid PASS credit.
+            self.assertEqual(
+                ("TEST.DECISIVE-SHORT", "TEST.DECISIVE-LONG", "TEST.NONDECISIVE"),
+                decision.selected_ids,
+            )
+            self.assertEqual((), decision.preserved_credit_ids)
+            self.assertIn("TEST.DECISIVE-SHORT", decision.rejected_credit_ids)
+        finally:
+            temporary.cleanup()
+
+    def test_merge_checkpoint_records_first_unresolved_and_partial_progress(
+        self,
+    ) -> None:
+        temporary, repository = self._four_repository()
+        try:
+            specs = self._four_specs()
+            with patch.object(release_checks, "CHECK_REGISTRY", specs):
+                credit_a = release_checks.credit_record(specs[0], repository.root)
+                disposition_d = release_checks.disposition_record(
+                    specs[3],
+                    repository.root,
+                    status="FAIL",
+                    reason="prior ordinary nonzero exit",
+                )
+                decision = release_checks.select_checks(
+                    "affected",
+                    repository.root,
+                    credits=[credit_a],
+                    dispositions=[disposition_d],
+                )
+                self.assertEqual(
+                    ("TEST.B", "TEST.C", "TEST.D"), decision.selected_ids
+                )
+                input_checkpoint = {
+                    "credits": [credit_a],
+                    "dispositions": [disposition_d],
+                }
+                merged = release_checks.merge_checkpoint_results(
+                    decision.to_record(),
+                    [
+                        {"stable_id": "TEST.B", "status": "FAIL", "reason": "ordinary nonzero exit code 7"},
+                        {"stable_id": "TEST.C", "status": "UNRESOLVED", "reason": "candidate identity uncertainty"},
+                    ],
+                    input_checkpoint,
+                )
+            self.assertEqual(release_checks.CHECKPOINT_SCHEMA, merged["schema"])
+            self.assertEqual(("TEST.A",), tuple(item["stable_id"] for item in merged["credits"]))
+            self.assertEqual(
+                ("TEST.D", "TEST.B", "TEST.C"),
+                tuple(item["stable_id"] for item in merged["dispositions"]),
+            )
+            self.assertEqual(
+                ("FAIL", "FAIL", "UNRESOLVED"),
+                tuple(item["status"] for item in merged["dispositions"]),
+            )
+            self.assertEqual("TEST.C", merged["first_unresolved_unit"])
+            self.assertEqual(
+                "prior ordinary nonzero exit",
+                merged["dispositions"][0]["reason"],
+            )
+        finally:
+            temporary.cleanup()
+
+    def test_checkpoint_cli_reads_dispositions_and_selects_registry_union(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="orchestrator-s6-checkpoint-cli-"
+        ) as raw:
+            root = Path(raw) / "candidate"
+            shutil.copytree(
+                REPOSITORY_ROOT,
+                root,
+                ignore=shutil.ignore_patterns(
+                    ".git", ".agent-workspace", "__pycache__", "*.pyc", ".ruff_cache"
+                ),
+            )
+            repository = TemporaryGitRepository.create(root, branch="test")
+            repository.git("add", "-A")
+            repository.git("commit", "-m", "checkpoint cli candidate")
+            selector_credit = release_checks.credit_record(
+                release_checks.get_check("S6.FAST.SELECTOR"), root
+            )
+            docs_failed = release_checks.disposition_record(
+                release_checks.get_check("S6.FAST.DOCS"),
+                root,
+                status="FAIL",
+                reason="prior ordinary nonzero exit",
+            )
+            package_unresolved = release_checks.disposition_record(
+                release_checks.get_check("S6.FAST.PACKAGE"),
+                root,
+                status="UNRESOLVED",
+                reason="prior identity uncertainty",
+            )
+            checkpoint_path = Path(raw) / "checkpoint.json"
+            release_checks.write_checkpoint(
+                checkpoint_path,
+                credits=[selector_credit],
+                dispositions=[docs_failed, package_unresolved],
+                first_unresolved_unit=package_unresolved["stable_id"],
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "orchestrator_harness.release_checks",
+                    "select",
+                    "--intent",
+                    "affected",
+                    "--root",
+                    str(root),
+                    "--credit-file",
+                    str(checkpoint_path),
+                ],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
+            selection = json.loads(completed.stdout)
+            self.assertEqual(
+                ("S6.FAST.SELECTOR",), tuple(selection["preserved_credit_ids"])
+            )
+            selected = tuple(item["stable_id"] for item in selection["selected"])
+            self.assertEqual(
+                (
+                    "S6.FAST.DOCS",
+                    "S6.FAST.PACKAGE",
+                    "S6.FAST.LOCAL-ISOLATION",
+                    "S6.AFFECTED.PUBLIC-E2E",
+                    "S6.AFFECTED.SAFEGUARD",
+                    "S6.AFFECTED.LEGACY",
+                    "S6.AFFECTED.REAL-AGENT",
+                ),
+                selected,
+            )
+            by_id = {item["stable_id"]: item for item in selection["selected"]}
+            self.assertEqual("prior-failed", by_id["S6.FAST.DOCS"]["selection_reason"])
+            self.assertEqual(
+                "prior-unresolved", by_id["S6.FAST.PACKAGE"]["selection_reason"]
+            )
+            self.assertEqual(
+                selector_credit["stable_id"],
+                selection["preserved_credit_records"][0]["stable_id"],
+            )
+
     def test_safeguard_rejects_foreign_selection_command_from_candidate_registry(
         self,
     ) -> None:
@@ -3264,7 +3608,7 @@ class S6SafeguardTests(unittest.TestCase):
             self.assertIn("READY S6.RELEASE.", completed.stdout)
             self.assertNotIn("TEST.SAFEGUARD", completed.stdout)
 
-    def test_safeguard_stops_before_second_component_after_identity_failure(
+    def test_safeguard_identity_failure_holds_remaining_units_and_stays_nonzero(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(
@@ -3304,16 +3648,15 @@ $checks = @(
     [pscustomobject]@{{ stable_id = 'TEST.FIRST'; command = @('powershell', '-NoProfile', '-File', 'first.ps1') }},
     [pscustomobject]@{{ stable_id = 'TEST.SECOND'; command = @('powershell', '-NoProfile', '-File', 'second.ps1') }}
 )
-try {{
-    Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
-        -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
-        -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
-        -BaselineHash '{baseline_hash}' -ConfigHash '{config_hash}'
-    exit 0
-}} catch {{
-    Write-Error $_
+$summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+    -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+    -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+    -BaselineHash '{baseline_hash}' -ConfigHash '{config_hash}'
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{root}/summary.json' -Encoding UTF8
+if ($summary.incomplete) {{
     exit 17
 }}
+exit 0
 """,
                 encoding="utf-8",
             )
@@ -3335,9 +3678,17 @@ try {{
             self.assertEqual(
                 17, completed.returncode, completed.stdout + completed.stderr
             )
-            self.assertIn("dirty", (completed.stdout + completed.stderr).lower())
             self.assertTrue((root / "first-ran.txt").is_file())
             self.assertFalse((root / "second-ran.txt").exists())
+            summary = json.loads(
+                (root / "summary.json").read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual(2, summary["total"])
+            self.assertEqual(1, summary["unresolved"])
+            self.assertEqual(1, summary["skipped"])
+            self.assertEqual(0, summary["passed"])
+            self.assertTrue(summary["incomplete"])
+            self.assertEqual("TEST.FIRST", summary["first_unresolved_unit"])
 
     def test_safeguard_core_delivers_one_argument_command_tail_as_array(
         self,

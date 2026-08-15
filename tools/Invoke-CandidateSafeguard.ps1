@@ -217,6 +217,11 @@ if (-not $Run) {
     exit 0
 }
 
+$checkpointPath = ''
+if (-not [string]::IsNullOrWhiteSpace($CreditFile)) {
+    $checkpointPath = Normalize-Path $CreditFile
+}
+$resultsPath = Join-Path ([IO.Path]::GetTempPath()) ('safeguard-results-' + [guid]::NewGuid().ToString('N') + '.json')
 $priorPythonPath = $env:PYTHONPATH
 $pythonPathSuffix = ''
 if (-not [string]::IsNullOrWhiteSpace($priorPythonPath)) {
@@ -225,9 +230,10 @@ if (-not [string]::IsNullOrWhiteSpace($priorPythonPath)) {
 try {
     $env:PYTHONPATH = $script:repositoryRoot + $pythonPathSuffix
     Push-Location $script:repositoryRoot
-    Invoke-ReleaseChecks -Checks $checks -RepositoryRoot $script:repositoryRoot `
+    $summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot $script:repositoryRoot `
         -ExpectedHead $head -ExpectedBranch $branch -ExpectedCommonDirectory $commonDirectory `
-        -Baseline $baseline -PyrightConfig $pyrightConfig -BaselineHash $baselineHash -ConfigHash $configHash
+        -Baseline $baseline -PyrightConfig $pyrightConfig -BaselineHash $baselineHash -ConfigHash $configHash `
+        -Selection $selection -CheckpointPath $checkpointPath -ResultsPath $resultsPath
 } finally {
     Pop-Location
     if ([string]::IsNullOrEmpty($priorPythonPath)) {
@@ -235,4 +241,10 @@ try {
     } else {
         $env:PYTHONPATH = $priorPythonPath
     }
+    if (Test-Path -LiteralPath $resultsPath -PathType Leaf) {
+        Remove-Item -LiteralPath $resultsPath -Force
+    }
+}
+if ($summary.incomplete) {
+    throw "candidate safeguard pool incomplete: passed=$($summary.passed) failed=$($summary.failed) unresolved=$($summary.unresolved) skipped=$($summary.skipped) first_unresolved_unit=$($summary.first_unresolved_unit)"
 }

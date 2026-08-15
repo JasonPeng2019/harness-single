@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from orchestrator_harness.tests.support import TemporaryGitRepository
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_WINDOWLESS_CREATION_FLAGS = 0x08000000 if os.name == "nt" else 0
 
 
 class CandidateSafeguardTests(unittest.TestCase):
@@ -106,6 +111,338 @@ class CandidateSafeguardTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("watch --until-actionable", recipe)
         self.assertIn("top-level-event-id", recipe)
+
+
+class CandidateSafeguardCheckpointCoreTests(unittest.TestCase):
+    def _repository_fixture(
+        self,
+    ) -> tuple[
+        tempfile.TemporaryDirectory[str], Path, Path, Path, TemporaryGitRepository
+    ]:
+        temporary = tempfile.TemporaryDirectory(prefix="orchestrator-csg-checkpoint-")
+        root = Path(temporary.name) / "candidate"
+        repository = TemporaryGitRepository.create(
+            root, branch="firmware/v2-candidate"
+        )
+        baseline = root / ".codex" / "dev" / "basedpyright-baseline.json"
+        baseline.parent.mkdir(parents=True)
+        baseline.write_text("{}\n", encoding="utf-8")
+        pyright_config = root / "pyrightconfig.json"
+        pyright_config.write_text(
+            '{"baselineFile": ".codex/dev/basedpyright-baseline.json"}\n',
+            encoding="utf-8",
+        )
+        repository.git("add", ".")
+        repository.git("commit", "-m", "candidate core fixture")
+        return temporary, root, baseline, pyright_config, repository
+
+    def _selection(
+        self,
+        repository: TemporaryGitRepository,
+        root: Path,
+        selected: list[dict[str, object]],
+        preserved: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "schema": "orchestrator-check-selection/v1",
+            "source": {
+                "source_root": str(root.resolve()),
+                "git_common_dir": str(repository.common_dir),
+                "branch": "firmware/v2-candidate",
+                "tip": repository.head,
+            },
+            "selected": selected,
+            "preserved_credit_records": preserved,
+        }
+
+    def test_core_records_fail_and_continues_later_independent_units(self) -> None:
+        temporary, root, baseline, pyright_config, repository = (
+            self._repository_fixture()
+        )
+        try:
+            failing = root / "failing.ps1"
+            passing = root / "passing.ps1"
+            failing.write_text("exit 3\n", encoding="utf-8")
+            passing.write_text(
+                f"Set-Content -LiteralPath '{Path(temporary.name) / 'second-ran.txt'}' -Value 'second'\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".")
+            repository.git("commit", "-m", "continuation fixture")
+            module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+            driver = Path(temporary.name) / "invoke-core.ps1"
+            driver.write_text(
+                f"""Import-Module -Force '{module}'
+$checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.FAILING'; command = @('powershell', '-NoProfile', '-File', 'failing.ps1') }},
+    [pscustomobject]@{{ stable_id = 'TEST.PASSING'; command = @('powershell', '-NoProfile', '-File', 'passing.ps1') }}
+)
+$summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+    -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+    -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+    -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}'
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+if ($summary.incomplete) {{
+    exit 17
+}}
+exit 0
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(driver),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertEqual(
+                17, completed.returncode, completed.stdout + completed.stderr
+            )
+            # The ordinary failure was recorded, the later independent unit
+            # still executed, and the incomplete pool stayed nonzero.
+            self.assertTrue((Path(temporary.name) / "second-ran.txt").is_file())
+            summary = json.loads(
+                (Path(temporary.name) / "summary.json").read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual(2, summary["total"])
+            self.assertEqual(1, summary["failed"])
+            self.assertEqual(1, summary["passed"])
+            self.assertTrue(summary["incomplete"])
+        finally:
+            temporary.cleanup()
+
+    def test_core_identity_uncertainty_never_passes_and_persists_checkpoint(
+        self,
+    ) -> None:
+        temporary, root, baseline, pyright_config, repository = (
+            self._repository_fixture()
+        )
+        try:
+            first = root / "first.ps1"
+            second = root / "second.ps1"
+            first.write_text(
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'first-ran.txt') -Value 'first'\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'second-ran.txt') -Value 'second'\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".")
+            repository.git("commit", "-m", "identity uncertainty fixture")
+            selection = self._selection(
+                repository,
+                root,
+                [
+                    {
+                        "stable_id": "TEST.FIRST",
+                        "tier": "affected",
+                        "command": ["powershell", "-NoProfile", "-File", "first.ps1"],
+                        "output_contract": "orchestrator-check-credit/v1",
+                        "dependency_fingerprint": "1" * 64,
+                    },
+                    {
+                        "stable_id": "TEST.SECOND",
+                        "tier": "affected",
+                        "command": ["powershell", "-NoProfile", "-File", "second.ps1"],
+                        "output_contract": "orchestrator-check-credit/v1",
+                        "dependency_fingerprint": "2" * 64,
+                    },
+                ],
+                [],
+            )
+            selection_path = Path(temporary.name) / "selection.json"
+            selection_path.write_text(
+                json.dumps(selection), encoding="utf-8"
+            )
+            checkpoint_path = Path(temporary.name) / "checkpoint.json"
+            results_path = Path(temporary.name) / "results.json"
+            module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+            driver = Path(temporary.name) / "invoke-core.ps1"
+            driver.write_text(
+                f"""$env:PYTHONPATH = '{REPOSITORY_ROOT}'
+Import-Module -Force '{module}'
+$checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.FIRST'; command = @('powershell', '-NoProfile', '-File', 'first.ps1') }},
+    [pscustomobject]@{{ stable_id = 'TEST.SECOND'; command = @('powershell', '-NoProfile', '-File', 'second.ps1') }}
+)
+$selection = Get-Content -LiteralPath '{selection_path}' -Raw | ConvertFrom-Json
+$summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+    -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+    -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+    -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
+    -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+if ($summary.incomplete) {{
+    exit 17
+}}
+exit 0
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(driver),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertEqual(
+                17, completed.returncode, completed.stdout + completed.stderr
+            )
+            self.assertTrue((root / "first-ran.txt").is_file())
+            self.assertFalse((root / "second-ran.txt").exists())
+            summary = json.loads(
+                (Path(temporary.name) / "summary.json").read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual(1, summary["unresolved"])
+            self.assertEqual(1, summary["skipped"])
+            self.assertEqual("TEST.FIRST", summary["first_unresolved_unit"])
+            checkpoint = json.loads(
+                checkpoint_path.read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
+            self.assertEqual([], checkpoint["credits"])
+            by_id = {item["stable_id"]: item for item in checkpoint["dispositions"]}
+            self.assertEqual("UNRESOLVED", by_id["TEST.FIRST"]["status"])
+            self.assertIn("identity", by_id["TEST.FIRST"]["reason"].lower())
+            self.assertEqual("SKIP", by_id["TEST.SECOND"]["status"])
+            self.assertIn("holds", by_id["TEST.SECOND"]["reason"].lower())
+            self.assertEqual("TEST.FIRST", checkpoint["first_unresolved_unit"])
+        finally:
+            temporary.cleanup()
+
+    def test_core_persists_preserved_pass_credit_with_new_pass(self) -> None:
+        temporary, root, baseline, pyright_config, repository = (
+            self._repository_fixture()
+        )
+        try:
+            probe = root / "probe.py"
+            probe.write_text(
+                "from __future__ import annotations\n"
+                "import sys\n"
+                "EXPECTED = 'probe.py'\n"
+                "assert len(sys.argv) == 1 and sys.argv[0] == EXPECTED, sys.argv\n"
+                "print('PROBE-OK')\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".")
+            repository.git("commit", "-m", "preserved credit fixture")
+            source = {
+                "source_root": str(root.resolve()),
+                "git_common_dir": str(repository.common_dir),
+                "branch": "firmware/v2-candidate",
+                "tip": repository.head,
+            }
+            credit_a = {
+                "schema": "orchestrator-check-credit/v1",
+                "stable_id": "TEST.PRESERVED",
+                "status": "PASS",
+                "outcome": "PASS",
+                "tier": "affected",
+                "command": ["python", "-c", "pass"],
+                "output_contract": "orchestrator-check-credit/v1",
+                "dependency_fingerprint": "a" * 64,
+                "source": source,
+                "observed_utc": "2026-08-15T00:00:00Z",
+            }
+            selection = self._selection(
+                repository,
+                root,
+                [
+                    {
+                        "stable_id": "TEST.NEW",
+                        "tier": "affected",
+                        "command": ["python", "probe.py"],
+                        "output_contract": "orchestrator-check-credit/v1",
+                        "dependency_fingerprint": "b" * 64,
+                    },
+                ],
+                [credit_a],
+            )
+            selection_path = Path(temporary.name) / "selection.json"
+            selection_path.write_text(
+                json.dumps(selection), encoding="utf-8"
+            )
+            checkpoint_path = Path(temporary.name) / "checkpoint.json"
+            checkpoint_path.write_text(
+                json.dumps({"credits": [credit_a], "dispositions": []}),
+                encoding="utf-8",
+            )
+            results_path = Path(temporary.name) / "results.json"
+            module = REPOSITORY_ROOT / "tools" / "CandidateSafeguard.Core.psm1"
+            driver = Path(temporary.name) / "invoke-core.ps1"
+            driver.write_text(
+                f"""$env:PYTHONPATH = '{REPOSITORY_ROOT}'
+Import-Module -Force '{module}'
+$checks = @(
+    [pscustomobject]@{{ stable_id = 'TEST.NEW'; command = @('python', 'probe.py') }}
+)
+$selection = Get-Content -LiteralPath '{selection_path}' -Raw | ConvertFrom-Json
+$summary = Invoke-ReleaseChecks -Checks $checks -RepositoryRoot '{root}' -ExpectedHead '{repository.head}' `
+    -ExpectedBranch 'firmware/v2-candidate' -ExpectedCommonDirectory '{repository.common_dir}' `
+    -Baseline '{baseline}' -PyrightConfig '{pyright_config}' `
+    -BaselineHash '{hashlib.sha256(baseline.read_bytes()).hexdigest().upper()}' -ConfigHash '{hashlib.sha256(pyright_config.read_bytes()).hexdigest().upper()}' `
+    -Selection $selection -CheckpointPath '{checkpoint_path}' -ResultsPath '{results_path}'
+$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath '{Path(temporary.name) / 'summary.json'}' -Encoding UTF8
+if ($summary.incomplete) {{
+    exit 17
+}}
+exit 0
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(driver),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=_WINDOWLESS_CREATION_FLAGS,
+            )
+            self.assertEqual(
+                0, completed.returncode, completed.stdout + completed.stderr
+            )
+            self.assertIn("PROBE-OK", completed.stdout)
+            checkpoint = json.loads(
+                checkpoint_path.read_text(encoding="utf-8-sig")
+            )
+            self.assertEqual("orchestrator-checkpoint/v1", checkpoint["schema"])
+            credits_by_id = {
+                item["stable_id"]: item for item in checkpoint["credits"]
+            }
+            self.assertIn("TEST.PRESERVED", credits_by_id)
+            self.assertEqual("PASS", credits_by_id["TEST.PRESERVED"]["status"])
+            self.assertIn("TEST.NEW", credits_by_id)
+            self.assertEqual("PASS", credits_by_id["TEST.NEW"]["status"])
+            self.assertEqual([], checkpoint["dispositions"])
+            self.assertIsNone(checkpoint["first_unresolved_unit"])
+        finally:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":
