@@ -1760,6 +1760,71 @@ class S4RepairRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_FC45_windows_job_more_data_retries_and_other_errors_fail_closed(
+        self,
+    ) -> None:
+        from ctypes import wintypes
+
+        calls = 0
+        sizes: list[int] = []
+
+        def more_data_query(
+            _handle: object,
+            _info_class: int,
+            buffer: object,
+            size: int,
+            returned: object,
+        ) -> bool:
+            nonlocal calls
+            calls += 1
+            sizes.append(size)
+            if calls == 1:
+                ctypes.set_last_error(234)
+                return False
+            payload = (0).to_bytes(4, "little") + (0).to_bytes(4, "little")
+            ctypes.memmove(buffer, payload, len(payload))
+            returned._obj.value = len(payload)  # type: ignore[attr-defined]
+            return True
+
+        boundary = ProcessBoundary(kind="windows-job", identity="job:repair")
+        boundary._job_handle = object()
+        with patch(
+            "orchestrator_harness.process_supervisor._windows_job_api",
+            return_value=(None, None, None, more_data_query, None, None, None, wintypes),
+        ):
+            observed = boundary.inventory()
+        self.assertTrue(observed.complete)
+        self.assertEqual((), observed.processes)
+        self.assertEqual((), observed.errors)
+        self.assertEqual(2, calls)
+        self.assertEqual(2, len(sizes))
+        self.assertGreater(sizes[1], sizes[0])
+
+        other_calls = 0
+
+        def other_error_query(
+            _handle: object,
+            _info_class: int,
+            _buffer: object,
+            _size: int,
+            _returned: object,
+        ) -> bool:
+            nonlocal other_calls
+            other_calls += 1
+            ctypes.set_last_error(5)
+            return False
+
+        boundary = ProcessBoundary(kind="windows-job", identity="job:repair-other")
+        boundary._job_handle = object()
+        with patch(
+            "orchestrator_harness.process_supervisor._windows_job_api",
+            return_value=(None, None, None, other_error_query, None, None, None, wintypes),
+        ):
+            observed = boundary.inventory()
+        self.assertFalse(observed.complete)
+        self.assertEqual(1, other_calls)
+        self.assertTrue(any("(5)" in error for error in observed.errors))
+
     def test_FC44_identity_uncertain_supervisor_still_runs_direct_handle_cleanup(
         self,
     ) -> None:
