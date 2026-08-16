@@ -1787,13 +1787,25 @@ class S4RepairRegressionTests(unittest.TestCase):
 
         boundary = ProcessBoundary(kind="windows-job", identity="job:repair")
         boundary._job_handle = object()
-        with patch(
-            "orchestrator_harness.process_supervisor._windows_job_api",
-            return_value=(None, None, None, more_data_query, None, None, None, wintypes),
-        ), patch(
-            "orchestrator_harness.process_supervisor.ctypes.get_last_error",
-            return_value=234,
-            create=True,
+        with (
+            patch(
+                "orchestrator_harness.process_supervisor._windows_job_api",
+                return_value=(
+                    None,
+                    None,
+                    None,
+                    more_data_query,
+                    None,
+                    None,
+                    None,
+                    wintypes,
+                ),
+            ),
+            patch(
+                "orchestrator_harness.process_supervisor.ctypes.get_last_error",
+                return_value=234,
+                create=True,
+            ),
         ):
             observed = boundary.inventory()
         self.assertTrue(observed.complete)
@@ -1818,13 +1830,25 @@ class S4RepairRegressionTests(unittest.TestCase):
 
         boundary = ProcessBoundary(kind="windows-job", identity="job:repair-other")
         boundary._job_handle = object()
-        with patch(
-            "orchestrator_harness.process_supervisor._windows_job_api",
-            return_value=(None, None, None, other_error_query, None, None, None, wintypes),
-        ), patch(
-            "orchestrator_harness.process_supervisor.ctypes.get_last_error",
-            return_value=5,
-            create=True,
+        with (
+            patch(
+                "orchestrator_harness.process_supervisor._windows_job_api",
+                return_value=(
+                    None,
+                    None,
+                    None,
+                    other_error_query,
+                    None,
+                    None,
+                    None,
+                    wintypes,
+                ),
+            ),
+            patch(
+                "orchestrator_harness.process_supervisor.ctypes.get_last_error",
+                return_value=5,
+                create=True,
+            ),
         ):
             observed = boundary.inventory()
         self.assertFalse(observed.complete)
