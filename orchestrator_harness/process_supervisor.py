@@ -519,7 +519,7 @@ class ProcessBoundary:
                             "job-object+CIM",
                         )
                     last_error = ctypes.get_last_error()
-                    if last_error in {24, 122} and attempt + 1 < max_attempts:
+                    if last_error in {24, 122, 234} and attempt + 1 < max_attempts:
                         next_capacity = min(max_capacity, capacity * 2)
                         if next_capacity <= capacity:
                             return incomplete(
