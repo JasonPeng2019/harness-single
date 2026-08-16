@@ -778,6 +778,59 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         runner._terminate_reap(child)
         self.assertEqual((1, 0, 1), (child.terminated, child.killed, child.waits))
 
+    def test_windows_start_launch_flags_keep_no_window_without_breakaway(
+        self,
+    ) -> None:
+        runner = importlib.import_module("harness_watcher_implementation.__main__")
+        no_window = 0x08000000
+        breakaway = 0x01000000
+        captured: dict[str, int] = {}
+        owner = {"pid": 4242, "created_utc": "owner-utc"}
+        watcher = {"pid": 4243, "created_utc": "watcher-utc"}
+        service = self.config.runtime_root / "watcher" / "service.json"
+        read_calls = 0
+
+        class Child:
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["creationflags"] = kwargs.get("creationflags", 0)
+            return Child()
+
+        def fake_identity(pid):
+            return {owner["pid"]: owner, watcher["pid"]: watcher}.get(pid)
+
+        def fake_read(path):
+            nonlocal read_calls
+            read_calls += 1
+            if read_calls == 1:
+                return None
+            state = json.loads(path.read_text(encoding="utf-8"))
+            state["startup_status"] = "READY"
+            state["watcher"] = watcher
+            return state
+
+        with (
+            patch.object(runner.os, "name", "nt"),
+            patch.object(
+                runner.subprocess, "CREATE_NO_WINDOW", no_window, create=True
+            ),
+            patch.object(
+                runner.subprocess, "CREATE_BREAKAWAY_FROM_JOB", breakaway, create=True
+            ),
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_identity", side_effect=fake_identity),
+            patch.object(runner, "_read", side_effect=fake_read),
+            patch.object(runner.time, "sleep"),
+            patch.object(runner.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            result = runner.main(["start", "--owner-pid", str(owner["pid"])])
+        self.assertEqual(0, result)
+        flags = captured["creationflags"]
+        self.assertEqual(no_window, flags & no_window)
+        self.assertEqual(0, flags & breakaway)
+
     def test_new_service_baseline_skips_preexisting_defect_shaped_bytes(self) -> None:
         class CountingEvaluator:
             def __init__(self):

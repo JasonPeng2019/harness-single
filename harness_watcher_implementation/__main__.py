@@ -257,9 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             flags = 0
             if os.name == "nt":
-                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-                    subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0
-                )
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             child = subprocess.Popen(
                 command,
                 cwd=str(cfg.repository_root),
