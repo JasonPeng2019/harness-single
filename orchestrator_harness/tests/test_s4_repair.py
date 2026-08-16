@@ -1779,7 +1779,6 @@ class S4RepairRegressionTests(unittest.TestCase):
             calls += 1
             sizes.append(size)
             if calls == 1:
-                ctypes.set_last_error(234)
                 return False
             payload = (0).to_bytes(4, "little") + (0).to_bytes(4, "little")
             ctypes.memmove(buffer, payload, len(payload))
@@ -1791,6 +1790,10 @@ class S4RepairRegressionTests(unittest.TestCase):
         with patch(
             "orchestrator_harness.process_supervisor._windows_job_api",
             return_value=(None, None, None, more_data_query, None, None, None, wintypes),
+        ), patch(
+            "orchestrator_harness.process_supervisor.ctypes.get_last_error",
+            return_value=234,
+            create=True,
         ):
             observed = boundary.inventory()
         self.assertTrue(observed.complete)
@@ -1811,7 +1814,6 @@ class S4RepairRegressionTests(unittest.TestCase):
         ) -> bool:
             nonlocal other_calls
             other_calls += 1
-            ctypes.set_last_error(5)
             return False
 
         boundary = ProcessBoundary(kind="windows-job", identity="job:repair-other")
@@ -1819,6 +1821,10 @@ class S4RepairRegressionTests(unittest.TestCase):
         with patch(
             "orchestrator_harness.process_supervisor._windows_job_api",
             return_value=(None, None, None, other_error_query, None, None, None, wintypes),
+        ), patch(
+            "orchestrator_harness.process_supervisor.ctypes.get_last_error",
+            return_value=5,
+            create=True,
         ):
             observed = boundary.inventory()
         self.assertFalse(observed.complete)
