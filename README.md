@@ -1,5 +1,9 @@
 # Portable Coding Orchestrator Harness
 
+> Firmware-enabled WIP delivery is closed. Read
+> [`final_v2-firmware_harness_overview.md`](final_v2-firmware_harness_overview.md)
+> for the supported surface, limits, and the exact meaning of that closure.
+
 This repository coordinates ordinary software work across Git branches and worktrees. A persistent
 manager plans lanes and integration; externally launched lane controllers validate identity,
 launch one coding worker, and serialize opaque named resources; the native observer reconciles
