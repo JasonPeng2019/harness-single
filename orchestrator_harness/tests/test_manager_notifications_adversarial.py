@@ -144,6 +144,46 @@ class ManagerNotificationAdversarialTests(unittest.TestCase):
             {item["code"] for item in first["observation_errors"]},
         )
 
+    def test_actionable_watch_is_ascii_safe_on_cp1252_console(self) -> None:
+        initial_code, initial_output = self._timeout_wait()
+        self.assertEqual(EXIT_TIMEOUT, initial_code)
+        self.assertEqual("WATCH_TIMEOUT", json.loads(initial_output)["type"])
+        self.assertTrue((self.fixture.config.output_dir / "snapshot.json").is_file())
+
+        summary = "operator handoff \u2192 Codex"
+        self._write_signal("unicode", summary=summary)
+
+        output_bytes = io.BytesIO()
+        output = io.TextIOWrapper(
+            output_bytes,
+            encoding="cp1252",
+            errors="strict",
+            newline="",
+        )
+        try:
+            code = watch_until_actionable(
+                self.fixture.config,
+                timeout_seconds=0.5,
+                process_provider=self.fixture.process_snapshot,
+                clock=lambda: NOW,
+                sleeper=lambda _: None,
+                monotonic=lambda: 0.0,
+                stream=output,
+            )
+            output.flush()
+            rendered = output_bytes.getvalue().decode("cp1252")
+        finally:
+            output.detach()
+
+        self.assertEqual(0, code)
+        self.assertTrue(rendered.isascii())
+        self.assertIn(r"\u2192", rendered)
+        event = json.loads(rendered)
+        self.assertEqual("MANAGER_SIGNAL", event["type"])
+        self.assertEqual("unicode", event["data"]["signal_id"])
+        self.assertEqual("A00_test:Atlas:A00", event["data"]["lane_id"])
+        self.assertEqual(summary, event["data"]["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

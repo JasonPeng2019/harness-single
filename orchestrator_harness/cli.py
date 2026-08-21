@@ -34,7 +34,7 @@ from .lane_lifecycle import allocate_immutable_source_view, retire_terminal_lane
 from .models import parse_utc, utc_now
 from .processes import process_snapshot
 from .reconcile import reconcile
-from .stable_io import PathSafetyError, SafeOutput, canonical_json
+from .stable_io import PathSafetyError, SafeOutput
 from .watcher_integration import merge_watcher_conditions
 from .workspace_overlay import ingest_super_cache, prepare_worktree
 
@@ -51,7 +51,15 @@ def _print_json(value: Any, *, stream: Any = sys.stdout) -> None:
 
 def _print_events(events: list[dict[str, Any]], *, stream: Any = sys.stdout) -> None:
     for event in events:
-        stream.write(canonical_json(event) + "\n")
+        stream.write(
+            json.dumps(
+                event,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
     stream.flush()
 
 
