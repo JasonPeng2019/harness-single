@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,12 +13,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 from examples.disposable_coding_fixture import _invocation
+from orchestrator_harness import operator_launch
 from orchestrator_harness.models import iso_utc
 from orchestrator_harness.operator_launch import detached_owner_snapshot, launch_process
 from orchestrator_harness.processes import process_snapshot
 
 
 class OperatorLaunchTests(unittest.TestCase):
+    def _windows_api(self):
+        if os.name != "nt":
+            self.skipTest("Windows native launch is only available on Windows")
+        import _winapi  # type: ignore[import-not-found]
+
+        return _winapi
+
+    @staticmethod
+    def _native_error(winerror: int) -> OSError:
+        error = OSError("native CreateProcess failure")
+        error.winerror = winerror
+        return error
+
     def _wait_for_exact(self, pid: int, created: str | None = None):
         for _ in range(20):
             item = process_snapshot().by_pid.get(pid)
@@ -83,6 +98,135 @@ class OperatorLaunchTests(unittest.TestCase):
             self.assertEqual("failed", failure["status"])
             self.assertTrue(failure["cleanup_confirmed"])
             self.assertIsNone(process_snapshot().by_pid.get(failure["child_pid"]))
+
+    def test_access_denied_retries_without_breakaway_and_publishes_before_resume(
+        self,
+    ) -> None:
+        winapi = self._windows_api()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            receipt = root / "retry.json"
+            argv = ("worker.exe", "argument with spaces")
+            calls: list[tuple[object, ...]] = []
+            events: list[str] = []
+            closed: list[object] = []
+            process_handle = object()
+            thread_handle = object()
+            pid = 424242
+
+            def create_process(*args: object) -> tuple[object, object, int, int]:
+                calls.append(args)
+                events.append(f"create-{len(calls)}")
+                if len(calls) == 1:
+                    raise self._native_error(5)
+                return process_handle, thread_handle, pid, 777
+
+            def creation_identity(_pid: int) -> str:
+                events.append("identity")
+                return "2026-08-20T22:36:00.000000Z"
+
+            observed_at_resume: dict[str, object] = {}
+
+            def resume(_thread: object) -> None:
+                events.append("resume")
+                if receipt.exists():
+                    observed_at_resume.update(
+                        json.loads(receipt.read_text(encoding="utf-8"))
+                    )
+
+            def close(handle: object) -> None:
+                events.append("close")
+                closed.append(handle)
+
+            with (
+                patch.object(winapi, "CreateProcess", side_effect=create_process),
+                patch.object(winapi, "CloseHandle", side_effect=close),
+                patch.object(
+                    operator_launch, "_creation_identity", side_effect=creation_identity
+                ),
+                patch.object(
+                    operator_launch, "_resume_windows_thread", side_effect=resume
+                ),
+                patch.dict(operator_launch._DETACHED_RECORDS, {}, clear=True),
+            ):
+                result = launch_process(
+                    receipt=receipt,
+                    label="retry",
+                    role="test",
+                    cwd=root,
+                    argv=argv,
+                )
+
+            self.assertEqual(2, len(calls))
+            first_flags = calls[0][5]
+            second_flags = calls[1][5]
+            assert isinstance(first_flags, int)
+            assert isinstance(second_flags, int)
+            self.assertEqual(
+                second_flags,
+                first_flags & ~winapi.CREATE_BREAKAWAY_FROM_JOB,
+            )
+            self.assertTrue(second_flags & 0x00000004)
+            self.assertIsNone(calls[0][0])
+            self.assertEqual(subprocess.list2cmdline(list(argv)), calls[0][1])
+            self.assertEqual(
+                ["create-1", "create-2", "identity", "resume", "close", "close"],
+                events,
+            )
+            self.assertEqual([thread_handle, process_handle], closed)
+            receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("launched", receipt_value["status"])
+            self.assertEqual(second_flags, result["creationflags"])
+            self.assertEqual(second_flags, receipt_value["creationflags"])
+            self.assertEqual(
+                "windows-native-detached-no-wait",
+                receipt_value["ownership_strategy"],
+            )
+            self.assertEqual(receipt_value, observed_at_resume)
+
+    def test_non_access_denied_native_error_attempts_once_and_writes_failed_receipt(
+        self,
+    ) -> None:
+        winapi = self._windows_api()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            receipt = root / "failed-native.json"
+            calls: list[tuple[object, ...]] = []
+            closed: list[object] = []
+
+            def create_process(*args: object) -> object:
+                calls.append(args)
+                raise self._native_error(123)
+
+            with (
+                patch.object(winapi, "CreateProcess", side_effect=create_process),
+                patch.object(winapi, "CloseHandle", side_effect=closed.append),
+                patch.object(
+                    operator_launch,
+                    "_creation_identity",
+                    side_effect=AssertionError("identity must not run"),
+                ),
+                patch.dict(operator_launch._DETACHED_RECORDS, {}, clear=True),
+                self.assertRaises(OSError),
+            ):
+                launch_process(
+                    receipt=receipt,
+                    label="failed-native",
+                    role="test",
+                    cwd=root,
+                    argv=("worker.exe",),
+                )
+
+            self.assertEqual(1, len(calls))
+            self.assertEqual([], closed)
+            failure = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("failed", failure["status"])
+            self.assertIsNone(failure["child_pid"])
+            self.assertIsNone(failure["cleanup_confirmed"])
+            self.assertEqual(
+                "windows-native-detached-no-wait",
+                failure["ownership_strategy"],
+            )
 
     def test_child_survives_launch_cli_and_receipt_has_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

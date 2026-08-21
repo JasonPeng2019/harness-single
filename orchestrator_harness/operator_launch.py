@@ -231,17 +231,33 @@ def _create_windows_native(
     pid: int | None = None
     created_utc: str | None = None
     command_line = subprocess.list2cmdline(list(argv))
-    process_handle, thread_handle, pid, _thread_id = _winapi.CreateProcess(
-        None,
-        command_line,
-        None,
-        None,
-        False,
-        flags,
-        environment,
-        str(cwd),
-        startup,
-    )
+    try:
+        process_handle, thread_handle, pid, _thread_id = _winapi.CreateProcess(
+            None,
+            command_line,
+            None,
+            None,
+            False,
+            flags,
+            environment,
+            str(cwd),
+            startup,
+        )
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 5:
+            raise
+        flags &= ~_winapi.CREATE_BREAKAWAY_FROM_JOB
+        process_handle, thread_handle, pid, _thread_id = _winapi.CreateProcess(
+            None,
+            command_line,
+            None,
+            None,
+            False,
+            flags,
+            environment,
+            str(cwd),
+            startup,
+        )
     created_utc = _creation_identity(pid)
     assert pid is not None
     assert process_handle is not None and thread_handle is not None
