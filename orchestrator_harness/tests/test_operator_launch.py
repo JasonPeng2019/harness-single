@@ -220,13 +220,67 @@ class OperatorLaunchTests(unittest.TestCase):
             self.assertEqual(1, len(calls))
             self.assertEqual([], closed)
             failure = json.loads(receipt.read_text(encoding="utf-8"))
+            initial_flags = calls[0][5]
+            assert isinstance(initial_flags, int)
             self.assertEqual("failed", failure["status"])
+            self.assertEqual(initial_flags, failure["creationflags"])
             self.assertIsNone(failure["child_pid"])
             self.assertIsNone(failure["cleanup_confirmed"])
             self.assertEqual(
                 "windows-native-detached-no-wait",
                 failure["ownership_strategy"],
             )
+
+    def test_access_denied_fallback_failure_records_effective_flags(self) -> None:
+        winapi = self._windows_api()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            receipt = root / "fallback-failed.json"
+            calls: list[tuple[object, ...]] = []
+            closed: list[object] = []
+
+            def create_process(*args: object) -> object:
+                calls.append(args)
+                raise self._native_error(5 if len(calls) == 1 else 123)
+
+            with (
+                patch.object(winapi, "CreateProcess", side_effect=create_process),
+                patch.object(winapi, "CloseHandle", side_effect=closed.append),
+                patch.object(
+                    operator_launch,
+                    "_creation_identity",
+                    side_effect=AssertionError("identity must not run"),
+                ),
+                patch.dict(operator_launch._DETACHED_RECORDS, {}, clear=True),
+                self.assertRaises(OSError),
+            ):
+                launch_process(
+                    receipt=receipt,
+                    label="fallback-failed",
+                    role="test",
+                    cwd=root,
+                    argv=("worker.exe",),
+                )
+
+            self.assertEqual(2, len(calls))
+            first_flags = calls[0][5]
+            second_flags = calls[1][5]
+            assert isinstance(first_flags, int)
+            assert isinstance(second_flags, int)
+            self.assertEqual(
+                second_flags,
+                first_flags & ~winapi.CREATE_BREAKAWAY_FROM_JOB,
+            )
+            self.assertEqual([], closed)
+            failure = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual("failed", failure["status"])
+            self.assertEqual(second_flags, failure["creationflags"])
+            self.assertEqual(
+                "windows-native-detached-inherited-job-no-wait",
+                failure["ownership_strategy"],
+            )
+            self.assertIsNone(failure["child_pid"])
+            self.assertIsNone(failure["cleanup_confirmed"])
 
     def test_child_survives_launch_cli_and_receipt_has_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

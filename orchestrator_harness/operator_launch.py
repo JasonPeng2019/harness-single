@@ -231,6 +231,19 @@ def _create_windows_native(
     pid: int | None = None
     created_utc: str | None = None
     command_line = subprocess.list2cmdline(list(argv))
+
+    def remember_attempt(exc: OSError) -> None:
+        setattr(exc, "_operator_launch_creationflags", flags)
+        setattr(
+            exc,
+            "_operator_launch_ownership_strategy",
+            (
+                "windows-native-detached-inherited-job-no-wait"
+                if (flags & _winapi.CREATE_BREAKAWAY_FROM_JOB) == 0
+                else "windows-native-detached-no-wait"
+            ),
+        )
+
     try:
         process_handle, thread_handle, pid, _thread_id = _winapi.CreateProcess(
             None,
@@ -244,20 +257,27 @@ def _create_windows_native(
             startup,
         )
     except OSError as exc:
+        remember_attempt(exc)
         if getattr(exc, "winerror", None) != 5:
             raise
         flags &= ~_winapi.CREATE_BREAKAWAY_FROM_JOB
-        process_handle, thread_handle, pid, _thread_id = _winapi.CreateProcess(
-            None,
-            command_line,
-            None,
-            None,
-            False,
-            flags,
-            environment,
-            str(cwd),
-            startup,
-        )
+        try:
+            process_handle, thread_handle, pid, _thread_id = (
+                _winapi.CreateProcess(
+                    None,
+                    command_line,
+                    None,
+                    None,
+                    False,
+                    flags,
+                    environment,
+                    str(cwd),
+                    startup,
+                )
+            )
+        except OSError as retry_exc:
+            remember_attempt(retry_exc)
+            raise
     created_utc = _creation_identity(pid)
     assert pid is not None
     assert process_handle is not None and thread_handle is not None
@@ -398,6 +418,11 @@ def launch_process(
             process_handle = None
         return result
     except Exception as exc:
+        if os.name == "nt":
+            flags = getattr(exc, "_operator_launch_creationflags", flags)
+            ownership_strategy = getattr(
+                exc, "_operator_launch_ownership_strategy", ownership_strategy
+            )
         cleanup_confirmed: bool | None = None
         cleanup_error: str | None = None
         if os.name == "nt" and process_handle is not None and pid is not None:
