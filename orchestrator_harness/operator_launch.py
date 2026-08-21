@@ -354,6 +354,8 @@ def launch_process(
             process_handle, thread_handle, pid, created_utc, flags = (
                 _create_windows_native(argv, cwd_path, inherited_environment)
             )
+            if (flags & _winapi.CREATE_BREAKAWAY_FROM_JOB) == 0:
+                ownership_strategy = "windows-native-detached-inherited-job-no-wait"
         else:
             pid = _spawn_posix_detached(argv, cwd_path, inherited_environment)
             created_utc = _creation_identity(pid)

@@ -179,7 +179,7 @@ class OperatorLaunchTests(unittest.TestCase):
             self.assertEqual(second_flags, result["creationflags"])
             self.assertEqual(second_flags, receipt_value["creationflags"])
             self.assertEqual(
-                "windows-native-detached-no-wait",
+                "windows-native-detached-inherited-job-no-wait",
                 receipt_value["ownership_strategy"],
             )
             self.assertEqual(receipt_value, observed_at_resume)
