@@ -36,6 +36,7 @@ from orchestrator_harness.workspace_overlay import (
     OverlayCollisionError,
     WorkspaceOverlayError,
     ingest_super_cache,
+    install_workspace_rules,
     prepare_worktree,
     restore_worktree,
     verify_overlay_receipt,
@@ -233,6 +234,7 @@ class OverlayModuleTests(unittest.TestCase):
         for role in ("orchestrator", "subagent"):
             target = self.root / f"prepared-{role}"
             target.mkdir()
+            (target / "AGENTS.md").write_text("# Project instructions\n", encoding="utf-8")
             receipt = self.root / f"{role}-receipt.json"
             prepared = prepare_worktree(
                 super_cache=self.cache,
@@ -249,6 +251,24 @@ class OverlayModuleTests(unittest.TestCase):
             self.assertEqual("^(Bash|shell_command)$", hooks["PreToolUse"][0]["matcher"])
             self.assertEqual(15, hooks["PreToolUse"][0]["timeout"])
             self.assertEqual(300, hooks["Stop"][0]["timeout"])
+            agents = (target / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertTrue(agents.startswith("# Project instructions\n"))
+            self.assertIn("BEGIN ORCHESTRATOR-HARNESS LANE RULES", agents)
+            self.assertIn("Work only in this assigned Git worktree", agents)
+
+    def test_install_workspace_rules_preserves_instructions_and_is_idempotent(self) -> None:
+        (self.target / "AGENTS.md").write_text("# Project instructions\n", encoding="utf-8")
+        first = install_workspace_rules(workspace=self.target)
+        self.assertTrue(first["installed"])
+        self.assertFalse(first["idempotent"])
+        agents = (self.target / "AGENTS.md").read_text(encoding="utf-8")
+        quick_rules = (Path(__file__).resolve().parents[2] / "QUICK_RULES.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(agents.startswith("# Project instructions\n"))
+        self.assertIn("BEGIN ORCHESTRATOR-HARNESS QUICK RULES", agents)
+        self.assertIn(quick_rules, agents)
+        self.assertTrue(install_workspace_rules(workspace=self.target)["idempotent"])
 
     def test_prepare_rejects_collision_before_any_mutation(self) -> None:
         cache = self._declared_cache()
@@ -738,6 +758,26 @@ class OverlayCliTests(unittest.TestCase):
         record = emitted[-1]
         self.assertTrue(record["complete"])
         self.assertEqual(b"cli payload\n", (self.target / "file.txt").read_bytes())
+
+    def test_cli_workspace_rules_install(self) -> None:
+        parser = build_parser()
+        parsed = parser.parse_args(
+            ["workspace", "rules", "install", "--workspace", str(self.target)]
+        )
+        self.assertEqual("rules", parsed.workspace_action)
+        self.assertEqual("install", parsed.rules_action)
+        from unittest import mock as _mock
+
+        emitted: list[Any] = []
+
+        with _mock.patch(
+            "orchestrator_harness.cli._print_json", side_effect=emitted.append
+        ):
+            code = cli_main(
+                ["workspace", "rules", "install", "--workspace", str(self.target)]
+            )
+        self.assertEqual(0, code)
+        self.assertTrue(emitted[-1]["installed"])
 
     def test_cli_lane_retire_accepts_overlay_receipt(self) -> None:
         parsed = build_parser().parse_args(

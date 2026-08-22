@@ -1,0 +1,6 @@
+{
+  "schema": "orchestrator-super-cache-control/v1",
+  "append_text": [
+    "AGENTS.md"
+  ]
+}

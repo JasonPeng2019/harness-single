@@ -47,6 +47,52 @@ python -m orchestrator_harness --config local-config/harness.json scan --no-writ
 The complete coding invocation, result, and lock-record shapes are in `examples/`. Paths and Git
 IDs in those static examples are placeholders and must be replaced with facts from the active lane.
 
+## Enable the optional lane features
+
+The harness source directory is not itself a registered Codex, Claude, or Qwen project.  Install
+the Python package into the same `python` command that the provider hooks will use, then prepare
+each actual Git worktree before launching its controller:
+
+```powershell
+$runner = "C:\path\to\firmware-v2-harness-runner"
+$workspace = "C:\path\to\manager-workspace"
+$lane = "C:\path\to\project-worktrees\lane-01"
+
+python -m pip install -e "$runner\orchestrator_harness"
+python -m orchestrator_harness workspace rules install --workspace $workspace
+python -m orchestrator_harness workspace prepare `
+  --super-cache "$runner\super-cache" `
+  --worktree $lane `
+  --role subagent `
+  --receipt "$lane\.agent-workspace\overlay-receipt.json"
+python -m orchestrator_harness adapter install --host codex --project-root $lane
+python -m orchestrator_harness adapter check --host codex --project-root $lane
+```
+
+Use `--role orchestrator` for an orchestrator lane.  Prepare before installing the Codex adapter:
+the cache supplies the base `.codex/hooks.json`, and the adapter installer merges its owned event
+hooks into that file.  The rules command appends the full marked `QUICK_RULES.md` block to the
+manager workspace's `AGENTS.md` once.  The prepared cache installs the finite Stop verifier and
+appends a narrower lane-rules block to each lane's `AGENTS.md`; existing project instructions are
+preserved in both places.  Put the returned receipt in the coding/canonical invocation's
+`overlay_receipt` field.
+Start a fresh provider session after installation so it reloads project hooks.
+
+For Claude or Qwen, use the same preparation command, then change the adapter command to
+`--host claude` or `--host qwen`.  Those installers write their provider-specific project files.
+
+Installing the Codex adapter creates hooks but does not bind them to a manager queue.  At manager
+startup, after creating the real `ManagerEventRouter`, call
+`activate_codex_binding(project_root, router)`.  That one setup-time call persists the exact queue
+and coordinator identity for the installed project hooks; it is not a polling loop and does not
+acknowledge work.  The installed PostToolUse and Stop hooks then use that binding at their safe
+boundaries.
+
+Firmware mode has no generic enable command.  Before a firmware operation, the owning manager must
+provide its real board/resource identity, policy authorization and lease path, MCP transport, and a
+caller-declared `FirmwareCampaignPack`/`FirmwareHardwareAdapter`.  This prevents a generic coding
+setup from silently claiming a physical resource or inventing hardware permission.
+
 ## Public release surface
 
 The supported launch journey is the operator boundary followed by the native lane-controller

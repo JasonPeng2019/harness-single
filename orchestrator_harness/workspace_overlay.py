@@ -21,14 +21,13 @@ import os
 import stat
 import uuid
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping
 
 from .models import iso_utc, utc_now
 from .mutation import (
-    MutationConflict,
     MutationError,
-    MutationUnsupported,
     TargetState,
     append_bytes as mutation_append_bytes,
     capture_target,
@@ -47,6 +46,8 @@ SUPER_CACHE_NAME = "super-cache"
 DECLARATION_NAME = ".super-cache.json"
 SUPPORTED_ROLES = frozenset({"orchestrator", "subagent"})
 _APPLIED_OPERATIONS = frozenset({"create_dir", "merge_dir", "create_file", "append"})
+WORKSPACE_RULES_BEGIN = "<!-- BEGIN ORCHESTRATOR-HARNESS QUICK RULES -->"
+WORKSPACE_RULES_END = "<!-- END ORCHESTRATOR-HARNESS QUICK RULES -->"
 
 
 class WorkspaceOverlayError(ValueError):
@@ -83,6 +84,76 @@ def _regular_directory(value: str | Path, *, name: str) -> Path:
 
 def _path_identity(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _workspace_rules_block() -> bytes:
+    """Return the packaged full rules block for a manager workspace."""
+
+    try:
+        rules = files("orchestrator_harness.assets.rules").joinpath(
+            "quick_rules.md"
+        ).read_bytes()
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        raise WorkspaceOverlayError("packaged workspace rules are unavailable") from exc
+    return (
+        f"{WORKSPACE_RULES_BEGIN}\n".encode("utf-8")
+        + rules.rstrip(b"\r\n")
+        + f"\n{WORKSPACE_RULES_END}\n".encode("utf-8")
+    )
+
+
+def install_workspace_rules(*, workspace: str | Path) -> dict[str, Any]:
+    """Append the packaged manager rules to one workspace's ``AGENTS.md`` once.
+
+    Existing workspace instructions remain byte-for-byte intact.  A current
+    managed block makes the operation idempotent; a partial or locally edited
+    managed block is rejected rather than overwritten.
+    """
+
+    root = _regular_directory(workspace, name="workspace")
+    agents = root / "AGENTS.md"
+    if _is_reparse(agents) or (agents.exists() and not agents.is_file()):
+        raise WorkspaceOverlayError("workspace AGENTS.md must be a regular file")
+    try:
+        existing = agents.read_bytes() if agents.exists() else b""
+        existing.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkspaceOverlayError("workspace AGENTS.md must be readable UTF-8") from exc
+    block = _workspace_rules_block()
+    begin = WORKSPACE_RULES_BEGIN.encode("utf-8")
+    end = WORKSPACE_RULES_END.encode("utf-8")
+    begin_count = existing.count(begin)
+    end_count = existing.count(end)
+    if begin_count or end_count:
+        if begin_count != 1 or end_count != 1 or block not in existing:
+            raise WorkspaceOverlayError(
+                "workspace AGENTS.md contains a modified or incomplete managed rules block"
+            )
+        return {
+            "schema": "orchestrator-workspace-rules-install/v1",
+            "workspace": str(root),
+            "agents_path": str(agents),
+            "installed": True,
+            "idempotent": True,
+        }
+    separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
+    payload = existing + separator + (b"\n" if existing else b"") + block
+    try:
+        mutation_replace(
+            root,
+            "AGENTS.md",
+            payload,
+            expected=capture_target(root, "AGENTS.md"),
+        )
+    except (MutationError, OSError) as exc:
+        raise WorkspaceOverlayError(f"could not install workspace rules: {exc}") from exc
+    return {
+        "schema": "orchestrator-workspace-rules-install/v1",
+        "workspace": str(root),
+        "agents_path": str(agents),
+        "installed": True,
+        "idempotent": False,
+    }
 
 
 def _walk_contents(root: Path) -> list[tuple[str, str]]:
@@ -135,7 +206,7 @@ def _verify_contents_match(source: Path, mirror: Path) -> None:
             "refreshed cache does not match the supplied folder structure"
         )
     for (relative, kind), (mirror_relative, mirror_kind) in zip(
-        source_entries, mirror_entries
+        source_entries, mirror_entries, strict=True
     ):
         if relative != mirror_relative or kind != mirror_kind:
             raise WorkspaceOverlayError(
