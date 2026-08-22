@@ -1,0 +1,54 @@
+{
+  "description": "Portable, repository-local Codex context and command safeguards.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; bash \"$r/.agent/hooks.sh\" session-start",
+            "commandWindows": "$payload=[Console]::In.ReadToEnd(); $data=$null; try { $data=$payload | ConvertFrom-Json } catch {}; $start=if ($data -and $data.cwd) { [string]$data.cwd } else { (Get-Location).Path }; $root=(& git -C $start rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or -not $root) { exit 0 }; $payload | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path ([string]$root.Trim()) '.agent/hooks.ps1') session-start; exit $LASTEXITCODE",
+            "timeout": 15,
+            "additionalContextLimit": 1800,
+            "statusMessage": "Loading portable workflow context"
+          },
+          {
+            "type": "command",
+            "command": "r=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; AGENT_STOP_GATE_ENABLED=1 bash \"$r/.agent/stop-verify.sh\" session-start",
+            "commandWindows": "$payload=[Console]::In.ReadToEnd(); $data=$null; try { $data=$payload | ConvertFrom-Json } catch {}; $start=if ($data -and $data.cwd) { [string]$data.cwd } else { (Get-Location).Path }; $root=(& git -C $start rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or -not $root) { exit 0 }; $env:AGENT_STOP_GATE_ENABLED='1'; $payload | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path ([string]$root.Trim()) '.agent/stop-verify.ps1') session-start; exit $LASTEXITCODE",
+            "timeout": 15,
+            "statusMessage": "Capturing Stop-verification baseline"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|shell_command)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; bash \"$r/.agent/hooks.sh\" pre-tool-use",
+            "commandWindows": "$payload=[Console]::In.ReadToEnd(); $data=$null; try { $data=$payload | ConvertFrom-Json } catch {}; $start=if ($data -and $data.cwd) { [string]$data.cwd } else { (Get-Location).Path }; $root=(& git -C $start rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or -not $root) { exit 0 }; $payload | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path ([string]$root.Trim()) '.agent/hooks.ps1') pre-tool-use; exit $LASTEXITCODE",
+            "timeout": 15,
+            "statusMessage": "Checking command scope"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "r=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; AGENT_STOP_GATE_ENABLED=1 bash \"$r/.agent/stop-verify.sh\" stop",
+            "commandWindows": "$payload=[Console]::In.ReadToEnd(); $data=$null; try { $data=$payload | ConvertFrom-Json } catch {}; $start=if ($data -and $data.cwd) { [string]$data.cwd } else { (Get-Location).Path }; $root=(& git -C $start rev-parse --show-toplevel 2>$null); if ($LASTEXITCODE -ne 0 -or -not $root) { exit 0 }; $env:AGENT_STOP_GATE_ENABLED='1'; $payload | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path ([string]$root.Trim()) '.agent/stop-verify.ps1') stop; exit $LASTEXITCODE",
+            "timeout": 300,
+            "statusMessage": "Verifying eligible session changes"
+          }
+        ]
+      }
+    ]
+  }
+}

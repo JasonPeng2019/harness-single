@@ -35,6 +35,11 @@ from orchestrator_harness.processes import (
 )
 from orchestrator_harness.public_launch import launch_lane_controller
 from orchestrator_harness.tests.wsl_identity import validate_cross_os_identity_relation
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SUPPORT = Path(__file__).resolve().parent / "support"
@@ -1377,6 +1382,20 @@ def _make_invocation(
 ) -> Path:
     workspace = repo / ".agent-workspace"
     workspace.mkdir(exist_ok=True)
+    overlay_source = runtime / "overlay-source"
+    overlay_source.mkdir(exist_ok=True)
+    overlay_harness = runtime / "overlay-harness"
+    overlay_harness.mkdir(exist_ok=True)
+    ingest_super_cache(
+        source_folder=overlay_source, harness_worktree=overlay_harness
+    )
+    overlay_receipt = workspace / "overlay-receipt.json"
+    prepare_worktree(
+        super_cache=overlay_harness / SUPER_CACHE_NAME,
+        target_worktree=repo,
+        role="subagent",
+        receipt_path=overlay_receipt,
+    )
     status = workspace / "real_agent_controller.status.json"
     invocation = {
         "schema": "orchestrator-coding-invocation/v1",
@@ -1404,6 +1423,7 @@ def _make_invocation(
         "task": "Complete the public real-agent release route in the synthetic repository",
         "phase": "public-route",
         "exclusive_resources": [],
+        "overlay_receipt": str(overlay_receipt),
         "codex": {
             "command": provider_command,
             "model": "gpt-5.6-terra",

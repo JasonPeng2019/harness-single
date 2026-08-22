@@ -931,6 +931,17 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertEqual("LAUNCH_FAILED", status["state"])
         self.assertIn("role", str(status["error"]))
 
+    def test_prelaunch_verification_rejects_missing_receipt_before_process_start(
+        self,
+    ) -> None:
+        path = self._invocation(None)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(1, controller.main([str(path)]))
+        self.assertFalse(self.capture.exists(), "provider process must never start")
+        status = self._status()
+        self.assertEqual("LAUNCH_FAILED", status["state"])
+        self.assertIn("requires an overlay receipt", str(status["error"]))
+
     def test_prelaunch_verification_allows_completed_matching_receipt(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
         path = self._invocation(receipt)
@@ -940,6 +951,15 @@ class OverlayLaneSeamTests(unittest.TestCase):
         status = self._status()
         self.assertTrue(status.get("overlay_receipt_verified"))
         self.assertEqual(str(receipt), status.get("overlay_receipt"))
+        self.assertNotIn("prepared_stop_hook", status)
+
+    def test_prepared_lane_leaves_cache_hooks_to_native_codex(self) -> None:
+        receipt = self._prepare_overlay(role="subagent")
+        path = self._invocation(receipt)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(0, controller.main([str(path)]))
+        status = self._status()
+        self.assertNotIn("prepared_stop_hook", status)
 
     def test_retirement_restores_prepared_overlay_and_records_restoration(self) -> None:
         receipt = self._prepare_overlay(role="subagent")

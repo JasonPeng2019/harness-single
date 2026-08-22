@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.agent/hooks.sh\" session-start",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "AGENT_STOP_GATE_ENABLED=1 bash \"$CLAUDE_PROJECT_DIR/.agent/stop-verify.sh\" session-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.agent/hooks.sh\" pre-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENT_STOP_GATE_ENABLED=1 bash \"$CLAUDE_PROJECT_DIR/.agent/stop-verify.sh\" stop",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

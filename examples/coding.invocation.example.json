@@ -20,6 +20,7 @@
     "last_message": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_last_message.txt"
   },
   "event_log_path": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/LANE_EVENTS.jsonl",
+  "overlay_receipt": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/overlay-receipt.json",
   "lane_id": "parser",
   "worker_invocation_id": "parser-001",
   "task": "Implement the parser and focused tests",

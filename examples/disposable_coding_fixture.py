@@ -31,6 +31,11 @@ from orchestrator_harness.processes import (
     targeted_process_query,
 )
 from orchestrator_harness.public_launch import launch_lane_controller
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 FIXTURE_RESOURCE = "service:fixture-database"
 FIXTURE_CONTROLLER_COMPLETION_SECONDS = 120
@@ -191,6 +196,21 @@ def _invocation(
     )
     branch = _git(worktree, "branch", "--show-current")
     worker_id = worker_invocation_id or f"{lane}-001"
+    overlay_root = runtime / "overlays" / worker_id
+    overlay_source = overlay_root / "source"
+    overlay_source.mkdir(parents=True, exist_ok=True)
+    overlay_harness = overlay_root / "harness"
+    overlay_harness.mkdir(parents=True, exist_ok=True)
+    ingest_super_cache(
+        source_folder=overlay_source, harness_worktree=overlay_harness
+    )
+    overlay_receipt = workspace / "overlay-receipt.json"
+    prepare_worktree(
+        super_cache=overlay_harness / SUPER_CACHE_NAME,
+        target_worktree=worktree,
+        role="subagent",
+        receipt_path=overlay_receipt,
+    )
     invocation = {
         "schema": "orchestrator-coding-invocation/v1",
         "action": "start",
@@ -218,6 +238,7 @@ def _invocation(
         "task": f"Disposable {lane} coding work",
         "phase": "merge" if lane == "merge" else "implementation",
         "exclusive_resources": [] if lane == "merge" else [FIXTURE_RESOURCE],
+        "overlay_receipt": str(overlay_receipt),
         "codex": {
             "command": [
                 sys.executable,

@@ -59,6 +59,10 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
         )
         self.assertEqual("orchestrator-coding-invocation/v1", invocation["schema"])
         self.assertIn("exclusive_resources", invocation)
+        self.assertEqual(
+            "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/overlay-receipt.json",
+            invocation["overlay_receipt"],
+        )
         self.assertNotIn("mcp_servers", invocation)
         self.assertNotIn("board_tokens", invocation)
 

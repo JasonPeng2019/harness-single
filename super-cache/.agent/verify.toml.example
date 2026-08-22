@@ -1,0 +1,8 @@
+# Optional repository-owned verification commands.
+# Copy to .agent/verify.toml and replace the examples. The agent reads this file;
+# the portable workflow does not install or invent the named tools.
+
+[verify]
+focused = ["replace with a focused changed-behavior command"]
+relevant = ["replace with the owning package/subsystem command"]
+full = ["replace with the repository's authoritative full gate"]

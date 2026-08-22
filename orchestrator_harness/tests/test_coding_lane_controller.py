@@ -14,6 +14,11 @@ from unittest.mock import patch
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.tests.support import TemporaryGitRepository
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 FAKE_CODEX = r"""
@@ -45,6 +50,19 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.fake = self.root / "fake_codex.py"
         self.fake.write_text(FAKE_CODEX, encoding="utf-8")
         self.capture = self.root / "argv.json"
+        self.cache_root = self.root / "cache"
+        self.cache_root.mkdir()
+        source = self.root / "overlay-source"
+        source.mkdir()
+        (source / "cache-marker.txt").write_text("prepared\n", encoding="utf-8")
+        ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
+        self.overlay_receipt = self.workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=self.cache_root / SUPER_CACHE_NAME,
+            target_worktree=self.run_root,
+            role="subagent",
+            receipt_path=self.overlay_receipt,
+        )
 
     def tearDown(self) -> None:
         for key in (
@@ -79,6 +97,7 @@ class CodingLaneControllerTests(unittest.TestCase):
             "prompt_sha256": hashlib.sha256(self.prompt.read_bytes()).hexdigest(),
             "output_paths": outputs,
             "resources": ["workspace"],
+            "overlay_receipt": str(self.overlay_receipt),
             "repository": self.repository.declaration(),
             "codex": {
                 "model": "gpt-5.6-codex",

@@ -43,6 +43,11 @@ from orchestrator_harness.lane_lifecycle import (
 )
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 class S4ContractTests(unittest.TestCase):
@@ -401,6 +406,20 @@ class S4ContractTests(unittest.TestCase):
 
         workspace = lane / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
+        overlay_source = root / f"{lane_id.replace(':', '-')}-overlay-source"
+        overlay_source.mkdir()
+        overlay_harness = root / f"{lane_id.replace(':', '-')}-overlay-harness"
+        overlay_harness.mkdir()
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        overlay_receipt = workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=lane,
+            role="subagent",
+            receipt_path=overlay_receipt,
+        )
         common = Path(
             subprocess.run(
                 ["git", "-C", str(lane), "rev-parse", "--git-common-dir"],
@@ -463,6 +482,7 @@ class S4ContractTests(unittest.TestCase):
             "phase": "repair",
             "prompt_path": str(prompt),
             "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            "overlay_receipt": str(overlay_receipt),
             "output_paths": {
                 "status": str(status),
                 "jsonl": str(workspace / "controller.jsonl"),
@@ -550,6 +570,48 @@ class S4ContractTests(unittest.TestCase):
             result = uninstall_codex_adapter(project)
             self.assertIn(b"UserHook", hooks.read_bytes())
             self.assertNotIn(".codex/hooks.json", result["preserved_modified"])
+
+    def test_S4_CODEX_INSTALL_UPGRADES_V3_NATIVE_HOOKS_001(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            project.mkdir()
+            install_codex_adapter(project)
+            hooks_path = project / ".codex" / "hooks.json"
+            manifest_path = project / ".codex" / "orchestrator-harness-adapter.json"
+            legacy_fragment = codex_adapter._legacy_v3_managed_hook_fragment()
+            legacy_hooks = codex_adapter._json_bytes({"hooks": legacy_fragment})
+            hooks_path.write_bytes(legacy_hooks)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["package_revision"] = "codex-assets-v3"
+            manifest["managed_hook_fragment"] = legacy_fragment
+            manifest["managed_hook_fragment_sha256"] = codex_adapter._fragment_digest(
+                legacy_fragment
+            )
+            manifest["installed_content_sha256"][".codex/hooks.json"] = (
+                codex_adapter._hash(legacy_hooks)
+            )
+            manifest["manifest_content_sha256"] = codex_adapter._manifest_content_digest(
+                manifest
+            )
+            manifest_path.write_bytes(codex_adapter._json_bytes(manifest))
+
+            upgraded = install_codex_adapter(project, upgrade=True)
+
+            self.assertTrue(upgraded["current"])
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertIn(
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+                            "type": "command",
+                        }
+                    ],
+                },
+                hooks["hooks"]["PostToolUse"],
+            )
+            self.assertFalse(any("id" in entry for entry in hooks["hooks"]["PostToolUse"]))
 
     def test_S4_NONPREEMPTIVE_DELIVERY_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -785,6 +847,7 @@ class S4ContractTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane_workspace / "overlay-receipt.json",
                 )
             self.assertEqual("CLOSED", result.outcome)
             self.assertFalse(lane.exists())

@@ -2,23 +2,23 @@
   "hooks": {
     "PostToolUse": [
       {
-        "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
-        "id": "orchestrator-harness-post-tool-use",
-        "type": "command"
-      }
-    ],
-    "PreToolUse": [
-      {
-        "command": "python .codex/hooks/orchestrator_harness_bounded_policy.py",
-        "id": "orchestrator-harness-bounded-policy",
-        "type": "command"
+        "matcher": ".*",
+        "hooks": [
+          {
+            "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+            "type": "command"
+          }
+        ]
       }
     ],
     "Stop": [
       {
-        "command": "python .codex/hooks/orchestrator_harness_stop.py",
-        "id": "orchestrator-harness-stop",
-        "type": "command"
+        "hooks": [
+          {
+            "command": "python .codex/hooks/orchestrator_harness_stop.py",
+            "type": "command"
+          }
+        ]
       }
     ]
   }

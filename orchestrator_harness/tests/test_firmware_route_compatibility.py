@@ -13,6 +13,11 @@ from orchestrator_harness.tests.support import (
     TemporaryGitRepository,
     write_json,
 )
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 class FirmwareRouteCompatibilityTests(unittest.TestCase):
@@ -145,6 +150,20 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
         runtime_root.mkdir()
         prompt = coding_root / "prompt.md"
         prompt.write_text("Coding task.\n", encoding="utf-8")
+        overlay_source = self.root / "overlay-source"
+        overlay_source.mkdir()
+        overlay_harness = self.root / "overlay-harness"
+        overlay_harness.mkdir()
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        overlay_receipt = workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=coding_root,
+            role="subagent",
+            receipt_path=overlay_receipt,
+        )
         value: dict[str, object] = {
             "schema": controller.CODING_INVOCATION_SCHEMA,
             "action": "start",
@@ -164,6 +183,7 @@ class FirmwareRouteCompatibilityTests(unittest.TestCase):
                 "last_message": str(workspace / "last-message.txt"),
             },
             "exclusive_resources": ["service:parser"],
+            "overlay_receipt": str(overlay_receipt),
             "repository": repository.declaration(),
             "codex_settings": {
                 "model": "gpt-5.6-terra",

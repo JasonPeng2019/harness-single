@@ -12,6 +12,7 @@ session/redacted provenance.  Only deterministic fake CLI fixtures are used.
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -228,6 +229,19 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
             claude.parse_transcript_line(
                 b'{"type":"system","subtype":"init","session_id":"session-1"}'
             ).kind,  # type: ignore[union-attr]
+        )
+
+    def test_codex_keeps_user_configuration_for_a_prepared_overlay(self) -> None:
+        codex = CodexProviderAdapter()
+        project_root = Path("/prepared/subagent-worktree")
+        argv = codex.build_argv(
+            _spec(trusted_project_root=project_root)
+        )
+
+        self.assertNotIn("--ignore-user-config", argv)
+        self.assertIn("--dangerously-bypass-hook-trust", argv)
+        self.assertIn(
+            f'projects.{json.dumps(str(project_root))}.trust_level="trusted"', argv
         )
 
     def test_foreign_adapter_registers_and_is_selectable_without_core_edits(

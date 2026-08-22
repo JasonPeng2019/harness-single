@@ -20,6 +20,11 @@ from orchestrator_harness.handoff_preflight import (
     preflight_handoff,
 )
 from orchestrator_harness.tests.support import TemporaryGitRepository, write_json
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 def _failed_predicates(result: Mapping[str, object]) -> set[str]:
@@ -52,6 +57,20 @@ class HandoffPreflightTests(unittest.TestCase):
         self.starting_commit = self.repository.head
         self.workspace = self.worktree / ".agent-workspace"
         _ = self.workspace.mkdir()
+        overlay_source = self.root / "overlay-source"
+        overlay_source.mkdir()
+        overlay_harness = self.root / "overlay-harness"
+        overlay_harness.mkdir()
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        self.overlay_receipt = self.workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=self.worktree,
+            role="subagent",
+            receipt_path=self.overlay_receipt,
+        )
         self.task_card_path = self.root / "TASK_CARD.json"
         self.invocation_path = self.workspace / "INVOCATION.json"
         self.result_path = self.workspace / "RESULT.json"
@@ -101,6 +120,7 @@ class HandoffPreflightTests(unittest.TestCase):
             "prompt_sha256": hashlib.sha256(self.prompt_path.read_bytes()).hexdigest(),
             "output_paths": self.output_paths,
             "resources": [],
+            "overlay_receipt": str(self.overlay_receipt),
             "repository": {
                 **self.repository.declaration(),
                 "base_commit": self.starting_commit,

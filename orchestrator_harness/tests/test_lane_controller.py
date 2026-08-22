@@ -7,9 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import orchestrator_harness.lane_controller as controller
+from orchestrator_harness.lane_lifecycle import _helper_records
 from orchestrator_harness.config import load_config
 from orchestrator_harness.discovery import discover_suite
 
@@ -22,6 +24,8 @@ prompt=sys.stdin.read()
 if not prompt.startswith('## AUTHORITATIVE ZERO-OPERATOR OVERRIDE\n'): raise SystemExit(92)
 capture=os.environ.get('LANE_FAKE_CAPTURE')
 if capture: open(capture,'w',encoding='utf-8').write(json.dumps(argv))
+cwd_capture=os.environ.get('LANE_FAKE_CWD_CAPTURE')
+if cwd_capture: open(cwd_capture,'w',encoding='utf-8').write(os.getcwd())
 if os.environ.get('LANE_FAKE_NO_THREAD') != '1':
  print(json.dumps({'type':'thread.started','thread_id':'fake-thread'}), flush=True)
 print(json.dumps({'type':'turn.completed'}), flush=True)
@@ -72,6 +76,7 @@ class LaneControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         controller.__file__ = self.old_file
         os.environ.pop("LANE_FAKE_CAPTURE", None)
+        os.environ.pop("LANE_FAKE_CWD_CAPTURE", None)
         os.environ.pop("LANE_FAKE_NO_THREAD", None)
         self.temporary.cleanup()
 
@@ -138,7 +143,7 @@ class LaneControllerTests(unittest.TestCase):
         self.assertIsInstance(status["codex_pid"], int)
         argv = json.loads(self.capture.read_text(encoding="utf-8"))
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
-        self.assertIn("--ignore-user-config", argv)
+        self.assertNotIn("--ignore-user-config", argv)
         self.assertIn("--skip-git-repo-check", argv)
         self.assertIn('approval_policy="never"', argv)
         self.assertIn('approvals_reviewer="user"', argv)
@@ -151,6 +156,43 @@ class LaneControllerTests(unittest.TestCase):
         )
         records = discover_suite(load_config(config_path, harness_root=self.harness))
         self.assertEqual("fake", records[0].controllers[0].label)
+
+    def test_start_uses_the_lane_worktree_as_provider_cwd(self) -> None:
+        cwd_capture = self.root / "provider-cwd.txt"
+        os.environ["LANE_FAKE_CWD_CAPTURE"] = str(cwd_capture)
+
+        self.assertEqual(0, controller.main([str(self.invocation())]))
+
+        self.assertEqual(
+            str(self.run.resolve()), cwd_capture.read_text(encoding="utf-8")
+        )
+
+    def test_helper_record_names_distinguish_reused_pids(self) -> None:
+        first = controller.ProcessInfo(
+            18828,
+            1,
+            "helper",
+            "first-helper",
+            datetime(2026, 8, 22, 21, 22, 42, 179483, tzinfo=timezone.utc),
+        )
+        second = controller.ProcessInfo(
+            18828,
+            1,
+            "helper",
+            "second-helper",
+            datetime(2026, 8, 22, 21, 23, 13, 358851, tzinfo=timezone.utc),
+        )
+
+        records = _helper_records(
+            [
+                controller._owned_helper_record(first),
+                controller._owned_helper_record(second),
+            ]
+        )
+
+        self.assertEqual(2, len(records))
+        self.assertNotEqual(records[0]["name"], records[1]["name"])
+        self.assertEqual([18828, 18828], [record["pid"] for record in records])
 
     def test_resume_reuses_persisted_thread(self) -> None:
         self.assertEqual(0, controller.main([str(self.invocation())]))

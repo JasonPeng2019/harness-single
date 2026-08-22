@@ -1,0 +1,8 @@
+{
+  "schema": "portable-bounded-launchers/v1",
+  "launcher_categories": {
+    "python_script": ["python", "python3", "py"],
+    "powershell_file": ["powershell", "pwsh"],
+    "posix_shell": ["bash", "sh", "zsh"]
+  }
+}

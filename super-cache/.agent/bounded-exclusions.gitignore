@@ -1,0 +1,4 @@
+# Paths are relative to the repository root. Git-ignore syntax applies.
+# The bounded launchers must be callable so they can supervise their inner command.
+.agent/run-bounded.ps1
+.agent/run-bounded.sh

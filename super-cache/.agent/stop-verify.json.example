@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "source_extensions": [".py"],
+  "commands": [
+    ["ruff", "check", "{files}"],
+    ["pyright", "{files}"]
+  ],
+  "full_commands": [
+    ["ruff", "check", "."],
+    ["pyright"]
+  ],
+  "expected_upper_bound_seconds": 60,
+  "cleanup_allowance_seconds": 15,
+  "heartbeat_interval_seconds": 15,
+  "timeout_basis": "Measured repository checks; the Stop hook has a 300-second ceiling."
+}

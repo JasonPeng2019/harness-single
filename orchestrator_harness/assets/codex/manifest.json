@@ -33,6 +33,6 @@
       "sha256": "1e6d5a6f2c87ea9cdb3699cf4b63aa65bb21a356f135f8304a63f76e2249811f"
     }
   ],
-  "package_revision": "codex-assets-v3",
+  "package_revision": "codex-assets-v4",
   "schema": "orchestrator-codex-adapter/v1"
 }

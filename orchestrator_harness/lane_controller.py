@@ -1004,6 +1004,21 @@ def _command_tail(command_line: str) -> str:
     return " ".join(parts[1].split()) if len(parts) == 2 else ""
 
 
+def _owned_helper_record(item: ProcessInfo) -> dict[str, Any]:
+    """Build a unique lifecycle helper record from the exact OS identity."""
+
+    created_utc = iso_utc(item.created_utc)
+    if created_utc is None:
+        raise InvocationError("owned helper creation time is missing")
+    return {
+        "name": f"helper-{item.pid}-{created_utc}",
+        "identity": {
+            "pid": item.pid,
+            "created_utc": created_utc,
+        },
+    }
+
+
 def _is_launcher_descendant(
     item: ProcessInfo,
     parent: ProcessInfo,
@@ -1602,6 +1617,12 @@ def _provider_launch_spec(
             session_id=session_id,
             run_root=invocation.run_root,
             last_message_path=invocation.last_message_path,
+            trusted_project_root=(
+                invocation.run_root
+                if invocation.invocation_schema is not None
+                and invocation.overlay_receipt is not None
+                else None
+            ),
             config_overrides=tuple(invocation.config_overrides),
             sandbox=invocation.sandbox,
             approval_policy=invocation.approval_policy,
@@ -2841,6 +2862,14 @@ def run(invocation: Invocation) -> int:
                         "cleared_variable_names": cleared,
                     }
             if argv is not None:
+                if (
+                    invocation.invocation_schema is not None
+                    and invocation.overlay_receipt is None
+                ):
+                    raise InvocationError(
+                        "coding/subagent launch requires an overlay receipt prepared "
+                        "for its identified worktree"
+                    )
                 if invocation.overlay_receipt is not None:
                     state["overlay_receipt"] = str(invocation.overlay_receipt)
                     overlay_verification = verify_overlay_receipt(
@@ -3028,15 +3057,7 @@ def run(invocation: Invocation) -> int:
                 provider_root_pid=state.get("provider_pid"),
             ):
                 continue
-            owned_helpers.append(
-                {
-                    "name": f"helper-{item.pid}",
-                    "identity": {
-                        "pid": item.pid,
-                        "created_utc": iso_utc(item.created_utc),
-                    },
-                }
-            )
+            owned_helpers.append(_owned_helper_record(item))
         state["owned_helpers"] = owned_helpers
         if not release_safe:
             state.update(

@@ -12,6 +12,11 @@ from unittest import mock
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.models import ProcessInfo
 from orchestrator_harness.resource_locks import ResourceClaims, claim_filename
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
@@ -54,13 +59,30 @@ class ReapedAfterKillChild(UnreapableChild):
 class ControllerLockCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.overlay_temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         self.runtime = self.root / "runtime"
         self.runtime.mkdir()
+        overlay_root = Path(self.overlay_temporary.name)
+        overlay_source = overlay_root / "source"
+        overlay_source.mkdir()
+        overlay_harness = overlay_root / "harness"
+        overlay_harness.mkdir()
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        self.overlay_receipt = self.workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=self.root,
+            role="subagent",
+            receipt_path=self.overlay_receipt,
+        )
 
     def tearDown(self) -> None:
+        self.overlay_temporary.cleanup()
         self.temporary.cleanup()
 
     def invocation(self) -> controller.Invocation:
@@ -101,6 +123,7 @@ class ControllerLockCleanupTests(unittest.TestCase):
             self.workspace / "stderr.log",
             self.workspace / "last-message.txt",
             self.runtime / "events.jsonl",
+            overlay_receipt=self.overlay_receipt,
         )
 
     def test_unproven_child_shutdown_retains_owned_claim(self) -> None:

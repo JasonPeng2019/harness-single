@@ -70,6 +70,11 @@ from orchestrator_harness.stable_io import (
     PathKeyedAppendLock,
     SafeOutput,
 )
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 from orchestrator_harness import codex_adapter, lane_lifecycle
 
 
@@ -175,6 +180,20 @@ class S4RepairRegressionTests(unittest.TestCase):
 
         workspace = lane / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
+        overlay_source = root / f"{lane_id.replace(':', '-')}-overlay-source"
+        overlay_source.mkdir(exist_ok=True)
+        overlay_harness = root / f"{lane_id.replace(':', '-')}-overlay-harness"
+        overlay_harness.mkdir(exist_ok=True)
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        overlay_receipt = workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=lane,
+            role="subagent",
+            receipt_path=overlay_receipt,
+        )
         bound_worktree = lane
         common = Path(cls._git(lane, "rev-parse", "--git-common-dir"))
         if not common.is_absolute():
@@ -234,6 +253,7 @@ class S4RepairRegressionTests(unittest.TestCase):
             "phase": "repair",
             "prompt_path": str(prompt),
             "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            "overlay_receipt": str(overlay_receipt),
             "output_paths": {
                 "status": str(status),
                 "jsonl": str(workspace / "controller.jsonl"),

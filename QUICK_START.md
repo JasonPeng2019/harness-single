@@ -12,6 +12,82 @@ git worktree add -b lane/api ..\project-worktrees\api <base-commit>
 Do not switch branches in an active lane worktree. A later split starts only after the parent lane
 commits; every child branches from that exact commit.
 
+### Root-restricted campaign bootstrap
+
+When the campaign coordinator is prohibited from entering the experiment tree, it must not create
+the worktree, task card, invocation, or overlay receipt itself. Write the bootstrap manifest and its
+result/launch receipts outside that tree, then use the public operator boundary to run the one-shot
+preparation process:
+
+```powershell
+python -m orchestrator_harness.operator_launch `
+  --receipt <runtime>/bootstrap-operator-launch.json `
+  --label coding-lane-bootstrap `
+  --role coding-lane-bootstrap `
+  --cwd <harness-root> `
+  -- python -m orchestrator_harness.lane_bootstrap <outside-fresh-manifest.json> `
+     --result <runtime>/bootstrap-result.json
+```
+
+The manifest identifies the source Git root/base/branch, `experiment_root`, canonical mapping plus
+workflow role, lane ID, worktree name, task card, resource claims, prompt, non-provider launch
+options, and runtime root. The
+bootstrap process creates only the declared linked worktree beneath
+`experiment_root/worktrees/`, its completed overlay receipt, dispatch artifacts, and controller
+invocation. It does not launch a provider, controller, MCP server, or hardware action. Read the
+result outside the experiment tree, admit that exact invocation, then use the normal public
+operator/controller launch below.
+
+For a board-free `ROLE_CHECKER` readiness lane only, a manifest may include an explicit untracked
+source candidate:
+
+```json
+"source_snapshot": {
+  "source_root": "C:/source-repository/Firmware/app",
+  "allowed_root": "C:/source-repository",
+  "exclude_paths": ["build"]
+}
+```
+
+`source_root` must be below `allowed_root` (which defaults to `source_repository_root`); each
+exclusion is a relative descendant path. Use an explicit `allowed_root` when a committed lane base
+and an untracked candidate belong to different repositories. Bootstrap copies that exact content
+only to `.agent-workspace/source-snapshot`, writes a complete file-hash manifest beside it, and
+returns its digest, file count, and byte count in the outside-tree receipt. The original checkout is
+never staged, committed, or changed. This is read-only readiness evidence, not a committed candidate
+and not authorization for a build, source edit, flash, MCP, or hardware action.
+
+If bootstrap fails after creating a worktree, do not remove it directly. Use the same outside-tree
+manifest through the public operator boundary with `--cleanup` and a new result path. The cleanup
+mode reads that exact worktree's porcelain status and removes it only when there are no tracked or
+untracked changes:
+
+```powershell
+python -m orchestrator_harness.operator_launch `
+  --receipt <runtime>/cleanup-operator-launch.json `
+  --label coding-lane-bootstrap-cleanup `
+  --role coding-lane-bootstrap-cleanup `
+  --cwd <harness-root> `
+  -- python -m orchestrator_harness.lane_bootstrap <outside-fresh-manifest.json> `
+     --cleanup --result <runtime>/cleanup-result.json
+```
+
+When ROOT cannot read the experiment tree, export the controller status and worker result through
+the same public boundary. The exporter refuses an output beneath that tree:
+
+```powershell
+python -m orchestrator_harness.operator_launch `
+  --receipt <runtime>/status-export-operator-launch.json `
+  --label lane-status-export `
+  --role lane-status-export `
+  --cwd <harness-root> `
+  -- python -m orchestrator_harness.lane_status_export <lane-invocation.json> `
+     --result <runtime>/status-export.json
+```
+
+Use `LANE-EXEC-*` only for `ROLE_EXECUTOR`; a non-executor role uses its own stable lane ID and
+resolves directly through the canonical mapping.
+
 ## 2. Configure discovery
 
 ```powershell
@@ -67,6 +143,11 @@ Repeat after timeouts. Never poll worker transcripts or add a relay as an altern
 Workers may update `.agent-workspace/PARALLEL_CHECKPOINT.md` during progress. Completion requires a
 clean committed branch plus `.agent-workspace/RESULT.json` matching
 `examples/coding.result.example.json`. The commit must be the current branch tip.
+The terminal result must be written exactly at `.agent-workspace/RESULT.json`; never write a bare
+`RESULT.json` at a worktree or experiment root. Start from the workspace-local
+`.agent-workspace/RESULT_TEMPLATE.json` when the runner bootstrap provides it.
+Terminal outcomes are `PASS`, `FAIL`, or `BLOCKED`; individual check outcomes are `PASS`, `FAIL`,
+`SKIP`, or `NOT_RUN`. Explain incomplete or indeterminate evidence in the relevant summary.
 
 Normal named-lock contention waits automatically. Investigate only malformed, stale, unknown, or
 excessive-wait evidence. Never delete another invocation's claim.

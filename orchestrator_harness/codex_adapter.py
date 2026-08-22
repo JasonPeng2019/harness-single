@@ -64,8 +64,10 @@ CODEX_ADAPTER_SCHEMA = "orchestrator-codex-adapter/v1"
 CODEX_INSTALL_MANIFEST_SCHEMA = "orchestrator-codex-installation/v1"
 CODEX_BINDING_SCHEMA = "orchestrator-codex-binding/v1"
 CODEX_ADAPTER_VERSION = "codex-v1"
-CODEX_PACKAGE_REVISION = "codex-assets-v3"
-CODEX_SUPPORTED_LEGACY_REVISIONS = frozenset({"codex-assets-v1", "codex-assets-v2"})
+CODEX_PACKAGE_REVISION = "codex-assets-v4"
+CODEX_SUPPORTED_LEGACY_REVISIONS = frozenset(
+    {"codex-assets-v1", "codex-assets-v2", "codex-assets-v3"}
+)
 INSTALL_MANIFEST_RELATIVE = Path(".codex") / "orchestrator-harness-adapter.json"
 CODEX_BINDING_RELATIVE = Path(".codex") / "orchestrator-harness-binding.json"
 HOOKS_RELATIVE = Path(".codex") / "hooks.json"
@@ -73,14 +75,14 @@ _HOOK_RELATIVES = (
     Path(".codex") / "hooks" / "orchestrator_harness_post_tool_use.py",
     Path(".codex") / "hooks" / "orchestrator_harness_stop.py",
 )
-_HOOK_EVENT_NAMES = ("PreToolUse", "PostToolUse", "Stop")
+_HOOK_EVENT_NAMES = ("PostToolUse", "Stop")
 _MAX_MANIFEST_BYTES = 512_000
 _MAX_BINDING_BYTES = 128_000
-_MANAGED_HOOK_IDS = {
-    "orchestrator-harness-bounded-policy",
-    "orchestrator-harness-post-tool-use",
-    "orchestrator-harness-stop",
+_MANAGED_HOOK_ID_BY_EVENT = {
+    "PostToolUse": "orchestrator-harness-post-tool-use",
+    "Stop": "orchestrator-harness-stop",
 }
+_MANAGED_HOOK_IDS = frozenset(_MANAGED_HOOK_ID_BY_EVENT.values())
 
 
 class CodexAdapterError(ValueError):
@@ -709,11 +711,11 @@ def _fragment_digest(fragment: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json(fragment).encode("utf-8")).hexdigest()
 
 
-def _managed_hook_fragment() -> dict[str, list[dict[str, str]]]:
+def _managed_hook_fragment() -> dict[str, list[dict[str, Any]]]:
     raw = json.loads(_package_resource("hooks.fragment.json").decode("utf-8"))
     if not isinstance(raw, dict) or not isinstance(raw.get("hooks"), dict):
         raise CodexAdapterError("packaged Codex hook fragment is invalid")
-    result: dict[str, list[dict[str, str]]] = {}
+    result: dict[str, list[dict[str, Any]]] = {}
     for event_name in _HOOK_EVENT_NAMES:
         entries = raw["hooks"].get(event_name)
         if not isinstance(entries, list) or any(
@@ -722,14 +724,71 @@ def _managed_hook_fragment() -> dict[str, list[dict[str, str]]]:
             raise CodexAdapterError("packaged Codex hook entries are invalid")
         result[event_name] = [dict(item) for item in entries]
         for entry in result[event_name]:
-            if set(entry) != {"id", "type", "command"}:
+            expected_keys = {"matcher", "hooks"} if event_name == "PostToolUse" else {"hooks"}
+            if set(entry) != expected_keys:
                 raise CodexAdapterError("packaged Codex hook entries are not closed")
-            if not all(
-                isinstance(entry.get(key), str) and entry[key].strip()
-                for key in ("id", "type", "command")
+            if event_name == "PostToolUse" and not (
+                isinstance(entry.get("matcher"), str) and entry["matcher"].strip()
             ):
-                raise CodexAdapterError("packaged Codex hook entry identity is invalid")
+                raise CodexAdapterError("packaged Codex hook matcher is invalid")
+            children = entry.get("hooks")
+            if not isinstance(children, list) or len(children) != 1:
+                raise CodexAdapterError("packaged Codex hook commands are invalid")
+            child = children[0]
+            if (
+                not isinstance(child, Mapping)
+                or set(child) != {"type", "command"}
+                or not all(
+                    isinstance(child.get(key), str) and child[key].strip()
+                    for key in ("type", "command")
+                )
+            ):
+                raise CodexAdapterError("packaged Codex hook command identity is invalid")
     return result
+
+
+def _legacy_v3_managed_hook_fragment() -> dict[str, list[dict[str, str]]]:
+    """Return the flat hook records shipped by codex-assets-v3."""
+
+    return {
+        "PreToolUse": [
+            {
+                "command": "python .codex/hooks/orchestrator_harness_bounded_policy.py",
+                "id": "orchestrator-harness-bounded-policy",
+                "type": "command",
+            }
+        ],
+        "PostToolUse": [
+            {
+                "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+                "id": "orchestrator-harness-post-tool-use",
+                "type": "command",
+            }
+        ],
+        "Stop": [
+            {
+                "command": "python .codex/hooks/orchestrator_harness_stop.py",
+                "id": "orchestrator-harness-stop",
+                "type": "command",
+            }
+        ],
+    }
+
+
+def _hook_command_signature(entry: Mapping[str, Any]) -> tuple[tuple[str, str], ...] | None:
+    children = entry.get("hooks")
+    if not isinstance(children, list) or not children:
+        return None
+    signature: list[tuple[str, str]] = []
+    for child in children:
+        if not isinstance(child, Mapping):
+            return None
+        hook_type = child.get("type")
+        command = child.get("command")
+        if not isinstance(hook_type, str) or not isinstance(command, str):
+            return None
+        signature.append((hook_type, command))
+    return tuple(signature)
 
 
 def _managed_paths(packaged: Mapping[Path, bytes]) -> list[str]:
@@ -759,7 +818,21 @@ def _legacy_v2_asset_hashes() -> dict[str, str]:
     }
 
 
+def _legacy_v3_asset_hashes() -> dict[str, str]:
+    """The codex-assets-v3 packaged byte identities."""
+
+    return {
+        ".codex/hooks/orchestrator_harness_post_tool_use.py": "d2ac4cd87cbab1c4000746a99ba142c2e55b6aa4794ffc7a7cae8b6ad659c667",
+        ".codex/hooks/orchestrator_harness_stop.py": "616390ecec117df2db33dd6f84b5d826b523ec873e4c53f88c21426b5d92e469",
+        ".codex/hooks/orchestrator_harness_bounded_policy.py": "8b9c6965967d44bb1b9555bfc57cb0e502f9bd311c5cc4b871528722cfffca18",
+        ".codex/policies/bounded-launchers.json": "d9ebc613c618c653e7e09670bba35c9bbddf1a84417afb088f73b0d1dbd868c2",
+        ".codex/policies/bounded-exclusions.gitignore": "1e6d5a6f2c87ea9cdb3699cf4b63aa65bb21a356f135f8304a63f76e2249811f",
+    }
+
+
 def _legacy_assets_for(revision: str) -> dict[str, str]:
+    if revision == "codex-assets-v3":
+        return _legacy_v3_asset_hashes()
     if revision == "codex-assets-v2":
         return _legacy_v2_asset_hashes()
     return _legacy_asset_hashes()
@@ -799,17 +872,22 @@ def _validate_manifest_identity(
         raise CodexInstallConflict("installation manifest revision is unsupported")
     packaged = packaged_codex_assets()
     expected_paths = _managed_paths(packaged)
-    if revision == CODEX_PACKAGE_REVISION:
-        expected_fragment = _managed_hook_fragment()
+    if revision in {CODEX_PACKAGE_REVISION, "codex-assets-v3"}:
+        expected_fragment = (
+            _managed_hook_fragment()
+            if revision == CODEX_PACKAGE_REVISION
+            else _legacy_v3_managed_hook_fragment()
+        )
         if manifest.get("managed_paths") != expected_paths:
             raise CodexInstallConflict(
                 "installation manifest managed path set is not supported"
             )
         assets = manifest.get("managed_assets")
-        packaged = packaged_codex_assets()
-        expected_assets = {
-            path.as_posix(): _hash(data) for path, data in packaged.items()
-        }
+        expected_assets = (
+            {path.as_posix(): _hash(data) for path, data in packaged.items()}
+            if revision == CODEX_PACKAGE_REVISION
+            else _legacy_v3_asset_hashes()
+        )
         if assets != expected_assets:
             raise CodexInstallConflict(
                 "installation manifest managed asset identities are not supported"
@@ -940,7 +1018,9 @@ def _validate_manifest_identity(
     return revision
 
 
-def _merge_hooks(existing: bytes | None) -> bytes:
+def _merge_hooks(
+    existing: bytes | None, *, upgrade_from_revision: str | None = None
+) -> bytes:
     if existing is None:
         value: dict[str, Any] = {"hooks": {}}
     else:
@@ -955,6 +1035,17 @@ def _merge_hooks(existing: bytes | None) -> bytes:
         value = dict(value)
         value.setdefault("hooks", {})
     hooks = dict(value["hooks"])
+    if upgrade_from_revision == "codex-assets-v3":
+        legacy_fragment = _legacy_v3_managed_hook_fragment()
+        for event_name, legacy_entries in legacy_fragment.items():
+            rows = hooks.get(event_name, [])
+            if not isinstance(rows, list) or any(
+                not isinstance(item, dict) for item in rows
+            ):
+                raise CodexInstallConflict(
+                    f".codex/hooks.json {event_name} is not a list of objects"
+                )
+            hooks[event_name] = [row for row in rows if row not in legacy_entries]
     fragment = _managed_hook_fragment()
     for event_name, entries in fragment.items():
         prior = hooks.get(event_name, [])
@@ -966,11 +1057,16 @@ def _merge_hooks(existing: bytes | None) -> bytes:
                 f".codex/hooks.json {event_name} contains invalid entries"
             )
         for entry in entries:
-            marker = entry.get("id")
-            clashes = [item for item in merged if item.get("id") == marker]
+            signature = _hook_command_signature(entry)
+            if signature is None:  # protected by _managed_hook_fragment validation
+                raise CodexAdapterError("packaged Codex hook command identity is invalid")
+            clashes = [
+                item for item in merged if _hook_command_signature(item) == signature
+            ]
             if clashes and any(item != entry for item in clashes):
                 raise CodexInstallConflict(
-                    f".codex/hooks.json contains an ambiguous owned hook: {marker}"
+                    ".codex/hooks.json contains an ambiguous owned hook: "
+                    f"{_MANAGED_HOOK_ID_BY_EVENT[event_name]}"
                 )
             if not clashes:
                 merged.append(entry)
@@ -1003,10 +1099,12 @@ def _hook_state(existing: bytes | None) -> tuple[dict[str, Any], bool, set[str]]
                 f".codex/hooks.json {event_name} is not a list of objects"
             )
         for entry in entries:
-            marker = entry["id"]
+            signature = _hook_command_signature(entry)
+            if signature is None:  # protected by _managed_hook_fragment validation
+                raise CodexAdapterError("packaged Codex hook command identity is invalid")
             for row in rows:
-                if row.get("id") == marker and row != entry:
-                    conflicts.add(marker)
+                if _hook_command_signature(row) == signature and row != entry:
+                    conflicts.add(_MANAGED_HOOK_ID_BY_EVENT[event_name])
     return value, True, conflicts
 
 
@@ -1023,8 +1121,9 @@ def _subtract_hooks(
         kept: list[dict[str, Any]] = []
         for row in rows:
             exact = any(row == entry for entry in entries)
-            if exact and row.get("id") not in conflicts:
-                removed.append(str(row.get("id")))
+            marker = _MANAGED_HOOK_ID_BY_EVENT[event_name]
+            if exact and marker not in conflicts:
+                removed.append(marker)
             else:
                 kept.append(row)
         value["hooks"][event_name] = kept
@@ -1205,7 +1304,9 @@ def install_codex_adapter(
             if originals[relative] != data:
                 guard.atomic_replace(relative, data, expected=original_states[relative])
                 changed.append(str(relative))
-        hooks_data = _merge_hooks(originals[HOOKS_RELATIVE])
+        hooks_data = _merge_hooks(
+            originals[HOOKS_RELATIVE], upgrade_from_revision=existing_revision
+        )
         if originals[HOOKS_RELATIVE] != hooks_data:
             guard.atomic_replace(
                 HOOKS_RELATIVE, hooks_data, expected=original_states[HOOKS_RELATIVE]

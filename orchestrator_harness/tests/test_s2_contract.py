@@ -56,15 +56,44 @@ from orchestrator_harness.task import (
     validate_task_result,
 )
 from orchestrator_harness.tests.support import SuiteFixture
+from orchestrator_harness.workspace_overlay import (
+    SUPER_CACHE_NAME,
+    ingest_super_cache,
+    prepare_worktree,
+)
 
 
 class S2ContractTests(unittest.TestCase):
-    def _canonical(self, root: Path) -> tuple[dict[str, object], object]:
+    @staticmethod
+    def _prepare_canonical_overlay(root: Path, run: Path) -> Path:
+        workspace = run / ".agent-workspace"
+        overlay_source = root / "overlay-source"
+        overlay_source.mkdir()
+        overlay_harness = root / "overlay-harness"
+        overlay_harness.mkdir()
+        ingest_super_cache(
+            source_folder=overlay_source, harness_worktree=overlay_harness
+        )
+        overlay_receipt = workspace / "overlay-receipt.json"
+        prepare_worktree(
+            super_cache=overlay_harness / SUPER_CACHE_NAME,
+            target_worktree=run,
+            role="subagent",
+            receipt_path=overlay_receipt,
+        )
+        return overlay_receipt
+
+    def _canonical(
+        self, root: Path, *, with_overlay: bool = False
+    ) -> tuple[dict[str, object], object]:
         run = root / "run"
         workspace = run / ".agent-workspace"
         workspace.mkdir(parents=True)
         runtime = root / "runtime"
         runtime.mkdir()
+        overlay_receipt: Path | None = None
+        if with_overlay:
+            overlay_receipt = self._prepare_canonical_overlay(root, run)
         prompt_a = run / "prompt-a.md"
         prompt_b = run / "prompt-b.md"
         prompt_a.write_bytes(b"workflow\n")
@@ -129,6 +158,8 @@ class S2ContractTests(unittest.TestCase):
             "event_log_path": str(runtime / "events.jsonl"),
             "resources": ["resource-1"],
         }
+        if overlay_receipt is not None:
+            value["overlay_receipt"] = str(overlay_receipt)
         return value, card
 
     @staticmethod
@@ -154,7 +185,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         fake = root / "fake_claude.py"
         marker = root / "launches.txt"
         fake.write_text(fake_source, encoding="utf-8")
-        raw, card = self._canonical(root)
+        raw, card = self._canonical(root, with_overlay=True)
         raw["provider"] = {
             **raw["provider"],  # type: ignore[arg-type]
             "command": [sys.executable, str(fake), str(marker)],
@@ -1045,7 +1076,7 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             root = Path(temporary)
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
-            raw, card = self._canonical(root)
+            raw, card = self._canonical(root, with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake)],
@@ -1115,7 +1146,7 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             self.assertIn("session", handoff["reason"])
 
             failure_root = root / "failure"
-            failure_raw, _ = self._canonical(failure_root)
+            failure_raw, _ = self._canonical(failure_root, with_overlay=True)
             failure_raw["provider"] = {
                 **failure_raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), "--failure"],
@@ -1152,7 +1183,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             marker = root / "provider-launches.txt"
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
-            raw, card = self._canonical(root)
+            raw, card = self._canonical(root, with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1419,6 +1450,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-s
                         )
                 if case == "fresh":
                     workspace.rmdir()
+                    raw["overlay_receipt"] = str(
+                        self._prepare_canonical_overlay(root, root / "run")
+                    )
                 event_parent = root / "runtime" / "missing-events"
                 raw["event_log_path"] = str(event_parent / "events.jsonl")
                 invocation_path = root / f"{case}.invocation.json"
@@ -1454,7 +1488,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
-            raw, _ = self._canonical(root)
+            raw, _ = self._canonical(root, with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1526,7 +1560,7 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
             fake = root / "fake_codex.py"
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
-            raw, _ = self._canonical(root)
+            raw, _ = self._canonical(root, with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "id": "codex",
@@ -1692,7 +1726,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
-            raw, card = self._canonical(root)
+            raw, card = self._canonical(root, with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1797,7 +1831,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             self.assertFalse((root / "runtime" / "accepted-resume").exists())
 
             fresh_root = root / "fresh"
-            fresh_raw, _ = self._canonical(fresh_root)
+            fresh_raw, _ = self._canonical(fresh_root, with_overlay=True)
             fresh_marker = root / "fresh-launches.txt"
             fresh_raw["provider"] = {
                 **fresh_raw["provider"],  # type: ignore[arg-type]
