@@ -49,6 +49,26 @@ tool-result boundary and Stop is a finalization backstop. The persistent
 harness coordinator owns the binding-specific wake subscription and replay; a
 hook does not directly watch arbitrary file changes. App Server fixtures use
 `thread/inject_items`, `turn/completed`, and `turn/start` for idle continuation.
+
+## Qwen Code adapter
+
+The native runner provider is `qwen-code`; its host adapter is selected with
+`--host qwen` (the `qwen-code` host spelling is also accepted):
+
+```powershell
+python -m orchestrator_harness adapter install --host qwen --project-root <disposable-project>
+python -m orchestrator_harness adapter check --host qwen --project-root <disposable-project>
+python -m orchestrator_harness adapter uninstall --host qwen --project-root <disposable-project>
+```
+
+The installer owns only `.qwen/settings.json`, `.qwen/hooks/`, and its
+project-local manifest. It uses Qwen Code’s documented top-level `hooks`
+settings form, command-hook `name` fields, `PostToolUse`/`Stop` groups, and a
+`Notification` group matched to `idle_prompt`. Existing project settings and
+unrelated hook groups are preserved; no user/global Qwen configuration is
+written. Delivery receipts are transport evidence and never acknowledge
+manager queue work. The deterministic fixture and tests prove installation,
+preservation, and sparse delivery; they make no live Qwen hook-session claim.
 Delivery notices contain binding identity, queue revision, pending count,
 highest class/severity, timestamp, and adapter profile only. Delivery receipts
 are transport evidence and never acknowledge pending events.

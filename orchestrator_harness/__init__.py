@@ -6,6 +6,7 @@ from .prompt_bundle import PromptBundle, PromptComponent
 from .provider import (
     ClaudeCodeProviderAdapter,
     CodexProviderAdapter,
+    QwenCodeProviderAdapter,
     ProviderAdapterRegistration,
     ProviderCapabilities,
     ProviderEvidence,
@@ -16,6 +17,7 @@ from .provider import (
     classify_operation,
     decide_resume_or_handoff,
     provider_registry,
+    provider_default_command,
     redact_command,
     register_provider_adapter,
     structured_handoff,
@@ -47,6 +49,14 @@ from .codex_adapter import (
     bind_codex_project,
     run_installed_codex_hook,
 )
+from .qwen_adapter import QwenAdapter, SyntheticQwenTransport
+from .qwen_installer import (
+    check_qwen_adapter,
+    install_qwen_adapter,
+    run_installed_qwen_hook,
+    uninstall_qwen_adapter,
+    upgrade_qwen_adapter,
+)
 from .lane_lifecycle import ImmutableSourceView, RetirementResult
 from .capability_broker import (
     AdapterResult,
@@ -72,6 +82,7 @@ __all__ = [
     "CanonicalInvocation",
     "ClaudeCodeProviderAdapter",
     "CodexProviderAdapter",
+    "QwenCodeProviderAdapter",
     "NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY",
     "NOTIFICATION_MODE_WAKE",
     "NOTIFICATION_WAKE_TEXT",
@@ -87,6 +98,7 @@ __all__ = [
     "classify_operation",
     "decide_resume_or_handoff",
     "provider_registry",
+    "provider_default_command",
     "redact_command",
     "register_provider_adapter",
     "structured_handoff",
@@ -99,6 +111,7 @@ __all__ = [
     "RuntimeProfile",
     "AdapterCapabilities",
     "CodexAdapter",
+    "QwenAdapter",
     "activate_codex_binding",
     "bind_codex_project",
     "DeliveryCoordinator",
@@ -130,6 +143,12 @@ __all__ = [
     "FirmwareOperation",
     "HardwareCapabilityAdapter",
     "run_installed_codex_hook",
+    "check_qwen_adapter",
+    "install_qwen_adapter",
+    "run_installed_qwen_hook",
     "SyntheticCodexTransport",
+    "SyntheticQwenTransport",
+    "uninstall_qwen_adapter",
+    "upgrade_qwen_adapter",
 ]
 __version__ = "0.1.0"

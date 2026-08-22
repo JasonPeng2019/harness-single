@@ -16,6 +16,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .claude_adapter import create_claude_adapter
+from .claude_installer import (
+    check_claude_adapter,
+    install_claude_adapter,
+    run_installed_claude_hook,
+    uninstall_claude_adapter,
+    upgrade_claude_adapter,
+)
 from .codex_adapter import (
     CodexAdapterError,
     check_codex_adapter,
@@ -25,13 +33,21 @@ from .codex_adapter import (
     uninstall_codex_adapter,
     upgrade_codex_adapter,
 )
+from .qwen_installer import (
+    check_qwen_adapter,
+    install_qwen_adapter,
+    run_installed_qwen_hook,
+    uninstall_qwen_adapter,
+    upgrade_qwen_adapter,
+)
 from .config import ConfigError, HarnessConfig, load_config
 from .discovery import discover_suite
 from .events import diff_conditions
 from .handoff_preflight import exit_code as handoff_preflight_exit_code
 from .handoff_preflight import preflight_handoff
 from .lane_lifecycle import allocate_immutable_source_view, retire_terminal_lane
-from .models import parse_utc, utc_now
+from .models import utc_now
+from .notifications import ManagerEventRouter
 from .processes import process_snapshot
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput
@@ -282,7 +298,9 @@ def build_parser() -> argparse.ArgumentParser:
     hook = adapter_modes.add_parser("hook")
     hook.add_argument("--host", default="codex")
     hook.add_argument("--project-root", required=True, type=Path)
-    hook.add_argument("--boundary", choices=("post_tool_use", "stop"), required=True)
+    hook.add_argument(
+        "--boundary", choices=("post_tool_use", "notification", "stop"), required=True
+    )
 
     def add_view_commands(
         parent: argparse._SubParsersAction[argparse.ArgumentParser],
@@ -358,28 +376,87 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "adapter":
-            if args.host != "codex":
-                raise CodexAdapterError(
-                    "only the implemented codex host supports this command"
-                )
-            if args.adapter_action == "install":
-                _print_json(install_codex_adapter(args.project_root))
-            elif args.adapter_action == "check":
-                _print_json(check_codex_adapter(args.project_root))
-            elif args.adapter_action == "upgrade":
-                _print_json(upgrade_codex_adapter(args.project_root))
-            elif args.adapter_action == "uninstall":
-                _print_json(uninstall_codex_adapter(args.project_root))
-            elif args.adapter_action == "self-test":
-                _print_json(
-                    synthetic_wake_self_test(
-                        args.project_root, queue_root=args.queue_root
+            if args.host == "codex":
+                if args.adapter_action == "install":
+                    _print_json(install_codex_adapter(args.project_root))
+                elif args.adapter_action == "check":
+                    _print_json(check_codex_adapter(args.project_root))
+                elif args.adapter_action == "upgrade":
+                    _print_json(upgrade_codex_adapter(args.project_root))
+                elif args.adapter_action == "uninstall":
+                    _print_json(uninstall_codex_adapter(args.project_root))
+                elif args.adapter_action == "self-test":
+                    _print_json(
+                        synthetic_wake_self_test(
+                            args.project_root, queue_root=args.queue_root
+                        )
                     )
-                )
+                else:
+                    _print_json(
+                        run_codex_hook(args.boundary, project_root=args.project_root)
+                    )
+            elif args.host == "claude":
+                if args.adapter_action == "install":
+                    _print_json(install_claude_adapter(args.project_root))
+                elif args.adapter_action == "check":
+                    _print_json(check_claude_adapter(args.project_root))
+                elif args.adapter_action == "upgrade":
+                    _print_json(upgrade_claude_adapter(args.project_root))
+                elif args.adapter_action == "uninstall":
+                    _print_json(uninstall_claude_adapter(args.project_root))
+                elif args.adapter_action == "self-test":
+                    queue_root = args.queue_root
+                    if queue_root is None:
+                        queue_root = (
+                            args.project_root / ".claude" / ".synthetic-manager-binding"
+                        )
+                    router = ManagerEventRouter(
+                        queue_root,
+                        run_id="synthetic-s4-run",
+                        manager_session_id="synthetic-s4-session",
+                        manager_thread_id="synthetic-s4-thread",
+                        registration_id="synthetic-s4-registration",
+                    )
+                    _print_json(create_claude_adapter(router).synthetic_self_test())
+                else:
+                    _print_json(
+                        run_installed_claude_hook(
+                            args.project_root, boundary=args.boundary
+                        )
+                    )
+            elif args.host in {"qwen", "qwen-code"}:
+                if args.adapter_action == "install":
+                    _print_json(install_qwen_adapter(args.project_root))
+                elif args.adapter_action == "check":
+                    _print_json(check_qwen_adapter(args.project_root))
+                elif args.adapter_action == "upgrade":
+                    _print_json(upgrade_qwen_adapter(args.project_root))
+                elif args.adapter_action == "uninstall":
+                    _print_json(uninstall_qwen_adapter(args.project_root))
+                elif args.adapter_action == "self-test":
+                    queue_root = args.queue_root
+                    if queue_root is None:
+                        queue_root = (
+                            args.project_root / ".qwen" / ".synthetic-manager-binding"
+                        )
+                    router = ManagerEventRouter(
+                        queue_root,
+                        run_id="synthetic-qwen-run",
+                        manager_session_id="synthetic-qwen-session",
+                        manager_thread_id="synthetic-qwen-thread",
+                        registration_id="synthetic-qwen-registration",
+                    )
+                    from .qwen_adapter import create_qwen_adapter
+
+                    _print_json(create_qwen_adapter(router).synthetic_self_test())
+                else:
+                    _print_json(
+                        run_installed_qwen_hook(
+                            args.project_root, boundary=args.boundary
+                        )
+                    )
             else:
-                _print_json(
-                    run_codex_hook(args.boundary, project_root=args.project_root)
-                )
+                raise CodexAdapterError("unsupported host: " + args.host)
             return EXIT_OK
         if args.command in {"view", "source"}:
             result = allocate_immutable_source_view(

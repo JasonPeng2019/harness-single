@@ -14,8 +14,6 @@ import os
 import stat
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -23,7 +21,6 @@ from typing import Any, Mapping, Sequence
 from .host_adapters import (
     AdapterCapabilities,
     DELIVERY_NOTICE_SCHEMA,
-    DELIVERY_RECEIPT_SCHEMA,
     DeliveryCoordinator,
     DeliveryNotice,
     DeliveryReceipt,
@@ -31,9 +28,8 @@ from .host_adapters import (
     HostAdapter,
     HostAdapterError,
     HostProfile,
-    UnsupportedHostAdapterError,
 )
-from .models import iso_utc, parse_utc, utc_now
+from .models import iso_utc, utc_now
 from .mutation import (
     MutationConflict,
     MutationReceipt,
@@ -325,6 +321,22 @@ def select_host_adapter(
         return create_codex_adapter(
             router,
             transport=transport,
+            state_root=state_root,
+            registration_generation=registration_generation,
+        )
+    if kind == "claude":
+        from .claude_adapter import create_claude_adapter
+
+        return create_claude_adapter(
+            router,
+            state_root=state_root,
+            registration_generation=registration_generation,
+        )
+    if kind in {"qwen", "qwen-code"}:
+        from .qwen_adapter import create_qwen_adapter
+
+        return create_qwen_adapter(
+            router,
             state_root=state_root,
             registration_generation=registration_generation,
         )
@@ -1151,7 +1163,6 @@ def install_codex_adapter(
     project = guard.project
     packaged = packaged_codex_assets()
     manifest_path = guard.path(INSTALL_MANIFEST_RELATIVE, require_parent=True)
-    hooks_path = guard.path(HOOKS_RELATIVE, require_parent=True)
     existing_manifest = _load_install_manifest(manifest_path, guard=guard)
     existing_revision: str | None = None
     if existing_manifest is not None:
@@ -1315,7 +1326,7 @@ def uninstall_codex_adapter(project_root: str | Path) -> dict[str, Any]:
     }
     originals = {relative: state.content for relative, state in original_states.items()}
     try:
-        for relative, data in packaged.items():
+        for relative, _ in packaged.items():
             expected = expected_assets.get(relative.as_posix())
             if _hash(originals[relative]) == expected:
                 guard.delete(relative, expected=original_states[relative])
@@ -1721,7 +1732,7 @@ def run_installed_codex_hook(
         state_root=Path(binding["coordinator_root"]),
         registration_generation=binding["registration_generation"],
     )
-    adapter = CodexAdapter(transport, coordinator)
+    CodexAdapter(transport, coordinator)
     coordinator.restore()
     notice = coordinator.notice_for_wake()
     receipt: DeliveryReceipt | None = None

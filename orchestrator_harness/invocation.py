@@ -15,8 +15,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .prompt_bundle import PROMPT_BUNDLE_SCHEMA, PromptBundleError, bundle_from_record
-from .provider import provider_adapter, provider_registry
+from .prompt_bundle import PROMPT_BUNDLE_SCHEMA
+from .provider import provider_adapter, provider_default_command, provider_registry
 from .stable_io import canonical_json
 
 
@@ -283,7 +283,9 @@ class CanonicalInvocation:
         record: dict[str, Any] = {
             "provider_id": self.provider_id,
             "model": self.provider_model,
-            "command": list(options.get("command", [self.provider_id])),
+            "command": list(
+                options.get("command", provider_default_command(self.provider_id))
+            ),
             "reasoning_effort": options.get("reasoning_effort", "medium"),
             "service_tier": options.get("service_tier", "priority"),
             "permission_mode": options.get("permission_mode"),
@@ -401,6 +403,39 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
         raise InvocationValidationError(
             f"provider.id is not a registered provider: {provider_id}"
         )
+    if provider_id == "claude-code":
+        unsupported = sorted({"service_tier", "approval_policy"} & set(provider))
+        if unsupported:
+            raise InvocationValidationError(
+                "provider claude-code has no equivalent for field(s): "
+                + ", ".join(f"provider.{name}" for name in unsupported)
+                + "; Claude Code has no --service-tier or --approval-policy flags"
+            )
+    if provider_id == "qwen-code":
+        unsupported = sorted(
+            {
+                "reasoning_effort",
+                "service_tier",
+                "permission_mode",
+                "allowed_tools",
+                "disallowed_tools",
+                "mcp_config",
+                "config_overrides",
+                "sandbox",
+                "approval_policy",
+            }
+            & set(provider)
+        )
+        if unsupported:
+            raise InvocationValidationError(
+                "provider qwen-code cannot honor field(s): "
+                + ", ".join(f"provider.{name}" for name in unsupported)
+                + "; Qwen Code has no equivalent native launch fields"
+            )
+        if provider.get("notification") is True:
+            raise InvocationValidationError(
+                "provider qwen-code does not support provider.notification"
+            )
     model = _text(provider.get("model"), "provider.model")
     if "command" in provider:
         _strings(provider.get("command"), "provider.command")

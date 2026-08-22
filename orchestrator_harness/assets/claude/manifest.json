@@ -1,0 +1,20 @@
+{
+  "adapter": "claude",
+  "adapter_version": "claude-v1",
+  "files": [
+    {
+      "content_mode": "utf8-lf",
+      "destination": ".claude/hooks/orchestrator_harness_post_tool_use.py",
+      "resource": "orchestrator_harness_post_tool_use.py",
+      "sha256": "c19c9c9e505209a02a4a48a96d844bfc1b76afdfccef1455d55b39bc914ea321"
+    },
+    {
+      "content_mode": "utf8-lf",
+      "destination": ".claude/hooks/orchestrator_harness_stop.py",
+      "resource": "orchestrator_harness_stop.py",
+      "sha256": "074e9203e515b0236ff9289e88fae7579059acb99056674ab3fed457b474d947"
+    }
+  ],
+  "package_revision": "claude-assets-v1",
+  "schema": "orchestrator-claude-adapter/v1"
+}

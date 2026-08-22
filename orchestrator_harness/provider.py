@@ -4,8 +4,8 @@ The versioned adapter contract (``orchestrator-provider-adapter/v1``) keeps
 provider semantics inside each adapter: command construction, prompt
 transport, result/session parsing, permission mapping, and redacted
 provenance.  The generic core only selects a registered adapter and consumes
-the declared lifecycle contract.  Codex and Claude Code are maintained
-built-ins; a separately registered external CLI adapter becomes selectable
+the declared lifecycle contract.  Codex, Claude Code, and Qwen Code are
+maintained built-ins; a separately registered external CLI adapter becomes selectable
 without edits to generic dispatch, workflow, task, event, supervisor, or
 cleanup code.
 """
@@ -54,6 +54,19 @@ PROVIDER_OPERATION_NAMES = (
 # shape-valid.
 PROVIDER_TERMINAL_OUTCOMES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 
+# Qwen Code's native headless entry point is ``qwen exec``.  Keeping this
+# provider-owned default in one place makes launch identity and lane launch
+# agree without teaching generic code Qwen-specific flags.
+_PROVIDER_DEFAULT_COMMANDS: Mapping[str, tuple[str, ...]] = {
+    "qwen-code": ("qwen", "exec"),
+}
+
+
+def provider_default_command(provider_id: str) -> tuple[str, ...]:
+    """Return the native default command for one provider."""
+
+    return _PROVIDER_DEFAULT_COMMANDS.get(provider_id, (provider_id,))
+
 # Deterministic redaction markers for command provenance.  Provenance never
 # carries credentials; any token that looks like a credential is replaced.
 _REDACTION_MARKERS = (
@@ -90,6 +103,7 @@ class ProviderLaunchSpec:
     disallowed_tools: tuple[str, ...] = ()
     mcp_config: str | Mapping[str, Any] | list[Any] | None = None
     provider_options: Mapping[str, Any] = field(default_factory=dict)
+    env_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -252,6 +266,19 @@ class ProviderCapabilities:
             notification=False,
         )
 
+    @classmethod
+    def qwen_code(cls) -> "ProviderCapabilities":
+        return cls(
+            launch=True,
+            prompt=True,
+            event_result=True,
+            session=True,
+            resume=True,
+            permission=True,
+            configuration=True,
+            notification=False,
+        )
+
 
 @dataclass(frozen=True)
 class ProviderOperationResult:
@@ -393,6 +420,60 @@ def _nonempty(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+# Claude Code has no ``-c`` config channel and no ``--service-tier`` or
+# ``--approval-policy`` flags.  The faithful transport for a per-invocation
+# endpoint redirect is the child process environment.
+CLAUDE_CONFIG_OVERRIDE_ALIASES: Mapping[str, Mapping[str, str]] = {
+    'model_provider="ollama"': {
+        "ANTHROPIC_BASE_URL": "http://localhost:11434",
+        "ANTHROPIC_AUTH_TOKEN": "ollama",
+        "ANTHROPIC_API_KEY": "",
+    },
+}
+
+
+def claude_config_override_env(override: str) -> Mapping[str, str]:
+    """Translate one Claude ``config_overrides`` entry into env assignments.
+
+    The documented Ollama alias expands to the Anthropic-compatible child
+    environment. Explicit ``ANTHROPIC_*`` assignments are also accepted;
+    every other spelling fails loudly so it cannot be silently dropped.
+    """
+    alias = CLAUDE_CONFIG_OVERRIDE_ALIASES.get(override)
+    if alias is not None:
+        return dict(alias)
+    key, sep, value = override.partition("=")
+    key = key.strip()
+    if not sep or not key.startswith("ANTHROPIC_") or not key.isidentifier():
+        raise ProviderAdapterError(
+            "claude-code config_overrides entries must be the "
+            'model_provider="ollama" alias or an ANTHROPIC_* env assignment '
+            f"(got {override!r}); Claude Code has no -c config channel"
+        )
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1]
+    return {key: value}
+
+
+def claude_child_env_overrides(spec: ProviderLaunchSpec) -> Mapping[str, str]:
+    """Return validated Claude child-environment configuration."""
+    merged: dict[str, str] = {}
+    for override in spec.config_overrides:
+        merged.update(claude_config_override_env(override))
+    for key, value in spec.env_overrides.items():
+        if not isinstance(key, str) or not key.startswith("ANTHROPIC_") or not key.isidentifier():
+            raise ProviderAdapterError(
+                "claude-code env override keys must be ANTHROPIC_* env vars "
+                f"(got {key!r})"
+            )
+        if not isinstance(value, str):
+            raise ProviderAdapterError(
+                f"claude-code env override {key!r} must have a string value"
+            )
+        merged[key] = value
+    return merged
+
+
 class CodexProviderAdapter(BaseProviderAdapter):
     """Own the current Codex command and transcript shapes."""
 
@@ -505,15 +586,23 @@ class ClaudeCodeProviderAdapter(BaseProviderAdapter):
     def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
         if spec.action not in {"start", "resume"}:
             raise ProviderAdapterError("Claude Code action must be start or resume")
-        argv = [*spec.command, "--print", "--output-format", "stream-json"]
+        # Validate the child-environment channel even when the adapter is used
+        # directly, so unsupported overrides are never silently discarded.
+        claude_child_env_overrides(spec)
+        argv = [
+            *spec.command,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
         if spec.action == "resume":
             if not spec.session_id:
                 raise ProviderAdapterError("Claude Code resume requires a session ID")
             argv.extend(["--resume", spec.session_id])
         if spec.model:
             argv.extend(["--model", spec.model])
-        if spec.permission_mode:
-            argv.extend(["--permission-mode", spec.permission_mode])
+        argv.extend(["--permission-mode", spec.permission_mode or "bypassPermissions"])
         for tool in spec.allowed_tools:
             argv.extend(["--allowedTools", tool])
         for tool in spec.disallowed_tools:
@@ -540,22 +629,47 @@ class ClaudeCodeProviderAdapter(BaseProviderAdapter):
         session_id = _nonempty(value.get("session_id")) or _nonempty(
             value.get("sessionId")
         )
-        if raw_type == "system" and value.get("subtype") == "init":
-            return ProviderEvent("STARTED", session_id=session_id, raw_type=raw_type)
+        if raw_type == "system":
+            subtype = _nonempty(value.get("subtype"))
+            if subtype == "init":
+                return ProviderEvent("STARTED", session_id=session_id, raw_type=raw_type)
+            if subtype == "permission_denied":
+                detail = _nonempty(value.get("message")) or subtype
+                return ProviderEvent(
+                    "FAILED",
+                    session_id=session_id,
+                    outcome="FAILED",
+                    raw_type=raw_type,
+                    detail=detail,
+                )
+            return None
         if raw_type != "result":
             return None
         subtype = _nonempty(value.get("subtype"))
+        permission_denials = value.get("permission_denials")
+        denial_items = (
+            permission_denials if isinstance(permission_denials, list) else []
+        )
+        denied = bool(denial_items)
         is_error = value.get("is_error") is True or subtype in {
             "error",
             "error_during_execution",
         }
-        if is_error:
+        if is_error or denied:
+            detail = _nonempty(value.get("result")) or subtype
+            if denied:
+                tools = ",".join(
+                    str(item.get("tool_name"))
+                    for item in denial_items
+                    if isinstance(item, Mapping) and _nonempty(item.get("tool_name"))
+                )
+                detail = f"permission_denied {tools}".strip() or detail
             return ProviderEvent(
                 "FAILED",
                 session_id=session_id,
                 outcome="FAILED",
                 raw_type=raw_type,
-                detail=_nonempty(value.get("result")) or subtype,
+                detail=detail,
             )
         return ProviderEvent(
             "COMPLETED", session_id=session_id, outcome="COMPLETED", raw_type=raw_type
@@ -578,9 +692,145 @@ class ClaudeCodeProviderAdapter(BaseProviderAdapter):
         return redact_command(argv)
 
 
+class QwenCodeProviderAdapter(BaseProviderAdapter):
+    """Own Qwen Code's native headless stream-JSON contract."""
+
+    provider_id = "qwen-code"
+
+    _SUPPORTED_OPTIONS = frozenset({"command", "notification"})
+    _UNSUPPORTED_FIELDS = frozenset(
+        {
+            "reasoning_effort",
+            "service_tier",
+            "permission_mode",
+            "allowed_tools",
+            "disallowed_tools",
+            "mcp_config",
+            "config_overrides",
+            "sandbox",
+            "approval_policy",
+        }
+    )
+
+    def _validate_unsupported_options(self, spec: ProviderLaunchSpec) -> None:
+        unknown_options = sorted(
+            set(spec.provider_options) - self._SUPPORTED_OPTIONS, key=str
+        )
+        if unknown_options:
+            raise ProviderAdapterError(
+                "qwen-code does not support provider option(s): "
+                + ", ".join(unknown_options)
+            )
+        explicit_fields = sorted(
+            self._UNSUPPORTED_FIELDS & set(spec.provider_options), key=str
+        )
+        if explicit_fields:
+            raise ProviderAdapterError(
+                "qwen-code does not support field(s): "
+                + ", ".join(f"provider.{name}" for name in explicit_fields)
+            )
+        if spec.reasoning_effort != "medium":
+            raise ProviderAdapterError(
+                "qwen-code cannot honor provider.reasoning_effort"
+            )
+        if spec.service_tier != "priority":
+            raise ProviderAdapterError("qwen-code cannot honor provider.service_tier")
+        if spec.permission_mode is not None:
+            raise ProviderAdapterError("qwen-code cannot honor provider.permission_mode")
+        if spec.allowed_tools:
+            raise ProviderAdapterError("qwen-code cannot honor provider.allowed_tools")
+        if spec.disallowed_tools:
+            raise ProviderAdapterError(
+                "qwen-code cannot honor provider.disallowed_tools"
+            )
+        if spec.mcp_config is not None:
+            raise ProviderAdapterError("qwen-code cannot honor provider.mcp_config")
+        if spec.config_overrides:
+            raise ProviderAdapterError(
+                "qwen-code cannot honor provider.config_overrides"
+            )
+        if spec.sandbox != "workspace-write":
+            raise ProviderAdapterError("qwen-code cannot honor provider.sandbox")
+        if spec.approval_policy != "never":
+            raise ProviderAdapterError(
+                "qwen-code cannot honor provider.approval_policy"
+            )
+        if spec.env_overrides:
+            raise ProviderAdapterError(
+                "qwen-code cannot honor child environment overrides"
+            )
+        if spec.provider_options.get("notification") is True:
+            raise ProviderAdapterError("qwen-code does not support provider.notification")
+
+    def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
+        if spec.action not in {"start", "resume"}:
+            raise ProviderAdapterError("Qwen Code action must be start or resume")
+        self._validate_unsupported_options(spec)
+        argv = [
+            *spec.command,
+            "--approval-mode=yolo",
+            "--model",
+            spec.model,
+            "--output-format",
+            "stream-json",
+        ]
+        if spec.action == "resume":
+            if not spec.session_id:
+                raise ProviderAdapterError("Qwen Code resume requires a session ID")
+            argv.extend(["--resume", spec.session_id])
+        return argv
+
+    def encode_prompt(self, prompt: bytes) -> bytes:
+        if not isinstance(prompt, bytes) or not prompt:
+            raise ProviderAdapterError("Qwen Code prompt must be non-empty bytes")
+        return prompt
+
+    def parse_transcript_line(self, line: bytes) -> ProviderEvent | None:
+        value = _json_line(line)
+        if value is None:
+            return None
+        raw_type = _nonempty(value.get("type"))
+        subtype = _nonempty(value.get("subtype"))
+        session_id = _nonempty(value.get("session_id")) or _nonempty(
+            value.get("sessionId")
+        )
+        if raw_type == "interrupt" or subtype == "interrupt":
+            return ProviderEvent(
+                "CANCELLED",
+                session_id=session_id,
+                outcome="CANCELLED",
+                raw_type=raw_type or "interrupt",
+                detail=_nonempty(value.get("message")) or "interrupt",
+            )
+        if raw_type == "system" and subtype == "init":
+            return ProviderEvent("STARTED", session_id=session_id, raw_type=raw_type)
+        if raw_type != "result":
+            return None
+        is_error = value.get("is_error") is True or subtype != "success"
+        kind = "FAILED" if is_error else "COMPLETED"
+        return ProviderEvent(
+            kind,
+            session_id=session_id,
+            outcome=kind,
+            raw_type=f"result:{subtype}",
+            detail=_nonempty(value.get("result")) or subtype,
+        )
+
+    def terminal_outcome(self, event: ProviderEvent | None, exit_code: int) -> str:
+        if event is not None and event.kind in {"FAILED", "CANCELLED"}:
+            return event.kind
+        if exit_code == 130:
+            return "CANCELLED"
+        return "COMPLETED" if exit_code == 0 else "FAILED"
+
+    def redact_argv(self, argv: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        return redact_command(argv)
+
+
 _ADAPTERS: dict[str, ProviderAdapter] = {
     "codex": CodexProviderAdapter(),
     "claude-code": ClaudeCodeProviderAdapter(),
+    "qwen-code": QwenCodeProviderAdapter(),
 }
 
 _REGISTRY: dict[str, ProviderAdapterRegistration] = {
@@ -595,6 +845,12 @@ _REGISTRY: dict[str, ProviderAdapterRegistration] = {
         version="claude-code-v1",
         adapter_class="ClaudeCodeProviderAdapter",
         capabilities=ProviderCapabilities.claude_code(),
+    ),
+    "qwen-code": ProviderAdapterRegistration(
+        provider_id="qwen-code",
+        version="qwen-code-v1",
+        adapter_class="QwenCodeProviderAdapter",
+        capabilities=ProviderCapabilities.qwen_code(),
     ),
 }
 
@@ -821,6 +1077,7 @@ def provider_config_digest(spec: ProviderLaunchSpec) -> str:
         "disallowed_tools": list(spec.disallowed_tools),
         "mcp_config": spec.mcp_config,
         "provider_options": dict(spec.provider_options),
+        "env_overrides": dict(spec.env_overrides),
     }
     return hashlib.sha256(canonical_json(record).encode("utf-8")).hexdigest()
 
@@ -1085,6 +1342,7 @@ def decide_resume_or_handoff(
 
 CodexAdapter = CodexProviderAdapter
 ClaudeCodeAdapter = ClaudeCodeProviderAdapter
+QwenCodeAdapter = QwenCodeProviderAdapter
 get_provider_adapter = provider_adapter
 
 
@@ -1094,6 +1352,8 @@ __all__ = [
     "ClaudeCodeProviderAdapter",
     "CodexAdapter",
     "CodexProviderAdapter",
+    "QwenCodeAdapter",
+    "QwenCodeProviderAdapter",
     "PROVIDER_ADAPTER_SCHEMA",
     "PROVIDER_HANDOFF_SCHEMA",
     "PROVIDER_OPERATION_NAMES",
@@ -1109,6 +1369,8 @@ __all__ = [
     "ProviderResumeDecision",
     "build_provider_evidence",
     "classify_operation",
+    "claude_child_env_overrides",
+    "claude_config_override_env",
     "decide_resume_or_handoff",
     "NOTIFICATION_MODE_SAFE_BOUNDARY_ONLY",
     "NOTIFICATION_MODE_WAKE",
@@ -1116,6 +1378,7 @@ __all__ = [
     "get_provider_adapter",
     "provider_adapter",
     "provider_config_digest",
+    "provider_default_command",
     "provider_registry",
     "notification_mode",
     "redact_command",

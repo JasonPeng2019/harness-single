@@ -53,18 +53,18 @@ from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     PROVIDER_OPERATION_NAMES,
     PROVIDER_TERMINAL_OUTCOMES,
-    ProviderAdapter,
     ProviderAdapterError,
     ProviderEvent,
-    ProviderEvidence,
     ProviderHandoff,
     ProviderLaunchSpec,
     ProviderResumeDecision,
     build_provider_evidence,
     classify_operation,
+    claude_config_override_env,
     decide_resume_or_handoff,
     provider_adapter,
     structured_handoff,
+    provider_default_command,
     unsupported_operation_result,
 )
 from .processes import process_snapshot
@@ -201,6 +201,18 @@ def isolated_coding_child_environment(
         and not key.upper().startswith(_PHYSICAL_CHILD_PREFIXES)
     }
     return allowed, cleared
+
+
+def apply_provider_env_overrides(
+    child_env: dict[str, str] | None,
+    env_overrides: Mapping[str, str],
+) -> dict[str, str] | None:
+    """Merge declared provider overrides after child isolation filtering."""
+    if not env_overrides:
+        return child_env
+    merged = dict(os.environ) if child_env is None else dict(child_env)
+    merged.update(env_overrides)
+    return merged
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -838,7 +850,9 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
             except GitSafetyError as exc:
                 raise InvocationValidationError(str(exc)) from exc
         provider_options = dict(canonical.provider_options)
-        command = provider_options.get("command", [canonical.provider_id])
+        command = provider_options.get(
+            "command", provider_default_command(canonical.provider_id)
+        )
         command_list = _string_list(command, "provider.command")
         overrides = _string_list(
             provider_options.get("config_overrides", []), "provider.config_overrides"
@@ -870,10 +884,10 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
             "never",
         }:
             raise InvocationValidationError("provider approval_policy is invalid")
-        allowed_tools = _string_list(
+        _string_list(
             provider_options.get("allowed_tools", []), "provider.allowed_tools"
         )
-        disallowed_tools = _string_list(
+        _string_list(
             provider_options.get("disallowed_tools", []), "provider.disallowed_tools"
         )
         if permission_mode is not None and (
@@ -1182,16 +1196,16 @@ def _canonical_prior_identity_check(
         "prompt_content_sha256",
         "resources",
     )
-    for field in identity_fields:
-        if invocation.action == "start" and field == "session_id":
+    for identity_field in identity_fields:
+        if invocation.action == "start" and identity_field == "session_id":
             continue
-        if field not in persisted_identity or field not in expected_identity:
+        if identity_field not in persisted_identity or identity_field not in expected_identity:
             raise InvocationError(
-                f"canonical persisted status identity is missing {field}"
+                f"canonical persisted status identity is missing {identity_field}"
             )
-        persisted_value = persisted_identity[field]
-        expected_value = expected_identity[field]
-        if field == "repository":
+        persisted_value = persisted_identity[identity_field]
+        expected_value = expected_identity[identity_field]
+        if identity_field == "repository":
             include_starting_commit = invocation.action == "resume"
             persisted_value = _canonical_repository_identity(
                 persisted_value, include_starting_commit=include_starting_commit
@@ -1199,7 +1213,7 @@ def _canonical_prior_identity_check(
             expected_value = _canonical_repository_identity(
                 expected_value, include_starting_commit=include_starting_commit
             )
-        if persisted_value != expected_value and field not in allowed_identity_fields:
+        if persisted_value != expected_value and identity_field not in allowed_identity_fields:
             raise InvocationError(
                 "canonical prior task identity does not match persisted status"
             )
@@ -1228,13 +1242,13 @@ def _canonical_prior_identity_check(
         if invocation.runtime_profile is not None
         else None,
     }
-    for field, expected in expected_status_identity.items():
-        if field not in prior_status:
+    for status_field, expected in expected_status_identity.items():
+        if status_field not in prior_status:
             raise InvocationError(
                 "canonical prior task identity does not match persisted status"
             )
-        if field == "task_card" and "task_card_sha256" in allowed_identity_fields:
-            persisted_card = prior_status.get(field)
+        if status_field == "task_card" and "task_card_sha256" in allowed_identity_fields:
+            persisted_card = prior_status.get(status_field)
             if not isinstance(persisted_card, Mapping) or not isinstance(
                 expected, Mapping
             ):
@@ -1250,11 +1264,11 @@ def _canonical_prior_identity_check(
                 )
             continue
         if (
-            field in {"prompt_bundle_sha256", "prompt_content_sha256"}
-            and field in allowed_identity_fields
+            status_field in {"prompt_bundle_sha256", "prompt_content_sha256"}
+            and status_field in allowed_identity_fields
         ):
             continue
-        if prior_status[field] != expected:
+        if prior_status[status_field] != expected:
             raise InvocationError(
                 "canonical prior task identity does not match persisted status"
             )
@@ -1593,6 +1607,10 @@ def _provider_launch_spec(
 ) -> ProviderLaunchSpec:
     options = dict(invocation.provider_options)
     try:
+        env_overrides: dict[str, str] = {}
+        if invocation.provider_id == "claude-code":
+            for override in invocation.config_overrides:
+                env_overrides.update(claude_config_override_env(override))
         return ProviderLaunchSpec(
             action=invocation.action,
             command=tuple(invocation.codex_command),
@@ -1625,6 +1643,7 @@ def _provider_launch_spec(
                 else None
             ),
             provider_options=options,
+            env_overrides=env_overrides,
         )
     except (TypeError, ValueError) as exc:
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
@@ -1745,7 +1764,7 @@ def _canonical_amendment_job_identity(
         "provider_session_id": requested_identity.get("session_id"),
         "exclusive_resources": list(invocation.canonical.resources),
     }
-    for field, value in (
+    for status_key, value in (
         ("repository_common_dir", repository.get("common_dir")),
         ("worktree_root", repository.get("worktree_root")),
         ("branch", repository.get("branch")),
@@ -1753,7 +1772,7 @@ def _canonical_amendment_job_identity(
         ("continuation_start_commit", prior_repository.get("starting_commit")),
     ):
         if value is not None:
-            expected[field] = value
+            expected[status_key] = value
     return expected
 
 
@@ -2856,6 +2875,10 @@ def run(invocation: Invocation) -> int:
                     state["overlay_receipt_verified"] = True
                 else:
                     state["overlay_receipt"] = None
+            if launch_spec is not None:
+                child_env = apply_provider_env_overrides(
+                    child_env, launch_spec.env_overrides
+                )
             boundary = ProcessBoundary.prepare()
             process = subprocess.Popen(
                 argv,

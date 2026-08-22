@@ -16,6 +16,7 @@ packages = [
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.qwen",
     "harness_common",
 ]
 
@@ -23,6 +24,8 @@ packages = [
 orchestrator_harness = [
     "assets/codex/*.json",
     "assets/codex/*.py",
+    "assets/qwen/*.json",
+    "assets/qwen/*.py",
     "assets/release/*.json",
     "assets/release/examples/*.json",
     "assets/release/examples/*.md",

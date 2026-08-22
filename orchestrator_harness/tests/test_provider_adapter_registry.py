@@ -178,8 +178,8 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
 
     def test_builtin_registry_is_versioned_and_truthful(self) -> None:
         registry = provider_registry()
-        self.assertEqual({"claude-code", "codex"}, set(registry))
-        for provider_id in ("codex", "claude-code"):
+        self.assertEqual({"claude-code", "codex", "qwen-code"}, set(registry))
+        for provider_id in ("codex", "claude-code", "qwen-code"):
             registration = registry[provider_id]
             self.assertEqual(PROVIDER_ADAPTER_SCHEMA, registration.schema)
             self.assertTrue(registration.version)
