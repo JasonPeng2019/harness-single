@@ -33,13 +33,6 @@ from .codex_adapter import (
     uninstall_codex_adapter,
     upgrade_codex_adapter,
 )
-from .qwen_installer import (
-    check_qwen_adapter,
-    install_qwen_adapter,
-    run_installed_qwen_hook,
-    uninstall_qwen_adapter,
-    upgrade_qwen_adapter,
-)
 from .config import ConfigError, HarnessConfig, load_config
 from .discovery import discover_suite
 from .events import diff_conditions
@@ -49,11 +42,21 @@ from .lane_lifecycle import allocate_immutable_source_view, retire_terminal_lane
 from .models import utc_now
 from .notifications import ManagerEventRouter
 from .processes import process_snapshot
+from .qwen_installer import (
+    check_qwen_adapter,
+    install_qwen_adapter,
+    run_installed_qwen_hook,
+    uninstall_qwen_adapter,
+    upgrade_qwen_adapter,
+)
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput
 from .watcher_integration import merge_watcher_conditions
-from .workspace_overlay import ingest_super_cache, prepare_worktree
-
+from .workspace_overlay import (
+    ingest_super_cache,
+    install_workspace_rules,
+    prepare_worktree,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -369,6 +372,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--worktree", required=True, type=Path)
     prepare.add_argument("--role", required=True, choices=("orchestrator", "subagent"))
     prepare.add_argument("--receipt", required=True, type=Path)
+    rules = workspace_modes.add_parser(
+        "rules", help="install the packaged manager rules into one workspace"
+    )
+    rules_modes = rules.add_subparsers(dest="rules_action", required=True)
+    install_rules = rules_modes.add_parser(
+        "install", help="append the managed quick-rules block to AGENTS.md once"
+    )
+    install_rules.add_argument("--workspace", required=True, type=Path)
     return parser
 
 
@@ -504,8 +515,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         receipt_path=args.receipt,
                     )
                 )
+            elif args.workspace_action == "rules":
+                if args.rules_action != "install":
+                    raise ValueError("workspace rules action must be install")
+                _print_json(install_workspace_rules(workspace=args.workspace))
             else:
-                raise ValueError("workspace action must be super-cache or prepare")
+                raise ValueError("workspace action must be super-cache, prepare, or rules")
             return EXIT_OK
         if args.command == "handoff-preflight":
             result = preflight_handoff(

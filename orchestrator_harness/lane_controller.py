@@ -16,10 +16,11 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .git_safety import (
     GitDeclaration,
@@ -29,9 +30,9 @@ from .git_safety import (
     inspect_repository,
     invalid_result_evidence,
     repository_status,
-    validate_task_result_repository,
     validate_coding_result,
     validate_findings,
+    validate_task_result_repository,
 )
 from .invocation import (
     CANONICAL_INVOCATION_SCHEMA,
@@ -41,14 +42,29 @@ from .invocation import (
     parse_canonical_invocation,
     validate_coding_v1_fields,
 )
+from .lane_lifecycle import (
+    LaneLifecycleError,
+    _admit_lifecycle_registry,
+    _LifecycleAdmission,
+    _update_lifecycle_registry,
+)
 from .models import ProcessInfo, iso_utc
-from .profile import ProfileError, RuntimeProfile, build_child_environment
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    capture_target,
+)
+from .mutation import (
+    replace as mutation_replace,
+)
 from .process_supervisor import (
     CleanupResult,
     ProcessBoundary,
     ProcessBoundaryUnsupported,
     ProcessSupervisor,
 )
+from .processes import process_snapshot
+from .profile import ProfileError, RuntimeProfile, build_child_environment
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     PROVIDER_OPERATION_NAMES,
@@ -63,30 +79,16 @@ from .provider import (
     claude_config_override_env,
     decide_resume_or_handoff,
     provider_adapter,
-    structured_handoff,
     provider_default_command,
+    structured_handoff,
     unsupported_operation_result,
 )
-from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
-from .workspace_overlay import verify_overlay_receipt
-from .stable_io import append_jsonl_record
-from .lane_lifecycle import (
-    LaneLifecycleError,
-    _LifecycleAdmission,
-    _admit_lifecycle_registry,
-    _update_lifecycle_registry,
-)
-from .mutation import (
-    MutationConflict,
-    MutationUnsupported,
-    capture_target,
-    replace as mutation_replace,
-)
 from .resume import (
     ResumeAdmissionError,
     require_resume_admission,
 )
+from .stable_io import append_jsonl_record
 from .task import (
     COMPLETION_REVIEW_FILENAME,
     ORCHESTRATOR_ACCEPTANCE_FILENAME,
@@ -96,6 +98,7 @@ from .task import (
     task_card_from_identity,
     validate_task_result,
 )
+from .workspace_overlay import verify_overlay_receipt
 
 
 class InvocationError(ValueError):
@@ -1445,7 +1448,7 @@ def _persisted_repository(
     }
     for key, value in expected.items():
         persisted = nested.get(key)
-        if key.endswith("dir") or key.endswith("root"):
+        if key.endswith(("dir", "root")):
             try:
                 if not isinstance(persisted, str) or Path(persisted).resolve(
                     strict=False
@@ -1647,6 +1650,34 @@ def _provider_launch_spec(
         )
     except (TypeError, ValueError) as exc:
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
+
+
+def _overlay_role(invocation: Invocation) -> str:
+    """Return the provider-neutral cache role owned by this lane."""
+
+    return invocation.doer if invocation.doer in {"orchestrator", "subagent"} else "subagent"
+
+
+def _verify_declared_overlay(invocation: Invocation) -> dict[str, Any]:
+    """Verify an optional supplied receipt before any provider construction."""
+
+    if invocation.overlay_receipt is None:
+        return {
+            "present": False,
+            "verified": False,
+            "reason": "no overlay was requested",
+        }
+    verification = verify_overlay_receipt(
+        receipt_path=invocation.overlay_receipt,
+        expected_target_worktree_id=invocation.run_root,
+        role=_overlay_role(invocation),
+    )
+    if not verification.get("verified"):
+        raise InvocationError(
+            "supplied overlay receipt is not completed for this worktree and role: "
+            + str(verification.get("reason"))
+        )
+    return verification
 
 
 def _requested_provider_operations(
@@ -2128,6 +2159,7 @@ def run(invocation: Invocation) -> int:
             raise InvocationError(
                 "coding worktree HEAD changed during pre-launch validation"
             )
+    overlay_verification = _verify_declared_overlay(invocation)
     controller = _identity(os.getpid())
     if provider_resume_handoff is not None:
         # A declared handoff never fabricates provider work: no adapter
@@ -2246,6 +2278,10 @@ def run(invocation: Invocation) -> int:
         "held_resource_claims": [],
         "waiting_resource_claim": None,
         "resource_claim_findings": [],
+        "overlay_receipt": str(invocation.overlay_receipt)
+        if invocation.overlay_receipt is not None
+        else None,
+        "overlay_receipt_verified": bool(overlay_verification.get("verified")),
         "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path),
         "last_message_path": str(invocation.last_message_path),
@@ -2859,22 +2895,6 @@ def run(invocation: Invocation) -> int:
                         "enabled": True,
                         "cleared_variable_names": cleared,
                     }
-            if argv is not None:
-                if invocation.overlay_receipt is not None:
-                    state["overlay_receipt"] = str(invocation.overlay_receipt)
-                    overlay_verification = verify_overlay_receipt(
-                        receipt_path=invocation.overlay_receipt,
-                        expected_target_worktree_id=invocation.run_root,
-                        role="subagent",
-                    )
-                    if not overlay_verification.get("verified"):
-                        raise InvocationError(
-                            "overlay receipt is not completed for this subagent worktree: "
-                            + str(overlay_verification.get("reason"))
-                        )
-                    state["overlay_receipt_verified"] = True
-                else:
-                    state["overlay_receipt"] = None
             if launch_spec is not None:
                 child_env = apply_provider_env_overrides(
                     child_env, launch_spec.env_overrides

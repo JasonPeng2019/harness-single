@@ -47,6 +47,65 @@ python -m orchestrator_harness --config local-config/harness.json scan --no-writ
 The complete coding invocation, result, and lock-record shapes are in `examples/`. Paths and Git
 IDs in those static examples are placeholders and must be replaced with facts from the active lane.
 
+## Enable optional lane features
+
+Install the package into the same Python environment used by provider hooks. Install the packaged
+manager rules into the top-level ROOT workspace separately from any lane overlay:
+
+```powershell
+$runner = "C:\path\to\harness-v2-firmware-runner"
+$workspace = "C:\path\to\manager-workspace"
+
+python -m pip install -e "$runner\orchestrator_harness"
+python -m orchestrator_harness workspace rules install --workspace $workspace
+```
+
+### Optional neutral super-cache
+
+The repository does not ship a cache payload. To deploy files into lane worktrees, choose a source
+folder explicitly, ingest exactly its contents, and then prepare each desired lane:
+
+```powershell
+$cacheSource = "C:\path\to\your-selected-cache-contents"
+$lane = "C:\path\to\project-worktrees\lane-01"
+
+python -m orchestrator_harness workspace super-cache ingest `
+  --source $cacheSource `
+  --harness-worktree $runner
+python -m orchestrator_harness workspace prepare `
+  --super-cache "$runner\super-cache" `
+  --worktree $lane `
+  --role subagent `
+  --receipt "$lane\.agent-workspace\overlay-receipt.json"
+```
+
+Use `--role orchestrator` for an orchestrator lane. Put the returned receipt path in that lane's
+coding or canonical invocation when the cache is used. A lane that does not use the cache omits
+`overlay_receipt` and launches normally.
+
+The super-cache copies only the caller-selected contents. It does not supply hooks, verification
+scripts, `AGENTS.md`, or provider configuration. An optional `.super-cache.json` inside the selected
+source may declare exact text-append targets; it is cache control data and is not copied.
+
+### Provider adapters and manager events
+
+Install provider hooks/configuration explicitly after preparing a lane when both features are used:
+
+```powershell
+python -m orchestrator_harness adapter install --host codex --project-root $lane
+python -m orchestrator_harness adapter check --host codex --project-root $lane
+```
+
+Use `--host claude` or `--host qwen` for those providers. Adapter-owned hooks are separate from the
+super-cache and are installed, checked, upgraded, and removed only through the corresponding
+adapter command.
+
+Installing the Codex adapter does not bind its hooks to a manager queue. At manager startup, after
+creating the real `ManagerEventRouter`, call `activate_codex_binding(project_root, router)`. The
+installed PostToolUse and Stop hooks then deliver content-free manager notices at their supported
+safe boundaries. Start a fresh provider session after adapter installation so project configuration
+is reloaded.
+
 ## Public release surface
 
 The supported launch journey is the operator boundary followed by the native lane-controller

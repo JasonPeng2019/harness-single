@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -20,17 +19,16 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
 import orchestrator_harness.lane_controller as controller
-from orchestrator_harness.cli import build_parser, main as cli_main
+from orchestrator_harness.cli import build_parser
+from orchestrator_harness.cli import main as cli_main
 from orchestrator_harness.lane_lifecycle import RetirementResult, retire_terminal_lane
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.mutation import MutationError, MutationReceipt, TargetState
-from orchestrator_harness.tests.support import TemporaryGitRepository
 from orchestrator_harness.workspace_overlay import (
     DECLARATION_NAME,
     OVERLAY_RECEIPT_SCHEMA,
@@ -38,6 +36,7 @@ from orchestrator_harness.workspace_overlay import (
     OverlayCollisionError,
     WorkspaceOverlayError,
     ingest_super_cache,
+    install_workspace_rules,
     prepare_worktree,
     restore_worktree,
     verify_overlay_receipt,
@@ -48,8 +47,7 @@ def _git(root: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), *args],
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
     return completed.stdout.strip()
@@ -103,6 +101,12 @@ class OverlayModuleTests(unittest.TestCase):
         # The container folder itself is not copied.
         self.assertFalse((self.cache / source.name).exists())
         self.assertEqual("orchestrator-workspace-overlay-ingest/v1", result["schema"])
+
+    def test_ingest_accepts_an_empty_user_selected_source(self) -> None:
+        result = self._ingest(self._source())
+        self.assertTrue(result["complete"])
+        self.assertEqual(0, result["entry_count"])
+        self.assertEqual([], list(self.cache.iterdir()))
 
     def test_reingest_replaces_prior_contents(self) -> None:
         source = self._source()
@@ -375,14 +379,13 @@ class OverlayModuleTests(unittest.TestCase):
         with mock.patch(
             "orchestrator_harness.workspace_overlay.mutation_replace",
             side_effect=failing_replace,
-        ):
-            with self.assertRaisesRegex(WorkspaceOverlayError, "rolled back"):
-                prepare_worktree(
-                    super_cache=cache,
-                    target_worktree=self.target,
-                    role="subagent",
-                    receipt_path=self.receipt,
-                )
+        ), self.assertRaisesRegex(WorkspaceOverlayError, "rolled back"):
+            prepare_worktree(
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
+                receipt_path=self.receipt,
+            )
         self.assertIn("created.txt", calls)
         self.assertFalse((self.target / "created.txt").exists())
         self.assertFalse((self.target / "shared" / "merged.txt").exists())
@@ -408,16 +411,15 @@ class OverlayModuleTests(unittest.TestCase):
         with mock.patch(
             "orchestrator_harness.workspace_overlay.mutation_replace",
             side_effect=failing_receipt,
+        ), self.assertRaisesRegex(
+            WorkspaceOverlayError, "receipt could not be published"
         ):
-            with self.assertRaisesRegex(
-                WorkspaceOverlayError, "receipt could not be published"
-            ):
-                prepare_worktree(
-                    super_cache=cache,
-                    target_worktree=self.target,
-                    role="subagent",
-                    receipt_path=self.receipt,
-                )
+            prepare_worktree(
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
+                receipt_path=self.receipt,
+            )
         self.assertFalse((self.target / "created.txt").exists())
         self.assertFalse((self.target / "shared" / "merged.txt").exists())
         self.assertFalse((self.target / "notes.txt").exists())
@@ -715,6 +717,31 @@ class OverlayCliTests(unittest.TestCase):
         self.assertTrue(record["complete"])
         self.assertEqual(b"cli payload\n", (self.target / "file.txt").read_bytes())
 
+    def test_workspace_rules_install_is_separate_and_idempotent(self) -> None:
+        (self.target / "AGENTS.md").write_text(
+            "# Existing project rules\n", encoding="utf-8"
+        )
+        first = install_workspace_rules(workspace=self.target)
+        self.assertTrue(first["installed"])
+        self.assertFalse(first["idempotent"])
+        agents = (self.target / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertTrue(agents.startswith("# Existing project rules\n"))
+        self.assertIn("BEGIN ORCHESTRATOR-HARNESS QUICK RULES", agents)
+        self.assertTrue(install_workspace_rules(workspace=self.target)["idempotent"])
+
+    def test_cli_workspace_rules_install(self) -> None:
+        from unittest import mock as _mock
+
+        emitted: list[Any] = []
+        with _mock.patch(
+            "orchestrator_harness.cli._print_json", side_effect=emitted.append
+        ):
+            code = cli_main(
+                ["workspace", "rules", "install", "--workspace", str(self.target)]
+            )
+        self.assertEqual(0, code)
+        self.assertTrue(emitted[-1]["installed"])
+
     def test_cli_lane_retire_accepts_overlay_receipt(self) -> None:
         parsed = build_parser().parse_args(
             [
@@ -834,7 +861,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
         )
         return receipt
 
-    def _invocation(self, receipt: Path | None) -> Path:
+    def _invocation(self, receipt: Path | None, *, doer: str = "subagent") -> Path:
         common = Path(_git(self.lane, "rev-parse", "--git-common-dir"))
         if not common.is_absolute():
             common = (self.lane / common).resolve()
@@ -849,6 +876,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
             "event_log_path": str(self.runtime / "events" / "controller.jsonl"),
             "worker_invocation_id": "worker-overlay",
             "lane_id": "overlay-lane",
+            "doer": doer,
             "task": "overlay lane task",
             "phase": "implementation",
             "prompt_path": str(prompt),
@@ -925,11 +953,19 @@ class OverlayLaneSeamTests(unittest.TestCase):
         receipt = self._prepare_overlay(role="orchestrator")
         path = self._invocation(receipt)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
-        self.assertEqual(1, controller.main([str(path)]))
+        self.assertEqual(2, controller.main([str(path)]))
         self.assertFalse(self.capture.exists(), "provider process must never start")
+
+    def test_prelaunch_allows_an_unprepared_lane_when_cache_is_not_requested(
+        self,
+    ) -> None:
+        path = self._invocation(None)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue(self.capture.exists())
         status = self._status()
-        self.assertEqual("LAUNCH_FAILED", status["state"])
-        self.assertIn("role", str(status["error"]))
+        self.assertIsNone(status.get("overlay_receipt"))
+        self.assertFalse(status.get("overlay_receipt_verified"))
 
     def test_prelaunch_verification_allows_completed_matching_receipt(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
@@ -940,6 +976,15 @@ class OverlayLaneSeamTests(unittest.TestCase):
         status = self._status()
         self.assertTrue(status.get("overlay_receipt_verified"))
         self.assertEqual(str(receipt), status.get("overlay_receipt"))
+
+    def test_prelaunch_allows_matching_orchestrator_receipt(self) -> None:
+        receipt = self._prepare_overlay(role="orchestrator")
+        path = self._invocation(receipt, doer="orchestrator")
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue(self.capture.exists())
+        status = self._status()
+        self.assertTrue(status.get("overlay_receipt_verified"))
 
     def test_retirement_restores_prepared_overlay_and_records_restoration(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
