@@ -10,6 +10,7 @@ from orchestrator_harness.invocation import (
     CanonicalInvocation,
     InvocationValidationError,
     _provider,
+    parse_canonical_invocation,
 )
 from orchestrator_harness.provider import (
     ProviderAdapterError,
@@ -37,6 +38,68 @@ def _spec(**overrides: object) -> ProviderLaunchSpec:
 
 
 class QwenProviderTests(unittest.TestCase):
+    def test_canonical_provider_options_exclude_identity_fields(self) -> None:
+        profile = {
+            "schema": "orchestrator-runtime-profile/v1",
+            "id": "profile-qwen",
+            "role": "worker",
+            "provider": "qwen-code",
+            "model": "qwen-model",
+            "tools": [],
+            "capabilities": [],
+            "resources": [],
+        }
+        invocation = parse_canonical_invocation(
+            {
+                "schema": CANONICAL_INVOCATION_SCHEMA,
+                "action": "start",
+                "run_root": "C:/run",
+                "runtime_root": "C:/runtime",
+                "lane_id": "lane-qwen",
+                "worker_invocation_id": "worker-qwen",
+                "cohort_id": "cohort-qwen",
+                "workflow": {"id": "workflow-qwen", "version": "v1"},
+                "task_card": {
+                    "id": "task-qwen",
+                    "revision": "1",
+                    "sha256": "0" * 64,
+                },
+                "role": "worker",
+                "provider": {
+                    "id": "qwen-code",
+                    "model": "qwen-model",
+                    "command": ["qwen", "exec"],
+                },
+                "profile": profile,
+                "prompt_bundle": {
+                    "schema": "orchestrator-prompt-bundle/v1",
+                    "version": 1,
+                    "workflow_id": "workflow-qwen",
+                    "task_card_id": "task-qwen",
+                    "profile_id": "profile-qwen",
+                    "components": [],
+                    "final_sha256": "0" * 64,
+                    "final_size": 0,
+                    "bundle_sha256": "0" * 64,
+                },
+                "output_paths": {
+                    "status": "C:/run/status.json",
+                    "jsonl": "C:/run/output.jsonl",
+                    "stderr": "C:/run/stderr.log",
+                    "last_message": "C:/run/last-message",
+                },
+                "event_log_path": "C:/runtime/events.jsonl",
+                "resources": [],
+            }
+        )
+        self.assertEqual("qwen-code", invocation.provider_id)
+        self.assertEqual("qwen-model", invocation.provider_model)
+        self.assertEqual(
+            {"command": ["qwen", "exec"]}, dict(invocation.provider_options)
+        )
+        self.assertNotIn("id", invocation.provider_options)
+        self.assertNotIn("model", invocation.provider_options)
+
     def test_native_registry_and_canonical_runner_path(self) -> None:
         registry = provider_registry()
         self.assertIn("qwen-code", registry)

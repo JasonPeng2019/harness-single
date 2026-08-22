@@ -452,7 +452,13 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
         provider.get("notification"), bool
     ):
         raise InvocationValidationError("provider.notification must be boolean")
-    return provider_id, model, _immutable(provider)
+    # ``id`` and ``model`` identify the provider at the canonical boundary;
+    # they are carried separately on ``CanonicalInvocation`` and must not be
+    # forwarded as adapter-specific launch options.
+    options = {
+        key: value for key, value in provider.items() if key not in {"id", "model"}
+    }
+    return provider_id, model, _immutable(options)
 
 
 def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
