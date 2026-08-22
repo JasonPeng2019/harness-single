@@ -216,6 +216,16 @@ class ProviderAdapterRegistryTests(unittest.TestCase):
         )
         self.assertEqual("FAILED", codex.terminal_outcome(None, 1))
 
+        prepared_argv = codex.build_argv(
+            _spec(prepared_worktree=True, run_root=Path("C:/prepared-worktree"))
+        )
+        self.assertIn("--dangerously-bypass-hook-trust", prepared_argv)
+        self.assertIn(
+            f'projects."{Path("C:/prepared-worktree")}".trust_level="trusted"',
+            prepared_argv,
+        )
+        self.assertNotIn("--dangerously-bypass-hook-trust", argv)
+
         claude = provider_adapter("claude-code")
         self.assertIsInstance(claude, ClaudeCodeProviderAdapter)
         argv = claude.build_argv(

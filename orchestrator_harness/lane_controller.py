@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -1644,9 +1645,68 @@ def _provider_launch_spec(
             ),
             provider_options=options,
             env_overrides=env_overrides,
+            prepared_worktree=invocation.overlay_receipt is not None,
         )
     except (TypeError, ValueError) as exc:
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
+
+
+def _prepared_overlay_role(invocation: Invocation) -> str:
+    """Map a controller lane to the one cache receipt role it owns."""
+
+    return invocation.doer if invocation.doer in {"orchestrator", "subagent"} else "subagent"
+
+
+def _verify_prepared_overlay(invocation: Invocation) -> dict[str, Any]:
+    """Require a completed overlay receipt before any provider launch work."""
+
+    if invocation.overlay_receipt is None:
+        raise InvocationError("a completed overlay receipt is required before provider launch")
+    verification = verify_overlay_receipt(
+        receipt_path=invocation.overlay_receipt,
+        expected_target_worktree_id=invocation.run_root,
+        role=_prepared_overlay_role(invocation),
+    )
+    if not verification.get("verified"):
+        raise InvocationError(
+            "overlay receipt is not completed for this prepared worktree: "
+            + str(verification.get("reason"))
+        )
+    return verification
+
+
+def _run_prepared_stop_hook(invocation: Invocation, *, boundary: str) -> dict[str, Any]:
+    """Run the cache-provided finite verifier and reject its blocking result."""
+
+    script = invocation.run_root / ".agent" / "stop-verify.ps1"
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if not script.is_file() or shell is None:
+        raise InvocationError("prepared worktree is missing its executable Stop verifier")
+    environment = os.environ.copy()
+    environment["AGENT_STOP_GATE_ENABLED"] = "1"
+    environment["AGENT_STOP_GATE_BOUNDARY"] = boundary
+    try:
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            cwd=invocation.run_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise InvocationError(f"prepared Stop verifier could not run: {exc}") from exc
+    output = completed.stdout.strip().splitlines()
+    try:
+        result = json.loads(output[-1]) if output else None
+    except json.JSONDecodeError as exc:
+        raise InvocationError("prepared Stop verifier did not emit JSON") from exc
+    if completed.returncode != 0 or not isinstance(result, dict):
+        raise InvocationError("prepared Stop verifier failed")
+    if result.get("continue") is not True:
+        raise InvocationError(str(result.get("reason") or "prepared Stop verifier blocked"))
+    return result
 
 
 def _requested_provider_operations(
@@ -2128,6 +2188,8 @@ def run(invocation: Invocation) -> int:
             raise InvocationError(
                 "coding worktree HEAD changed during pre-launch validation"
             )
+    overlay_verification = _verify_prepared_overlay(invocation)
+    prepared_stop_baseline = _run_prepared_stop_hook(invocation, boundary="baseline")
     controller = _identity(os.getpid())
     if provider_resume_handoff is not None:
         # A declared handoff never fabricates provider work: no adapter
@@ -2246,6 +2308,9 @@ def run(invocation: Invocation) -> int:
         "held_resource_claims": [],
         "waiting_resource_claim": None,
         "resource_claim_findings": [],
+        "overlay_receipt": str(invocation.overlay_receipt),
+        "overlay_receipt_verified": bool(overlay_verification.get("verified")),
+        "prepared_stop": {"baseline": prepared_stop_baseline},
         "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path),
         "last_message_path": str(invocation.last_message_path),
@@ -2859,22 +2924,6 @@ def run(invocation: Invocation) -> int:
                         "enabled": True,
                         "cleared_variable_names": cleared,
                     }
-            if argv is not None:
-                if invocation.overlay_receipt is not None:
-                    state["overlay_receipt"] = str(invocation.overlay_receipt)
-                    overlay_verification = verify_overlay_receipt(
-                        receipt_path=invocation.overlay_receipt,
-                        expected_target_worktree_id=invocation.run_root,
-                        role="subagent",
-                    )
-                    if not overlay_verification.get("verified"):
-                        raise InvocationError(
-                            "overlay receipt is not completed for this subagent worktree: "
-                            + str(overlay_verification.get("reason"))
-                        )
-                    state["overlay_receipt_verified"] = True
-                else:
-                    state["overlay_receipt"] = None
             if launch_spec is not None:
                 child_env = apply_provider_env_overrides(
                     child_env, launch_spec.env_overrides
@@ -3204,6 +3253,9 @@ def run(invocation: Invocation) -> int:
                 ),
             )
             return 1
+        state["prepared_stop"]["final"] = _run_prepared_stop_hook(
+            invocation, boundary="final"
+        )
         state.update(
             {
                 "state": exited_state,

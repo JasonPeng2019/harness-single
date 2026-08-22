@@ -104,6 +104,7 @@ class ProviderLaunchSpec:
     mcp_config: str | Mapping[str, Any] | list[Any] | None = None
     provider_options: Mapping[str, Any] = field(default_factory=dict)
     env_overrides: Mapping[str, str] = field(default_factory=dict)
+    prepared_worktree: bool = False
 
 
 @dataclass(frozen=True)
@@ -502,6 +503,14 @@ class CodexProviderAdapter(BaseProviderAdapter):
                 f'service_tier="{spec.service_tier}"',
             ]
         )
+        if spec.prepared_worktree:
+            argv.extend(
+                [
+                    "--dangerously-bypass-hook-trust",
+                    "-c",
+                    f'projects."{spec.run_root}".trust_level="trusted"',
+                ]
+            )
         if spec.worker_invocation_id is None:
             argv.extend(["-c", 'approvals_reviewer="user"'])
         for override in spec.config_overrides:

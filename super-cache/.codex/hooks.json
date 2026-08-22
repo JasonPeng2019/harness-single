@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "powershell -NoProfile -NonInteractive -File .agent/stop-verify.ps1",
+        "timeout": 15,
+        "type": "command"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "command": "powershell -NoProfile -NonInteractive -File .agent/stop-verify.ps1",
+        "matcher": "^(Bash|shell_command)$",
+        "timeout": 15,
+        "type": "command"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "powershell -NoProfile -NonInteractive -File .agent/stop-verify.ps1",
+        "timeout": 300,
+        "type": "command"
+      }
+    ]
+  }
+}

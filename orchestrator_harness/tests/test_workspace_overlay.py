@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -20,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
@@ -30,7 +29,6 @@ from orchestrator_harness.cli import build_parser, main as cli_main
 from orchestrator_harness.lane_lifecycle import RetirementResult, retire_terminal_lane
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.mutation import MutationError, MutationReceipt, TargetState
-from orchestrator_harness.tests.support import TemporaryGitRepository
 from orchestrator_harness.workspace_overlay import (
     DECLARATION_NAME,
     OVERLAY_RECEIPT_SCHEMA,
@@ -225,6 +223,32 @@ class OverlayModuleTests(unittest.TestCase):
         # The declaration is cache control data and is never copied.
         self.assertFalse((self.target / DECLARATION_NAME).exists())
         self.assertTrue(self.receipt.is_file())
+
+    def test_checked_in_super_cache_deploys_hooks_for_both_lane_roles(self) -> None:
+        """The checked-in cache, not a toy fixture, is deployable to either lane."""
+
+        source = Path(__file__).resolve().parents[2] / "super-cache"
+        result = ingest_super_cache(source_folder=source, harness_worktree=self.harness)
+        self.assertTrue(result["complete"])
+        for role in ("orchestrator", "subagent"):
+            target = self.root / f"prepared-{role}"
+            target.mkdir()
+            receipt = self.root / f"{role}-receipt.json"
+            prepared = prepare_worktree(
+                super_cache=self.cache,
+                target_worktree=target,
+                role=role,
+                receipt_path=receipt,
+            )
+            self.assertTrue(prepared["complete"])
+            self.assertTrue((target / ".agent" / "stop-verify.ps1").is_file())
+            hooks = json.loads(
+                (target / ".codex" / "hooks.json").read_text(encoding="utf-8")
+            )["hooks"]
+            self.assertEqual(15, hooks["SessionStart"][0]["timeout"])
+            self.assertEqual("^(Bash|shell_command)$", hooks["PreToolUse"][0]["matcher"])
+            self.assertEqual(15, hooks["PreToolUse"][0]["timeout"])
+            self.assertEqual(300, hooks["Stop"][0]["timeout"])
 
     def test_prepare_rejects_collision_before_any_mutation(self) -> None:
         cache = self._declared_cache()
@@ -753,6 +777,8 @@ if capture:
 sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "coding-thread"}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "provider-session"}), flush=True)
+print(json.dumps({"type": "result", "subtype": "success", "session_id": "provider-session"}), flush=True)
 raise SystemExit(0)
 """
 
@@ -807,6 +833,13 @@ class OverlayLaneSeamTests(unittest.TestCase):
         source = self.root / "overlay-source"
         source.mkdir()
         (source / "instructions.md").write_bytes(b"# overlay instructions\n")
+        (source / ".agent").mkdir()
+        (source / ".agent" / "stop-verify.ps1").write_text(
+            "if ($env:AGENT_STOP_GATE_ENABLED -ne '1') { "
+            "Write-Output '{\"continue\":false,\"reason\":\"gate disabled\"}'; exit 0 }\n"
+            "Write-Output '{\"continue\":true,\"reason\":\"test pass\"}'\n",
+            encoding="utf-8",
+        )
         (source / "config").mkdir()
         (source / "config" / "settings.txt").write_bytes(b"overlay setting\n")
         ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
@@ -824,6 +857,13 @@ class OverlayLaneSeamTests(unittest.TestCase):
         source.mkdir()
         (source / "instructions.md").write_bytes(b"# overlay instructions\n")
         (source / "empty-marker.txt").write_bytes(b"")
+        (source / ".agent").mkdir()
+        (source / ".agent" / "stop-verify.ps1").write_text(
+            "if ($env:AGENT_STOP_GATE_ENABLED -ne '1') { "
+            "Write-Output '{\"continue\":false,\"reason\":\"gate disabled\"}'; exit 0 }\n"
+            "Write-Output '{\"continue\":true,\"reason\":\"test pass\"}'\n",
+            encoding="utf-8",
+        )
         ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
         receipt = self.workspace / "overlay-receipt.json"
         prepare_worktree(
@@ -925,11 +965,14 @@ class OverlayLaneSeamTests(unittest.TestCase):
         receipt = self._prepare_overlay(role="orchestrator")
         path = self._invocation(receipt)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
-        self.assertEqual(1, controller.main([str(path)]))
+        self.assertEqual(2, controller.main([str(path)]))
         self.assertFalse(self.capture.exists(), "provider process must never start")
-        status = self._status()
-        self.assertEqual("LAUNCH_FAILED", status["state"])
-        self.assertIn("role", str(status["error"]))
+
+    def test_prelaunch_verification_requires_receipt_before_process_start(self) -> None:
+        path = self._invocation(None)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(2, controller.main([str(path)]))
+        self.assertFalse(self.capture.exists(), "provider process must never start")
 
     def test_prelaunch_verification_allows_completed_matching_receipt(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
@@ -940,6 +983,54 @@ class OverlayLaneSeamTests(unittest.TestCase):
         status = self._status()
         self.assertTrue(status.get("overlay_receipt_verified"))
         self.assertEqual(str(receipt), status.get("overlay_receipt"))
+
+    def _assert_prepared_providers(self, role: str) -> None:
+        receipt = self._prepare_overlay(role=role)
+        for provider_id in ("codex", "claude-code", "qwen-code"):
+            invocation = controller.load_invocation(self._invocation(receipt))
+            worker_id = f"worker-{role}-{provider_id}"
+            invocation = replace(
+                invocation,
+                doer=role,
+                provider_id=provider_id,
+                worker_invocation_id=worker_id,
+                lane_id=f"lane-{role}-{provider_id}",
+                status_path=self.workspace / f"{provider_id}.status.json",
+                jsonl_path=self.workspace / f"{provider_id}.jsonl",
+                stderr_path=self.workspace / f"{provider_id}.stderr.log",
+                last_message_path=self.workspace / f"{provider_id}.last-message.txt",
+                event_log=self.runtime / "events" / f"{provider_id}.jsonl",
+            )
+            self.assertEqual(0, controller.run(invocation), provider_id)
+            status = json.loads(invocation.status_path.read_text(encoding="utf-8"))
+            self.assertTrue(status.get("overlay_receipt_verified"), provider_id)
+            self.assertEqual("CODEX_EXITED", status.get("state"), provider_id)
+            prepared_stop = cast(dict[str, object], status["prepared_stop"])
+            self.assertIn("baseline", prepared_stop, provider_id)
+            self.assertIn("final", prepared_stop, provider_id)
+
+    def test_prepared_cache_runs_for_all_provider_subagents(self) -> None:
+        self._assert_prepared_providers("subagent")
+
+    def test_prepared_cache_runs_for_all_provider_orchestrators(self) -> None:
+        self._assert_prepared_providers("orchestrator")
+
+    def test_prepared_stop_block_fails_after_provider_cleanup(self) -> None:
+        receipt = self._prepare_overlay(role="subagent")
+        script = self.lane / ".agent" / "stop-verify.ps1"
+        script.write_text(
+            "if ($env:AGENT_STOP_GATE_BOUNDARY -eq 'final') { "
+            "Write-Output '{\"continue\":false,\"reason\":\"deliberate block\"}'; exit 0 }\n"
+            "Write-Output '{\"continue\":true,\"reason\":\"baseline pass\"}'\n",
+            encoding="utf-8",
+        )
+        path = self._invocation(receipt)
+        os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        self.assertEqual(1, controller.main([str(path)]))
+        self.assertTrue(self.capture.exists(), "provider started after the baseline pass")
+        status = self._status()
+        self.assertEqual("CONTROLLER_FAILED", status.get("state"))
+        self.assertIn("deliberate block", str(status.get("error")))
 
     def test_retirement_restores_prepared_overlay_and_records_restoration(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
