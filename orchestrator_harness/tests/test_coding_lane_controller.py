@@ -97,17 +97,11 @@ class CodingLaneControllerTests(unittest.TestCase):
     def _write(self, path: Path, value: dict[str, object]) -> None:
         path.write_text(json.dumps(value), encoding="utf-8")
 
-    def test_minimal_coding_invocation_has_no_firmware_contract(self) -> None:
+    def test_minimal_coding_invocation_has_only_provider_neutral_contract(self) -> None:
         path, _ = self.invocation()
         parsed = controller.load_invocation(path)
         self.assertEqual(controller.CODING_INVOCATION_SCHEMA, parsed.invocation_schema)
         self.assertEqual("worker-1", parsed.worker_invocation_id)
-        self.assertEqual([], parsed.leases)
-        self.assertEqual([], parsed.board_tokens)
-        self.assertEqual([], parsed.mcp_servers)
-        self.assertEqual({}, parsed.server_snapshot)
-        self.assertIsNone(parsed.policy_path)
-        self.assertIsNone(parsed.policy_sha256)
 
     def test_coding_settings_alias_remains_an_accepted_route_field(self) -> None:
         path, raw = self.invocation()
@@ -160,14 +154,13 @@ class CodingLaneControllerTests(unittest.TestCase):
             "mcp_servers": ["firmware-mcp"],
             "server_snapshot": {"head": "firmware"},
         }
-        self.assertEqual(set(firmware_only), controller._FIRMWARE_ONLY_FIELDS)
         for field, value in firmware_only.items():
             with self.subTest(field=field):
                 path, raw = self.invocation()
                 raw[field] = value
                 self._write(path, raw)
                 with self.assertRaisesRegex(
-                    controller.InvocationError, "reserved for the other route"
+                    controller.InvocationError, "unknown top-level fields"
                 ):
                     controller.load_invocation(path)
 

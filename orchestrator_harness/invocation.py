@@ -1,10 +1,4 @@
-"""Strict invocation records and compatibility adapters.
-
-The canonical record is intentionally small and provider-neutral.  The two
-older routes are parsed by their existing contracts and can be represented as
-an internal :class:`CanonicalInvocation` for shared checks, but their input
-schemas are never silently merged with the canonical record.
-"""
+"""Strict provider-neutral invocation records and adapters."""
 
 from __future__ import annotations
 
@@ -33,15 +27,6 @@ CODING_V1_CANONICAL_ONLY_FIELDS = frozenset(
         "workflow",
         "task_card",
         "cohort_id",
-    }
-)
-CODING_V1_FIRMWARE_ONLY_FIELDS = frozenset(
-    {
-        "policy_sha256",
-        "leases",
-        "board_tokens",
-        "mcp_servers",
-        "server_snapshot",
     }
 )
 CODING_V1_ALIAS_GROUPS = (
@@ -106,12 +91,6 @@ def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
             "coding v1 record contains canonical-only fields: "
             + ", ".join(map(str, canonical))
         )
-    firmware = sorted(CODING_V1_FIRMWARE_ONLY_FIELDS & set(raw), key=str)
-    if firmware:
-        raise InvocationValidationError(
-            "coding v1 record contains fields reserved for the other route (firmware-only): "
-            + ", ".join(map(str, firmware))
-        )
     unknown = sorted(set(raw) - CODING_V1_ALLOWED_FIELDS, key=str)
     if unknown:
         raise InvocationValidationError(
@@ -140,35 +119,6 @@ def validate_coding_v1_fields(raw: Mapping[str, Any]) -> None:
         raise InvocationValidationError(
             "coding v1 resources and exclusive_resources conflict"
         )
-
-
-_LEGACY_FIELDS = frozenset(
-    {
-        "prompt_path",
-        "prompt_sha256",
-        "model_settings",
-        "codex_command",
-        "config_overrides",
-        "policy_sha256",
-        "leases",
-        "board_tokens",
-        "mcp_servers",
-        "server_snapshot",
-        "doer",
-        "declared_lane_id",
-        "resource_lock_root",
-        "event_log",
-        "lane_event_log",
-        "exclusive_resources",
-        "git",
-        "resume_identity",
-        "resume_thread_id",
-        "codex",
-        "codex_settings",
-        "finding_gate",
-        "child_environment_isolation",
-    }
-)
 
 
 def _text(value: object, name: str) -> str:
@@ -248,8 +198,6 @@ class CanonicalInvocation:
     label: str
     task: str
     phase: str
-    legacy_route: str | None = None
-    legacy_policy_sha256: str | None = None
     resume_admission_path: Path | None = None
     overlay_receipt: Path | None = None
 
@@ -462,17 +410,12 @@ def _provider(value: object) -> tuple[str, str, Mapping[str, Any]]:
 
 
 def parse_canonical_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
-    """Parse only the canonical schema; legacy aliases are rejected."""
+    """Parse only the canonical schema; alternate aliases are rejected."""
 
     if not isinstance(raw, Mapping):
         raise InvocationValidationError("invocation root must be an object")
     if raw.get("schema") != CANONICAL_INVOCATION_SCHEMA:
         raise InvocationValidationError("invocation is not the canonical schema")
-    foreign = sorted(set(raw) & _LEGACY_FIELDS)
-    if foreign:
-        raise InvocationValidationError(
-            "canonical invocation contains legacy aliases: " + ", ".join(foreign)
-        )
     required = {
         "schema",
         "action",
@@ -649,13 +592,7 @@ def _legacy_bundle_record(
     task_card_id: str,
     profile_id: str,
 ) -> dict[str, Any]:
-    """Create an identity-only record for a legacy adapter.
-
-    Legacy routes do not read this record to change their prompt policy.  It is
-    only used when the route is represented in a provider-neutral diagnostic
-    identity, and the controller continues to verify the original prompt
-    contract through its legacy loader.
-    """
+    """Create the identity-only record for the retained coding-v1 adapter."""
 
     manifest = {
         "schema": PROMPT_BUNDLE_SCHEMA,
@@ -686,7 +623,7 @@ def _legacy_bundle_record(
 def adapt_coding_v1(
     raw: Mapping[str, Any], *, run_root: Path | None = None
 ) -> CanonicalInvocation:
-    """Adapt coding v1 without accepting firmware-only fields."""
+    """Adapt the supported coding-v1 record into the canonical model."""
 
     validate_coding_v1_fields(raw)
     settings = raw.get("codex", raw.get("codex_settings", raw.get("model_settings")))
@@ -793,8 +730,6 @@ def adapt_coding_v1(
         _text(raw.get("label", worker_id), "label"),
         _text(raw.get("task", card_id), "task"),
         _text(raw.get("phase", "implementation"), "phase"),
-        "coding-v1",
-        None,
         overlay_receipt=(
             Path(_text(raw.get("overlay_receipt"), "overlay_receipt"))
             if raw.get("overlay_receipt") is not None
@@ -803,122 +738,14 @@ def adapt_coding_v1(
     )
 
 
-def adapt_legacy_firmware(raw: Mapping[str, Any]) -> CanonicalInvocation:
-    """Represent the schema-less firmware route without migrating its policy."""
-
-    if "schema" in raw:
-        raise InvocationValidationError(
-            "legacy firmware adapter requires a schema-less record"
-        )
-    forbidden = {
-        "worker_invocation_id",
-        "runtime_root",
-        "resource_lock_root",
-        "event_log_path",
-        "event_log",
-        "lane_id",
-        "resources",
-        "exclusive_resources",
-        "repository",
-        "git",
-        "resume_identity",
-        "resume",
-        "codex",
-        "codex_settings",
-        "finding_gate",
-        "child_environment_isolation",
-    }
-    present = sorted(forbidden & set(raw))
-    if present:
-        raise InvocationValidationError(
-            "schema-less firmware record contains coding aliases: " + ", ".join(present)
-        )
-    prompt_sha256 = _digest(raw.get("prompt_sha256"), "prompt_sha256")
-    lane_id = _text(raw.get("declared_lane_id"), "declared_lane_id")
-    label = _text(raw.get("label"), "label")
-    settings = raw.get("model_settings")
-    if not isinstance(settings, Mapping):
-        raise InvocationValidationError(
-            "schema-less firmware model_settings are missing"
-        )
-    profile_id = f"legacy-firmware:{lane_id}"
-    profile = {
-        "id": profile_id,
-        "role": _text(raw.get("doer"), "doer"),
-        "provider": "codex",
-        "model": _text(settings.get("model"), "model_settings.model"),
-        "tools": [],
-        "capabilities": ["legacy-firmware-policy"],
-        "resources": list(raw.get("leases", [])),
-    }
-    return CanonicalInvocation(
-        CANONICAL_INVOCATION_SCHEMA,
-        _text(raw.get("action"), "action").lower(),
-        Path(_text(raw.get("run_root"), "run_root")),
-        Path(_text(raw.get("run_root"), "run_root")),
-        lane_id,
-        f"legacy-firmware:{label}",
-        "legacy-firmware",
-        "legacy-firmware",
-        "1",
-        _text(raw.get("task"), "task"),
-        "legacy",
-        prompt_sha256,
-        _text(raw.get("doer"), "doer"),
-        "codex",
-        _text(settings.get("model"), "model_settings.model"),
-        _immutable(
-            {
-                "command": list(raw.get("codex_command", ["codex"])),
-                "config_overrides": list(raw.get("config_overrides", [])),
-                "reasoning_effort": _text(
-                    settings.get("reasoning_effort"), "reasoning_effort"
-                ),
-                "service_tier": _text(settings.get("service_tier"), "service_tier"),
-                "sandbox": "danger-full-access",
-                "approval_policy": "never",
-            }
-        ),
-        _immutable(profile),
-        _immutable(
-            _legacy_bundle_record(
-                prompt_path=_text(raw.get("prompt_path"), "prompt_path"),
-                prompt_sha256=prompt_sha256,
-                workflow_id="legacy-firmware",
-                task_card_id=_text(raw.get("task"), "task"),
-                profile_id=profile_id,
-            )
-        ),
-        {
-            key: Path(
-                _text((raw.get("output_paths") or {}).get(key), f"output_paths.{key}")
-            )
-            for key in ("status", "jsonl", "stderr", "last_message")
-        },
-        Path(_text(raw.get("lane_event_log"), "lane_event_log")),
-        tuple(profile["resources"]),
-        None,
-        _text(raw.get("resume_thread_id"), "resume_thread_id")
-        if raw.get("resume_thread_id") is not None
-        else None,
-        label,
-        _text(raw.get("task"), "task"),
-        _text(raw.get("phase"), "phase"),
-        "legacy-firmware",
-        prompt_sha256,
-    )
-
-
 def adapt_invocation(raw: Mapping[str, Any]) -> CanonicalInvocation:
-    """Select exactly one canonical, coding-v1, or schema-less firmware adapter."""
+    """Select exactly one supported canonical invocation adapter."""
 
     schema = raw.get("schema") if isinstance(raw, Mapping) else None
     if schema == CANONICAL_INVOCATION_SCHEMA:
         return parse_canonical_invocation(raw)
     if schema == CODING_INVOCATION_SCHEMA:
         return adapt_coding_v1(raw)
-    if schema is None:
-        return adapt_legacy_firmware(raw)
     raise InvocationValidationError(f"unsupported invocation schema: {schema}")
 
 
@@ -933,12 +760,10 @@ __all__ = [
     "CODING_V1_ALLOWED_FIELDS",
     "CODING_V1_ALIAS_GROUPS",
     "CODING_V1_CANONICAL_ONLY_FIELDS",
-    "CODING_V1_FIRMWARE_ONLY_FIELDS",
     "WorkerInvocation",
     "InvocationValidationError",
     "adapt_coding_v1",
     "adapt_invocation",
-    "adapt_legacy_firmware",
     "parse_invocation",
     "parse_canonical_invocation",
     "validate_coding_v1_fields",

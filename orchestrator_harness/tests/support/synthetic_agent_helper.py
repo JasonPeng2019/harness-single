@@ -76,8 +76,8 @@ def main() -> int:
                 checkpoint = workspace / "PARALLEL_CHECKPOINT.md"
                 checkpoint.write_text(
                     "# Real-agent synthetic checkpoint\n\n"
-                    "The exact synthetic relay was observed. No MCP, firmware server, "
-                    "board, probe, serial endpoint, or hardware action was used.\n",
+                    "The exact synthetic relay was observed. No external provider "
+                    "service or physical action was used.\n",
                     encoding="utf-8",
                 )
                 atomic_json(

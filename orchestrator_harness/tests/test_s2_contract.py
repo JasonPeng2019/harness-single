@@ -15,7 +15,6 @@ from orchestrator_harness.invocation import (
     CANONICAL_INVOCATION_SCHEMA,
     InvocationValidationError,
     adapt_coding_v1,
-    adapt_legacy_firmware,
     parse_canonical_invocation,
 )
 from orchestrator_harness.lane_controller import load_invocation
@@ -24,7 +23,6 @@ from orchestrator_harness.discovery import discover_run
 from orchestrator_harness.profile import RuntimeProfile, build_child_environment
 from orchestrator_harness.prompt_bundle import (
     bundle_from_record,
-    compose_prompt_bundle,
     prompt_bundle_record_from_paths,
 )
 from orchestrator_harness.provider import (
@@ -896,7 +894,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             cleared,
         )
 
-    def test_legacy_adapters_are_separate_and_reject_ambiguous_aliases(self) -> None:
+    def test_coding_v1_adapter_rejects_ambiguous_aliases(self) -> None:
         coding = {
             "schema": "orchestrator-coding-invocation/v1",
             "action": "start",
@@ -928,32 +926,6 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         ambiguous["codex_settings"] = dict(coding["codex"])  # type: ignore[index]
         with self.assertRaises(InvocationValidationError):
             adapt_coding_v1(ambiguous)
-
-        firmware = {
-            "action": "start",
-            "run_root": "C:/run",
-            "prompt_path": "C:/run/prompt.md",
-            "prompt_sha256": "b" * 64,
-            "declared_lane_id": "legacy-lane",
-            "label": "legacy-worker",
-            "doer": "firmware-worker",
-            "task": "legacy-task",
-            "phase": "implementation",
-            "lane_event_log": "C:/run/.agent-workspace/events.jsonl",
-            "output_paths": coding["output_paths"],
-            "model_settings": {
-                "model": "codex-test",
-                "reasoning_effort": "medium",
-                "service_tier": "priority",
-            },
-        }
-        self.assertEqual(
-            "legacy-firmware", adapt_legacy_firmware(firmware).legacy_route
-        )
-        mixed = dict(firmware)
-        mixed["worker_invocation_id"] = "not-legacy"
-        with self.assertRaises(InvocationValidationError):
-            adapt_legacy_firmware(mixed)
 
     def test_coding_v1_closed_contract_and_alias_matrix(self) -> None:
         coding = {

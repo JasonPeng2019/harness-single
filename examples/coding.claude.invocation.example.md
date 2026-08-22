@@ -11,7 +11,7 @@ loads end-to-end through `lane_controller.load_invocation`.
 
 | Field | Meaning |
 | --- | --- |
-| `schema` | **`orchestrator-worker-invocation/v1`** â€” the canonical provider-neutral schema, not the legacy `orchestrator-coding-invocation/v1`. A claude-code lane must use this schema: the legacy coding-v1 route is hard-wired to `provider.id="codex"` and has no claude block. |
+| `schema` | **`orchestrator-worker-invocation/v1`** â€” the canonical provider-neutral schema. A claude-code lane uses this schema and its provider block identifies `provider.id="claude-code"`. |
 | `action` | `"start"` (or `"resume"` with a `resume.session_id`). |
 | `run_root` | The Git **worktree** the provider edits. Must already exist and be a directory; the provider process starts with this as its working directory. |
 | `runtime_root` | A runtime directory **separate from** `run_root` (the controller rejects a runtime_root nested inside run_root or vice-versa). Holds the lane event log. |

@@ -289,7 +289,7 @@ def _manager_root_records(
     error_code: str,
     seen_paths: set[Path],
 ) -> tuple[list[JsonRecord], list[ObservationError]]:
-    """Read current manager records without relaxing legacy request semantics."""
+    """Read current manager records without relaxing request semantics."""
     records: list[JsonRecord] = []
     errors: list[ObservationError] = []
     if not root.exists():
@@ -833,12 +833,7 @@ def discover_run(
             "orchestrator-worker-invocation/v1",
         }
     ]
-    firmware_controllers = [
-        item
-        for item in controllers
-        if item.status.value.get("invocation_schema") is None
-    ]
-    coding_route = bool(coding_controllers) and not firmware_controllers
+    coding_route = bool(coding_controllers)
     coding_owner: ControllerRecord | None = None
     candidate: JsonRecord | None = None
     if result_path.exists():
@@ -895,20 +890,12 @@ def discover_run(
                 result = candidate
                 result_status_path = coding_owner.status.path
             else:
-                if len(firmware_controllers) > 1:
-                    raise ValueError(
-                        "legacy firmware result has ambiguous controller ownership"
-                    )
-                if not firmware_controllers and coding_controllers:
-                    coding_route = True
-                    if len(coding_controllers) == 1:
-                        coding_owner = coding_controllers[0]
-                    raise GitSafetyError(
-                        "firmware-shaped result is not valid for a coding lane"
-                    )
-                result = candidate
-                if firmware_controllers:
-                    result_status_path = firmware_controllers[0].status.path
+                coding_route = True
+                if len(coding_controllers) == 1:
+                    coding_owner = coding_controllers[0]
+                raise GitSafetyError(
+                    "result does not use a supported coding result schema"
+                )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             code = "CODING_RESULT_INVALID" if coding_route else "RESULT_READ_ERROR"
             errors.append(ObservationError(str(result_path), code, str(exc)[:500]))

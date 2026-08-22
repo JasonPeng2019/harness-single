@@ -113,33 +113,6 @@ Run the complete local example at any time:
 python examples/disposable_coding_fixture.py
 ```
 
-The legacy policy-bound firmware path remains supported but is not part of this quick start.
-
-## Optional firmware seam and dual-path operation
-
-The legacy policy-bound firmware path remains supported but is not part of this quick start. For an
-existing policy-bound firmware lane, start from `examples/legacy-firmware.invocation.example.json`;
-it intentionally has no `schema` field and no coding V1 Git/runtime/resource fields. Do not migrate
-a schema-less firmware fixture just to share an observer epoch.
-
-`examples/dual-path-manager.example.md` is the copyable native-manager sequence for one coding and
-one legacy firmware lane. It uses a fresh config/runtime, `scan --no-write`, and one native
-`watch --until-actionable` call. Its acknowledgement is the returned envelope's top-level
-`event_id`, never `data.signal_id`.
-
-The optional firmware seam is caller-declared and installed with the package. A caller builds a
-`FirmwareCampaignPack` from a declared capability name, `FirmwareAction` declarations (MCP tool
-name, positive method version, positive maximum duration, exact required argument names), canonical
-resource identities, and a nonempty public policy binding; there is no default pack or built-in
-fixture. The broker-compatible `FirmwareHardwareAdapter` takes that pack plus caller-supplied
-snapshot, launch/configuration, child-identity, and transport seams, reuses `ProcessBoundary` and
-`ProcessSupervisor`, and sends exact MCP traffic (`initialize` with the caller-declared protocol
-version, `notifications/initialized`, then `tools/call`). Permit-expiry checks precede launch,
-enqueue, and dispatch; public results never leak private launch/configuration data; and cleanup
-retains the claim until both the owned process boundary and transport are proven closed. The
-pack/adapter plus the existing `CapabilityBroker` is the complete optional firmware seam; it is not
-connected to the lane controller and introduces no controller or runtime protocol.
-
 Resume a coding controller only with its persisted identity and output paths; the controller, not a
 new wrapper, verifies that resume identity:
 
@@ -148,8 +121,7 @@ python -m orchestrator_harness.lane_controller C:/absolute/path/to/coding.resume
 ```
 
 That resume invocation keeps the same `worker_invocation_id` and supplies the recorded thread as
-`resume_thread_id` or `resume_identity.thread_id`. Legacy firmware resumes under its retained
-policy-bound contract.
+`resume_thread_id` or `resume_identity.thread_id`.
 
 Before disposal, let each bounded diagnostic wait return and request cooperative stop from the
 recorded owner. Prove absence using every recorded PID plus creation time from its status/launch

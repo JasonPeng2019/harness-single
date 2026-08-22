@@ -1,9 +1,8 @@
 # Harness Watcher operating guide
 
-> **Legacy firmware compatibility:** The M5 counted-sprint workflow, named experiment roles, MCP,
-> hardware, lease, relay, and server-repair procedures below describe the supported legacy firmware
-> path. They are not the current ordinary coding workflow. For general coding operation, start with
-> `QUICK_START.md` and keep the optional watcher deterministic with evaluation disabled.
+> The watcher is an optional diagnostic around the canonical coding workflow. It does not launch
+> providers, manage lanes, or replace the harness event loop. For operation, start with
+> `QUICK_START.md` and keep evaluation disabled unless a separately reviewed configuration enables it.
 
 The Harness Watcher is an **optional deterministic, read-only diagnostic service** around the
 required `orchestrator_harness`. It is not an AI subagent, suite manager, wake bridge, or replacement
@@ -11,9 +10,9 @@ for the managed harness event loop. It tails configured logs, records health and
 and can durably publish a diagnosed harness alert when its optional evaluator is enabled.
 
 The implementation is under `harness_watcher_implementation/`; each live epoch writes only under
-`harness_watcher/<epoch>/`. During M5 counted sprints the evaluator is disabled, so the watcher only
-collects deterministic diagnostics. A separate AI result reviewer may inspect the retained evidence
-after the sprint has fully stopped; it is not part of the watcher or live runtime.
+`harness_watcher/<epoch>/`. When evaluation is disabled, the watcher only collects deterministic
+diagnostics. A separate result reviewer may inspect retained evidence after the run has fully
+stopped; it is not part of the watcher or live runtime.
 
 ## Roles and authority
 
@@ -21,7 +20,7 @@ after the sprint has fully stopped; it is not part of the watcher or live runtim
 |---|---|---|
 | Main orchestrator | Owns scheduling, resource leases, agent instructions, exact permission relays, evidence acceptance, failure classification, repair barriers, and recovery decisions. | `multi-agent-logs/orchestrator-harness/<epoch>/MANAGER_LOG.jsonl`, current suite ledgers, and the affected run's status/evidence. |
 | `orchestrator_harness` | Read-only reconciliation and durable actionable-event delivery. It observes lanes and process identities but never schedules, approves, leases, kills, flashes, or edits evidence. | The fresh epoch output directory named by its config, including `snapshot.json`, `events.jsonl`, and `pending-notification.json`. |
-| Harness Watcher | Deterministically tails bounded new log data and writes health/attention diagnostics. Outside M5 it may invoke the configured evaluator when enabled, validate a packet-bound verdict, and publish a durable `HARNESS_WATCHER_ALERT`; in M5 diagnostic-only mode it never invokes a model or publishes evaluator-derived alerts. | `harness_watcher/<epoch>/watcher/`, including events, cursor/state, alerts, lifecycle, and recovery history. |
+| Harness Watcher | Deterministically tails bounded new log data and writes health/attention diagnostics. When evaluation is enabled, it validates a packet-bound verdict and may publish a durable `HARNESS_WATCHER_ALERT`; in diagnostic-only mode it never invokes a model or publishes evaluator-derived alerts. | `harness_watcher/<epoch>/watcher/`, including events, cursor/state, alerts, lifecycle, and recovery history. |
 | Atlas, Boreal, Cygnus, Delta | Persistent Luna-high/Fast (`priority`) experiment doers. Each owns one catalog task at a time and reports progress, checkpoint, help, and completion signals; they never manage another lane or edit the production server. | Their experiment root plus `harness_watcher/<epoch>/subagents/<safe-id>/`. |
 | Experiment reviewer | Terra-high/Fast, read-only against its assigned run. Reviews the specification and retained evidence; it does not operate hardware or repair the server. | The assigned run's review/evidence records and routed subagent log. |
 | Server-repair roles | Terra-high/Fast roles used only after the main orchestrator independently validates a production-server defect and opens one serialized change-loop. | The owning run's server-repair records and `.agent-workspace/SERVER_REPAIR_QUEUE.md`. |
@@ -72,7 +71,7 @@ either mode.
 
 Healthy operation is silent. Unchanged logs are not repeatedly evaluated before the configured
 no-progress threshold, and one unchanged generation is not evaluated over and over. A normal long
-build, a provider/hardware/lease wait, a single retry, an ordinary firmware failure, a test failure,
+build, a provider/resource wait, a single retry, a provider failure, a test failure,
 or a server defect is **not** by itself a harness defect.
 
 ## What qualifies as a harness problem
@@ -112,7 +111,7 @@ The watcher never performs these actions itself. After `RESOLVED`, it returns to
 Never restart completed experiments or the entire suite merely because one alert or targeted test
 failed.
 
-## Evaluator modes and M5 diagnostic-only operation
+## Evaluator modes and diagnostic-only operation
 
 `evaluator_enabled` is independent of the global watcher feature flag. The normal default is
 `false`: the watcher remains deterministic and diagnostic-only unless a configuration explicitly
@@ -144,7 +143,7 @@ watcher runtime. If READY is not published, confirm the owner PID/creation ident
 paths; if stop does not complete, inspect the exact service identity and wait for its cooperative
 terminal record—do not kill an unrelated process.
 
-For M5 scoring, 90 seconds is a diagnostic target rather than an automatic failure. A longer
+For diagnostic scoring, 90 seconds is a diagnostic target rather than an automatic failure. A longer
 request is acceptable only when the canonical attention timeline contains one complete, gap-free
 chain proving genuine manager work or handling an earlier real request. Late harness observation,
 native-wait delay, otherwise-idle delay, and partial or contradictory activity are not valid

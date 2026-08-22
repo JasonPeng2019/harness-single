@@ -50,7 +50,6 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
                 "orchestrator-disposable-coding-fixture/v1", result["schema"]
             )
             self.assertEqual(4, result["coding_lane_count"])
-            self.assertEqual(0, result["firmware_records"])
             self.assertTrue(result["contention_observed"])
             self.assertTrue(result["stale_result_rejected"])
             self.assertEqual(
@@ -69,8 +68,6 @@ class GeneralCodingIntegrationTests(unittest.TestCase):
                 status = statuses[lane]
                 self.assertEqual("orchestrator-lane-controller/v1", status["schema"])
                 self.assertEqual(lane, status["declared_lane_id"])
-                self.assertEqual([], status["mcp_servers"])
-                self.assertEqual([], status["board_tokens"])
                 self.assertEqual([], status["held_resource_claims"])
                 self.assertTrue((Path(status["jsonl_path"])).is_file())
                 self.assertTrue((Path(status["stderr_path"])).is_file())

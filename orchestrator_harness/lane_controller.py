@@ -1,8 +1,7 @@
-"""Small, externally invoked controller for one persistent Codex lane turn.
+"""Small, externally invoked controller for one persistent coding lane turn.
 
-The controller accepts either the original firmware/policy-bound invocation or the explicit
-general-coding schema. It does not schedule lanes: it validates one manager-written invocation,
-launches one child, and leaves factual process/output records for the read-only harness to observe.
+The controller validates one manager-written canonical invocation, launches one provider child, and
+leaves factual process/output records for the read-only harness to observe.
 """
 
 from __future__ import annotations
@@ -36,7 +35,6 @@ from .git_safety import (
 )
 from .invocation import (
     CANONICAL_INVOCATION_SCHEMA,
-    CODING_V1_FIRMWARE_ONLY_FIELDS,
     CanonicalInvocation,
     InvocationValidationError,
     parse_canonical_invocation,
@@ -106,43 +104,6 @@ class InvocationError(ValueError):
 
 
 CODING_INVOCATION_SCHEMA = "orchestrator-coding-invocation/v1"
-
-# These keys are route discriminators, rather than optional aliases.  Silently
-# ignoring one on the other route would make a hand-written mixed invocation
-# appear valid while dropping its safety contract.
-_FIRMWARE_ONLY_FIELDS = CODING_V1_FIRMWARE_ONLY_FIELDS
-_CODING_ONLY_FIELDS = frozenset(
-    {
-        "worker_invocation_id",
-        "runtime_root",
-        "resource_lock_root",
-        "event_log_path",
-        "event_log",
-        "lane_id",
-        "resources",
-        "exclusive_resources",
-        "repository",
-        "git",
-        "resume_identity",
-        "resume",
-        "codex",
-        "codex_settings",
-        "finding_gate",
-        "child_environment_isolation",
-    }
-)
-# ``model_settings`` is retained by both routes, but coding accepts these
-# nested settings only as a compatibility fallback.  They must not be silently
-# discarded when a schema-less firmware invocation is parsed.
-_CODING_ONLY_MODEL_SETTINGS_FIELDS = frozenset(
-    {
-        "command",
-        "config_overrides",
-        "sandbox",
-        "approval_policy",
-    }
-)
-
 
 def _utc() -> str:
     return iso_utc(datetime.now(timezone.utc)) or ""
@@ -311,45 +272,6 @@ def _string_list(value: object, name: str) -> list[str]:
     return list(value)
 
 
-def _reject_foreign_fields(
-    raw: Mapping[str, Any],
-    *,
-    route: str,
-    fields: frozenset[str],
-) -> None:
-    present = sorted(field for field in fields if field in raw)
-    if present:
-        raise InvocationError(
-            f"{route} invocation contains fields reserved for the other route: "
-            + ", ".join(present)
-        )
-
-
-def _reject_firmware_coding_model_settings(raw: Mapping[str, Any]) -> None:
-    settings = raw.get("model_settings")
-    if not isinstance(settings, Mapping):
-        return
-    _reject_foreign_fields(
-        settings,
-        route="schema-less firmware model_settings",
-        fields=_CODING_ONLY_MODEL_SETTINGS_FIELDS,
-    )
-
-
-def _reject_ambiguous_coding_aliases(raw: Mapping[str, Any]) -> None:
-    for aliases, name in (
-        (("codex", "codex_settings", "model_settings"), "provider settings"),
-        (("repository", "git"), "repository"),
-        (("event_log_path", "event_log", "lane_event_log"), "event log"),
-        (("resume_identity", "resume"), "resume identity"),
-    ):
-        present = [alias for alias in aliases if alias in raw]
-        if len(present) > 1:
-            raise InvocationError(
-                f"coding invocation contains ambiguous {name} aliases: {', '.join(present)}"
-            )
-
-
 @dataclass(frozen=True)
 class Invocation:
     invocation_schema: str | None
@@ -360,17 +282,11 @@ class Invocation:
     prompt_path: Path
     prompt_sha256: str
     prompt_bytes: bytes
-    policy_path: Path | None
-    policy_sha256: str | None
     label: str
     doer: str
     task: str
     phase: str
     lane_id: str
-    leases: list[str]
-    board_tokens: list[str]
-    mcp_servers: list[str]
-    server_snapshot: dict[str, Any]
     resources: list[str]
     resource_lock_root: Path | None
     model: str
@@ -471,121 +387,6 @@ def _resume_thread(raw: dict[str, Any]) -> str | None:
     return requested_thread.strip() if isinstance(requested_thread, str) else None
 
 
-def _load_firmware_invocation(raw: dict[str, Any]) -> Invocation:
-    _reject_foreign_fields(
-        raw, route="schema-less firmware", fields=_CODING_ONLY_FIELDS
-    )
-    _reject_firmware_coding_model_settings(raw)
-    action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = (
-        _common_paths(raw)
-    )
-    label = _string(raw, "label")
-    expected = {
-        "status": f"{label}_controller.status.json",
-        "jsonl": f"{label}_codex.jsonl",
-    }
-    if (
-        outputs["status"].name != expected["status"]
-        or outputs["jsonl"].name != expected["jsonl"]
-    ):
-        raise InvocationError("controller status/JSONL names must match the lane label")
-    server_snapshot = raw.get("server_snapshot")
-    if not isinstance(server_snapshot, dict):
-        raise InvocationError("server_snapshot must be an object")
-    model_settings = raw.get("model_settings")
-    if not isinstance(model_settings, dict):
-        raise InvocationError("model_settings must be an object")
-    command = raw.get("codex_command", ["codex"])
-    command = _string_list(command, "codex_command")
-    overrides = _string_list(raw.get("config_overrides", []), "config_overrides")
-    requested_thread = _resume_thread(raw)
-    suite_root = Path(__file__).resolve().parent.parent
-    policy_path = suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.md"
-    sidecar_path = (
-        suite_root / ".agent-workspace" / "AUTONOMOUS_EXECUTION_POLICY.sha256"
-    )
-    policy_sha256 = _string(raw, "policy_sha256").lower()
-    if len(policy_sha256) != 64 or any(
-        char not in "0123456789abcdef" for char in policy_sha256
-    ):
-        raise InvocationError("policy_sha256 must be a SHA-256 hex digest")
-    try:
-        policy_bytes = policy_path.read_bytes()
-        sidecar = sidecar_path.read_text(encoding="utf-8").split()[0].lower()
-    except (OSError, IndexError) as exc:
-        raise InvocationError(f"cannot verify policy-bound prompt: {exc}") from exc
-    if (
-        hashlib.sha256(policy_bytes).hexdigest() != policy_sha256
-        or sidecar != policy_sha256
-    ):
-        raise InvocationError(
-            "canonical policy file or sidecar does not match policy_sha256"
-        )
-    try:
-        prompt_text = prompt_bytes.decode("utf-8-sig")
-        policy_text = policy_bytes.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise InvocationError("policy-bound prompt must be UTF-8") from exc
-    markers = (
-        "## AUTHORITATIVE ZERO-OPERATOR OVERRIDE",
-        f"Policy SHA-256: `{policy_sha256}`",
-        "## END AUTHORITATIVE ZERO-OPERATOR OVERRIDE",
-        "## FINAL PRECEDENCE REMINDER",
-        f"Policy `{policy_sha256}` and the latest signed run amendment control.",
-    )
-    if (
-        any(marker not in prompt_text for marker in markers)
-        or policy_text not in prompt_text
-    ):
-        raise InvocationError(
-            "prompt is not the required policy-bound prompt composition"
-        )
-    log_root = suite_root / "multi-agent-logs" / "orchestrator-harness"
-    event_log = _safe_path(
-        raw.get("lane_event_log"), root=log_root, name="lane_event_log"
-    )
-    if event_log.name != "LANE_EVENTS.jsonl":
-        raise InvocationError("lane_event_log must be named LANE_EVENTS.jsonl")
-    event_log.parent.mkdir(parents=True, exist_ok=True)
-    return Invocation(
-        None,
-        None,
-        action,
-        run_root,
-        workspace,
-        prompt_path,
-        prompt_sha256,
-        prompt_bytes,
-        policy_path,
-        policy_sha256,
-        label,
-        _string(raw, "doer"),
-        _string(raw, "task"),
-        _string(raw, "phase"),
-        _string(raw, "declared_lane_id"),
-        _string_list(raw.get("leases", []), "leases"),
-        _string_list(raw.get("board_tokens", []), "board_tokens"),
-        _string_list(raw.get("mcp_servers", []), "mcp_servers"),
-        server_snapshot,
-        [],
-        None,
-        _string(model_settings, "model"),
-        _string(model_settings, "reasoning_effort"),
-        _string(model_settings, "service_tier"),
-        command,
-        overrides,
-        "danger-full-access",
-        "never",
-        requested_thread,
-        None,
-        outputs["status"],
-        outputs["jsonl"],
-        outputs["stderr"],
-        outputs["last_message"],
-        event_log,
-    )
-
-
 def _coding_settings(
     raw: dict[str, Any],
 ) -> tuple[str, str, str, list[str], list[str], str, str]:
@@ -626,8 +427,6 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         validate_coding_v1_fields(raw)
     except InvocationValidationError as exc:
         raise InvocationError(str(exc)) from exc
-    _reject_foreign_fields(raw, route="coding", fields=_FIRMWARE_ONLY_FIELDS)
-    _reject_ambiguous_coding_aliases(raw)
     action, run_root, workspace, prompt_path, prompt_sha256, prompt_bytes, outputs = (
         _common_paths(raw)
     )
@@ -666,12 +465,12 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     if not isinstance(lane_id_value, str) or not lane_id_value.strip():
         raise InvocationError("lane_id must be a non-empty string")
     lane_id = lane_id_value.strip()
-    legacy_resources = raw.get("resources")
+    declared_resources = raw.get("resources")
     exclusive_resources = raw.get("exclusive_resources")
     if (
-        legacy_resources is not None
+        declared_resources is not None
         and exclusive_resources is not None
-        and legacy_resources != exclusive_resources
+        and declared_resources != exclusive_resources
     ):
         raise InvocationError(
             "resources and exclusive_resources must match when both are supplied"
@@ -679,7 +478,7 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
     resources = _string_list(
         exclusive_resources
         if exclusive_resources is not None
-        else legacy_resources or [],
+        else declared_resources or [],
         "exclusive_resources",
     )
     try:
@@ -753,17 +552,11 @@ def _load_coding_invocation(raw: dict[str, Any]) -> Invocation:
         prompt_path,
         prompt_sha256,
         prompt_bytes,
-        None,
-        None,
         label_value.strip(),
         doer_value.strip(),
         _string(raw, "task"),
         _string(raw, "phase"),
         lane_id,
-        [],
-        [],
-        [],
-        {},
         resources,
         resource_lock_root,
         model,
@@ -918,17 +711,11 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
             component_path,
             bundle.final_sha256,
             bundle.final_bytes,
-            None,
-            None,
             canonical.label,
             canonical.role,
             canonical.task,
             canonical.phase,
             canonical.lane_id,
-            [],
-            [],
-            [],
-            {},
             list(canonical.resources),
             runtime_root / "canonical-resource-locks",
             canonical.provider_model,
@@ -972,8 +759,6 @@ def load_invocation(path: Path) -> Invocation:
         invocation = _load_canonical_invocation(raw)
     elif schema == CODING_INVOCATION_SCHEMA:
         invocation = _load_coding_invocation(raw)
-    elif schema is None:
-        invocation = _load_firmware_invocation(raw)
     else:
         raise InvocationError(f"unsupported invocation schema: {schema}")
     object.__setattr__(
@@ -2215,11 +2000,11 @@ def run(invocation: Invocation) -> int:
             raise InvocationError(
                 f"cannot create canonical launch parents: {exc}"
             ) from exc
-    legacy_status_names = invocation.canonical is None
-    running_state = "RUNNING_CODEX" if legacy_status_names else "RUNNING_PROVIDER"
-    exited_state = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
-    started_event = "CODEX_STARTED" if legacy_status_names else "PROVIDER_STARTED"
-    exited_event = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"
+    coding_v1_status_names = invocation.canonical is None
+    running_state = "RUNNING_CODEX" if coding_v1_status_names else "RUNNING_PROVIDER"
+    exited_state = "CODEX_EXITED" if coding_v1_status_names else "PROVIDER_EXITED"
+    started_event = "CODEX_STARTED" if coding_v1_status_names else "PROVIDER_STARTED"
+    exited_event = "CODEX_EXITED" if coding_v1_status_names else "PROVIDER_EXITED"
     state: dict[str, Any] = {
         "schema": "orchestrator-lane-controller/v1",
         "state": "LAUNCH_FAILED",
@@ -2266,10 +2051,6 @@ def run(invocation: Invocation) -> int:
         "lane_id": invocation.lane_id,
         "thread_id": thread,
         "session_id": thread,
-        "leases": invocation.leases,
-        "board_tokens": invocation.board_tokens,
-        "mcp_servers": invocation.mcp_servers,
-        "server_snapshot": invocation.server_snapshot,
         "resources": invocation.resources,
         "exclusive_resources": invocation.resources,
         "resource_lock_root": str(invocation.resource_lock_root)
@@ -2294,10 +2075,6 @@ def run(invocation: Invocation) -> int:
         "prompt_bundle_sha256": invocation.prompt_bundle.bundle_sha256
         if invocation.prompt_bundle is not None
         else None,
-        "policy_path": str(invocation.policy_path)
-        if invocation.policy_path is not None
-        else None,
-        "policy_sha256": invocation.policy_sha256,
         "resume_identity": invocation.canonical.identity(
             session_id=thread, starting_commit=starting_commit
         )

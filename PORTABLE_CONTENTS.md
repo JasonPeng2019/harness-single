@@ -19,11 +19,11 @@ Snapshot date: 2026-08-02.
 - `multi-agent-logs/`, `harness_watcher/<epoch>/`, and `fresh-experiments/`.
 - Canary state directories, generated JSONL, snapshots, pending notifications, caches, and
   `test_results/`.
-- Historical firmware sprint plans, reviews, checkpoints, handoffs, verdicts, and repair prompts.
+- Historical sprint plans, reviews, checkpoints, handoffs, verdicts, and repair prompts.
 - The AI watcher-subagent relay model and all collaboration-notification machinery.
 - Obsolete owner/watcher wrappers and their repository-history-only test.
-- Firmware server code and firmware experiment artifacts; they are observed targets, not harness or
-  watcher dependencies.
+- External provider service code and experiment artifacts; they are observed targets, not harness
+  or watcher dependencies.
 
 The portable runtime generates new state only under paths selected in local configuration. No
 historical runtime evidence was copied into this folder.

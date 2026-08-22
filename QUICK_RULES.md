@@ -66,9 +66,3 @@
   it can consume selector credit and rechecks root/common-directory/branch/tip, baseline/config,
   and cleanliness after each selector-owned component. It has no developer checkout path. The
   safeguard is candidate-only and release-owned.
-
-## Firmware compatibility
-
-Schema-less policy-bound firmware invocations remain supported separately. Their board, relay,
-lease, MCP, hardware authorization, and physical cleanup rules still apply to firmware work. None
-of those records is required for an `orchestrator-coding-invocation/v1` lane.

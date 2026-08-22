@@ -372,7 +372,7 @@ def _local_creation_utc(value: dict[str, Any]) -> datetime | None:
 
 
 def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
-    """Read only declared process shapes, with schema-less legacy compatibility."""
+    """Read only declared process shapes from a status record."""
 
     found: list[dict[str, Any]] = []
     seen: set[tuple[int, str, str | None]] = set()
@@ -445,8 +445,7 @@ def _local_pid_identities(value: Any, prefix: str = "") -> list[dict[str, Any]]:
     if not isinstance(value, dict):
         return found
 
-    # Schema-less helper and MCP records historically use a direct ``pid``;
-    # the field is accepted only at this record boundary.
+    # A direct ``pid`` is accepted only at this record boundary.
     add_direct_fields(value, prefix or "record")
     for field in ("process", "mcp_process", "helper_process"):
         child = value.get(field)
@@ -582,7 +581,7 @@ def _mcp_record_observations(
         exited_state="MCP_EXITED",
         unknown_state="MCP_STATE_UNKNOWN",
     )
-    for record, observation in zip(run.mcp_records, observations):
+    for record, observation in zip(run.mcp_records, observations, strict=False):
         if _explicit_terminal_mcp_lifetime(record.value):
             observation["operational_state"] = "MCP_EXITED"
     return observations

@@ -2,11 +2,15 @@
 
 ## Purpose
 
-Provide a durable event-driven view of parallel coding lanes while preserving the supported legacy
-firmware observation contract. Ordinary coding lanes use separate Git branches/worktrees, explicit
-`orchestrator-coding-invocation/v1` identity, validated branch-tip results, and opaque exclusive
-named resources. The persistent manager owns planning, split/merge ordering, launches, decisions,
+Provide a durable event-driven view of parallel coding lanes. Coding lanes use separate Git
+branches/worktrees, provider-neutral `orchestrator-worker-invocation/v1` and retained
+`orchestrator-coding-invocation/v1` input identities, validated branch-tip results, and opaque
+exclusive named resources. The persistent manager owns planning, split/merge ordering, launches, decisions,
 acceptance, promotion, and cleanup.
+
+Both supported input shapes feed the same lane-management/controller path. The removed schema-less
+firmware shape is unsupported and fails ordinary invocation validation; no compatibility rejection
+branch exists for it.
 
 ## S4 host delivery and lifecycle boundary
 
@@ -46,8 +50,7 @@ Any failed proof leaves the terminal lane visible.
 The watcher is a monitor, not another manager. It must make crashes, stale state, permission
 requests, helper expiry, checkpoints, provider waits, results, duplicated controllers, and resource
 conflicts visible promptly. The main orchestrator remains the only authority that schedules work,
-changes leases, reviews hardware plans, publishes relays, recovers lanes, classifies failures, or
-serializes production-server repairs on the legacy firmware path.
+changes leases, publishes relays, recovers lanes, and classifies failures.
 
 ## Coding operating loop
 
@@ -65,12 +68,6 @@ main orchestrator freezes a stable base and plans branch/worktree lanes
 lane, invocation, branch, full current tip, checks shape, and clean-worktree evidence validate.
 The harness does not execute reported checks or infer a dependency graph.
 
-### Legacy firmware compatibility
-
-Parallel firmware and host work may run in isolated workspaces. Parallel hardware work is valid
-only under nonconflicting exclusive leases. Exact hardware relays and all production-server edits
-remain serialized by the main orchestrator.
-
 ## Functional requirements
 
 ### R1. Suite-local discovery
@@ -82,7 +79,7 @@ remain serialized by the main orchestrator.
    discarding older simultaneously live attempts.
 4. Discover Codex JSONL, permission request, relay, helper-process, checkpoint, and result files
    associated with each run.
-5. Work with the heterogeneous historical request schemas already present in MCP-Trial-3.
+5. Work with the request schemas present in configured run workspaces.
 
 ### R2. Truthful process reconciliation
 
@@ -90,7 +87,7 @@ remain serialized by the main orchestrator.
 2. Record PID, parent PID, name, command line, and creation time when the platform exposes it.
 3. Treat a process identity as PID plus normalized creation time. New status records must carry
    separate `controller_started_utc` and `codex_started_utc` values captured from the process
-   provider; a legacy shared `started_utc` is chronology only and cannot prove either identity.
+   provider; a shared `started_utc` is chronology only and cannot prove either identity.
    The configured comparison tolerance is capped at two seconds for provider precision. Reconcile
    liveness, expected parent identity, and terminal JSONL events.
 4. Never treat a raw `state="running"` declaration as authoritative.
@@ -184,10 +181,10 @@ scheduling epoch and invoke the exit-on-event interface again after handling eac
 ### R6. Read-only and fail-closed behavior
 
 1. All writes must stay beneath the configured watcher output directory.
-2. Never write under `fresh-experiments`, `.agent-workspace`, `BYO-Firmware-MCP`, or any observed
+2. Never write under `fresh-experiments`, `.agent-workspace`, an external provider runtime, or any observed
    lane directory.
 3. Never launch, resume, stop, signal, or kill a lane, helper, MCP process, or agent.
-4. Never invoke MCP, hardware tools, server code, or a firmware action.
+4. Never invoke external provider tools or modify server code.
 5. Never assign/release a lease, write a permission relay, classify a production defect, or edit
    evidence.
 6. Malformed files produce observation errors, not destructive recovery.
@@ -195,7 +192,7 @@ scheduling epoch and invoke the exit-on-event interface again after handling eac
    indirection in existing output-path components. Revalidate containment and components
    immediately before temporary-file creation and immediately before `os.replace`.
 8. Reject output roots that overlap the suite's observed runs, `.agent-workspace`,
-   `fresh-experiments`, or `BYO-Firmware-MCP`. Detect replacement of the validated output root
+   `fresh-experiments`, or an external provider runtime. Detect replacement of the validated output root
    before every write.
 9. The default configuration must be safe for a stopped suite.
 
@@ -218,7 +215,7 @@ scheduling epoch and invoke the exit-on-event interface again after handling eac
 - Bounded file reads; tail JSONL rather than loading unbounded logs.
 - Clear error messages and documented exit codes.
 - No busy model polling.
-- No dependency on the production firmware MCP server.
+- No dependency on an external provider service.
 
 ## Test requirements
 
@@ -274,8 +271,8 @@ OS-enforced WSL2/bubblewrap boundary, outside every real suite run/server/state 
 explicit host-only prompt. The trusted outer WSL supervisor may see harness source and the host
 evidence destination, but the agent mount namespace contains only a read-only Linux runtime, a
 pinned read-only Codex release, a writable synthetic workspace, and a writable ephemeral
-`CODEX_HOME`. It must not contain `/mnt/c`, the repository, WSL home/root data, the firmware
-server, or host USB devices.
+`CODEX_HOME`. It must not contain `/mnt/c`, the repository, WSL home/root data, an external
+provider service, or host devices.
 
 Run the agent as `nobody` with all capabilities dropped in fresh mount, user, PID, IPC, UTS, and
 cgroup namespaces. Put the complete bubblewrap/init/Codex/helper tree in a dedicated cgroup-v2
@@ -314,8 +311,8 @@ the single live `RELAYED` transition, `RELAYED_INACTIVE`, the checkpoint, and
 `RESOURCE_RELEASE_POSSIBLE` (an observation, never an automatic lease release). Verify outer-PID
 ancestry and cgroup membership, preserve the proxy
 allow/deny audit, and verify that no MCP/provider child appears or MCP lifecycle event is emitted.
-The test must not inspect or mutate the firmware server, invoke MCP, reserve a real board, or
-operate hardware.
+The test must not inspect or mutate an external provider service, invoke external tools, reserve a
+real resource, or operate hardware.
 
 ## Acceptance criteria
 
@@ -340,7 +337,7 @@ operate hardware.
 - Automatic hardware approval or relay publication.
 - Automatic process cleanup, restart, or crash recovery.
 - Production-server modification.
-- Firmware/test execution.
+- Provider/test execution.
 - Rewriting historical controller files.
 - Waking an entirely inactive conversation.
 

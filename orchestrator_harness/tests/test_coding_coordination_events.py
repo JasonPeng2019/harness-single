@@ -308,20 +308,5 @@ class CodingCoordinationEventTests(unittest.TestCase):
         assert selected is not None
         self.assertEqual("COORDINATION_FAILED", selected["type"])
 
-    def test_firmware_lane_does_not_receive_coding_conditions(self) -> None:
-        firmware = coding_lane(
-            invocation_schema=None,
-            declared_state="coordination_failed",
-            coordination_failure={"error": "ignored"},
-        )
-        current = snapshot(firmware)
-        conditions = conditions_from_snapshot(current)
-        self.assertNotIn("lane:coding:one:coordination-failure", conditions)
-        self.assertFalse(
-            {"COORDINATION_FAILED", "CODING_RESULT_INVALID"}
-            & {condition["type"] for condition in conditions.values()}
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,10 @@
-# Harness Watcher testing guide - legacy firmware compatibility
+# Harness Watcher testing guide
 
-The MCP-Trial-3, counted-sprint, canary, and production-source-routing instructions in this guide
-are retained for the supported legacy firmware path. They are not required for current ordinary
-coding operation or its disposable fixture; use `QUICK_START.md` for the general coding path.
+These checks cover the optional watcher around the canonical coding workflow. They are diagnostic
+only and do not launch providers, manage lanes, or modify accepted evidence; use `QUICK_START.md`
+for the general coding path.
 
-Run from `MCP-Trial-3`:
+Run from the repository root:
 
 ```powershell
 $env:PYTHONUTF8='1'
@@ -16,4 +16,7 @@ python -m harness_watcher_implementation.tests.run_canary
 python -m harness_watcher_implementation.tests.run_defect_canary
 ```
 
-Expected baseline: 14 focused passed; harness 108 passed/1 skipped. For production-source routing, use a fresh epoch configuration that declares the current manager log, managed-harness event JSONL, and lane event JSONL. The example documents the required role/source-ID form. Do not use hardware or alter accepted experiment evidence for these checks.
+Expected baseline: 14 focused passed; harness 108 passed/1 skipped. Use a fresh epoch
+configuration that declares the current manager log, managed-harness event JSONL, and lane event
+JSONL. The example documents the required role/source-ID form. Do not alter accepted evidence for
+these checks.

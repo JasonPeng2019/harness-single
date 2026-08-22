@@ -597,24 +597,6 @@ def _registry() -> tuple[CheckSpec, ...]:
             estimated_duration_seconds=2.0,
         ),
         CheckSpec(
-            "S6.AFFECTED.LEGACY",
-            "schema-less legacy and coding fixture compatibility",
-            "affected",
-            _python_test(
-                "orchestrator_harness.tests.test_general_coding_docs",
-                "GeneralCodingDocumentationTests",
-            ),
-            ("legacy-compat", "controller-lifecycle"),
-            (
-                "orchestrator_harness/invocation.py",
-                "orchestrator_harness/lane_controller.py",
-                "examples/legacy-firmware.invocation.example.json",
-                "examples/coding.invocation.example.json",
-                "orchestrator_harness/tests/test_general_coding_docs.py",
-            ),
-            estimated_duration_seconds=3.0,
-        ),
-        CheckSpec(
             "S6.AFFECTED.REAL-AGENT",
             "optional real-agent isolation journey",
             "affected",

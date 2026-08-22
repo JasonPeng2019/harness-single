@@ -97,24 +97,6 @@ class CandidateSafeguardTests(unittest.TestCase):
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("not a git repository", completed.stderr.lower())
 
-    def test_legacy_example_remains_schema_less_and_dual_path_recipe_names_native_wait(
-        self,
-    ) -> None:
-        legacy = json.loads(
-            (
-                REPOSITORY_ROOT / "examples" / "legacy-firmware.invocation.example.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertNotIn("schema", legacy)
-        self.assertIn("policy_sha256", legacy)
-        self.assertNotIn("repository", legacy)
-        recipe = (
-            REPOSITORY_ROOT / "examples" / "dual-path-manager.example.md"
-        ).read_text(encoding="utf-8")
-        self.assertIn("watch --until-actionable", recipe)
-        self.assertIn("top-level-event-id", recipe)
-
-
 class CandidateSafeguardCheckpointCoreTests(unittest.TestCase):
     def _repository_fixture(
         self,

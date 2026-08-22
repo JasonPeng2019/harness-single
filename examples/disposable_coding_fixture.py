@@ -1,8 +1,7 @@
 """Disposable end-to-end fixture for the ordinary coding workflow.
 
 Run this file directly from the portable repository root. It uses only temporary
-directories, local Python processes, and Git. No Codex service or firmware records
-are required.
+directories, local Python processes, and Git. No Codex service is required.
 """
 
 from __future__ import annotations
@@ -468,13 +467,6 @@ def run_fixture(root: Path) -> dict[str, object]:
         raise FixtureError(
             "scan did not preserve two independent coding lane identities"
         )
-    if any(
-        lane.get("mcp_servers") or lane.get("board_tokens") for lane in coding_lanes
-    ):
-        raise FixtureError(
-            "ordinary coding fixture unexpectedly required firmware records"
-        )
-
     manager_queue = runtime / "manager-queue"
     router = ManagerEventRouter(
         manager_queue,
@@ -553,7 +545,6 @@ def run_fixture(root: Path) -> dict[str, object]:
         "lane_event_count": event_count,
         "python_tests": "PASS" if tests.returncode == 0 else "FAIL",
         "resource_claims_remaining": 0,
-        "firmware_records": 0,
     }
 
 

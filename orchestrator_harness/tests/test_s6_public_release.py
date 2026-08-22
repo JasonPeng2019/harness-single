@@ -33,14 +33,11 @@ from orchestrator_harness.tests.real_agent_test import (
     DEFAULT_EVIDENCE_DIRECTORY,
     _capture_directory_identity,
     _close_evidence_root_handle,
-    _finalize_attempt_evidence,
     _open_evidence_root_handle,
     _provider_identity_from_query,
-    _release_preparation_process,
     _remove_disposable_temp_root,
     _resolve_evidence_root,
     _revalidate_evidence_root_binding,
-    _safe_failure_record,
     _safe_success_record,
     _terminal_finalize,
     _validate_controller_receipt_identity,
@@ -985,7 +982,6 @@ class S6SelectorTests(unittest.TestCase):
                     "S6.FAST.LOCAL-ISOLATION",
                     "S6.AFFECTED.PUBLIC-E2E",
                     "S6.AFFECTED.SAFEGUARD",
-                    "S6.AFFECTED.LEGACY",
                     "S6.AFFECTED.REAL-AGENT",
                 ),
                 selected,
@@ -3053,20 +3049,36 @@ class S6LocalIsolationTests(unittest.TestCase):
                 real_open_file = module._open_regular_file_handle
                 real_close = module._close_handle
 
-                def track_open_dir(path, *, access, share):
-                    handle = real_open_dir(path, access=access, share=share)
-                    opened.append(handle)
+                def track_open_dir(
+                    path,
+                    *,
+                    access,
+                    share,
+                    _real_open_dir=real_open_dir,
+                    _opened=opened,
+                ):
+                    handle = _real_open_dir(path, access=access, share=share)
+                    _opened.append(handle)
                     return handle
 
-                def track_open_file(path, *, access, share):
-                    handle = real_open_file(path, access=access, share=share)
-                    opened.append(handle)
+                def track_open_file(
+                    path,
+                    *,
+                    access,
+                    share,
+                    _real_open_file=real_open_file,
+                    _opened=opened,
+                ):
+                    handle = _real_open_file(path, access=access, share=share)
+                    _opened.append(handle)
                     return handle
 
-                def track_close(handle):
+                def track_close(
+                    handle, *, _closed=closed, _real_close=real_close
+                ):
                     if handle is not None and handle != module._INVALID_HANDLE_VALUE:
-                        closed.append(handle)
-                    return real_close(handle)
+                        _closed.append(handle)
+                    return _real_close(handle)
 
                 with tempfile.TemporaryDirectory(
                     prefix="orchestrator-s6-closure-"
@@ -4343,19 +4355,6 @@ class S6PackageTests(unittest.TestCase):
             check=True,
         ).stdout
         self.assertEqual(before, after)
-
-    def test_package_exports_optional_firmware_seam_types(self) -> None:
-        import orchestrator_harness as harness
-
-        for name in (
-            "FirmwareAction",
-            "FirmwareCampaignPack",
-            "FirmwareOperation",
-            "FirmwareHardwareAdapter",
-            "HardwareCapabilityAdapter",
-        ):
-            self.assertTrue(hasattr(harness, name), name)
-
 
 if __name__ == "__main__":
     unittest.main()

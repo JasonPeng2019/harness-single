@@ -58,25 +58,6 @@ from .qwen_installer import (
     upgrade_qwen_adapter,
 )
 from .lane_lifecycle import ImmutableSourceView, RetirementResult
-from .capability_broker import (
-    AdapterResult,
-    CapabilityAdapter,
-    CapabilityAdapterError,
-    CapabilityAdapterUnavailable,
-    CapabilityApproval,
-    CapabilityBroker,
-    CapabilityDenied,
-    CapabilityError,
-    CapabilityPermit,
-    CapabilityRequest,
-    CapabilityResult,
-    CapabilitySnapshot,
-    CleanupEvidence,
-    FakeCapabilityAdapter,
-)
-from .firmware_campaign import FirmwareAction, FirmwareCampaignPack, FirmwareOperation
-from .firmware_adapter import FirmwareHardwareAdapter, HardwareCapabilityAdapter
-
 __all__ = [
     "CANONICAL_INVOCATION_SCHEMA",
     "CanonicalInvocation",
@@ -123,25 +104,6 @@ __all__ = [
     "ImmutableSourceView",
     "ManagerEventAck",
     "RetirementResult",
-    "AdapterResult",
-    "CapabilityAdapter",
-    "CapabilityAdapterError",
-    "CapabilityAdapterUnavailable",
-    "CapabilityApproval",
-    "CapabilityBroker",
-    "CapabilityDenied",
-    "CapabilityError",
-    "CapabilityPermit",
-    "CapabilityRequest",
-    "CapabilityResult",
-    "CapabilitySnapshot",
-    "CleanupEvidence",
-    "FakeCapabilityAdapter",
-    "FirmwareAction",
-    "FirmwareCampaignPack",
-    "FirmwareHardwareAdapter",
-    "FirmwareOperation",
-    "HardwareCapabilityAdapter",
     "run_installed_codex_hook",
     "check_qwen_adapter",
     "install_qwen_adapter",

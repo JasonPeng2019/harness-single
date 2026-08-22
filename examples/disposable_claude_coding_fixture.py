@@ -254,12 +254,10 @@ def _wait_for_status(
 
 
 def _finish_controller(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    """Wait for the canonical (non-legacy) lane to reach its terminal state.
+    """Wait for the canonical provider lane to reach its terminal state.
 
-    A canonical invocation uses the provider-neutral state vocabulary:
-    ``PROVIDER_EXITED`` is the terminal success state (the legacy coding-v1
-    route calls it ``CODEX_EXITED``).  Discovered from lane_controller.py:
-    ``exited_state = "CODEX_EXITED" if legacy_status_names else "PROVIDER_EXITED"``.
+    A canonical invocation uses the provider-neutral ``PROVIDER_EXITED``
+    terminal success state.
     """
     pid = receipt.get("pid")
     created_utc = receipt.get("created_utc")

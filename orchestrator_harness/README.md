@@ -354,10 +354,10 @@ repair, scheduling, or acknowledgement.
 - `1`: configuration, safety, ownership, or lifecycle proof failed
 - `3`: bounded diagnostic wait timed out
 
-## Legacy firmware suite use
+## Ordinary coding lane contract
 
-The schema-less legacy firmware compatibility path remains separate from the
-coding contract. It may retain firmware-specific evidence readers, but it is
-not a host-adapter implementation and is not part of the ordinary coding
-workflow. A schema-less legacy firmware result is never accepted as a coding
-lane result.
+The canonical coding invocation path has one lane-management/controller implementation with two
+supported input shapes: the provider-neutral `orchestrator-worker-invocation/v1` schema and the
+retained Codex `orchestrator-coding-invocation/v1` adapter. The removed schema-less firmware shape
+is unsupported and fails ordinary invocation validation before any workspace, event, or provider
+work starts.

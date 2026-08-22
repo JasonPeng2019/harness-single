@@ -323,25 +323,5 @@ class DiscoveryCodingResultTests(unittest.TestCase):
         self.assertIsNotNone(corrected.result)
         self.assertIsNone(corrected.invalid_result)
 
-    def test_firmware_result_is_rejected_by_coding_lane_but_firmware_is_unaffected(
-        self,
-    ) -> None:
-        write_json(self.status, self.status_value())
-        write_json(self.workspace / "RESULT.json", {"status": "PASS"})
-        coding = discover_run(self.run_root, self.workspace, self.fixture.config)
-        self.assertIsNone(coding.result)
-        self.assertEqual("CODING_RESULT_INVALID", coding.errors[0].code)
-        firmware_workspace = self.fixture.workspace("firmware")
-        write_json(
-            firmware_workspace / "legacy.json",
-            {"state": "exited", "controller_pid": 1, "codex_pid": 2},
-        )
-        write_json(firmware_workspace / "RESULT.json", {"status": "PASS"})
-        firmware = discover_run(
-            firmware_workspace.parent, firmware_workspace, self.fixture.config
-        )
-        self.assertIsNotNone(firmware.result)
-
-
 if __name__ == "__main__":
     unittest.main()
