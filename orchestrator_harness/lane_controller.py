@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -196,16 +198,49 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 ROOT_ADJUDICATION_SCHEMA = "orchestrator-root-adjudication/v1"
 
 
-# This capability is deliberately private and process-local.  A canonical
-# invocation, provider payload, or public CLI argument can never manufacture
-# it; ROOT must call the manager-side API in-process with this exact object.
-_ROOT_ADJUDICATION_AUTHORITY = object()
+ROOT_ADJUDICATION_SECRET_ENV = "ORCHESTRATOR_ROOT_ADJUDICATION_SECRET"
+
+
+def generate_root_adjudication_secret() -> str:
+    """Generate the manager-held permit secret for one controller launch."""
+
+    return secrets.token_hex(32)
+
+
+def root_adjudication_commitment(root_secret: str) -> str:
+    """Return the only value that may be persisted in controller evidence."""
+
+    if not isinstance(root_secret, str) or len(root_secret) < 64:
+        raise InvocationError("ROOT adjudication secret is invalid")
+    return hashlib.sha256(root_secret.encode("utf-8")).hexdigest()
+
+
+def _root_commitment_from_launch_environment() -> str | None:
+    secret = os.environ.get(ROOT_ADJUDICATION_SECRET_ENV)
+    if secret is None:
+        return None
+    try:
+        return root_adjudication_commitment(secret)
+    except InvocationError:
+        return None
+
+
+def _without_root_secret(child_env: dict[str, str] | None) -> dict[str, str] | None:
+    """Prevent the manager permit from crossing the provider boundary."""
+
+    if ROOT_ADJUDICATION_SECRET_ENV not in os.environ and (
+        child_env is None or ROOT_ADJUDICATION_SECRET_ENV not in child_env
+    ):
+        return child_env
+    sanitized = dict(os.environ if child_env is None else child_env)
+    sanitized.pop(ROOT_ADJUDICATION_SECRET_ENV, None)
+    return sanitized
 
 
 def adjudicate_controller_status(
     status_path: str | Path,
     *,
-    root_authority: object,
+    root_secret: str,
     root_identity: str,
     rationale: str,
     effective_state: str = "PASS",
@@ -214,14 +249,13 @@ def adjudicate_controller_status(
     """Record an explicit ROOT decision over a controller failure.
 
     The controller's factual record is copied before the effective status is
-    changed.  This is intentionally a manager-side API: callers must hold the
-    private ROOT capability, and no invocation/provider field can originate an
-    adjudication.  A status can be adjudicated only once and only from the
-    known controller-failure state.
+    changed.  This is intentionally a manager-side API: the caller must hold
+    the high-entropy ROOT secret that was prebound to the controller status;
+    no invocation/provider field can originate an adjudication.  A status can
+    be adjudicated only once and only from the known controller-failure state.
     """
 
-    if root_authority is not _ROOT_ADJUDICATION_AUTHORITY:
-        raise InvocationError("only the in-process ROOT authority may adjudicate")
+    provided_commitment = root_adjudication_commitment(root_secret)
     if not isinstance(root_identity, str) or not root_identity.strip():
         raise InvocationError("ROOT identity must be a non-empty string")
     if not isinstance(rationale, str) or not rationale.strip():
@@ -244,6 +278,11 @@ def adjudicate_controller_status(
         raise InvocationError(
             "ROOT adjudication requires the original CONTROLLER_FAILED state"
         )
+    bound_commitment = current.get("root_adjudication_commitment")
+    if not isinstance(bound_commitment, str) or not hmac.compare_digest(
+        bound_commitment, provided_commitment
+    ):
+        raise InvocationError("ROOT secret does not match the controller commitment")
     if current.get("root_adjudication") is not None:
         raise InvocationError("controller status has already been adjudicated")
     original = json.loads(json.dumps(current, ensure_ascii=False))
@@ -2082,6 +2121,7 @@ def run(invocation: Invocation) -> int:
     state: dict[str, Any] = {
         "schema": "orchestrator-lane-controller/v1",
         "state": "LAUNCH_FAILED",
+        "root_adjudication_commitment": _root_commitment_from_launch_environment(),
         "started_utc": _utc(),
         "invocation_schema": invocation.invocation_schema,
         "worker_invocation_id": invocation.worker_invocation_id,
@@ -2750,6 +2790,7 @@ def run(invocation: Invocation) -> int:
                 child_env = apply_provider_env_overrides(
                     child_env, launch_spec.env_overrides
                 )
+            child_env = _without_root_secret(child_env)
             boundary = ProcessBoundary.prepare()
             process = subprocess.Popen(
                 argv,

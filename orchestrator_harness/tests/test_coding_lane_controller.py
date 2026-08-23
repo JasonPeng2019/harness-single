@@ -25,6 +25,11 @@ argv = sys.argv[1:]
 capture = os.environ.get("CODING_CONTROLLER_CAPTURE")
 if capture:
     open(capture, "w", encoding="utf-8").write(json.dumps(argv))
+secret_capture = os.environ.get("CODING_CONTROLLER_SECRET_CAPTURE")
+if secret_capture:
+    open(secret_capture, "w", encoding="utf-8").write(
+        os.environ.get("ORCHESTRATOR_ROOT_ADJUDICATION_SECRET", "<missing>")
+    )
 sys.stdin.read()
 if os.environ.get("CODING_CONTROLLER_NO_THREAD") != "1":
     print(json.dumps({"type": "thread.started", "thread_id": os.environ.get("CODING_CONTROLLER_THREAD", "coding-thread")}), flush=True)
@@ -55,6 +60,8 @@ class CodingLaneControllerTests(unittest.TestCase):
             "CODING_CONTROLLER_NO_THREAD",
             "CODING_CONTROLLER_THREAD",
             "CODING_CONTROLLER_EXIT",
+            "CODING_CONTROLLER_SECRET_CAPTURE",
+            controller.ROOT_ADJUDICATION_SECRET_ENV,
         ):
             os.environ.pop(key, None)
         self.temporary.cleanup()
@@ -360,16 +367,20 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual(2, controller.main([str(resume)]))
 
     def test_root_adjudication_preserves_failure_and_records_pass(self) -> None:
+        secret = controller.generate_root_adjudication_secret()
         status_path = self.workspace / "controller.status.json"
         original = {
             "state": "CONTROLLER_FAILED",
             "error": "synthetic controller failure",
             "controller_pid": 123,
+            "root_adjudication_commitment": controller.root_adjudication_commitment(
+                secret
+            ),
         }
         status_path.write_text(json.dumps(original), encoding="utf-8")
         updated = controller.adjudicate_controller_status(
             status_path,
-            root_authority=controller._ROOT_ADJUDICATION_AUTHORITY,
+            root_secret=secret,
             root_identity="root-session-1",
             rationale=(
                 "independent evidence review accepted the controller failure "
@@ -385,21 +396,28 @@ class CodingLaneControllerTests(unittest.TestCase):
         with self.assertRaises(controller.InvocationError):
             controller.adjudicate_controller_status(
                 status_path,
-                root_authority=object(),
+                root_secret=controller.generate_root_adjudication_secret(),
                 root_identity="root-session-2",
                 rationale="duplicate decision must be rejected",
             )
         with self.assertRaises(controller.InvocationError):
             controller.adjudicate_controller_status(
                 status_path,
-                root_authority=object(),
+                root_secret=controller.generate_root_adjudication_secret(),
                 root_identity="worker-session",
                 rationale="worker cannot adjudicate",
             )
 
     def test_root_adjudication_has_no_worker_or_public_cli_forge_path(self) -> None:
+        secret = controller.generate_root_adjudication_secret()
         status_path = self.workspace / "controller.status.json"
-        original = {"state": "CONTROLLER_FAILED", "error": "synthetic failure"}
+        original = {
+            "state": "CONTROLLER_FAILED",
+            "error": "synthetic failure",
+            "root_adjudication_commitment": controller.root_adjudication_commitment(
+                secret
+            ),
+        }
         status_path.write_text(json.dumps(original), encoding="utf-8")
         with self.assertRaises(TypeError):
             controller.adjudicate_controller_status(  # type: ignore[call-arg]
@@ -407,6 +425,34 @@ class CodingLaneControllerTests(unittest.TestCase):
                 root_identity="worker-session",
                 rationale="missing authority must fail closed",
             )
+        worker_code = (
+            "import sys\n"
+            "import orchestrator_harness.lane_controller as c\n"
+            "try:\n"
+            "    c.adjudicate_controller_status(\n"
+            "        sys.argv[1], root_secret=c.generate_root_adjudication_secret(),\n"
+            "        root_identity='worker', rationale='forge'\n"
+            "    )\n"
+            "except c.InvocationError:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        )
+        worker = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                worker_code,
+                str(status_path),
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key != controller.ROOT_ADJUDICATION_SECRET_ENV
+            },
+            check=False,
+        )
+        self.assertEqual(0, worker.returncode)
         self.assertEqual(
             1,
             cli.main(
@@ -422,6 +468,23 @@ class CodingLaneControllerTests(unittest.TestCase):
             ),
         )
         self.assertEqual(original, json.loads(status_path.read_text(encoding="utf-8")))
+
+    def test_root_secret_is_bound_as_commitment_and_stripped_from_provider(self) -> None:
+        secret = controller.generate_root_adjudication_secret()
+        capture = self.root / "secret.txt"
+        os.environ["CODING_CONTROLLER_SECRET_CAPTURE"] = str(capture)
+        os.environ[controller.ROOT_ADJUDICATION_SECRET_ENV] = secret
+        path, _ = self.invocation()
+        self.assertEqual(0, controller.main([str(path)]))
+        status = json.loads(
+            (self.workspace / "controller.status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            controller.root_adjudication_commitment(secret),
+            status["root_adjudication_commitment"],
+        )
+        self.assertNotIn(secret, json.dumps(status))
+        self.assertEqual("<missing>", capture.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

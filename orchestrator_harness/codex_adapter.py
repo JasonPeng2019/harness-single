@@ -1121,11 +1121,40 @@ def _merge_hooks(
         value.setdefault("hooks", {})
     hooks = dict(value["hooks"])
     fragment = _managed_hook_fragment()
-    legacy_by_id = {
-        entry["id"]: entry
-        for entries in _legacy_flat_hook_fragment().values()
-        for entry in entries
+    legacy_by_event_and_id = {
+        event_name: {entry["id"]: entry for entry in entries}
+        for event_name, entries in _legacy_flat_hook_fragment().items()
     }
+    legacy_ids = {
+        legacy_id
+        for entries in legacy_by_event_and_id.values()
+        for legacy_id in entries
+    }
+    legacy_event_by_id = {
+        legacy_id: event_name
+        for event_name, entries in legacy_by_event_and_id.items()
+        for legacy_id in entries
+    }
+    if legacy_revision == "codex-assets-v3":
+        for existing_event, prior in hooks.items():
+            if not isinstance(prior, list):
+                continue
+            for item in prior:
+                if not isinstance(item, dict):
+                    continue
+                legacy_id = item.get("id")
+                expected_event = legacy_event_by_id.get(legacy_id)
+                if expected_event is None:
+                    continue
+                if existing_event != expected_event:
+                    raise CodexInstallConflict(
+                        "v3 managed hook was found under an unexpected event: "
+                        + str(legacy_id)
+                    )
+                if item != legacy_by_event_and_id[expected_event][legacy_id]:
+                    raise CodexInstallConflict(
+                        "v3 managed hook was modified: " + str(legacy_id)
+                    )
     for event_name, entries in fragment.items():
         prior = hooks.get(event_name, [])
         if not isinstance(prior, list):
@@ -1136,13 +1165,19 @@ def _merge_hooks(
                 f".codex/hooks.json {event_name} contains invalid entries"
             )
         if legacy_revision == "codex-assets-v3":
+            expected_legacy = legacy_by_event_and_id[event_name]
             migrated: list[dict[str, Any]] = []
             for item in merged:
                 legacy_id = item.get("id")
-                legacy_entry = legacy_by_id.get(legacy_id)
-                if legacy_entry is None:
+                if legacy_id not in legacy_ids:
                     migrated.append(item)
                     continue
+                legacy_entry = expected_legacy.get(legacy_id)
+                if legacy_entry is None:
+                    raise CodexInstallConflict(
+                        "v3 managed hook was found under an unexpected event: "
+                        + str(legacy_id)
+                    )
                 if item != legacy_entry:
                     raise CodexInstallConflict(
                         "v3 managed hook was modified: " + str(legacy_id)
