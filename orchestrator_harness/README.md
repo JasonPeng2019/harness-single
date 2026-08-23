@@ -280,6 +280,21 @@ task/result/findings/acceptance/transcript/dependency/process evidence and
 content hashes before normal `git worktree remove`. Dirty, live, ambiguous,
 unretained, unmerged, or archive-failed lanes remain visible.
 
+### Explicit ROOT adjudication
+
+A manager may pre-authorize later adjudication of a known harness failure by
+generating a one-launch secret with `generate_root_adjudication_secret`, retaining
+that secret in ROOT, and setting `ORCHESTRATOR_ROOT_ADJUDICATION_SECRET` only in
+the controller launch environment. The controller persists a commitment and an
+HMAC-authenticated status, then removes the secret before starting the provider.
+
+If the terminal controller state is `CONTROLLER_FAILED`, ROOT may call
+`adjudicate_controller_status` with the retained secret, its identity, and a
+rationale. A valid decision preserves the complete original failure, records the
+decision, and exposes effective `PASS`. Missing, mismatched, worker-modified, or
+unsigned status fails closed. Lanes launched without the secret remain valid but
+cannot be adjudicated; the public CLI intentionally has no adjudication authority.
+
 ## Workspace overlay and bounded policy readback
 
 One provider-neutral overlay owner prepares identified worktrees from an
