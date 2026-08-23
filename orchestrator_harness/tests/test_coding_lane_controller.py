@@ -369,14 +369,18 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_root_adjudication_preserves_failure_and_records_pass(self) -> None:
         secret = controller.generate_root_adjudication_secret()
         status_path = self.workspace / "controller.status.json"
-        original = {
-            "state": "CONTROLLER_FAILED",
-            "error": "synthetic controller failure",
-            "controller_pid": 123,
-            "root_adjudication_commitment": controller.root_adjudication_commitment(
-                secret
-            ),
-        }
+        original = controller._signed_controller_status(
+            {
+                "schema": "orchestrator-lane-controller/v1",
+                "state": "CONTROLLER_FAILED",
+                "error": "synthetic controller failure",
+                "controller_pid": 123,
+                "root_adjudication_commitment": controller.root_adjudication_commitment(
+                    secret
+                ),
+            },
+            secret,
+        )
         status_path.write_text(json.dumps(original), encoding="utf-8")
         updated = controller.adjudicate_controller_status(
             status_path,
@@ -411,13 +415,17 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_root_adjudication_has_no_worker_or_public_cli_forge_path(self) -> None:
         secret = controller.generate_root_adjudication_secret()
         status_path = self.workspace / "controller.status.json"
-        original = {
-            "state": "CONTROLLER_FAILED",
-            "error": "synthetic failure",
-            "root_adjudication_commitment": controller.root_adjudication_commitment(
-                secret
-            ),
-        }
+        original = controller._signed_controller_status(
+            {
+                "schema": "orchestrator-lane-controller/v1",
+                "state": "CONTROLLER_FAILED",
+                "error": "synthetic failure",
+                "root_adjudication_commitment": controller.root_adjudication_commitment(
+                    secret
+                ),
+            },
+            secret,
+        )
         status_path.write_text(json.dumps(original), encoding="utf-8")
         with self.assertRaises(TypeError):
             controller.adjudicate_controller_status(  # type: ignore[call-arg]
@@ -426,11 +434,19 @@ class CodingLaneControllerTests(unittest.TestCase):
                 rationale="missing authority must fail closed",
             )
         worker_code = (
+            "import json\n"
+            "from pathlib import Path\n"
             "import sys\n"
             "import orchestrator_harness.lane_controller as c\n"
+            "path = Path(sys.argv[1])\n"
+            "worker_secret = c.generate_root_adjudication_secret()\n"
+            "forged = json.loads(path.read_text(encoding='utf-8'))\n"
+            "forged['state'] = 'CONTROLLER_FAILED'\n"
+            "forged['root_adjudication_commitment'] = c.root_adjudication_commitment(worker_secret)\n"
+            "path.write_text(json.dumps(forged), encoding='utf-8')\n"
             "try:\n"
             "    c.adjudicate_controller_status(\n"
-            "        sys.argv[1], root_secret=c.generate_root_adjudication_secret(),\n"
+            "        sys.argv[1], root_secret=worker_secret,\n"
             "        root_identity='worker', rationale='forge'\n"
             "    )\n"
             "except c.InvocationError:\n"
@@ -453,6 +469,14 @@ class CodingLaneControllerTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(0, worker.returncode)
+        forged = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual("CONTROLLER_FAILED", forged["state"])
+        self.assertNotIn("root_adjudication", forged)
+        self.assertNotEqual(
+            original["root_adjudication_commitment"],
+            forged["root_adjudication_commitment"],
+        )
+        before_cli = dict(forged)
         self.assertEqual(
             1,
             cli.main(
@@ -467,7 +491,7 @@ class CodingLaneControllerTests(unittest.TestCase):
                 ]
             ),
         )
-        self.assertEqual(original, json.loads(status_path.read_text(encoding="utf-8")))
+        self.assertEqual(before_cli, json.loads(status_path.read_text(encoding="utf-8")))
 
     def test_root_secret_is_bound_as_commitment_and_stripped_from_provider(self) -> None:
         secret = controller.generate_root_adjudication_secret()
@@ -482,6 +506,10 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual(
             controller.root_adjudication_commitment(secret),
             status["root_adjudication_commitment"],
+        )
+        self.assertEqual(
+            controller._controller_status_hmac(status, secret),
+            status[controller.ROOT_ADJUDICATION_SIGNATURE_FIELD],
         )
         self.assertNotIn(secret, json.dumps(status))
         self.assertEqual("<missing>", capture.read_text(encoding="utf-8"))

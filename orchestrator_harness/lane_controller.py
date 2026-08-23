@@ -182,8 +182,18 @@ def apply_provider_env_overrides(
     return merged
 
 
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+def _atomic_json(
+    path: Path, value: dict[str, Any], *, status_secret: str | None = None
+) -> None:
+    payload = value
+    effective_secret = status_secret or os.environ.get(ROOT_ADJUDICATION_SECRET_ENV)
+    if (
+        value.get("schema") == _CONTROLLER_STATUS_SCHEMA
+        and isinstance(effective_secret, str)
+        and len(effective_secret) >= 64
+    ):
+        payload = _signed_controller_status(value, effective_secret)
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
         mutation_replace(
             path.parent,
@@ -199,6 +209,30 @@ ROOT_ADJUDICATION_SCHEMA = "orchestrator-root-adjudication/v1"
 
 
 ROOT_ADJUDICATION_SECRET_ENV = "ORCHESTRATOR_ROOT_ADJUDICATION_SECRET"
+ROOT_ADJUDICATION_SIGNATURE_FIELD = "root_adjudication_status_hmac"
+_CONTROLLER_STATUS_SCHEMA = "orchestrator-lane-controller/v1"
+
+
+def _controller_status_hmac(value: Mapping[str, Any], root_secret: str) -> str:
+    unsigned = {
+        key: item
+        for key, item in value.items()
+        if key != ROOT_ADJUDICATION_SIGNATURE_FIELD
+    }
+    payload = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hmac.new(root_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _signed_controller_status(
+    value: Mapping[str, Any], root_secret: str
+) -> dict[str, Any]:
+    signed = dict(value)
+    signed[ROOT_ADJUDICATION_SIGNATURE_FIELD] = _controller_status_hmac(
+        signed, root_secret
+    )
+    return signed
 
 
 def generate_root_adjudication_secret() -> str:
@@ -274,6 +308,11 @@ def adjudicate_controller_status(
         raise InvocationError("controller status is not valid JSON") from exc
     if not isinstance(current, dict):
         raise InvocationError("controller status must be an object")
+    signature = current.get(ROOT_ADJUDICATION_SIGNATURE_FIELD)
+    if not isinstance(signature, str) or not hmac.compare_digest(
+        signature, _controller_status_hmac(current, root_secret)
+    ):
+        raise InvocationError("controller status is not authenticated by ROOT")
     if current.get("state") != "CONTROLLER_FAILED":
         raise InvocationError(
             "ROOT adjudication requires the original CONTROLLER_FAILED state"
@@ -301,7 +340,7 @@ def adjudicate_controller_status(
     updated["original_controller_status"] = original
     updated["root_adjudication"] = record
     updated["state"] = effective_state
-    _atomic_json(path, updated)
+    _atomic_json(path, updated, status_secret=root_secret)
     return updated
 
 
