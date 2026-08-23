@@ -50,6 +50,12 @@ harness coordinator owns the binding-specific wake subscription and replay; a
 hook does not directly watch arbitrary file changes. App Server fixtures use
 `thread/inject_items`, `turn/completed`, and `turn/start` for idle continuation.
 
+This describes the adapter contract, not a live guarantee for `codex exec`.
+Codex CLI 0.149.0 headless runs did not invoke project PostToolUse or Stop hooks
+even with explicit hook-trust bypass, while direct installed-hook execution did.
+Accordingly, deterministic installer/hook checks must not be promoted to live
+headless-delivery evidence.
+
 ## Qwen Code adapter
 
 The native runner provider is `qwen-code`; its host adapter is selected with

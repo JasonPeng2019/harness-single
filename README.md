@@ -106,7 +106,10 @@ Installing the Codex adapter does not bind its hooks to a manager queue. At mana
 creating the real `ManagerEventRouter`, call `activate_codex_binding(project_root, router)`. The
 installed PostToolUse and Stop hooks then deliver content-free manager notices at their supported
 safe boundaries. Start a fresh provider session after adapter installation so project configuration
-is reloaded.
+is reloaded. Do not assume this proves delivery for `codex exec`: current live testing with Codex
+CLI 0.149.0 observed no project-hook invocation in headless exec sessions, including with explicit
+hook-trust bypass. Use installed-hook self-tests only as deterministic adapter evidence until a
+supported headless hook channel or controller-native delivery path is implemented and proven live.
 
 ## Public release surface
 
