@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
-import hashlib
 import ctypes
-import io
+import hashlib
 import importlib
+import io
+import json
 import os
 import pkgutil
 import subprocess
@@ -19,15 +19,15 @@ from typing import Any, Mapping
 from unittest.mock import MagicMock, patch
 
 import orchestrator_harness.lane_controller as lane_controller
-
+from orchestrator_harness import codex_adapter, lane_lifecycle
 from orchestrator_harness.codex_adapter import (
     CODEX_ADAPTER_VERSION,
     CODEX_INSTALL_MANIFEST_SCHEMA,
     CODEX_PACKAGE_REVISION,
     CodexAdapterError,
     CodexInstallConflict,
-    install_codex_adapter,
     check_codex_adapter,
+    install_codex_adapter,
     uninstall_codex_adapter,
 )
 from orchestrator_harness.host_adapters import (
@@ -44,13 +44,13 @@ from orchestrator_harness.lane_lifecycle import (
     retire_terminal_lane,
     validate_lane_archive,
 )
-from orchestrator_harness.notifications import ManagerEventRouter
 from orchestrator_harness.models import (
     ProcessBoundaryInventory,
     ProcessInfo,
     ProcessSnapshot,
     iso_utc,
 )
+from orchestrator_harness.notifications import ManagerEventRouter
 from orchestrator_harness.process_supervisor import (
     CleanupResult,
     ProcessBoundary,
@@ -70,7 +70,8 @@ from orchestrator_harness.stable_io import (
     PathKeyedAppendLock,
     SafeOutput,
 )
-from orchestrator_harness import codex_adapter, lane_lifecycle
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
+from orchestrator_harness.workspace_overlay import restore_worktree
 
 
 class _WrongReceiptAdapter(HostAdapter):
@@ -97,6 +98,27 @@ class _WrongReceiptAdapter(HostAdapter):
 
 
 class S4RepairRegressionTests(unittest.TestCase):
+    def test_helper_display_name_distinguishes_pid_reuse_by_creation_time(self) -> None:
+        first = lane_lifecycle.helper_display_name(
+            {
+                "identity": {
+                    "pid": 7001,
+                    "created_utc": "2026-08-22T00:00:00Z",
+                }
+            }
+        )
+        second = lane_lifecycle.helper_display_name(
+            {
+                "identity": {
+                    "pid": 7001,
+                    "created_utc": "2026-08-22T00:01:00Z",
+                }
+            }
+        )
+        self.assertNotEqual(first, second)
+        self.assertIn("7001", first)
+        self.assertIn("2026-08-22T00_00_00Z", first)
+
     @staticmethod
     def _git(cwd: Path, *args: str) -> str:
         result = subprocess.run(
@@ -229,6 +251,7 @@ class S4RepairRegressionTests(unittest.TestCase):
                 runtime / "events" / f"{lane_id.replace(':', '-')}.jsonl"
             ),
             "worker_invocation_id": f"worker-{lane_id}",
+            "overlay_receipt": str(prepare_fixture_overlay_receipt(root, lane)),
             "lane_id": lane_id,
             "task": "synthetic lifecycle",
             "phase": "repair",
@@ -741,6 +764,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                         acceptance_ref=refs[3],
                         transcript_ref=refs[4],
                         dependency_ref=refs[5],
+                        overlay_receipt=lane
+                        / ".agent-workspace"
+                        / "fixture-overlay.receipt.json",
                     )
             self.assertTrue(changed)
             self.assertEqual("VISIBLE", result.outcome)
@@ -892,6 +918,22 @@ class S4RepairRegressionTests(unittest.TestCase):
                     "job-object+CIM" if os.name == "nt" else "/proc",
                     record["boundary"]["inventory_source"],
                 )
+            self.assertEqual(
+                "RESTORED",
+                restore_worktree(
+                    receipt_path=one
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json"
+                )["outcome"],
+            )
+            self.assertEqual(
+                "RESTORED",
+                restore_worktree(
+                    receipt_path=many
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json"
+                )["outcome"],
+            )
             self._git(main, "worktree", "remove", str(one))
             self._git(main, "worktree", "remove", str(many))
             del lane
@@ -939,6 +981,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertEqual("VISIBLE", result.outcome)
             self.assertIsNotNone(result.archive_path)
@@ -2035,6 +2080,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertEqual("CLOSED", result.outcome)
             del main
@@ -2335,6 +2383,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertTrue(provider.called)
             self.assertEqual("VISIBLE", result.outcome)
@@ -2495,6 +2546,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertEqual("CLOSED", result.outcome)
             for path in refs:
@@ -2596,6 +2650,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertEqual("VISIBLE", live.outcome)
             self.assertEqual("LIVE_USE_PROVEN", live.reason)
@@ -2629,6 +2686,9 @@ class S4RepairRegressionTests(unittest.TestCase):
                 acceptance_ref=refs[3],
                 transcript_ref=refs[4],
                 dependency_ref=refs[5],
+                overlay_receipt=lane
+                / ".agent-workspace"
+                / "fixture-overlay.receipt.json",
             )
             self.assertEqual("VISIBLE", unmerged.outcome)
             self.assertEqual("UNMERGED_WORK_PRESENT", unmerged.reason)

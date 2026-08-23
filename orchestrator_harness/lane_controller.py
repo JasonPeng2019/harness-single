@@ -45,6 +45,7 @@ from .lane_lifecycle import (
     _admit_lifecycle_registry,
     _LifecycleAdmission,
     _update_lifecycle_registry,
+    helper_display_name,
 )
 from .models import ProcessInfo, iso_utc
 from .mutation import (
@@ -190,6 +191,73 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         )
     except (MutationConflict, MutationUnsupported) as exc:
         raise OSError(str(exc)) from exc
+
+
+ROOT_ADJUDICATION_SCHEMA = "orchestrator-root-adjudication/v1"
+
+
+def adjudicate_controller_status(
+    status_path: str | Path,
+    *,
+    root_identity: str,
+    rationale: str,
+    effective_state: str = "PASS",
+    actor_role: str = "ROOT",
+    decided_utc: str | None = None,
+) -> dict[str, Any]:
+    """Record an explicit ROOT decision over a controller failure.
+
+    The controller's factual record is copied before the effective status is
+    changed.  This is intentionally a manager-side API: callers must identify
+    themselves as ROOT, and no invocation/provider field can originate an
+    adjudication.  A status can be adjudicated only once and only from the
+    known controller-failure state.
+    """
+
+    if actor_role != "ROOT":
+        raise InvocationError("only ROOT may adjudicate controller status")
+    if not isinstance(root_identity, str) or not root_identity.strip():
+        raise InvocationError("ROOT identity must be a non-empty string")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise InvocationError("ROOT adjudication rationale must be non-empty")
+    if effective_state != "PASS":
+        raise InvocationError("ROOT adjudication may only accept PASS")
+    try:
+        path = Path(status_path).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise InvocationError("controller status path is unavailable") from exc
+    if not path.is_file():
+        raise InvocationError("controller status must be a regular file")
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvocationError("controller status is not valid JSON") from exc
+    if not isinstance(current, dict):
+        raise InvocationError("controller status must be an object")
+    if current.get("state") != "CONTROLLER_FAILED":
+        raise InvocationError(
+            "ROOT adjudication requires the original CONTROLLER_FAILED state"
+        )
+    if current.get("root_adjudication") is not None:
+        raise InvocationError("controller status has already been adjudicated")
+    original = json.loads(json.dumps(current, ensure_ascii=False))
+    record = {
+        "schema": ROOT_ADJUDICATION_SCHEMA,
+        "authority": "ROOT",
+        "root_identity": root_identity.strip(),
+        "rationale": rationale.strip(),
+        "decided_utc": decided_utc or _utc(),
+        "original_state": "CONTROLLER_FAILED",
+        "effective_state": effective_state,
+    }
+    updated = dict(current)
+    updated["original_state"] = "CONTROLLER_FAILED"
+    updated["effective_state"] = effective_state
+    updated["original_controller_status"] = original
+    updated["root_adjudication"] = record
+    updated["state"] = effective_state
+    _atomic_json(path, updated)
+    return updated
 
 
 def _append_event(path: Path, value: dict[str, Any]) -> None:
@@ -2850,7 +2918,14 @@ def run(invocation: Invocation) -> int:
                 continue
             owned_helpers.append(
                 {
-                    "name": f"helper-{item.pid}",
+                    "name": helper_display_name(
+                        {
+                            "identity": {
+                                "pid": item.pid,
+                                "created_utc": iso_utc(item.created_utc),
+                            }
+                        }
+                    ),
                     "identity": {
                         "pid": item.pid,
                         "created_utc": iso_utc(item.created_utc),

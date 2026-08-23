@@ -13,8 +13,10 @@ from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
-from orchestrator_harness.tests.support import TemporaryGitRepository
-
+from orchestrator_harness.tests.support import (
+    TemporaryGitRepository,
+    prepare_fixture_overlay_receipt,
+)
 
 FAKE_CODEX = r"""
 import json, os, sys
@@ -57,7 +59,11 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def invocation(
-        self, *, action: str = "start", worker_id: str = "worker-1"
+        self,
+        *,
+        action: str = "start",
+        worker_id: str = "worker-1",
+        with_overlay: bool = False,
     ) -> tuple[Path, dict[str, object]]:
         outputs = {
             "status": str(self.workspace / "controller.status.json"),
@@ -90,6 +96,10 @@ class CodingLaneControllerTests(unittest.TestCase):
                 "approval_policy": "never",
             },
         }
+        if with_overlay:
+            value["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(self.root, self.run_root)
+            )
         path = self.workspace / f"{action}.invocation.json"
         path.write_text(json.dumps(value), encoding="utf-8")
         return path, value
@@ -165,7 +175,7 @@ class CodingLaneControllerTests(unittest.TestCase):
                     controller.load_invocation(path)
 
     def test_start_records_identity_events_and_configured_codex_argv(self) -> None:
-        path, _ = self.invocation()
+        path, _ = self.invocation(with_overlay=True)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
         self.assertEqual(0, controller.main([str(path)]))
         status = json.loads(
@@ -200,7 +210,7 @@ class CodingLaneControllerTests(unittest.TestCase):
         )
 
     def test_start_publishes_fixed_controller_lifecycle_registry(self) -> None:
-        path, _ = self.invocation()
+        path, _ = self.invocation(with_overlay=True)
         self.assertEqual(0, controller.main([str(path)]))
         registry_path = lifecycle_registry_path(
             self.run_root, "coding:worker-1", "worker-1"
@@ -233,7 +243,7 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_start_without_thread_is_failure_and_resume_identity_mismatches_are_rejected(
         self,
     ) -> None:
-        path, raw = self.invocation()
+        path, raw = self.invocation(with_overlay=True)
         os.environ["CODING_CONTROLLER_NO_THREAD"] = "1"
         self.assertEqual(1, controller.main([str(path)]))
         status = json.loads(
@@ -251,7 +261,9 @@ class CodingLaneControllerTests(unittest.TestCase):
             controller.InvocationError, "resume identity worker_invocation_id mismatch"
         ):
             controller.load_invocation(path)
-        path, _ = self.invocation(action="resume", worker_id="worker-2")
+        path, _ = self.invocation(
+            action="resume", worker_id="worker-2", with_overlay=True
+        )
         # REQ-O35: identity-mismatched resume emits a declared same-role
         # structured handoff with fabricated_continuity=false instead of
         # silently rejecting and losing the logical task.
@@ -268,7 +280,7 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_resource_acquisition_publishes_running_only_after_child_launch_and_popen_failure_releases_claim(
         self,
     ) -> None:
-        path, _ = self.invocation()
+        path, _ = self.invocation(with_overlay=True)
         status_path = self.workspace / "controller.status.json"
         lock_root = self.runtime_root / "coding-resource-locks"
         published: list[dict[str, object]] = []
@@ -301,7 +313,9 @@ class CodingLaneControllerTests(unittest.TestCase):
         first_registry.unlink()
         first_registry.parent.rmdir()
 
-        path, _ = self.invocation(worker_id="worker-popen-failure")
+        path, _ = self.invocation(
+            worker_id="worker-popen-failure", with_overlay=True
+        )
 
         def fail_codex_launch(
             *args: object, **kwargs: object
@@ -324,9 +338,9 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertFalse(any(lock_root.iterdir()))
 
     def test_resume_rejects_child_thread_mismatch(self) -> None:
-        start, _ = self.invocation()
+        start, _ = self.invocation(with_overlay=True)
         self.assertEqual(0, controller.main([str(start)]))
-        resume, raw = self.invocation(action="resume")
+        resume, raw = self.invocation(action="resume", with_overlay=True)
         raw["resume_thread_id"] = "coding-thread"
         self._write(resume, raw)
         os.environ["CODING_CONTROLLER_THREAD"] = "wrong-thread"
@@ -338,11 +352,47 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertIn("does not match", status["error"])
 
     def test_resume_rejects_a_branch_switch_after_start(self) -> None:
-        start, _ = self.invocation()
+        start, _ = self.invocation(with_overlay=True)
         self.assertEqual(0, controller.main([str(start)]))
         self.repository.git("checkout", "-b", "switched")
-        resume, _ = self.invocation(action="resume")
+        resume, _ = self.invocation(action="resume", with_overlay=True)
         self.assertEqual(2, controller.main([str(resume)]))
+
+    def test_root_adjudication_preserves_failure_and_records_pass(self) -> None:
+        status_path = self.workspace / "controller.status.json"
+        original = {
+            "state": "CONTROLLER_FAILED",
+            "error": "synthetic controller failure",
+            "controller_pid": 123,
+        }
+        status_path.write_text(json.dumps(original), encoding="utf-8")
+        updated = controller.adjudicate_controller_status(
+            status_path,
+            root_identity="root-session-1",
+            rationale=(
+                "independent evidence review accepted the controller failure "
+                "disposition"
+            ),
+            decided_utc="2026-08-22T00:00:00Z",
+        )
+        self.assertEqual("PASS", updated["state"])
+        self.assertEqual(original, updated["original_controller_status"])
+        self.assertEqual("CONTROLLER_FAILED", updated["original_state"])
+        self.assertEqual("PASS", updated["effective_state"])
+        self.assertEqual("ROOT", updated["root_adjudication"]["authority"])
+        with self.assertRaises(controller.InvocationError):
+            controller.adjudicate_controller_status(
+                status_path,
+                root_identity="root-session-2",
+                rationale="duplicate decision must be rejected",
+            )
+        with self.assertRaises(controller.InvocationError):
+            controller.adjudicate_controller_status(
+                status_path,
+                root_identity="worker-session",
+                rationale="worker cannot adjudicate",
+                actor_role="SUBAGENT",
+            )
 
 
 if __name__ == "__main__":

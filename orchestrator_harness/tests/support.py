@@ -13,7 +13,7 @@ from typing import Any
 
 from orchestrator_harness.config import HarnessConfig, load_config
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
-
+from orchestrator_harness.workspace_overlay import ingest_super_cache, prepare_worktree
 
 NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -25,6 +25,54 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def prepare_fixture_overlay_receipt(
+    root: Path,
+    target_worktree: Path,
+    *,
+    role: str = "subagent",
+    receipt_path: Path | None = None,
+) -> Path:
+    """Prepare a real, nonempty super-cache overlay for a provider fixture.
+
+    Fixture callers opt in at the provider-launch boundary; parser-only and
+    explicit no-cache tests remain receipt-free by construction.
+    """
+
+    token = hashlib.sha256(str(target_worktree.resolve()).encode()).hexdigest()[:12]
+    source = root / f".fixture-overlay-source-{token}"
+    harness = root / f".fixture-overlay-harness-{token}"
+    source.mkdir(parents=True, exist_ok=True)
+    harness.mkdir(parents=True, exist_ok=True)
+    (source / "fixture-overlay" / "receipt-proof.txt").parent.mkdir(
+        parents=True, exist_ok=True
+    )
+    (source / "fixture-overlay" / "receipt-proof.txt").write_text(
+        "nonempty fixture overlay\n", encoding="utf-8"
+    )
+    ingest_super_cache(source_folder=source, harness_worktree=harness)
+    receipt = receipt_path or (
+        target_worktree / ".agent-workspace" / "fixture-overlay.receipt.json"
+    )
+    if receipt.is_file():
+        try:
+            existing = json.loads(receipt.read_text(encoding="utf-8"))
+            created = existing.get("created_paths", [])
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return receipt
+        if isinstance(created, list) and all(
+            isinstance(relative, str) and (target_worktree / relative).exists()
+            for relative in created
+        ):
+            return receipt
+    prepare_worktree(
+        super_cache=harness / "super-cache",
+        target_worktree=target_worktree,
+        role=role,
+        receipt_path=receipt,
+    )
+    return receipt
 
 
 @dataclass

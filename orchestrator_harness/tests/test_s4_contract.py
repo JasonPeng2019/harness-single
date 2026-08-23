@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as lane_controller
 from orchestrator_harness import codex_adapter, mutation
-
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
     CodexAdapterError,
@@ -43,6 +42,7 @@ from orchestrator_harness.lane_lifecycle import (
 )
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.notifications import ManagerEventRouter
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
 
 
 class S4ContractTests(unittest.TestCase):
@@ -458,6 +458,7 @@ class S4ContractTests(unittest.TestCase):
             "runtime_root": str(runtime),
             "event_log_path": str(runtime / "events" / "controller.jsonl"),
             "worker_invocation_id": f"worker-{lane_id}",
+            "overlay_receipt": str(prepare_fixture_overlay_receipt(root, lane)),
             "lane_id": lane_id,
             "task": "synthetic lifecycle",
             "phase": "repair",
@@ -550,6 +551,61 @@ class S4ContractTests(unittest.TestCase):
             result = uninstall_codex_adapter(project)
             self.assertIn(b"UserHook", hooks.read_bytes())
             self.assertNotIn(".codex/hooks.json", result["preserved_modified"])
+
+    def test_S4_CODEX_V3_FLAT_HOOK_UPGRADE_PRESERVES_FOREIGN_001(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            project.mkdir()
+            install_codex_adapter(project)
+            manifest_path = project / ".codex" / "orchestrator-harness-adapter.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            legacy = codex_adapter._legacy_flat_hook_fragment()
+            legacy["PreToolUse"].append(
+                {"command": "foreign pre-tool", "id": "foreign-pre", "type": "command"}
+            )
+            hooks_bytes = codex_adapter._json_bytes({"hooks": legacy})
+            hooks_path = project / ".codex" / "hooks.json"
+            hooks_path.write_bytes(hooks_bytes)
+            manifest["package_revision"] = "codex-assets-v3"
+            manifest["managed_hook_fragment"] = (
+                codex_adapter._legacy_flat_hook_fragment()
+            )
+            manifest["managed_hook_fragment_sha256"] = codex_adapter._fragment_digest(
+                manifest["managed_hook_fragment"]
+            )
+            manifest["installed_content_sha256"][".codex/hooks.json"] = hashlib.sha256(
+                hooks_bytes
+            ).hexdigest()
+            manifest["manifest_content_sha256"] = (
+                codex_adapter._manifest_content_digest(manifest)
+            )
+            manifest_path.write_bytes(codex_adapter._json_bytes(manifest))
+
+            upgraded = codex_adapter.upgrade_codex_adapter(project)
+            self.assertTrue(upgraded["current"])
+            result = json.loads(hooks_path.read_text(encoding="utf-8"))
+            pre_tool = result["hooks"]["PreToolUse"]
+            self.assertTrue(
+                any(
+                    row.get("command") == "foreign pre-tool"
+                    for row in pre_tool
+                    if isinstance(row, dict)
+                )
+            )
+            legacy_ids = {
+                item.get("id")
+                for entries in codex_adapter._legacy_flat_hook_fragment().values()
+                for item in entries
+            }
+            self.assertTrue(
+                all(
+                    row.get("id") not in legacy_ids
+                    for rows in result["hooks"].values()
+                    for row in rows
+                    if isinstance(row, dict)
+                )
+            )
+            self.assertEqual("codex-assets-v4", upgraded["manifest_revision"])
 
     def test_S4_NONPREEMPTIVE_DELIVERY_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -785,6 +841,9 @@ class S4ContractTests(unittest.TestCase):
                     acceptance_ref=refs[3],
                     transcript_ref=refs[4],
                     dependency_ref=refs[5],
+                    overlay_receipt=lane
+                    / ".agent-workspace"
+                    / "fixture-overlay.receipt.json",
                 )
             self.assertEqual("CLOSED", result.outcome)
             self.assertFalse(lane.exists())

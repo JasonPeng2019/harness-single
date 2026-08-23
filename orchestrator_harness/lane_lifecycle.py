@@ -412,6 +412,36 @@ def _registry_process_identity(value: object, *, name: str) -> dict[str, Any] | 
     raise LaneLifecycleError(f"{name} identity is unsupported")
 
 
+def helper_display_name(value: object, *, fallback_index: int | None = None) -> str:
+    """Return a deterministic, human-readable key for one owned helper.
+
+    A PID is only one half of a Windows process identity.  Keep the complete
+    PID/creation pair in the display key so that a recycled PID cannot collide
+    in the lifecycle registry.  Explicit fixture names remain authoritative;
+    the fallback index is retained only for callers that provide an opaque
+    helper object and is never used for a process identity mapping.
+    """
+
+    identity: object = value
+    explicit: object = None
+    if isinstance(value, Mapping):
+        explicit = value.get("name")
+        identity = value.get("identity", value)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    normalized = _registry_process_identity(identity, name="helper")
+    if normalized is None:
+        if fallback_index is not None:
+            return f"helper-{fallback_index}"
+        raise LaneLifecycleError("helper identity is missing")
+    created = str(normalized["created_utc"])
+    # ISO timestamps are safe in JSON and logs but ``:``/``+`` are poor
+    # display/path separators.  Preserve all identity information while
+    # producing a stable token.
+    token = re.sub(r"[^0-9A-Za-z.-]", "_", created)
+    return f"helper-{normalized['pid']}-{token}"
+
+
 @dataclass
 class _LifecycleAdmission:
     path: Path
@@ -490,7 +520,7 @@ def _helper_records(helpers: Sequence[object]) -> list[dict[str, Any]]:
     helper_records: list[dict[str, Any]] = []
     helper_names: set[str] = set()
     for index, item in enumerate(helpers):
-        name = f"helper-{index}"
+        name = helper_display_name(item, fallback_index=index)
         identity = item
         if isinstance(item, Mapping) and "identity" in item:
             raw_name = item.get("name")

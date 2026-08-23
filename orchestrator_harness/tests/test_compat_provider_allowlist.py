@@ -46,6 +46,7 @@ from orchestrator_harness.provider import (
 )
 from orchestrator_harness.prompt_bundle import prompt_bundle_record_from_paths
 from orchestrator_harness.task import TASK_CARD_SCHEMA, record_sha256
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
 
 FAKE_CLAUDE = r"""
 import json, os, sys
@@ -62,7 +63,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
 """
 
 
-def _canonical(root: Path, provider_id: str) -> dict[str, object]:
+def _canonical(
+    root: Path, provider_id: str, *, with_overlay: bool = False
+) -> dict[str, object]:
     run = root / "run"
     workspace = run / ".agent-workspace"
     workspace.mkdir(parents=True)
@@ -99,7 +102,7 @@ def _canonical(root: Path, provider_id: str) -> dict[str, object]:
         paths=(("instructions", prompt_a), ("task", prompt_b)),
         run_root=run,
     )
-    return {
+    value: dict[str, object] = {
         "schema": CANONICAL_INVOCATION_SCHEMA,
         "action": "start",
         "run_root": str(run),
@@ -129,6 +132,11 @@ def _canonical(root: Path, provider_id: str) -> dict[str, object]:
         "event_log_path": str(runtime / "events.jsonl"),
         "resources": ["resource-1"],
     }
+    if with_overlay:
+        value["overlay_receipt"] = str(
+            prepare_fixture_overlay_receipt(root, run)
+        )
+    return value
 
 
 def _provider(raw: dict[str, object]) -> dict[str, object]:
@@ -201,7 +209,7 @@ class ClaudeCodeOptionalFieldAllowlistTests(unittest.TestCase):
     def test_claude_code_explicit_anthropic_override_passes_verbatim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            raw = _canonical(root / "root", "claude-code")
+            raw = _canonical(root / "root", "claude-code", with_overlay=True)
             provider = _provider(raw)
             del provider["service_tier"]
             del provider["approval_policy"]

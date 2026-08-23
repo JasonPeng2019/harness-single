@@ -50,6 +50,7 @@ from orchestrator_harness.processes import (
 )
 from orchestrator_harness.prompt_bundle import prompt_bundle_record_from_paths
 from orchestrator_harness.public_launch import launch_lane_controller
+from orchestrator_harness.workspace_overlay import ingest_super_cache, prepare_worktree
 
 # The real claude lane makes a real Ollama round-trip; bound it generously but
 # keep the fixture finite.
@@ -111,6 +112,24 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _prepare_overlay_receipt(worktree: Path, runtime: Path) -> Path:
+    source = runtime / "fixture-overlay-source"
+    harness = runtime / "fixture-overlay-harness"
+    source_file = source / "fixture-overlay" / "receipt-proof.txt"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("nonempty disposable Claude overlay\n", encoding="utf-8")
+    harness.mkdir(parents=True, exist_ok=True)
+    ingest_super_cache(source_folder=source, harness_worktree=harness)
+    receipt = worktree / ".agent-workspace" / "fixture-overlay.receipt.json"
+    prepare_worktree(
+        super_cache=harness / "super-cache",
+        target_worktree=worktree,
+        role="subagent",
+        receipt_path=receipt,
+    )
+    return receipt
+
+
 def _claude_command() -> list[str]:
     """Resolve the real Claude Code CLI exactly as a caller would on PATH."""
     claude = shutil.which("claude")
@@ -135,6 +154,7 @@ def _invocation(
     prompt.write_text(prompt_text, encoding="utf-8")
     branch = _git(worktree, "branch", "--show-current")
     worker_id = f"{lane}-001"
+    overlay_receipt = _prepare_overlay_receipt(worktree, runtime)
     card = {
         "schema": "orchestrator-task-card/v1",
         "card_id": f"card-{lane}",
@@ -176,6 +196,7 @@ def _invocation(
         "runtime_root": str(runtime),
         "lane_id": lane,
         "worker_invocation_id": worker_id,
+        "overlay_receipt": str(overlay_receipt),
         "cohort_id": "cohort-claude-fixture",
         "workflow": {"id": workflow_id, "version": "1"},
         "task_card": {

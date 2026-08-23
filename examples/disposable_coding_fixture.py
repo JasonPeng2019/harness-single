@@ -30,6 +30,7 @@ from orchestrator_harness.processes import (
     targeted_process_query,
 )
 from orchestrator_harness.public_launch import launch_lane_controller
+from orchestrator_harness.workspace_overlay import ingest_super_cache, prepare_worktree
 
 FIXTURE_RESOURCE = "service:fixture-database"
 FIXTURE_CONTROLLER_COMPLETION_SECONDS = 120
@@ -77,6 +78,24 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+
+
+def _prepare_overlay_receipt(worktree: Path, runtime: Path) -> Path:
+    source = runtime / "fixture-overlay-source"
+    harness = runtime / "fixture-overlay-harness"
+    source_file = source / "fixture-overlay" / "receipt-proof.txt"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("nonempty disposable fixture overlay\n", encoding="utf-8")
+    harness.mkdir(parents=True, exist_ok=True)
+    ingest_super_cache(source_folder=source, harness_worktree=harness)
+    receipt = worktree / ".agent-workspace" / "fixture-overlay.receipt.json"
+    prepare_worktree(
+        super_cache=harness / "super-cache",
+        target_worktree=worktree,
+        role="subagent",
+        receipt_path=receipt,
+    )
+    return receipt
 
 
 def _result(
@@ -190,6 +209,7 @@ def _invocation(
     )
     branch = _git(worktree, "branch", "--show-current")
     worker_id = worker_invocation_id or f"{lane}-001"
+    overlay_receipt = _prepare_overlay_receipt(worktree, runtime)
     invocation = {
         "schema": "orchestrator-coding-invocation/v1",
         "action": "start",
@@ -214,6 +234,7 @@ def _invocation(
         "event_log_path": str(runtime / "LANE_EVENTS.jsonl"),
         "lane_id": lane,
         "worker_invocation_id": worker_id,
+        "overlay_receipt": str(overlay_receipt),
         "task": f"Disposable {lane} coding work",
         "phase": "merge" if lane == "merge" else "implementation",
         "exclusive_resources": [] if lane == "merge" else [FIXTURE_RESOURCE],

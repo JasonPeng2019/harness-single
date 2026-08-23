@@ -54,6 +54,7 @@ from orchestrator_harness.task import (
     validate_task_result,
 )
 from orchestrator_harness.tests.support import SuiteFixture
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
 
 
 class S2ContractTests(unittest.TestCase):
@@ -153,6 +154,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
         marker = root / "launches.txt"
         fake.write_text(fake_source, encoding="utf-8")
         raw, card = self._canonical(root)
+        raw["overlay_receipt"] = str(
+            prepare_fixture_overlay_receipt(root, root / "run")
+        )
         raw["provider"] = {
             **raw["provider"],  # type: ignore[arg-type]
             "command": [sys.executable, str(fake), str(marker)],
@@ -1018,6 +1022,9 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
             raw, card = self._canonical(root)
+            raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(root, root / "run")
+            )
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake)],
@@ -1088,6 +1095,9 @@ print(json.dumps({'type': 'result', 'subtype': 'error_during_execution' if failu
 
             failure_root = root / "failure"
             failure_raw, _ = self._canonical(failure_root)
+            failure_raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(failure_root, failure_root / "run")
+            )
             failure_raw["provider"] = {
                 **failure_raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), "--failure"],
@@ -1125,6 +1135,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'session
             fake = root / "fake_claude.py"
             fake.write_text(fake_source, encoding="utf-8")
             raw, card = self._canonical(root)
+            raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(root, root / "run")
+            )
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1427,6 +1440,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'provide
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
             raw, _ = self._canonical(root)
+            raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(root, root / "run")
+            )
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1499,6 +1515,9 @@ print(json.dumps({'type': 'turn.completed', 'thread_id': 'provider-session'}), f
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
             raw, _ = self._canonical(root)
+            raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(root, root / "run")
+            )
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "id": "codex",
@@ -1665,6 +1684,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
             fake.write_text(fake_source, encoding="utf-8")
             marker = root / "launches.txt"
             raw, card = self._canonical(root)
+            raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(root, root / "run")
+            )
             raw["provider"] = {
                 **raw["provider"],  # type: ignore[arg-type]
                 "command": [sys.executable, str(fake), str(marker)],
@@ -1770,6 +1792,9 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'mutatio
 
             fresh_root = root / "fresh"
             fresh_raw, _ = self._canonical(fresh_root)
+            fresh_raw["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(fresh_root, fresh_root / "run")
+            )
             fresh_marker = root / "fresh-launches.txt"
             fresh_raw["provider"] = {
                 **fresh_raw["provider"],  # type: ignore[arg-type]

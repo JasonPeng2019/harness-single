@@ -34,6 +34,7 @@ from orchestrator_harness.processes import (
     targeted_process_query,
 )
 from orchestrator_harness.public_launch import launch_lane_controller
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
 from orchestrator_harness.tests.wsl_identity import validate_cross_os_identity_relation
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -1378,6 +1379,7 @@ def _make_invocation(
     workspace = repo / ".agent-workspace"
     workspace.mkdir(exist_ok=True)
     status = workspace / "real_agent_controller.status.json"
+    overlay_receipt = prepare_fixture_overlay_receipt(repo.parent, repo)
     invocation = {
         "schema": "orchestrator-coding-invocation/v1",
         "action": "start",
@@ -1401,6 +1403,7 @@ def _make_invocation(
         "event_log_path": str(runtime / "LANE_EVENTS.jsonl"),
         "lane_id": LANE_ID,
         "worker_invocation_id": WORKER_ID,
+        "overlay_receipt": str(overlay_receipt),
         "task": "Complete the public real-agent release route in the synthetic repository",
         "phase": "public-route",
         "exclusive_resources": [],

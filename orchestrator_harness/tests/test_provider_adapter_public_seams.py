@@ -61,6 +61,7 @@ from orchestrator_harness.task import (
     TASK_RESULT_SCHEMA,
     record_sha256,
 )
+from orchestrator_harness.tests.support import prepare_fixture_overlay_receipt
 
 
 FAKE_CLI = r"""
@@ -491,7 +492,11 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _canonical(
-        self, *, provider_id: str = "fake-cli", notification: bool | None = None
+        self,
+        *,
+        provider_id: str = "fake-cli",
+        notification: bool | None = None,
+        with_overlay: bool = False,
     ) -> dict[str, Any]:
         prompt_a = self.run / "prompt-a.md"
         prompt_b = self.run / "prompt-b.md"
@@ -531,7 +536,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         }
         if notification is not None:
             provider["notification"] = notification
-        return {
+        value: dict[str, Any] = {
             "schema": CANONICAL_INVOCATION_SCHEMA,
             "action": "start",
             "run_root": str(self.run),
@@ -558,6 +563,11 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             "event_log_path": str(self.runtime / "events.jsonl"),
             "resources": ["resource-1"],
         }
+        if with_overlay:
+            value["overlay_receipt"] = str(
+                prepare_fixture_overlay_receipt(self.root, self.run)
+            )
+        return value
 
     def _write(self, path: Path, value: dict[str, object]) -> None:
         path.write_text(json.dumps(value), encoding="utf-8")
@@ -571,7 +581,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
 
     def test_controller_selects_external_fake_adapter_without_core_edits(self) -> None:
         path = self.workspace / "start.invocation.json"
-        self._write(path, self._canonical())
+        self._write(path, self._canonical(with_overlay=True))
         self.assertEqual(0, controller.main([str(path)]))
         status = self._status()
         self.assertEqual("fake-cli", status["provider_id"])
@@ -638,9 +648,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
 
     def test_supported_resume_proceeds_through_real_admission(self) -> None:
         start = self.workspace / "start.invocation.json"
-        self._write(start, self._canonical())
+        self._write(start, self._canonical(with_overlay=True))
         self.assertEqual(0, controller.main([str(start)]))
-        resume = self._canonical()
+        resume = self._canonical(with_overlay=True)
         resume["action"] = "resume"
         resume["resume"] = {"session_id": "fake-cli-session"}
         resume_path = self.workspace / "resume.invocation.json"
@@ -654,9 +664,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         self,
     ) -> None:
         start = self.workspace / "start.invocation.json"
-        self._write(start, self._canonical())
+        self._write(start, self._canonical(with_overlay=True))
         self.assertEqual(0, controller.main([str(start)]))
-        wrong = self._canonical()
+        wrong = self._canonical(with_overlay=True)
         wrong["action"] = "resume"
         wrong["worker_invocation_id"] = "worker-2"
         wrong["resume"] = {"session_id": "fake-cli-session"}
@@ -724,11 +734,11 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             capabilities=_capabilities(resume=False),
         )
         start = self.workspace / "start.invocation.json"
-        self._write(start, self._canonical())
+        self._write(start, self._canonical(with_overlay=True))
         self.assertEqual(0, controller.main([str(start)]))
         self.assertIn("build_argv", side_effecting.calls)
         side_effecting.calls.clear()
-        resume = self._canonical()
+        resume = self._canonical(with_overlay=True)
         resume["action"] = "resume"
         resume["resume"] = {"session_id": "fake-cli-session"}
         resume_path = self.workspace / "resume.invocation.json"
@@ -824,7 +834,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         fake_argv = self.root / "fake_argv.py"
         fake_argv.write_text(FAKE_CLI_ARGV, encoding="utf-8")
         sentinel = "SENTINEL-TOKEN-9f3a7c"
-        raw = self._canonical()
+        raw = self._canonical(with_overlay=True)
         raw["provider"] = {
             **raw["provider"],
             "command": [
@@ -882,7 +892,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             "sys.exit(1)\n" % (payload, payload),
             encoding="utf-8",
         )
-        raw = self._canonical()
+        raw = self._canonical(with_overlay=True)
         raw["provider"] = {
             **raw["provider"],
             "command": [
@@ -966,7 +976,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             capabilities=_capabilities(notification=False),
         )
         try:
-            raw = self._canonical(provider_id="foreign-unknown")
+            raw = self._canonical(provider_id="foreign-unknown", with_overlay=True)
             card = {
                 "schema": TASK_CARD_SCHEMA,
                 "card_id": "card-1",
@@ -1052,7 +1062,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         fake_argv = self.root / "fake_argv.py"
         fake_argv.write_text(FAKE_CLI_ARGV, encoding="utf-8")
         sentinel = "ROOT-SYNTHETIC-AUTH-71d3"
-        raw = self._canonical()
+        raw = self._canonical(with_overlay=True)
         raw["provider"] = {
             **raw["provider"],
             "command": [
@@ -1130,7 +1140,10 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         try:
             path = self.workspace / "start.invocation.json"
             self._write(
-                path, self._canonical(provider_id="foreign-wake", notification=True)
+                path,
+                self._canonical(
+                    provider_id="foreign-wake", notification=True, with_overlay=True
+                ),
             )
             self.assertEqual(0, controller.main([str(path)]))
             status = self._status()
@@ -1223,7 +1236,9 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
         )
         try:
             path = self.workspace / "start.invocation.json"
-            self._write(path, self._canonical(provider_id="foreign-safe"))
+            self._write(
+                path, self._canonical(provider_id="foreign-safe", with_overlay=True)
+            )
             self.assertEqual(0, controller.main([str(path)]))
             status = self._status()
             self.assertEqual("foreign-safe", status["provider_id"])
@@ -1275,7 +1290,7 @@ class ProviderAdapterPublicSeamTests(unittest.TestCase):
             fake_argv = self.root / "fake_argv.py"
             fake_argv.write_text(FAKE_CLI_ARGV, encoding="utf-8")
             sentinel = "BOOTSTRAP-AUTH-5c1e"
-            raw = self._canonical(provider_id="my-cli")
+            raw = self._canonical(provider_id="my-cli", with_overlay=True)
             raw["provider"] = {
                 **raw["provider"],
                 "command": [
