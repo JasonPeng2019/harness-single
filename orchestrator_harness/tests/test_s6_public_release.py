@@ -1559,7 +1559,6 @@ class S6LocalIsolationTests(unittest.TestCase):
         argv = module._provider_argv(
             [
                 "exec",
-                "--ignore-user-config",
                 "--skip-git-repo-check",
                 "--json",
                 "--cd",
@@ -1575,7 +1574,6 @@ class S6LocalIsolationTests(unittest.TestCase):
                 "--die-with-parent",
                 "/opt/codex/bin/codex",
                 "exec",
-                "--ignore-user-config",
                 "--skip-git-repo-check",
                 "--json",
                 "--cd",

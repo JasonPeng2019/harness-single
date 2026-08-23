@@ -490,7 +490,6 @@ class CodexProviderAdapter(BaseProviderAdapter):
         argv.append("--dangerously-bypass-approvals-and-sandbox")
         argv.extend(
             [
-                "--ignore-user-config",
                 "--skip-git-repo-check",
                 "-c",
                 f'approval_policy="{spec.approval_policy}"',

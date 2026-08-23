@@ -198,6 +198,7 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual("coding-thread", status["thread_id"])
         argv = json.loads(self.capture.read_text(encoding="utf-8"))
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--ignore-user-config", argv)
         self.assertNotIn("--sandbox", argv)
         self.assertIn('approval_policy="never"', argv)
         self.assertIn("gpt-5.6-codex", argv)
