@@ -120,6 +120,11 @@ supported coding input shape, launches one provider, publishes durable status/ev
 and owns claims, semantic resume, result validation, and archive-first cleanup. Workers never
 receive hardware endpoints or credentials.
 
+Codex lanes are isolated by launching the provider with `--cd` set to the invocation's exact
+worktree. The runner does not pass `--ignore-user-config`: project-local configuration belonging to
+that lane, including an installed adapter, must remain discoverable. Callers must therefore create
+and select the correct worker worktree rather than launch a subagent from ROOT's workspace.
+
 Release checks are declared once in `orchestrator_harness.release_checks`. Each stable check ID
 declares its exact command, tier, dependency domains/files, platform or external requirements,
 and credit contract. Select the shortest decisive invalidated checks first:
