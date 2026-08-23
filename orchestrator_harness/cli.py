@@ -38,7 +38,6 @@ from .discovery import discover_suite
 from .events import diff_conditions
 from .handoff_preflight import exit_code as handoff_preflight_exit_code
 from .handoff_preflight import preflight_handoff
-from .lane_controller import adjudicate_controller_status
 from .lane_lifecycle import allocate_immutable_source_view, retire_terminal_lane
 from .models import utc_now
 from .notifications import ManagerEventRouter
@@ -394,14 +393,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "adjudicate":
-            _print_json(
-                adjudicate_controller_status(
-                    args.status,
-                    root_identity=args.root_identity,
-                    rationale=args.rationale,
-                )
+            raise ValueError(
+                "ROOT adjudication is manager-only and unavailable through the public CLI"
             )
-            return EXIT_OK
         if args.command == "adapter":
             if args.host == "codex":
                 if args.adapter_action == "install":

@@ -196,26 +196,32 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 ROOT_ADJUDICATION_SCHEMA = "orchestrator-root-adjudication/v1"
 
 
+# This capability is deliberately private and process-local.  A canonical
+# invocation, provider payload, or public CLI argument can never manufacture
+# it; ROOT must call the manager-side API in-process with this exact object.
+_ROOT_ADJUDICATION_AUTHORITY = object()
+
+
 def adjudicate_controller_status(
     status_path: str | Path,
     *,
+    root_authority: object,
     root_identity: str,
     rationale: str,
     effective_state: str = "PASS",
-    actor_role: str = "ROOT",
     decided_utc: str | None = None,
 ) -> dict[str, Any]:
     """Record an explicit ROOT decision over a controller failure.
 
     The controller's factual record is copied before the effective status is
-    changed.  This is intentionally a manager-side API: callers must identify
-    themselves as ROOT, and no invocation/provider field can originate an
+    changed.  This is intentionally a manager-side API: callers must hold the
+    private ROOT capability, and no invocation/provider field can originate an
     adjudication.  A status can be adjudicated only once and only from the
     known controller-failure state.
     """
 
-    if actor_role != "ROOT":
-        raise InvocationError("only ROOT may adjudicate controller status")
+    if root_authority is not _ROOT_ADJUDICATION_AUTHORITY:
+        raise InvocationError("only the in-process ROOT authority may adjudicate")
     if not isinstance(root_identity, str) or not root_identity.strip():
         raise InvocationError("ROOT identity must be a non-empty string")
     if not isinstance(rationale, str) or not rationale.strip():
@@ -768,7 +774,7 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
         overlay_receipt = None
         if canonical.overlay_receipt is not None:
             overlay_receipt = _safe_path(
-                str(canonical.overlay_receipt), root=workspace, name="overlay_receipt"
+                str(canonical.overlay_receipt), root=run_root, name="overlay_receipt"
             )
         return Invocation(
             canonical.schema,

@@ -607,6 +607,40 @@ class S4ContractTests(unittest.TestCase):
             )
             self.assertEqual("codex-assets-v4", upgraded["manifest_revision"])
 
+    def test_S4_CODEX_V3_MODIFIED_MANAGED_HOOK_IS_REJECTED_001(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            project.mkdir()
+            install_codex_adapter(project)
+            manifest_path = project / ".codex" / "orchestrator-harness-adapter.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            legacy = codex_adapter._legacy_flat_hook_fragment()
+            legacy["PostToolUse"][0]["command"] += " --modified"
+            hooks_bytes = codex_adapter._json_bytes({"hooks": legacy})
+            hooks_path = project / ".codex" / "hooks.json"
+            hooks_path.write_bytes(hooks_bytes)
+            manifest["package_revision"] = "codex-assets-v3"
+            manifest["managed_hook_fragment"] = (
+                codex_adapter._legacy_flat_hook_fragment()
+            )
+            manifest["managed_hook_fragment_sha256"] = codex_adapter._fragment_digest(
+                manifest["managed_hook_fragment"]
+            )
+            manifest["installed_content_sha256"][".codex/hooks.json"] = hashlib.sha256(
+                hooks_bytes
+            ).hexdigest()
+            manifest["manifest_content_sha256"] = (
+                codex_adapter._manifest_content_digest(manifest)
+            )
+            manifest_path.write_bytes(codex_adapter._json_bytes(manifest))
+
+            with self.assertRaisesRegex(
+                codex_adapter.CodexInstallRollback,
+                "modified.*orchestrator-harness-post-tool-use",
+            ):
+                codex_adapter.upgrade_codex_adapter(project)
+            self.assertEqual(hooks_bytes, hooks_path.read_bytes())
+
     def test_S4_NONPREEMPTIVE_DELIVERY_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             adapter, coordinator, transport = self._adapter(Path(raw) / "manager")

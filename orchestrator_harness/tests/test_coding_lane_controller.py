@@ -12,6 +12,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
+from orchestrator_harness import cli
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.tests.support import (
     TemporaryGitRepository,
@@ -368,6 +369,7 @@ class CodingLaneControllerTests(unittest.TestCase):
         status_path.write_text(json.dumps(original), encoding="utf-8")
         updated = controller.adjudicate_controller_status(
             status_path,
+            root_authority=controller._ROOT_ADJUDICATION_AUTHORITY,
             root_identity="root-session-1",
             rationale=(
                 "independent evidence review accepted the controller failure "
@@ -383,16 +385,43 @@ class CodingLaneControllerTests(unittest.TestCase):
         with self.assertRaises(controller.InvocationError):
             controller.adjudicate_controller_status(
                 status_path,
+                root_authority=object(),
                 root_identity="root-session-2",
                 rationale="duplicate decision must be rejected",
             )
         with self.assertRaises(controller.InvocationError):
             controller.adjudicate_controller_status(
                 status_path,
+                root_authority=object(),
                 root_identity="worker-session",
                 rationale="worker cannot adjudicate",
-                actor_role="SUBAGENT",
             )
+
+    def test_root_adjudication_has_no_worker_or_public_cli_forge_path(self) -> None:
+        status_path = self.workspace / "controller.status.json"
+        original = {"state": "CONTROLLER_FAILED", "error": "synthetic failure"}
+        status_path.write_text(json.dumps(original), encoding="utf-8")
+        with self.assertRaises(TypeError):
+            controller.adjudicate_controller_status(  # type: ignore[call-arg]
+                status_path,
+                root_identity="worker-session",
+                rationale="missing authority must fail closed",
+            )
+        self.assertEqual(
+            1,
+            cli.main(
+                [
+                    "adjudicate",
+                    "--status",
+                    str(status_path),
+                    "--root-identity",
+                    "ROOT-forged-by-worker",
+                    "--rationale",
+                    "public flags cannot create authority",
+                ]
+            ),
+        )
+        self.assertEqual(original, json.loads(status_path.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

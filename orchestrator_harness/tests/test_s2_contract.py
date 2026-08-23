@@ -1403,6 +1403,12 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': 'fresh-s
                             "not-json", encoding="utf-8"
                         )
                 if case == "fresh":
+                    receipt_path = root / "run" / "fresh-overlay.receipt.json"
+                    raw["overlay_receipt"] = str(
+                        prepare_fixture_overlay_receipt(
+                            root, root / "run", receipt_path=receipt_path
+                        )
+                    )
                     workspace.rmdir()
                 event_parent = root / "runtime" / "missing-events"
                 raw["event_log_path"] = str(event_parent / "events.jsonl")

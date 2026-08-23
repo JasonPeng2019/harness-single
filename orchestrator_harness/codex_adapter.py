@@ -1121,6 +1121,11 @@ def _merge_hooks(
         value.setdefault("hooks", {})
     hooks = dict(value["hooks"])
     fragment = _managed_hook_fragment()
+    legacy_by_id = {
+        entry["id"]: entry
+        for entries in _legacy_flat_hook_fragment().values()
+        for entry in entries
+    }
     for event_name, entries in fragment.items():
         prior = hooks.get(event_name, [])
         if not isinstance(prior, list):
@@ -1131,12 +1136,20 @@ def _merge_hooks(
                 f".codex/hooks.json {event_name} contains invalid entries"
             )
         if legacy_revision == "codex-assets-v3":
-            old_entries = _legacy_flat_hook_fragment()[event_name]
-            merged = [
-                item
-                for item in merged
-                if not any(item == legacy_entry for legacy_entry in old_entries)
-            ]
+            migrated: list[dict[str, Any]] = []
+            for item in merged:
+                legacy_id = item.get("id")
+                legacy_entry = legacy_by_id.get(legacy_id)
+                if legacy_entry is None:
+                    migrated.append(item)
+                    continue
+                if item != legacy_entry:
+                    raise CodexInstallConflict(
+                        "v3 managed hook was modified: " + str(legacy_id)
+                    )
+                # An exact managed v3 row is intentionally replaced by the
+                # native v4 group below.
+            merged = migrated
         for entry in entries:
             command = _group_command(entry)
             clashes = [

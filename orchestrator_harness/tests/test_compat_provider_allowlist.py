@@ -209,7 +209,7 @@ class ClaudeCodeOptionalFieldAllowlistTests(unittest.TestCase):
     def test_claude_code_explicit_anthropic_override_passes_verbatim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            raw = _canonical(root / "root", "claude-code", with_overlay=True)
+            raw = _canonical(root / "root", "claude-code")
             provider = _provider(raw)
             del provider["service_tier"]
             del provider["approval_policy"]
@@ -337,7 +337,7 @@ class ClaudeCodeOptionalFieldAllowlistTests(unittest.TestCase):
             fake = root / "fake_claude_env.py"
             fake.write_text(FAKE_CLAUDE, encoding="utf-8")
             envdump = root / "child-env.json"
-            raw = _canonical(root / "root", "claude-code")
+            raw = _canonical(root / "root", "claude-code", with_overlay=True)
             provider = _provider(raw)
             del provider["service_tier"]
             del provider["approval_policy"]
