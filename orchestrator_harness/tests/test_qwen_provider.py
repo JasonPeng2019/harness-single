@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import orchestrator_harness.lane_controller as controller
 from orchestrator_harness.invocation import (
     CANONICAL_INVOCATION_SCHEMA,
     CanonicalInvocation,
@@ -20,12 +22,13 @@ from orchestrator_harness.provider import (
     provider_default_command,
     provider_registry,
 )
+from orchestrator_harness.profile import RuntimeProfile, build_child_environment
 
 
 def _spec(**overrides: object) -> ProviderLaunchSpec:
     values: dict[str, object] = {
         "action": "start",
-        "command": ("qwen", "exec"),
+        "command": ("qwen",),
         "model": "qwen-model",
         "reasoning_effort": "medium",
         "service_tier": "priority",
@@ -68,7 +71,7 @@ class QwenProviderTests(unittest.TestCase):
                 "provider": {
                     "id": "qwen-code",
                     "model": "qwen-model",
-                    "command": ["qwen", "exec"],
+                    "command": ["qwen"],
                 },
                 "profile": profile,
                 "prompt_bundle": {
@@ -95,7 +98,7 @@ class QwenProviderTests(unittest.TestCase):
         self.assertEqual("qwen-code", invocation.provider_id)
         self.assertEqual("qwen-model", invocation.provider_model)
         self.assertEqual(
-            {"command": ["qwen", "exec"]}, dict(invocation.provider_options)
+            {"command": ["qwen"]}, dict(invocation.provider_options)
         )
         self.assertNotIn("id", invocation.provider_options)
         self.assertNotIn("model", invocation.provider_options)
@@ -105,7 +108,7 @@ class QwenProviderTests(unittest.TestCase):
         self.assertIn("qwen-code", registry)
         self.assertEqual("QwenCodeProviderAdapter", registry["qwen-code"].adapter_class)
         self.assertIsInstance(provider_adapter("qwen-code"), QwenCodeProviderAdapter)
-        self.assertEqual(("qwen", "exec"), provider_default_command("qwen-code"))
+        self.assertEqual(("qwen",), provider_default_command("qwen-code"))
         self.assertFalse(registry["qwen-code"].capabilities.notification)
 
         invocation = CanonicalInvocation(
@@ -136,14 +139,13 @@ class QwenProviderTests(unittest.TestCase):
             task="task",
             phase="implementation",
         )
-        self.assertEqual(["qwen", "exec"], invocation.provider_launch_record()["command"])
+        self.assertEqual(["qwen"], invocation.provider_launch_record()["command"])
 
     def test_start_and_resume_stream_json_argv(self) -> None:
         adapter = QwenCodeProviderAdapter()
         self.assertEqual(
             [
                 "qwen",
-                "exec",
                 "--approval-mode=yolo",
                 "--model",
                 "qwen-model",
@@ -155,7 +157,6 @@ class QwenProviderTests(unittest.TestCase):
         self.assertEqual(
             [
                 "qwen",
-                "exec",
                 "--approval-mode=yolo",
                 "--model",
                 "qwen-model",
@@ -168,6 +169,38 @@ class QwenProviderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ProviderAdapterError, "resume requires"):
             adapter.build_argv(_spec(action="resume"))
+
+    def test_controller_resolves_qwen_before_child_environment_isolation(self) -> None:
+        with patch.object(controller.shutil, "which", return_value="C:/qwen/qwen.cmd"):
+            self.assertEqual(
+                ["C:/qwen/qwen.cmd", "--approval-mode=yolo"],
+                controller._resolve_qwen_executable(
+                    ["qwen", "--approval-mode=yolo"]
+                ),
+            )
+
+    def test_qwen_environment_retains_windows_shared_system_locations(self) -> None:
+        profile = RuntimeProfile(
+            profile_id="qwen-profile",
+            role="implementer",
+            provider="qwen-code",
+            model="qwen-model",
+            tools=(),
+            capabilities=("repo",),
+            resources=(),
+        )
+        environment, _cleared = build_child_environment(
+            profile,
+            {
+                "PATH": "C:/Windows/System32",
+                "SYSTEMDRIVE": "C:",
+                "PROGRAMDATA": "C:/ProgramData",
+                "UNRELATED_SECRET": "must-not-pass",
+            },
+        )
+        self.assertEqual("C:", environment["SYSTEMDRIVE"])
+        self.assertEqual("C:/ProgramData", environment["PROGRAMDATA"])
+        self.assertNotIn("UNRELATED_SECRET", environment)
 
     def test_unsupported_invocation_fields_reject_loudly(self) -> None:
         unsupported = {

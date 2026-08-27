@@ -50,6 +50,11 @@ _BASE_ENV_ALLOW = frozenset(
         "SYSTEMROOT",
         "COMSPEC",
         "WINDIR",
+        # Windows-native CLIs can derive shared cache locations from these
+        # non-secret OS paths.  Omitting them lets some runtimes create a
+        # literal "%SystemDrive%" directory under the lane working tree.
+        "SYSTEMDRIVE",
+        "PROGRAMDATA",
         "TEMP",
         "TMP",
         "USERPROFILE",

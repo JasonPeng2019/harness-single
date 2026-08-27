@@ -14,7 +14,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import orchestrator_harness
 from orchestrator_harness.claude_adapter import (
     ClaudeAdapter,
     ClaudeAdapterError,
@@ -23,12 +25,14 @@ from orchestrator_harness.claude_adapter import (
     create_claude_adapter,
 )
 from orchestrator_harness.claude_installer import (
+    bind_claude_project_from_queue,
     check_claude_adapter,
     install_claude_adapter,
     run_installed_claude_hook,
     uninstall_claude_adapter,
     upgrade_claude_adapter,
 )
+from orchestrator_harness.cli import main
 from orchestrator_harness.codex_adapter import (
     CodexInstallConflict,
     CodexInstallRollback,
@@ -87,6 +91,11 @@ class ClaudeAdapterCompatTests(unittest.TestCase):
             self.assertNotIsInstance(adapter, FutureHostFixture)
             self.assertTrue(adapter.profile.implemented)
             self.assertEqual("claude", adapter.profile.kind)
+
+    def test_package_root_exposes_all_shipped_binding_helpers(self) -> None:
+        self.assertTrue(callable(orchestrator_harness.activate_codex_binding))
+        self.assertTrue(callable(orchestrator_harness.activate_claude_binding))
+        self.assertTrue(callable(orchestrator_harness.activate_qwen_binding))
 
     def test_N8_capability_selection(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -383,28 +392,10 @@ class ClaudeAdapterCompatTests(unittest.TestCase):
             install_claude_adapter(project)
             router = self._router(root / "manager")
             coordinator_root = root / "coordinator"
-            coordinator = create_claude_adapter(
-                router,
-                state_root=coordinator_root,
-                registration_generation=router.registration_generation,
-            ).coordinator
-            coordinator.restore()
-            binding = router.binding
-            (project / ".claude" / "orchestrator-harness-binding.json").write_text(
-                json.dumps(
-                    {
-                        "project_root": str(project.resolve()),
-                        "queue_root": str(router.root),
-                        "coordinator_root": str(coordinator_root),
-                        "run_id": binding.run_id,
-                        "queue_id": binding.queue_id,
-                        "manager_session_id": binding.manager_session_id,
-                        "manager_thread_id": binding.manager_thread_id,
-                        "registration_id": binding.registration_id,
-                        "registration_generation": router.registration_generation,
-                    }
-                ),
-                encoding="utf-8",
+            bind_claude_project_from_queue(
+                project,
+                router.root,
+                coordinator_root=coordinator_root,
             )
             router.admit(self._event("installed-post-tool"))
             result = run_installed_claude_hook(
@@ -418,6 +409,92 @@ class ClaudeAdapterCompatTests(unittest.TestCase):
                 )
             )
             self.assertEqual(1, state["attempt_count"])
+
+    def test_manager_bind_command_connects_installed_post_tool_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            install_claude_adapter(project)
+            router = self._router(root / "manager")
+            coordinator_root = root / "coordinator"
+
+            binding = bind_claude_project_from_queue(
+                project,
+                router.root,
+                coordinator_root=coordinator_root,
+            )
+            self.assertEqual("orchestrator-claude-binding/v1", binding["schema"])
+            self.assertEqual(str(router.root), binding["binding"]["queue_root"])
+
+            with patch("orchestrator_harness.cli._print_json") as emit:
+                self.assertEqual(
+                    0,
+                    main(
+                        [
+                            "adapter",
+                            "bind",
+                            "--host",
+                            "claude",
+                            "--project-root",
+                            str(project),
+                            "--queue-root",
+                            str(router.root),
+                            "--coordinator-root",
+                            str(coordinator_root),
+                        ]
+                    ),
+                )
+            self.assertEqual(
+                "orchestrator-claude-binding/v1",
+                emit.call_args.args[0]["schema"],
+            )
+
+            router.admit(self._event("claude-manager-bind"))
+            result = run_installed_claude_hook(project, boundary="post_tool_use")
+            self.assertEqual("DELIVERED", result["receipt"]["outcome"])
+            self.assertEqual("DELIVERED", router.read_deliveries()[0]["outcome"])
+
+    def test_installed_hook_requires_a_manager_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            project = Path(raw) / "project"
+            project.mkdir()
+            install_claude_adapter(project)
+            with self.assertRaisesRegex(
+                CodexInstallConflict,
+                "installed Claude hook has no harness binding",
+            ):
+                run_installed_claude_hook(project, boundary="post_tool_use")
+
+    def test_manager_bind_migrates_the_exact_legacy_binding_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            install_claude_adapter(project)
+            router = self._router(root / "manager")
+            legacy = {
+                "project_root": str(project.resolve()),
+                "queue_root": str(router.root),
+                "coordinator_root": str(root / "coordinator"),
+                "run_id": router.binding.run_id,
+                "queue_id": router.binding.queue_id,
+                "manager_session_id": router.binding.manager_session_id,
+                "manager_thread_id": router.binding.manager_thread_id,
+                "registration_id": router.binding.registration_id,
+                "registration_generation": router.registration_generation,
+            }
+            (project / ".claude" / "orchestrator-harness-binding.json").write_text(
+                json.dumps(legacy),
+                encoding="utf-8",
+            )
+
+            bound = bind_claude_project_from_queue(
+                project,
+                router.root,
+                coordinator_root=root / "coordinator",
+            )
+            self.assertEqual("orchestrator-claude-binding/v1", bound["schema"])
 
 
 if __name__ == "__main__":

@@ -7,8 +7,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from orchestrator_harness.cli import build_parser
+from orchestrator_harness.cli import build_parser, main
 from orchestrator_harness.codex_adapter import select_host_adapter
 from orchestrator_harness.host_adapters import FutureHostFixture
 from orchestrator_harness.notifications import ManagerEventRouter
@@ -19,6 +20,7 @@ from orchestrator_harness.qwen_adapter import (
     qwen_capabilities,
 )
 from orchestrator_harness.qwen_installer import (
+    bind_qwen_project_from_queue,
     check_qwen_adapter,
     install_qwen_adapter,
     run_installed_qwen_hook,
@@ -204,28 +206,10 @@ class QwenAdapterCompatTests(unittest.TestCase):
             install_qwen_adapter(project)
             router = self._router(root / "manager")
             coordinator_root = root / "coordinator"
-            coordinator = create_qwen_adapter(
-                router,
-                state_root=coordinator_root,
-                registration_generation=router.registration_generation,
-            ).coordinator
-            coordinator.restore()
-            binding = router.binding
-            (project / ".qwen" / "orchestrator-harness-binding.json").write_text(
-                json.dumps(
-                    {
-                        "project_root": str(project.resolve()),
-                        "queue_root": str(router.root),
-                        "coordinator_root": str(coordinator_root),
-                        "run_id": binding.run_id,
-                        "queue_id": binding.queue_id,
-                        "manager_session_id": binding.manager_session_id,
-                        "manager_thread_id": binding.manager_thread_id,
-                        "registration_id": binding.registration_id,
-                        "registration_generation": router.registration_generation,
-                    }
-                ),
-                encoding="utf-8",
+            bind_qwen_project_from_queue(
+                project,
+                router.root,
+                coordinator_root=coordinator_root,
             )
             router.admit(self._event("installed-post-tool"))
             result = run_installed_qwen_hook(project, boundary="post_tool_use")
@@ -237,6 +221,48 @@ class QwenAdapterCompatTests(unittest.TestCase):
                 )
             )
             self.assertEqual(1, state["attempt_count"])
+
+    def test_manager_bind_command_connects_installed_post_tool_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            install_qwen_adapter(project)
+            router = self._router(root / "manager")
+            coordinator_root = root / "coordinator"
+
+            binding = bind_qwen_project_from_queue(
+                project,
+                router.root,
+                coordinator_root=coordinator_root,
+            )
+            self.assertEqual("orchestrator-qwen-binding/v1", binding["schema"])
+            self.assertEqual(str(router.root), binding["binding"]["queue_root"])
+
+            with patch("orchestrator_harness.cli._print_json") as emit:
+                self.assertEqual(
+                    0,
+                    main(
+                        [
+                            "adapter",
+                            "bind",
+                            "--host",
+                            "qwen-code",
+                            "--project-root",
+                            str(project),
+                            "--queue-root",
+                            str(router.root),
+                            "--coordinator-root",
+                            str(coordinator_root),
+                        ]
+                    ),
+                )
+            self.assertEqual("orchestrator-qwen-binding/v1", emit.call_args.args[0]["schema"])
+
+            router.admit(self._event("qwen-manager-bind"))
+            result = run_installed_qwen_hook(project, boundary="post_tool_use")
+            self.assertEqual("DELIVERED", result["receipt"]["outcome"])
+            self.assertEqual("DELIVERED", router.read_deliveries()[0]["outcome"])
 
 
 if __name__ == "__main__":

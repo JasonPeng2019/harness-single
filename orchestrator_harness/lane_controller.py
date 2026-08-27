@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -445,6 +446,15 @@ def _string_list(value: object, name: str) -> list[str]:
     return list(value)
 
 
+def _resolve_qwen_executable(argv: list[str]) -> list[str]:
+    """Resolve Qwen Code before the isolated child environment is applied."""
+
+    if not argv:
+        raise InvocationError("Qwen Code command must not be empty")
+    resolved = shutil.which(argv[0])
+    return [resolved or argv[0], *argv[1:]]
+
+
 @dataclass(frozen=True)
 class Invocation:
     invocation_schema: str | None
@@ -819,9 +829,9 @@ def _load_canonical_invocation(raw: dict[str, Any]) -> Invocation:
             except GitSafetyError as exc:
                 raise InvocationValidationError(str(exc)) from exc
         provider_options = dict(canonical.provider_options)
-        command = provider_options.get(
-            "command", provider_default_command(canonical.provider_id)
-        )
+        command = provider_options.get("command")
+        if command is None:
+            command = list(provider_default_command(canonical.provider_id))
         command_list = _string_list(command, "provider.command")
         overrides = _string_list(
             provider_options.get("config_overrides", []), "provider.config_overrides"
@@ -2163,6 +2173,8 @@ def run(invocation: Invocation) -> int:
             try:
                 adapter = provider_adapter(invocation.provider_id)
                 argv = adapter.build_argv(launch_spec)
+                if invocation.provider_id == "qwen-code":
+                    argv = _resolve_qwen_executable(argv)
             except ProviderAdapterError as exc:
                 raise InvocationError(str(exc)) from exc
             provider_evidence = build_provider_evidence(

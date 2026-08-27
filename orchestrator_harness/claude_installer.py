@@ -23,32 +23,60 @@ from .codex_adapter import (
     CodexInstallConflict,
     CodexInstallRollback,
     _ProjectMutationGuard,
+    _directory_identity,
+    _external_directory,
     _hash,
+    _is_reparse,
     _json_bytes,
+    _lexical_path,
     _manifest_content_digest,
     _project_guard,
     _read_bytes,
+    _read_external_json,
 )
-from .claude_adapter import ClaudeAdapter, SyntheticClaudeTransport
+from .claude_adapter import (
+    ClaudeAdapter,
+    SyntheticClaudeTransport,
+    claude_profile,
+)
 from .host_adapters import (
     DeliveryCoordinator,
     DeliveryReceipt,
     FutureHostFixture,
 )
 from .models import iso_utc, utc_now
-from .mutation import MutationConflict, safe_relative_path
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    ensure_directory_path,
+    safe_relative_path,
+)
 from .notifications import ManagerEventRouter
 from .stable_io import canonical_json
 
 
 CLAUDE_INSTALL_MANIFEST_SCHEMA = "orchestrator-claude-install/v1"
 CLAUDE_ADAPTER_VERSION = "claude-v1"
+CLAUDE_BINDING_SCHEMA = "orchestrator-claude-binding/v1"
 CLAUDE_PACKAGE_REVISION = "claude-assets-v2"
 CLAUDE_INSTALL_MANIFEST_RELATIVE = Path(".claude") / "orchestrator-harness-adapter.json"
 CLAUDE_SETTINGS_RELATIVE = Path(".claude") / "settings.json"
 CLAUDE_BINDING_RELATIVE = Path(".claude") / "orchestrator-harness-binding.json"
 _MANAGED_EVENT_NAMES = ("PostToolUse", "Stop")
 _MANAGED_HOOK_IDS = ("orchestrator-harness-post-tool-use", "orchestrator-harness-stop")
+_LEGACY_BINDING_FIELDS = frozenset(
+    {
+        "project_root",
+        "queue_root",
+        "coordinator_root",
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "registration_id",
+        "registration_generation",
+    }
+)
 _MAX_MANIFEST_BYTES = 512_000
 _MAX_BINDING_BYTES = 128_000
 
@@ -842,6 +870,132 @@ def uninstall_claude_adapter(project_root: str | Path) -> dict[str, Any]:
     }
 
 
+def _binding_record(
+    project: Path, router: ManagerEventRouter, coordinator_root: Path
+) -> dict[str, Any]:
+    registration = router.registration
+    router.validate_binding(registration)
+    queue = _external_directory(router.root, name="manager queue root")
+    coordinator = _external_directory(coordinator_root, name="coordinator root")
+    return {
+        "schema": CLAUDE_BINDING_SCHEMA,
+        "adapter": "claude",
+        "adapter_version": CLAUDE_ADAPTER_VERSION,
+        "package_revision": CLAUDE_PACKAGE_REVISION,
+        "project_root": str(project),
+        "project_identity": _directory_identity(project),
+        "queue_root": str(queue),
+        "queue_identity": _directory_identity(queue),
+        "coordinator_root": str(coordinator),
+        "coordinator_identity": _directory_identity(coordinator),
+        "run_id": router.binding.run_id,
+        "queue_id": router.binding.queue_id,
+        "manager_session_id": router.binding.manager_session_id,
+        "manager_thread_id": router.binding.manager_thread_id,
+        "manager_invocation_id": router.binding.manager_invocation_id,
+        "registration_id": router.binding.registration_id,
+        "registration_generation": router.registration_generation,
+        "adapter_profile": claude_profile().profile_id,
+    }
+
+
+def _is_migratable_legacy_binding(
+    value: object, record: Mapping[str, object]
+) -> bool:
+    """Accept only the exact pre-v1 Claude binding for the same binding facts."""
+
+    return isinstance(value, dict) and set(value) == _LEGACY_BINDING_FIELDS and all(
+        value.get(key) == record.get(key) for key in _LEGACY_BINDING_FIELDS
+    )
+
+
+def activate_claude_binding(
+    project_root: str | Path,
+    router: ManagerEventRouter,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Persist one exact manager binding for an installed Claude project."""
+
+    guard = _project_guard(project_root)
+    if not check_claude_adapter(guard.project).get("current"):
+        raise CodexInstallConflict(
+            "Claude binding requires a current owned installation"
+        )
+    queue = _external_directory(router.root, name="manager queue root")
+    root = (
+        _lexical_path(coordinator_root)
+        if coordinator_root is not None
+        else queue / "claude-coordinator"
+    )
+    if not root.exists():
+        _external_directory(root.parent, name="coordinator parent")
+        try:
+            ensure_directory_path(root)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise CodexInstallConflict(str(exc)) from exc
+    if _is_reparse(root) or not root.is_dir():
+        raise CodexInstallConflict("coordinator root is not safe")
+    coordinator = DeliveryCoordinator(
+        router=router,
+        adapter=FutureHostFixture("claude-bootstrap"),
+        state_root=root,
+        registration_generation=router.registration_generation,
+    )
+    ClaudeAdapter(SyntheticClaudeTransport(), coordinator)
+    coordinator.restore()
+    record = _binding_record(guard.project, router, root)
+    prior = guard.read(CLAUDE_BINDING_RELATIVE)
+    if prior is not None:
+        try:
+            prior_value = json.loads(prior.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CodexInstallConflict("Claude binding record is malformed") from exc
+        if _is_migratable_legacy_binding(prior_value, record):
+            guard.atomic_replace(
+                CLAUDE_BINDING_RELATIVE,
+                _json_bytes(record),
+                expected=guard.snapshot(CLAUDE_BINDING_RELATIVE),
+            )
+        elif prior_value != record:
+            raise CodexInstallConflict(
+                "Claude binding record is stale or cross-bound"
+            )
+    else:
+        guard.atomic_replace(
+            CLAUDE_BINDING_RELATIVE,
+            _json_bytes(record),
+            expected=guard.snapshot(CLAUDE_BINDING_RELATIVE),
+        )
+    return {
+        "schema": CLAUDE_BINDING_SCHEMA,
+        "binding": record,
+        "state": coordinator.load_state(),
+    }
+
+
+def bind_claude_project_from_queue(
+    project_root: str | Path,
+    queue_root: str | Path,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Bind a prepared Claude project to one already-registered manager queue."""
+
+    queue = _external_directory(queue_root, name="manager queue root")
+    registration = _read_external_json(
+        queue / "REGISTRATION.json", name="manager registration"
+    )
+    router = ManagerEventRouter(queue, binding=registration)
+    router.validate_binding(router.registration)
+    return activate_claude_binding(
+        project_root, router, coordinator_root=coordinator_root
+    )
+
+
+bind_claude_project = activate_claude_binding
+
+
 def _load_binding_for_hook(
     project: Path, guard: _ProjectMutationGuard
 ) -> dict[str, Any]:
@@ -854,22 +1008,76 @@ def _load_binding_for_hook(
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexInstallConflict("Claude binding record is malformed") from exc
-    if not isinstance(value, dict):
-        raise CodexInstallConflict("Claude binding record is malformed")
     required = {
+        "schema",
+        "adapter",
+        "adapter_version",
+        "package_revision",
+        "project_root",
+        "project_identity",
         "queue_root",
+        "queue_identity",
         "coordinator_root",
+        "coordinator_identity",
         "run_id",
         "queue_id",
         "manager_session_id",
         "manager_thread_id",
+        "manager_invocation_id",
         "registration_id",
         "registration_generation",
+        "adapter_profile",
     }
-    if not required.issubset(value):
-        raise CodexInstallConflict("Claude binding record is incomplete")
-    if value.get("project_root") != str(project):
+    if not isinstance(value, dict) or set(value) != required:
+        raise CodexInstallConflict(
+            "Claude binding record has an invalid closed shape"
+        )
+    if (
+        value["schema"] != CLAUDE_BINDING_SCHEMA
+        or value["adapter"] != "claude"
+        or value["adapter_version"] != CLAUDE_ADAPTER_VERSION
+        or value["package_revision"] != CLAUDE_PACKAGE_REVISION
+    ):
+        raise CodexInstallConflict("Claude binding record revision is stale")
+    if value["project_root"] != str(project) or value[
+        "project_identity"
+    ] != _directory_identity(project):
         raise CodexInstallConflict("Claude binding project identity is stale")
+    if value["adapter_profile"] != claude_profile().profile_id:
+        raise CodexInstallConflict("Claude binding adapter profile is stale")
+    generation = value["registration_generation"]
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise CodexInstallConflict("Claude binding registration generation is invalid")
+    queue = _external_directory(
+        value["queue_root"], name="bound manager queue root"
+    )
+    if _directory_identity(queue) != value["queue_identity"]:
+        raise CodexInstallConflict("bound manager queue identity changed")
+    coordinator = _external_directory(
+        value["coordinator_root"], name="bound coordinator root"
+    )
+    if _directory_identity(coordinator) != value["coordinator_identity"]:
+        raise CodexInstallConflict("bound coordinator identity changed")
+    registration = _read_external_json(
+        queue / "REGISTRATION.json", name="bound manager registration"
+    )
+    for key in (
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "manager_invocation_id",
+        "registration_id",
+        "registration_generation",
+    ):
+        if registration.get(key) != value.get(key):
+            raise CodexInstallConflict(
+                f"bound manager registration mismatch in {key}"
+            )
     return value
 
 
@@ -882,9 +1090,9 @@ def run_installed_claude_hook(
     """Run the actually installed, bound Claude safe-boundary route.
 
     ``post_tool_use`` delivers the sparse notice through the adapter's own
-    transport seam; ``stop`` enforces the notification stop matrix.  With no
-    persisted binding the route is honest ``SAFE_BOUNDARY_ONLY`` (nothing was
-    delivered).  Transport delivery never acknowledges queue work.
+    transport seam; ``stop`` enforces the notification stop matrix. An
+    installed project must have an exact persisted manager binding before its
+    hook can run. Transport delivery never acknowledges queue work.
     """
     if boundary not in {"post_tool_use", "stop"}:
         raise CodexAdapterError(
@@ -897,19 +1105,6 @@ def run_installed_claude_hook(
         raise CodexInstallConflict(
             "installed Claude hook is not a current trusted byte set"
         )
-    if guard.read(CLAUDE_BINDING_RELATIVE) is None:
-        # No persisted runtime binding: the safe-boundary-only record is the
-        # honest answer (nothing was delivered, stop is permitted).
-        return {
-            "schema": "orchestrator-claude-installed-hook/v1",
-            "boundary": boundary,
-            "project_root": str(project),
-            "notice": None,
-            "receipt": None,
-            "stop_decision": {"permitted": True},
-            "acknowledged_by_hook": False,
-            "transport_calls": [],
-        }
     binding = _load_binding_for_hook(project, guard)
     transport = SyntheticClaudeTransport()
     router = ManagerEventRouter(
@@ -918,6 +1113,7 @@ def run_installed_claude_hook(
         queue_id=binding["queue_id"],
         manager_session_id=binding["manager_session_id"],
         manager_thread_id=binding["manager_thread_id"],
+        manager_invocation_id=binding["manager_invocation_id"],
         registration_id=binding["registration_id"],
         registration_generation=binding["registration_generation"],
     )
@@ -957,10 +1153,14 @@ def run_installed_claude_hook(
 
 __all__ = [
     "CLAUDE_ADAPTER_VERSION",
+    "CLAUDE_BINDING_SCHEMA",
     "CLAUDE_INSTALL_MANIFEST_SCHEMA",
     "CLAUDE_INSTALL_MANIFEST_RELATIVE",
     "CLAUDE_PACKAGE_REVISION",
     "CLAUDE_SETTINGS_RELATIVE",
+    "activate_claude_binding",
+    "bind_claude_project",
+    "bind_claude_project_from_queue",
     "check_claude_adapter",
     "install_claude_adapter",
     "packaged_claude_assets",

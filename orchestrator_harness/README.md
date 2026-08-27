@@ -30,6 +30,7 @@ or implementation claim.
 ```powershell
 python -m orchestrator_harness adapter install --host codex --project-root <disposable-project>
 python -m orchestrator_harness adapter check --host codex --project-root <disposable-project>
+python -m orchestrator_harness adapter bind --host codex --project-root <disposable-project> --queue-root <registered-manager-queue>
 python -m orchestrator_harness adapter upgrade --host codex --project-root <disposable-project>
 python -m orchestrator_harness adapter uninstall --host codex --project-root <disposable-project>
 ```
@@ -50,11 +51,31 @@ harness coordinator owns the binding-specific wake subscription and replay; a
 hook does not directly watch arbitrary file changes. App Server fixtures use
 `thread/inject_items`, `turn/completed`, and `turn/start` for idle continuation.
 
-This describes the adapter contract, not a live guarantee for `codex exec`.
-Codex CLI 0.149.0 headless runs did not invoke project PostToolUse or Stop hooks
-even with explicit hook-trust bypass, while direct installed-hook execution did.
-Accordingly, deterministic installer/hook checks must not be promoted to live
-headless-delivery evidence.
+Codex CLI 0.150.1 was live-proven through `operator_launch` and
+`lane_controller`: `codex exec` invoked project PostToolUse and the bound
+manager received a `DELIVERED` receipt. Older 0.149.0 headless evidence is not
+representative of the current shipped hook route. See
+[`../docs/codex-headless-hook-proof.md`](../docs/codex-headless-hook-proof.md).
+
+## Claude Code adapter
+
+The native runner provider is `claude-code`; its host adapter is selected with
+`--host claude`:
+
+```powershell
+python -m orchestrator_harness adapter install --host claude --project-root <disposable-project>
+python -m orchestrator_harness adapter check --host claude --project-root <disposable-project>
+python -m orchestrator_harness adapter bind --host claude --project-root <disposable-project> --queue-root <registered-manager-queue>
+python -m orchestrator_harness adapter uninstall --host claude --project-root <disposable-project>
+```
+
+The installer owns only `.claude/settings.json`, `.claude/hooks/`, and its
+project-local manifest. Binding records the exact project, queue, coordinator,
+manager registration, and adapter revision; a missing, stale, or cross-bound
+record makes an installed hook fail loudly rather than silently skipping
+delivery. A Windows Claude Code 2.1.239 headless session live-proved one Bash
+tool call and PostToolUse delivery to the bound manager queue; see
+[`../docs/claude-headless-hook-proof.md`](../docs/claude-headless-hook-proof.md).
 
 ## Qwen Code adapter
 
@@ -64,6 +85,7 @@ The native runner provider is `qwen-code`; its host adapter is selected with
 ```powershell
 python -m orchestrator_harness adapter install --host qwen --project-root <disposable-project>
 python -m orchestrator_harness adapter check --host qwen --project-root <disposable-project>
+python -m orchestrator_harness adapter bind --host qwen --project-root <disposable-project> --queue-root <registered-manager-queue>
 python -m orchestrator_harness adapter uninstall --host qwen --project-root <disposable-project>
 ```
 
@@ -72,9 +94,13 @@ project-local manifest. It uses Qwen Code’s documented top-level `hooks`
 settings form, command-hook `name` fields, `PostToolUse`/`Stop` groups, and a
 `Notification` group matched to `idle_prompt`. Existing project settings and
 unrelated hook groups are preserved; no user/global Qwen configuration is
-written. Delivery receipts are transport evidence and never acknowledge
-manager queue work. The deterministic fixture and tests prove installation,
-preservation, and sparse delivery; they make no live Qwen hook-session claim.
+written. Binding is explicit and accepts only a real registered manager queue;
+it never creates a synthetic queue or guesses manager identity. Delivery
+receipts are transport evidence and never acknowledge manager queue work. The
+deterministic fixture and tests prove installation, preservation, and sparse
+delivery. A Windows Qwen Code 0.21.10 headless session also live-proved that a
+project PostToolUse hook delivers to the bound manager queue; see
+[`../docs/qwen-headless-hook-proof.md`](../docs/qwen-headless-hook-proof.md).
 Delivery notices contain binding identity, queue revision, pending count,
 highest class/severity, timestamp, and adapter profile only. Delivery receipts
 are transport evidence and never acknowledge pending events.

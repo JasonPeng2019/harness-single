@@ -54,11 +54,12 @@ PROVIDER_OPERATION_NAMES = (
 # shape-valid.
 PROVIDER_TERMINAL_OUTCOMES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 
-# Qwen Code's native headless entry point is ``qwen exec``.  Keeping this
+# Qwen Code's native headless entry point is ``qwen`` with a prompt on stdin.
+# Keeping this
 # provider-owned default in one place makes launch identity and lane launch
 # agree without teaching generic code Qwen-specific flags.
 _PROVIDER_DEFAULT_COMMANDS: Mapping[str, tuple[str, ...]] = {
-    "qwen-code": ("qwen", "exec"),
+    "qwen-code": ("qwen",),
 }
 
 

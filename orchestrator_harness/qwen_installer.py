@@ -18,21 +18,32 @@ from .codex_adapter import (
     CodexInstallConflict,
     CodexInstallRollback,
     _ProjectMutationGuard,
+    _directory_identity,
+    _external_directory,
     _hash,
+    _is_reparse,
     _json_bytes,
+    _lexical_path,
     _manifest_content_digest,
     _project_guard,
     _read_bytes,
+    _read_external_json,
 )
 from .host_adapters import DeliveryCoordinator, DeliveryReceipt, FutureHostFixture
 from .models import iso_utc, utc_now
-from .mutation import MutationConflict, safe_relative_path
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    ensure_directory_path,
+    safe_relative_path,
+)
 from .notifications import ManagerEventRouter
-from .qwen_adapter import QwenAdapter, SyntheticQwenTransport
+from .qwen_adapter import QwenAdapter, SyntheticQwenTransport, qwen_profile
 from .stable_io import canonical_json
 
 
 QWEN_INSTALL_MANIFEST_SCHEMA = "orchestrator-qwen-install/v1"
+QWEN_BINDING_SCHEMA = "orchestrator-qwen-binding/v1"
 QWEN_ADAPTER_VERSION = "qwen-v1"
 QWEN_PACKAGE_REVISION = "qwen-assets-v1"
 QWEN_INSTALL_MANIFEST_RELATIVE = Path(".qwen") / "orchestrator-harness-adapter.json"
@@ -559,17 +570,186 @@ def uninstall_qwen_adapter(project_root: str | Path) -> dict[str, Any]:
     return {"schema": QWEN_INSTALL_MANIFEST_SCHEMA, "adapter": "qwen", "project_root": str(project), "operation": "uninstall", "installed": True, "removed": sorted(removed), "preserved_modified": sorted(preserved), "project_trust": "unverified", "ownership_safe": True}
 
 
+def _binding_record(
+    project: Path, router: ManagerEventRouter, coordinator_root: Path
+) -> dict[str, Any]:
+    registration = router.registration
+    router.validate_binding(registration)
+    queue = _external_directory(router.root, name="manager queue root")
+    coordinator = _external_directory(coordinator_root, name="coordinator root")
+    return {
+        "schema": QWEN_BINDING_SCHEMA,
+        "adapter": "qwen",
+        "adapter_version": QWEN_ADAPTER_VERSION,
+        "package_revision": QWEN_PACKAGE_REVISION,
+        "project_root": str(project),
+        "project_identity": _directory_identity(project),
+        "queue_root": str(queue),
+        "queue_identity": _directory_identity(queue),
+        "coordinator_root": str(coordinator),
+        "coordinator_identity": _directory_identity(coordinator),
+        "run_id": router.binding.run_id,
+        "queue_id": router.binding.queue_id,
+        "manager_session_id": router.binding.manager_session_id,
+        "manager_thread_id": router.binding.manager_thread_id,
+        "manager_invocation_id": router.binding.manager_invocation_id,
+        "registration_id": router.binding.registration_id,
+        "registration_generation": router.registration_generation,
+        "adapter_profile": qwen_profile().profile_id,
+    }
+
+
+def activate_qwen_binding(
+    project_root: str | Path,
+    router: ManagerEventRouter,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Persist one exact manager binding for an installed Qwen project."""
+
+    guard = _project_guard(project_root)
+    if not check_qwen_adapter(guard.project).get("current"):
+        raise QwenInstallConflict("Qwen binding requires a current owned installation")
+    queue = _external_directory(router.root, name="manager queue root")
+    root = (
+        _lexical_path(coordinator_root)
+        if coordinator_root is not None
+        else queue / "qwen-coordinator"
+    )
+    if not root.exists():
+        _external_directory(root.parent, name="coordinator parent")
+        try:
+            ensure_directory_path(root)
+        except (MutationConflict, MutationUnsupported) as exc:
+            raise QwenInstallConflict(str(exc)) from exc
+    if _is_reparse(root) or not root.is_dir():
+        raise QwenInstallConflict("coordinator root is not safe")
+    coordinator = DeliveryCoordinator(
+        router=router,
+        adapter=FutureHostFixture("qwen-bootstrap"),
+        state_root=root,
+        registration_generation=router.registration_generation,
+    )
+    QwenAdapter(SyntheticQwenTransport(), coordinator)
+    coordinator.restore()
+    record = _binding_record(guard.project, router, root)
+    prior = guard.read(QWEN_BINDING_RELATIVE)
+    if prior is not None:
+        try:
+            prior_value = json.loads(prior.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise QwenInstallConflict("Qwen binding record is malformed") from exc
+        if prior_value != record:
+            raise QwenInstallConflict("Qwen binding record is stale or cross-bound")
+    else:
+        guard.atomic_replace(
+            QWEN_BINDING_RELATIVE,
+            _json_bytes(record),
+            expected=guard.snapshot(QWEN_BINDING_RELATIVE),
+        )
+    return {
+        "schema": QWEN_BINDING_SCHEMA,
+        "binding": record,
+        "state": coordinator.load_state(),
+    }
+
+
+def bind_qwen_project_from_queue(
+    project_root: str | Path,
+    queue_root: str | Path,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Bind a prepared Qwen project to one already-registered manager queue."""
+
+    queue = _external_directory(queue_root, name="manager queue root")
+    registration = _read_external_json(
+        queue / "REGISTRATION.json", name="manager registration"
+    )
+    router = ManagerEventRouter(queue, binding=registration)
+    router.validate_binding(router.registration)
+    return activate_qwen_binding(
+        project_root, router, coordinator_root=coordinator_root
+    )
+
+
+bind_qwen_project = activate_qwen_binding
+
+
 def _load_binding_for_hook(project: Path, guard: _ProjectMutationGuard) -> dict[str, Any]:
     data = guard.read(QWEN_BINDING_RELATIVE)
-    if data is None or len(data) > _MAX_BINDING_BYTES:
-        raise QwenInstallConflict("installed Qwen hook has no valid harness binding")
+    if data is None:
+        raise QwenInstallConflict("installed Qwen hook has no harness binding")
+    if len(data) > _MAX_BINDING_BYTES:
+        raise QwenInstallConflict("Qwen binding record is oversized")
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise QwenInstallConflict("Qwen binding record is malformed") from exc
-    required = {"queue_root", "coordinator_root", "run_id", "queue_id", "manager_session_id", "manager_thread_id", "registration_id", "registration_generation"}
-    if not isinstance(value, dict) or not required.issubset(value) or value.get("project_root") != str(project):
-        raise QwenInstallConflict("Qwen binding record is incomplete or stale")
+    required = {
+        "schema",
+        "adapter",
+        "adapter_version",
+        "package_revision",
+        "project_root",
+        "project_identity",
+        "queue_root",
+        "queue_identity",
+        "coordinator_root",
+        "coordinator_identity",
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "manager_invocation_id",
+        "registration_id",
+        "registration_generation",
+        "adapter_profile",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise QwenInstallConflict("Qwen binding record has an invalid closed shape")
+    if (
+        value["schema"] != QWEN_BINDING_SCHEMA
+        or value["adapter"] != "qwen"
+        or value["adapter_version"] != QWEN_ADAPTER_VERSION
+        or value["package_revision"] != QWEN_PACKAGE_REVISION
+    ):
+        raise QwenInstallConflict("Qwen binding record revision is stale")
+    if value["project_root"] != str(project) or value[
+        "project_identity"
+    ] != _directory_identity(project):
+        raise QwenInstallConflict("Qwen binding project identity is stale")
+    if value["adapter_profile"] != qwen_profile().profile_id:
+        raise QwenInstallConflict("Qwen binding adapter profile is stale")
+    generation = value["registration_generation"]
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise QwenInstallConflict("Qwen binding registration generation is invalid")
+    queue = _external_directory(value["queue_root"], name="bound manager queue root")
+    if _directory_identity(queue) != value["queue_identity"]:
+        raise QwenInstallConflict("bound manager queue identity changed")
+    coordinator = _external_directory(
+        value["coordinator_root"], name="bound coordinator root"
+    )
+    if _directory_identity(coordinator) != value["coordinator_identity"]:
+        raise QwenInstallConflict("bound coordinator identity changed")
+    registration = _read_external_json(
+        queue / "REGISTRATION.json", name="bound manager registration"
+    )
+    for key in (
+        "run_id",
+        "queue_id",
+        "manager_session_id",
+        "manager_thread_id",
+        "manager_invocation_id",
+        "registration_id",
+        "registration_generation",
+    ):
+        if registration.get(key) != value.get(key):
+            raise QwenInstallConflict(f"bound manager registration mismatch in {key}")
     return value
 
 
@@ -588,13 +768,12 @@ def run_installed_qwen_hook(
     project = guard.project
     if not check_qwen_adapter(project).get("current"):
         raise QwenInstallConflict("installed Qwen hook is not a current trusted byte set")
-    if guard.read(QWEN_BINDING_RELATIVE) is None:
-        return {"schema": "orchestrator-qwen-installed-hook/v1", "boundary": boundary, "project_root": str(project), "notice": None, "receipt": None, "stop_decision": {"permitted": True}, "acknowledged_by_hook": False, "transport_calls": []}
     binding = _load_binding_for_hook(project, guard)
     transport = SyntheticQwenTransport()
     router = ManagerEventRouter(
         Path(binding["queue_root"]), run_id=binding["run_id"], queue_id=binding["queue_id"],
         manager_session_id=binding["manager_session_id"], manager_thread_id=binding["manager_thread_id"],
+        manager_invocation_id=binding["manager_invocation_id"],
         registration_id=binding["registration_id"], registration_generation=binding["registration_generation"],
     )
     router.validate_binding(router.registration)
@@ -622,8 +801,10 @@ def run_installed_qwen_hook(
 
 __all__ = [
     "QWEN_ADAPTER_VERSION", "QWEN_BINDING_RELATIVE", "QWEN_INSTALL_MANIFEST_RELATIVE",
-    "QWEN_INSTALL_MANIFEST_SCHEMA", "QWEN_PACKAGE_REVISION", "QWEN_SETTINGS_RELATIVE",
-    "QwenInstallConflict", "QwenInstallRollback", "check_qwen_adapter", "install_qwen_adapter",
+    "QWEN_BINDING_SCHEMA", "QWEN_INSTALL_MANIFEST_SCHEMA", "QWEN_PACKAGE_REVISION",
+    "QWEN_SETTINGS_RELATIVE", "QwenInstallConflict", "QwenInstallRollback",
+    "activate_qwen_binding", "bind_qwen_project", "bind_qwen_project_from_queue",
+    "check_qwen_adapter", "install_qwen_adapter",
     "packaged_qwen_assets", "packaged_qwen_manifest", "run_installed_qwen_hook",
     "uninstall_qwen_adapter", "upgrade_qwen_adapter",
 ]

@@ -49,8 +49,11 @@ from .codex_adapter import (
     bind_codex_project,
     run_installed_codex_hook,
 )
+from .claude_installer import activate_claude_binding, bind_claude_project
 from .qwen_adapter import QwenAdapter, SyntheticQwenTransport
 from .qwen_installer import (
+    activate_qwen_binding,
+    bind_qwen_project,
     check_qwen_adapter,
     install_qwen_adapter,
     run_installed_qwen_hook,
@@ -95,6 +98,10 @@ __all__ = [
     "QwenAdapter",
     "activate_codex_binding",
     "bind_codex_project",
+    "activate_claude_binding",
+    "bind_claude_project",
+    "activate_qwen_binding",
+    "bind_qwen_project",
     "DeliveryCoordinator",
     "DeliveryNotice",
     "DeliveryReceipt",

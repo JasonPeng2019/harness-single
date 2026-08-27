@@ -42,6 +42,21 @@ Must cross-match the invocation: `profile.provider == provider.id`,
 `profile.resources == resources` (as a set/order-insensitive tuple). `tools`
 should mirror the provider's `allowed_tools`.
 
+## Project hook binding
+
+Install and bind the project before starting a fresh Claude Code session:
+
+```powershell
+python -m orchestrator_harness adapter install --host claude --project-root <project>
+python -m orchestrator_harness adapter bind --host claude --project-root <project> --queue-root <registered-manager-queue>
+```
+
+Binding only accepts an existing registered manager queue and records the
+exact queue, registration, project, and coordinator identities. It never
+creates a synthetic queue or guesses manager identity. A missing, stale, or
+cross-bound record makes the installed hook error so the setup issue can be
+repaired before retrying with a fresh provider session.
+
 ## `prompt_bundle`
 
 The closed content-bound prompt record. `components` are path-bound files under

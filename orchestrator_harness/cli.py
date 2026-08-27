@@ -18,6 +18,7 @@ from typing import Any
 
 from .claude_adapter import create_claude_adapter
 from .claude_installer import (
+    bind_claude_project_from_queue,
     check_claude_adapter,
     install_claude_adapter,
     run_installed_claude_hook,
@@ -44,6 +45,7 @@ from .models import utc_now
 from .notifications import ManagerEventRouter
 from .processes import process_snapshot
 from .qwen_installer import (
+    bind_qwen_project_from_queue,
     check_qwen_adapter,
     install_qwen_adapter,
     run_installed_qwen_hook,
@@ -401,8 +403,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ROOT adjudication is manager-only and unavailable through the public CLI"
             )
         if args.command == "adapter":
-            if args.adapter_action == "bind" and args.host != "codex":
-                raise ValueError("adapter bind currently supports only host=codex")
+            if args.adapter_action == "bind" and args.host not in {
+                "codex",
+                "claude",
+                "qwen",
+                "qwen-code",
+            }:
+                raise ValueError(
+                    "adapter bind supports only host=codex, claude, or qwen"
+                )
             if args.host == "codex":
                 if args.adapter_action == "install":
                     _print_json(install_codex_adapter(args.project_root))
@@ -453,6 +462,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         registration_id="synthetic-s4-registration",
                     )
                     _print_json(create_claude_adapter(router).synthetic_self_test())
+                elif args.adapter_action == "bind":
+                    _print_json(
+                        bind_claude_project_from_queue(
+                            args.project_root,
+                            args.queue_root,
+                            coordinator_root=args.coordinator_root,
+                        )
+                    )
                 else:
                     _print_json(
                         run_installed_claude_hook(
@@ -484,6 +501,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     from .qwen_adapter import create_qwen_adapter
 
                     _print_json(create_qwen_adapter(router).synthetic_self_test())
+                elif args.adapter_action == "bind":
+                    _print_json(
+                        bind_qwen_project_from_queue(
+                            args.project_root,
+                            args.queue_root,
+                            coordinator_root=args.coordinator_root,
+                        )
+                    )
                 else:
                     _print_json(
                         run_installed_qwen_hook(

@@ -102,17 +102,22 @@ Use `--host claude` or `--host qwen` for those providers. Adapter-owned hooks ar
 super-cache and are installed, checked, upgraded, and removed only through the corresponding
 adapter command.
 
-Installing the Codex adapter does not bind its hooks to a manager queue. At manager startup, create
-the real `ManagerEventRouter`, then bind the prepared lane to that exact registered queue before
-launching the provider:
+Installing the Codex, Claude, or Qwen adapter does not bind its hooks to a manager queue. At manager
+startup, create the real `ManagerEventRouter`, then bind the prepared lane to that exact registered
+queue before launching the provider:
 
 ```powershell
 python -m orchestrator_harness adapter bind --host codex --project-root $lane --queue-root $managerQueue
+# Or, for Claude Code:
+python -m orchestrator_harness adapter bind --host claude --project-root $lane --queue-root $managerQueue
+# Or, for Qwen Code:
+python -m orchestrator_harness adapter bind --host qwen --project-root $lane --queue-root $managerQueue
 ```
 
 `adapter bind` never creates a synthetic queue or guesses manager identity. It is repeatable for
 the same registration and fails on a missing, stale, or cross-bound queue. Library callers may use
-`activate_codex_binding(project_root, router)` directly instead. The installed PostToolUse and Stop
+`activate_codex_binding(project_root, router)`, `activate_claude_binding(project_root, router)`, or
+`activate_qwen_binding(project_root, router)` directly instead. The installed PostToolUse and Stop
 hooks then deliver content-free manager notices at their supported safe boundaries. Start a fresh
 provider session after adapter installation or binding so project configuration is reloaded.
 
@@ -121,6 +126,18 @@ CLI 0.150.1: a `codex exec` lane launched through `operator_launch` and `lane_co
 PostToolUse command and appended a delivery record for a real pending manager event. See
 [`docs/codex-headless-hook-proof.md`](docs/codex-headless-hook-proof.md) for the reproducible proof
 contract and limits.
+
+The same Windows launcher path was live-proven with Qwen Code 0.21.10: a `qwen` lane selected the
+user's configured `deepseek-v4-flash:0731-cloud` Ollama-backed model, performed a shell tool call,
+and its PostToolUse hook appended a `DELIVERED` record for a real pending manager event. No
+credentials or provider configuration were supplied by the harness. See
+[`docs/qwen-headless-hook-proof.md`](docs/qwen-headless-hook-proof.md) for the proof contract and
+limits.
+
+Claude Code 2.1.239 was live-proven through the same Windows launcher path: a `claude --print`
+lane ran one Bash tool call and its PostToolUse hook appended a `DELIVERED` record for a real pending
+manager event. See [`docs/claude-headless-hook-proof.md`](docs/claude-headless-hook-proof.md) for
+the proof contract and limits.
 
 ## Public release surface
 
