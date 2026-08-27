@@ -376,6 +376,10 @@ The optional firmware seam is caller-declared and installed with the package:
   complete optional firmware seam; it is not connected to the lane controller and introduces no
   controller or runtime protocol.
 
+Future direction: `CapabilityBroker` may be useful inside a backend firmware-policy service that
+issues signed approval for a precisely declared hardware action. That would be a separately
+designed integration; it is not current controller or worker authorization.
+
 The retained `examples/legacy-firmware.invocation.example.json` and
 `examples/dual-path-manager.example.md` show how legacy firmware and coding V1 coexist without a
 schema migration or an alternate event loop. `QUICK_START.md` contains the fresh-epoch/operator
