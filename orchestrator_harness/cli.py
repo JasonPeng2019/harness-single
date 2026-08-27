@@ -33,13 +33,6 @@ from .codex_adapter import (
     uninstall_codex_adapter,
     upgrade_codex_adapter,
 )
-from .qwen_installer import (
-    check_qwen_adapter,
-    install_qwen_adapter,
-    run_installed_qwen_hook,
-    uninstall_qwen_adapter,
-    upgrade_qwen_adapter,
-)
 from .config import ConfigError, HarnessConfig, load_config
 from .discovery import discover_suite
 from .events import diff_conditions
@@ -49,11 +42,21 @@ from .lane_lifecycle import allocate_immutable_source_view, retire_terminal_lane
 from .models import utc_now
 from .notifications import ManagerEventRouter
 from .processes import process_snapshot
+from .qwen_installer import (
+    check_qwen_adapter,
+    install_qwen_adapter,
+    run_installed_qwen_hook,
+    uninstall_qwen_adapter,
+    upgrade_qwen_adapter,
+)
 from .reconcile import reconcile
 from .stable_io import PathSafetyError, SafeOutput
 from .watcher_integration import merge_watcher_conditions
-from .workspace_overlay import ingest_super_cache, install_workspace_rules, prepare_worktree
-
+from .workspace_overlay import (
+    ingest_super_cache,
+    install_workspace_rules,
+    prepare_worktree,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1

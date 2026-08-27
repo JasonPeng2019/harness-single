@@ -20,24 +20,33 @@ import json
 import os
 import stat
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .models import iso_utc, utc_now
 from .mutation import (
     MutationError,
     TargetState,
-    append_bytes as mutation_append_bytes,
     capture_target,
-    delete as mutation_delete,
     ensure_directory_path,
     make_temporary_directory,
     remove_tree,
-    rename as mutation_rename,
-    replace as mutation_replace,
     safe_relative_path,
+)
+from .mutation import (
+    append_bytes as mutation_append_bytes,
+)
+from .mutation import (
+    delete as mutation_delete,
+)
+from .mutation import (
+    rename as mutation_rename,
+)
+from .mutation import (
+    replace as mutation_replace,
 )
 
 OVERLAY_RECEIPT_SCHEMA = "orchestrator-workspace-overlay-receipt/v1"
@@ -58,34 +67,6 @@ class OverlayCollisionError(WorkspaceOverlayError):
     """Preparation rejected an existing-file collision without mutating."""
 
 
-def _lexical(value: str | Path) -> Path:
-    return Path(os.path.abspath(str(Path(value).expanduser())))
-
-
-def _is_reparse(path: Path) -> bool:
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False
-    if stat.S_ISLNK(info.st_mode):
-        return True
-    attributes = getattr(info, "st_file_attributes", 0)
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-
-
-def _regular_directory(value: str | Path, *, name: str) -> Path:
-    path = _lexical(value)
-    if _is_reparse(path) or not path.is_dir():
-        raise WorkspaceOverlayError(
-            f"{name} must be an existing regular directory: {path}"
-        )
-    return path
-
-
-def _path_identity(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(str(path)))
-
-
 def _workspace_rules_block() -> bytes:
     """Return the packaged full rules block for a manager workspace."""
 
@@ -96,19 +77,14 @@ def _workspace_rules_block() -> bytes:
     except (FileNotFoundError, ModuleNotFoundError) as exc:
         raise WorkspaceOverlayError("packaged workspace rules are unavailable") from exc
     return (
-        f"{WORKSPACE_RULES_BEGIN}\n".encode("utf-8")
+        f"{WORKSPACE_RULES_BEGIN}\n".encode()
         + rules.rstrip(b"\r\n")
-        + f"\n{WORKSPACE_RULES_END}\n".encode("utf-8")
+        + f"\n{WORKSPACE_RULES_END}\n".encode()
     )
 
 
 def install_workspace_rules(*, workspace: str | Path) -> dict[str, Any]:
-    """Append the packaged manager rules to one workspace's ``AGENTS.md`` once.
-
-    Existing workspace instructions remain byte-for-byte intact.  A current
-    managed block makes the operation idempotent; a partial or locally edited
-    managed block is rejected rather than overwritten.
-    """
+    """Append the packaged manager rules to ``AGENTS.md`` exactly once."""
 
     root = _regular_directory(workspace, name="workspace")
     agents = root / "AGENTS.md"
@@ -120,8 +96,8 @@ def install_workspace_rules(*, workspace: str | Path) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError) as exc:
         raise WorkspaceOverlayError("workspace AGENTS.md must be readable UTF-8") from exc
     block = _workspace_rules_block()
-    begin = WORKSPACE_RULES_BEGIN.encode("utf-8")
-    end = WORKSPACE_RULES_END.encode("utf-8")
+    begin = WORKSPACE_RULES_BEGIN.encode()
+    end = WORKSPACE_RULES_END.encode()
     begin_count = existing.count(begin)
     end_count = existing.count(end)
     if begin_count or end_count:
@@ -154,6 +130,34 @@ def install_workspace_rules(*, workspace: str | Path) -> dict[str, Any]:
         "installed": True,
         "idempotent": False,
     }
+
+
+def _lexical(value: str | Path) -> Path:
+    return Path(os.path.abspath(str(Path(value).expanduser())))
+
+
+def _is_reparse(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _regular_directory(value: str | Path, *, name: str) -> Path:
+    path = _lexical(value)
+    if _is_reparse(path) or not path.is_dir():
+        raise WorkspaceOverlayError(
+            f"{name} must be an existing regular directory: {path}"
+        )
+    return path
+
+
+def _path_identity(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 def _walk_contents(root: Path) -> list[tuple[str, str]]:
@@ -968,19 +972,20 @@ def verify_overlay_receipt(
         "verified": True,
         "target_worktree_id": target_id,
         "role": receipt_role,
-        "reason": "completed overlay receipt matches the identified subagent worktree",
+        "reason": "completed overlay receipt matches the identified worktree and role",
     }
 
 
 __all__ = [
     "DECLARATION_NAME",
     "OVERLAY_RECEIPT_SCHEMA",
-    "OverlayCollisionError",
     "SUPER_CACHE_CONTROL_SCHEMA",
     "SUPER_CACHE_NAME",
     "SUPPORTED_ROLES",
+    "OverlayCollisionError",
     "WorkspaceOverlayError",
     "ingest_super_cache",
+    "install_workspace_rules",
     "prepare_worktree",
     "restore_worktree",
     "verify_overlay_receipt",

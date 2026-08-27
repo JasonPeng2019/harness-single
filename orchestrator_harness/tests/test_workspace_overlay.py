@@ -19,13 +19,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
 import orchestrator_harness.lane_controller as controller
-from orchestrator_harness.cli import build_parser, main as cli_main
+from orchestrator_harness.cli import build_parser
+from orchestrator_harness.cli import main as cli_main
 from orchestrator_harness.lane_lifecycle import RetirementResult, retire_terminal_lane
 from orchestrator_harness.models import ProcessSnapshot
 from orchestrator_harness.mutation import MutationError, MutationReceipt, TargetState
@@ -47,8 +47,7 @@ def _git(root: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), *args],
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
     return completed.stdout.strip()
@@ -102,6 +101,12 @@ class OverlayModuleTests(unittest.TestCase):
         # The container folder itself is not copied.
         self.assertFalse((self.cache / source.name).exists())
         self.assertEqual("orchestrator-workspace-overlay-ingest/v1", result["schema"])
+
+    def test_ingest_accepts_an_empty_user_selected_source(self) -> None:
+        result = self._ingest(self._source())
+        self.assertTrue(result["complete"])
+        self.assertEqual(0, result["entry_count"])
+        self.assertEqual([], list(self.cache.iterdir()))
 
     def test_reingest_replaces_prior_contents(self) -> None:
         source = self._source()
@@ -224,51 +229,6 @@ class OverlayModuleTests(unittest.TestCase):
         # The declaration is cache control data and is never copied.
         self.assertFalse((self.target / DECLARATION_NAME).exists())
         self.assertTrue(self.receipt.is_file())
-
-    def test_checked_in_super_cache_deploys_hooks_for_both_lane_roles(self) -> None:
-        """The checked-in cache, not a toy fixture, is deployable to either lane."""
-
-        source = Path(__file__).resolve().parents[2] / "super-cache"
-        result = ingest_super_cache(source_folder=source, harness_worktree=self.harness)
-        self.assertTrue(result["complete"])
-        for role in ("orchestrator", "subagent"):
-            target = self.root / f"prepared-{role}"
-            target.mkdir()
-            (target / "AGENTS.md").write_text("# Project instructions\n", encoding="utf-8")
-            receipt = self.root / f"{role}-receipt.json"
-            prepared = prepare_worktree(
-                super_cache=self.cache,
-                target_worktree=target,
-                role=role,
-                receipt_path=receipt,
-            )
-            self.assertTrue(prepared["complete"])
-            self.assertTrue((target / ".agent" / "stop-verify.ps1").is_file())
-            hooks = json.loads(
-                (target / ".codex" / "hooks.json").read_text(encoding="utf-8")
-            )["hooks"]
-            self.assertEqual(15, hooks["SessionStart"][0]["timeout"])
-            self.assertEqual("^(Bash|shell_command)$", hooks["PreToolUse"][0]["matcher"])
-            self.assertEqual(15, hooks["PreToolUse"][0]["timeout"])
-            self.assertEqual(300, hooks["Stop"][0]["timeout"])
-            agents = (target / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertTrue(agents.startswith("# Project instructions\n"))
-            self.assertIn("BEGIN ORCHESTRATOR-HARNESS LANE RULES", agents)
-            self.assertIn("Work only in this assigned Git worktree", agents)
-
-    def test_install_workspace_rules_preserves_instructions_and_is_idempotent(self) -> None:
-        (self.target / "AGENTS.md").write_text("# Project instructions\n", encoding="utf-8")
-        first = install_workspace_rules(workspace=self.target)
-        self.assertTrue(first["installed"])
-        self.assertFalse(first["idempotent"])
-        agents = (self.target / "AGENTS.md").read_text(encoding="utf-8")
-        quick_rules = (Path(__file__).resolve().parents[2] / "QUICK_RULES.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertTrue(agents.startswith("# Project instructions\n"))
-        self.assertIn("BEGIN ORCHESTRATOR-HARNESS QUICK RULES", agents)
-        self.assertIn(quick_rules, agents)
-        self.assertTrue(install_workspace_rules(workspace=self.target)["idempotent"])
 
     def test_prepare_rejects_collision_before_any_mutation(self) -> None:
         cache = self._declared_cache()
@@ -419,14 +379,13 @@ class OverlayModuleTests(unittest.TestCase):
         with mock.patch(
             "orchestrator_harness.workspace_overlay.mutation_replace",
             side_effect=failing_replace,
-        ):
-            with self.assertRaisesRegex(WorkspaceOverlayError, "rolled back"):
-                prepare_worktree(
-                    super_cache=cache,
-                    target_worktree=self.target,
-                    role="subagent",
-                    receipt_path=self.receipt,
-                )
+        ), self.assertRaisesRegex(WorkspaceOverlayError, "rolled back"):
+            prepare_worktree(
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
+                receipt_path=self.receipt,
+            )
         self.assertIn("created.txt", calls)
         self.assertFalse((self.target / "created.txt").exists())
         self.assertFalse((self.target / "shared" / "merged.txt").exists())
@@ -452,16 +411,15 @@ class OverlayModuleTests(unittest.TestCase):
         with mock.patch(
             "orchestrator_harness.workspace_overlay.mutation_replace",
             side_effect=failing_receipt,
+        ), self.assertRaisesRegex(
+            WorkspaceOverlayError, "receipt could not be published"
         ):
-            with self.assertRaisesRegex(
-                WorkspaceOverlayError, "receipt could not be published"
-            ):
-                prepare_worktree(
-                    super_cache=cache,
-                    target_worktree=self.target,
-                    role="subagent",
-                    receipt_path=self.receipt,
-                )
+            prepare_worktree(
+                super_cache=cache,
+                target_worktree=self.target,
+                role="subagent",
+                receipt_path=self.receipt,
+            )
         self.assertFalse((self.target / "created.txt").exists())
         self.assertFalse((self.target / "shared" / "merged.txt").exists())
         self.assertFalse((self.target / "notes.txt").exists())
@@ -759,17 +717,22 @@ class OverlayCliTests(unittest.TestCase):
         self.assertTrue(record["complete"])
         self.assertEqual(b"cli payload\n", (self.target / "file.txt").read_bytes())
 
-    def test_cli_workspace_rules_install(self) -> None:
-        parser = build_parser()
-        parsed = parser.parse_args(
-            ["workspace", "rules", "install", "--workspace", str(self.target)]
+    def test_workspace_rules_install_is_separate_and_idempotent(self) -> None:
+        (self.target / "AGENTS.md").write_text(
+            "# Existing project rules\n", encoding="utf-8"
         )
-        self.assertEqual("rules", parsed.workspace_action)
-        self.assertEqual("install", parsed.rules_action)
+        first = install_workspace_rules(workspace=self.target)
+        self.assertTrue(first["installed"])
+        self.assertFalse(first["idempotent"])
+        agents = (self.target / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertTrue(agents.startswith("# Existing project rules\n"))
+        self.assertIn("BEGIN ORCHESTRATOR-HARNESS QUICK RULES", agents)
+        self.assertTrue(install_workspace_rules(workspace=self.target)["idempotent"])
+
+    def test_cli_workspace_rules_install(self) -> None:
         from unittest import mock as _mock
 
         emitted: list[Any] = []
-
         with _mock.patch(
             "orchestrator_harness.cli._print_json", side_effect=emitted.append
         ):
@@ -817,8 +780,6 @@ if capture:
 sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "coding-thread"}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
-print(json.dumps({"type": "system", "subtype": "init", "session_id": "provider-session"}), flush=True)
-print(json.dumps({"type": "result", "subtype": "success", "session_id": "provider-session"}), flush=True)
 raise SystemExit(0)
 """
 
@@ -873,13 +834,6 @@ class OverlayLaneSeamTests(unittest.TestCase):
         source = self.root / "overlay-source"
         source.mkdir()
         (source / "instructions.md").write_bytes(b"# overlay instructions\n")
-        (source / ".agent").mkdir()
-        (source / ".agent" / "stop-verify.ps1").write_text(
-            "if ($env:AGENT_STOP_GATE_ENABLED -ne '1') { "
-            "Write-Output '{\"continue\":false,\"reason\":\"gate disabled\"}'; exit 0 }\n"
-            "Write-Output '{\"continue\":true,\"reason\":\"test pass\"}'\n",
-            encoding="utf-8",
-        )
         (source / "config").mkdir()
         (source / "config" / "settings.txt").write_bytes(b"overlay setting\n")
         ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
@@ -897,13 +851,6 @@ class OverlayLaneSeamTests(unittest.TestCase):
         source.mkdir()
         (source / "instructions.md").write_bytes(b"# overlay instructions\n")
         (source / "empty-marker.txt").write_bytes(b"")
-        (source / ".agent").mkdir()
-        (source / ".agent" / "stop-verify.ps1").write_text(
-            "if ($env:AGENT_STOP_GATE_ENABLED -ne '1') { "
-            "Write-Output '{\"continue\":false,\"reason\":\"gate disabled\"}'; exit 0 }\n"
-            "Write-Output '{\"continue\":true,\"reason\":\"test pass\"}'\n",
-            encoding="utf-8",
-        )
         ingest_super_cache(source_folder=source, harness_worktree=self.cache_root)
         receipt = self.workspace / "overlay-receipt.json"
         prepare_worktree(
@@ -914,7 +861,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
         )
         return receipt
 
-    def _invocation(self, receipt: Path | None) -> Path:
+    def _invocation(self, receipt: Path | None, *, doer: str = "subagent") -> Path:
         common = Path(_git(self.lane, "rev-parse", "--git-common-dir"))
         if not common.is_absolute():
             common = (self.lane / common).resolve()
@@ -929,6 +876,7 @@ class OverlayLaneSeamTests(unittest.TestCase):
             "event_log_path": str(self.runtime / "events" / "controller.jsonl"),
             "worker_invocation_id": "worker-overlay",
             "lane_id": "overlay-lane",
+            "doer": doer,
             "task": "overlay lane task",
             "phase": "implementation",
             "prompt_path": str(prompt),
@@ -1008,11 +956,16 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertEqual(2, controller.main([str(path)]))
         self.assertFalse(self.capture.exists(), "provider process must never start")
 
-    def test_prelaunch_verification_requires_receipt_before_process_start(self) -> None:
+    def test_prelaunch_allows_an_unprepared_lane_when_cache_is_not_requested(
+        self,
+    ) -> None:
         path = self._invocation(None)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
-        self.assertEqual(2, controller.main([str(path)]))
-        self.assertFalse(self.capture.exists(), "provider process must never start")
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue(self.capture.exists())
+        status = self._status()
+        self.assertIsNone(status.get("overlay_receipt"))
+        self.assertFalse(status.get("overlay_receipt_verified"))
 
     def test_prelaunch_verification_allows_completed_matching_receipt(self) -> None:
         receipt = self._prepare_overlay(role="subagent")
@@ -1024,53 +977,14 @@ class OverlayLaneSeamTests(unittest.TestCase):
         self.assertTrue(status.get("overlay_receipt_verified"))
         self.assertEqual(str(receipt), status.get("overlay_receipt"))
 
-    def _assert_prepared_providers(self, role: str) -> None:
-        receipt = self._prepare_overlay(role=role)
-        for provider_id in ("codex", "claude-code", "qwen-code"):
-            invocation = controller.load_invocation(self._invocation(receipt))
-            worker_id = f"worker-{role}-{provider_id}"
-            invocation = replace(
-                invocation,
-                doer=role,
-                provider_id=provider_id,
-                worker_invocation_id=worker_id,
-                lane_id=f"lane-{role}-{provider_id}",
-                status_path=self.workspace / f"{provider_id}.status.json",
-                jsonl_path=self.workspace / f"{provider_id}.jsonl",
-                stderr_path=self.workspace / f"{provider_id}.stderr.log",
-                last_message_path=self.workspace / f"{provider_id}.last-message.txt",
-                event_log=self.runtime / "events" / f"{provider_id}.jsonl",
-            )
-            self.assertEqual(0, controller.run(invocation), provider_id)
-            status = json.loads(invocation.status_path.read_text(encoding="utf-8"))
-            self.assertTrue(status.get("overlay_receipt_verified"), provider_id)
-            self.assertEqual("CODEX_EXITED", status.get("state"), provider_id)
-            prepared_stop = cast(dict[str, object], status["prepared_stop"])
-            self.assertIn("baseline", prepared_stop, provider_id)
-            self.assertIn("final", prepared_stop, provider_id)
-
-    def test_prepared_cache_runs_for_all_provider_subagents(self) -> None:
-        self._assert_prepared_providers("subagent")
-
-    def test_prepared_cache_runs_for_all_provider_orchestrators(self) -> None:
-        self._assert_prepared_providers("orchestrator")
-
-    def test_prepared_stop_block_fails_after_provider_cleanup(self) -> None:
-        receipt = self._prepare_overlay(role="subagent")
-        script = self.lane / ".agent" / "stop-verify.ps1"
-        script.write_text(
-            "if ($env:AGENT_STOP_GATE_BOUNDARY -eq 'final') { "
-            "Write-Output '{\"continue\":false,\"reason\":\"deliberate block\"}'; exit 0 }\n"
-            "Write-Output '{\"continue\":true,\"reason\":\"baseline pass\"}'\n",
-            encoding="utf-8",
-        )
-        path = self._invocation(receipt)
+    def test_prelaunch_allows_matching_orchestrator_receipt(self) -> None:
+        receipt = self._prepare_overlay(role="orchestrator")
+        path = self._invocation(receipt, doer="orchestrator")
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
-        self.assertEqual(1, controller.main([str(path)]))
-        self.assertTrue(self.capture.exists(), "provider started after the baseline pass")
+        self.assertEqual(0, controller.main([str(path)]))
+        self.assertTrue(self.capture.exists())
         status = self._status()
-        self.assertEqual("CONTROLLER_FAILED", status.get("state"))
-        self.assertIn("deliberate block", str(status.get("error")))
+        self.assertTrue(status.get("overlay_receipt_verified"))
 
     def test_retirement_restores_prepared_overlay_and_records_restoration(self) -> None:
         receipt = self._prepare_overlay(role="subagent")

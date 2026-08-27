@@ -11,16 +11,16 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .git_safety import (
     GitDeclaration,
@@ -30,9 +30,9 @@ from .git_safety import (
     inspect_repository,
     invalid_result_evidence,
     repository_status,
-    validate_task_result_repository,
     validate_coding_result,
     validate_findings,
+    validate_task_result_repository,
 )
 from .invocation import (
     CANONICAL_INVOCATION_SCHEMA,
@@ -42,14 +42,29 @@ from .invocation import (
     parse_canonical_invocation,
     validate_coding_v1_fields,
 )
+from .lane_lifecycle import (
+    LaneLifecycleError,
+    _admit_lifecycle_registry,
+    _LifecycleAdmission,
+    _update_lifecycle_registry,
+)
 from .models import ProcessInfo, iso_utc
-from .profile import ProfileError, RuntimeProfile, build_child_environment
+from .mutation import (
+    MutationConflict,
+    MutationUnsupported,
+    capture_target,
+)
+from .mutation import (
+    replace as mutation_replace,
+)
 from .process_supervisor import (
     CleanupResult,
     ProcessBoundary,
     ProcessBoundaryUnsupported,
     ProcessSupervisor,
 )
+from .processes import process_snapshot
+from .profile import ProfileError, RuntimeProfile, build_child_environment
 from .prompt_bundle import PromptBundle, PromptBundleError, bundle_from_record
 from .provider import (
     PROVIDER_OPERATION_NAMES,
@@ -64,30 +79,16 @@ from .provider import (
     claude_config_override_env,
     decide_resume_or_handoff,
     provider_adapter,
-    structured_handoff,
     provider_default_command,
+    structured_handoff,
     unsupported_operation_result,
 )
-from .processes import process_snapshot
 from .resource_locks import ResourceClaims, ResourceLockError
-from .workspace_overlay import verify_overlay_receipt
-from .stable_io import append_jsonl_record
-from .lane_lifecycle import (
-    LaneLifecycleError,
-    _LifecycleAdmission,
-    _admit_lifecycle_registry,
-    _update_lifecycle_registry,
-)
-from .mutation import (
-    MutationConflict,
-    MutationUnsupported,
-    capture_target,
-    replace as mutation_replace,
-)
 from .resume import (
     ResumeAdmissionError,
     require_resume_admission,
 )
+from .stable_io import append_jsonl_record
 from .task import (
     COMPLETION_REVIEW_FILENAME,
     ORCHESTRATOR_ACCEPTANCE_FILENAME,
@@ -97,6 +98,7 @@ from .task import (
     task_card_from_identity,
     validate_task_result,
 )
+from .workspace_overlay import verify_overlay_receipt
 
 
 class InvocationError(ValueError):
@@ -1446,7 +1448,7 @@ def _persisted_repository(
     }
     for key, value in expected.items():
         persisted = nested.get(key)
-        if key.endswith("dir") or key.endswith("root"):
+        if key.endswith(("dir", "root")):
             try:
                 if not isinstance(persisted, str) or Path(persisted).resolve(
                     strict=False
@@ -1645,68 +1647,37 @@ def _provider_launch_spec(
             ),
             provider_options=options,
             env_overrides=env_overrides,
-            prepared_worktree=invocation.overlay_receipt is not None,
         )
     except (TypeError, ValueError) as exc:
         raise InvocationError(f"provider launch settings are invalid: {exc}") from exc
 
 
-def _prepared_overlay_role(invocation: Invocation) -> str:
-    """Map a controller lane to the one cache receipt role it owns."""
+def _overlay_role(invocation: Invocation) -> str:
+    """Return the provider-neutral cache role owned by this lane."""
 
     return invocation.doer if invocation.doer in {"orchestrator", "subagent"} else "subagent"
 
 
-def _verify_prepared_overlay(invocation: Invocation) -> dict[str, Any]:
-    """Require a completed overlay receipt before any provider launch work."""
+def _verify_declared_overlay(invocation: Invocation) -> dict[str, Any]:
+    """Verify an optional supplied receipt before any provider construction."""
 
     if invocation.overlay_receipt is None:
-        raise InvocationError("a completed overlay receipt is required before provider launch")
+        return {
+            "present": False,
+            "verified": False,
+            "reason": "no overlay was requested",
+        }
     verification = verify_overlay_receipt(
         receipt_path=invocation.overlay_receipt,
         expected_target_worktree_id=invocation.run_root,
-        role=_prepared_overlay_role(invocation),
+        role=_overlay_role(invocation),
     )
     if not verification.get("verified"):
         raise InvocationError(
-            "overlay receipt is not completed for this prepared worktree: "
+            "supplied overlay receipt is not completed for this worktree and role: "
             + str(verification.get("reason"))
         )
     return verification
-
-
-def _run_prepared_stop_hook(invocation: Invocation, *, boundary: str) -> dict[str, Any]:
-    """Run the cache-provided finite verifier and reject its blocking result."""
-
-    script = invocation.run_root / ".agent" / "stop-verify.ps1"
-    shell = shutil.which("pwsh") or shutil.which("powershell")
-    if not script.is_file() or shell is None:
-        raise InvocationError("prepared worktree is missing its executable Stop verifier")
-    environment = os.environ.copy()
-    environment["AGENT_STOP_GATE_ENABLED"] = "1"
-    environment["AGENT_STOP_GATE_BOUNDARY"] = boundary
-    try:
-        completed = subprocess.run(
-            [shell, "-NoProfile", "-NonInteractive", "-File", str(script)],
-            cwd=invocation.run_root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise InvocationError(f"prepared Stop verifier could not run: {exc}") from exc
-    output = completed.stdout.strip().splitlines()
-    try:
-        result = json.loads(output[-1]) if output else None
-    except json.JSONDecodeError as exc:
-        raise InvocationError("prepared Stop verifier did not emit JSON") from exc
-    if completed.returncode != 0 or not isinstance(result, dict):
-        raise InvocationError("prepared Stop verifier failed")
-    if result.get("continue") is not True:
-        raise InvocationError(str(result.get("reason") or "prepared Stop verifier blocked"))
-    return result
 
 
 def _requested_provider_operations(
@@ -2188,8 +2159,7 @@ def run(invocation: Invocation) -> int:
             raise InvocationError(
                 "coding worktree HEAD changed during pre-launch validation"
             )
-    overlay_verification = _verify_prepared_overlay(invocation)
-    prepared_stop_baseline = _run_prepared_stop_hook(invocation, boundary="baseline")
+    overlay_verification = _verify_declared_overlay(invocation)
     controller = _identity(os.getpid())
     if provider_resume_handoff is not None:
         # A declared handoff never fabricates provider work: no adapter
@@ -2308,9 +2278,10 @@ def run(invocation: Invocation) -> int:
         "held_resource_claims": [],
         "waiting_resource_claim": None,
         "resource_claim_findings": [],
-        "overlay_receipt": str(invocation.overlay_receipt),
+        "overlay_receipt": str(invocation.overlay_receipt)
+        if invocation.overlay_receipt is not None
+        else None,
         "overlay_receipt_verified": bool(overlay_verification.get("verified")),
-        "prepared_stop": {"baseline": prepared_stop_baseline},
         "jsonl_path": str(invocation.jsonl_path),
         "stderr_path": str(invocation.stderr_path),
         "last_message_path": str(invocation.last_message_path),
@@ -3253,9 +3224,6 @@ def run(invocation: Invocation) -> int:
                 ),
             )
             return 1
-        state["prepared_stop"]["final"] = _run_prepared_stop_hook(
-            invocation, boundary="final"
-        )
         state.update(
             {
                 "state": exited_state,
