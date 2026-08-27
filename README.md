@@ -102,14 +102,25 @@ Use `--host claude` or `--host qwen` for those providers. Adapter-owned hooks ar
 super-cache and are installed, checked, upgraded, and removed only through the corresponding
 adapter command.
 
-Installing the Codex adapter does not bind its hooks to a manager queue. At manager startup, after
-creating the real `ManagerEventRouter`, call `activate_codex_binding(project_root, router)`. The
-installed PostToolUse and Stop hooks then deliver content-free manager notices at their supported
-safe boundaries. Start a fresh provider session after adapter installation so project configuration
-is reloaded. Do not assume this proves delivery for `codex exec`: current live testing with Codex
-CLI 0.149.0 observed no project-hook invocation in headless exec sessions, including with explicit
-hook-trust bypass. Use installed-hook self-tests only as deterministic adapter evidence until a
-supported headless hook channel or controller-native delivery path is implemented and proven live.
+Installing the Codex adapter does not bind its hooks to a manager queue. At manager startup, create
+the real `ManagerEventRouter`, then bind the prepared lane to that exact registered queue before
+launching the provider:
+
+```powershell
+python -m orchestrator_harness adapter bind --host codex --project-root $lane --queue-root $managerQueue
+```
+
+`adapter bind` never creates a synthetic queue or guesses manager identity. It is repeatable for
+the same registration and fails on a missing, stale, or cross-bound queue. Library callers may use
+`activate_codex_binding(project_root, router)` directly instead. The installed PostToolUse and Stop
+hooks then deliver content-free manager notices at their supported safe boundaries. Start a fresh
+provider session after adapter installation or binding so project configuration is reloaded.
+
+The firmware-v2 launcher flags and this binding sequence were live-proven on Windows with Codex
+CLI 0.150.1: a `codex exec` lane launched through `operator_launch` and `lane_controller` ran its
+PostToolUse command and appended a delivery record for a real pending manager event. See
+[`docs/codex-headless-hook-proof.md`](docs/codex-headless-hook-proof.md) for the reproducible proof
+contract and limits.
 
 ## Public release surface
 

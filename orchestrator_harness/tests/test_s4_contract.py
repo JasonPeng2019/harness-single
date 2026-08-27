@@ -12,15 +12,17 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as lane_controller
-from orchestrator_harness import codex_adapter, mutation
+from orchestrator_harness import cli, codex_adapter, mutation
 from orchestrator_harness.codex_adapter import (
     CodexAdapter,
     CodexAdapterError,
     SyntheticCodexTransport,
     activate_codex_binding,
+    bind_codex_project_from_queue,
     check_codex_adapter,
     create_codex_adapter,
     install_codex_adapter,
+    run_codex_hook,
     select_host_adapter,
     synthetic_wake_self_test,
     uninstall_codex_adapter,
@@ -532,6 +534,48 @@ class S4ContractTests(unittest.TestCase):
             self.assertEqual("PostToolUse", evidence["transport_calls"][0]["method"])
             self.assertEqual(b'{"unrelated":true}\n', unrelated.read_bytes())
             self.assertEqual("owned", check_codex_adapter(project)["ownership"])
+
+    def test_S4_CODEX_MANAGER_BIND_COMMAND_001(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            (project / ".codex").mkdir()
+            install_codex_adapter(project)
+            router = self._router(root / "manager", session="bind-command")
+
+            with patch.object(cli, "_print_json") as report:
+                self.assertEqual(
+                    0,
+                    cli.main(
+                        [
+                            "adapter",
+                            "bind",
+                            "--host",
+                            "codex",
+                            "--project-root",
+                            str(project),
+                            "--queue-root",
+                            str(router.root),
+                        ]
+                    ),
+                )
+
+            evidence = report.call_args.args[0]
+            self.assertEqual(str(router.root), evidence["binding"]["queue_root"])
+            self.assertEqual(
+                str(project.resolve()), evidence["binding"]["project_root"]
+            )
+            self.assertTrue(
+                (project / ".codex" / "orchestrator-harness-binding.json").is_file()
+            )
+            repeated = bind_codex_project_from_queue(project, router.root)
+            self.assertEqual(evidence["binding"], repeated["binding"])
+
+            router.admit(self._event("bound-live-route"))
+            delivered = run_codex_hook("post_tool_use", project_root=project)
+            self.assertEqual("DELIVERED", delivered["receipt"]["outcome"])
+            self.assertFalse(delivered["acknowledged_by_hook"])
 
     def test_S4_CODEX_INSTALL_LIFECYCLE_001(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

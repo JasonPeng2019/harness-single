@@ -26,6 +26,7 @@ from .claude_installer import (
 )
 from .codex_adapter import (
     CodexAdapterError,
+    bind_codex_project_from_queue,
     check_codex_adapter,
     install_codex_adapter,
     run_codex_hook,
@@ -298,12 +299,15 @@ def build_parser() -> argparse.ArgumentParser:
         "adapter", help="install or inspect a project-local host adapter"
     )
     adapter_modes = adapter.add_subparsers(dest="adapter_action", required=True)
-    for action in ("install", "check", "upgrade", "uninstall", "self-test"):
+    for action in ("install", "check", "upgrade", "uninstall", "self-test", "bind"):
         command = adapter_modes.add_parser(action)
         command.add_argument("--host", default="codex")
         command.add_argument("--project-root", required=True, type=Path)
         if action == "self-test":
             command.add_argument("--queue-root", type=Path)
+        if action == "bind":
+            command.add_argument("--queue-root", required=True, type=Path)
+            command.add_argument("--coordinator-root", type=Path)
     hook = adapter_modes.add_parser("hook")
     hook.add_argument("--host", default="codex")
     hook.add_argument("--project-root", required=True, type=Path)
@@ -397,6 +401,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ROOT adjudication is manager-only and unavailable through the public CLI"
             )
         if args.command == "adapter":
+            if args.adapter_action == "bind" and args.host != "codex":
+                raise ValueError("adapter bind currently supports only host=codex")
             if args.host == "codex":
                 if args.adapter_action == "install":
                     _print_json(install_codex_adapter(args.project_root))
@@ -410,6 +416,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _print_json(
                         synthetic_wake_self_test(
                             args.project_root, queue_root=args.queue_root
+                        )
+                    )
+                elif args.adapter_action == "bind":
+                    _print_json(
+                        bind_codex_project_from_queue(
+                            args.project_root,
+                            args.queue_root,
+                            coordinator_root=args.coordinator_root,
                         )
                     )
                 else:

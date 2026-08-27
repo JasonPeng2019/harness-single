@@ -1805,6 +1805,30 @@ def activate_codex_binding(
     }
 
 
+def bind_codex_project_from_queue(
+    project_root: str | Path,
+    queue_root: str | Path,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Bind a prepared Codex project to one already-registered manager queue.
+
+    Manager startup owns the queue and its identity.  This helper only restores
+    that exact registration before persisting the project's matching hook
+    binding; it never creates a synthetic queue or guesses manager coordinates.
+    """
+
+    queue = _external_directory(queue_root, name="manager queue root")
+    registration = _read_external_json(
+        queue / "REGISTRATION.json", name="manager registration"
+    )
+    router = ManagerEventRouter(queue, binding=registration)
+    router.validate_binding(router.registration)
+    return activate_codex_binding(
+        project_root, router, coordinator_root=coordinator_root
+    )
+
+
 bind_codex_project = activate_codex_binding
 
 
@@ -2204,6 +2228,7 @@ __all__ = [
     "RecordingCodexTransport",
     "SyntheticCodexTransport",
     "activate_codex_binding",
+    "bind_codex_project_from_queue",
     "bind_codex_project",
     "check_codex_adapter",
     "codex_profile",
