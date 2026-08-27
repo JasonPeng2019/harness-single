@@ -602,17 +602,19 @@ def run_installed_qwen_hook(
         router=router, adapter=FutureHostFixture("qwen-bootstrap"),
         state_root=Path(binding["coordinator_root"]), registration_generation=binding["registration_generation"],
     )
-    adapter = QwenAdapter(transport, coordinator)
+    QwenAdapter(transport, coordinator)
     coordinator.restore()
     notice = coordinator.notice_for_wake()
     receipt: DeliveryReceipt | None = None
     stop_decision: dict[str, Any] | None = None
     if boundary == "post_tool_use":
         if notice is not None:
-            receipt = adapter.deliver_notice(notice, boundary="post_tool_use")
+            receipt = coordinator.deliver_at_boundary(
+                notice, boundary="post_tool_use"
+            )
     elif boundary == "notification":
         if notice is not None:
-            receipt = adapter.deliver_notice(notice, boundary="idle")
+            receipt = coordinator.deliver_at_boundary(notice, boundary="idle")
     else:
         stop_decision = coordinator.notification_stop_request().as_record()
     return {"schema": "orchestrator-qwen-installed-hook/v1", "boundary": boundary, "project_root": str(project), "notice": notice.as_record() if notice is not None else None, "receipt": receipt.as_record() if receipt is not None else None, "stop_decision": stop_decision, "acknowledged_by_hook": False, "transport_calls": list(transport.calls)}

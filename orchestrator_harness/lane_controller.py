@@ -182,6 +182,27 @@ def apply_provider_env_overrides(
     return merged
 
 
+def apply_native_hook_pythonpath(
+    child_env: dict[str, str] | None,
+) -> dict[str, str]:
+    """Expose this installed harness package to native hook subprocesses."""
+
+    merged = dict(os.environ) if child_env is None else dict(child_env)
+    import_root = Path(__file__).resolve().parent.parent
+    package_root = import_root / "orchestrator_harness"
+    if not (package_root / "__init__.py").is_file():
+        raise InvocationError(
+            f"native hook harness package root is unavailable: {package_root}"
+        )
+    prior_keys = [key for key in merged if key.upper() == "PYTHONPATH"]
+    prior_values = [merged.pop(key) for key in prior_keys]
+    paths = [str(import_root)]
+    for prior in prior_values:
+        paths.extend(value for value in prior.split(os.pathsep) if value)
+    merged["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
+    return merged
+
+
 def _atomic_json(
     path: Path, value: dict[str, Any], *, status_secret: str | None = None
 ) -> None:
@@ -1548,9 +1569,17 @@ def _provider_launch_spec(
     options = dict(invocation.provider_options)
     try:
         env_overrides: dict[str, str] = {}
+        config_overrides = list(invocation.config_overrides)
         if invocation.provider_id == "claude-code":
             for override in invocation.config_overrides:
                 env_overrides.update(claude_config_override_env(override))
+        if (
+            invocation.provider_id == "codex"
+            and invocation.overlay_receipt is not None
+        ):
+            from .codex_adapter import codex_session_hook_overrides
+
+            config_overrides.extend(codex_session_hook_overrides())
         return ProviderLaunchSpec(
             action=invocation.action,
             command=tuple(invocation.codex_command),
@@ -1560,7 +1589,10 @@ def _provider_launch_spec(
             session_id=session_id,
             run_root=invocation.run_root,
             last_message_path=invocation.last_message_path,
-            config_overrides=tuple(invocation.config_overrides),
+            trusted_project_root=(
+                invocation.run_root if invocation.overlay_receipt is not None else None
+            ),
+            config_overrides=tuple(config_overrides),
             sandbox=invocation.sandbox,
             approval_policy=invocation.approval_policy,
             worker_invocation_id=invocation.worker_invocation_id,
@@ -2829,6 +2861,11 @@ def run(invocation: Invocation) -> int:
                 child_env = apply_provider_env_overrides(
                     child_env, launch_spec.env_overrides
                 )
+            if (
+                overlay_verification.get("verified") is True
+                and invocation.provider_id in {"codex", "claude-code", "qwen-code"}
+            ):
+                child_env = apply_native_hook_pythonpath(child_env)
             child_env = _without_root_secret(child_env)
             boundary = ProcessBoundary.prepare()
             process = subprocess.Popen(

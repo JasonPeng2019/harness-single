@@ -1143,6 +1143,8 @@ def _merge_hooks(
                 if not isinstance(item, dict):
                     continue
                 legacy_id = item.get("id")
+                if not isinstance(legacy_id, str):
+                    continue
                 expected_event = legacy_event_by_id.get(legacy_id)
                 if expected_event is None:
                     continue
@@ -2151,6 +2153,40 @@ def run_codex_hook(
     return run_installed_codex_hook(project_root, boundary=boundary, payload=payload)
 
 
+def _toml_inline(value: Any) -> str:
+    """Serialize the closed managed-hook subset for a Codex ``-c`` override."""
+
+    if isinstance(value, str):
+        if "'" in value:
+            raise CodexAdapterError(
+                "managed Codex hook strings containing apostrophes are unsupported"
+            )
+        return f"'{value}'"
+    if isinstance(value, list):
+        return "[" + ",".join(_toml_inline(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        return "{" + ",".join(
+            f"{key}={_toml_inline(item)}" for key, item in value.items()
+        ) + "}"
+    raise CodexAdapterError("managed Codex hook values are not TOML-serializable")
+
+
+def codex_session_hook_overrides() -> tuple[str, ...]:
+    """Return native session hooks derived from the verified installed fragment.
+
+    Codex 0.149 and later intentionally resolve hook declarations for linked Git
+    worktrees from the primary checkout. Prepared lanes therefore repeat the exact
+    owned declarations as session flags while keeping scripts and bindings local to
+    the verified lane worktree.
+    """
+
+    fragment = _managed_hook_fragment()
+    return tuple(
+        f"hooks.{event_name}={_toml_inline(fragment[event_name])}"
+        for event_name in _HOOK_EVENT_NAMES
+    )
+
+
 __all__ = [
     "CODEX_ADAPTER_SCHEMA",
     "CODEX_ADAPTER_VERSION",
@@ -2158,6 +2194,7 @@ __all__ = [
     "CODEX_BINDING_RELATIVE",
     "CODEX_INSTALL_MANIFEST_SCHEMA",
     "CODEX_PACKAGE_REVISION",
+    "codex_session_hook_overrides",
     "CodexAdapter",
     "CodexAdapterError",
     "CodexInstallConflict",

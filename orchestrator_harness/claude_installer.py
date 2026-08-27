@@ -43,7 +43,7 @@ from .stable_io import canonical_json
 
 CLAUDE_INSTALL_MANIFEST_SCHEMA = "orchestrator-claude-install/v1"
 CLAUDE_ADAPTER_VERSION = "claude-v1"
-CLAUDE_PACKAGE_REVISION = "claude-assets-v1"
+CLAUDE_PACKAGE_REVISION = "claude-assets-v2"
 CLAUDE_INSTALL_MANIFEST_RELATIVE = Path(".claude") / "orchestrator-harness-adapter.json"
 CLAUDE_SETTINGS_RELATIVE = Path(".claude") / "settings.json"
 CLAUDE_BINDING_RELATIVE = Path(".claude") / "orchestrator-harness-binding.json"
@@ -928,14 +928,16 @@ def run_installed_claude_hook(
         state_root=Path(binding["coordinator_root"]),
         registration_generation=binding["registration_generation"],
     )
-    adapter = ClaudeAdapter(transport, coordinator)
+    ClaudeAdapter(transport, coordinator)
     coordinator.restore()
     notice = coordinator.notice_for_wake()
     receipt: DeliveryReceipt | None = None
     stop_decision: dict[str, Any] | None = None
     if boundary == "post_tool_use":
         if notice is not None:
-            receipt = adapter.deliver_notice(notice, boundary="post_tool_use")
+            receipt = coordinator.deliver_at_boundary(
+                notice, boundary="post_tool_use"
+            )
     else:
         if hasattr(coordinator, "notification_stop_request"):
             stop_decision = coordinator.notification_stop_request().as_record()

@@ -1,0 +1,18 @@
+{
+  "acknowledged_event_ids": [],
+  "binding_digest": "6faa513024c33d7d5914944c7b0979449e9809ce12598a1d7d7d51a3cea0f347",
+  "events": [],
+  "manager_invocation_id": null,
+  "manager_session_id": "patch-live-hook-session",
+  "manager_thread_id": "patch-live-hook-thread",
+  "next_admission_seq": 1,
+  "next_journal_seq": 1,
+  "observed": {},
+  "queue_id": "patch-live-hook-queue",
+  "registration_generation": 1,
+  "registration_id": "patch-live-hook-registration",
+  "run_id": "patch-live-hook-run",
+  "schema": "orchestrator-manager-queue-state/v1",
+  "superseded": {},
+  "wake_revision": 0
+}

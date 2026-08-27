@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +14,8 @@ from unittest.mock import patch
 
 import orchestrator_harness.lane_controller as controller
 from orchestrator_harness import cli
+from orchestrator_harness import codex_adapter
+from orchestrator_harness.codex_adapter import codex_session_hook_overrides
 from orchestrator_harness.lane_lifecycle import lifecycle_registry_path
 from orchestrator_harness.tests.support import (
     TemporaryGitRepository,
@@ -29,6 +32,11 @@ secret_capture = os.environ.get("CODING_CONTROLLER_SECRET_CAPTURE")
 if secret_capture:
     open(secret_capture, "w", encoding="utf-8").write(
         os.environ.get("ORCHESTRATOR_ROOT_ADJUDICATION_SECRET", "<missing>")
+    )
+env_capture = os.environ.get("CODING_CONTROLLER_ENV_CAPTURE")
+if env_capture:
+    open(env_capture, "w", encoding="utf-8").write(
+        os.environ.get("PYTHONPATH", "<missing>")
     )
 sys.stdin.read()
 if os.environ.get("CODING_CONTROLLER_NO_THREAD") != "1":
@@ -60,6 +68,7 @@ class CodingLaneControllerTests(unittest.TestCase):
             "CODING_CONTROLLER_NO_THREAD",
             "CODING_CONTROLLER_THREAD",
             "CODING_CONTROLLER_EXIT",
+            "CODING_CONTROLLER_ENV_CAPTURE",
             "CODING_CONTROLLER_SECRET_CAPTURE",
             controller.ROOT_ADJUDICATION_SECRET_ENV,
         ):
@@ -185,6 +194,8 @@ class CodingLaneControllerTests(unittest.TestCase):
     def test_start_records_identity_events_and_configured_codex_argv(self) -> None:
         path, _ = self.invocation(with_overlay=True)
         os.environ["CODING_CONTROLLER_CAPTURE"] = str(self.capture)
+        env_capture = self.root / "child-pythonpath.txt"
+        os.environ["CODING_CONTROLLER_ENV_CAPTURE"] = str(env_capture)
         self.assertEqual(0, controller.main([str(path)]))
         status = json.loads(
             (self.workspace / "controller.status.json").read_text(encoding="utf-8")
@@ -199,12 +210,24 @@ class CodingLaneControllerTests(unittest.TestCase):
         argv = json.loads(self.capture.read_text(encoding="utf-8"))
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertNotIn("--ignore-user-config", argv)
+        self.assertIn("--dangerously-bypass-hook-trust", argv)
+        self.assertIn("features.hooks=true", argv)
+        self.assertIn(
+            f'projects.{json.dumps(str(self.run_root))}.trust_level="trusted"',
+            argv,
+        )
         self.assertNotIn("--sandbox", argv)
         self.assertIn('approval_policy="never"', argv)
         self.assertIn("gpt-5.6-codex", argv)
         self.assertIn('model_reasoning_effort="high"', argv)
         self.assertIn('service_tier="priority"', argv)
         self.assertIn("feature_flag=true", argv)
+        for override in codex_session_hook_overrides():
+            self.assertIn(override, argv)
+        self.assertEqual(
+            Path(controller.__file__).resolve().parent.parent,
+            Path(env_capture.read_text(encoding="utf-8").split(os.pathsep)[0]),
+        )
         events = [
             json.loads(line)
             for line in (self.runtime_root / "events" / "controller.jsonl")
@@ -217,6 +240,18 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertTrue(
             all(event["worker_invocation_id"] == "worker-1" for event in events)
         )
+
+    def test_unprepared_codex_launch_is_not_hook_trusted(self) -> None:
+        path, _ = self.invocation(with_overlay=False)
+        invocation = controller.load_invocation(path)
+        spec = controller._provider_launch_spec(invocation, None)
+        self.assertIsNone(spec.trusted_project_root)
+        for override in codex_session_hook_overrides():
+            self.assertNotIn(override, spec.config_overrides)
+
+    def test_codex_session_hooks_round_trip_owned_fragment(self) -> None:
+        parsed = tomllib.loads("\n".join(codex_session_hook_overrides()))
+        self.assertEqual(codex_adapter._managed_hook_fragment(), parsed["hooks"])
 
     def test_start_publishes_fixed_controller_lifecycle_registry(self) -> None:
         path, _ = self.invocation(with_overlay=True)

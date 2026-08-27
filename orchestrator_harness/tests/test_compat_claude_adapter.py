@@ -25,6 +25,7 @@ from orchestrator_harness.claude_adapter import (
 from orchestrator_harness.claude_installer import (
     check_claude_adapter,
     install_claude_adapter,
+    run_installed_claude_hook,
     uninstall_claude_adapter,
     upgrade_claude_adapter,
 )
@@ -373,6 +374,50 @@ class ClaudeAdapterCompatTests(unittest.TestCase):
                         ),
                         f"no {transport_method} transport call for {boundary}",
                     )
+
+    def test_installed_post_tool_hook_records_durable_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            install_claude_adapter(project)
+            router = self._router(root / "manager")
+            coordinator_root = root / "coordinator"
+            coordinator = create_claude_adapter(
+                router,
+                state_root=coordinator_root,
+                registration_generation=router.registration_generation,
+            ).coordinator
+            coordinator.restore()
+            binding = router.binding
+            (project / ".claude" / "orchestrator-harness-binding.json").write_text(
+                json.dumps(
+                    {
+                        "project_root": str(project.resolve()),
+                        "queue_root": str(router.root),
+                        "coordinator_root": str(coordinator_root),
+                        "run_id": binding.run_id,
+                        "queue_id": binding.queue_id,
+                        "manager_session_id": binding.manager_session_id,
+                        "manager_thread_id": binding.manager_thread_id,
+                        "registration_id": binding.registration_id,
+                        "registration_generation": router.registration_generation,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            router.admit(self._event("installed-post-tool"))
+            result = run_installed_claude_hook(
+                project, boundary="post_tool_use"
+            )
+            self.assertEqual("DELIVERED", result["receipt"]["outcome"])
+            self.assertEqual("DELIVERED", router.read_deliveries()[0]["outcome"])
+            state = json.loads(
+                (coordinator_root / "DELIVERY_COORDINATOR.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(1, state["attempt_count"])
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@ class ProviderLaunchSpec:
     session_id: str | None
     run_root: Path
     last_message_path: Path
+    trusted_project_root: Path | None = None
     config_overrides: tuple[str, ...] = ()
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
@@ -479,6 +480,10 @@ class CodexProviderAdapter(BaseProviderAdapter):
 
     provider_id = "codex"
 
+    @staticmethod
+    def _trusted_project_override(project_root: Path) -> str:
+        return f'projects.{json.dumps(str(project_root))}.trust_level="trusted"'
+
     def build_argv(self, spec: ProviderLaunchSpec) -> list[str]:
         if spec.action not in {"start", "resume"}:
             raise ProviderAdapterError("Codex action must be start or resume")
@@ -505,6 +510,17 @@ class CodexProviderAdapter(BaseProviderAdapter):
             argv.extend(["-c", 'approvals_reviewer="user"'])
         for override in spec.config_overrides:
             argv.extend(["-c", override])
+        if spec.trusted_project_root is not None:
+            if "--dangerously-bypass-hook-trust" not in spec.command:
+                argv.append("--dangerously-bypass-hook-trust")
+            argv.extend(
+                [
+                    "-c",
+                    "features.hooks=true",
+                    "-c",
+                    self._trusted_project_override(spec.trusted_project_root),
+                ]
+            )
         argv.extend(["--json", "--output-last-message", str(spec.last_message_path)])
         if spec.action == "start":
             argv.extend(["--cd", str(spec.run_root)])

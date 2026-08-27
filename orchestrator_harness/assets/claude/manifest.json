@@ -15,6 +15,6 @@
       "sha256": "074e9203e515b0236ff9289e88fae7579059acb99056674ab3fed457b474d947"
     }
   ],
-  "package_revision": "claude-assets-v1",
+  "package_revision": "claude-assets-v2",
   "schema": "orchestrator-claude-adapter/v1"
 }
