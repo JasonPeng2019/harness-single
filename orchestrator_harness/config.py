@@ -15,10 +15,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .core import read_json, require_schema, sha256_hex
+from .core import read_json, sha256_hex
 
-CONFIG_SCHEMA = "harness-config/v1"
-MANIFEST_SCHEMA = "resource-manifest/v1"
+CONFIG_SCHEMA = "harness-config/v1"  # logical schema name; never a literal field
+MANIFEST_SCHEMA = "resource-manifest/v1"  # logical schema name; never a literal field
 RUNTIME_DIR_NAME = ".harness-runtime"
 PROFILE_MANAGED = "managed"
 PROFILE_PLAIN = "plain"
@@ -260,7 +260,13 @@ def _load_legacy_config(
 
 
 def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
-    """Read and validate the stored harness-config.json."""
+    """Read and validate the stored harness-config.json.
+
+    The stored record is the closed two-key ``harness-config/v1`` shape:
+    required absolute ``root_workspace`` and optional ``managed_coordination``
+    (``enabled`` or ``disabled``, default ``enabled``).  The record carries no
+    literal ``schema`` field and no other keys are legal.
+    """
     root = Path(harness_root).absolute()
     path = root / "harness-config.json"
     if not path.is_file():
@@ -269,13 +275,22 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"harness config unreadable: {path}: {exc}") from exc
-    require_schema(record, CONFIG_SCHEMA, path)
+    unknown = sorted(set(record) - {"root_workspace", "managed_coordination"})
+    if unknown:
+        raise ConfigError(
+            f"harness config unknown key {unknown[0]!r} "
+            f"(closed keys: root_workspace, managed_coordination): {path}"
+        )
     root_workspace = record.get("root_workspace")
     if not isinstance(root_workspace, str) or not root_workspace:
         raise ConfigError(f"harness config root_workspace missing: {path}")
     workspace = Path(root_workspace).expanduser()
     if not workspace.is_absolute():
         raise ConfigError(f"harness config root_workspace must be absolute: {path}")
+    if workspace.is_symlink():
+        raise ConfigError(
+            f"harness config root_workspace must not be a symbolic link: {path}"
+        )
     managed = record.get("managed_coordination", "enabled")
     if managed not in ("enabled", "disabled"):
         raise ConfigError(
@@ -308,7 +323,13 @@ def load_config(
 
 
 def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceManifest:
-    """Read and validate ``<harness-root>/resource-manifest.json``."""
+    """Read and validate ``<harness-root>/resource-manifest.json``.
+
+    The stored record is the closed ``resource-manifest/v1`` shape: a single
+    ``resources`` list.  Every nonempty entry is a closed object with a
+    nonempty literal ``id`` and ``exclusive: true``; duplicate IDs and unknown
+    fields are invalid.  The record carries no literal ``schema`` field.
+    """
     root = Path(harness_root).absolute()
     path = root / "resource-manifest.json"
     if not path.is_file():
@@ -317,7 +338,11 @@ def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceMani
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"resource manifest unreadable: {path}: {exc}") from exc
-    require_schema(record, MANIFEST_SCHEMA, path)
+    unknown = sorted(set(record) - {"resources"})
+    if unknown:
+        raise ConfigError(
+            f"resource manifest unknown key {unknown[0]!r} (closed keys: resources): {path}"
+        )
     resources = record.get("resources")
     if not isinstance(resources, list):
         raise ConfigError(f"resource manifest resources must be a list: {path}")
@@ -326,15 +351,23 @@ def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceMani
     for item in resources:
         if not isinstance(item, dict):
             raise ConfigError(f"resource manifest entry must be an object: {path}")
+        entry_unknown = sorted(set(item) - {"id", "exclusive"})
+        if entry_unknown:
+            raise ConfigError(
+                f"resource manifest entry unknown key {entry_unknown[0]!r} "
+                f"(closed keys: id, exclusive): {path}"
+            )
         resource_id = item.get("id")
         if not isinstance(resource_id, str) or not resource_id:
             raise ConfigError(f"resource manifest entry id missing: {path}")
         if resource_id in seen:
             raise ConfigError(f"resource manifest duplicate id: {resource_id}")
         seen.add(resource_id)
-        exclusive = item.get("exclusive", True)
-        if not isinstance(exclusive, bool):
-            raise ConfigError(f"resource manifest exclusive must be a bool: {resource_id}")
+        exclusive = item.get("exclusive")
+        if exclusive is not True:
+            raise ConfigError(
+                f"resource manifest entry exclusive must be true: {resource_id}"
+            )
         validated.append({"id": resource_id, "exclusive": exclusive})
     return ResourceManifest(tuple(validated))
 

@@ -240,7 +240,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         harness_root = find_harness_root()
         config = load_config(harness_root)
         manifest = load_resource_manifest(harness_root)
-    except ConfigError as exc:
+    except (ConfigError, OSError, ValueError) as exc:
         return {"ok": False, "code": SETUP_CONFIG_INVALID, "summary": str(exc),
                 "evidence_paths": [], "next_action": "fix harness-config.json and resource-manifest.json, then re-run setup"}
 
