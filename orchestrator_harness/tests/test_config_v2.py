@@ -147,7 +147,9 @@ class HarnessV2RootConfigTests(unittest.TestCase):
 
     def test_manifest_empty_resources_is_valid(self) -> None:
         root = self._root()
-        self._write_manifest(root, {"resources": []})
+        self._write_manifest(
+            root, {"schema": "resource-manifest/v1", "resources": []}
+        )
         manifest = load_resource_manifest(root)
         self.assertEqual((), manifest.resources)
         self.assertEqual((), manifest.resource_ids())
@@ -156,37 +158,60 @@ class HarnessV2RootConfigTests(unittest.TestCase):
         root = self._root()
         self._write_manifest(
             root,
-            {"resources": [{"id": "gpu-0", "exclusive": True}]},
+            {
+                "schema": "resource-manifest/v1",
+                "resources": [{"id": "gpu-0", "exclusive": True}],
+            },
         )
         manifest = load_resource_manifest(root)
         self.assertEqual(({"id": "gpu-0", "exclusive": True},), manifest.resources)
         self.assertTrue(manifest.is_declared("gpu-0"))
         self.assertFalse(manifest.is_declared("missing"))
 
-    def test_manifest_rejects_literal_schema_field(self) -> None:
+    def test_manifest_rejects_missing_schema(self) -> None:
         root = self._root()
-        self._write_manifest(
-            root,
-            {"resources": [], "schema": "resource-manifest/v1"},
-        )
+        self._write_manifest(root, {"resources": []})
         with self.assertRaises(ConfigError):
             load_resource_manifest(root)
 
+    def test_manifest_rejects_wrong_schema_value(self) -> None:
+        root = self._root()
+        for value in ("resource-manifest/v2", "harness-config/v1", 1, None):
+            self._write_manifest(
+                root,
+                {"schema": value, "resources": []},
+            )
+            with self.assertRaises(ConfigError):
+                load_resource_manifest(root)
+
     def test_manifest_rejects_unknown_root_key(self) -> None:
         root = self._root()
-        self._write_manifest(root, {"resources": [], "owner": "root"})
+        self._write_manifest(
+            root,
+            {
+                "schema": "resource-manifest/v1",
+                "resources": [],
+                "owner": "root",
+            },
+        )
         with self.assertRaises(ConfigError):
             load_resource_manifest(root)
 
     def test_manifest_rejects_non_list_resources(self) -> None:
         root = self._root()
-        self._write_manifest(root, {"resources": {"id": "gpu-0"}})
+        self._write_manifest(
+            root,
+            {"schema": "resource-manifest/v1", "resources": {"id": "gpu-0"}},
+        )
         with self.assertRaises(ConfigError):
             load_resource_manifest(root)
 
     def test_manifest_rejects_non_object_entry(self) -> None:
         root = self._root()
-        self._write_manifest(root, {"resources": ["gpu-0"]})
+        self._write_manifest(
+            root,
+            {"schema": "resource-manifest/v1", "resources": ["gpu-0"]},
+        )
         with self.assertRaises(ConfigError):
             load_resource_manifest(root)
 
@@ -194,7 +219,10 @@ class HarnessV2RootConfigTests(unittest.TestCase):
         root = self._root()
         self._write_manifest(
             root,
-            {"resources": [{"id": "gpu-0", "exclusive": True, "owner": "x"}]},
+            {
+                "schema": "resource-manifest/v1",
+                "resources": [{"id": "gpu-0", "exclusive": True, "owner": "x"}],
+            },
         )
         with self.assertRaises(ConfigError):
             load_resource_manifest(root)
@@ -202,7 +230,10 @@ class HarnessV2RootConfigTests(unittest.TestCase):
     def test_manifest_rejects_missing_or_empty_id(self) -> None:
         root = self._root()
         for entry in ({"exclusive": True}, {"id": "", "exclusive": True}):
-            self._write_manifest(root, {"resources": [entry]})
+            self._write_manifest(
+                root,
+                {"schema": "resource-manifest/v1", "resources": [entry]},
+            )
             with self.assertRaises(ConfigError):
                 load_resource_manifest(root)
 
@@ -214,7 +245,10 @@ class HarnessV2RootConfigTests(unittest.TestCase):
             {"id": "gpu-0", "exclusive": "yes"},
             {"id": "gpu-0", "exclusive": 1},
         ):
-            self._write_manifest(root, {"resources": [entry]})
+            self._write_manifest(
+                root,
+                {"schema": "resource-manifest/v1", "resources": [entry]},
+            )
             with self.assertRaises(ConfigError):
                 load_resource_manifest(root)
 
@@ -223,6 +257,7 @@ class HarnessV2RootConfigTests(unittest.TestCase):
         self._write_manifest(
             root,
             {
+                "schema": "resource-manifest/v1",
                 "resources": [
                     {"id": "gpu-0", "exclusive": True},
                     {"id": "gpu-0", "exclusive": True},
@@ -245,7 +280,9 @@ class HarnessV2RootConfigTests(unittest.TestCase):
                 "schema": "harness-config/v1",
             },
         )
-        self._write_manifest(root, {"resources": []})
+        self._write_manifest(
+            root, {"schema": "resource-manifest/v1", "resources": []}
+        )
         with patch("orchestrator_harness.setup.find_harness_root", return_value=root):
             result = run_setup()
         self.assertFalse(result["ok"])

@@ -18,7 +18,7 @@ from typing import Any
 from .core import read_json, sha256_hex
 
 CONFIG_SCHEMA = "harness-config/v1"  # logical schema name; never a literal field
-MANIFEST_SCHEMA = "resource-manifest/v1"  # logical schema name; never a literal field
+MANIFEST_SCHEMA = "resource-manifest/v1"  # literal schema field in the manifest
 RUNTIME_DIR_NAME = ".harness-runtime"
 PROFILE_MANAGED = "managed"
 PROFILE_PLAIN = "plain"
@@ -325,10 +325,11 @@ def load_config(
 def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceManifest:
     """Read and validate ``<harness-root>/resource-manifest.json``.
 
-    The stored record is the closed ``resource-manifest/v1`` shape: a single
+    The stored record is the closed ``resource-manifest/v1`` shape: a literal
+    ``schema`` field equal to ``resource-manifest/v1`` plus a single
     ``resources`` list.  Every nonempty entry is a closed object with a
     nonempty literal ``id`` and ``exclusive: true``; duplicate IDs and unknown
-    fields are invalid.  The record carries no literal ``schema`` field.
+    fields are invalid.
     """
     root = Path(harness_root).absolute()
     path = root / "resource-manifest.json"
@@ -338,10 +339,15 @@ def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceMani
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"resource manifest unreadable: {path}: {exc}") from exc
-    unknown = sorted(set(record) - {"resources"})
+    unknown = sorted(set(record) - {"schema", "resources"})
     if unknown:
         raise ConfigError(
-            f"resource manifest unknown key {unknown[0]!r} (closed keys: resources): {path}"
+            f"resource manifest unknown key {unknown[0]!r} "
+            f"(closed keys: schema, resources): {path}"
+        )
+    if record.get("schema") != MANIFEST_SCHEMA:
+        raise ConfigError(
+            f"resource manifest schema must be {MANIFEST_SCHEMA!r}: {path}"
         )
     resources = record.get("resources")
     if not isinstance(resources, list):
