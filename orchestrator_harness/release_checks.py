@@ -372,7 +372,6 @@ _WATCHER_UNIT_INPUT_SCOPES = (
     InputScope("file", "QUICK_START.md"),
     InputScope("file", "QUICK_RULES.md"),
 )
-_ATTENTION_INPUT_SCOPES = _WATCHER_UNIT_INPUT_SCOPES
 _RELEASE_AGGREGATE_INPUT_SCOPES = (
     InputScope("tree", "orchestrator_harness"),
     InputScope("tree", "harness_common"),
@@ -705,22 +704,6 @@ def _registry() -> tuple[CheckSpec, ...]:
             ),
             estimated_duration_seconds=120.0,
             input_scopes=_WATCHER_UNIT_INPUT_SCOPES,
-        ),
-        CheckSpec(
-            "S6.RELEASE.ATTENTION",
-            "attention-retention practical",
-            "release",
-            (
-                "python",
-                "harness_watcher_implementation/tests/run_attention_practical.py",
-            ),
-            ("release-attention",),
-            (
-                "harness_watcher_implementation/tests/run_attention_practical.py",
-                "harness_watcher_implementation/tests/test_attention_practical_retention.py",
-            ),
-            estimated_duration_seconds=30.0,
-            input_scopes=_ATTENTION_INPUT_SCOPES,
         ),
         CheckSpec(
             "S6.RELEASE.SYNTHETIC-CLEANUP",

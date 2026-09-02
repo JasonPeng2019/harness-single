@@ -42,10 +42,9 @@ from harness_watcher_implementation.state import (
     transition,
     unresolved_alerts,
 )
-from orchestrator_harness import cli
 from orchestrator_harness.events import conditions_from_snapshot
-from orchestrator_harness.notifications import select_actionable
 from orchestrator_harness.watcher_integration import merge_watcher_conditions
+from harness_watcher_implementation import __main__ as watcher_cli
 
 
 def defect_verdict(path: str = "observed.jsonl") -> dict[str, object]:
@@ -1177,10 +1176,10 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             conditions_from_snapshot(snapshot), merge_watcher_conditions(snapshot)
         )
 
-    def test_cli_exposes_no_ack_command_or_watcher_acknowledgement_api(self) -> None:
+    def test_watcher_cli_exposes_no_ack_command_or_acknowledgement_api(self) -> None:
         """The diagnostic CLI owns no manager queue or acknowledgement policy."""
-        self.assertFalse(hasattr(cli, "ack_command"))
-        self.assertFalse(hasattr(cli, "acknowledge_watcher_event"))
+        self.assertFalse(hasattr(watcher_cli, "ack_command"))
+        self.assertFalse(hasattr(watcher_cli, "acknowledge_watcher_event"))
 
     def test_poll_routes_new_manager_harness_and_lane_records_to_four_separate_trees(
         self,

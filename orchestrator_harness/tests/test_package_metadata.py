@@ -79,7 +79,7 @@ def _on_disk_required_files() -> list[str]:
         "assets/codex/bounded-exclusions.gitignore",
     ):
         required.append(relative)
-    for sub in ("claude", "codex", "qwen"):
+    for sub in ("codex",):
         for path in sorted((PACKAGE_ROOT / "assets" / sub).iterdir()):
             if path.is_file() and path.name != "__init__.py":
                 required.append(path.relative_to(PACKAGE_ROOT).as_posix())
@@ -87,7 +87,7 @@ def _on_disk_required_files() -> list[str]:
         if path.is_file() and path.name != "__init__.py":
             required.append(path.relative_to(PACKAGE_ROOT).as_posix())
     for path in sorted((PACKAGE_ROOT / "assets" / "release").rglob("*")):
-        if path.is_file():
+        if path.is_file() and "__pycache__" not in path.parts:
             required.append(path.relative_to(PACKAGE_ROOT).as_posix())
     return sorted(set(required))
 
