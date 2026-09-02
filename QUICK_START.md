@@ -1,158 +1,109 @@
-# Quick Start: Ordinary Coding
+# Quick Start: Harness v2 Operator Run
 
-## 1. Prepare lanes
-
-Start from a stable committed base. Create one branch and worktree for each concurrent task:
-
-```powershell
-git worktree add -b lane/parser ..\project-worktrees\parser <base-commit>
-git worktree add -b lane/api ..\project-worktrees\api <base-commit>
-```
-
-Do not switch branches in an active lane worktree. A later split starts only after the parent lane
-commits; every child branches from that exact commit.
-
-## 2. Configure discovery
+The shortest live run: configure once, setup, bootstrap, launch, watch, review, retire. All
+commands use the one public launcher:
 
 ```powershell
-New-Item -ItemType Directory -Force local-config | Out-Null
-Copy-Item examples/harness.example.json local-config/harness.json
+python -m orchestrator_harness.operator_launch <group> <command> [options]
 ```
 
-Set `suite_root` to the directory containing `worktrees/`, keep `run_globs` as `worktrees/*`, and
-choose a fresh ignored `runtime/orchestrator-harness/<epoch>` output. Validate before launch:
+## 1. Configure the harness root
+
+Write `harness-config.json` at the harness root (closed two-key `harness-config/v1` shape):
+
+```json
+{
+  "root_workspace": "<absolute-path-to-root-workspace>",
+  "managed_coordination": "enabled"
+}
+```
+
+Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
+
+```json
+{
+  "schema": "resource-manifest/v1",
+  "resources": []
+}
+```
+
+Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `resources`.
+`managed_coordination: "disabled"` runs plain lanes without the manager queue.
+
+## 2. One-time setup
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json scan --no-write
+python -m orchestrator_harness.operator_launch harness setup
 ```
 
-## 3. Launch lane controllers
+Setup is idempotent; re-run with `--overwrite` to re-integrate. It starts no lane or provider.
 
-For each lane, copy the shape in `examples/coding.invocation.example.json`, replace every path and
-Git identity, write the prompt beneath that lane's `.agent-workspace`, and calculate its SHA-256.
-Use `exclusive_resources` only for non-Git resources that cannot be shared concurrently.
+## 3. Bootstrap one lane
 
 ```powershell
-python -m orchestrator_harness.lane_controller <lane-invocation.json>
+python -m orchestrator_harness.operator_launch lane bootstrap `
+  --lane-id lane-01 --provider codex --model <model> --task-card <path-to-task-card.json>
 ```
 
-The manager may use `orchestrator_harness.operator_launch` for a detached, identity-recorded
-controller. The harness does not schedule controllers automatically.
+`--task-card` names a `project-task-card/v1` file (task text, branch, base commit). Add
+`--exclusive-resource <id>` for each resource declared in the manifest. Bootstrap creates the
+worktree, stages the super-cache base and the selected provider payload, and writes the worker
+binding. Shipped provider IDs: `codex`, `claude-code`, `qwen-code`.
 
-For the copyable public launch shape, see `examples/public-coding-launch.example.md`. It composes
-the operator launcher and native lane controller; the controller remains the owner of provider
-lifecycle, claims, durable events, semantic resume, result validation, and cleanup.
-
-## 4. Wait and acknowledge
+## 4. Launch
 
 ```powershell
-python -m orchestrator_harness --config local-config/harness.json watch --until-actionable --timeout 60
+python -m orchestrator_harness.operator_launch lane launch --lane-id lane-01
 ```
 
-Handle one returned event, verify the corresponding action or durable record, then acknowledge the
-top-level `event_id` exactly:
-
-```python
-router.acknowledge("<top-level-event-id>", binding=router.registration)
-```
-
-The acknowledgement is a manager action through the bound S3 `ManagerEventRouter`; this
-diagnostic CLI has no competing acknowledgement queue. `data.signal_id` is not an acknowledgement
-ID.
-
-Repeat after timeouts. Never poll worker transcripts or add a relay as an alternate discovery path.
-
-## 5. Finish each lane
-
-Workers may update `.agent-workspace/PARALLEL_CHECKPOINT.md` during progress. Completion requires a
-clean committed branch plus `.agent-workspace/RESULT.json` matching
-`examples/coding.result.example.json`. The commit must be the current branch tip.
-
-Normal named-lock contention waits automatically. Investigate only malformed, stale, unknown, or
-excessive-wait evidence. Never delete another invocation's claim.
-
-### Select release checks
-
-The versioned registry/selector is the single owner of fast, affected, full, and release checks:
+## 5. Wait and acknowledge (managed)
 
 ```powershell
-python -m orchestrator_harness.release_checks select --intent fast --root <repository-root>
-python -m orchestrator_harness.release_checks select --intent affected --root <repository-root> `
-  --changed-domain public-launch
+python -m orchestrator_harness.operator_launch watch --until-actionable --timeout 5m
+python -m orchestrator_harness.operator_launch manager acknowledge --event-id <top-level-event-id>
 ```
 
-Credit is retained only for the same stable ID, exact declared dependency fingerprint, command,
-tier, output contract, and exact source root/common-directory/branch identity; its recorded origin
-tip must be an ancestor of the current tip. A dependency or contract mutation invalidates that
-credit. Fast is local and does not select WSL or a real agent. Full/release may enumerate the
-accumulated component checks, but the aggregate safeguard remains ROOT-owned and is not run in an ordinary coding lane.
-
-## 6. Merge and accept
+Acknowledge only the envelope's top-level `event_id` after handling the event; `data.signal_id`
+is not an acknowledgement ID. Close handled events with:
 
 ```powershell
-git worktree add -b integration/candidate ..\project-worktrees\candidate <base-commit>
-git -C ..\project-worktrees\candidate merge --no-edit lane/parser
-git -C ..\project-worktrees\candidate merge --no-edit lane/api
-python -m unittest discover -s ..\project-worktrees\candidate -v
+python -m orchestrator_harness.operator_launch manager close --event-id <id> --outcome COMPLETE
 ```
 
-Use a manager-assigned merge worker when conflict resolution or integration work is needed. Its
-invocation identifies the integration branch and merge inputs. Publish and validate its result,
-then treat that commit as the candidate. Run acceptance before promoting it over the frozen
-known-good revision.
+## 6. Review and accept
 
-## 7. Clean up
-
-Stop managed observation cooperatively if active, prove exact process identities absent, confirm
-all named claims released, preserve results, then remove disposable worktrees with `git worktree
-remove`. Never remove a dirty or unmerged lane without an explicit manager decision.
-
-Run the complete local example at any time:
+The worker writes `.agent-workspace/RESULT.json` (`result/v1`). ROOT records the factual finding
+and the separate accept/reject decision:
 
 ```powershell
-python examples/disposable_coding_fixture.py
+python -m orchestrator_harness.operator_launch lane completion-review `
+  --lane-id lane-01 --review-outcome PASS --approval ACCEPTED --review-summary <summary>
 ```
 
-Resume a coding controller only with its persisted identity and output paths; the controller, not a
-new wrapper, verifies that resume identity:
+## 7. Retire
 
 ```powershell
-python -m orchestrator_harness.lane_controller C:/absolute/path/to/coding.resume.invocation.json
+python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acceptance-ref>
 ```
 
-That resume invocation keeps the same `worker_invocation_id` and supplies the recorded thread as
-`resume_thread_id` or `resume_identity.thread_id`.
+## Resume, force-stop, shutdown
 
-Before disposal, let each bounded diagnostic wait return and request cooperative stop from the
-recorded owner. Prove absence using every recorded PID plus creation time from its status/launch
-record. Do not kill by process name or command text:
+- Resume a stopped, unaccepted lane: `resume-lane --lane-id lane-01 --resume-task-card <card>`,
+  then `lane launch --lane-id lane-01`.
+- Hard-stop a stuck lane: `lane force-stop --lane-id lane-01`.
+- End the whole runtime: `harness shutdown`.
 
-```powershell
-# For each recorded { pid, creation_time_utc }, prove that the exact identity is absent (or stop only
-# that exact still-live identity cooperatively and re-check it).
-$process = Get-CimInstance Win32_Process -Filter "ProcessId = <recorded-pid>" -ErrorAction SilentlyContinue
-if ($process) { [Management.ManagementDateTimeConverter]::ToDateTime($process.CreationDate).ToUniversalTime().ToString('o') }
-git -C C:/absolute/path/to/worktree status --porcelain
-git worktree remove C:/absolute/path/to/worktree
-```
+## Notes
 
-Treat a missing process as absence only after the recorded PID-plus-creation identity was checked;
-a reused PID is a different process and must never be stopped. Confirm named claims and pending
-events in the epoch runtime before removing a clean, preserved worktree.
-
-## Candidate-only final safeguard
-
-After acceptance and pre-safeguard admission, run the launcher from the reserved candidate
-worktree with the caller-supplied expected branch (there is no default branch):
-
-```powershell
-$candidateRoot = "<candidate-root>"
-& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -ExpectedBranch "<candidate-branch>"
-& (Join-Path $candidateRoot "tools/Invoke-CandidateSafeguard.ps1") -RepositoryRoot $candidateRoot -ExpectedBranch "<candidate-branch>" -Run
-```
-
-The first command prints its bound checks. The second runs the selector-owned Ruff, formatting,
-retained non-expanded BasedPyright baseline, compilation, orchestrator and watcher unit
-discoveries, attention retention, and synthetic cleanup components. It refuses any non-reserved,
-ambiguous, dirty, stable-runner, or wrong-branch root; it is a safeguard launcher, not a scheduler,
-retry controller, or alternate harness.
+- Run `scan --no-write` before launch for a read-only lane-status snapshot.
+- `send-lane-notification --lane-id <id> --prompt <assignment>` appends one assignment to a
+  running managed lane.
+- `orchestrator_harness.release_checks` is the one stable-ID registry/selector for fast,
+  affected, full, and release checks; credit requires exact source root, Git common directory,
+  and branch identity.
+- Static examples and fixtures are never live provider proof; only a real recorded live run with
+  exact identity evidence can claim provider proof.
+- Stop and cleanup use exact recorded PID-plus-creation identity only; never kill by broad process
+  name or command matching.
+- Use a fresh epoch and fresh runtime directories for every live run; retire lanes or shut down
+  before re-running.

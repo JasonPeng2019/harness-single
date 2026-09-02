@@ -145,7 +145,7 @@ class S3OperatorJourneyTests(unittest.TestCase):
             self.assertIn("scan --no-write", text)
             self.assertIn("watch --until-actionable", text)
             self.assertIn("top-level-event-id", text)
-        for required in ("resume_thread_id", "PID-plus-creation"):
+        for required in ("resume-lane", "PID-plus-creation"):
             self.assertIn(required, quick_start)
         for text in (quick_start, root_readme):
             self.assertNotIn("passed-tests.json", text)
