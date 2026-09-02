@@ -163,22 +163,32 @@ def run_launch(lane_id: str) -> dict[str, Any]:
 
 
 def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
-    """Terminate the lane's controller (and provider) by exact identity."""
+    """Terminate the lane's complete provider boundary and controller exactly."""
     process = lane.get("process") or {}
     controller_pid = process.get("pid")
     controller_creation = process.get("creation_time")
     status = _read_controller_status(lane)
     provider_pid = None
-    if status is not None:
-        provider_pid = (status.get("provider_state") or {}).get("pid")
+    provider_creation = None
     ok = True
-    if isinstance(provider_pid, int):
-        if not processes.terminate_process(provider_pid, None):
-            ok = False
     if isinstance(controller_pid, int):
-        if not processes.terminate_process(controller_pid, controller_creation):
+        if not processes.terminate_process(
+            controller_pid,
+            controller_creation,
+            force=True,
+        ):
             ok = False
-    return ok
+    boundary_ok = status is not None
+    if status is not None:
+        provider_state = status.get("provider_state") or {}
+        provider_pid = provider_state.get("pid")
+        provider_creation = provider_state.get("creation_time")
+        boundary = status.get("process_boundary")
+        if isinstance(boundary, dict):
+            boundary_ok = processes.cleanup_recorded_process_boundary(boundary)
+        elif isinstance(provider_pid, int):
+            boundary_ok = processes.terminate_process(provider_pid, provider_creation, force=True)
+    return ok and boundary_ok
 
 
 def run_force_stop(lane_id: str) -> dict[str, Any]:
@@ -289,7 +299,25 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
             process.get("pid"), process.get("creation_time")
         )
         cleanup_proven = bool((status or {}).get("cleanup_proven", False))
-        if not controller_gone or not cleanup_proven:
+        boundary = (status or {}).get("process_boundary")
+        boundary_gone = (
+            isinstance(boundary, dict)
+            and processes.process_boundary_is_gone(boundary)
+        )
+        provider_state = (status or {}).get("provider_state") or {}
+        provider_pid = provider_state.get("pid")
+        provider_creation = provider_state.get("creation_time")
+        provider_gone = not (
+            isinstance(provider_pid, int)
+            and (
+                processes.identity_matches(provider_pid, provider_creation)
+                or (
+                    processes.process_alive(provider_pid)
+                    and processes.process_identity(provider_pid) is None
+                )
+            )
+        )
+        if not controller_gone or not cleanup_proven or not boundary_gone or not provider_gone:
             return {
                 "ok": False,
                 "code": RETIRE_CLEANUP_UNPROVEN,

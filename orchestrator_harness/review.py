@@ -48,6 +48,54 @@ class ReviewError(RuntimeError):
         self.code = code
 
 
+def validate_acceptance_chain(
+    review: dict[str, Any],
+    acceptance: dict[str, Any],
+    *,
+    lane_id: str,
+    run_id: str | None = None,
+) -> bool:
+    """Validate the complete review/acceptance link before it is honored.
+
+    Both records are integrity checked and every task, result, lane, run, and
+    commit identifier must match.  In particular, ``review_ref`` must point to
+    the actual review content hash; matching copied fields alone are not a
+    valid acceptance chain.
+    """
+
+    if review.get("content_hash") != content_hash(review):
+        return False
+    if acceptance.get("content_hash") != content_hash(acceptance):
+        return False
+    if acceptance.get("review_ref") != review.get("content_hash"):
+        return False
+    required = (
+        "lane_id",
+        "run_id",
+        "task_card_id",
+        "task_card_hash",
+        "result_id",
+        "result_hash",
+        "commit",
+    )
+    for field in required:
+        review_value = review.get(field)
+        acceptance_value = acceptance.get(field)
+        if not isinstance(review_value, str) or not review_value:
+            return False
+        if acceptance_value != review_value:
+            return False
+    if review.get("lane_id") != lane_id or acceptance.get("lane_id") != lane_id:
+        return False
+    if run_id is not None and review.get("run_id") != run_id:
+        return False
+    if acceptance.get("approval") not in APPROVALS:
+        return False
+    if not isinstance(acceptance.get("accepted_by"), str) or not acceptance["accepted_by"]:
+        return False
+    return review.get("review_outcome") in REVIEW_OUTCOMES
+
+
 def _read_task_card(worktree: Path) -> dict[str, Any]:
     path = worktree / ".agent-workspace" / "task-card.json"
     if not path.is_file():
