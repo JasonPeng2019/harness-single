@@ -25,7 +25,9 @@ class CheckU4Tests(unittest.TestCase):
                 assert_valid_result(mutated, "lane", "run")
 
     def test_rejected_replacement_preserves_complete_prior_record_and_leaves_no_temp(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        workspace = Path(__file__).resolve().parents[3] / ".agent-workspace"
+        workspace.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=workspace) as temporary:
             path = Path(temporary) / "RUNTIME_STATE.json"
             prior = {"schema": "runtime-state/v1", "state": "OPEN"}
             atomic_json(path, prior)
@@ -51,31 +53,49 @@ class CheckU4Tests(unittest.TestCase):
 
     def test_public_launcher_exposes_the_complete_normative_v2_command_vocabulary(self) -> None:
         root = Path(__file__).resolve().parents[3]
-        completed = subprocess.run(
-            [sys.executable, "-m", "orchestrator_harness.operator_launch", "--help"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        help_surfaces = (
+            (
+                (),
+                (
+                    "harness",
+                    "lane",
+                    "manager",
+                    "health",
+                    "resume-lane",
+                    "send-lane-notification",
+                    "scan",
+                    "watch",
+                ),
+            ),
+            (("harness",), ("setup", "shutdown")),
+            (
+                ("lane",),
+                ("bootstrap", "launch", "completion-review", "force-stop", "retire"),
+            ),
+            (("manager",), ("acknowledge", "close")),
+            (("health",), ("reconcile",)),
         )
-        self.assertEqual(0, completed.returncode, completed.stderr)
-        help_text = completed.stdout
-        required = (
-            "harness setup",
-            "harness shutdown",
-            "lane bootstrap",
-            "lane launch",
-            "lane completion-review",
-            "resume-lane",
-            "lane force-stop",
-            "lane retire",
-            "manager acknowledge",
-            "manager close",
-            "send-lane-notification",
-            "scan",
-            "watch",
-            "health reconcile",
-        )
-        missing = [token for token in required if token not in help_text]
-        self.assertEqual([], missing, f"normative v2 public commands missing: {missing}")
+
+        for command, required in help_surfaces:
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "orchestrator_harness.operator_launch",
+                        *command,
+                        "--help",
+                    ],
+                    cwd=root,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                missing = [token for token in required if token not in completed.stdout]
+                self.assertEqual(
+                    [],
+                    missing,
+                    f"normative v2 commands missing from {' '.join(command) or 'top-level'} help: {missing}",
+                )
