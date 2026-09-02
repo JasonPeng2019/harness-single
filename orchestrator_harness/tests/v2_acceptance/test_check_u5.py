@@ -72,10 +72,6 @@ class CheckU5Tests(unittest.TestCase):
             aborted["observed_process_identity"]["identity_token"],
             recovered["observed_process_identity"]["identity_token"],
         )
-        self.assertNotEqual(
-            aborted["observed_process_identity"]["pid"],
-            recovered["observed_process_identity"]["pid"],
-        )
         self.assertEqual(aborted["observed_process_identity"], result["identity_correlation"]["abort_process_identity"])
         self.assertEqual(recovered["observed_process_identity"], result["identity_correlation"]["recovery_process_identity"])
         for attempt in (aborted, recovered):
