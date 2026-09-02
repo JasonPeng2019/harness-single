@@ -7,8 +7,8 @@ project was explicitly bound.
 
 ## Proven run
 
-On Windows, Qwen Code 0.21.10 was launched through `operator_launch` and
-`lane_controller` in a fresh Git lane. The provider command was:
+On Windows, Qwen Code 0.21.10 was launched through the native v2 operator and
+lane route in a fresh Git lane. The provider command was:
 
 ```text
 qwen --approval-mode=yolo --model deepseek-v4-flash:0731-cloud --output-format stream-json
@@ -20,13 +20,8 @@ configuration. The one-line task asked Qwen to run `git status --short` once
 without editing files. The stream recorded that tool call and ended with
 `QWEN_HOOK_PROOF_COMPLETE` and a successful result.
 
-Before launch, the proof created a real `ManagerEventRouter`, admitted one
-pending `MANAGER_SIGNAL`, installed the Qwen project adapter, and bound the
-project with:
-
-```powershell
-python -m orchestrator_harness adapter bind --host qwen --project-root $lane --queue-root $managerQueue
-```
+Before launch, the proof created a real managed queue and admitted one pending
+`MANAGER_SIGNAL`; the controller loaded the shipped direct Qwen binding.
 
 The manager's durable `DELIVERY.jsonl` then recorded `outcome: "DELIVERED"`.
 The coordinator receipt identifies `boundary: "post_tool_use"`, reports one

@@ -1,6 +1,6 @@
 [project]
 name = "portable-orchestrator-harness"
-version = "0.1.0"
+version = "2.0.0"
 description = "Durable event observation and lane control for parallel coding work"
 requires-python = ">=3.11"
 dependencies = []
@@ -16,22 +16,27 @@ packages = [
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
-    "orchestrator_harness.assets.qwen",
     "orchestrator_harness.assets.rules",
+    "orchestrator_harness.provider_adapters",
+    "orchestrator_harness.provider_adapters.claude-code",
+    "orchestrator_harness.provider_adapters.codex",
+    "orchestrator_harness.provider_adapters.qwen-code",
     "harness_common",
 ]
 
 [tool.setuptools.package-data]
 orchestrator_harness = [
+    "assets/codex/bounded-exclusions.gitignore",
     "assets/codex/*.json",
     "assets/codex/*.py",
-    "assets/qwen/*.json",
-    "assets/qwen/*.py",
     "assets/rules/*.md",
     "assets/release/*.json",
     "assets/release/examples/*.json",
     "assets/release/examples/*.md",
     "assets/release/templates/*.md",
+    "config.example.json",
+    "install_wsl_codex.ps1",
+    "provider_adapters/*/launcher_binding.py",
 ]
 
 [tool.setuptools.data-files]
@@ -39,7 +44,6 @@ orchestrator_harness = [
     "../examples/coding.invocation.example.json",
     "../examples/coding.named-lock.example.json",
     "../examples/coding.result.example.json",
-    "../examples/disposable_coding_fixture.py",
     "../examples/harness.example.json",
     "../examples/watcher.diagnostic.example.json",
     "assets/release/examples/*.json",

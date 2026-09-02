@@ -118,11 +118,10 @@ requires the ordered recovery ledger to reach `RESOLVED`.
    validation, deduplication, alert redelivery, recovery ordering, and resolution.
 2. Integration tests prove the original harness behavior is byte/exit-equivalent where applicable
    when disabled and that enabled healthy observations do not produce alerts.
-3. A focused defect canary proves one meaningful loop/stall reaches the manager and the complete
-   safe recovery sequence can be recorded.
-4. Practical suite canaries run the same representative, board-free experiment slice in both
-   modes, with real role processes and the real harness path. They compare progress, exit state,
-   latency, watcher actions, and evidence. No hardware or production-server mutation is permitted.
+3. A board-free lifecycle canary proves duplicate-start rejection, exact PID/creation identity
+   reporting, cooperative stop, and owner-identity loss for the watcher subprocess.
+4. Practical suite canaries were retired with the scripts that ran them; they are historical
+   only and are not a current runnable asset.
 5. Reviewer and independent tester results are retained under
    `harness_watcher_implementation/test_results/`.
 

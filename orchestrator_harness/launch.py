@@ -1,0 +1,357 @@
+﻿"""``lane launch``, ``lane force-stop``, and ``lane retire``.
+
+Launch consumes the prepared invocation and starts the lane controller (which
+starts the provider and owns the leases).  Force-stop is the targeted single-
+lane hard stop.  Retire is the graceful end of an accepted lane.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from . import processes
+from .config import find_harness_root, load_config
+from .core import read_json, require_schema
+from .epochs import (
+    close_epoch,
+    epoch_dir,
+    lane_record_dir,
+    read_active_lanes,
+    read_current_epoch,
+    read_epoch_state,
+    write_active_lanes,
+)
+from .lanes import find_active_lane, read_lane, update_lane
+from .leases import force_release_leases, release_leases
+from .manager_queue import read_manager_queue
+from .records import read_record
+from .setup import read_runtime_state
+
+INVOCATION_SCHEMA = "controller-invocation/v1"
+CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
+ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
+COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
+
+LAUNCH_INVOCATION_INVALID = "LAUNCH_INVOCATION_INVALID"
+LAUNCH_BINDING_FAILED = "LAUNCH_BINDING_FAILED"
+LAUNCH_LEASE_BUSY = "LAUNCH_LEASE_BUSY"
+LAUNCH_CONTROLLER_START_FAILED = "LAUNCH_CONTROLLER_START_FAILED"
+LAUNCH_PROVIDER_START_FAILED = "LAUNCH_PROVIDER_START_FAILED"
+FORCE_STOP_LANE_NOT_FOUND = "FORCE_STOP_LANE_NOT_FOUND"
+FORCE_STOP_PROCESS_SURVIVED = "FORCE_STOP_PROCESS_SURVIVED"
+FORCE_STOP_LEASE_RELEASE_FAILED = "FORCE_STOP_LEASE_RELEASE_FAILED"
+RETIRE_LANE_NOT_FOUND = "RETIRE_LANE_NOT_FOUND"
+RETIRE_ACCEPTANCE_INVALID = "RETIRE_ACCEPTANCE_INVALID"
+RETIRE_CLEANUP_UNPROVEN = "RETIRE_CLEANUP_UNPROVEN"
+RETIRE_LEASE_RELEASE_FAILED = "RETIRE_LEASE_RELEASE_FAILED"
+
+HANDSHAKE_TIMEOUT_SECONDS = 30.0
+
+
+class LaunchError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
+    path = Path(lane["controller_status_path"])
+    if not path.is_file():
+        return None
+    try:
+        return read_record(path, CONTROLLER_STATUS_SCHEMA)
+    except (OSError, ValueError):
+        return None
+
+
+def run_launch(lane_id: str) -> dict[str, Any]:
+    """Execute ``lane launch`` and return the structured result."""
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": LAUNCH_CONTROLLER_START_FAILED,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "fix the configuration and re-run setup",
+        }
+    rt = config.runtime_root
+    try:
+        state = read_runtime_state(rt)
+        if state is None or state.get("state") != "OPEN":
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                "runtime is not OPEN; run setup first",
+            )
+        epoch_id, lane = find_active_lane(rt, lane_id)
+        if lane.get("lifecycle") not in ("prepared", "running"):
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                f"lane {lane_id} is not prepared (lifecycle={lane.get('lifecycle')})",
+            )
+        invocation_path = Path(lane["worktree_path"]) / ".agent-workspace" / "invocation.json"
+        try:
+            invocation = read_record(invocation_path, INVOCATION_SCHEMA)
+            if invocation.get("lane_id") != lane_id or invocation.get("run_id") != lane.get("run_id"):
+                raise LaunchError(LAUNCH_INVOCATION_INVALID, "invocation does not match the lane's current run")
+        except (OSError, ValueError) as exc:
+            raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
+        provider_id = invocation["provider"]["id"]
+        binding_path = (
+            harness_root / "orchestrator_harness" / "provider_adapters" / provider_id / "launcher_binding.py"
+        )
+        if not binding_path.is_file():
+            raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
+
+        child = processes.spawn_detached(
+            processes.python_argv("orchestrator_harness.controller", lane_id),
+            cwd=str(harness_root),
+        )
+        deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                break
+            status = _read_controller_status(lane)
+            if (
+                status is not None
+                and status.get("controller_state") == "running"
+                and (status.get("provider_state") or {}).get("state") == "running"
+            ):
+                lane = read_lane(rt, epoch_id, lane_id)
+                return {
+                    "ok": True,
+                    "code": "LAUNCH_OK",
+                    "summary": f"lane {lane_id} is running",
+                    "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
+                    "next_action": "wait for the worker result; the monitor reports actionable status",
+                }
+            time.sleep(0.2)
+        # The controller exited before the handshake: map its last event to a code.
+        events_path = Path(lane["controller_events_path"])
+        code = LAUNCH_CONTROLLER_START_FAILED
+        summary = "controller exited before the provider started"
+        if events_path.is_file():
+            for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "lease_busy" in line:
+                    code = LAUNCH_LEASE_BUSY
+                    summary = "a declared resource is held; no lane started"
+                elif "provider_start_failed" in line:
+                    code = LAUNCH_PROVIDER_START_FAILED
+                    summary = "the provider process could not be started"
+        raise LaunchError(code, summary)
+    except LaunchError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "on LAUNCH_LEASE_BUSY, wait for the holder to finish and re-launch",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": LAUNCH_CONTROLLER_START_FAILED,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "resolve the error and re-launch",
+        }
+
+
+def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
+    """Terminate the lane's controller (and provider) by exact identity."""
+    process = lane.get("process") or {}
+    controller_pid = process.get("pid")
+    controller_creation = process.get("creation_time")
+    status = _read_controller_status(lane)
+    provider_pid = None
+    if status is not None:
+        provider_pid = (status.get("provider_state") or {}).get("pid")
+    ok = True
+    if isinstance(provider_pid, int):
+        if not processes.terminate_process(provider_pid, None):
+            ok = False
+    if isinstance(controller_pid, int):
+        if not processes.terminate_process(controller_pid, controller_creation):
+            ok = False
+    return ok
+
+
+def run_force_stop(lane_id: str) -> dict[str, Any]:
+    """Execute ``lane force-stop`` and return the structured result."""
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": FORCE_STOP_LANE_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "fix the configuration and re-run setup",
+        }
+    rt = config.runtime_root
+    try:
+        epoch_id, lane = find_active_lane(rt, lane_id)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": FORCE_STOP_LANE_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "check the lane id",
+        }
+    try:
+        if not _terminate_lane_processes(lane):
+            return {
+                "ok": False,
+                "code": FORCE_STOP_PROCESS_SURVIVED,
+                "summary": "a lane process could not be terminated even forcibly",
+                "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
+                "next_action": "escalate to the operator/host; an unkillable process is outside the harness's authority",
+            }
+        try:
+            force_release_leases(rt, lane_id)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "code": FORCE_STOP_LEASE_RELEASE_FAILED,
+                "summary": str(exc),
+                "evidence_paths": [],
+                "next_action": "force-release the lease manually or retry force-stop",
+            }
+        update_lane(rt, epoch_id, lane_id, lambda current: {**current, "lifecycle": "retired"})
+        entries = [e for e in read_active_lanes(rt, epoch_id) if e.get("lane_id") != lane_id]
+        write_active_lanes(rt, epoch_id, entries)
+        _prune_worktrees(config.root_workspace)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": FORCE_STOP_LANE_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "resolve the error and retry",
+        }
+    return {
+        "ok": True,
+        "code": "FORCE_STOP_OK",
+        "summary": f"lane {lane_id} force-stopped and retired",
+        "evidence_paths": [str(lane_record_dir(rt, epoch_id, lane_id) / "lane.json")],
+        "next_action": "reuse the freed resource or bootstrap a fresh lane",
+    }
+
+
+def _prune_worktrees(root_workspace: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(root_workspace), "worktree", "prune"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _validate_acceptance_ref(path: Path) -> dict[str, Any]:
+    try:
+        acceptance = read_record(path, ACCEPTANCE_SCHEMA)
+    except (OSError, ValueError) as exc:
+        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, str(exc)) from exc
+    if acceptance.get("approval") != "ACCEPTED":
+        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, "acceptance is not ACCEPTED")
+    return acceptance
+
+
+def run_retire(acceptance_ref: str) -> dict[str, Any]:
+    """Execute ``lane retire`` and return the structured result."""
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": RETIRE_LANE_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "fix the configuration and re-run setup",
+        }
+    rt = config.runtime_root
+    try:
+        acceptance = _validate_acceptance_ref(Path(acceptance_ref))
+        lane_id = str(acceptance["lane_id"])
+        epoch_id, lane = find_active_lane(rt, lane_id)
+        status = _read_controller_status(lane)
+        process = lane.get("process") or {}
+        controller_gone = not processes.identity_matches(
+            process.get("pid"), process.get("creation_time")
+        )
+        cleanup_proven = bool((status or {}).get("cleanup_proven", False))
+        if not controller_gone or not cleanup_proven:
+            return {
+                "ok": False,
+                "code": RETIRE_CLEANUP_UNPROVEN,
+                "summary": "lane cleanup is not proven; force-stop the lane first",
+                "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
+                "next_action": "run `lane force-stop --lane-id <id>` then treat as done",
+            }
+        try:
+            release_leases(rt, lane_id, lane["run_id"])
+        except Exception as exc:
+            return {
+                "ok": False,
+                "code": RETIRE_LEASE_RELEASE_FAILED,
+                "summary": str(exc),
+                "evidence_paths": [],
+                "next_action": "retry retire after resolving the lease error",
+            }
+        update_lane(rt, epoch_id, lane_id, lambda current: {**current, "lifecycle": "retired"})
+        entries = [e for e in read_active_lanes(rt, epoch_id) if e.get("lane_id") != lane_id]
+        write_active_lanes(rt, epoch_id, entries)
+        _prune_worktrees(config.root_workspace)
+        if not entries:
+            _maybe_close_epoch(rt, epoch_id)
+    except LaunchError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "resolve the error and retry retire",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": RETIRE_LANE_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "resolve the error and retry retire",
+        }
+    return {
+        "ok": True,
+        "code": "RETIRE_OK",
+        "summary": f"lane {lane_id} retired",
+        "evidence_paths": [str(Path(acceptance_ref))],
+        "next_action": "none; the lane branch is retained",
+    }
+
+
+def _maybe_close_epoch(rt: Path, epoch_id: str) -> None:
+    """Close the epoch when no active lane remains and no unresolved ROOT
+    manager event remains (managed)."""
+    try:
+        state = read_epoch_state(rt, epoch_id)
+    except (OSError, ValueError):
+        return
+    if state.get("lifecycle") != "active":
+        return
+    if state.get("lane_mode") == "managed":
+        try:
+            queue = read_manager_queue(rt)
+        except Exception:
+            return
+        if any(event.get("state") in ("PENDING", "ACKNOWLEDGED") for event in queue.get("events", [])):
+            return
+    close_epoch(rt, epoch_id)

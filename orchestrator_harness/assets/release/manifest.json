@@ -3,7 +3,7 @@
   "registry_module": "orchestrator_harness.release_checks",
   "registry_schema": "orchestrator-release-check-registry/v1",
   "public_modules": [
-    "orchestrator_harness.public_launch",
+    "orchestrator_harness.operator_launch",
     "orchestrator_harness.release_checks",
     "orchestrator_harness.release_assets"
   ],

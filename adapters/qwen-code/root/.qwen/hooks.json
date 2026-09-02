@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": [
+    {
+      "matcher": "PostToolUse",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python .qwen/hooks/post-tool-use.py"
+        }
+      ]
+    }
+  ]
+}

@@ -31,7 +31,6 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
             "examples/coding.invocation.example.json",
             "examples/coding.result.example.json",
             "examples/coding.named-lock.example.json",
-            "examples/disposable_coding_fixture.py",
             "orchestrator_harness/config.example.json",
         ):
             self.assertTrue((REPOSITORY_ROOT / relative_path).is_file(), relative_path)
@@ -41,31 +40,31 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
         package_readme = (
             REPOSITORY_ROOT / "orchestrator_harness" / "README.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("## Start here", root_readme)
         self.assertIn("QUICK_START.md", root_readme)
-        self.assertIn("# Quick Start: Ordinary Coding", quick_start)
-        self.assertIn("python -m orchestrator_harness.lane_controller", quick_start)
-        self.assertIn("python -m orchestrator_harness --config", package_readme)
+        self.assertIn("# Quick Start: Harness v2 Operator Run", quick_start)
+        self.assertIn("python -m orchestrator_harness.operator_launch", quick_start)
+        self.assertIn("python -m orchestrator_harness.operator_launch", package_readme)
+        self.assertIn("harness setup", root_readme)
+        self.assertIn("lane bootstrap", quick_start)
 
         invocation = json.loads(
             (REPOSITORY_ROOT / "examples/coding.invocation.example.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual("orchestrator-coding-invocation/v1", invocation["schema"])
+        self.assertEqual("controller-invocation/v1", invocation["schema"])
+        self.assertEqual("codex", invocation["provider"]["id"])
         self.assertIn("exclusive_resources", invocation)
-        self.assertNotIn("mcp_servers", invocation)
-        self.assertNotIn("board_tokens", invocation)
 
-    def test_canonical_coding_contract_is_explicit_and_scoped(self) -> None:
+    def test_v2_operator_contract_is_explicit_and_scoped(self) -> None:
         root_readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
         quick_start = (REPOSITORY_ROOT / "QUICK_START.md").read_text(encoding="utf-8")
         package_readme = (
             REPOSITORY_ROOT / "orchestrator_harness" / "README.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("canonical coding invocation", root_readme)
-        self.assertIn("canonical coding invocation", package_readme)
-        self.assertIn("resume_thread_id", quick_start)
+        self.assertIn("operator_launch", root_readme)
+        self.assertIn("operator_launch", package_readme)
+        self.assertIn("resume-lane", quick_start)
         for document in PRIMARY_DOCS:
             self.assertNotIn(
                 "MCP-Trial", document.read_text(encoding="utf-8"), document
