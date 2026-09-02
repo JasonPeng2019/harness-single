@@ -13,7 +13,7 @@ from unittest.mock import patch
 from harness_common import process_identity as common_identity
 from orchestrator_harness import controller, monitor, processes
 from orchestrator_harness.core import content_hash
-from orchestrator_harness.models import ProcessInfo, ProcessQuery
+from orchestrator_harness.models import ProcessInfo, ProcessQuery, ProcessSnapshot
 from orchestrator_harness.records import atomic_write_json, read_record
 
 
@@ -113,33 +113,141 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                 "open(sys.argv[1],'w',encoding='ascii').write(str(helper.pid)); "
                 "time.sleep(30)"
             )
-            provider = subprocess.Popen(
-                [sys.executable, "-c", code, str(marker)],
-                creationflags=processes.WINDOWS_CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            provider = None
+            boundary = None
+            try:
+                stdin_path = Path(raw) / "stdin.txt"
+                stdout_path = Path(raw) / "stdout.txt"
+                stderr_path = Path(raw) / "stderr.txt"
+                stdin_path.write_text("", encoding="utf-8")
+                with (
+                    stdin_path.open("r", encoding="utf-8") as stdin_handle,
+                    stdout_path.open("w", encoding="utf-8") as stdout_handle,
+                    stderr_path.open("w", encoding="utf-8") as stderr_handle,
+                ):
+                    provider = processes.spawn_provider(
+                        [sys.executable, "-c", code, str(marker)],
+                        cwd=raw,
+                        stdin=stdin_handle,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                    )
+                self.assertFalse(marker.exists(), "provider ran before containment")
+                identity = processes.process_identity(provider.pid)
+                self.assertIsNotNone(identity)
+                assert identity is not None
+                boundary = processes.ProcessBoundary(
+                    provider.pid,
+                    identity["creation_time"],
+                    boundary_kind="windows-job",
+                )
+                self.assertTrue(
+                    boundary.attach_windows_process_handle(getattr(provider, "_handle", None))
+                )
+                getattr(provider, "resume")()
+                deadline = time.monotonic() + 5
+                while not marker.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(marker.is_file())
+                helper_pid = int(marker.read_text(encoding="ascii"))
+                self.assertTrue(processes.process_alive(helper_pid))
+                self.assertTrue(boundary.observe())
+                self.assertTrue(boundary.cleanup(force=True, timeout_seconds=5))
+                provider.wait(timeout=5)
+                self.assertFalse(processes.process_alive(helper_pid))
+            finally:
+                if boundary is not None:
+                    boundary._close_job()
+                if provider is not None and provider.poll() is None:
+                    provider.kill()
+                    provider.wait(timeout=5)
+
+    def test_windows_job_handle_close_kills_members_and_serialized_boundary_recovers(self) -> None:
+        if os.name != "nt":
+            self.skipTest("requires the Windows Job Object containment path")
+        TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as raw:
+            marker = Path(raw) / "helper.pid"
+            code = (
+                "import subprocess,sys,time; "
+                "helper=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+                "open(sys.argv[1],'w',encoding='ascii').write(str(helper.pid)); "
+                "time.sleep(30)"
             )
-            self.addCleanup(lambda: provider.poll() is None and provider.kill())
-            identity = processes.process_identity(provider.pid)
-            self.assertIsNotNone(identity)
-            assert identity is not None
-            boundary = processes.ProcessBoundary(
-                provider.pid,
-                identity["creation_time"],
-                boundary_kind="windows-job",
-            )
-            self.assertTrue(
-                boundary.attach_windows_process_handle(getattr(provider, "_handle", None))
-            )
-            deadline = time.monotonic() + 5
-            while not marker.is_file() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(marker.is_file())
-            helper_pid = int(marker.read_text(encoding="ascii"))
-            self.assertTrue(processes.process_alive(helper_pid))
-            self.assertTrue(boundary.cleanup(force=True, timeout_seconds=5))
-            provider.wait(timeout=5)
-            self.assertFalse(processes.process_alive(helper_pid))
+            provider = None
+            boundary = None
+            try:
+                stdin_path = Path(raw) / "stdin.txt"
+                stdout_path = Path(raw) / "stdout.txt"
+                stderr_path = Path(raw) / "stderr.txt"
+                stdin_path.write_text("", encoding="utf-8")
+                with (
+                    stdin_path.open("r", encoding="utf-8") as stdin_handle,
+                    stdout_path.open("w", encoding="utf-8") as stdout_handle,
+                    stderr_path.open("w", encoding="utf-8") as stderr_handle,
+                ):
+                    provider = processes.spawn_provider(
+                        [sys.executable, "-c", code, str(marker)],
+                        cwd=raw,
+                        stdin=stdin_handle,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                    )
+                self.assertFalse(marker.exists(), "provider ran before containment")
+                identity = processes.process_identity(provider.pid)
+                self.assertIsNotNone(identity)
+                assert identity is not None
+                boundary = processes.ProcessBoundary(
+                    provider.pid,
+                    identity["creation_time"],
+                    boundary_kind="windows-job",
+                )
+                self.assertTrue(
+                    boundary.attach_windows_process_handle(getattr(provider, "_handle", None))
+                )
+                getattr(provider, "resume")()
+                deadline = time.monotonic() + 5
+                while not marker.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(marker.is_file())
+                helper_pid = int(marker.read_text(encoding="ascii"))
+                self.assertTrue(boundary.observe())
+                record = boundary.record()
+                self.assertIn(
+                    helper_pid,
+                    [item["pid"] for item in record["processes"]],
+                )
+
+                # Closing the native Job handle models an abrupt controller
+                # exit.  Kill-on-close must terminate the provider and helper.
+                boundary._close_job()
+                provider.wait(timeout=5)
+                self.assertFalse(processes.process_alive(helper_pid))
+                with patch.object(
+                    processes,
+                    "process_snapshot",
+                    return_value=ProcessSnapshot(True, ()),
+                ):
+                    self.assertTrue(processes.process_boundary_is_gone(record))
+            finally:
+                if boundary is not None:
+                    boundary._close_job()
+                if provider is not None and provider.poll() is None:
+                    provider.kill()
+                    provider.wait(timeout=5)
+
+    def test_removed_boundary_inventory_symbols_have_no_tracked_references(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        for symbol in ("process_group_" + "inventory", "ProcessBoundary" + "Inventory"):
+            with self.subTest(symbol=symbol):
+                result = subprocess.run(
+                    ["git", "-C", str(repository), "grep", "-n", "-e", symbol, "--"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(1, result.returncode, result.stdout)
 
     def test_cleanup_status_transition_retains_boundary_evidence(self) -> None:
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)

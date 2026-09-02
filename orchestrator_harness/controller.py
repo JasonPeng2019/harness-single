@@ -188,39 +188,59 @@ def _run_provider(
         resume=resume,
     )
     _append_event(lane, "provider_started", " ".join(argv))
-    creationflags = processes.WINDOWS_CREATE_NO_WINDOW
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
-        child = subprocess.Popen(
+        child = processes.spawn_provider(
             argv,
             cwd=str(worktree),
             stdin=prompt_handle,
             stdout=transcript_handle,
             stderr=stderr_handle,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=creationflags if os.name == "nt" else 0,
-            start_new_session=os.name != "nt",
         )
-    boundary = processes.ProcessBoundary.for_process(child.pid)
-    if boundary.root_creation_time is None:
-        child.terminate()
-        child.wait(timeout=10.0)
-        raise ControllerError(
-            LAUNCH_PROVIDER_START_FAILED,
-            "cannot record provider process identity",
-        )
-    if os.name == "nt":
-        handle = getattr(child, "_handle", None)
-        if not boundary.attach_windows_process_handle(handle):
-            child.terminate()
-            child.wait(timeout=10.0)
+    boundary: processes.ProcessBoundary | None = None
+    try:
+        boundary = processes.ProcessBoundary.for_process(child.pid)
+        if boundary.root_creation_time is None:
             raise ControllerError(
                 LAUNCH_PROVIDER_START_FAILED,
-                "cannot attach provider to its process boundary",
+                "cannot record provider process identity",
             )
+        if os.name == "nt":
+            handle = getattr(child, "_handle", None)
+            if not boundary.attach_windows_process_handle(handle):
+                raise ControllerError(
+                    LAUNCH_PROVIDER_START_FAILED,
+                    "cannot attach provider to its process boundary",
+                )
+            # The record is durable before the suspended provider is allowed to
+            # execute.  A controller crash after this point leaves exact Job
+            # evidence for force-stop/recovery while kill-on-close remains the
+            # immediate safety net.
+            _write_status(
+                lane,
+                {
+                    "provider_state": {
+                        "state": "starting",
+                        "pid": child.pid,
+                        "creation_time": boundary.root_creation_time,
+                        "process_group_id": boundary.process_group_id,
+                        "session_id": boundary.session_id,
+                    },
+                    "process_boundary": boundary.record(),
+                },
+            )
+            getattr(child, "resume")()
+    except Exception:
+        cleanup_proven = boundary is not None and boundary.cleanup(
+            force=True,
+            timeout_seconds=10.0,
+        )
+        if not cleanup_proven:
+            child.terminate()
+            child.wait(timeout=10.0)
+        raise
+    assert boundary is not None
     _write_status(
         lane,
         {

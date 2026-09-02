@@ -26,15 +26,14 @@ from harness_common.process_identity import (
 )
 
 from .models import (
-    ProcessBoundaryInventory,
     ProcessInfo,
     ProcessQuery,
     ProcessSnapshot,
-    iso_utc,
     parse_utc,
 )
 
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
+WINDOWS_CREATE_SUSPENDED = 0x00000004
 BOUNDARY_WAIT_SECONDS = 5.0
 
 
@@ -182,6 +181,171 @@ def spawn_detached(
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
         close_fds=True,
+    )
+
+
+class _WindowsSuspendedProcess:
+    """Small ``Popen``-shaped handle for a natively suspended process."""
+
+    def __init__(self, argv: Sequence[str], process_handle: int, thread_handle: int, pid: int) -> None:
+        self.args = list(argv)
+        self._handle = process_handle
+        self._thread_handle: int | None = thread_handle
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def resume(self) -> None:
+        """Resume the primary thread after its Job Object has been attached."""
+
+        if self._thread_handle is None:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.ResumeThread.argtypes = (ctypes.c_void_p,)
+            kernel32.ResumeThread.restype = ctypes.c_uint32
+            if kernel32.ResumeThread(self._thread_handle) == 0xFFFFFFFF:
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            import _winapi
+
+            _winapi.CloseHandle(self._thread_handle)
+            self._thread_handle = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        import _winapi
+
+        code = _winapi.GetExitCodeProcess(self._handle)
+        if code == 259:  # STILL_ACTIVE
+            return None
+        self.returncode = int(code)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        import _winapi
+
+        if self.poll() is None:
+            milliseconds = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+            result = _winapi.WaitForSingleObject(self._handle, milliseconds)
+            if result == 0x102:  # WAIT_TIMEOUT
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            if result == 0xFFFFFFFF:  # WAIT_FAILED
+                raise OSError("WaitForSingleObject failed")
+        result = self.poll()
+        if result is None:
+            raise OSError("process signaled without an exit code")
+        return result
+
+    def terminate(self) -> None:
+        import _winapi
+
+        if self.poll() is None:
+            _winapi.TerminateProcess(self._handle, 1)
+
+    kill = terminate
+
+    def close(self) -> None:
+        import _winapi
+
+        if self._thread_handle is not None:
+            _winapi.CloseHandle(self._thread_handle)
+            self._thread_handle = None
+        if self._handle is not None:
+            _winapi.CloseHandle(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
+
+
+def _spawn_windows_suspended(
+    argv: Sequence[str],
+    *,
+    cwd: str | Path | None,
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+) -> _WindowsSuspendedProcess:
+    """Create a provider suspended until the caller has attached its Job."""
+
+    import _winapi
+    import msvcrt
+
+    handles: list[int] = []
+    previous_inheritability: dict[int, bool] = {}
+    process_handle: int | None = None
+    thread_handle: int | None = None
+    try:
+        for stream in (stdin, stdout, stderr):
+            handle = int(msvcrt.get_osfhandle(stream.fileno()))
+            if handle == -1:
+                raise OSError("provider standard stream has no native handle")
+            handles.append(handle)
+            if handle not in previous_inheritability:
+                previous_inheritability[handle] = os.get_handle_inheritable(handle)
+                os.set_handle_inheritable(handle, True)
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
+        startupinfo.hStdInput, startupinfo.hStdOutput, startupinfo.hStdError = handles
+        process_handle, thread_handle, pid, _tid = _winapi.CreateProcess(
+            None,
+            subprocess.list2cmdline(list(argv)),
+            None,
+            None,
+            True,
+            WINDOWS_CREATE_NO_WINDOW | WINDOWS_CREATE_SUSPENDED,
+            None,
+            str(cwd) if cwd is not None else None,
+            startupinfo,
+        )
+        return _WindowsSuspendedProcess(argv, process_handle, thread_handle, pid)
+    except BaseException:
+        if thread_handle is not None:
+            _winapi.CloseHandle(thread_handle)
+        if process_handle is not None:
+            _winapi.CloseHandle(process_handle)
+        raise
+    finally:
+        for handle, inheritable in previous_inheritability.items():
+            os.set_handle_inheritable(handle, inheritable)
+
+
+def spawn_provider(
+    argv: Sequence[str],
+    *,
+    cwd: str | Path,
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+) -> subprocess.Popen[Any] | _WindowsSuspendedProcess:
+    """Start a provider, suspended on Windows until its boundary is complete."""
+
+    if os.name == "nt":
+        return _spawn_windows_suspended(
+            argv,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    return subprocess.Popen(
+        list(argv),
+        cwd=str(cwd),
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=0,
+        start_new_session=True,
     )
 
 
@@ -962,83 +1126,3 @@ def process_boundary_is_gone(record: dict[str, Any]) -> bool:
     if not boundary.root_creation_time or not boundary.observe():
         return False
     return boundary._remaining() == []
-
-
-def process_group_inventory(
-    process_group_id: int | None,
-    *,
-    snapshot_provider: Callable[[], ProcessSnapshot] = process_snapshot,
-    boundary_identity: str | None = None,
-    session_id: int | None = None,
-    root_pid: int | None = None,
-    root_identity: ProcessInfo | None = None,
-    controller_pid: int | None = None,
-    owned_history: Sequence[ProcessInfo] = (),
-) -> ProcessBoundaryInventory:
-    """Return a generic POSIX or Windows boundary inventory.
-
-    This compatibility reader is intentionally read-only.  Live controller
-    cleanup uses :class:`ProcessBoundary`, which carries opaque exact creation
-    identities suitable for termination.
-    """
-
-    valid_group = process_group_id is None or (
-        isinstance(process_group_id, int) and not isinstance(process_group_id, bool) and process_group_id > 0
-    )
-    valid_session = session_id is None or (
-        isinstance(session_id, int) and not isinstance(session_id, bool) and session_id > 0
-    )
-    valid_root = root_pid is None or (_valid_pid(root_pid))
-    kind = "windows-job" if os.name == "nt" else "posix-process-group"
-    source = "windows-cim" if os.name == "nt" else (
-        "darwin-libproc" if sys.platform == "darwin" else "linux-proc"
-    )
-    if not valid_group or not valid_session or not valid_root:
-        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=("process boundary identity is invalid",), source=source)
-    if root_pid is None or root_identity is None or root_identity.created_utc is None:
-        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=("complete descendant boundary identity is unavailable",), source=source)
-    snapshot = snapshot_provider()
-    if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
-        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=getattr(snapshot, "errors", ("process snapshot is incomplete",)), source=source)
-    root_key = (root_identity.pid, iso_utc(root_identity.created_utc) or "")
-    known = {
-        (item.pid, iso_utc(item.created_utc) or ""): item
-        for item in tuple(owned_history) + (root_identity,)
-        if item.created_utc is not None
-    }
-    selected: dict[tuple[int, str], ProcessInfo] = {}
-    errors: list[str] = []
-    for item in snapshot.processes:
-        key = (item.pid, iso_utc(item.created_utc) or "")
-        if key in known or (
-            process_group_id is not None and item.process_group_id == process_group_id
-        ) or (session_id is not None and item.session_id == session_id):
-            if item.created_utc is None:
-                errors.append(f"owned PID {item.pid} lacks a creation identity")
-            else:
-                selected[key] = item
-    changed = True
-    while changed:
-        changed = False
-        parent_pids = {item.pid for item in selected.values()}
-        for item in snapshot.processes:
-            if item.ppid not in parent_pids or item.created_utc is None:
-                continue
-            key = (item.pid, iso_utc(item.created_utc) or "")
-            if key not in selected:
-                selected[key] = item
-                changed = True
-    if root_pid in {item.pid for item in selected.values()}:
-        root = next(item for item in selected.values() if item.pid == root_pid)
-        if (root.pid, iso_utc(root.created_utc) or "") != root_key:
-            errors.append(f"root PID {root_pid} creation identity was reused")
-    members = tuple(sorted(selected.values(), key=lambda item: item.pid))
-    return ProcessBoundaryInventory(
-        not errors,
-        kind,
-        boundary_identity or f"group:{process_group_id}:session:{session_id}",
-        processes=members,
-        observed_processes=tuple(sorted(known.values(), key=lambda item: item.pid)),
-        errors=tuple(errors),
-        source=source,
-    )
