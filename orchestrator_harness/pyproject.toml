@@ -15,14 +15,22 @@ package-dir = { orchestrator_harness = ".", harness_common = "../harness_common"
 packages = [
     "orchestrator_harness",
     "orchestrator_harness.assets",
+    "orchestrator_harness.assets.claude",
     "orchestrator_harness.assets.codex",
     "orchestrator_harness.assets.qwen",
     "orchestrator_harness.assets.rules",
+    "orchestrator_harness.provider_adapters",
+    "orchestrator_harness.provider_adapters.claude-code",
+    "orchestrator_harness.provider_adapters.codex",
+    "orchestrator_harness.provider_adapters.qwen-code",
     "harness_common",
 ]
 
 [tool.setuptools.package-data]
 orchestrator_harness = [
+    "assets/claude/*.json",
+    "assets/claude/*.py",
+    "assets/codex/bounded-exclusions.gitignore",
     "assets/codex/*.json",
     "assets/codex/*.py",
     "assets/qwen/*.json",
@@ -32,6 +40,9 @@ orchestrator_harness = [
     "assets/release/examples/*.json",
     "assets/release/examples/*.md",
     "assets/release/templates/*.md",
+    "config.example.json",
+    "install_wsl_codex.ps1",
+    "provider_adapters/*/launcher_binding.py",
 ]
 
 [tool.setuptools.data-files]
