@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from . import processes
-from .config import find_harness_root, load_config
+from .config import (
+    compute_config_identity,
+    find_harness_root,
+    load_config,
+    load_resource_manifest,
+)
 from .core import iso_utc, read_json, require_schema, utc_now
 from .epochs import (
     ACTIVE_LANES_SCHEMA,
@@ -311,6 +316,8 @@ def _heartbeat(rt: Path, config_identity: str) -> None:
             record = None
         if record is None:
             return
+        if record.get("config_identity") != config_identity:
+            return
         record["health"] = "healthy"
         record["last_heartbeat_at"] = iso_utc()
         atomic_write_json(record_path, record)
@@ -326,12 +333,14 @@ def main() -> int:
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
+        manifest = load_resource_manifest(harness_root)
+        config_identity = compute_config_identity(config, manifest)
     except Exception as exc:
         return 1
     rt = config.runtime_root
     while True:
         try:
-            run_monitor_once(rt, config.profile)
+            run_monitor_once(rt, config_identity)
         except Exception:
             pass
         record = read_monitor_record(rt)

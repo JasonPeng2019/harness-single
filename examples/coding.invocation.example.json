@@ -1,41 +1,35 @@
 {
-  "schema": "orchestrator-coding-invocation/v1",
-  "action": "start",
-  "runtime_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch",
-  "resource_lock_root": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/coding-resource-locks",
-  "run_root": "C:/absolute/path/to/project-worktrees/parser",
-  "repository": {
-    "common_dir": "C:/absolute/path/to/repository/.git",
-    "worktree_root": "C:/absolute/path/to/project-worktrees/parser",
-    "branch": "lane/parser",
-    "base_commit": "0123456789abcdef0123456789abcdef01234567",
-    "merge_inputs": []
-  },
-  "prompt_path": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker-prompt.md",
-  "prompt_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "output_paths": {
-    "status": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_controller.status.json",
-    "jsonl": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_codex.jsonl",
-    "stderr": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_codex.stderr.log",
-    "last_message": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker_last_message.txt"
-  },
-  "event_log_path": "C:/absolute/path/to/runtime/orchestrator-harness/example-epoch/LANE_EVENTS.jsonl",
+  "schema": "controller-invocation/v1",
   "lane_id": "parser",
-  "worker_invocation_id": "parser-001",
-  "task": "Implement the parser and focused tests",
-  "phase": "implementation",
+  "run_id": "parser-001",
+  "provider": {
+    "id": "codex",
+    "model": "gpt-5.6-terra"
+  },
   "exclusive_resources": [
     "service:integration-database"
   ],
-  "codex": {
-    "command": [
-      "codex"
-    ],
-    "model": "gpt-5.6-terra",
-    "reasoning_effort": "high",
-    "service_tier": "priority",
-    "sandbox": "danger-full-access",
-    "approval_policy": "never",
-    "config_overrides": []
-  }
+  "launcher": {
+    "entry": "python -m orchestrator_harness.controller",
+    "argv": [
+      "python",
+      "-m",
+      "orchestrator_harness.controller",
+      "parser"
+    ]
+  },
+  "env": {},
+  "cwd": "C:/absolute/path/to/project-worktrees/parser",
+  "paths": {
+    "worktree": "C:/absolute/path/to/project-worktrees/parser",
+    "result": "C:/absolute/path/to/project-worktrees/parser/RESULT.json",
+    "controller_status": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/controller.status.json",
+    "controller_events": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/controller.events.jsonl",
+    "transcript": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/provider-transcript.jsonl",
+    "stderr": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/provider-stderr.txt",
+    "last_message": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/last-message.txt",
+    "prompt": "C:/absolute/path/to/project-worktrees/parser/.agent-workspace/worker-prompt.md"
+  },
+  "created_at": "2026-08-03T10:00:00Z",
+  "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }

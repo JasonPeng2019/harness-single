@@ -7,7 +7,6 @@ import unittest
 from datetime import datetime, timezone
 
 from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
-from orchestrator_harness.process_supervisor import ProcessBoundary
 from orchestrator_harness.processes import (
     WINDOWS_CIM_SCRIPT,
     WINDOWS_CREATE_NO_WINDOW,
@@ -89,13 +88,6 @@ class ProcessProviderTests(unittest.TestCase):
         self.assertEqual("-Command", captured["argv"][-2])
         self.assertNotIn("shell", captured["kwargs"])
         self.assertEqual(WINDOWS_CREATE_NO_WINDOW, captured["kwargs"]["creationflags"])
-
-    def test_windows_provider_boundary_suppresses_console_window(self) -> None:
-        boundary = ProcessBoundary(kind="windows-job")
-        self.assertEqual(
-            0x00000004 | WINDOWS_CREATE_NO_WINDOW,
-            boundary.popen_kwargs["creationflags"],
-        )
 
     def test_windows_provider_fails_unknown_on_cim_error(self) -> None:
         def runner(argv, **kwargs):

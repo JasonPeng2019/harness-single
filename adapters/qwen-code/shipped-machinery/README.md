@@ -10,6 +10,5 @@ Notes for adapter authors maintaining the Qwen Code payload.
 - Hooks: `hooks.json` declares the PostToolUse hook; the hook script appends
   liveness receipts and, for ROOT with `HARNESS_EVENT_ID`, managed delivery
   receipts.
-- The binding delegates to
-  `orchestrator_harness.provider.QwenCodeProviderAdapter` so shipped flags
-  and parsing stay conformant with the runtime adapter.
+- The binding directly owns the strict provider contract, so shipped flags and
+  parsing stay conformant with the v2 controller.

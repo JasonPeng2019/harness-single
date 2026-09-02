@@ -26,6 +26,7 @@ from . import processes
 from .config import (
     ConfigError,
     HarnessConfig,
+    compute_config_identity,
     find_harness_root,
     load_config,
     load_resource_manifest,
@@ -386,7 +387,12 @@ def _check_launcher_bindings(harness_root: Path) -> list[Path]:
     return checked
 
 
-def _start_monitor(harness_root: Path, rt: Path, config: HarnessConfig) -> dict[str, Any]:
+def _start_monitor(
+    harness_root: Path,
+    rt: Path,
+    config: HarnessConfig,
+    config_identity: str,
+) -> dict[str, Any]:
     """Start the one persistent monitor under the monitor-record lock."""
     record_path = monitor_record_path(rt)
     with RecordLock(record_path):
@@ -407,7 +413,7 @@ def _start_monitor(harness_root: Path, rt: Path, config: HarnessConfig) -> dict[
             raise ConfigError("cannot record monitor process identity")
         record = {
             "schema": MONITOR_SCHEMA,
-            "config_identity": config.profile,
+            "config_identity": config_identity,
             "pid": identity["pid"],
             "creation_time": identity["creation_time"],
             "started_at": iso_utc(),
@@ -572,7 +578,12 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         (rt / "resources" / "leases").mkdir(parents=True, exist_ok=True)
 
         try:
-            monitor = _start_monitor(harness_root, rt, config)
+            monitor = _start_monitor(
+                harness_root,
+                rt,
+                config,
+                compute_config_identity(config, manifest),
+            )
         except ConfigError as exc:
             if str(exc) == SETUP_MONITOR_ALREADY_RUNNING:
                 return {

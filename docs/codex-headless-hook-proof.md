@@ -5,25 +5,19 @@ an actual successful run, not a synthetic adapter self-test.
 
 ## Preconditions
 
-1. Prepare the exact lane and install the Codex adapter.
-2. The manager creates and owns the real `ManagerEventRouter`.
-3. Bind the lane to that already-registered queue before launching:
+1. Prepare the exact lane with the native v2 `lane bootstrap` command.
+2. The manager creates and owns the real managed queue.
+3. Admit a real pending manager event, then start the lane with the native
+   `lane launch` command. The controller loads the shipped direct binding.
 
-   ```powershell
-   python -m orchestrator_harness adapter bind --host codex --project-root $lane --queue-root $managerQueue
-   ```
-
-4. Admit a real pending manager event, then start a fresh lane through the
-   native `operator_launch` followed by `lane_controller` path.
-
-The binding is deliberately manager-owned: it carries the exact queue,
-registration, manager-session, and coordinator identities. `adapter bind` does
-not make a synthetic queue or choose those values itself.
+The binding is shipped/read-only and provider-owned: it carries only the strict
+provider identity/version/argv/parser contract. The v2 controller owns queue,
+registration, and lifecycle state.
 
 ## Live result
 
 On 2026-08-27, Windows Codex CLI `0.150.1` launched GPT-5.6 Luna at medium
-reasoning through the firmware-v2 `operator_launch -> lane_controller` path.
+reasoning through the firmware-v2 operator/lane route.
 The disposable worker's only tool action was `git status --short`; it ended
 normally with its expected proof marker.
 
@@ -44,7 +38,6 @@ not manager acknowledgement or queue mutation.
 ## Failure and recovery
 
 If a Codex hook reports `installed Codex hook has no harness binding`, the
-hook command did execute, but the manager omitted the binding step. Bind the
-prepared lane to the real registered queue and start a fresh provider session.
-If the queue is missing, stale, or belongs to a different binding, `adapter
-bind` fails rather than redirecting the lane to a guessed queue.
+hook command did execute without the lane's shipped binding record. Re-run
+bootstrap with the catalog intact and start a fresh provider session. The v2
+route does not create or guess a manager queue from a provider command.

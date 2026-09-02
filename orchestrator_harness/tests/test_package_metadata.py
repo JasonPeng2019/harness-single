@@ -26,9 +26,7 @@ PYPROJECT_PATH = PACKAGE_ROOT / "pyproject.toml"
 REQUIRED_PACKAGES = (
     "orchestrator_harness",
     "orchestrator_harness.assets",
-    "orchestrator_harness.assets.claude",
     "orchestrator_harness.assets.codex",
-    "orchestrator_harness.assets.qwen",
     "orchestrator_harness.assets.rules",
     "orchestrator_harness.provider_adapters",
     "orchestrator_harness.provider_adapters.claude-code",
@@ -39,10 +37,6 @@ REQUIRED_PACKAGES = (
 
 # Package-owned assets that must be declared as package data.
 REQUIRED_PACKAGE_DATA = (
-    "assets/claude/manifest.json",
-    "assets/claude/settings.fragment.json",
-    "assets/claude/orchestrator_harness_post_tool_use.py",
-    "assets/claude/orchestrator_harness_stop.py",
     "assets/codex/bounded-exclusions.gitignore",
     "config.example.json",
     "install_wsl_codex.ps1",
@@ -99,6 +93,28 @@ def _on_disk_required_files() -> list[str]:
 
 
 class PackageMetadataStaticTests(unittest.TestCase):
+    def test_runtime_and_build_versions_are_coherent(self) -> None:
+        pyproject = _load_pyproject()
+        self.assertEqual("2.0.0", pyproject["project"]["version"])
+        package_init = (PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('__version__ = "2.0.0"', package_init)
+        metadata = (PACKAGE_ROOT / "portable_orchestrator_harness.egg-info" / "PKG-INFO").read_text(encoding="utf-8")
+        self.assertIn("Version: 2.0.0", metadata)
+
+    def test_removed_candidate_modules_are_not_packaged(self) -> None:
+        removed = (
+            "provider.py",
+            "invocation.py",
+            "prompt_bundle.py",
+            "host_adapters.py",
+            "lane_controller.py",
+            "public_launch.py",
+            "cli.py",
+            "resume_admission.py",
+        )
+        for name in removed:
+            self.assertFalse((PACKAGE_ROOT / name).exists(), name)
+
     def test_packages_cover_every_runtime_module(self) -> None:
         pyproject = _load_pyproject()
         declared = set(pyproject["tool"]["setuptools"]["packages"])
@@ -200,9 +216,7 @@ class PackageWheelBuildTests(unittest.TestCase):
             required_entries = (
                 "orchestrator_harness/__init__.py",
                 "orchestrator_harness/release_checks.py",
-                "orchestrator_harness/public_launch.py",
-                "orchestrator_harness/cli.py",
-                "orchestrator_harness/claude_installer.py",
+                "orchestrator_harness/operator_launch.py",
                 "orchestrator_harness/provider_adapters/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
@@ -210,11 +224,6 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "orchestrator_harness/provider_adapters/claude-code/launcher_binding.py",
                 "orchestrator_harness/provider_adapters/qwen-code/__init__.py",
                 "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
-                "orchestrator_harness/assets/claude/__init__.py",
-                "orchestrator_harness/assets/claude/manifest.json",
-                "orchestrator_harness/assets/claude/settings.fragment.json",
-                "orchestrator_harness/assets/claude/orchestrator_harness_post_tool_use.py",
-                "orchestrator_harness/assets/claude/orchestrator_harness_stop.py",
                 "orchestrator_harness/assets/codex/bounded-exclusions.gitignore",
                 "orchestrator_harness/config.example.json",
                 "orchestrator_harness/install_wsl_codex.ps1",

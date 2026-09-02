@@ -1,22 +1,9 @@
-"""Registered launcher binding for the Claude Code provider.
-
-The controller loads this module from
-``orchestrator_harness/provider_adapters/<provider_id>/launcher_binding.py``
-and checks that ``PROVIDER_ID`` matches before use.  ``build_argv`` assembles
-the headless launch vector and ``parse_line`` reads one transcript line into
-controller facts; both delegate to the current runtime adapter so the shipped
-flags and parsing stay conformant with ``orchestrator_harness.provider``.
-"""
+"""Direct v2 launcher binding for Claude Code."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 from typing import Any
-
-from orchestrator_harness.provider import (
-    ClaudeCodeProviderAdapter,
-    ProviderLaunchSpec,
-)
 
 PROVIDER_ID = "claude-code"
 ADAPTER_VERSION = "claude-code-v1"
@@ -30,34 +17,47 @@ def build_argv(
     session_id: str | None = None,
     resume: bool = False,
 ) -> list[str]:
-    """Assemble the Claude Code headless launch argument vector.
-
-    The prompt is transported on stdin; ``prompt_path`` is accepted for
-    contract symmetry with the controller.
-    """
-    adapter = ClaudeCodeProviderAdapter()
-    spec = ProviderLaunchSpec(
-        action="resume" if resume else "start",
-        command=("claude",),
-        model=model,
-        reasoning_effort="medium",
-        service_tier="priority",
-        session_id=session_id,
-        run_root=Path(worktree),
-        last_message_path=Path(worktree) / ".agent-workspace" / "last-message.txt",
-        approval_policy="never",
-    )
-    return adapter.build_argv(spec)
+    """Build the provider-owned, stdin-prompted Claude Code launch vector."""
+    del worktree, prompt_path
+    argv = ["claude", "--print", "--output-format", "stream-json", "--verbose"]
+    if resume:
+        if not session_id:
+            raise ValueError("Claude Code resume requires a session ID")
+        argv.extend(["--resume", session_id])
+    if model:
+        argv.extend(["--model", model])
+    argv.extend(["--permission-mode", "bypassPermissions"])
+    return argv
 
 
 def parse_line(line: str) -> dict[str, Any] | None:
-    """Read one Claude Code transcript line into controller facts."""
-    event = ClaudeCodeProviderAdapter().parse_transcript_line(line.encode("utf-8"))
-    if event is None:
+    """Parse one Claude Code JSON transcript line into controller facts."""
+    try:
+        value = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
         return None
+    if not isinstance(value, dict):
+        return None
+    raw_type = value.get("type")
+    session_id = value.get("session_id") or value.get("sessionId")
     parsed: dict[str, Any] = {}
-    if event.session_id:
-        parsed["session_id"] = event.session_id
-    if event.kind in {"COMPLETED", "FAILED", "CANCELLED"}:
-        parsed["message"] = event.detail or event.raw_type or event.kind
+    if isinstance(session_id, str) and session_id:
+        parsed["session_id"] = session_id
+    if raw_type == "system" and value.get("subtype") == "init":
+        return parsed
+    if raw_type == "system" and value.get("subtype") == "permission_denied":
+        parsed["message"] = value.get("message") or "permission_denied"
+        return parsed
+    if raw_type != "result":
+        return None
+    denials = value.get("permission_denials")
+    subtype = value.get("subtype")
+    if (
+        value.get("is_error") is True
+        or subtype in {"error", "error_during_execution"}
+        or (isinstance(denials, list) and bool(denials))
+    ):
+        parsed["message"] = value.get("result") or subtype or "error"
+        return parsed
+    parsed["message"] = "result"
     return parsed

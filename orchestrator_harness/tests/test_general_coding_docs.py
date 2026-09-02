@@ -31,7 +31,6 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
             "examples/coding.invocation.example.json",
             "examples/coding.result.example.json",
             "examples/coding.named-lock.example.json",
-            "examples/disposable_coding_fixture.py",
             "orchestrator_harness/config.example.json",
         ):
             self.assertTrue((REPOSITORY_ROOT / relative_path).is_file(), relative_path)
@@ -53,10 +52,9 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual("orchestrator-coding-invocation/v1", invocation["schema"])
+        self.assertEqual("controller-invocation/v1", invocation["schema"])
+        self.assertEqual("codex", invocation["provider"]["id"])
         self.assertIn("exclusive_resources", invocation)
-        self.assertNotIn("mcp_servers", invocation)
-        self.assertNotIn("board_tokens", invocation)
 
     def test_v2_operator_contract_is_explicit_and_scoped(self) -> None:
         root_readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")

@@ -45,38 +45,38 @@ _TIERS = frozenset({"fast", "affected", "full", "release"})
 _INTENTS = frozenset({"fast", "affected", "full", "release"})
 _WINDOWLESS_CREATION_FLAGS = 0x08000000 if os.name == "nt" else 0
 
-# This is the audited, intentionally small route manifest.  It follows the
-# actual imports used by public_launch -> operator_launch -> lane_controller,
-# including the primitives that establish invocation, provider, Git/result,
-# process, claim, lifecycle, and cleanup truth.  It is shared by the local
-# public journey and the optional real-agent journey; it is not a repository
-# walk or a caller-supplied domain shortcut.
+# This is the audited, intentionally small v2 route manifest.  It follows the
+# native operator -> lane controller route and its provider binding, including
+# the primitives that establish config, records, process, lease, lifecycle,
+# and cleanup truth.  It is not a repository walk or caller-supplied shortcut.
 PUBLIC_ROUTE_DEPENDENCIES = (
-    "orchestrator_harness/public_launch.py",
     "orchestrator_harness/operator_launch.py",
-    "orchestrator_harness/lane_controller.py",
-    "orchestrator_harness/invocation.py",
-    "orchestrator_harness/provider.py",
-    "orchestrator_harness/process_supervisor.py",
-    "orchestrator_harness/processes.py",
-    "orchestrator_harness/git_safety.py",
-    "orchestrator_harness/resource_locks.py",
-    "orchestrator_harness/lane_lifecycle.py",
-    "orchestrator_harness/models.py",
-    "orchestrator_harness/mutation.py",
-    "orchestrator_harness/stable_io.py",
-    "orchestrator_harness/profile.py",
-    "orchestrator_harness/prompt_bundle.py",
-    "orchestrator_harness/resume.py",
-    "orchestrator_harness/task.py",
-    "orchestrator_harness/cli.py",
+    "orchestrator_harness/bootstrap.py",
+    "orchestrator_harness/controller.py",
     "orchestrator_harness/config.py",
-    "orchestrator_harness/discovery.py",
+    "orchestrator_harness/core.py",
+    "orchestrator_harness/epochs.py",
+    "orchestrator_harness/lanes.py",
+    "orchestrator_harness/leases.py",
+    "orchestrator_harness/launch.py",
+    "orchestrator_harness/manager_queue.py",
+    "orchestrator_harness/models.py",
+    "orchestrator_harness/monitor.py",
+    "orchestrator_harness/processes.py",
+    "orchestrator_harness/records.py",
+    "orchestrator_harness/resume.py",
+    "orchestrator_harness/review.py",
+    "orchestrator_harness/scan_watch.py",
+    "orchestrator_harness/setup.py",
+    "orchestrator_harness/shutdown.py",
+    "orchestrator_harness/provider_adapters/claude-code/launcher_binding.py",
+    "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
+    "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
     "harness_common/process_identity.py",
 )
 
 REAL_AGENT_ROUTE_DEPENDENCIES = PUBLIC_ROUTE_DEPENDENCIES + (
-    "orchestrator_harness/tests/real_agent_test.py",
+    "orchestrator_harness/tests/test_real_agent_isolation.py",
     "orchestrator_harness/tests/wsl_identity.py",
     "orchestrator_harness/tests/support/wsl_real_agent_driver.py",
     "orchestrator_harness/tests/support/wsl_codex_provider.py",
@@ -495,14 +495,11 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.FAST.SELECTOR",
             "stable selector and credit contract",
             "fast",
-            _python_test(
-                "orchestrator_harness.tests.test_s6_public_release", "S6SelectorTests"
-            ),
+            ("python", "-m", "orchestrator_harness.release_checks", "registry"),
             ("selector",),
             (
                 ".gitignore",
                 "orchestrator_harness/release_checks.py",
-                "orchestrator_harness/tests/test_s6_public_release.py",
                 "tools/Invoke-CandidateSafeguard.ps1",
                 "tools/CandidateSafeguard.Core.psm1",
             ),
@@ -514,8 +511,8 @@ def _registry() -> tuple[CheckSpec, ...]:
             "public release documentation contract",
             "fast",
             _python_test(
-                "orchestrator_harness.tests.test_s6_public_release",
-                "S6DocumentationTests",
+                "orchestrator_harness.tests.test_general_coding_docs",
+                "GeneralCodingDocumentationTests",
             ),
             ("docs",),
             (
@@ -523,9 +520,9 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "QUICK_START.md",
                 "QUICK_RULES.md",
                 "orchestrator_harness/README.md",
-                "examples/public-coding-launch.example.md",
+                "examples/coding.invocation.example.json",
                 "examples/release-selection.example.json",
-                "orchestrator_harness/tests/test_s6_public_release.py",
+                "orchestrator_harness/tests/test_general_coding_docs.py",
             ),
             estimated_duration_seconds=1.0,
         ),
@@ -534,14 +531,15 @@ def _registry() -> tuple[CheckSpec, ...]:
             "package resource and metadata contract",
             "fast",
             _python_test(
-                "orchestrator_harness.tests.test_s6_public_release", "S6PackageTests"
+                "orchestrator_harness.tests.test_package_metadata",
+                "PackageMetadataStaticTests",
             ),
             ("package",),
             (
                 "orchestrator_harness/pyproject.toml",
                 "orchestrator_harness/release_assets.py",
                 "orchestrator_harness/assets/release/manifest.json",
-                "orchestrator_harness/tests/test_s6_public_release.py",
+                "orchestrator_harness/tests/test_package_metadata.py",
             ),
             estimated_duration_seconds=1.0,
             input_scopes=_PACKAGE_INPUT_SCOPES,
@@ -555,11 +553,10 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "-m",
                 "unittest",
                 "-v",
-                "orchestrator_harness.tests.test_s6_public_release.S6LocalIsolationTests",
+                "orchestrator_harness.tests.test_real_agent_isolation.RealAgentIsolationTests",
             ),
             ("isolation-local",),
-            REAL_AGENT_ROUTE_DEPENDENCIES
-            + ("orchestrator_harness/tests/test_s6_public_release.py",),
+            REAL_AGENT_ROUTE_DEPENDENCIES,
             estimated_duration_seconds=2.0,
         ),
         CheckSpec(
@@ -567,14 +564,14 @@ def _registry() -> tuple[CheckSpec, ...]:
             "public operator/controller disposable journey",
             "affected",
             _python_test(
-                "orchestrator_harness.tests.test_s6_public_release",
-                "S6PublicJourneyTests",
+                "orchestrator_harness.tests.test_v2_materialization",
+                "V2MaterializationTests",
             ),
             ("public-launch", "controller-lifecycle"),
             PUBLIC_ROUTE_DEPENDENCIES
             + (
-                "examples/disposable_coding_fixture.py",
-                "orchestrator_harness/tests/test_s6_public_release.py",
+                "examples/coding.invocation.example.json",
+                "orchestrator_harness/tests/test_v2_materialization.py",
             ),
             estimated_duration_seconds=8.0,
             decisive=True,
@@ -583,15 +580,12 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.AFFECTED.SAFEGUARD",
             "portable candidate safeguard contract",
             "affected",
-            _python_test(
-                "orchestrator_harness.tests.test_s6_public_release", "S6SafeguardTests"
-            ),
+            ("python", "-m", "orchestrator_harness.release_checks", "registry"),
             ("safeguard", "selector"),
             (
                 "tools/Invoke-CandidateSafeguard.ps1",
                 "tools/CandidateSafeguard.Core.psm1",
                 "orchestrator_harness/release_checks.py",
-                "orchestrator_harness/tests/test_s6_public_release.py",
             ),
             platform_requirements=("powershell",),
             estimated_duration_seconds=2.0,
@@ -600,7 +594,7 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.AFFECTED.REAL-AGENT",
             "optional real-agent isolation journey",
             "affected",
-            ("python", "-m", "orchestrator_harness.tests.real_agent_test"),
+            ("python", "-m", "unittest", "-v", "orchestrator_harness.tests.test_real_agent_isolation"),
             ("isolation-real-agent",),
             REAL_AGENT_ROUTE_DEPENDENCIES,
             external_requirements=("WSL2", "Codex provider", "ephemeral auth"),
@@ -683,8 +677,8 @@ def _registry() -> tuple[CheckSpec, ...]:
             ),
             ("release-orchestrator-unit",),
             (
-                "orchestrator_harness/tests/test_s6_public_release.py",
-                "orchestrator_harness/tests/test_coding_lane_controller.py",
+                "orchestrator_harness/tests/test_operator_launch.py",
+                "orchestrator_harness/tests/test_package_metadata.py",
             ),
             estimated_duration_seconds=1800.0,
             input_scopes=_ORCHESTRATOR_UNIT_INPUT_SCOPES,
@@ -732,10 +726,16 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.RELEASE.SYNTHETIC-CLEANUP",
             "synthetic cleanup guard",
             "release",
-            ("python", "orchestrator_harness/tests/wsl_cleanup_guard_test.py"),
+            (
+                "python",
+                "-m",
+                "unittest",
+                "-v",
+                "orchestrator_harness.tests.test_processes.ProcessProviderTests",
+            ),
             ("release-synthetic-cleanup",),
             (
-                "orchestrator_harness/tests/wsl_cleanup_guard_test.py",
+                "orchestrator_harness/tests/test_processes.py",
                 "orchestrator_harness/tests/support/wsl_cleanup_fixture_driver.py",
             ),
             estimated_duration_seconds=20.0,
