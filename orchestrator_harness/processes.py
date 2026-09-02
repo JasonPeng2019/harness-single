@@ -34,6 +34,12 @@ from .models import (
 
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
 WINDOWS_CREATE_SUSPENDED = 0x00000004
+WINDOWS_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+WINDOWS_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D
+WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+WINDOWS_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 BOUNDARY_WAIT_SECONDS = 5.0
 
 
@@ -184,15 +190,116 @@ def spawn_detached(
     )
 
 
+def _close_windows_handle(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        import _winapi
+
+        _winapi.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _create_kill_on_close_job() -> int:
+    """Create one anonymous Windows Job Object with kill-on-close enabled."""
+
+    import ctypes
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            (name, ctypes.c_uint64)
+            for name in (
+                "read_operations",
+                "write_operations",
+                "other_operations",
+                "read_bytes",
+                "write_bytes",
+                "other_bytes",
+            )
+        ]
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("per_process_user_time", ctypes.c_int64),
+            ("per_job_user_time", ctypes.c_int64),
+            ("limit_flags", ctypes.c_uint32),
+            ("minimum_working_set_size", ctypes.c_void_p),
+            ("maximum_working_set_size", ctypes.c_void_p),
+            ("active_process_limit", ctypes.c_uint32),
+            ("affinity", ctypes.c_void_p),
+            ("priority_class", ctypes.c_uint32),
+            ("scheduling_class", ctypes.c_uint32),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("basic", BasicLimits),
+            ("io", IoCounters),
+            ("process_memory_limit", ctypes.c_void_p),
+            ("job_memory_limit", ctypes.c_void_p),
+            ("peak_process_memory_used", ctypes.c_void_p),
+            ("peak_job_memory_used", ctypes.c_void_p),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        limits = ExtendedLimits()
+        limits.basic.limit_flags = WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job,
+            WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            _close_windows_handle(job)
+            raise ctypes.WinError(error)
+        return int(job)
+    except BaseException:
+        _close_windows_handle(job)
+        raise
+
+
 class _WindowsSuspendedProcess:
     """Small ``Popen``-shaped handle for a natively suspended process."""
 
-    def __init__(self, argv: Sequence[str], process_handle: int, thread_handle: int, pid: int) -> None:
+    def __init__(
+        self,
+        argv: Sequence[str],
+        process_handle: int,
+        thread_handle: int,
+        pid: int,
+        job_handle: int | None = None,
+    ) -> None:
         self.args = list(argv)
         self._handle = process_handle
         self._thread_handle: int | None = thread_handle
+        self._job_handle: int | None = job_handle
         self.pid = pid
         self.returncode: int | None = None
+
+    def take_job_handle(self) -> int | None:
+        """Transfer ownership of the preassigned Job handle to ProcessBoundary."""
+
+        handle = self._job_handle
+        self._job_handle = None
+        return handle
 
     def resume(self) -> None:
         """Resume the primary thread after its Job Object has been attached."""
@@ -248,13 +355,16 @@ class _WindowsSuspendedProcess:
     kill = terminate
 
     def close(self) -> None:
-        import _winapi
-
+        # Closing the Job first is the last-resort containment path if this
+        # wrapper is abandoned before ProcessBoundary takes ownership.
+        if self._job_handle is not None:
+            _close_windows_handle(self._job_handle)
+            self._job_handle = None
         if self._thread_handle is not None:
-            _winapi.CloseHandle(self._thread_handle)
+            _close_windows_handle(self._thread_handle)
             self._thread_handle = None
         if self._handle is not None:
-            _winapi.CloseHandle(self._handle)
+            _close_windows_handle(self._handle)
             self._handle = None
 
     def __del__(self) -> None:
@@ -272,16 +382,59 @@ def _spawn_windows_suspended(
     stdout: Any,
     stderr: Any,
 ) -> _WindowsSuspendedProcess:
-    """Create a provider suspended until the caller has attached its Job."""
+    """Create a suspended provider already owned by a kill-on-close Job."""
 
-    import _winapi
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
+
+    class StartupInfo(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", ctypes.c_wchar_p),
+            ("lpDesktop", ctypes.c_wchar_p),
+            ("lpTitle", ctypes.c_wchar_p),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class StartupInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("startup_info", StartupInfo),
+            ("attribute_list", ctypes.c_void_p),
+        ]
+
+    class ProcessInformation(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
 
     handles: list[int] = []
     previous_inheritability: dict[int, bool] = {}
+    job_handle: int | None = None
     process_handle: int | None = None
     thread_handle: int | None = None
+    attribute_buffer: Any = None
+    attribute_initialized = False
+    native_error: BaseException | None = None
+    result: _WindowsSuspendedProcess | None = None
     try:
+        job_handle = _create_kill_on_close_job()
         for stream in (stdin, stdout, stderr):
             handle = int(msvcrt.get_osfhandle(stream.fileno()))
             if handle == -1:
@@ -291,30 +444,131 @@ def _spawn_windows_suspended(
                 previous_inheritability[handle] = os.get_handle_inheritable(handle)
                 os.set_handle_inheritable(handle, True)
 
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= _winapi.STARTF_USESTDHANDLES
-        startupinfo.hStdInput, startupinfo.hStdOutput, startupinfo.hStdError = handles
-        process_handle, thread_handle, pid, _tid = _winapi.CreateProcess(
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.InitializeProcThreadAttributeList.argtypes = (
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_size_t),
+        )
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        kernel32.UpdateProcThreadAttribute.argtypes = (
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+        )
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+        kernel32.DeleteProcThreadAttributeList.argtypes = (ctypes.c_void_p,)
+        kernel32.DeleteProcThreadAttributeList.restype = None
+        kernel32.CreateProcessW.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ProcessInformation),
+        )
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+
+        attribute_size = ctypes.c_size_t()
+        kernel32.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(attribute_size))
+        if not attribute_size.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
+        attribute_list = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+        startupinfo = StartupInfoEx()
+        startupinfo.startup_info.cb = ctypes.sizeof(StartupInfoEx)
+        startupinfo.startup_info.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
+        startupinfo.startup_info.hStdInput, startupinfo.startup_info.hStdOutput, startupinfo.startup_info.hStdError = handles
+        startupinfo.attribute_list = attribute_list
+        if not kernel32.InitializeProcThreadAttributeList(
+            attribute_list, 2, 0, ctypes.byref(attribute_size)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attribute_initialized = True
+        job_list = (wintypes.HANDLE * 1)(job_handle)
+        handle_list = (wintypes.HANDLE * len(handles))(*handles)
+        if not kernel32.UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            WINDOWS_PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            ctypes.cast(job_list, ctypes.c_void_p),
+            ctypes.sizeof(job_list),
             None,
-            subprocess.list2cmdline(list(argv)),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            WINDOWS_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            ctypes.cast(handle_list, ctypes.c_void_p),
+            ctypes.sizeof(handle_list),
+            None,
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(list(argv)))
+        process_info = ProcessInformation()
+        if not kernel32.CreateProcessW(
+            None,
+            ctypes.cast(command_line, ctypes.c_void_p),
             None,
             None,
             True,
-            WINDOWS_CREATE_NO_WINDOW | WINDOWS_CREATE_SUSPENDED,
+            WINDOWS_CREATE_NO_WINDOW
+            | WINDOWS_CREATE_SUSPENDED
+            | WINDOWS_EXTENDED_STARTUPINFO_PRESENT,
             None,
             str(cwd) if cwd is not None else None,
-            startupinfo,
+            ctypes.byref(startupinfo),
+            ctypes.byref(process_info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process_handle = int(process_info.hProcess)
+        thread_handle = int(process_info.hThread)
+        result = _WindowsSuspendedProcess(
+            argv,
+            process_handle,
+            thread_handle,
+            int(process_info.dwProcessId),
+            job_handle,
         )
-        return _WindowsSuspendedProcess(argv, process_handle, thread_handle, pid)
-    except BaseException:
-        if thread_handle is not None:
-            _winapi.CloseHandle(thread_handle)
-        if process_handle is not None:
-            _winapi.CloseHandle(process_handle)
-        raise
-    finally:
-        for handle, inheritable in previous_inheritability.items():
+    except BaseException as exc:
+        native_error = exc
+    if attribute_initialized:
+        try:
+            kernel32.DeleteProcThreadAttributeList(attribute_list)
+        except BaseException as exc:
+            if native_error is None:
+                native_error = exc
+    for handle, inheritable in previous_inheritability.items():
+        try:
             os.set_handle_inheritable(handle, inheritable)
+        except BaseException as exc:
+            if native_error is None:
+                native_error = exc
+    if native_error is not None:
+        if thread_handle is not None:
+            _close_windows_handle(thread_handle)
+        if process_handle is not None:
+            _close_windows_handle(process_handle)
+        _close_windows_handle(job_handle)
+        raise native_error
+    if result is None or job_handle is None or process_handle is None or thread_handle is None:
+        _close_windows_handle(job_handle)
+        _close_windows_handle(process_handle)
+        _close_windows_handle(thread_handle)
+        raise OSError("Windows provider creation returned incomplete process handles")
+    return result
 
 
 def spawn_provider(
@@ -720,6 +974,7 @@ class ProcessBoundary:
         session_id: int | None = None,
         boundary_kind: str | None = None,
         snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
+        windows_job_handle: Any = None,
     ) -> None:
         self.root_pid = root_pid
         self.root_creation_time = root_creation_time
@@ -738,7 +993,9 @@ class ProcessBoundary:
             self.errors.append("provider root creation identity is unavailable")
         if _valid_pid(root_pid) and isinstance(root_creation_time, str) and root_creation_time:
             self._owned[_identity_key(root_pid, root_creation_time)] = root_process
-        self._job_handle: Any = None
+        self._job_handle: Any = windows_job_handle
+        if windows_job_handle is not None:
+            self.boundary_kind = "windows-job"
         self._last_observation_complete = not self.errors
 
     @classmethod
@@ -747,18 +1004,27 @@ class ProcessBoundary:
         pid: int,
         *,
         snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
+        windows_job_handle: Any = None,
     ) -> "ProcessBoundary":
-        identity = process_identity(pid)
-        query = targeted_process_query(pid) if identity is not None else None
-        process = query.process if query is not None and query.complete else None
-        return cls(
-            pid,
-            identity["creation_time"] if identity is not None else None,
-            root_process=process,
-            process_group_id=process.process_group_id if process else None,
-            session_id=process.session_id if process else None,
-            snapshot_provider=snapshot_provider,
-        )
+        try:
+            identity = process_identity(pid)
+            query = targeted_process_query(pid) if identity is not None else None
+            process = query.process if query is not None and query.complete else None
+            return cls(
+                pid,
+                identity["creation_time"] if identity is not None else None,
+                root_process=process,
+                process_group_id=process.process_group_id if process else None,
+                session_id=process.session_id if process else None,
+                snapshot_provider=snapshot_provider,
+                windows_job_handle=windows_job_handle,
+            )
+        except BaseException:
+            # Until the boundary object is returned, the startup wrapper is
+            # still the Job owner. Do not leave a created provider exposed if
+            # identity discovery or boundary construction itself fails.
+            _close_windows_handle(windows_job_handle)
+            raise
 
     @classmethod
     def from_record(
@@ -786,68 +1052,6 @@ class ProcessBoundary:
                 continue
             boundary._owned[_identity_key(item["pid"], creation)] = None
         return boundary
-
-    def attach_windows_process_handle(self, handle: Any) -> bool:
-        """Attach a Windows provider to a kill-on-close Job Object."""
-
-        if os.name != "nt":
-            return True
-        try:
-            import ctypes
-
-            class IoCounters(ctypes.Structure):
-                _fields_ = [(name, ctypes.c_uint64) for name in (
-                    "read_operations", "write_operations", "other_operations",
-                    "read_bytes", "write_bytes", "other_bytes",
-                )]
-
-            class BasicLimits(ctypes.Structure):
-                _fields_ = [
-                    ("per_process_user_time", ctypes.c_int64),
-                    ("per_job_user_time", ctypes.c_int64),
-                    ("limit_flags", ctypes.c_uint32),
-                    ("minimum_working_set_size", ctypes.c_void_p),
-                    ("maximum_working_set_size", ctypes.c_void_p),
-                    ("active_process_limit", ctypes.c_uint32),
-                    ("affinity", ctypes.c_void_p),
-                    ("priority_class", ctypes.c_uint32),
-                    ("scheduling_class", ctypes.c_uint32),
-                ]
-
-            class ExtendedLimits(ctypes.Structure):
-                _fields_ = [
-                    ("basic", BasicLimits),
-                    ("io", IoCounters),
-                    ("process_memory_limit", ctypes.c_void_p),
-                    ("job_memory_limit", ctypes.c_void_p),
-                    ("peak_process_memory_used", ctypes.c_void_p),
-                    ("peak_job_memory_used", ctypes.c_void_p),
-                ]
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
-            kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-            kernel32.SetInformationJobObject.argtypes = (
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32
-            )
-            kernel32.SetInformationJobObject.restype = ctypes.c_int
-            kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-            kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-            job = kernel32.CreateJobObjectW(None, None)
-            if not job:
-                return False
-            limits = ExtendedLimits()
-            limits.basic.limit_flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            if not kernel32.SetInformationJobObject(
-                job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
-            ) or not kernel32.AssignProcessToJobObject(job, handle):
-                kernel32.CloseHandle(job)
-                return False
-            self._job_handle = job
-            self.boundary_kind = "windows-job"
-            return True
-        except (AttributeError, OSError):
-            return False
 
     def _close_job(self) -> None:
         if self._job_handle is None or os.name != "nt":
@@ -1030,13 +1234,14 @@ class ProcessBoundary:
     def cleanup(self, *, force: bool = False, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
         """Terminate every recorded/contained member and prove the boundary gone."""
 
-        if not self.root_creation_time:
-            self.errors.append("provider root creation identity is unavailable")
-            return False
         if self._job_handle is not None:
+            cleanup_proven = False
             try:
                 import ctypes
 
+                if not self.root_creation_time:
+                    self.errors.append("provider root creation identity is unavailable")
+                    return False
                 if not self._observe_job():
                     return False
                 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1046,10 +1251,20 @@ class ProcessBoundary:
                     return False
                 if not self._wait_job_empty(timeout_seconds):
                     return False
-            except (AttributeError, OSError):
+                cleanup_proven = True
+            except (AttributeError, OSError, ValueError):
                 return False
-            self._close_job()
+            finally:
+                # The Job is the native failure/crash safety net. Closing it
+                # must happen even when exact proof cannot be completed.
+                self._close_job()
+            if not cleanup_proven:
+                return False
             return self._wait_exact_members(timeout_seconds)
+
+        if not self.root_creation_time:
+            self.errors.append("provider root creation identity is unavailable")
+            return False
 
         self.observe()
         if not self._last_observation_complete:

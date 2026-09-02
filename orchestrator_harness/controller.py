@@ -200,23 +200,31 @@ def _run_provider(
         )
     boundary: processes.ProcessBoundary | None = None
     try:
-        boundary = processes.ProcessBoundary.for_process(child.pid)
+        take_job_handle = getattr(child, "take_job_handle", None)
+        job_handle = (
+            take_job_handle()
+            if os.name == "nt" and callable(take_job_handle)
+            else None
+        )
+        if os.name == "nt" and job_handle is None:
+            raise ControllerError(
+                LAUNCH_PROVIDER_START_FAILED,
+                "provider was created without a preassigned Job Object",
+            )
+        boundary = processes.ProcessBoundary.for_process(
+            child.pid,
+            windows_job_handle=job_handle,
+        )
         if boundary.root_creation_time is None:
             raise ControllerError(
                 LAUNCH_PROVIDER_START_FAILED,
                 "cannot record provider process identity",
             )
         if os.name == "nt":
-            handle = getattr(child, "_handle", None)
-            if not boundary.attach_windows_process_handle(handle):
-                raise ControllerError(
-                    LAUNCH_PROVIDER_START_FAILED,
-                    "cannot attach provider to its process boundary",
-                )
             # The record is durable before the suspended provider is allowed to
-            # execute.  A controller crash after this point leaves exact Job
-            # evidence for force-stop/recovery while kill-on-close remains the
-            # immediate safety net.
+            # execute. The provider was already a Job member when native
+            # process creation returned, so every point before this record is
+            # also covered by kill-on-close.
             _write_status(
                 lane,
                 {
@@ -231,14 +239,23 @@ def _run_provider(
                 },
             )
             getattr(child, "resume")()
-    except Exception:
+    except BaseException:
         cleanup_proven = boundary is not None and boundary.cleanup(
             force=True,
             timeout_seconds=10.0,
         )
         if not cleanup_proven:
-            child.terminate()
-            child.wait(timeout=10.0)
+            try:
+                child.terminate()
+                child.wait(timeout=10.0)
+            finally:
+                close = getattr(child, "close", None)
+                if callable(close):
+                    close()
+        else:
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
         raise
     assert boundary is not None
     _write_status(
