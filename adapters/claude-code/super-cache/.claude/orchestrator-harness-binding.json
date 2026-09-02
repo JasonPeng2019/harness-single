@@ -1,0 +1,11 @@
+{
+  "schema": "harness-hook-binding/v1",
+  "role": "worker",
+  "provider_id": "claude-code",
+  "liveness_path": ".agent-workspace/worker-hook-liveness.jsonl",
+  "inbox_path": ".agent-workspace/QUEUE.json",
+  "outbox_dir": ".agent-workspace/manager-notifications",
+  "result_path": "RESULT.json",
+  "result_stop_check": ".agent-workspace/result-stop-check.py",
+  "note": "Worker payload binding. Bootstrap writes the authoritative binding with runtime paths into .agent-workspace/harness-hook-binding.json."
+}

@@ -1,0 +1,10 @@
+# Shipped Codex configuration for the orchestrator-harness payload.
+# The controller overrides model, effort, and tier per lane invocation;
+# these values are the managed defaults for interactive ROOT use.
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+service_tier = "priority"
+approval_policy = "never"
+
+[features]
+hooks = true

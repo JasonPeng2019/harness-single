@@ -1,0 +1,5 @@
+{
+  "model": "qwen3-coder",
+  "approval_mode": "yolo",
+  "output_format": "stream-json"
+}
