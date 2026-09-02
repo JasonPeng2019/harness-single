@@ -103,22 +103,41 @@ import sys
 from datetime import datetime, timezone
 
 token = sys.argv[1]
+target_root = sys.argv[2]
+authorization = json.loads(sys.argv[3])
 created_at = datetime.now(timezone.utc).isoformat()
-print(json.dumps({"event": "observer-ready", "pid": os.getpid(), "created_at": created_at, "identity_token": token}), flush=True)
-action = json.loads(sys.stdin.readline())
-print(json.dumps({"event": "action-complete", "action": action["name"], "unit": action["unit"], "identity_token": token}), flush=True)
+binding = {
+    "target_root": target_root,
+    "authorization": authorization,
+    "cwd": os.getcwd(),
+}
+print(json.dumps({"event": "observer-ready", "pid": os.getpid(), "creation_time_utc": created_at, "identity_token": token, "binding": binding}), flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(3)
+action = json.loads(line)
+print(json.dumps({"event": "action-complete", "action": action["name"], "unit": action["unit"], "identity_token": token, "binding": binding}), flush=True)
 print("local-fake-child:" + action["name"], file=sys.stderr, flush=True)
 """
 
 
-def _run_local_fake_child(root: Path, action: str, unit: str) -> dict[str, Any]:
-    """Run one local Python child and retain its exact observed identity."""
+def _launch_local_fake_child(
+    target_root: Path, authorization: dict[str, Any], attempt: int, unit: str
+) -> tuple[subprocess.Popen[str], dict[str, Any], dict[str, Any]]:
+    """Launch a local child and independently capture its parent and observer records."""
     identity_token = uuid4().hex
-    command = [sys.executable, "-c", _LOCAL_FAKE_CHILD, identity_token]
+    command = [
+        sys.executable,
+        "-c",
+        _LOCAL_FAKE_CHILD,
+        identity_token,
+        str(target_root),
+        json.dumps(authorization, sort_keys=True),
+    ]
     started_at = _timestamp()
     process = subprocess.Popen(
         command,
-        cwd=root,
+        cwd=target_root,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -128,38 +147,87 @@ def _run_local_fake_child(root: Path, action: str, unit: str) -> dict[str, Any]:
     ready_line = process.stdout.readline()
     observer_ready_at = _timestamp()
     ready = json.loads(ready_line)
-    if ready["event"] != "observer-ready" or ready["pid"] != process.pid:
+    requested_identity = {"pid": process.pid, "identity_token": identity_token}
+    observed_identity = {
+        "pid": ready.get("pid"),
+        "creation_time_utc": ready.get("creation_time_utc"),
+        "identity_token": ready.get("identity_token"),
+    }
+    if ready["event"] != "observer-ready" or observed_identity["pid"] != process.pid:
         raise RuntimeError("local fake observer did not report its spawned process")
-    if ready["identity_token"] != identity_token:
+    if observed_identity["identity_token"] != identity_token or not observed_identity["creation_time_utc"]:
         raise RuntimeError("local fake observer identity token mismatch")
+    if process.poll() is not None:
+        raise RuntimeError("local fake child was not still running when observed")
+    return process, {
+        "attempt": attempt,
+        "unit": unit,
+        "command": command,
+        "started_at": started_at,
+        "observer_ready_at": observer_ready_at,
+        "requested_process_identity": requested_identity,
+        "observed_process_identity": observed_identity,
+        "observer_record": ready,
+        "still_running_when_observed": True,
+    }, ready
+
+
+def _abort_local_fake_child(
+    process: subprocess.Popen[str], attempt_record: dict[str, Any]
+) -> dict[str, Any]:
+    """Terminate the already observed process handle without a completion action."""
+    assert process.stdin and process.stdout and process.stderr
+    termination_requested_at = _timestamp()
+    process.terminate()
+    stdout_tail = process.stdout.read()
+    stderr = process.stderr.read()
+    exit_code = process.wait()
+    ended_at = _timestamp()
+    action_records = [json.loads(line) for line in stdout_tail.splitlines() if line]
+    if exit_code == 0 or action_records or process.poll() is None:
+        raise RuntimeError("local fake abort was not a forced terminal stop")
+    attempt_record.update(
+        {
+            "termination_requested_at": termination_requested_at,
+            "ended_at": ended_at,
+            "stdout_tail": action_records,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "completion_action_sent": False,
+            "terminal_process_closed": process.poll() is not None,
+        }
+    )
+    return attempt_record
+
+
+def _complete_local_fake_child(
+    process: subprocess.Popen[str], attempt_record: dict[str, Any], action: str
+) -> dict[str, Any]:
+    """Complete a distinct child after sending its one local fake action."""
+    assert process.stdin and process.stdout and process.stderr
     action_dispatched_at = _timestamp()
-    process.stdin.write(json.dumps({"name": action, "unit": unit}) + "\n")
+    process.stdin.write(json.dumps({"name": action, "unit": attempt_record["unit"]}) + "\n")
     process.stdin.flush()
     process.stdin.close()
     stdout_tail = process.stdout.read()
     stderr = process.stderr.read()
     exit_code = process.wait()
     ended_at = _timestamp()
-    action_record = json.loads(stdout_tail)
-    if action_record["identity_token"] != identity_token or exit_code != 0:
+    action_records = [json.loads(line) for line in stdout_tail.splitlines() if line]
+    if len(action_records) != 1 or action_records[0]["event"] != "action-complete" or exit_code != 0:
         raise RuntimeError("local fake child failed its correlated action")
-    return {
-        "command": command,
-        "stdout": [ready, action_record],
-        "stderr": stderr,
-        "exit_code": exit_code,
-        "started_at": started_at,
-        "observer_ready_at": observer_ready_at,
-        "action_dispatched_at": action_dispatched_at,
-        "ended_at": ended_at,
-        "observer_ready_before_action": observer_ready_at <= action_dispatched_at,
-        "process_identity": {
-            "pid": process.pid,
-            "creation_time_utc": ready["created_at"],
-            "identity_token": identity_token,
-        },
-        "exact_identity_closed": process.poll() == 0,
-    }
+    attempt_record.update(
+        {
+            "action_dispatched_at": action_dispatched_at,
+            "ended_at": ended_at,
+            "stdout_tail": action_records,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "completion_action_sent": True,
+            "terminal_process_closed": process.poll() is not None,
+        }
+    )
+    return attempt_record
 
 
 def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, object]:
@@ -173,19 +241,16 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
     runtime_root.mkdir(parents=True)
     fake_target_root.mkdir(parents=True)
     units = ["unit-1", "unit-2", "unit-3"]
-    checkpoint = {
+    initial_checkpoint = {
         "schema": "readiness-checkpoint/v1",
         "lane_id": lane_id,
         "run_id": run_id,
         "worker_invocation_id": worker_invocation_id,
         "completed_units": [units[0]],
         "pending_units": units[1:],
+        "attempts": [],
     }
-    atomic_json(checkpoint_path, checkpoint)
-    checkpoint_read = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-    resume_unit = checkpoint_read["pending_units"][0]
-    if checkpoint_read != checkpoint or resume_unit != "unit-2":
-        raise RuntimeError("atomic checkpoint did not resume from the earliest pending unit")
+    atomic_json(checkpoint_path, initial_checkpoint)
 
     binding = {
         "kind": "local-fake-target/v1",
@@ -197,17 +262,52 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
             "retained": True,
         },
     }
-    aborted = _run_local_fake_child(root, "abort", resume_unit)
-    recovered = _run_local_fake_child(root, "recover", resume_unit)
-    if not aborted["observer_ready_before_action"] or not recovered["observer_ready_before_action"]:
-        raise RuntimeError("observer was not ready before the local child action")
+    abort_process, aborted, _ = _launch_local_fake_child(
+        fake_target_root, binding["authorization"], 1, units[1]
+    )
+    aborted = _abort_local_fake_child(abort_process, aborted)
+    failed_checkpoint = {
+        **initial_checkpoint,
+        "status": "FAILED_ABORTED",
+        "attempts": [aborted],
+    }
+    atomic_json(checkpoint_path, failed_checkpoint)
+    failed_checkpoint_read = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    resume_unit = failed_checkpoint_read["pending_units"][0]
+    if failed_checkpoint_read != failed_checkpoint or resume_unit != units[1]:
+        raise RuntimeError("failed checkpoint did not retain the earliest pending unit")
+
+    recovery_process, recovered, recovery_ready = _launch_local_fake_child(
+        fake_target_root, binding["authorization"], 2, resume_unit
+    )
+    recovered = _complete_local_fake_child(recovery_process, recovered, "recover")
+    recovery_action = recovered["stdout_tail"][0]
+    if (
+        recovery_action["unit"] != resume_unit
+        or recovery_action["binding"] != recovery_ready["binding"]
+        or recovery_ready["binding"]["target_root"] != binding["target_root"]
+        or recovery_ready["binding"]["authorization"] != binding["authorization"]
+        or recovery_ready["binding"]["cwd"] != str(fake_target_root)
+    ):
+        raise RuntimeError("recovery child did not consume the declared local binding")
+    final_checkpoint = {
+        **failed_checkpoint_read,
+        "status": "RECOVERED",
+        "completed_units": [units[0], resume_unit],
+        "pending_units": units[2:],
+        "attempts": [aborted, recovered],
+    }
+    atomic_json(checkpoint_path, final_checkpoint)
+    final_checkpoint_read = json.loads(checkpoint_path.read_text(encoding="utf-8"))
 
     process_correlation = {
         "lane_id": lane_id,
         "run_id": run_id,
         "worker_invocation_id": worker_invocation_id,
-        "abort_process_identity": aborted["process_identity"],
-        "recovery_process_identity": recovered["process_identity"],
+        "abort_attempt": 1,
+        "recovery_attempt": 2,
+        "abort_process_identity": aborted["observed_process_identity"],
+        "recovery_process_identity": recovered["observed_process_identity"],
     }
     resource_closed = False
     cleanup_passes = 0
@@ -216,7 +316,7 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
             shutil.rmtree(fake_target_root)
         resource_closed = not fake_target_root.exists()
         cleanup_passes += 1
-    if not resource_closed or not aborted["exact_identity_closed"] or not recovered["exact_identity_closed"]:
+    if not resource_closed or not aborted["terminal_process_closed"] or not recovered["terminal_process_closed"]:
         raise RuntimeError("local fake terminal closure was not verified")
     return {
         "schema": "v2-disposable-readiness/v1",
@@ -234,27 +334,33 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
         "identity_correlation": process_correlation,
         "checkpoint": {
             "path": str(checkpoint_path),
-            "atomic_write": True,
-            "read_back_matches": checkpoint_read == checkpoint,
+            "failed_attempt_atomic_write": True,
+            "failed_attempt_read_back_matches": failed_checkpoint_read == failed_checkpoint,
+            "final_read_back_matches": final_checkpoint_read == final_checkpoint,
             "resume_from_earliest_pending_unit": resume_unit,
+            "failed_attempt": failed_checkpoint_read["attempts"][0],
+            "retry_consumed_failed_checkpoint": True,
         },
         "fake_target_binding": binding,
         "child_actions": {"abort": aborted, "recovery": recovered},
-        "observer_ready_before_child_action": True,
         "abort": {
-            "requested_process_identity": aborted["process_identity"],
-            "observed_process_identity": aborted["process_identity"],
-            "exact_identity_match": True,
-            "cooperative_exit": aborted["exit_code"] == 0,
+            "requested_process_identity": aborted["requested_process_identity"],
+            "observed_process_identity": aborted["observed_process_identity"],
+            "still_running_when_observed": aborted["still_running_when_observed"],
+            "completion_action_sent": aborted["completion_action_sent"],
+            "action_complete_records": aborted["stdout_tail"],
+            "forced_non_success_exit": aborted["exit_code"],
         },
         "recovery_retry": {
             "attempt": 2,
             "resumed_unit": resume_unit,
             "exit_code": recovered["exit_code"],
+            "consumed_checkpoint": failed_checkpoint_read,
+            "observed_binding": recovery_action["binding"],
         },
         "terminal_closure": {
-            "abort_process_closed": aborted["exact_identity_closed"],
-            "recovery_process_closed": recovered["exact_identity_closed"],
+            "abort_process_closed": aborted["terminal_process_closed"],
+            "recovery_process_closed": recovered["terminal_process_closed"],
             "fake_resource_closed": resource_closed,
         },
         "idempotent_cleanup": {"passes": cleanup_passes, "safe": True},
