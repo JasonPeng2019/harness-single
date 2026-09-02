@@ -7,3 +7,4 @@ runtime/
 multi-agent-logs/
 harness_watcher/
 test_results/
+.agent-workspace/
