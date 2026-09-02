@@ -1,14 +1,23 @@
-﻿"""``harness setup``: idempotent one-time integration.
+"""``harness setup``: idempotent one-time integration.
 
-Installs the ROOT payloads, builds the active cache, writes the active
-resource manifest + lease dir, and starts the persistent monitor.  It starts
-no lane or provider.
+Validates the stored config and resource manifest, preflights the entire
+catalog (active cache, ROOT payloads, launcher bindings) before writing
+anything, then creates only the required runtime parents/state/idle managed
+queue, atomically stages and byte-verifies the active super-cache, installs
+the ROOT payloads, writes the active resource manifest + lease dir, and
+starts the persistent monitor.  It starts no lane or provider and never
+creates an epoch or worktree.
+
+Launcher bindings are shipped/read-only: setup validates the catalog binding
+bytes against the matching registered binding and imports the registered
+binding; it never copies a binding into product source.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,14 +26,14 @@ from . import processes
 from .config import (
     ConfigError,
     HarnessConfig,
-    ResourceManifest,
     find_harness_root,
     load_config,
     load_resource_manifest,
+    path_identity,
 )
-from .core import iso_utc, read_json, require_schema
+from .core import iso_utc
 from .epochs import MANAGER_QUEUE_SCHEMA, manager_queue_path, read_current_epoch
-from .records import RecordLock, atomic_write_json, read_record, write_record
+from .records import RecordLock, atomic_write_json, read_record
 
 RUNTIME_STATE_SCHEMA = "runtime-state/v1"
 MONITOR_SCHEMA = "monitor/v1"
@@ -36,6 +45,14 @@ SETUP_RESOURCE_MANIFEST_INVALID = "SETUP_RESOURCE_MANIFEST_INVALID"
 SETUP_ADAPTER_COLLISION = "SETUP_ADAPTER_COLLISION"
 SETUP_OVERWRITE_FAILED = "SETUP_OVERWRITE_FAILED"
 SETUP_MONITOR_ALREADY_RUNNING = "SETUP_MONITOR_ALREADY_RUNNING"
+
+
+class SetupError(ConfigError):
+    """A setup failure carrying a stable result code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def runtime_state_path(rt: Path) -> Path:
@@ -73,132 +90,300 @@ def read_monitor_record(rt: Path) -> dict[str, Any] | None:
         return None
 
 
-def _copy_tree(source: Path, destination: Path, *, overwrite: bool) -> list[Path]:
-    """Copy one directory tree; a destination-file collision rejects the whole
-    copy unless ``overwrite`` is set.  Returns the copied file paths."""
+def _plan_tree(source: Path) -> list[tuple[Path, Path]]:
+    """Return ``(source_file, relative_path)`` pairs for one source tree.
+
+    Bytecode caches are never part of a shipped plan.
+    """
     if not source.is_dir():
         raise ConfigError(f"source tree missing: {source}")
     planned: list[tuple[Path, Path]] = []
     for item in source.rglob("*"):
-        if item.is_file():
-            relative = item.relative_to(source)
-            planned.append((item, destination / relative))
-    if not overwrite:
-        collisions = [target for _, target in planned if target.exists()]
-        if collisions:
-            raise ConfigError(
-                f"destination collision (re-run with --overwrite to replace): {collisions[0]}"
-            )
-    copied: list[Path] = []
-    for source_file, target in planned:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, target)
-        copied.append(target)
-    return copied
-
-
-def _byte_verify_copy(source: Path, destination: Path) -> None:
-    """Copy a tree and verify every destination file matches its source bytes."""
-    if not source.is_dir():
-        raise ConfigError(f"source tree missing: {source}")
-    for item in source.rglob("*"):
-        if not item.is_file():
+        if not item.is_file() or "__pycache__" in item.parts:
             continue
-        relative = item.relative_to(source)
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item, target)
-        if target.read_bytes() != item.read_bytes():
-            raise ConfigError(f"byte verification failed for {target}")
+        planned.append((item, item.relative_to(source)))
+    return planned
 
 
-def _install_active_cache(harness_root: Path, rt: Path, *, overwrite: bool) -> None:
-    """Stage and byte-verify the active super-cache, then place it atomically."""
+def _plan_active_cache(harness_root: Path) -> list[tuple[Path, Path]]:
+    """Plan the active cache: ``super-cache/workspace`` plus every
+    ``adapters/<provider-id>/super-cache`` payload, each relative to
+    ``<rt>/super-cache``."""
     source_cache = harness_root / "super-cache"
     if not source_cache.is_dir():
-        raise ConfigError(f"shipped super-cache missing: {source_cache}")
+        raise SetupError(SETUP_CACHE_INVALID, f"shipped super-cache missing: {source_cache}")
+    workspace = source_cache / "workspace"
+    if not workspace.is_dir():
+        raise SetupError(
+            SETUP_CACHE_INVALID, f"shipped super-cache workspace missing: {workspace}"
+        )
+    planned: list[tuple[Path, Path]] = []
+    for source_file, relative in _plan_tree(workspace):
+        planned.append((source_file, Path("workspace") / relative))
+    custom = source_cache / "custom"
+    if custom.is_dir():
+        for source_file, relative in _plan_tree(custom):
+            planned.append((source_file, Path("custom") / relative))
+    adapters_dir = harness_root / "adapters"
+    if adapters_dir.is_dir():
+        for adapter in sorted(adapters_dir.iterdir()):
+            if not adapter.is_dir():
+                continue
+            payload = adapter / "super-cache"
+            if not payload.is_dir():
+                continue
+            for source_file, relative in _plan_tree(payload):
+                planned.append(
+                    (source_file, Path("adapter-payloads") / adapter.name / relative)
+                )
+    return planned
+
+
+def _validate_active_cache(
+    plan: list[tuple[Path, Path]], destination: Path
+) -> None:
+    """Reject an existing active cache that is incomplete or differs from the
+    shipped catalog; a valid cache is preserved exactly."""
+    for source_file, relative in plan:
+        target = destination / relative
+        if not target.is_file():
+            raise SetupError(
+                SETUP_CACHE_INVALID, f"active cache incomplete: missing {relative}"
+            )
+        if target.read_bytes() != source_file.read_bytes():
+            raise SetupError(
+                SETUP_CACHE_INVALID,
+                f"active cache malformed: {relative} differs from the shipped source",
+            )
+
+
+def _replace_tree(staging: Path, destination: Path) -> None:
+    """Atomically replace ``destination`` with the fully staged ``staging``."""
+    backup = destination.with_name(f"{destination.name}.old")
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+    if destination.exists():
+        os.replace(destination, backup)
+    try:
+        os.replace(staging, destination)
+    except BaseException:
+        if backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _install_active_cache(
+    harness_root: Path,
+    rt: Path,
+    *,
+    plan: list[tuple[Path, Path]],
+    overwrite: bool,
+) -> None:
+    """Stage and byte-verify the active cache, then place it atomically.
+
+    An existing valid cache is preserved exactly; a malformed or incomplete
+    cache is rejected unless ``overwrite`` rebuilds it from the catalog.
+    """
     destination = rt / "super-cache"
     if destination.is_dir():
-        # Preserve an existing valid cache; never silently overwrite it.
-        return
+        try:
+            _validate_active_cache(plan, destination)
+            return
+        except SetupError:
+            if not overwrite:
+                raise
     staging = Path(tempfile.mkdtemp(prefix=".super-cache.", dir=str(rt)))
     try:
-        _byte_verify_copy(source_cache / "workspace", staging / "workspace")
-        if (source_cache / "custom").is_dir():
-            _byte_verify_copy(source_cache / "custom", staging / "custom")
-        adapters_dir = harness_root / "adapters"
-        if adapters_dir.is_dir():
-            for adapter in sorted(adapters_dir.iterdir()):
-                payload = adapter / "super-cache"
-                if not payload.is_dir():
-                    continue
-                _byte_verify_copy(
-                    payload, staging / "adapter-payloads" / adapter.name
+        for source_file, relative in plan:
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, target)
+            if target.read_bytes() != source_file.read_bytes():
+                raise SetupError(
+                    SETUP_CACHE_INVALID, f"byte verification failed for {relative}"
                 )
-        os.replace(staging, destination)
+        _replace_tree(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
 
-def _install_root_payloads(
-    harness_root: Path, root_workspace: Path, *, overwrite: bool
-) -> list[Path]:
-    """Materialize each shipped adapter's ROOT payload into root_workspace."""
+def _plan_root_payloads(harness_root: Path) -> list[tuple[Path, Path]]:
+    """Plan every shipped adapter's ROOT payload, relative to the root
+    workspace."""
     adapters_dir = harness_root / "adapters"
     if not adapters_dir.is_dir():
-        raise ConfigError(f"adapter catalog missing: {adapters_dir}")
-    installed: list[Path] = []
+        raise SetupError(SETUP_CONFIG_INVALID, f"adapter catalog missing: {adapters_dir}")
+    planned: list[tuple[Path, Path]] = []
     for adapter in sorted(adapters_dir.iterdir()):
+        if not adapter.is_dir():
+            continue
         root_payload = adapter / "root"
         if not root_payload.is_dir():
             continue
-        try:
-            installed.extend(_copy_tree(root_payload, root_workspace, overwrite=overwrite))
-        except ConfigError as exc:
-            raise ConfigError(f"{SETUP_ADAPTER_COLLISION}: {exc}") from exc
-    return installed
+        planned.extend(_plan_tree(root_payload))
+    return planned
 
 
-def _check_launcher_bindings(harness_root: Path) -> list[Path]:
-    """Verify the registered launcher bindings exist and expose the strict
-    symbols; register any custom adapter binding found in the catalog."""
-    registered_dir = harness_root / "orchestrator_harness" / "provider_adapters"
-    registered_dir.mkdir(parents=True, exist_ok=True)
-    adapters_dir = harness_root / "adapters"
-    checked: list[Path] = []
-    if not adapters_dir.is_dir():
-        return checked
-    for adapter in sorted(adapters_dir.iterdir()):
-        source_binding = adapter / "harness" / "launcher_binding.py"
-        if not source_binding.is_file():
-            continue
-        target_binding = registered_dir / adapter.name / "launcher_binding.py"
-        if not target_binding.is_file() or (
-            target_binding.read_bytes() != source_binding.read_bytes()
-        ):
-            target_binding.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_binding, target_binding)
-        checked.append(target_binding)
-    for binding in sorted(registered_dir.rglob("launcher_binding.py")):
-        module = _load_binding(binding)
-        for symbol in ("PROVIDER_ID", "ADAPTER_VERSION", "build_argv", "parse_line"):
-            if not hasattr(module, symbol):
-                raise ConfigError(
-                    f"launcher binding {binding} lacks required symbol {symbol}"
-                )
-    return checked
+def _preflight_root_payloads(
+    plan: list[tuple[Path, Path]],
+    root_workspace: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Reject any destination collision across the whole ROOT payload plan
+    before anything is written; ``--overwrite`` replaces only catalog-planned
+    files."""
+    seen: set[Path] = set()
+    plan_collisions: list[Path] = []
+    for _, relative in plan:
+        if relative in seen:
+            plan_collisions.append(relative)
+        seen.add(relative)
+    if plan_collisions:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"catalog payload collision at {plan_collisions[0]}",
+        )
+    if overwrite:
+        return
+    collisions = [
+        root_workspace / relative
+        for _, relative in plan
+        if (root_workspace / relative).exists()
+    ]
+    if collisions:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"destination collision (re-run with --overwrite to replace): {collisions[0]}",
+        )
+
+
+def _install_root_payloads(
+    harness_root: Path,
+    root_workspace: Path,
+    *,
+    plan: list[tuple[Path, Path]],
+    overwrite: bool,
+) -> tuple[list[Path], list[Path]]:
+    """Install the preflighted ROOT payloads and return ``(installed,
+    overwritten)`` paths.  Never writes back into the shipped harness trees."""
+    harness_identity = path_identity(harness_root)
+    workspace_identity = path_identity(root_workspace)
+    if workspace_identity == harness_identity or workspace_identity.startswith(
+        harness_identity + os.sep
+    ):
+        raise SetupError(
+            SETUP_CONFIG_INVALID,
+            f"root workspace must not be inside the harness root: {root_workspace}",
+        )
+    installed: list[Path] = []
+    overwritten: list[Path] = []
+    for source_file, relative in plan:
+        target = root_workspace / relative
+        replaced = target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target)
+        if target.read_bytes() != source_file.read_bytes():
+            raise SetupError(
+                SETUP_OVERWRITE_FAILED if overwrite else SETUP_CONFIG_INVALID,
+                f"byte verification failed for {target}",
+            )
+        installed.append(target)
+        if replaced:
+            overwritten.append(target)
+    return installed, overwritten
 
 
 def _load_binding(path: Path) -> Any:
+    """Import one registered launcher binding without writing bytecode back
+    into the shipped tree."""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("_harness_binding", path)
     if spec is None or spec.loader is None:
         raise ConfigError(f"cannot load launcher binding: {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
+
+
+def _validate_binding_module(path: Path, provider_id: str) -> None:
+    """Require exact PROVIDER_ID plus ADAPTER_VERSION/build_argv/parse_line."""
+    try:
+        module = _load_binding(path)
+    except Exception as exc:
+        raise SetupError(
+            SETUP_CONFIG_INVALID,
+            f"launcher binding {path} cannot be imported: {exc}",
+        ) from exc
+    if getattr(module, "PROVIDER_ID", None) != provider_id:
+        raise SetupError(
+            SETUP_CONFIG_INVALID,
+            f"launcher binding {path} PROVIDER_ID {getattr(module, 'PROVIDER_ID', None)!r} "
+            f"does not match {provider_id!r}",
+        )
+    version = getattr(module, "ADAPTER_VERSION", None)
+    if not isinstance(version, str) or not version:
+        raise SetupError(
+            SETUP_CONFIG_INVALID,
+            f"launcher binding {path} lacks a non-empty ADAPTER_VERSION",
+        )
+    for symbol in ("build_argv", "parse_line"):
+        if not callable(getattr(module, symbol, None)):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"launcher binding {path} lacks required callable {symbol}",
+            )
+
+
+def _check_launcher_bindings(harness_root: Path) -> list[Path]:
+    """Validate the shipped/read-only launcher bindings.
+
+    Every registered binding must import and expose the strict symbols with
+    an exact PROVIDER_ID; every catalog binding must byte-match its matching
+    registered binding.  Setup never copies a binding into product source.
+    """
+    registered_dir = harness_root / "orchestrator_harness" / "provider_adapters"
+    adapters_dir = harness_root / "adapters"
+    if not adapters_dir.is_dir():
+        raise SetupError(SETUP_CONFIG_INVALID, f"adapter catalog missing: {adapters_dir}")
+    checked: list[Path] = []
+    registered: dict[str, Path] = {}
+    if registered_dir.is_dir():
+        for binding in sorted(registered_dir.rglob("launcher_binding.py")):
+            provider_id = binding.parent.name
+            _validate_binding_module(binding, provider_id)
+            registered[provider_id] = binding
+            checked.append(binding)
+    for adapter in sorted(adapters_dir.iterdir()):
+        if not adapter.is_dir():
+            continue
+        source_binding = adapter / "harness" / "launcher_binding.py"
+        if not source_binding.is_file():
+            continue
+        target_binding = registered.get(adapter.name)
+        if target_binding is None:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"registered binding missing for {adapter.name}: "
+                f"{registered_dir / adapter.name / 'launcher_binding.py'} "
+                f"(bindings are shipped/read-only; setup never copies them)",
+            )
+        if target_binding.read_bytes() != source_binding.read_bytes():
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"registered binding drift for {adapter.name}: {target_binding} "
+                f"differs from the catalog binding",
+            )
+    return checked
 
 
 def _start_monitor(harness_root: Path, rt: Path, config: HarnessConfig) -> dict[str, Any]:
@@ -234,22 +419,80 @@ def _start_monitor(harness_root: Path, rt: Path, config: HarnessConfig) -> dict[
     return record
 
 
+def _failure(code: str, summary: str, next_action: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "code": code,
+        "summary": summary,
+        "evidence_paths": [],
+        "next_action": next_action,
+    }
+
+
 def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
-    """Execute ``harness setup`` and return the structured result."""
+    """Execute ``harness setup`` and return the structured result.
+
+    Phase one validates and preflights the entire catalog with no writes;
+    phase two performs the writes.  A ROOT payload collision in normal mode
+    therefore causes no partial copy of any kind.
+    """
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
         manifest = load_resource_manifest(harness_root)
     except (ConfigError, OSError, ValueError) as exc:
-        return {"ok": False, "code": SETUP_CONFIG_INVALID, "summary": str(exc),
-                "evidence_paths": [], "next_action": "fix harness-config.json and resource-manifest.json, then re-run setup"}
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "fix harness-config.json and resource-manifest.json, then re-run setup",
+        )
 
     rt = config.runtime_root
     try:
-        if rt.is_symlink():
-            raise ConfigError(
-                f"runtime root must not be a symbolic link: {rt}"
+        if config.root_workspace is None:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                "harness config does not declare root_workspace",
             )
+        if config.root_workspace.is_symlink() or rt.is_symlink():
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"workspace and runtime root must not be symbolic links: {rt}",
+            )
+        harness_identity = path_identity(harness_root)
+        workspace_identity = path_identity(config.root_workspace)
+        if workspace_identity == harness_identity or workspace_identity.startswith(
+            harness_identity + os.sep
+        ):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"root workspace must not be inside the harness root: {config.root_workspace}",
+            )
+        root_plan = _plan_root_payloads(harness_root)
+        _preflight_root_payloads(root_plan, config.root_workspace, overwrite=overwrite)
+        cache_plan = _plan_active_cache(harness_root)
+        destination = rt / "super-cache"
+        if destination.is_dir():
+            try:
+                _validate_active_cache(cache_plan, destination)
+            except SetupError:
+                if not overwrite:
+                    raise
+        _check_launcher_bindings(harness_root)
+    except SetupError as exc:
+        return _failure(
+            exc.code,
+            str(exc),
+            "resolve the named target or re-run with --overwrite",
+        )
+    except ConfigError as exc:
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "fix harness-config.json and resource-manifest.json, then re-run setup",
+        )
+
+    try:
         for parent in ("worktrees", "monitor", "epochs", "resources"):
             (rt / parent).mkdir(parents=True, exist_ok=True)
         if config.profile == "managed":
@@ -259,7 +502,9 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         if state is None or state.get("state") == "CLOSED":
             set_runtime_state(rt, "OPEN")
         elif state.get("state") not in ("OPEN", "SHUTTING_DOWN"):
-            raise ConfigError(f"unexpected runtime state: {state.get('state')}")
+            raise SetupError(
+                SETUP_CONFIG_INVALID, f"unexpected runtime state: {state.get('state')}"
+            )
 
         if config.profile == "managed":
             queue_path = manager_queue_path(rt)
@@ -274,39 +519,56 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                         # A live epoch owns the queue; leave it alone.
                         pass
                 except (OSError, ValueError):
-                    raise ConfigError("manager queue is malformed; remove it and re-run setup")
+                    raise SetupError(
+                        SETUP_CONFIG_INVALID,
+                        "manager queue is malformed; remove it and re-run setup",
+                    )
 
-        _install_active_cache(harness_root, rt, overwrite=overwrite)
-        _install_root_payloads(harness_root, config.root_workspace, overwrite=overwrite)
-        _check_launcher_bindings(harness_root)
+        _install_active_cache(harness_root, rt, plan=cache_plan, overwrite=overwrite)
+        _, overwritten = _install_root_payloads(
+            harness_root,
+            config.root_workspace,
+            plan=root_plan,
+            overwrite=overwrite,
+        )
 
         manifest_path = rt / "resources" / "RESOURCE_MANIFEST.json"
-        source_manifest = harness_root / "resource-manifest.json"
         if manifest_path.is_file():
             try:
                 active = read_record(manifest_path, RESOURCE_MANIFEST_SCHEMA)
                 if active.get("resources") != [dict(item) for item in manifest.resources]:
                     if read_current_epoch(rt) is not None:
-                        raise ConfigError(
+                        raise SetupError(
+                            SETUP_RESOURCE_MANIFEST_INVALID,
                             "resource manifest changed while an epoch is active; "
-                            "shut down the runtime before changing it"
+                            "shut down the runtime before changing it",
                         )
                     if any((rt / "resources" / "leases").glob("*")):
-                        raise ConfigError(
+                        raise SetupError(
+                            SETUP_RESOURCE_MANIFEST_INVALID,
                             "resource manifest changed while a lease is live; "
-                            "shut down the runtime before changing it"
+                            "shut down the runtime before changing it",
                         )
-                    atomic_write_json(manifest_path, {
-                        "schema": RESOURCE_MANIFEST_SCHEMA,
-                        "resources": [dict(item) for item in manifest.resources],
-                    })
+                    atomic_write_json(
+                        manifest_path,
+                        {
+                            "schema": RESOURCE_MANIFEST_SCHEMA,
+                            "resources": [dict(item) for item in manifest.resources],
+                        },
+                    )
             except (OSError, ValueError):
-                raise ConfigError("active resource manifest is malformed")
+                raise SetupError(
+                    SETUP_RESOURCE_MANIFEST_INVALID,
+                    "active resource manifest is malformed",
+                )
         else:
-            atomic_write_json(manifest_path, {
-                "schema": RESOURCE_MANIFEST_SCHEMA,
-                "resources": [dict(item) for item in manifest.resources],
-            })
+            atomic_write_json(
+                manifest_path,
+                {
+                    "schema": RESOURCE_MANIFEST_SCHEMA,
+                    "resources": [dict(item) for item in manifest.resources],
+                },
+            )
         (rt / "resources" / "leases").mkdir(parents=True, exist_ok=True)
 
         try:
@@ -321,11 +583,20 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                     "next_action": "proceed; the runtime is already monitored",
                 }
             raise
+    except SetupError as exc:
+        return _failure(
+            exc.code,
+            str(exc),
+            "resolve the named target or re-run with --overwrite",
+        )
     except ConfigError as exc:
-        return {"ok": False, "code": SETUP_CONFIG_INVALID, "summary": str(exc),
-                "evidence_paths": [], "next_action": "resolve the named target or re-run with --overwrite"}
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "resolve the named target or re-run with --overwrite",
+        )
 
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "code": "SETUP_OK",
         "summary": "runtime is OPEN and the active resource manifest exists",
@@ -335,3 +606,6 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         ],
         "next_action": "bootstrap a lane with `lane bootstrap`",
     }
+    if overwritten:
+        result["overwritten_paths"] = [str(path) for path in overwritten]
+    return result

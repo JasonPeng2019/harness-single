@@ -1,0 +1,382 @@
+"""Focused tests for v2 setup and profile-aware lane materialization."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from orchestrator_harness import bootstrap, setup
+
+
+class MaterializationFixture:
+    def __init__(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.harness = self.root / "harness"
+        self.root_workspace = self.root / "root-workspace"
+        self.harness.mkdir()
+        self.root_workspace.mkdir()
+        self._write_json(
+            self.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.root_workspace),
+                "managed_coordination": "enabled",
+            },
+        )
+        self._write_json(
+            self.harness / "resource-manifest.json",
+            {"schema": "resource-manifest/v1", "resources": []},
+        )
+        agent_workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
+        for name, contents in {
+            "README.md": "base workspace\n",
+            "lane-queue.py": "# lane queue\n",
+            "manager-notify.py": "# manager notify\n",
+            "result-stop-check.py": "# result stop check\n",
+        }.items():
+            self._write_text(agent_workspace / name, contents)
+        self._write_text(
+            self.harness / "super-cache" / "custom" / "README.md",
+            "custom marker\n",
+        )
+        self._write_provider("codex", ".codex", "codex-root\n", "codex-worker\n")
+        self._write_provider(
+            "disposable-custom", ".custom", "custom-root\n", "custom-worker\n"
+        )
+
+    def close(self) -> None:
+        self.temporary.cleanup()
+
+    def _write_text(self, path: Path, contents: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+
+    def _write_json(self, path: Path, value: object) -> None:
+        self._write_text(path, json.dumps(value, indent=2) + "\n")
+
+    def _write_provider(
+        self,
+        provider_id: str,
+        dotdir: str,
+        root_contents: str,
+        worker_contents: str,
+    ) -> None:
+        adapter = self.harness / "adapters" / provider_id
+        binding = (
+            f"PROVIDER_ID = {provider_id!r}\n"
+            "ADAPTER_VERSION = 'test-v1'\n"
+            "def build_argv(**kwargs): return [PROVIDER_ID]\n"
+            "def parse_line(line): return None\n"
+        )
+        self._write_text(adapter / "harness" / "launcher_binding.py", binding)
+        self._write_text(
+            self.harness
+            / "orchestrator_harness"
+            / "provider_adapters"
+            / provider_id
+            / "launcher_binding.py",
+            binding,
+        )
+        self._write_text(adapter / "root" / dotdir / "root.txt", root_contents)
+        self._write_text(
+            adapter / "super-cache" / dotdir / "worker.txt", worker_contents
+        )
+
+    def _write_provider_to(self, harness: Path, provider_id: str, dotdir: str) -> None:
+        """Install a disposable provider fixture next to a copied shipped tree."""
+        adapter = harness / "adapters" / provider_id
+        binding = (
+            f"PROVIDER_ID = {provider_id!r}\n"
+            "ADAPTER_VERSION = 'test-v1'\n"
+            "def build_argv(**kwargs): return [PROVIDER_ID]\n"
+            "def parse_line(line): return None\n"
+        )
+        self._write_text(adapter / "harness" / "launcher_binding.py", binding)
+        self._write_text(adapter / "root" / dotdir / "root.txt", "fixture\n")
+        self._write_text(
+            adapter / "super-cache" / dotdir / "worker.txt", "fixture\n"
+        )
+        self._write_text(
+            harness
+            / "orchestrator_harness"
+            / "provider_adapters"
+            / provider_id
+            / "launcher_binding.py",
+            binding,
+        )
+
+    def active_cache(self) -> Path:
+        destination = self.root_workspace / ".harness-runtime" / "super-cache"
+        for source, relative in setup._plan_active_cache(self.harness):
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        return destination
+
+    def source_snapshot(self) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(self.harness)): path.read_bytes()
+            for path in self.harness.rglob("*")
+            if path.is_file()
+        }
+
+
+class V2MaterializationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = MaterializationFixture()
+        self.addCleanup(self.fixture.close)
+
+    def test_active_cache_preserves_valid_and_rejects_invalid(self) -> None:
+        destination = self.fixture.active_cache()
+        before = {
+            str(path.relative_to(destination)): path.read_bytes()
+            for path in destination.rglob("*")
+            if path.is_file()
+        }
+        with patch.object(setup, "_replace_tree") as replace_tree:
+            setup._install_active_cache(
+                self.fixture.harness,
+                self.fixture.root_workspace / ".harness-runtime",
+                plan=setup._plan_active_cache(self.fixture.harness),
+                overwrite=False,
+            )
+        replace_tree.assert_not_called()
+        self.assertEqual(
+            before,
+            {
+                str(path.relative_to(destination)): path.read_bytes()
+                for path in destination.rglob("*")
+                if path.is_file()
+            },
+        )
+
+        corrupt = next(path for path in destination.rglob("*") if path.is_file())
+        corrupt.write_text("corrupt\n", encoding="utf-8")
+        with self.assertRaises(setup.SetupError) as raised:
+            setup._install_active_cache(
+                self.fixture.harness,
+                self.fixture.root_workspace / ".harness-runtime",
+                plan=setup._plan_active_cache(self.fixture.harness),
+                overwrite=False,
+            )
+        self.assertEqual(setup.SETUP_CACHE_INVALID, raised.exception.code)
+        self.assertEqual("corrupt\n", corrupt.read_text(encoding="utf-8"))
+
+    def test_overlay_collision_is_rejected_before_partial_write(self) -> None:
+        source = self.fixture.root / "overlay-source"
+        destination = self.fixture.root / "overlay-destination"
+        self.fixture._write_text(source / "first.txt", "first\n")
+        self.fixture._write_text(source / "second.txt", "second\n")
+        self.fixture._write_text(destination / "second.txt", "original\n")
+
+        with self.assertRaises(bootstrap.BootstrapError) as raised:
+            bootstrap._copy_overlay(source, destination)
+        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, raised.exception.code)
+        self.assertFalse((destination / "first.txt").exists())
+        self.assertEqual(
+            "original\n", (destination / "second.txt").read_text(encoding="utf-8")
+        )
+
+        first = self.fixture.root / "payload-a.txt"
+        second = self.fixture.root / "payload-b.txt"
+        first.write_text("a\n", encoding="utf-8")
+        second.write_text("b\n", encoding="utf-8")
+        with self.assertRaises(setup.SetupError) as duplicate:
+            setup._preflight_root_payloads(
+                [(first, Path("same.txt")), (second, Path("same.txt"))],
+                self.fixture.root_workspace,
+                overwrite=False,
+            )
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, duplicate.exception.code)
+        self.assertFalse((self.fixture.root_workspace / "same.txt").exists())
+
+    def test_overwrite_replaces_only_planned_root_payloads(self) -> None:
+        planned = (
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "root"
+            / ".codex"
+            / "root.txt"
+        )
+        planned_target = self.fixture.root_workspace / ".codex" / "root.txt"
+        unrelated = self.fixture.root_workspace / "keep.txt"
+        planned_target.parent.mkdir(parents=True, exist_ok=True)
+        planned_target.write_text("old\n", encoding="utf-8")
+        unrelated.write_text("preserve\n", encoding="utf-8")
+        plan = setup._plan_root_payloads(self.fixture.harness)
+        setup._preflight_root_payloads(plan, self.fixture.root_workspace, overwrite=True)
+        _, overwritten = setup._install_root_payloads(
+            self.fixture.harness,
+            self.fixture.root_workspace,
+            plan=plan,
+            overwrite=True,
+        )
+        self.assertEqual(
+            planned.read_text(encoding="utf-8"),
+            planned_target.read_text(encoding="utf-8"),
+        )
+        self.assertEqual("preserve\n", unrelated.read_text(encoding="utf-8"))
+        self.assertEqual([planned_target], overwritten)
+
+    def test_setup_root_collision_has_no_partial_runtime_write(self) -> None:
+        collision = self.fixture.root_workspace / ".codex" / "root.txt"
+        collision.parent.mkdir(parents=True, exist_ok=True)
+        collision.write_text("existing\n", encoding="utf-8")
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            result = setup.run_setup()
+        self.assertFalse(result["ok"])
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
+        self.assertFalse(
+            (self.fixture.root_workspace / ".harness-runtime").exists()
+        )
+        self.assertEqual("existing\n", collision.read_text(encoding="utf-8"))
+
+    def test_setup_materialization_keeps_shipped_sources_immutable(self) -> None:
+        before = self.fixture.source_snapshot()
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ) as spawn_detached,
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+        ):
+            result = setup.run_setup()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(before, self.fixture.source_snapshot())
+        self.assertTrue(
+            (self.fixture.root_workspace / ".codex" / "root.txt").is_file()
+        )
+        self.assertTrue(
+            (
+                self.fixture.root_workspace
+                / ".harness-runtime"
+                / "super-cache"
+                / "custom"
+                / "README.md"
+            ).is_file()
+        )
+        spawn_detached.assert_called_once()
+
+    def test_shipped_and_disposable_custom_provider_bindings_validate(self) -> None:
+        repository = Path(__file__).resolve().parents[2]
+        harness = self.fixture.root / "binding-harness"
+        shutil.copytree(
+            repository / "adapters" / "codex", harness / "adapters" / "codex"
+        )
+        shutil.copytree(
+            repository / "orchestrator_harness" / "provider_adapters" / "codex",
+            harness / "orchestrator_harness" / "provider_adapters" / "codex",
+        )
+        self.fixture._write_provider_to(harness, "disposable-custom", ".custom")
+        checked = setup._check_launcher_bindings(harness)
+        self.assertEqual(
+            {"codex", "disposable-custom"},
+            {path.parent.name for path in checked},
+        )
+
+        catalog_binding = (
+            harness / "adapters" / "disposable-custom" / "harness" / "launcher_binding.py"
+        )
+        catalog_binding.write_text(
+            catalog_binding.read_text(encoding="utf-8") + "# drift\n", encoding="utf-8"
+        )
+        with self.assertRaises(setup.SetupError) as raised:
+            setup._check_launcher_bindings(harness)
+        self.assertEqual(setup.SETUP_CONFIG_INVALID, raised.exception.code)
+
+    def test_managed_bootstrap_copies_only_selected_provider(self) -> None:
+        result, worktree = self._bootstrap("managed-lane", managed=True, provider="codex")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            "codex-worker\n",
+            (worktree / ".codex" / "worker.txt").read_text(encoding="utf-8"),
+        )
+        self.assertFalse((worktree / ".custom" / "worker.txt").exists())
+        self.assertTrue((worktree / ".agent-workspace" / "QUEUE.json").is_file())
+        self.assertTrue(
+            (worktree / ".agent-workspace" / "manager-notifications").is_dir()
+        )
+
+    def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(self) -> None:
+        result, worktree = self._bootstrap(
+            "plain-lane", managed=False, provider="codex"
+        )
+        self.assertTrue(result["ok"], result)
+        agent_workspace = worktree / ".agent-workspace"
+        self.assertFalse((agent_workspace / "lane-queue.py").exists())
+        self.assertFalse((agent_workspace / "manager-notify.py").exists())
+        self.assertTrue((agent_workspace / "result-stop-check.py").is_file())
+        self.assertFalse((worktree / ".codex").exists())
+        self.assertFalse((worktree / ".custom").exists())
+
+    def _bootstrap(
+        self, lane_id: str, *, managed: bool, provider: str
+    ) -> tuple[dict[str, object], Path]:
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "enabled" if managed else "disabled",
+            },
+        )
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        self.fixture.active_cache()
+        task_card = self.fixture.root / f"{lane_id}.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": f"materialize {lane_id}",
+                "branch": f"lane/{lane_id}",
+                "base_commit": "test-base",
+            },
+        )
+        epoch = {"epoch_id": "epoch-1"}
+        worktree = runtime / "worktrees" / "epoch-1" / lane_id
+
+        def fake_git(root: Path, branch: str, target: Path, base_commit: str) -> None:
+            target.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value=epoch),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(
+                bootstrap, "_git_worktree_add", side_effect=fake_git
+            ) as git_add,
+            patch.object(bootstrap.subprocess, "run") as provider_cli,
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id=lane_id,
+                provider=provider,
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        git_add.assert_called_once()
+        provider_cli.assert_not_called()
+        return result, worktree
+if __name__ == "__main__":
+    unittest.main()

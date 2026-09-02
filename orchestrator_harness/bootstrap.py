@@ -1,31 +1,32 @@
-﻿"""``lane bootstrap``: prepare one lane (a short program, not an agent).
+"""``lane bootstrap``: prepare one lane (a short program, not an agent).
 
 Creates the worktree + ``.agent-workspace``, applies the cache overlay, writes
 the worker prompt/result template and the controller invocation.  Opens a new
 epoch if none is active.  Does not start a provider or take a lease.
+
+Managed bootstrap copies the active ``workspace/`` base and only the selected
+provider payload, then generates the lane-specific queue/result/invocation/
+records.  Plain bootstrap gets no queue helpers, hook payload, or worker
+skills.  Source trees stay unchanged.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from .config import HarnessConfig, ResourceManifest, load_config, load_resource_manifest
+from .config import load_config, load_resource_manifest
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
 from .epochs import (
-    ACTIVE_LANES_SCHEMA,
-    epoch_dir,
     lane_record_dir,
     open_epoch,
     read_active_lanes,
-    read_current_epoch,
     write_active_lanes,
 )
 from .lanes import LANE_SCHEMA, write_lane
-from .records import RecordLock, atomic_write_json
+from .records import atomic_write_json
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -38,7 +39,14 @@ BOOTSTRAP_LANE_ID_IN_USE = "BOOTSTRAP_LANE_ID_IN_USE"
 BOOTSTRAP_WORKTREE_EXISTS = "BOOTSTRAP_WORKTREE_EXISTS"
 BOOTSTRAP_CACHE_COLLISION = "BOOTSTRAP_CACHE_COLLISION"
 BOOTSTRAP_ADAPTER_MISSING = "BOOTSTRAP_ADAPTER_MISSING"
+BOOTSTRAP_CACHE_MISSING = "BOOTSTRAP_CACHE_MISSING"
 BOOTSTRAP_RESOURCE_UNDECLARED = "BOOTSTRAP_RESOURCE_UNDECLARED"
+
+# Managed-only helpers carried by the workspace base; plain bootstrap omits them.
+PLAIN_EXCLUDED_HELPERS = (
+    ".agent-workspace/lane-queue.py",
+    ".agent-workspace/manager-notify.py",
+)
 
 
 class BootstrapError(RuntimeError):
@@ -83,17 +91,42 @@ def _git_worktree_add(
         )
 
 
-def _copy_overlay(source: Path, destination: Path) -> None:
-    """Copy one overlay tree; a destination-file collision rejects the copy."""
+def _overlay_plan(
+    source: Path,
+    destination: Path,
+    *,
+    exclude: tuple[str, ...] = (),
+) -> list[tuple[Path, Path]]:
+    """Plan one overlay tree and reject collisions before any write.
+
+    ``exclude`` holds relative POSIX paths (e.g. ``.agent-workspace/lane-queue.py``)
+    that are skipped; plain bootstrap uses it to omit the managed queue helpers.
+    """
     if not source.is_dir():
-        return
+        return []
+    excluded = {Path(relative).as_posix() for relative in exclude}
+    planned: list[tuple[Path, Path]] = []
     for item in source.rglob("*"):
         if not item.is_file():
             continue
         relative = item.relative_to(source)
+        if relative.as_posix() in excluded:
+            continue
         target = destination / relative
         if target.exists():
             raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"collision at {target}")
+        planned.append((item, target))
+    return planned
+
+
+def _copy_overlay(
+    source: Path,
+    destination: Path,
+    *,
+    exclude: tuple[str, ...] = (),
+) -> None:
+    """Copy one overlay tree after preflighting all destination paths."""
+    for item, target in _overlay_plan(source, destination, exclude=exclude):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item, target)
 
@@ -289,10 +322,21 @@ def run_bootstrap(
 
         managed = config.profile == "managed"
         base_overlay = rt / "super-cache" / "workspace"
-        _copy_overlay(base_overlay, worktree_path)
+        if not base_overlay.is_dir():
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_MISSING,
+                f"active workspace base missing: {base_overlay} (run harness setup first)",
+            )
         if managed:
+            _copy_overlay(base_overlay, worktree_path)
             _install_managed_material(
                 rt, worktree_path, provider_id=provider, lane_id=lane_id, run_id=run_id
+            )
+        else:
+            _copy_overlay(
+                base_overlay,
+                worktree_path,
+                exclude=PLAIN_EXCLUDED_HELPERS,
             )
         receipt = {
             "schema": OVERLAY_RECEIPT_SCHEMA,
@@ -308,7 +352,7 @@ def run_bootstrap(
 
         _write_worker_prompt(worktree_path, task_card, managed=managed)
         _write_result_template(worktree_path, lane_id, run_id)
-        invocation = _write_invocation(
+        _write_invocation(
             worktree_path,
             lane_id=lane_id,
             run_id=run_id,
