@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator_harness.tests.v2_acceptance.contract import assert_valid_result, atomic_json, content_hash
 
@@ -29,13 +30,24 @@ class CheckU4Tests(unittest.TestCase):
             prior = {"schema": "runtime-state/v1", "state": "OPEN"}
             atomic_json(path, prior)
             self.assertEqual(prior, json.loads(path.read_text(encoding="utf-8")))
-            malformed = path.with_name(f".{path.name}.acceptance-tmp")
-            malformed.write_text("{", encoding="utf-8")
-            with self.assertRaises(json.JSONDecodeError):
-                json.loads(malformed.read_text(encoding="utf-8"))
+            replacement = {"schema": "runtime-state/v1", "state": "CLOSED"}
+            temporary_path = path.with_name(f".{path.name}.acceptance-tmp")
+            decode_json = json.loads
+
+            def reject_post_write_validation(document: str) -> object:
+                self.assertTrue(temporary_path.exists())
+                self.assertEqual(prior, decode_json(path.read_text(encoding="utf-8")))
+                self.assertEqual(replacement, decode_json(document))
+                raise json.JSONDecodeError("synthetic post-write rejection", document, 0)
+
+            with patch(
+                "orchestrator_harness.tests.v2_acceptance.contract.json.loads",
+                side_effect=reject_post_write_validation,
+            ), self.assertRaises(json.JSONDecodeError):
+                atomic_json(path, replacement)
+
             self.assertEqual(prior, json.loads(path.read_text(encoding="utf-8")))
-            malformed.unlink()
-            self.assertFalse(malformed.exists())
+            self.assertFalse(temporary_path.exists())
 
     def test_public_launcher_exposes_the_complete_normative_v2_command_vocabulary(self) -> None:
         root = Path(__file__).resolve().parents[3]
