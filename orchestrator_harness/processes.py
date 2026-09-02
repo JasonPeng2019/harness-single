@@ -1,14 +1,17 @@
-﻿"""Cross-platform process identity, liveness, termination, and detached spawn.
+"""Cross-platform process identity, liveness, containment, and termination.
 
-A process is identified by its PID plus its start/creation time and checked
-through a cross-platform process API; a reused PID with a different creation
-time is never treated as the same process.
+Every destructive process operation is bound to a PID and its recorded
+creation/start identity.  Provider cleanup uses a controller-owned boundary:
+POSIX providers run in a fresh process group/session and Windows providers run
+in a Job Object.  A cleanup result is proven only after the boundary's exact
+identities are gone; unknown process observations remain unproven.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -16,7 +19,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 
-from harness_common.process_identity import exact_process_identity
+from harness_common.process_identity import (
+    darwin_process_ids,
+    darwin_process_info,
+    exact_process_identity,
+)
 
 from .models import (
     ProcessBoundaryInventory,
@@ -28,10 +35,16 @@ from .models import (
 )
 
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
+BOUNDARY_WAIT_SECONDS = 5.0
+
+
+def _valid_pid(pid: object) -> bool:
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
 
 
 def process_identity(pid: int) -> dict[str, Any] | None:
-    """Return ``{"pid": pid, "creation_time": <opaque>}`` or None when unknown."""
+    """Return ``{"pid", "creation_time"}`` or ``None`` when unprovable."""
+
     identity = exact_process_identity(pid)
     if identity is None:
         return None
@@ -39,8 +52,13 @@ def process_identity(pid: int) -> dict[str, Any] | None:
 
 
 def process_alive(pid: int) -> bool:
-    """Return whether a process with this PID is alive (identity not checked)."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    """Return whether the operating system still reports a live PID.
+
+    This is only a preliminary liveness probe.  Any ownership or termination
+    decision must also compare the exact creation identity.
+    """
+
+    if not _valid_pid(pid):
         return False
     if os.name == "nt":
         try:
@@ -49,13 +67,18 @@ def process_alive(pid: int) -> bool:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
             kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+            kernel32.GetExitCodeProcess.restype = ctypes.c_int
             kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
             kernel32.CloseHandle.restype = ctypes.c_int
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if not handle:
                 return False
-            kernel32.CloseHandle(handle)
-            return True
+            try:
+                exit_code = ctypes.c_uint32()
+                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+            finally:
+                kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
             return False
     try:
@@ -70,28 +93,35 @@ def process_alive(pid: int) -> bool:
 
 
 def identity_matches(pid: int, creation_time: str | None) -> bool:
-    """Return whether the recorded PID+creation identity is a live same process."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    """Return whether the recorded PID is the same live process incarnation."""
+
+    if not _valid_pid(pid) or not creation_time:
         return False
     if not process_alive(pid):
-        return False
-    if not creation_time:
         return False
     current = process_identity(pid)
     return current is not None and current["creation_time"] == creation_time
 
 
-def terminate_process(pid: int, creation_time: str | None) -> bool:
-    """Terminate one process only when its exact identity matches.
+def terminate_process(
+    pid: int,
+    creation_time: str | None,
+    *,
+    force: bool = False,
+    timeout_seconds: float = BOUNDARY_WAIT_SECONDS,
+) -> bool:
+    """Terminate one exact process incarnation and verify that it exited.
 
-    Returns True when the process is gone (or was already gone); False when the
-    process survived or the identity did not match.
+    A live PID without a creation identity is never targeted.  ``force`` uses
+    the platform's hard termination primitive after the caller has already
+    supplied the same exact identity.
     """
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+
+    if not _valid_pid(pid):
         return True
     if not process_alive(pid):
         return True
-    if creation_time is not None and not identity_matches(pid, creation_time):
+    if not creation_time or not identity_matches(pid, creation_time):
         return False
     if os.name == "nt":
         try:
@@ -107,23 +137,25 @@ def terminate_process(pid: int, creation_time: str | None) -> bool:
             if not handle:
                 return False
             try:
-                kernel32.TerminateProcess(handle, 1)
+                if not kernel32.TerminateProcess(handle, 1):
+                    return False
             finally:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
             return False
     else:
         try:
-            os.kill(pid, 15)  # SIGTERM
+            os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
         except ProcessLookupError:
             return True
         except OSError:
             return False
-    return wait_for_exit(pid, timeout_seconds=5.0)
+    return wait_for_exit(pid, timeout_seconds=timeout_seconds)
 
 
-def wait_for_exit(pid: int, timeout_seconds: float = 5.0) -> bool:
-    """Poll until the process is gone or the timeout elapses."""
+def wait_for_exit(pid: int, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
+    """Poll until a PID is gone or the bounded wait elapses."""
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if not process_alive(pid):
@@ -139,7 +171,8 @@ def spawn_detached(
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
 ) -> subprocess.Popen[Any]:
-    """Start one detached child process and return its Popen handle."""
+    """Start one detached monitor/helper process and return its Popen handle."""
+
     creationflags = WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0
     return subprocess.Popen(
         list(argv),
@@ -154,7 +187,9 @@ def spawn_detached(
 
 def python_argv(module: str, *args: str) -> list[str]:
     """Return the argv for ``python -m <module> <args>``."""
+
     return [sys.executable, "-m", module, *args]
+
 
 WINDOWS_CIM_SCRIPT = r"""
 $ErrorActionPreference='Stop'
@@ -171,8 +206,8 @@ $ErrorActionPreference='Stop'
 
 
 def _windows_cim_identity_script(pid: int) -> str:
-    # ``pid`` is converted to an integer before it is placed in the fixed CIM
-    # filter, so this remains an argv-only, non-shell query.
+    """Return the fixed-shape, integer-filtered known-PID query."""
+
     return f"""
 $ErrorActionPreference='Stop'
 @(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}' | ForEach-Object {{
@@ -192,6 +227,8 @@ def windows_process_snapshot(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout_seconds: float = 12.0,
 ) -> ProcessSnapshot:
+    """Read one bounded Windows process snapshot through CIM."""
+
     powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     argv = [
         powershell,
@@ -214,9 +251,7 @@ def windows_process_snapshot(
             creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
     except Exception as exc:
-        return ProcessSnapshot(
-            False, (), (f"CIM invocation failed: {exc}",), "windows-cim"
-        )
+        return ProcessSnapshot(False, (), (f"CIM invocation failed: {exc}",), "windows-cim")
     if completed.returncode != 0:
         return ProcessSnapshot(
             False,
@@ -230,14 +265,14 @@ def windows_process_snapshot(
             raw = [raw]
         if not isinstance(raw, list):
             raise ValueError("CIM JSON root is not a list")
-        processes = []
-        missing_time = 0
+        processes: list[ProcessInfo] = []
+        errors: list[str] = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
             created = parse_utc(item.get("created_utc"))
             if created is None:
-                missing_time += 1
+                errors.append(f"PID {item.get('pid')!r} lacks a creation identity")
             processes.append(
                 ProcessInfo(
                     pid=int(item["pid"]),
@@ -247,18 +282,14 @@ def windows_process_snapshot(
                     created_utc=created,
                 )
             )
-        errors = (
-            (f"{missing_time} process records lack creation time",)
-            if missing_time
-            else ()
-        )
         return ProcessSnapshot(
-            True, tuple(sorted(processes, key=lambda p: p.pid)), errors, "windows-cim"
+            not errors,
+            tuple(sorted(processes, key=lambda p: p.pid)),
+            tuple(errors),
+            "windows-cim",
         )
     except Exception as exc:
-        return ProcessSnapshot(
-            False, (), (f"invalid CIM output: {exc}",), "windows-cim"
-        )
+        return ProcessSnapshot(False, (), (f"invalid CIM output: {exc}",), "windows-cim")
 
 
 def windows_process_query(
@@ -267,9 +298,9 @@ def windows_process_query(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout_seconds: float = 12.0,
 ) -> ProcessQuery:
-    """Query one known Windows PID without taking a process inventory."""
+    """Query one known Windows PID without taking a full inventory."""
 
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    if not _valid_pid(pid):
         return ProcessQuery(True, None, ("PID is invalid",))
     powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     argv = [
@@ -298,9 +329,7 @@ def windows_process_query(
         return ProcessQuery(
             False,
             None,
-            (
-                f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",
-            ),
+            (f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",),
         )
     try:
         raw = json.loads(completed.stdout.lstrip("\ufeff") or "[]")
@@ -313,9 +342,11 @@ def windows_process_query(
         item = raw[0]
         if not isinstance(item, dict):
             raise ValueError("CIM identity record is not an object")
+        if int(item["pid"]) != pid:
+            raise ValueError("CIM identity record PID does not match the requested PID")
         created = parse_utc(item.get("created_utc"))
         return ProcessQuery(
-            True,
+            created is not None,
             ProcessInfo(
                 pid=int(item["pid"]),
                 ppid=int(item.get("ppid", 0)),
@@ -350,7 +381,7 @@ def _linux_process_query(
     boot: datetime | None = None,
     ticks: int | None = None,
 ) -> ProcessQuery:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    if not _valid_pid(pid):
         return ProcessQuery(True, None, ("PID is invalid",))
     try:
         boot = boot or _linux_boot_time()
@@ -389,23 +420,48 @@ def _linux_process_query(
         return ProcessQuery(False, None, (f"/proc/{pid}: {exc}",))
 
 
+def _darwin_process_query(pid: int) -> ProcessQuery:
+    if not _valid_pid(pid):
+        return ProcessQuery(True, None, ("PID is invalid",))
+    info = darwin_process_info(pid)
+    if info is None:
+        if not process_alive(pid):
+            return ProcessQuery(True, None)
+        return ProcessQuery(False, None, ("libproc process identity is unavailable",))
+    return ProcessQuery(
+        True,
+        ProcessInfo(
+            pid=pid,
+            ppid=int(info["ppid"]),
+            name=str(info["name"]),
+            command_line=str(info["command_line"]),
+            created_utc=cast(datetime, info["created_utc"]),
+            process_group_id=int(info["pgid"]) if info.get("pgid") else None,
+            session_id=(
+                int(info["session_id"])
+                if info.get("session_id") is not None
+                else None
+            ),
+        ),
+    )
+
+
 def targeted_process_query(
     pid: int,
     *,
     expected_parent_pid: int | None = None,
 ) -> ProcessQuery:
-    """Query one known PID and optionally its parent identity directly."""
+    """Query one known PID through the current platform's native provider."""
 
     if os.name == "nt":
         query = windows_process_query(pid)
-    elif Path("/proc").is_dir():
+    elif sys.platform == "darwin":
+        query = _darwin_process_query(pid)
+    elif sys.platform.startswith("linux"):
         query = _linux_process_query(pid)
     else:
         return ProcessQuery(False, None, ("unsupported process platform",))
-    if (
-        expected_parent_pid is not None
-        and query.parent_matches(expected_parent_pid) is False
-    ):
+    if expected_parent_pid is not None and query.parent_matches(expected_parent_pid) is False:
         return ProcessQuery(
             query.complete,
             query.process,
@@ -415,6 +471,8 @@ def targeted_process_query(
 
 
 def linux_process_snapshot() -> ProcessSnapshot:
+    """Read one Linux ``/proc`` process snapshot."""
+
     errors: list[str] = []
     processes: list[ProcessInfo] = []
     try:
@@ -425,24 +483,13 @@ def linux_process_snapshot() -> ProcessSnapshot:
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
-        try:
-            query = _linux_process_query(int(entry.name), boot=boot, ticks=ticks)
-            if query.process is not None:
-                processes.append(query.process)
-            if not query.complete:
-                errors.extend(query.errors)
-            elif query.process is None:
-                # A directory listed in /proc disappeared before its stat could
-                # be read.  The remaining records are useful, but this scan
-                # cannot prove absence for any PID it did not observe.
-                errors.append(f"{entry}: process disappeared during observation")
-        except (FileNotFoundError, ProcessLookupError):
+        query = _linux_process_query(int(entry.name), boot=boot, ticks=ticks)
+        if query.process is not None:
+            processes.append(query.process)
+        if not query.complete:
+            errors.extend(query.errors)
+        elif query.process is None:
             errors.append(f"{entry}: process disappeared during observation")
-            continue
-        except PermissionError as exc:
-            errors.append(f"{entry}: {exc}")
-        except Exception as exc:
-            errors.append(f"{entry}: {exc}")
     return ProcessSnapshot(
         complete=not errors,
         processes=tuple(sorted(processes, key=lambda p: p.pid)),
@@ -451,12 +498,470 @@ def linux_process_snapshot() -> ProcessSnapshot:
     )
 
 
+def darwin_process_snapshot() -> ProcessSnapshot:
+    """Read one macOS ``libproc`` process snapshot without using ``/proc``."""
+
+    pids = darwin_process_ids()
+    if pids is None:
+        return ProcessSnapshot(False, (), ("libproc process inventory is unavailable",), "darwin-libproc")
+    errors: list[str] = []
+    processes: list[ProcessInfo] = []
+    for pid in pids:
+        query = _darwin_process_query(pid)
+        if query.process is not None:
+            processes.append(query.process)
+        elif not query.complete:
+            errors.extend(query.errors)
+    return ProcessSnapshot(
+        complete=not errors,
+        processes=tuple(sorted(processes, key=lambda p: p.pid)),
+        errors=tuple(errors),
+        provider="darwin-libproc",
+    )
+
+
 def process_snapshot() -> ProcessSnapshot:
+    """Read one complete process snapshot through the current platform path."""
+
     if os.name == "nt":
         return windows_process_snapshot()
-    if Path("/proc").is_dir():
+    if sys.platform == "darwin":
+        return darwin_process_snapshot()
+    if sys.platform.startswith("linux"):
         return linux_process_snapshot()
     return ProcessSnapshot(False, (), ("unsupported process platform",), "unsupported")
+
+
+def _identity_key(pid: int, creation_time: str) -> tuple[int, str]:
+    return pid, creation_time
+
+
+class ProcessBoundary:
+    """Controller-owned provider/helper process boundary.
+
+    The boundary remembers exact identities observed while the provider lives.
+    A POSIX process group/session supplies containment for descendants; a
+    Windows Job Object supplies kernel containment.  The object is also
+    serializable so a force-stop route can continue exact cleanup after a
+    controller has exited.
+    """
+
+    def __init__(
+        self,
+        root_pid: int,
+        root_creation_time: str | None,
+        *,
+        root_process: ProcessInfo | None = None,
+        process_group_id: int | None = None,
+        session_id: int | None = None,
+        boundary_kind: str | None = None,
+        snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
+    ) -> None:
+        self.root_pid = root_pid
+        self.root_creation_time = root_creation_time
+        self.root_process = root_process
+        self.process_group_id = process_group_id
+        self.session_id = session_id
+        self.boundary_kind = boundary_kind or (
+            "windows-job" if os.name == "nt" else "posix-process-group"
+        )
+        self.snapshot_provider = snapshot_provider or process_snapshot
+        self._owned: dict[tuple[int, str], ProcessInfo | None] = {}
+        self.errors: list[str] = []
+        if not _valid_pid(root_pid):
+            self.errors.append("provider root PID is invalid")
+        if not isinstance(root_creation_time, str) or not root_creation_time:
+            self.errors.append("provider root creation identity is unavailable")
+        if _valid_pid(root_pid) and isinstance(root_creation_time, str) and root_creation_time:
+            self._owned[_identity_key(root_pid, root_creation_time)] = root_process
+        self._job_handle: Any = None
+        self._last_observation_complete = not self.errors
+
+    @classmethod
+    def for_process(
+        cls,
+        pid: int,
+        *,
+        snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
+    ) -> "ProcessBoundary":
+        identity = process_identity(pid)
+        query = targeted_process_query(pid) if identity is not None else None
+        process = query.process if query is not None and query.complete else None
+        return cls(
+            pid,
+            identity["creation_time"] if identity is not None else None,
+            root_process=process,
+            process_group_id=process.process_group_id if process else None,
+            session_id=process.session_id if process else None,
+            snapshot_provider=snapshot_provider,
+        )
+
+    @classmethod
+    def from_record(
+        cls,
+        record: dict[str, Any],
+        *,
+        snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
+    ) -> "ProcessBoundary":
+        root = record.get("root") if isinstance(record.get("root"), dict) else {}
+        boundary = cls(
+            root.get("pid"),
+            root.get("creation_time"),
+            process_group_id=record.get("process_group_id"),
+            session_id=record.get("session_id"),
+            boundary_kind=record.get("kind"),
+            snapshot_provider=snapshot_provider,
+        )
+        for item in record.get("processes", []):
+            if not isinstance(item, dict) or not _valid_pid(item.get("pid")):
+                boundary.errors.append("recorded boundary identity is malformed")
+                continue
+            creation = item.get("creation_time")
+            if not isinstance(creation, str) or not creation:
+                boundary.errors.append("recorded boundary creation identity is missing")
+                continue
+            boundary._owned[_identity_key(item["pid"], creation)] = None
+        return boundary
+
+    def attach_windows_process_handle(self, handle: Any) -> bool:
+        """Attach a Windows provider to a kill-on-close Job Object."""
+
+        if os.name != "nt":
+            return True
+        try:
+            import ctypes
+
+            class IoCounters(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_uint64) for name in (
+                    "read_operations", "write_operations", "other_operations",
+                    "read_bytes", "write_bytes", "other_bytes",
+                )]
+
+            class BasicLimits(ctypes.Structure):
+                _fields_ = [
+                    ("per_process_user_time", ctypes.c_int64),
+                    ("per_job_user_time", ctypes.c_int64),
+                    ("limit_flags", ctypes.c_uint32),
+                    ("minimum_working_set_size", ctypes.c_void_p),
+                    ("maximum_working_set_size", ctypes.c_void_p),
+                    ("active_process_limit", ctypes.c_uint32),
+                    ("affinity", ctypes.c_void_p),
+                    ("priority_class", ctypes.c_uint32),
+                    ("scheduling_class", ctypes.c_uint32),
+                ]
+
+            class ExtendedLimits(ctypes.Structure):
+                _fields_ = [
+                    ("basic", BasicLimits),
+                    ("io", IoCounters),
+                    ("process_memory_limit", ctypes.c_void_p),
+                    ("job_memory_limit", ctypes.c_void_p),
+                    ("peak_process_memory_used", ctypes.c_void_p),
+                    ("peak_job_memory_used", ctypes.c_void_p),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
+            kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+            kernel32.SetInformationJobObject.argtypes = (
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32
+            )
+            kernel32.SetInformationJobObject.restype = ctypes.c_int
+            kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+            kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            limits = ExtendedLimits()
+            limits.basic.limit_flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+            ) or not kernel32.AssignProcessToJobObject(job, handle):
+                kernel32.CloseHandle(job)
+                return False
+            self._job_handle = job
+            self.boundary_kind = "windows-job"
+            return True
+        except (AttributeError, OSError):
+            return False
+
+    def _close_job(self) -> None:
+        if self._job_handle is None or os.name != "nt":
+            return
+        try:
+            import ctypes
+
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self._job_handle)
+        except (AttributeError, OSError):
+            pass
+        finally:
+            self._job_handle = None
+
+    def _job_process_ids(self) -> set[int] | None:
+        """Return the current native Job Object membership, or unknown."""
+
+        if self._job_handle is None or os.name != "nt":
+            return set()
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.QueryInformationJobObject.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            )
+            kernel32.QueryInformationJobObject.restype = ctypes.c_int
+            pointer_size = ctypes.sizeof(ctypes.c_void_p)
+            size = 8 + pointer_size
+            while True:
+                buffer = ctypes.create_string_buffer(size)
+                returned = ctypes.c_uint32()
+                if kernel32.QueryInformationJobObject(
+                    self._job_handle,
+                    3,  # JobObjectBasicProcessIdList
+                    ctypes.byref(buffer),
+                    size,
+                    ctypes.byref(returned),
+                ):
+                    count = ctypes.c_uint32.from_buffer(buffer, 4).value
+                    required = 8 + count * pointer_size
+                    if required > size:
+                        size = required
+                        continue
+                    ids = []
+                    for offset in range(8, required, pointer_size):
+                        value = int.from_bytes(
+                            buffer.raw[offset : offset + pointer_size],
+                            byteorder=sys.byteorder,
+                        )
+                        if value:
+                            ids.append(value)
+                    return set(ids)
+                if returned.value <= size:
+                    return None
+                size = returned.value
+        except (AttributeError, OSError, ValueError):
+            return None
+
+    def _observe_job(self) -> bool:
+        pids = self._job_process_ids()
+        if pids is None:
+            self.errors.append("Windows Job Object membership is unavailable")
+            self._last_observation_complete = False
+            return False
+        for pid in pids:
+            identity = process_identity(pid)
+            if identity is None:
+                if process_alive(pid):
+                    self.errors.append(f"Job Object PID {pid} identity is unavailable")
+                    self._last_observation_complete = False
+                continue
+            creation = identity["creation_time"]
+            self._owned[_identity_key(pid, creation)] = None
+            if pid == self.root_pid and creation != self.root_creation_time:
+                self.errors.append(f"root PID {pid} creation identity was reused")
+                self._last_observation_complete = False
+        self._last_observation_complete = not self.errors
+        return self._last_observation_complete
+
+    def __del__(self) -> None:
+        self._close_job()
+
+    def _snapshot_identity(self, item: ProcessInfo) -> str | None:
+        if item.created_utc is None:
+            self.errors.append(f"PID {item.pid} lacks a snapshot creation identity")
+            return None
+        identity = process_identity(item.pid)
+        if identity is None:
+            if process_alive(item.pid):
+                self.errors.append(f"PID {item.pid} identity is unavailable")
+            return None
+        return identity["creation_time"]
+
+    def observe(self) -> bool:
+        """Observe and retain exact members of the provider boundary."""
+
+        if self._job_handle is not None:
+            return self._observe_job()
+        snapshot = self.snapshot_provider()
+        if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
+            self._last_observation_complete = False
+            self.errors.extend(
+                list(getattr(snapshot, "errors", ("process snapshot is incomplete",)))
+            )
+            return False
+        by_pid = snapshot.by_pid
+        root = by_pid.get(self.root_pid)
+        if root is not None:
+            root_identity = self._snapshot_identity(root)
+            if root_identity != self.root_creation_time:
+                self.errors.append(f"root PID {self.root_pid} creation identity was reused")
+                self._last_observation_complete = False
+                return False
+            if self.process_group_id is None:
+                self.process_group_id = root.process_group_id
+            if self.session_id is None:
+                self.session_id = root.session_id
+        selected: list[ProcessInfo] = []
+        known_pids = {pid for pid, _ in self._owned}
+        for item in snapshot.processes:
+            in_boundary = (
+                self.process_group_id is not None
+                and item.process_group_id == self.process_group_id
+            ) or (
+                self.session_id is not None and item.session_id == self.session_id
+            )
+            if item.pid in known_pids or in_boundary:
+                selected.append(item)
+        changed = True
+        while changed:
+            changed = False
+            selected_pids = {item.pid for item in selected}
+            owned_current_pids = {
+                item.pid
+                for item in selected
+                if self._snapshot_identity(item) is not None
+            }
+            for item in snapshot.processes:
+                if item.pid in selected_pids or item.ppid not in owned_current_pids:
+                    continue
+                selected.append(item)
+                changed = True
+        for item in selected:
+            creation = self._snapshot_identity(item)
+            if creation is not None:
+                self._owned[_identity_key(item.pid, creation)] = item
+        self._last_observation_complete = not self.errors
+        return self._last_observation_complete
+
+    def record(self) -> dict[str, Any]:
+        """Return the exact identities needed by a later force-stop route."""
+
+        return {
+            "kind": self.boundary_kind,
+            "root": {"pid": self.root_pid, "creation_time": self.root_creation_time},
+            "process_group_id": self.process_group_id,
+            "session_id": self.session_id,
+            "processes": [
+                {"pid": pid, "creation_time": creation}
+                for pid, creation in sorted(self._owned)
+            ],
+        }
+
+    def _remaining(self) -> list[tuple[int, str]] | None:
+        remaining: list[tuple[int, str]] = []
+        for pid, creation in self._owned:
+            if not process_alive(pid):
+                continue
+            current = process_identity(pid)
+            if current is None:
+                return None
+            if current["creation_time"] == creation:
+                remaining.append((pid, creation))
+        return remaining
+
+    def cleanup(self, *, force: bool = False, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
+        """Terminate every recorded/contained member and prove the boundary gone."""
+
+        if not self.root_creation_time:
+            self.errors.append("provider root creation identity is unavailable")
+            return False
+        if self._job_handle is not None:
+            try:
+                import ctypes
+
+                if not self._observe_job():
+                    return False
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+                kernel32.TerminateJobObject.restype = ctypes.c_int
+                if not kernel32.TerminateJobObject(self._job_handle, 1):
+                    return False
+                if not self._wait_job_empty(timeout_seconds):
+                    return False
+            except (AttributeError, OSError):
+                return False
+            self._close_job()
+            return self._wait_exact_members(timeout_seconds)
+
+        self.observe()
+        if not self._last_observation_complete:
+            return False
+        members = list(self._owned)
+        members.sort(key=lambda value: value[0] == self.root_pid)
+        for pid, creation in members:
+            terminate_process(
+                pid,
+                creation,
+                force=force,
+                timeout_seconds=min(timeout_seconds, 1.0),
+            )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            self.observe()
+            if not self._last_observation_complete:
+                return False
+            remaining = self._remaining()
+            if remaining is None:
+                return False
+            if not remaining:
+                return True
+            for pid, creation in remaining:
+                terminate_process(pid, creation, force=True, timeout_seconds=0.5)
+            time.sleep(0.1)
+        self.observe()
+        return self._last_observation_complete and self._remaining() == []
+
+    def _wait_job_empty(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pids = self._job_process_ids()
+            if pids is None:
+                return False
+            if not pids:
+                return True
+            if not self._observe_job():
+                return False
+            time.sleep(0.1)
+        pids = self._job_process_ids()
+        return pids == set()
+
+    def _wait_exact_members(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            remaining = self._remaining()
+            if remaining == []:
+                return True
+            if remaining is None:
+                return False
+            time.sleep(0.1)
+        return self._remaining() == []
+
+
+def cleanup_recorded_process_boundary(
+    record: dict[str, Any],
+    *,
+    force: bool = True,
+    timeout_seconds: float = BOUNDARY_WAIT_SECONDS,
+) -> bool:
+    """Force-clean one serialized exact process boundary."""
+
+    return ProcessBoundary.from_record(record).cleanup(
+        force=force,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def process_boundary_is_gone(record: dict[str, Any]) -> bool:
+    """Prove a serialized boundary is absent without terminating anything."""
+
+    boundary = ProcessBoundary.from_record(record)
+    if not boundary.root_creation_time or not boundary.observe():
+        return False
+    return boundary._remaining() == []
 
 
 def process_group_inventory(
@@ -470,181 +975,70 @@ def process_group_inventory(
     controller_pid: int | None = None,
     owned_history: Sequence[ProcessInfo] = (),
 ) -> ProcessBoundaryInventory:
-    """Return a complete subreaper ownership inventory or refuse.
+    """Return a generic POSIX or Windows boundary inventory.
 
-    A process group is only one selector in the Linux boundary.  The
-    controller also supplies the provider root, session, controller PID, and
-    exact identities observed in earlier snapshots.  That history is what
-    makes a descendant that leaves its original group and is later adopted by
-    the subreaper remain owned.  Calling this function without that context is
-    deliberately incomplete: group-only emptiness is not terminal evidence.
+    This compatibility reader is intentionally read-only.  Live controller
+    cleanup uses :class:`ProcessBoundary`, which carries opaque exact creation
+    identities suitable for termination.
     """
 
     valid_group = process_group_id is None or (
-        isinstance(process_group_id, int)
-        and not isinstance(process_group_id, bool)
-        and process_group_id > 0
+        isinstance(process_group_id, int) and not isinstance(process_group_id, bool) and process_group_id > 0
     )
     valid_session = session_id is None or (
-        isinstance(session_id, int)
-        and not isinstance(session_id, bool)
-        and session_id > 0
+        isinstance(session_id, int) and not isinstance(session_id, bool) and session_id > 0
     )
-    valid_root = root_pid is None or (
-        isinstance(root_pid, int) and not isinstance(root_pid, bool) and root_pid > 0
+    valid_root = root_pid is None or (_valid_pid(root_pid))
+    kind = "windows-job" if os.name == "nt" else "posix-process-group"
+    source = "windows-cim" if os.name == "nt" else (
+        "darwin-libproc" if sys.platform == "darwin" else "linux-proc"
     )
     if not valid_group or not valid_session or not valid_root:
-        return ProcessBoundaryInventory(
-            False,
-            "linux-subreaper",
-            boundary_identity,
-            errors=("process boundary identity is invalid",),
-            source="/proc",
-        )
-    if (
-        root_pid is None
-        or root_identity is None
-        or root_identity.created_utc is None
-        or (process_group_id is None and session_id is None)
-    ):
-        return ProcessBoundaryInventory(
-            False,
-            "linux-subreaper",
-            boundary_identity,
-            errors=("complete descendant/adoption boundary identity is unavailable",),
-            source="/proc",
-        )
+        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=("process boundary identity is invalid",), source=source)
+    if root_pid is None or root_identity is None or root_identity.created_utc is None:
+        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=("complete descendant boundary identity is unavailable",), source=source)
     snapshot = snapshot_provider()
-    for _ in range(2):
-        if isinstance(snapshot, ProcessSnapshot) and snapshot.complete:
-            break
-        time.sleep(0.01)
-        snapshot = snapshot_provider()
     if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
-        return ProcessBoundaryInventory(
-            False,
-            "linux-subreaper",
-            boundary_identity or f"pgid:{process_group_id}",
-            errors=tuple(
-                getattr(snapshot, "errors", ("process snapshot is incomplete",))
-            ),
-            source="/proc",
-        )
-
-    by_pid = snapshot.by_pid
+        return ProcessBoundaryInventory(False, kind, boundary_identity, errors=getattr(snapshot, "errors", ("process snapshot is incomplete",)), source=source)
     root_key = (root_identity.pid, iso_utc(root_identity.created_utc) or "")
-    known_by_key: dict[tuple[int, str], ProcessInfo] = {}
-    for item in tuple(owned_history) + (root_identity,):
-        if item.created_utc is not None:
-            known_by_key[(item.pid, iso_utc(item.created_utc) or "")] = item
-
-    errors: list[str] = []
-    current_root = by_pid.get(root_pid)
-    if current_root is not None and current_root.created_utc is None:
-        errors.append(f"provider root {root_pid} lacks a creation identity")
-    elif (
-        current_root is not None
-        and (current_root.pid, iso_utc(current_root.created_utc) or "") != root_key
-    ):
-        errors.append(f"provider root {root_pid} creation identity was reused")
-
+    known = {
+        (item.pid, iso_utc(item.created_utc) or ""): item
+        for item in tuple(owned_history) + (root_identity,)
+        if item.created_utc is not None
+    }
     selected: dict[tuple[int, str], ProcessInfo] = {}
-
-    def select(item: ProcessInfo) -> None:
-        if item.created_utc is None:
-            errors.append(f"owned PID {item.pid} lacks a creation identity")
-            return
-        selected[(item.pid, iso_utc(item.created_utc) or "")] = item
-
+    errors: list[str] = []
     for item in snapshot.processes:
-        if (
+        key = (item.pid, iso_utc(item.created_utc) or "")
+        if key in known or (
             process_group_id is not None and item.process_group_id == process_group_id
         ) or (session_id is not None and item.session_id == session_id):
-            select(item)
-        if (item.pid, iso_utc(item.created_utc) or "") in known_by_key:
-            select(item)
-
-    # Descendant closure is calculated only through a currently observed
-    # parent identity.  A child seen for the first time after its parent has
-    # disappeared cannot be safely attributed, so it remains an explicit
-    # incomplete observation rather than being silently treated as unrelated.
+            if item.created_utc is None:
+                errors.append(f"owned PID {item.pid} lacks a creation identity")
+            else:
+                selected[key] = item
     changed = True
     while changed:
         changed = False
-        selected_pids = {item.pid for item in selected.values()}
+        parent_pids = {item.pid for item in selected.values()}
         for item in snapshot.processes:
-            if item.pid in selected_pids:
+            if item.ppid not in parent_pids or item.created_utc is None:
                 continue
-            if item.ppid not in selected_pids:
-                continue
-            parent = by_pid.get(item.ppid)
-            if (
-                parent is None
-                or (parent.pid, iso_utc(parent.created_utc) or "") not in selected
-            ):
-                errors.append(
-                    f"descendant PID {item.pid} has no exact owned parent observation"
-                )
-                continue
-            before = len(selected)
-            select(item)
-            changed = len(selected) != before
-
-    if controller_pid is not None:
-        for item in snapshot.processes:
             key = (item.pid, iso_utc(item.created_utc) or "")
-            if item.ppid != controller_pid:
-                continue
-            if key in known_by_key:
-                select(item)
-            else:
-                errors.append(
-                    f"adopted PID {item.pid} is outside the known ownership history"
-                )
-
-    # A process still claiming the provider root as parent after the root has
-    # disappeared must have been captured in history before adoption.  Refuse
-    # the snapshot if it was not, rather than losing a daemonizing child.
-    if current_root is None:
-        for item in snapshot.processes:
-            if (
-                item.ppid == root_pid
-                and (item.pid, iso_utc(item.created_utc) or "") not in known_by_key
-            ):
-                errors.append(
-                    f"unobserved descendant PID {item.pid} cannot be attributed after root exit"
-                )
-
+            if key not in selected:
+                selected[key] = item
+                changed = True
+    if root_pid in {item.pid for item in selected.values()}:
+        root = next(item for item in selected.values() if item.pid == root_pid)
+        if (root.pid, iso_utc(root.created_utc) or "") != root_key:
+            errors.append(f"root PID {root_pid} creation identity was reused")
     members = tuple(sorted(selected.values(), key=lambda item: item.pid))
-    observed: dict[tuple[int, str], ProcessInfo] = dict(known_by_key)
-    for item in members:
-        if item.created_utc is not None:
-            observed[(item.pid, iso_utc(item.created_utc) or "")] = item
-    if errors:
-        return ProcessBoundaryInventory(
-            False,
-            "linux-subreaper",
-            boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
-            processes=members,
-            observed_processes=tuple(
-                sorted(
-                    observed.values(),
-                    key=lambda item: (item.pid, iso_utc(item.created_utc) or ""),
-                )
-            ),
-            errors=tuple(errors),
-            source="/proc",
-        )
     return ProcessBoundaryInventory(
-        True,
-        "linux-subreaper",
-        boundary_identity or f"pgid:{process_group_id}:sid:{session_id}",
+        not errors,
+        kind,
+        boundary_identity or f"group:{process_group_id}:session:{session_id}",
         processes=members,
-        observed_processes=tuple(
-            sorted(
-                observed.values(),
-                key=lambda item: (item.pid, iso_utc(item.created_utc) or ""),
-            )
-        ),
-        source="/proc",
+        observed_processes=tuple(sorted(known.values(), key=lambda item: item.pid)),
+        errors=tuple(errors),
+        source=source,
     )

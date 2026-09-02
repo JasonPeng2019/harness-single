@@ -35,6 +35,7 @@ from .epochs import (
 from .lanes import LANE_SCHEMA, read_lane, update_lane
 from .manager_queue import ManagerQueueError, promote_event
 from .records import RecordLock, atomic_write_json, read_record
+from .review import validate_acceptance_chain
 from .setup import MONITOR_SCHEMA, monitor_record_path, read_monitor_record
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
@@ -73,7 +74,12 @@ def read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def _read_acceptance_chain(rt: Path, epoch_id: str, lane_id: str) -> dict[str, Any] | None:
+def _read_acceptance_chain(
+    rt: Path,
+    epoch_id: str,
+    lane_id: str,
+    lane: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return the acceptance decision when a complete linked pair exists."""
     folder = lane_record_dir(rt, epoch_id, lane_id)
     review_path = folder / "COMPLETION_REVIEW.json"
@@ -87,9 +93,12 @@ def _read_acceptance_chain(rt: Path, epoch_id: str, lane_id: str) -> dict[str, A
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return None
-    if review.get("run_id") != acceptance.get("run_id"):
-        return None
-    if review.get("result_hash") != acceptance.get("result_id") and review.get("result_id") != acceptance.get("result_id"):
+    if not validate_acceptance_chain(
+        review,
+        acceptance,
+        lane_id=lane_id,
+        run_id=lane.get("run_id") if lane is not None else None,
+    ):
         return None
     return acceptance
 
@@ -154,7 +163,7 @@ def derive_lane_status(
         return None
     if _orphaned_lease_for(rt, lane):
         return "orphaned_lease"
-    acceptance = _read_acceptance_chain(rt, epoch_id, lane["lane_id"])
+    acceptance = _read_acceptance_chain(rt, epoch_id, lane["lane_id"], lane)
     if acceptance is not None:
         if acceptance.get("approval") == "ACCEPTED":
             return None

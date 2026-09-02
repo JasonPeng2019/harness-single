@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .leases import acquire_leases, release_leases
 from .records import RecordLock, append_jsonl, atomic_write_json, read_record
+from .review import validate_acceptance_chain
 from .setup import read_runtime_state
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
@@ -45,6 +47,14 @@ class ControllerError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True)
+class ProviderExecution:
+    """The provider exit code plus its controller-owned process boundary."""
+
+    exit_code: int
+    boundary: processes.ProcessBoundary
 
 
 def _load_binding(harness_root: Path, provider_id: str) -> Any:
@@ -82,8 +92,20 @@ def _write_status(lane: dict[str, Any], fields: dict[str, Any]) -> None:
         "acceptance_advancement": None,
         "updated_at": iso_utc(),
     }
-    record.update(fields)
     with RecordLock(path):
+        if path.is_file():
+            try:
+                existing = read_record(path, CONTROLLER_STATUS_SCHEMA)
+            except (OSError, ValueError):
+                existing = None
+            if (
+                isinstance(existing, dict)
+                and existing.get("lane_id") == lane["lane_id"]
+                and existing.get("run_id") == lane["run_id"]
+            ):
+                record.update(existing)
+        record.update(fields)
+        record["updated_at"] = iso_utc()
         atomic_write_json(path, record)
 
 
@@ -133,9 +155,12 @@ def _read_acceptance_chain(
         acceptance = read_record(acceptance_path, ACCEPTANCE_SCHEMA)
     except (OSError, ValueError):
         return None
-    if review.get("run_id") != lane["run_id"] or acceptance.get("run_id") != lane["run_id"]:
-        return None
-    if acceptance.get("review_ref") != review.get("content_hash"):
+    if not validate_acceptance_chain(
+        review,
+        acceptance,
+        lane_id=lane["lane_id"],
+        run_id=lane["run_id"],
+    ):
         return None
     return {"review": review, "acceptance": acceptance}
 
@@ -147,8 +172,8 @@ def _run_provider(
     invocation: dict[str, Any],
     binding: Any,
     prompt_path: Path,
-) -> int:
-    """Start the provider, stream its output, and return its exit code."""
+) -> ProviderExecution:
+    """Start the provider, stream output, and return its exact process boundary."""
     worktree = Path(lane["worktree_path"])
     transcript_path = Path(lane["transcript_path"])
     stderr_path = Path(lane["stderr_path"])
@@ -163,6 +188,7 @@ def _run_provider(
         resume=resume,
     )
     _append_event(lane, "provider_started", " ".join(argv))
+    creationflags = processes.WINDOWS_CREATE_NO_WINDOW
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
@@ -175,14 +201,49 @@ def _run_provider(
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=processes.WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0,
+            creationflags=creationflags if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
         )
-    _write_status(lane, {"provider_state": {"state": "running", "pid": child.pid}})
+    boundary = processes.ProcessBoundary.for_process(child.pid)
+    if boundary.root_creation_time is None:
+        child.terminate()
+        child.wait(timeout=10.0)
+        raise ControllerError(
+            LAUNCH_PROVIDER_START_FAILED,
+            "cannot record provider process identity",
+        )
+    if os.name == "nt":
+        handle = getattr(child, "_handle", None)
+        if not boundary.attach_windows_process_handle(handle):
+            child.terminate()
+            child.wait(timeout=10.0)
+            raise ControllerError(
+                LAUNCH_PROVIDER_START_FAILED,
+                "cannot attach provider to its process boundary",
+            )
+    _write_status(
+        lane,
+        {
+            "provider_state": {
+                "state": "running",
+                "pid": child.pid,
+                "creation_time": boundary.root_creation_time,
+                "process_group_id": boundary.process_group_id,
+                "session_id": boundary.session_id,
+            },
+            "process_boundary": boundary.record(),
+        },
+    )
+    boundary.observe()
     last_message: str | None = None
     session: str | None = None
     with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(0, os.SEEK_END)
+        next_observation = time.monotonic()
         while child.poll() is None:
+            if time.monotonic() >= next_observation:
+                boundary.observe()
+                next_observation = time.monotonic() + 0.5
             line = handle.readline()
             if line:
                 parsed = binding.parse_line(line.rstrip("\n"))
@@ -197,12 +258,16 @@ def _run_provider(
                 # the normal cleanup-proof path below runs.
                 state = read_runtime_state(rt)
                 if state is not None and state.get("state") == "SHUTTING_DOWN":
-                    _append_event(lane, "shutdown_stop", "runtime shutting down; terminating provider")
-                    child.terminate()
+                    _append_event(
+                        lane,
+                        "shutdown_stop",
+                        "runtime shutting down; terminating provider boundary",
+                    )
+                    boundary.cleanup(force=True, timeout_seconds=10.0)
                     try:
                         child.wait(timeout=10.0)
                     except subprocess.TimeoutExpired:
-                        child.kill()
+                        child.kill()  # Popen handle for this exact child
                         child.wait(timeout=10.0)
                     break
                 time.sleep(0.2)
@@ -223,7 +288,7 @@ def _run_provider(
             lane["lane_id"],
             lambda current, value=session: {**current, "session": {"session_id": value}},
         )
-    return exit_code
+    return ProviderExecution(exit_code, boundary)
 
 
 def run_controller(lane_id: str) -> int:
@@ -285,21 +350,75 @@ def run_controller(lane_id: str) -> int:
     if not prompt_path.is_file():
         prompt_path = Path(lane["worktree_path"]) / ".agent-workspace" / "prompt.md"
     try:
-        exit_code = _run_provider(rt, epoch_id, lane, invocation, binding, prompt_path)
+        execution = _run_provider(rt, epoch_id, lane, invocation, binding, prompt_path)
+        exit_code = execution.exit_code
     except Exception as exc:
+        status_path = Path(lane["controller_status_path"])
+        try:
+            status = read_record(status_path, CONTROLLER_STATUS_SCHEMA)
+        except (OSError, ValueError):
+            status = {}
+        boundary = status.get("process_boundary") if isinstance(status, dict) else None
+        cleanup_proven = (
+            isinstance(boundary, dict)
+            and processes.cleanup_recorded_process_boundary(boundary)
+        )
+        provider_state = dict(status.get("provider_state") or {}) if isinstance(status, dict) else {}
+        provider_state.update({"state": "exited", "exit_code": -1})
         _write_status(
             lane,
-            {"controller_state": "exited", "provider_state": {"state": "exited", "exit_code": -1}},
+            {
+                "controller_state": "exited",
+                "provider_state": provider_state,
+                "cleanup_proven": cleanup_proven,
+                **({"cleanup_error": "provider/helper process boundary remains unknown or live"} if not cleanup_proven else {}),
+            },
         )
         _append_event(lane, "provider_start_failed", str(exc))
+        if cleanup_proven:
+            release_leases(rt, lane_id, lane["run_id"])
         return 4
 
-    _write_status(lane, {"provider_state": {"state": "exited", "exit_code": exit_code}})
+    provider_state = {
+        "state": "exited",
+        "pid": execution.boundary.root_pid,
+        "creation_time": execution.boundary.root_creation_time,
+        "exit_code": exit_code,
+        "process_group_id": execution.boundary.process_group_id,
+        "session_id": execution.boundary.session_id,
+    }
+    _write_status(
+        lane,
+        {
+            "provider_state": provider_state,
+            "process_boundary": execution.boundary.record(),
+            "cleanup_proven": False,
+        },
+    )
     _append_event(lane, "provider_exited", f"exit_code={exit_code}")
 
-    # Cleanup proof: the provider process is gone; release the leases.
+    cleanup_proven = execution.boundary.cleanup(force=True)
+    if not cleanup_proven:
+        _write_status(
+            lane,
+            {
+                "provider_state": provider_state,
+                "process_boundary": execution.boundary.record(),
+                "cleanup_proven": False,
+                "cleanup_error": "provider/helper process boundary remains unknown or live",
+            },
+        )
+        _append_event(
+            lane,
+            "cleanup_unproven",
+            "provider/helper process boundary was not proven gone; leases remain held",
+        )
+        return 5
+
+    # Cleanup proof covers the complete provider/helper boundary; only now may
+    # the controller publish the fact and release exclusive leases.
     _write_status(lane, {"cleanup_proven": True})
-    _append_event(lane, "cleanup_proven", "provider process confirmed gone")
+    _append_event(lane, "cleanup_proven", "provider/helper process boundary confirmed gone")
     release_leases(rt, lane_id, lane["run_id"])
     _append_event(lane, "leases_released", ",".join(declared) or "(none)")
 

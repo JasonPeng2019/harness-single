@@ -24,6 +24,7 @@ from .epochs import (
     write_active_lanes,
 )
 from .lanes import read_lane, update_lane
+from .leases import release_leases
 from .records import RecordLock, atomic_write_json, read_record
 from .setup import (
     MONITOR_SCHEMA,
@@ -88,7 +89,7 @@ def _wait_for_controller_exit(lane: dict[str, Any], timeout_seconds: float) -> b
 
 
 def _lane_clean(rt: Path, lane: dict[str, Any]) -> bool:
-    """Return whether every lane process is proven gone (controller + provider)."""
+    """Return whether controller and provider boundary are proven gone."""
     process = lane.get("process") or {}
     if processes.identity_matches(
         process.get("pid"), process.get("creation_time")
@@ -96,11 +97,20 @@ def _lane_clean(rt: Path, lane: dict[str, Any]) -> bool:
         return False
     status = _read_controller_status(lane)
     if status is None:
-        return True
+        return False
+    if status.get("cleanup_proven") is not True:
+        return False
+    boundary = status.get("process_boundary")
+    if not isinstance(boundary, dict) or not processes.process_boundary_is_gone(boundary):
+        return False
     provider_state = status.get("provider_state") or {}
     provider_pid = provider_state.get("pid")
-    if isinstance(provider_pid, int) and processes.process_alive(provider_pid):
-        return False
+    provider_creation = provider_state.get("creation_time")
+    if isinstance(provider_pid, int):
+        if processes.identity_matches(provider_pid, provider_creation):
+            return False
+        if processes.process_alive(provider_pid) and processes.process_identity(provider_pid) is None:
+            return False
     return True
 
 
@@ -222,6 +232,7 @@ def run_shutdown() -> dict[str, Any]:
                             SHUTDOWN_LANE_CLEANUP_UNPROVEN,
                             f"lane {lane_id} processes could not be proven gone; force-stop the lane",
                         )
+                    release_leases(rt, lane_id, lane["run_id"])
                     _retire_lane(rt, epoch_id, lane_id)
                 close_epoch(rt, epoch_id)
 

@@ -115,7 +115,7 @@ class ProcessProviderTests(unittest.TestCase):
             )
 
         snapshot = windows_process_snapshot(runner=runner)
-        self.assertTrue(snapshot.complete)
+        self.assertFalse(snapshot.complete)
         self.assertIsNone(snapshot.processes[0].created_utc)
         self.assertTrue(snapshot.errors)
 
