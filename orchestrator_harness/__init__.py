@@ -120,4 +120,4 @@ __all__ = [
     "uninstall_qwen_adapter",
     "upgrade_qwen_adapter",
 ]
-__version__ = "0.1.0"
+__version__ = "2.0.0"

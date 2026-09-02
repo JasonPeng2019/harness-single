@@ -1,12 +1,22 @@
+﻿"""Cross-platform process identity, liveness, termination, and detached spawn.
+
+A process is identified by its PID plus its start/creation time and checked
+through a cross-platform process API; a reused PID with a different creation
+time is never treated as the same process.
+"""
+
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Sequence, cast
+from typing import Any, Callable, Sequence, cast
+
+from harness_common.process_identity import exact_process_identity
 
 from .models import (
     ProcessBoundaryInventory,
@@ -18,6 +28,134 @@ from .models import (
 )
 
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
+
+
+def process_identity(pid: int) -> dict[str, Any] | None:
+    """Return ``{"pid": pid, "creation_time": <opaque>}`` or None when unknown."""
+    identity = exact_process_identity(pid)
+    if identity is None:
+        return None
+    return {"pid": int(identity["pid"]), "creation_time": str(identity["created_utc"])}
+
+
+def process_alive(pid: int) -> bool:
+    """Return whether a process with this PID is alive (identity not checked)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = ctypes.c_int
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except (AttributeError, OSError):
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def identity_matches(pid: int, creation_time: str | None) -> bool:
+    """Return whether the recorded PID+creation identity is a live same process."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if not process_alive(pid):
+        return False
+    if not creation_time:
+        return False
+    current = process_identity(pid)
+    return current is not None and current["creation_time"] == creation_time
+
+
+def terminate_process(pid: int, creation_time: str | None) -> bool:
+    """Terminate one process only when its exact identity matches.
+
+    Returns True when the process is gone (or was already gone); False when the
+    process survived or the identity did not match.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return True
+    if not process_alive(pid):
+        return True
+    if creation_time is not None and not identity_matches(pid, creation_time):
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+            kernel32.TerminateProcess.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            handle = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if not handle:
+                return False
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            return False
+    else:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+    return wait_for_exit(pid, timeout_seconds=5.0)
+
+
+def wait_for_exit(pid: int, timeout_seconds: float = 5.0) -> bool:
+    """Poll until the process is gone or the timeout elapses."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not process_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not process_alive(pid)
+
+
+def spawn_detached(
+    argv: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+    stdout: Any = subprocess.DEVNULL,
+    stderr: Any = subprocess.DEVNULL,
+) -> subprocess.Popen[Any]:
+    """Start one detached child process and return its Popen handle."""
+    creationflags = WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0
+    return subprocess.Popen(
+        list(argv),
+        cwd=str(cwd) if cwd is not None else None,
+        stdout=stdout,
+        stderr=stderr,
+        stdin=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+
+
+def python_argv(module: str, *args: str) -> list[str]:
+    """Return the argv for ``python -m <module> <args>``."""
+    return [sys.executable, "-m", module, *args]
+
 WINDOWS_CIM_SCRIPT = r"""
 $ErrorActionPreference='Stop'
 @(Get-CimInstance Win32_Process | ForEach-Object {
