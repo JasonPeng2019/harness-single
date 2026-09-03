@@ -106,7 +106,15 @@ class RootPayloadTests(unittest.TestCase):
             self.assertTrue(
                 (root / "orchestrator-harness-binding.json").is_file(), provider_id
             )
-            self.assertTrue((root / "hooks" / "post-tool-use.py").is_file(), provider_id)
+            self.assertTrue(
+                (root / "hooks" / "orchestrator_harness_post_tool_use.py").is_file(),
+                provider_id,
+            )
+            self.assertTrue(
+                (root / "hooks" / "orchestrator_harness_stop.py").is_file(),
+                provider_id,
+            )
+            self.assertFalse((root / "hooks" / "post-tool-use.py").exists(), provider_id)
             declarations = [root / "hooks.json", root / "settings.json"]
             self.assertTrue(any(path.is_file() for path in declarations), provider_id)
 
