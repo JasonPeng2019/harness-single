@@ -260,7 +260,9 @@ def main(argv: list[str] | None = None) -> int:
         else Path(__file__).resolve().parent
     )
     try:
-        result = _run(agent_workspace, args.command, args.event_id, args.summary)
+        result = _run(
+            agent_workspace, args.command, args.event_id, getattr(args, "summary", None)
+        )
     except (OSError, ValueError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

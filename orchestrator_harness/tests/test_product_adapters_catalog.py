@@ -391,5 +391,57 @@ class HelperCompilationTests(unittest.TestCase):
                 )
 
 
+class LaneQueueAcknowledgeTests(unittest.TestCase):
+    def test_lane_queue_acknowledge_without_summary_advances_pending(self) -> None:
+        helper = (
+            REPOSITORY_ROOT / "super-cache" / "workspace" / ".agent-workspace" / "lane-queue.py"
+        )
+        spec = importlib.util.spec_from_file_location("_lane_queue", helper)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        event_id = "event-ack-010"
+        temp_root = REPOSITORY_ROOT / ".agent-workspace" / "test-temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as raw:
+            workspace = Path(raw)
+            queue_path = workspace / "QUEUE.json"
+            binding = {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "provider_id": "qwen-code",
+                "inbox_path": str(queue_path),
+            }
+            (workspace / "harness-hook-binding.json").write_text(
+                json.dumps(binding, indent=2), encoding="utf-8"
+            )
+            inbox = {
+                "schema": "lane-inbox/v1",
+                "lane_id": "lane-ack-010",
+                "run_id": "run-ack-010",
+                "assignments": [
+                    {
+                        "event_id": event_id,
+                        "state": "PENDING",
+                        "history": [{"state": "PENDING", "at": "2026-09-03T00:00:00Z"}],
+                    }
+                ],
+            }
+            queue_path.write_text(json.dumps(inbox, indent=2), encoding="utf-8")
+
+            exit_code = module.main(
+                ["--agent-workspace", str(workspace), "acknowledge", "--event-id", event_id]
+            )
+
+            self.assertEqual(exit_code, 0)
+            updated = json.loads(queue_path.read_text(encoding="utf-8"))
+            assignment = updated["assignments"][0]
+            self.assertEqual(assignment["state"], "ACKNOWLEDGED")
+            self.assertNotIn("summary", assignment)
+            self.assertEqual(assignment["history"][-1]["state"], "ACKNOWLEDGED")
+
+
 if __name__ == "__main__":
     unittest.main()
