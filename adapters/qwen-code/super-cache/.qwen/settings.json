@@ -1,5 +1,28 @@
 {
   "model": "qwen3-coder",
   "approval_mode": "yolo",
-  "output_format": "stream-json"
+  "output_format": "stream-json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .qwen/hooks/orchestrator_harness_post_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .qwen/hooks/orchestrator_harness_stop.py"
+          }
+        ]
+      }
+    ]
+  }
 }
