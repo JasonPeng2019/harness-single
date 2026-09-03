@@ -94,7 +94,7 @@ class HookDispatchTestCase(unittest.TestCase):
             )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        cls.dispatch_func = module.dispatch
+        cls.dispatch_func = staticmethod(module.dispatch)
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -204,7 +204,7 @@ class HookDispatchTestCase(unittest.TestCase):
     def test_stop_rejects_result_with_invalid_outcome(self):
         self.write_binding()
         self.write_inbox([_make_assignment("evt-complete-1", "COMPLETE")])
-        self.write_result("PASS", outcome="UNKNOWN")
+        self.write_result(outcome="UNKNOWN")
         result = self.call_dispatch("stop")
         self.assertEqual(result["decision"], "REJECT")
 

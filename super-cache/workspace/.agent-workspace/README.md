@@ -2,7 +2,7 @@
 
 This directory is the provider-neutral workspace base staged into every
 managed worktree by `lane bootstrap`.  It carries the shared
-`.agent-workspace/` skeleton and the three provider-neutral helpers that the
+`.agent-workspace/` skeleton and the four provider-neutral helpers that the
 worker skills call.
 
 ## Contents
@@ -14,6 +14,9 @@ worker skills call.
   (`lane-inbox/v1`) through PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
 - `manager-notify.py` — writes one escalation notice into
   `manager-notifications/` for the monitor to promote into the manager queue.
+- `hook-dispatch.py` — decides the worker PostToolUse/Stop hook boundary from
+  the worker binding and inbox (`harness-hook-binding/v1`, `lane-inbox/v1`);
+  it never reads the manager queue and never advances assignment state.
 
 ## Rules
 

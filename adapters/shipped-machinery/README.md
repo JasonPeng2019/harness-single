@@ -14,6 +14,9 @@ and the registered launcher-binding contract.
   (`lane-inbox/v1`) through PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
 - `manager-notify.py` — writes one escalation notice into
   `manager-notifications/` for the monitor to promote into the manager queue.
+- `hook-dispatch.py` — decides the worker PostToolUse/Stop hook boundary from
+  the worker binding and inbox; the Stop boundary delegates result validation
+  to `result-stop-check.py`.
 
 Helpers prefer the current runtime record primitives
 (`orchestrator_harness.records`, `orchestrator_harness.core`) when the

@@ -38,7 +38,12 @@ ROOT_SKILLS = [
 
 WORKER_SKILLS = ["manager-notify", "lane-assignment"]
 
-HELPERS = ["result-stop-check.py", "lane-queue.py", "manager-notify.py"]
+HELPERS = [
+    "result-stop-check.py",
+    "lane-queue.py",
+    "manager-notify.py",
+    "hook-dispatch.py",
+]
 
 PLACEHOLDER_MARKERS = ("TODO", "TBD", "FIXME", "lorem", "placeholder", "XXX")
 
