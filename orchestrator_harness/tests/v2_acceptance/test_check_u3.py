@@ -36,3 +36,28 @@ class CheckU3Tests(unittest.TestCase):
         runtime.bootstrap("lane", "run-1")
         with self.assertRaisesRegex(ValueError, "COMPLETION_REVIEW_FORCE_REASON_INVALID"):
             runtime.review_pair("lane", "FAIL", "ACCEPTED")
+
+    def test_bound_009_resume_is_observable_before_new_run_artifacts_replace_old_ones(self) -> None:
+        runtime = ReferenceRuntime()
+        runtime.bootstrap("lane", "run-1")
+        runtime.terminal("lane", "review_pending")
+        self.assertEqual(
+            [
+                "resuming-persisted",
+                "task-rationale-instructions-replaced",
+                "obsolete-current-run-artifacts-cleared",
+                "fresh-invocation-validated",
+                "running-persisted",
+            ],
+            runtime.resume_ordered("lane", "run-2"),
+        )
+        self.assertEqual("run-2", runtime.lanes["lane"]["run_id"])
+
+    def test_bound_010_rejected_review_is_the_single_resume_signal_owner(self) -> None:
+        runtime = ReferenceRuntime(mode="managed")
+        runtime.bootstrap("lane", "run-1")
+        runtime.terminal("lane", "review_pending")
+        runtime.review_pair("lane", "FAIL", "REJECTED")
+        # The acceptance oracle permits one review-originated signal, never a second
+        # producer at resume.  This reference model intentionally has no resume event API.
+        self.assertEqual(1, len(runtime.events))

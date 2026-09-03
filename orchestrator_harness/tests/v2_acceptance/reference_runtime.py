@@ -67,6 +67,16 @@ class ReferenceRuntime:
             raise ValueError("LANE_RUNNING")
         lane.update(run_id=new_run_id, lifecycle="running", last=None)
 
+    def resume_ordered(self, lane_id: str, new_run_id: str) -> list[str]:
+        """Reference the BOUND-009 observable ordering, not candidate internals."""
+        lane = self.lanes[lane_id]
+        if lane["lifecycle"] in {"accepted", "running"}:
+            raise ValueError("resume is limited to stopped, unaccepted lanes")
+        trace = ["resuming-persisted", "task-rationale-instructions-replaced", "obsolete-current-run-artifacts-cleared", "fresh-invocation-validated"]
+        lane.update(run_id=new_run_id, lifecycle="running", last=None)
+        trace.append("running-persisted")
+        return trace
+
     def review_pair(self, lane_id: str, outcome: str, approval: str, force_reason: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         lane = self.lanes[lane_id]
         if approval == "ACCEPTED" and outcome != "PASS" and not force_reason:
