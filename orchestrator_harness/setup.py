@@ -464,7 +464,7 @@ def _heartbeat_is_fresh(record: dict[str, Any]) -> bool:
     return (datetime.now(timezone.utc) - parsed).total_seconds() <= HEARTBEAT_STALENESS_SECONDS
 
 
-def run_monitor_recover() -> dict[str, Any]:
+def run_monitor_recover(harness_root: Path | None = None) -> dict[str, Any]:
     """Execute ``health monitor-recover`` and return the structured result.
 
     Automatic recovery is managed-only and requires the runtime state OPEN.
@@ -474,7 +474,11 @@ def run_monitor_recover() -> dict[str, Any]:
     restarted.
     """
     try:
-        harness_root = find_harness_root()
+        harness_root = (
+            Path(harness_root).resolve()
+            if harness_root is not None
+            else find_harness_root()
+        )
         config = load_config(harness_root)
         manifest = load_resource_manifest(harness_root)
     except (ConfigError, OSError, ValueError) as exc:
