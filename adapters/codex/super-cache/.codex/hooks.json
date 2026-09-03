@@ -1,14 +1,25 @@
 {
-  "version": 1,
-  "hooks": [
-    {
-      "matcher": "PostToolUse",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "python .codex/hooks/post-tool-use.py"
-        }
-      ]
-    }
-  ]
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .codex/hooks/orchestrator_harness_stop.py"
+          }
+        ]
+      }
+    ]
+  }
 }
