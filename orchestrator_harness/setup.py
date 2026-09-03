@@ -19,6 +19,7 @@ import os
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,15 @@ SETUP_RESOURCE_MANIFEST_INVALID = "SETUP_RESOURCE_MANIFEST_INVALID"
 SETUP_ADAPTER_COLLISION = "SETUP_ADAPTER_COLLISION"
 SETUP_OVERWRITE_FAILED = "SETUP_OVERWRITE_FAILED"
 SETUP_MONITOR_ALREADY_RUNNING = "SETUP_MONITOR_ALREADY_RUNNING"
+
+MONITOR_RECOVERED = "MONITOR_RECOVERED"
+MONITOR_HEALTHY = "MONITOR_HEALTHY"
+MONITOR_DELIBERATELY_STOPPED = "MONITOR_DELIBERATELY_STOPPED"
+MONITOR_STOP_INCOMPLETE = "MONITOR_STOP_INCOMPLETE"
+MONITOR_CLEANUP_UNPROVEN = "MONITOR_CLEANUP_UNPROVEN"
+MONITOR_IDENTITY_UNPROVEN = "MONITOR_IDENTITY_UNPROVEN"
+MONITOR_RECOVERY_DISABLED = "MONITOR_RECOVERY_DISABLED"
+MONITOR_RUNTIME_NOT_OPEN = "MONITOR_RUNTIME_NOT_OPEN"
 
 
 class SetupError(ConfigError):
@@ -387,6 +397,31 @@ def _check_launcher_bindings(harness_root: Path) -> list[Path]:
     return checked
 
 
+def _start_monitor_locked(
+    harness_root: Path,
+    rt: Path,
+    config_identity: str,
+) -> dict[str, Any]:
+    """Start and record the monitor; the caller must hold the monitor-record lock."""
+    argv = processes.python_argv("orchestrator_harness.monitor")
+    child = processes.spawn_detached(argv, cwd=str(harness_root))
+    identity = processes.process_identity(child.pid)
+    if identity is None:
+        raise ConfigError("cannot record monitor process identity")
+    record = {
+        "schema": MONITOR_SCHEMA,
+        "config_identity": config_identity,
+        "pid": identity["pid"],
+        "creation_time": identity["creation_time"],
+        "started_at": iso_utc(),
+        "health": "starting",
+        "last_heartbeat_at": iso_utc(),
+        "stop_requested": False,
+    }
+    atomic_write_json(monitor_record_path(rt), record)
+    return record
+
+
 def _start_monitor(
     harness_root: Path,
     rt: Path,
@@ -406,23 +441,160 @@ def _start_monitor(
                 and not existing.get("stop_requested", False)
             ):
                 raise ConfigError(SETUP_MONITOR_ALREADY_RUNNING)
-        argv = processes.python_argv("orchestrator_harness.monitor")
-        child = processes.spawn_detached(argv, cwd=str(harness_root))
-        identity = processes.process_identity(child.pid)
-        if identity is None:
-            raise ConfigError("cannot record monitor process identity")
-        record = {
-            "schema": MONITOR_SCHEMA,
-            "config_identity": config_identity,
-            "pid": identity["pid"],
-            "creation_time": identity["creation_time"],
-            "started_at": iso_utc(),
-            "health": "starting",
-            "last_heartbeat_at": iso_utc(),
-            "stop_requested": False,
-        }
-        atomic_write_json(record_path, record)
-    return record
+        return _start_monitor_locked(harness_root, rt, config_identity)
+
+
+def _heartbeat_is_fresh(record: dict[str, Any]) -> bool:
+    """Return whether the recorded heartbeat is a fresh, valid ISO UTC time.
+
+    Missing, malformed, naive, or stale timestamps are not fresh.  The
+    staleness bound is imported locally to avoid the monitor -> setup cycle.
+    """
+    from .monitor import HEARTBEAT_STALENESS_SECONDS
+
+    raw = record.get("last_heartbeat_at")
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return (datetime.now(timezone.utc) - parsed).total_seconds() <= HEARTBEAT_STALENESS_SECONDS
+
+
+def run_monitor_recover() -> dict[str, Any]:
+    """Execute ``health monitor-recover`` and return the structured result.
+
+    Automatic recovery is managed-only and requires the runtime state OPEN.
+    Under the single monitor-record lock it starts a missing monitor, leaves
+    a fresh live monitor untouched, restarts a dead one, and force-stops a
+    hung one before replacement.  A deliberately stopped monitor is never
+    restarted.
+    """
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+        manifest = load_resource_manifest(harness_root)
+    except (ConfigError, OSError, ValueError) as exc:
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "fix harness-config.json and resource-manifest.json, then re-run setup",
+        )
+
+    rt = config.runtime_root
+    if config.profile != "managed":
+        return _failure(
+            MONITOR_RECOVERY_DISABLED,
+            "automatic monitor recovery requires managed coordination",
+            "enable managed_coordination or start the monitor manually",
+        )
+    state = read_runtime_state(rt)
+    if state is None or state.get("state") != "OPEN":
+        current = state.get("state") if state is not None else "missing"
+        return _failure(
+            MONITOR_RUNTIME_NOT_OPEN,
+            f"runtime state is not OPEN: {current}",
+            "open the runtime with `harness setup` before recovering the monitor",
+        )
+
+    record_path = monitor_record_path(rt)
+    try:
+        config_identity = compute_config_identity(config, manifest)
+        with RecordLock(record_path):
+            record = read_monitor_record(rt)
+            if record is None:
+                _start_monitor_locked(harness_root, rt, config_identity)
+                return {
+                    "ok": True,
+                    "code": MONITOR_RECOVERED,
+                    "summary": "monitor record was missing; a fresh monitor started",
+                    "evidence_paths": [str(record_path)],
+                    "next_action": "confirm the monitor heartbeat in MONITOR.json",
+                }
+
+            pid = record.get("pid")
+            creation = record.get("creation_time")
+            stop_requested = record.get("stop_requested", False)
+            health = record.get("health")
+
+            if not isinstance(pid, int) or not creation:
+                return {
+                    "ok": False,
+                    "code": MONITOR_IDENTITY_UNPROVEN,
+                    "summary": "recorded monitor PID has no usable creation identity",
+                    "evidence_paths": [str(record_path)],
+                    "next_action": "remove the unproven MONITOR.json and re-run monitor-recover",
+                }
+
+            alive = processes.identity_matches(pid, creation)
+
+            if stop_requested or health == "STOPPED":
+                if alive:
+                    return {
+                        "ok": False,
+                        "code": MONITOR_STOP_INCOMPLETE,
+                        "summary": "monitor is marked stopped but the recorded process is still alive",
+                        "evidence_paths": [str(record_path)],
+                        "next_action": "stop the exact recorded process, then re-run monitor-recover",
+                    }
+                return {
+                    "ok": True,
+                    "code": MONITOR_DELIBERATELY_STOPPED,
+                    "summary": "monitor is deliberately stopped; nothing started",
+                    "evidence_paths": [str(record_path)],
+                    "next_action": "start the monitor manually when it is needed again",
+                }
+
+            if alive:
+                if _heartbeat_is_fresh(record):
+                    return {
+                        "ok": True,
+                        "code": MONITOR_HEALTHY,
+                        "summary": "monitor is alive with a fresh heartbeat; nothing changed",
+                        "evidence_paths": [str(record_path)],
+                        "next_action": "no action; the monitor is healthy",
+                    }
+                terminated = processes.terminate_process(pid, creation, force=True)
+                if not terminated or processes.identity_matches(pid, creation):
+                    return {
+                        "ok": False,
+                        "code": MONITOR_CLEANUP_UNPROVEN,
+                        "summary": "hung monitor termination could not be proven",
+                        "evidence_paths": [str(record_path)],
+                        "next_action": "verify the exact recorded process is gone, then re-run monitor-recover",
+                    }
+                _start_monitor_locked(harness_root, rt, config_identity)
+                return {
+                    "ok": True,
+                    "code": MONITOR_RECOVERED,
+                    "summary": "hung monitor was force-stopped and replaced",
+                    "evidence_paths": [str(record_path)],
+                    "next_action": "confirm the replacement monitor heartbeat in MONITOR.json",
+                }
+
+            _start_monitor_locked(harness_root, rt, config_identity)
+            return {
+                "ok": True,
+                "code": MONITOR_RECOVERED,
+                "summary": "dead monitor was replaced with a fresh one",
+                "evidence_paths": [str(record_path)],
+                "next_action": "confirm the replacement monitor heartbeat in MONITOR.json",
+            }
+    except ConfigError as exc:
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "resolve the error and re-run monitor-recover",
+        )
+    except OSError as exc:
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "resolve the error and re-run monitor-recover",
+        )
 
 
 def _failure(code: str, summary: str, next_action: str) -> dict[str, Any]:

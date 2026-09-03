@@ -71,6 +71,9 @@ results, operates hardware, or replaces the root orchestrator.
   `1h`.
 - `health reconcile` — rebuild active-lanes and re-derive status (manual entry point to the
   monitor's automatic reconciliation).
+- `health monitor-recover` — recover the persistent monitor. Managed coordination only and the
+  runtime must be OPEN: starts a missing monitor, restarts a dead one, and force-stops a hung one
+  before replacement. A deliberately stopped monitor (stop mark) is never restarted.
 
 ## Configuration and one-time integration
 

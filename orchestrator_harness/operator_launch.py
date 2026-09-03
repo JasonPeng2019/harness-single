@@ -288,6 +288,9 @@ def _build_parser() -> argparse.ArgumentParser:
     health = subparsers.add_parser("health", help="health commands")
     health_sub = health.add_subparsers(dest="health_command", required=True)
     health_sub.add_parser("reconcile", help="rebuild active-lanes and re-derive status")
+    health_sub.add_parser(
+        "monitor-recover", help="recover the persistent monitor (managed, runtime OPEN)"
+    )
 
     return parser
 
@@ -348,6 +351,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if command == "health":
         if args.health_command == "reconcile":
             return scan_watch.run_health_reconcile()
+        if args.health_command == "monitor-recover":
+            return setup.run_monitor_recover()
         raise ValueError(f"unknown health command: {args.health_command}")
     raise ValueError(f"unknown command: {command}")
 
