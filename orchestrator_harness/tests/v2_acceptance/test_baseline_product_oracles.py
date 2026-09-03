@@ -17,7 +17,7 @@ from orchestrator_harness import operator_launch
 
 
 class BaselineProductOracleTests(unittest.TestCase):
-    """CHECK-U1/U3/U4: exact BOUND-011/012 and hygiene contracts."""
+    """Product-facing baseline-red CHECK-U1/U3/U4 contract oracles."""
 
     def test_bound_011_exposes_only_public_orphan_lease_force_release_route(self) -> None:
         parser = operator_launch._build_parser()
@@ -31,8 +31,18 @@ class BaselineProductOracleTests(unittest.TestCase):
 
     def test_bound_012_requires_nonempty_close_summary_for_every_outcome(self) -> None:
         parser = operator_launch._build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["manager", "close", "--event-id", "event-1", "--outcome", "COMPLETE"])
+        for outcome in ("COMPLETE", "BLOCKED"):
+            for summary in (None, "", "   "):
+                command = ["manager", "close", "--event-id", "event-1", "--outcome", outcome]
+                if summary is not None:
+                    command.extend(["--summary", summary])
+                with self.subTest(outcome=outcome, summary=summary):
+                    with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                        parser.parse_args(command)
+            accepted = parser.parse_args(
+                ["manager", "close", "--event-id", "event-1", "--outcome", outcome, "--summary", "operator decision"]
+            )
+            self.assertEqual("operator decision", accepted.summary)
 
     def test_runtime_and_lane_worktrees_are_explicitly_git_ignored(self) -> None:
         root = Path(__file__).resolve().parents[3]
