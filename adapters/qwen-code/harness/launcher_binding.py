@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from typing import Any
 
 PROVIDER_ID = "qwen-code"
@@ -19,7 +20,8 @@ def build_argv(
 ) -> list[str]:
     """Build the provider-owned, stdin-prompted Qwen Code launch vector."""
     del worktree, prompt_path
-    argv = ["qwen", "--approval-mode=yolo", "--model", model, "--output-format", "stream-json"]
+    executable = shutil.which("qwen") or "qwen"
+    argv = [executable, "--approval-mode=yolo", "--model", model, "--output-format", "stream-json"]
     if resume:
         if not session_id:
             raise ValueError("Qwen Code resume requires a session ID")

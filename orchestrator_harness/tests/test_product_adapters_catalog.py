@@ -15,6 +15,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -288,15 +289,38 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--verbose", argv)
 
         qwen = self._load_registered("qwen-code")
-        argv = qwen.build_argv(
-            model="qwen3-coder",
-            worktree="C:/wt",
-            prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
-        )
+        with mock.patch.object(qwen.shutil, "which", return_value=None):
+            argv = qwen.build_argv(
+                model="qwen3-coder",
+                worktree="C:/wt",
+                prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
+            )
         self.assertEqual(argv[0], "qwen")
         self.assertIn("--approval-mode=yolo", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
+
+    def test_qwen_binding_uses_portable_executable_discovery(self) -> None:
+        qwen = self._load_registered("qwen-code")
+        kwargs = {
+            "model": "qwen3-coder",
+            "worktree": "C:/wt",
+            "prompt_path": "C:/wt/.agent-workspace/worker-prompt.md",
+        }
+        resolved = "C:/portable/qwen-code/bin/qwen.cmd"
+        with mock.patch.object(qwen.shutil, "which", return_value=resolved) as discover:
+            argv = qwen.build_argv(**kwargs)
+        discover.assert_called_once_with("qwen")
+        self.assertEqual(argv[0], resolved)
+        self.assertIn("--approval-mode=yolo", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("stream-json", argv)
+
+        with mock.patch.object(qwen.shutil, "which", return_value=None) as discover:
+            argv = qwen.build_argv(**kwargs)
+        discover.assert_called_once_with("qwen")
+        self.assertEqual(argv[0], "qwen")
+        self.assertIn("--approval-mode=yolo", argv)
 
     def test_parse_line_facts(self) -> None:
         codex = self._load_registered("codex")
