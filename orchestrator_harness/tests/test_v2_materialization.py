@@ -83,6 +83,20 @@ class MaterializationFixture:
         )
         self._write_text(adapter / "root" / dotdir / "root.txt", root_contents)
         self._write_text(
+            adapter / "root" / dotdir / "hooks" / "post-tool-use.py",
+            "# root hook fixture\n",
+        )
+        self._write_json(
+            adapter / "root" / dotdir / "orchestrator-harness-binding.json",
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "root",
+                "provider_id": provider_id,
+                "harness_root": None,
+                "runtime_root": None,
+            },
+        )
+        self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", worker_contents
         )
 
@@ -97,6 +111,20 @@ class MaterializationFixture:
         )
         self._write_text(adapter / "harness" / "launcher_binding.py", binding)
         self._write_text(adapter / "root" / dotdir / "root.txt", "fixture\n")
+        self._write_text(
+            adapter / "root" / dotdir / "hooks" / "post-tool-use.py",
+            "# root hook fixture\n",
+        )
+        self._write_json(
+            adapter / "root" / dotdir / "orchestrator-harness-binding.json",
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "root",
+                "provider_id": provider_id,
+                "harness_root": None,
+                "runtime_root": None,
+            },
+        )
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", "fixture\n"
         )
@@ -265,6 +293,23 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertTrue(
             (self.fixture.root_workspace / ".codex" / "root.txt").is_file()
         )
+        for provider_id, dotdir in (
+            ("codex", ".codex"),
+            ("disposable-custom", ".custom"),
+        ):
+            binding = json.loads(
+                (
+                    self.fixture.root_workspace
+                    / dotdir
+                    / "orchestrator-harness-binding.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(str(self.fixture.harness.resolve()), binding["harness_root"])
+            self.assertEqual(
+                str((self.fixture.root_workspace / ".harness-runtime").resolve()),
+                binding["runtime_root"],
+            )
+            self.assertEqual(provider_id, binding["provider_id"])
         self.assertTrue(
             (
                 self.fixture.root_workspace
@@ -275,6 +320,43 @@ class V2MaterializationTests(unittest.TestCase):
             ).is_file()
         )
         spawn_detached.assert_called_once()
+
+    def test_setup_rejects_hooked_provider_without_binding_before_writes(self) -> None:
+        (
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "root"
+            / ".codex"
+            / "orchestrator-harness-binding.json"
+        ).unlink()
+        with patch.object(setup, "find_harness_root", return_value=self.fixture.harness):
+            result = setup.run_setup()
+        self.assertFalse(result["ok"])
+        self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
+        self.assertIn("installed codex hook has no harness binding", result["summary"])
+        self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
+        self.assertFalse((self.fixture.root_workspace / ".codex").exists())
+
+    def test_setup_rejects_invalid_root_binding_before_writes(self) -> None:
+        binding_path = (
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "root"
+            / ".codex"
+            / "orchestrator-harness-binding.json"
+        )
+        record = json.loads(binding_path.read_text(encoding="utf-8"))
+        record["provider_id"] = "wrong-provider"
+        self.fixture._write_json(binding_path, record)
+        with patch.object(setup, "find_harness_root", return_value=self.fixture.harness):
+            result = setup.run_setup()
+        self.assertFalse(result["ok"])
+        self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
+        self.assertIn("invalid provider_id", result["summary"])
+        self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
+        self.assertFalse((self.fixture.root_workspace / ".codex").exists())
 
     def test_shipped_and_disposable_custom_provider_bindings_validate(self) -> None:
         repository = Path(__file__).resolve().parents[2]

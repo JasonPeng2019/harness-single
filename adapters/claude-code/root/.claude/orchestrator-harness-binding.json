@@ -2,6 +2,8 @@
   "schema": "harness-hook-binding/v1",
   "role": "root",
   "provider_id": "claude-code",
+  "harness_root": null,
+  "runtime_root": null,
   "liveness_path": ".agent-workspace/root-hook-liveness.jsonl",
   "delivery_receipt_path": ".agent-workspace/root-hook-delivery.jsonl",
   "manager_queue_path": null,

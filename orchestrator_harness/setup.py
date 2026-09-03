@@ -15,6 +15,7 @@ binding; it never copies a binding into product source.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -40,6 +41,8 @@ from .records import RecordLock, atomic_write_json, read_record
 RUNTIME_STATE_SCHEMA = "runtime-state/v1"
 MONITOR_SCHEMA = "monitor/v1"
 RESOURCE_MANIFEST_SCHEMA = "resource-manifest/v1"
+ROOT_HOOK_BINDING_SCHEMA = "harness-hook-binding/v1"
+ROOT_HOOK_BINDING_NAME = "orchestrator-harness-binding.json"
 
 SETUP_CONFIG_INVALID = "SETUP_CONFIG_INVALID"
 SETUP_CACHE_INVALID = "SETUP_CACHE_INVALID"
@@ -270,6 +273,114 @@ def _preflight_root_payloads(
             SETUP_ADAPTER_COLLISION,
             f"destination collision (re-run with --overwrite to replace): {collisions[0]}",
         )
+
+
+def _plan_root_hook_bindings(
+    harness_root: Path,
+    plan: list[tuple[Path, Path]],
+) -> list[tuple[str, Path, dict[str, Any]]]:
+    """Validate portable ROOT hook bindings before setup writes anything."""
+    adapters_dir = harness_root / "adapters"
+    provider_files: dict[str, list[tuple[Path, Path]]] = {}
+    for source, relative in plan:
+        try:
+            source_parts = source.relative_to(adapters_dir).parts
+        except ValueError as exc:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"ROOT payload source is outside the adapter catalog: {source}",
+            ) from exc
+        if len(source_parts) < 3 or source_parts[1] != "root":
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"ROOT payload source has an invalid adapter location: {source}",
+            )
+        provider_files.setdefault(source_parts[0], []).append((source, relative))
+
+    bindings: list[tuple[str, Path, dict[str, Any]]] = []
+    for provider_id, files in sorted(provider_files.items()):
+        has_python_hook = any(
+            source.suffix == ".py" and "hooks" in relative.parts
+            for source, relative in files
+        )
+        if not has_python_hook:
+            continue
+        candidates = [
+            (source, relative)
+            for source, relative in files
+            if relative.name == ROOT_HOOK_BINDING_NAME
+        ]
+        if len(candidates) != 1:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"installed {provider_id} hook has no harness binding",
+            )
+        source, relative = candidates[0]
+        try:
+            record = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"ROOT hook binding for {provider_id} is unreadable: {exc}",
+            ) from exc
+        if not isinstance(record, dict):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"ROOT hook binding for {provider_id} must be a JSON object",
+            )
+        expected = {
+            "schema": ROOT_HOOK_BINDING_SCHEMA,
+            "role": "root",
+            "provider_id": provider_id,
+            "harness_root": None,
+            "runtime_root": None,
+        }
+        for field, value in expected.items():
+            if record.get(field) != value:
+                raise SetupError(
+                    SETUP_CONFIG_INVALID,
+                    f"ROOT hook binding for {provider_id} has invalid {field}",
+                )
+        bindings.append((provider_id, relative, record))
+    return bindings
+
+
+def _materialize_root_hook_bindings(
+    root_workspace: Path,
+    harness_root: Path,
+    runtime_root: Path,
+    bindings: list[tuple[str, Path, dict[str, Any]]],
+) -> list[Path]:
+    """Atomically bind verified installed ROOT hook payloads to this runtime."""
+    bound_paths: list[Path] = []
+    resolved_harness = str(harness_root.resolve())
+    resolved_runtime = str(runtime_root.resolve())
+    for provider_id, relative, template in bindings:
+        target = root_workspace / relative
+        try:
+            copied = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"installed {provider_id} hook has no harness binding: {exc}",
+            ) from exc
+        if copied != template:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"installed ROOT hook binding for {provider_id} does not match its verified template",
+            )
+        bound = dict(copied)
+        bound["harness_root"] = resolved_harness
+        bound["runtime_root"] = resolved_runtime
+        try:
+            atomic_write_json(target, bound)
+        except OSError as exc:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"cannot bind installed ROOT hook for {provider_id}: {exc}",
+            ) from exc
+        bound_paths.append(target)
+    return bound_paths
 
 
 def _install_root_payloads(
@@ -652,6 +763,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             )
         root_plan = _plan_root_payloads(harness_root)
         _preflight_root_payloads(root_plan, config.root_workspace, overwrite=overwrite)
+        root_bindings = _plan_root_hook_bindings(harness_root, root_plan)
         cache_plan = _plan_active_cache(harness_root)
         destination = rt / "super-cache"
         if destination.is_dir():
@@ -707,11 +819,23 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                     )
 
         _install_active_cache(harness_root, rt, plan=cache_plan, overwrite=overwrite)
-        _, overwritten = _install_root_payloads(
+        installed, overwritten = _install_root_payloads(
             harness_root,
             config.root_workspace,
             plan=root_plan,
             overwrite=overwrite,
+        )
+        installed_set = set(installed)
+        if any(config.root_workspace / relative not in installed_set for _, relative, _ in root_bindings):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                "installed ROOT hook payload is missing its planned harness binding",
+            )
+        _materialize_root_hook_bindings(
+            config.root_workspace,
+            harness_root,
+            rt,
+            root_bindings,
         )
 
         manifest_path = rt / "resources" / "RESOURCE_MANIFEST.json"
