@@ -183,7 +183,7 @@ class WorkerPayloadTests(unittest.TestCase):
             self.assertTrue(
                 (payload / "orchestrator-harness-binding.json").is_file(), provider_id
             )
-            if provider_id == "codex":
+            if provider_id in ("codex", "claude-code"):
                 self.assertTrue(
                     (payload / "hooks" / "orchestrator_harness_post_tool_use.py").is_file(),
                     provider_id,
