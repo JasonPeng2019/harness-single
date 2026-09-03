@@ -44,9 +44,12 @@ ACCEPTANCE_POLL_SECONDS = 2.0
 
 
 class ControllerError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, *, no_provider_started: bool = False
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.no_provider_started = no_provider_started
 
 
 @dataclass(frozen=True)
@@ -191,13 +194,20 @@ def _run_provider(
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
-        child = processes.spawn_provider(
-            argv,
-            cwd=str(worktree),
-            stdin=prompt_handle,
-            stdout=transcript_handle,
-            stderr=stderr_handle,
-        )
+        try:
+            child = processes.spawn_provider(
+                argv,
+                cwd=str(worktree),
+                stdin=prompt_handle,
+                stdout=transcript_handle,
+                stderr=stderr_handle,
+            )
+        except Exception as exc:
+            raise ControllerError(
+                LAUNCH_PROVIDER_START_FAILED,
+                f"provider process was not created: {exc}",
+                no_provider_started=True,
+            ) from exc
     boundary: processes.ProcessBoundary | None = None
     try:
         take_job_handle = getattr(child, "take_job_handle", None)
@@ -345,7 +355,6 @@ def run_controller(lane_id: str) -> int:
     except (OSError, ValueError) as exc:
         raise ControllerError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
     provider_id = invocation["provider"]["id"]
-    binding = _load_binding(harness_root, provider_id)
 
     _write_status(lane, {"controller_state": "starting"})
     _append_event(lane, "controller_started", lane_id)
@@ -365,6 +374,26 @@ def run_controller(lane_id: str) -> int:
             "process": {"pid": identity["pid"], "creation_time": identity["creation_time"]},
         },
     )
+    try:
+        binding = _load_binding(harness_root, provider_id)
+    except Exception as exc:
+        _write_status(
+            lane,
+            {
+                "controller_state": "exited",
+                "provider_state": {"state": "not_started"},
+                "cleanup_proven": True,
+                "cleanup_error": None,
+            },
+        )
+        _append_event(lane, "binding_failed", str(exc))
+        update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            lambda current: {**current, "lifecycle": "prepared", "process": {}},
+        )
+        return 4
 
     declared = [str(item) for item in invocation.get("exclusive_resources", [])]
     try:
@@ -378,10 +407,25 @@ def run_controller(lane_id: str) -> int:
         )
     except Exception as exc:
         code = getattr(exc, "code", LAUNCH_LEASE_BUSY)
-        _write_status(lane, {"controller_state": "exited"})
+        _write_status(
+            lane,
+            {
+                "controller_state": "exited",
+                "provider_state": {"state": "not_started"},
+                "cleanup_proven": True,
+                "cleanup_error": None,
+            },
+        )
         _append_event(lane, "lease_busy", str(exc))
+        update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            lambda current: {**current, "lifecycle": "prepared", "process": {}},
+        )
         return 2 if code == LAUNCH_LEASE_BUSY else 3
     _append_event(lane, "leases_acquired", ",".join(declared) or "(none)")
+    _write_status(lane, {"controller_state": "running"})
 
     prompt_path = Path(lane["worktree_path"]) / ".agent-workspace" / "worker-prompt.md"
     if not prompt_path.is_file():
@@ -396,12 +440,17 @@ def run_controller(lane_id: str) -> int:
         except (OSError, ValueError):
             status = {}
         boundary = status.get("process_boundary") if isinstance(status, dict) else None
-        cleanup_proven = (
+        no_provider_started = bool(
+            isinstance(exc, ControllerError) and exc.no_provider_started
+        )
+        cleanup_proven = no_provider_started or (
             isinstance(boundary, dict)
             and processes.cleanup_recorded_process_boundary(boundary)
         )
         provider_state = dict(status.get("provider_state") or {}) if isinstance(status, dict) else {}
-        provider_state.update({"state": "exited", "exit_code": -1})
+        provider_state.update(
+            {"state": "not_started" if no_provider_started else "exited", "exit_code": -1}
+        )
         _write_status(
             lane,
             {
@@ -414,6 +463,7 @@ def run_controller(lane_id: str) -> int:
         _append_event(lane, "provider_start_failed", str(exc))
         if cleanup_proven:
             release_leases(rt, lane_id, lane["run_id"])
+            _append_event(lane, "leases_released", ",".join(declared) or "(none)")
         return 4
 
     provider_state = {

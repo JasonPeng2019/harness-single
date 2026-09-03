@@ -52,9 +52,12 @@ HANDSHAKE_TIMEOUT_SECONDS = 30.0
 
 
 class LaunchError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, *, evidence_paths: list[str] | None = None
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.evidence_paths = evidence_paths or []
 
 
 def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
@@ -62,7 +65,13 @@ def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        return read_record(path, CONTROLLER_STATUS_SCHEMA)
+        status = read_record(path, CONTROLLER_STATUS_SCHEMA)
+        if (
+            status.get("lane_id") != lane.get("lane_id")
+            or status.get("run_id") != lane.get("run_id")
+        ):
+            return None
+        return status
     except (OSError, ValueError):
         return None
 
@@ -112,24 +121,62 @@ def run_launch(lane_id: str) -> dict[str, Any]:
             processes.python_argv("orchestrator_harness.controller", lane_id),
             cwd=str(harness_root),
         )
+        controller_identity = processes.process_identity(child.pid)
+        if controller_identity is None:
+            child.terminate()
+            child.wait(timeout=10.0)
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                "cannot record the launched controller process identity",
+            )
+        try:
+            lane = update_lane(
+                rt,
+                epoch_id,
+                lane_id,
+                lambda current: {
+                    **current,
+                    "lifecycle": "running",
+                    "process": {
+                        "pid": controller_identity["pid"],
+                        "creation_time": controller_identity["creation_time"],
+                    },
+                },
+            )
+        except Exception as exc:
+            child.terminate()
+            child.wait(timeout=10.0)
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                f"cannot persist the launched controller process identity: {exc}",
+            ) from exc
         deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if child.poll() is not None:
-                break
             status = _read_controller_status(lane)
-            if (
+            provider_state = (status or {}).get("provider_state") or {}
+            running = (
                 status is not None
                 and status.get("controller_state") == "running"
-                and (status.get("provider_state") or {}).get("state") == "running"
-            ):
+                and provider_state.get("state") == "running"
+            )
+            terminal = (
+                status is not None
+                and provider_state.get("state") == "exited"
+                and status.get("cleanup_proven") is True
+                and status.get("recorded_status") in ("review_pending", "result_invalid")
+            )
+            if running or terminal:
                 lane = read_lane(rt, epoch_id, lane_id)
+                state = status.get("recorded_status") if terminal else "running"
                 return {
                     "ok": True,
                     "code": "LAUNCH_OK",
-                    "summary": f"lane {lane_id} is running",
+                    "summary": f"lane {lane_id} reached {state}",
                     "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
                     "next_action": "wait for the worker result; the monitor reports actionable status",
                 }
+            if child.poll() is not None:
+                break
             time.sleep(0.2)
         # The controller exited before the handshake: map its last event to a code.
         events_path = Path(lane["controller_events_path"])
@@ -140,16 +187,21 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 if "lease_busy" in line:
                     code = LAUNCH_LEASE_BUSY
                     summary = "a declared resource is held; no lane started"
+                elif "binding_failed" in line:
+                    code = LAUNCH_BINDING_FAILED
+                    summary = "the provider launcher binding could not be loaded"
                 elif "provider_start_failed" in line:
                     code = LAUNCH_PROVIDER_START_FAILED
                     summary = "the provider process could not be started"
-        raise LaunchError(code, summary)
+        status = _read_controller_status(lane)
+        evidence = [str(Path(lane["controller_status_path"]))] if status else []
+        raise LaunchError(code, summary, evidence_paths=evidence)
     except LaunchError as exc:
         return {
             "ok": False,
             "code": exc.code,
             "summary": str(exc),
-            "evidence_paths": [],
+            "evidence_paths": exc.evidence_paths,
             "next_action": "on LAUNCH_LEASE_BUSY, wait for the holder to finish and re-launch",
         }
     except Exception as exc:
@@ -168,6 +220,8 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
     controller_pid = process.get("pid")
     controller_creation = process.get("creation_time")
     status = _read_controller_status(lane)
+    if not isinstance(controller_pid, int) and status is None:
+        return lane.get("lifecycle") == "prepared"
     provider_pid = None
     provider_creation = None
     ok = True
@@ -178,7 +232,7 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
             force=True,
         ):
             ok = False
-    boundary_ok = status is not None
+    boundary_ok = False
     if status is not None:
         provider_state = status.get("provider_state") or {}
         provider_pid = provider_state.get("pid")
@@ -188,6 +242,8 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
             boundary_ok = processes.cleanup_recorded_process_boundary(boundary)
         elif isinstance(provider_pid, int):
             boundary_ok = processes.terminate_process(provider_pid, provider_creation, force=True)
+        elif status.get("cleanup_proven") is True and provider_state.get("state") == "not_started":
+            boundary_ok = True
     return ok and boundary_ok
 
 
