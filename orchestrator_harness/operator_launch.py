@@ -15,8 +15,22 @@ import sys
 from typing import Any
 
 from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown
-from .config import find_harness_root, load_config
-from .lanes import find_active_lane
+from .config import find_harness_root, load_config, load_resource_manifest
+from .lanes import LaneError, find_active_lane
+from .leases import (
+    FORCE_RELEASE_CONFIG_INVALID,
+    FORCE_RELEASE_DELETE_FAILED,
+    FORCE_RELEASE_HOLDER_LIVE,
+    FORCE_RELEASE_HOLDER_UNPROVEN,
+    FORCE_RELEASE_LEASE_INVALID,
+    FORCE_RELEASE_LEASE_MISSING,
+    FORCE_RELEASE_OK,
+    FORCE_RELEASE_UNDECLARED,
+    LeaseError,
+    force_release_lease,
+    lease_path,
+    read_lease,
+)
 from .manager_queue import (
     MANAGER_ACK_ALREADY_ACKNOWLEDGED,
     MANAGER_ACK_EVENT_NOT_FOUND,
@@ -221,6 +235,69 @@ def _send_lane_notification(lane_id: str, prompt: str) -> dict[str, Any]:
     }
 
 
+def _lease_force_release(resource_id: str) -> dict[str, Any]:
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+        manifest = load_resource_manifest(harness_root)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": FORCE_RELEASE_CONFIG_INVALID,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "fix the configuration and re-run setup",
+        }
+    if not manifest.is_declared(resource_id):
+        return {
+            "ok": False,
+            "code": FORCE_RELEASE_UNDECLARED,
+            "summary": f"resource not declared: {resource_id}",
+            "evidence_paths": [],
+            "next_action": "declare the resource in resource-manifest.json",
+        }
+    rt = config.runtime_root
+    lane: dict[str, Any] | None = None
+    lease = read_lease(rt, resource_id)
+    if lease is not None:
+        lane_id = lease.get("lane_id")
+        if isinstance(lane_id, str) and lane_id:
+            try:
+                _epoch_id, lane = find_active_lane(rt, lane_id)
+            except LaneError:
+                lane = None
+    try:
+        force_release_lease(rt, resource_id, lane=lane)
+    except LeaseError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "summary": str(exc),
+            "evidence_paths": [str(lease_path(rt, resource_id))],
+            "next_action": {
+                FORCE_RELEASE_LEASE_MISSING: "the resource has no lease; nothing to release",
+                FORCE_RELEASE_LEASE_INVALID: "resolve the invalid lease record and retry",
+                FORCE_RELEASE_HOLDER_LIVE: "stop the exact holder process before force-releasing",
+                FORCE_RELEASE_HOLDER_UNPROVEN: "prove the holder dead or retire/abandon the lane before retrying",
+                FORCE_RELEASE_DELETE_FAILED: "resolve the error and retry",
+            }.get(exc.code, "resolve the error and retry"),
+        }
+    return {
+        "ok": True,
+        "code": FORCE_RELEASE_OK,
+        "summary": f"lease force-released: {resource_id}",
+        "evidence_paths": [str(lease_path(rt, resource_id))],
+        "next_action": "none",
+    }
+
+
+def _nonblank_summary(value: str) -> str:
+    summary = value.strip()
+    if not summary:
+        raise argparse.ArgumentTypeError("summary must be nonblank")
+    return summary
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="operator_launch",
@@ -272,7 +349,14 @@ def _build_parser() -> argparse.ArgumentParser:
     close_parser = manager_sub.add_parser("close", help="close an acknowledged event")
     close_parser.add_argument("--event-id", required=True)
     close_parser.add_argument("--outcome", required=True, choices=["COMPLETE", "BLOCKED"])
-    close_parser.add_argument("--summary")
+    close_parser.add_argument("--summary", required=True, type=_nonblank_summary)
+
+    lease = subparsers.add_parser("lease", help="exclusive-resource lease commands")
+    lease_sub = lease.add_subparsers(dest="lease_command", required=True)
+    force_release_parser = lease_sub.add_parser(
+        "force-release", help="force-release one orphaned exclusive-resource lease"
+    )
+    force_release_parser.add_argument("--resource-id", required=True)
 
     send_parser = subparsers.add_parser("send-lane-notification", help="append one assignment to a running managed lane")
     send_parser.add_argument("--lane-id", required=True)
@@ -342,6 +426,10 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.manager_command == "close":
             return _manager_close(args.event_id, args.outcome, args.summary)
         raise ValueError(f"unknown manager command: {args.manager_command}")
+    if command == "lease":
+        if args.lease_command == "force-release":
+            return _lease_force_release(args.resource_id)
+        raise ValueError(f"unknown lease command: {args.lease_command}")
     if command == "send-lane-notification":
         return _send_lane_notification(args.lane_id, args.prompt)
     if command == "scan":

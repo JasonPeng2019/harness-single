@@ -25,6 +25,43 @@ class OperatorLaunchV2Tests(unittest.TestCase):
         self.assertEqual(2, raised.exception.code)
         self.assertIn("invalid choice", output.getvalue())
 
+    def test_force_release_is_only_under_top_level_lease(self) -> None:
+        parser = operator_launch._build_parser()
+        parsed = parser.parse_args(
+            ["lease", "force-release", "--resource-id", "resource-1"]
+        )
+        self.assertEqual("lease", parsed.command)
+        self.assertEqual("force-release", parsed.lease_command)
+        self.assertEqual("resource-1", parsed.resource_id)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    ["lane", "force-release", "--resource-id", "resource-1"]
+                )
+
+    def test_manager_close_requires_and_normalizes_summary(self) -> None:
+        parser = operator_launch._build_parser()
+        for outcome in ("COMPLETE", "BLOCKED"):
+            for summary in (None, "", "   "):
+                argv = [
+                    "manager", "close", "--event-id", "event-1",
+                    "--outcome", outcome,
+                ]
+                if summary is not None:
+                    argv.extend(["--summary", summary])
+                with self.subTest(outcome=outcome, summary=summary):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            parser.parse_args(argv)
+            parsed = parser.parse_args(
+                [
+                    "manager", "close", "--event-id", "event-1",
+                    "--outcome", outcome, "--summary",
+                    "  operator decision  ",
+                ]
+            )
+            self.assertEqual("operator decision", parsed.summary)
+
     def test_v2_commands_dispatch_through_native_modules(self) -> None:
         with mock.patch.object(
             operator_launch.setup,

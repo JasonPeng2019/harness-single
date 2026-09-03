@@ -41,6 +41,7 @@ MANAGER_CLOSE_NOT_ACKNOWLEDGED = "MANAGER_CLOSE_NOT_ACKNOWLEDGED"
 MANAGER_CLOSE_ALREADY_CLOSED = "MANAGER_CLOSE_ALREADY_CLOSED"
 MANAGER_CLOSE_NOT_ROOT_EVENT = "MANAGER_CLOSE_NOT_ROOT_EVENT"
 MANAGER_CLOSE_INVALID_OUTCOME = "MANAGER_CLOSE_INVALID_OUTCOME"
+MANAGER_CLOSE_SUMMARY_REQUIRED = "MANAGER_CLOSE_SUMMARY_REQUIRED"
 SEND_LANE_NOT_FOUND = "SEND_LANE_NOT_FOUND"
 SEND_LANE_NOT_MANAGED = "SEND_LANE_NOT_MANAGED"
 SEND_LANE_NOT_RUNNING = "SEND_LANE_NOT_RUNNING"
@@ -139,6 +140,11 @@ def close_event(
     """ROOT closes an acknowledged event with COMPLETE or BLOCKED."""
     if outcome not in ("COMPLETE", "BLOCKED"):
         raise ManagerQueueError(MANAGER_CLOSE_INVALID_OUTCOME, f"invalid outcome: {outcome}")
+    normalized_summary = summary.strip() if isinstance(summary, str) else ""
+    if not normalized_summary:
+        raise ManagerQueueError(
+            MANAGER_CLOSE_SUMMARY_REQUIRED, "close summary must be nonblank"
+        )
     record = read_manager_queue(rt)
     event = _find_event(record, event_id)
     if event is None:
@@ -152,9 +158,10 @@ def close_event(
             MANAGER_CLOSE_ALREADY_CLOSED, f"event {event_id} is already {event['state']}"
         )
     event["state"] = outcome
-    event["history"].append({"state": outcome, "at": iso_utc()})
-    if summary is not None:
-        event["summary"] = summary
+    event["history"].append(
+        {"state": outcome, "at": iso_utc(), "summary": normalized_summary}
+    )
+    event["summary"] = normalized_summary
     _write_manager_queue(rt, record)
     return event
 
