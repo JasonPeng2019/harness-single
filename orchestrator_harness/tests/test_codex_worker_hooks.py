@@ -2,11 +2,12 @@
 
 The super-cache worker payload declares two Codex hooks (PostToolUse and Stop)
 that must be implemented by thin wrapper scripts under
-adapters/codex/super-cache/.codex/hooks/.  Each wrapper resolves the worker
-agent workspace, asks the shared hook-dispatch.py for a decision, and
-translates that decision into the Codex hook output contract.  This module is
-the test-first RED slice: the unittest run must fail until the wrapper files
-exist.
+adapters/codex/super-cache/.codex/hooks/.  The payload is copied unchanged
+into an arbitrary worker worktree, so each wrapper resolves its agent
+workspace relative to its installed location, asks the shared
+hook-dispatch.py for a decision, and translates that decision into the Codex
+hook output contract.  This module is the test-first RED slice: the unittest
+run must fail until the wrapper files exist.
 """
 
 import importlib.util
@@ -21,7 +22,7 @@ HOOKS_DIR = SUPER_CACHE_DIR / ".codex" / "hooks"
 HOOKS_JSON_PATH = SUPER_CACHE_DIR / ".codex" / "hooks.json"
 POST_TOOL_USE_WRAPPER_PATH = HOOKS_DIR / "orchestrator_harness_post_tool_use.py"
 STOP_WRAPPER_PATH = HOOKS_DIR / "orchestrator_harness_stop.py"
-AGENT_WORKSPACE = WORKTREE_ROOT / "super-cache" / "workspace" / ".agent-workspace"
+AGENT_WORKSPACE = HOOKS_DIR.parents[1] / ".agent-workspace"
 HOOK_DISPATCH_PATH = AGENT_WORKSPACE / "hook-dispatch.py"
 
 POST_TOOL_USE_BOUNDARY = "post-tool-use"
@@ -83,6 +84,12 @@ class CodexWorkerHooksTestCase(unittest.TestCase):
     def test_old_hook_script_is_absent_from_declaration(self):
         for command in _declared_commands():
             self.assertNotIn(OLD_HOOK_SCRIPT, command)
+
+    def test_old_hook_script_is_absent_from_hooks_dir(self):
+        self.assertFalse(
+            (HOOKS_DIR / OLD_HOOK_SCRIPT).is_file(),
+            "GREEN must delete the superseded %s" % (HOOKS_DIR / OLD_HOOK_SCRIPT),
+        )
 
     def test_wrappers_are_importable(self):
         _load_post_tool_use_wrapper()

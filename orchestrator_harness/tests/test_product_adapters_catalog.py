@@ -183,7 +183,22 @@ class WorkerPayloadTests(unittest.TestCase):
             self.assertTrue(
                 (payload / "orchestrator-harness-binding.json").is_file(), provider_id
             )
-            self.assertTrue((payload / "hooks" / "post-tool-use.py").is_file(), provider_id)
+            if provider_id == "codex":
+                self.assertTrue(
+                    (payload / "hooks" / "orchestrator_harness_post_tool_use.py").is_file(),
+                    provider_id,
+                )
+                self.assertTrue(
+                    (payload / "hooks" / "orchestrator_harness_stop.py").is_file(),
+                    provider_id,
+                )
+                self.assertFalse(
+                    (payload / "hooks" / "post-tool-use.py").exists(), provider_id
+                )
+            else:
+                self.assertTrue(
+                    (payload / "hooks" / "post-tool-use.py").is_file(), provider_id
+                )
 
     def test_worker_binding_record_valid(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
