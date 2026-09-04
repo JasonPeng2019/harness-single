@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from orchestrator_harness.tests.v2_acceptance.contract import CLAIMS, covered_requirements
+from orchestrator_harness.tests.v2_acceptance.contract import CLAIMS, PLATFORM_CLAIMS, covered_requirements
 
 
 class ClaimMapTests(unittest.TestCase):
@@ -17,6 +17,11 @@ class ClaimMapTests(unittest.TestCase):
                 self.assertTrue(item.scenario and item.trigger and item.expected)
                 self.assertTrue(item.oracle and item.cleanup)
                 self.assertIn(item.evidence_class, {"synthetic/static", "synthetic", "live-only"})
+
+    def test_platform_claims_are_explicit_and_not_synthetic_proof(self) -> None:
+        self.assertEqual(3, len(PLATFORM_CLAIMS))
+        for item in PLATFORM_CLAIMS:
+            self.assertTrue(all((item.scenario, item.trigger, item.expected, item.oracle, item.cleanup)))
 
     def test_static_assets_cover_every_non_live_requirement_and_live_is_reserved(self) -> None:
         self.assertTrue({f"REQ-{number:03d}" for number in range(1, 17)} <= covered_requirements())

@@ -21,6 +21,19 @@ class Claim:
     evidence_class: str
 
 
+@dataclass(frozen=True)
+class PlatformClaim:
+    """A native-runner claim intentionally reserved for its named host."""
+
+    name: str
+    platform: str
+    scenario: str
+    trigger: str
+    expected: str
+    oracle: str
+    cleanup: str
+
+
 CLAIMS: tuple[Claim, ...] = (
     Claim("CHECK-U1", ("REQ-001", "REQ-004", "REQ-005", "REQ-006"), "Layout, configuration, idempotent setup, and epoch transition.", "Create a fresh disposable workspace, then setup and open an epoch.", "Only the derived runtime is mutable; setup is idempotent and immutable configuration requires a new epoch.", "Inspect exact runtime records and source-tree digest before/after; reject an epoch/config mismatch.", "Remove the disposable workspace after shutdown.", "synthetic/static"),
     Claim("CHECK-U2", ("REQ-002", "REQ-003", "REQ-008", "REQ-009"), "Managed/plain profiles, cache/adapters, monitor, and queue roles.", "Bootstrap both profiles and promote a terminal managed status twice.", "Managed receives one queue event and coordination material; plain has neither; the monitor deduplicates without role cross-talk.", "Assert queue header, event state/history, profile-specific paths, and exactly one promotion for an unchanged status.", "Dispose queues and temporary worktrees; no live hook claim is made.", "synthetic/static"),
@@ -31,6 +44,13 @@ CLAIMS: tuple[Claim, ...] = (
     Claim("CHECK-LIVE-2", ("REQ-017",), "Native role queue isolation.", "M09 leaves one role's queue pending while exercising the other role.", "One role's queue cannot block or advance the other role's work.", "Read both durable queue records plus native hook outcome and run IDs.", "Acknowledge/close only the created events, then remove the disposable runtime.", "live-only"),
     Claim("CHECK-LIVE-3", ("REQ-017",), "Native monitor liveness recovery.", "M09 makes the recorded monitor dead, hung, and deliberately stopped in separate attempts.", "Dead/hung is restarted under the monitor lock; deliberately stopped/dead is not resurrected.", "Compare PID plus creation time and heartbeat/stop state before and after a real ROOT tool boundary.", "Stop only the exact recorded monitor and prove it absent before disposal.", "live-only"),
     Claim("CHECK-LIVE-4", ("REQ-017",), "Native serial exclusive-lease reuse.", "M09 runs two authorized lanes requesting the same resource in sequence.", "The second launch is fail-fast while held, then succeeds only after exact cleanup proof releases the first lease.", "Inspect both lease holder identities, launch result, cleanup proof, and final empty lease directory.", "Gracefully retire each lane or force-stop only the exact recorded identity.", "live-only"),
+)
+
+
+PLATFORM_CLAIMS: tuple[PlatformClaim, ...] = (
+    PlatformClaim("CHECK-PLATFORM-WINDOWS", "Windows", "Native Windows path, helper, PID-creation, advisory-lock and same-volume-replace proof.", "An authorized M09 runner creates a fresh disposable root with spaces.", "Host-native path storage and primitive behavior are retained as evidence; no emulation counts.", "Native runner identity, record bytes, lock contention result, replacement readback, and exact process identity.", "Cooperatively stop the exact process and delete the disposable root."),
+    PlatformClaim("CHECK-PLATFORM-MACOS", "macOS", "Native macOS path, helper, PID-creation, advisory-lock and same-volume-replace proof.", "An authorized M09 runner creates a fresh disposable root with spaces.", "Host-native path storage and primitive behavior are retained as evidence; no emulation counts.", "Native runner identity, record bytes, lock contention result, replacement readback, and exact process identity.", "Cooperatively stop the exact process and delete the disposable root."),
+    PlatformClaim("CHECK-PLATFORM-LINUX", "Linux", "Native Linux path, helper, PID-creation, advisory-lock and same-volume-replace proof.", "An authorized M09 runner creates a fresh disposable root with spaces.", "Host-native path storage and primitive behavior are retained as evidence; no emulation counts.", "Native runner identity, record bytes, lock contention result, replacement readback, and exact process identity.", "Cooperatively stop the exact process and delete the disposable root."),
 )
 
 
