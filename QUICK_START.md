@@ -67,7 +67,7 @@ Acknowledge only the envelope's top-level `event_id` after handling the event; `
 is not an acknowledgement ID. Close handled events with:
 
 ```powershell
-python -m orchestrator_harness.operator_launch manager close --event-id <id> --outcome COMPLETE
+python -m orchestrator_harness.operator_launch manager close --event-id <id> --outcome COMPLETE --summary <text>
 ```
 
 ## 6. Review and accept

@@ -3,7 +3,7 @@
 The package exposes one public launcher:
 
 ```powershell
-python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,send-lane-notification,scan,watch,health}
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
 ```
 
 Every public command returns the structured result `{ ok, code, summary, evidence_paths,
@@ -55,8 +55,14 @@ results, operates hardware, or replaces the root orchestrator.
 - `manager acknowledge --event-id <id>` — move one event PENDING -> ACKNOWLEDGED. Acknowledge
   only the envelope's top-level `event_id` after handling the event; `data.signal_id` is not an
   acknowledgement ID.
-- `manager close --event-id <id> --outcome {COMPLETE,BLOCKED} [--summary <text>]` — close an
+- `manager close --event-id <id> --outcome {COMPLETE,BLOCKED} --summary <text>` — close an
   acknowledged event.
+
+### `lease` — orphaned lease recovery
+
+- `lease force-release --resource-id <id>` — release one declared resource only after the exact
+  holder is no longer live and current lane/run evidence proves release is safe. The command fails
+  closed with a stable `code` and actionable `next_action`; never hand-edit lease records.
 
 ### `send-lane-notification`
 
