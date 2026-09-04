@@ -29,7 +29,6 @@ from .leases import (
     LeaseError,
     force_release_lease,
     lease_path,
-    read_lease,
 )
 from .manager_queue import (
     MANAGER_ACK_ALREADY_ACKNOWLEDGED,
@@ -257,17 +256,18 @@ def _lease_force_release(resource_id: str) -> dict[str, Any]:
             "next_action": "declare the resource in resource-manifest.json",
         }
     rt = config.runtime_root
-    lane: dict[str, Any] | None = None
-    lease = read_lease(rt, resource_id)
-    if lease is not None:
-        lane_id = lease.get("lane_id")
-        if isinstance(lane_id, str) and lane_id:
-            try:
-                _epoch_id, lane = find_active_lane(rt, lane_id)
-            except LaneError:
-                lane = None
+
+    def resolve_current_lane(lane_id: str) -> dict[str, Any] | None:
+        try:
+            _epoch_id, lane = find_active_lane(rt, lane_id)
+        except LaneError:
+            return None
+        return lane
+
     try:
-        force_release_lease(rt, resource_id, lane=lane)
+        force_release_lease(
+            rt, resource_id, lane_resolver=resolve_current_lane
+        )
     except LeaseError as exc:
         return {
             "ok": False,

@@ -8,6 +8,7 @@ delivery-history receipt only).  The controller and worker never write it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -82,9 +83,23 @@ def read_manager_queue(rt: Path) -> dict[str, Any]:
 
 
 def _write_manager_queue(rt: Path, record: dict[str, Any]) -> None:
+    """Replace the queue while the caller owns its queue lock."""
+    path = manager_queue_path(rt)
+    atomic_write_json(path, record)
+
+
+def _update_manager_queue(
+    rt: Path,
+    mutate: Callable[[dict[str, Any]], tuple[Any, bool]],
+) -> Any:
+    """Validate, mutate, and replace the manager queue in one transaction."""
     path = manager_queue_path(rt)
     with RecordLock(path):
-        atomic_write_json(path, record)
+        record = read_manager_queue(rt)
+        result, changed = mutate(record)
+        if changed:
+            _write_manager_queue(rt, record)
+        return result
 
 
 def promote_event(
@@ -99,39 +114,44 @@ def promote_event(
     """The monitor's sole-producer admission of one PENDING event."""
     if event_type not in EVENT_TYPES:
         raise ManagerQueueError("MANAGER_QUEUE_INVALID_EVENT_TYPE", event_type)
-    record = read_manager_queue(rt)
-    event = {
-        "event_id": new_id(),
-        "type": event_type,
-        "lane_id": lane_id,
-        "run_id": run_id,
-        "summary": summary,
-        "state": "PENDING",
-        "history": [{"state": "PENDING", "at": iso_utc()}],
-        "delivery_history": [],
-    }
-    if actionable_status is not None:
-        event["actionable_status"] = actionable_status
-    record["events"].append(event)
-    _write_manager_queue(rt, record)
-    return event
+
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        event = {
+            "event_id": new_id(),
+            "type": event_type,
+            "lane_id": lane_id,
+            "run_id": run_id,
+            "summary": summary,
+            "state": "PENDING",
+            "history": [{"state": "PENDING", "at": iso_utc()}],
+            "delivery_history": [],
+        }
+        if actionable_status is not None:
+            event["actionable_status"] = actionable_status
+        record["events"].append(event)
+        return event, True
+
+    return _update_manager_queue(rt, mutate)
 
 
 def acknowledge_event(rt: Path, event_id: str) -> dict[str, Any]:
     """ROOT advances one event PENDING -> ACKNOWLEDGED."""
-    record = read_manager_queue(rt)
-    event = _find_event(record, event_id)
-    if event is None:
-        raise ManagerQueueError(MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}")
-    if event["state"] != "PENDING":
-        raise ManagerQueueError(
-            MANAGER_ACK_ALREADY_ACKNOWLEDGED,
-            f"event {event_id} is already {event['state']}",
-        )
-    event["state"] = "ACKNOWLEDGED"
-    event["history"].append({"state": "ACKNOWLEDGED", "at": iso_utc()})
-    _write_manager_queue(rt, record)
-    return event
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            raise ManagerQueueError(
+                MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
+            )
+        if event["state"] != "PENDING":
+            raise ManagerQueueError(
+                MANAGER_ACK_ALREADY_ACKNOWLEDGED,
+                f"event {event_id} is already {event['state']}",
+            )
+        event["state"] = "ACKNOWLEDGED"
+        event["history"].append({"state": "ACKNOWLEDGED", "at": iso_utc()})
+        return event, True
+
+    return _update_manager_queue(rt, mutate)
 
 
 def close_event(
@@ -145,35 +165,44 @@ def close_event(
         raise ManagerQueueError(
             MANAGER_CLOSE_SUMMARY_REQUIRED, "close summary must be nonblank"
         )
-    record = read_manager_queue(rt)
-    event = _find_event(record, event_id)
-    if event is None:
-        raise ManagerQueueError(MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}")
-    if event["state"] == "PENDING":
-        raise ManagerQueueError(
-            MANAGER_CLOSE_NOT_ACKNOWLEDGED, f"event {event_id} is not acknowledged"
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            raise ManagerQueueError(
+                MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
+            )
+        if event["state"] == "PENDING":
+            raise ManagerQueueError(
+                MANAGER_CLOSE_NOT_ACKNOWLEDGED,
+                f"event {event_id} is not acknowledged",
+            )
+        if event["state"] in ("COMPLETE", "BLOCKED"):
+            raise ManagerQueueError(
+                MANAGER_CLOSE_ALREADY_CLOSED,
+                f"event {event_id} is already {event['state']}",
+            )
+        event["state"] = outcome
+        event["history"].append(
+            {"state": outcome, "at": iso_utc(), "summary": normalized_summary}
         )
-    if event["state"] in ("COMPLETE", "BLOCKED"):
-        raise ManagerQueueError(
-            MANAGER_CLOSE_ALREADY_CLOSED, f"event {event_id} is already {event['state']}"
-        )
-    event["state"] = outcome
-    event["history"].append(
-        {"state": outcome, "at": iso_utc(), "summary": normalized_summary}
-    )
-    event["summary"] = normalized_summary
-    _write_manager_queue(rt, record)
-    return event
+        event["summary"] = normalized_summary
+        return event, True
+
+    return _update_manager_queue(rt, mutate)
 
 
 def append_delivery_history(rt: Path, event_id: str) -> None:
     """The managed PostToolUse hook appends a DELIVERED receipt only."""
-    record = read_manager_queue(rt)
-    event = _find_event(record, event_id)
-    if event is None:
-        return
-    event["delivery_history"].append({"outcome": "DELIVERED", "at": iso_utc()})
-    _write_manager_queue(rt, record)
+    def mutate(record: dict[str, Any]) -> tuple[None, bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            return None, False
+        event["delivery_history"].append(
+            {"outcome": "DELIVERED", "at": iso_utc()}
+        )
+        return None, True
+
+    _update_manager_queue(rt, mutate)
 
 
 def _find_event(record: dict[str, Any], event_id: str) -> dict[str, Any] | None:

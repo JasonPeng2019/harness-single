@@ -111,6 +111,49 @@ class ForceReleaseLeaseTests(unittest.TestCase):
         )
         self.assertTrue(path.is_file())
 
+    def test_lane_is_resolved_after_locked_lease_reread(self) -> None:
+        path = self._write()
+        held = False
+        real_lock = leases._leases_lock
+
+        class TrackingLock:
+            def __enter__(self) -> "TrackingLock":
+                nonlocal held
+                self._lock = real_lock(self.runtime)
+                self._lock.__enter__()
+                held = True
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                nonlocal held
+                held = False
+                self._lock.__exit__(*args)
+
+            def __init__(self, runtime: Path) -> None:
+                self.runtime = runtime
+
+        def resolve(lane_id: str) -> dict[str, object]:
+            self.assertTrue(held, "lane proof must be resolved under the leases lock")
+            self.assertEqual("lane-1", lane_id)
+            return {
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "lifecycle": "retired",
+            }
+
+        with (
+            mock.patch.object(leases, "_leases_lock", TrackingLock),
+            mock.patch.object(leases, "identity_matches", return_value=False),
+            mock.patch.object(leases, "process_alive", return_value=True),
+            mock.patch.object(leases, "process_identity", return_value=None),
+        ):
+            leases.force_release_lease(
+                self.runtime, "resource-1", lane_resolver=resolve
+            )
+
+        self.assertFalse(path.exists())
+        self.assertFalse(held)
+
 
 if __name__ == "__main__":
     unittest.main()

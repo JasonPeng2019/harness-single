@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,6 +10,11 @@ from orchestrator_harness import manager_queue
 
 
 class ManagerQueueCloseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.runtime = Path(self.temporary.name)
+
     def _record(self) -> dict[str, object]:
         return {
             "events": [
@@ -21,7 +27,7 @@ class ManagerQueueCloseTests(unittest.TestCase):
         }
 
     def test_blank_summary_rejects_before_queue_access_or_mutation(self) -> None:
-        runtime = Path("runtime")
+        runtime = self.runtime
         for summary in (None, "", "   "):
             record = self._record()
             original = copy.deepcopy(record)
@@ -49,7 +55,7 @@ class ManagerQueueCloseTests(unittest.TestCase):
             self.assertEqual(original, record)
 
     def test_terminal_summary_is_normalized_and_persisted(self) -> None:
-        runtime = Path("runtime")
+        runtime = self.runtime
         for outcome in ("COMPLETE", "BLOCKED"):
             record = self._record()
             with (

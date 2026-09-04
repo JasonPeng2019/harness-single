@@ -322,7 +322,14 @@ def run_completion_review(
         )
         if event is not None:
             try:
-                close_event(rt, event["event_id"], "COMPLETE")
+                close_event(
+                    rt,
+                    event["event_id"],
+                    "COMPLETE",
+                    summary=(
+                        f"completion review recorded: {review_outcome} / {approval}"
+                    ),
+                )
             except ManagerQueueError as exc:
                 raise ReviewError(
                     COMPLETION_REVIEW_WRITE_FAILED,

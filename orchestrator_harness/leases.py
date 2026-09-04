@@ -4,6 +4,7 @@ controller lives, released only after cleanup proof (or a forced path).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -134,7 +135,8 @@ def force_release_lease(
     rt: Path,
     resource_id: str,
     *,
-    lane: dict[str, Any] | None,
+    lane: dict[str, Any] | None = None,
+    lane_resolver: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> None:
     """Force-release one orphaned lease after exact-identity proof.
 
@@ -181,6 +183,7 @@ def force_release_lease(
                 FORCE_RELEASE_LEASE_INVALID,
                 f"lease identity incomplete: {resource_id}",
             )
+        current_lane = lane_resolver(lane_id) if lane_resolver is not None else lane
         if identity_matches(pid, creation_time):
             raise LeaseError(
                 FORCE_RELEASE_HOLDER_LIVE,
@@ -192,11 +195,11 @@ def force_release_lease(
             if current is not None and current["creation_time"] != creation_time:
                 holder_dead = True
         lane_release_proven = False
-        if lane is not None and lane.get("lane_id") == lane_id:
-            if lane.get("lifecycle") in ("retired", "abandoned"):
+        if current_lane is not None and current_lane.get("lane_id") == lane_id:
+            if current_lane.get("lifecycle") in ("retired", "abandoned"):
                 lane_release_proven = True
             else:
-                current_run = lane.get("run_id")
+                current_run = current_lane.get("run_id")
                 if (
                     isinstance(current_run, str)
                     and current_run
