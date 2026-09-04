@@ -4,7 +4,7 @@ The Harness v2 coordinates ordinary software work across Git branches and worktr
 launcher exposes the entire operator surface:
 
 ```powershell
-python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,send-lane-notification,scan,watch,health}
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
 ```
 
 Every public command returns the small structured result `{ ok, code, summary, evidence_paths,
@@ -36,7 +36,10 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
   gracefully retire one accepted lane.
 - `resume-lane --lane-id --resume-task-card [--rationale]` — re-run a stopped, unaccepted lane.
 - `manager acknowledge --event-id <top-level-event-id>` — move one event PENDING -> ACKNOWLEDGED; `manager close
-  --event-id --outcome {COMPLETE,BLOCKED} [--summary]` — close an acknowledged event (managed only).
+  --event-id --outcome {COMPLETE,BLOCKED} --summary <text>` — close an acknowledged event (managed only).
+- `lease force-release --resource-id <id>` — recover one declared orphaned resource lease. The
+  command refuses an exact live holder and fails closed unless current process and lane/run evidence
+  proves release is safe; follow its returned `next_action` instead of hand-editing lease records.
 - `send-lane-notification --lane-id --prompt` — append one assignment to a running managed lane.
 - `scan --no-write` — read-only lane-status snapshot; `watch --until-actionable [--timeout]
   [--until-event]` — block until an actionable condition exists.
