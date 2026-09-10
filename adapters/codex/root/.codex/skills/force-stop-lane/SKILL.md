@@ -21,6 +21,9 @@ To hard-stop one stuck lane, use the public force-stop command.
 - The command terminates that lane's provider/helper/controller,
   force-releases its lease, and marks it retired.
 - Never kill by broad process name and never edit lease/process records.
+- For an orphaned resource that is not part of a force-stop, use only
+  `operator_launch lease force-release --resource-id <id>`. The command writes
+  locked STARTED and terminal audit records and reports any partial success.
 
 ## After
 

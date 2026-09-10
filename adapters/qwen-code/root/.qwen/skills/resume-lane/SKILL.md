@@ -24,6 +24,9 @@ resume task card.
   truthful.
 - Do not reconstruct a session, PID, worktree, invocation, or
   amendment/hash record.
+- A rejected completion review produces one deduplicated `LANE_RESUME_REQUIRED`
+  event. `resume-lane` consumes that prior-run event after its fresh invocation
+  is valid; it does not create another resume event.
 
 ## After
 

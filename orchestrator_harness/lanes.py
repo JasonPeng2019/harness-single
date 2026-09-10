@@ -19,6 +19,7 @@ LANE_SCHEMA = "lane/v1"
 LANE_LIFECYCLES = frozenset(
     {
         "prepared",
+        "resuming",
         "running",
         "review_pending",
         "result_invalid",

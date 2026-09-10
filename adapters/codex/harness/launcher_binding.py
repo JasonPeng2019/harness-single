@@ -70,4 +70,6 @@ def parse_line(line: str) -> dict[str, Any] | None:
         parsed["session_id"] = session_id
     if raw_type != "thread.started":
         parsed["message"] = raw_type
+    if raw_type in {"turn.failed", "turn.cancelled"}:
+        parsed["non_retryable_failure"] = True
     return parsed

@@ -8,6 +8,7 @@ monitor's automatic reconciliation.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,14 @@ from .epochs import (
     read_epoch_state,
 )
 from .lanes import read_lane
-from .manager_queue import read_manager_queue
-from .monitor import ACTIONABLE_STATUSES, derive_lane_status, read_controller_status, reconcile_active_lanes
-from .records import read_record
+from .manager_queue import append_watch_delivery, read_manager_queue
+from .monitor import (
+    ACTIONABLE_STATUSES,
+    _discover_orphaned_leases,
+    derive_lane_status,
+    read_controller_status,
+    reconcile_active_lanes,
+)
 
 SCAN_NO_ACTIVE_EPOCH = "SCAN_NO_ACTIVE_EPOCH"
 WATCH_TIMEOUT = "WATCH_TIMEOUT"
@@ -60,7 +66,11 @@ def _active_epoch(rt: Path) -> tuple[str, dict[str, Any]]:
     return epoch_id, state
 
 
-def _lane_snapshot(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
+def _lane_snapshot(
+    rt: Path,
+    epoch_id: str,
+    orphaned_leases: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for entry in read_active_lanes(rt, epoch_id):
         lane_id = entry["lane_id"]
@@ -69,7 +79,9 @@ def _lane_snapshot(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
         except Exception:
             continue
         status = read_controller_status(lane)
-        derived = derive_lane_status(rt, epoch_id, lane, status)
+        derived = derive_lane_status(
+            rt, epoch_id, lane, status, orphaned_leases=orphaned_leases
+        )
         entries.append(
             {
                 "lane_id": lane_id,
@@ -83,10 +95,12 @@ def _lane_snapshot(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
 
 def build_snapshot(rt: Path) -> dict[str, Any]:
     epoch_id, state = _active_epoch(rt)
+    orphaned_leases = _discover_orphaned_leases(rt, epoch_id)
     return {
         "epoch_id": epoch_id,
         "lane_mode": state.get("lane_mode"),
-        "lanes": _lane_snapshot(rt, epoch_id),
+        "lanes": _lane_snapshot(rt, epoch_id, orphaned_leases),
+        "orphaned_leases": orphaned_leases,
     }
 
 
@@ -118,6 +132,11 @@ def run_scan() -> dict[str, Any]:
     for lane in snapshot["lanes"]:
         status = lane["actionable_status"] or "ok"
         lines.append(f"  {lane['lane_id']}: {lane['lifecycle']} ({status})")
+    for lease in snapshot.get("orphaned_leases", []):
+        lines.append(
+            f"  resource {lease['resource_id']}: orphaned lease "
+            f"({lease.get('lane_id') or 'missing lane'})"
+        )
     result = {
         "ok": True,
         "code": "SCAN_OK",
@@ -129,7 +148,14 @@ def run_scan() -> dict[str, Any]:
     return result
 
 
-def _find_actionable(rt: Path, epoch_id: str) -> tuple[str, str] | None:
+def _find_actionable(
+    rt: Path,
+    epoch_id: str,
+    orphaned_leases: list[dict[str, Any]] | None = None,
+) -> tuple[str, str] | None:
+    if orphaned_leases:
+        lease = orphaned_leases[0]
+        return f"resource:{lease['resource_id']}", "orphaned_lease"
     for entry in read_active_lanes(rt, epoch_id):
         lane_id = entry["lane_id"]
         try:
@@ -137,24 +163,63 @@ def _find_actionable(rt: Path, epoch_id: str) -> tuple[str, str] | None:
         except Exception:
             continue
         status = read_controller_status(lane)
-        derived = derive_lane_status(rt, epoch_id, lane, status)
+        derived = derive_lane_status(
+            rt, epoch_id, lane, status, orphaned_leases=orphaned_leases
+        )
         if derived in ACTIONABLE_STATUSES:
             return lane_id, derived
     return None
 
 
-def _event_present(rt: Path, event_id: str) -> bool:
-    try:
-        queue = read_manager_queue(rt)
-    except Exception:
-        return False
-    return any(event.get("event_id") == event_id for event in queue.get("events", []))
+def _root_session_id(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for name in (
+        "HARNESS_ROOT_SESSION_ID",
+        "HARNESS_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_SESSION_ID",
+        "QWEN_SESSION_ID",
+    ):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return f"root-process-{os.getpid()}"
+
+
+def _watch_event(
+    queue: dict[str, Any], *, root_session_id: str, binding_id: str,
+    requested_event_id: str | None = None,
+) -> dict[str, Any] | None:
+    queue_id = queue.get("queue_id")
+    for event in queue.get("events", []):
+        if event.get("state") not in {"PENDING", "ACKNOWLEDGED"}:
+            continue
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            continue
+        if requested_event_id is not None and event_id != requested_event_id:
+            continue
+        already_delivered = any(
+            receipt.get("source") == "watch"
+            and receipt.get("queue_id") == queue_id
+            and receipt.get("event_id") == event_id
+            and receipt.get("session_id") == root_session_id
+            and receipt.get("binding_id") == binding_id
+            for receipt in event.get("delivery_history", [])
+            if isinstance(receipt, dict)
+        )
+        if not already_delivered:
+            return event
+    return None
 
 
 def run_watch(
     *,
     timeout: str | None = None,
     until_event: str | None = None,
+    root_session_id: str | None = None,
+    binding_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute ``watch --until-actionable`` and return the structured result."""
     try:
@@ -190,25 +255,59 @@ def run_watch(
             "evidence_paths": [],
             "next_action": "run `harness setup` first",
         }
+    managed = _state.get("lane_mode") == "managed"
+    session_id = _root_session_id(root_session_id)
+    watch_binding_id = binding_id or os.environ.get("HARNESS_BINDING_ID") or "root"
     while True:
-        actionable = _find_actionable(rt, epoch_id)
-        if actionable is not None:
-            lane_id, status = actionable
-            return {
-                "ok": True,
-                "code": "WATCH_ACTIONABLE",
-                "summary": f"lane {lane_id} is actionable: {status}",
-                "evidence_paths": [],
-                "next_action": "act on the condition per the operator-responses table",
-            }
-        if until_event is not None and _event_present(rt, until_event):
-            return {
-                "ok": True,
-                "code": "WATCH_EVENT",
-                "summary": f"manager event {until_event} is present",
-                "evidence_paths": [],
-                "next_action": "acknowledge and handle the event",
-            }
+        orphaned_leases = _discover_orphaned_leases(rt, epoch_id)
+        if managed:
+            try:
+                queue = read_manager_queue(rt)
+                event = _watch_event(
+                    queue,
+                    root_session_id=session_id,
+                    binding_id=watch_binding_id,
+                    requested_event_id=until_event,
+                )
+            except Exception:
+                event = None
+            if event is not None:
+                event_id = str(event["event_id"])
+                try:
+                    delivered = append_watch_delivery(
+                        rt,
+                        event_id,
+                        root_session_id=session_id,
+                        binding_id=watch_binding_id,
+                    )
+                except Exception:
+                    delivered = False
+                if delivered:
+                    return {
+                        "ok": True,
+                        "code": "WATCH_EVENT",
+                        "summary": f"manager event {event_id} is present",
+                        "evidence_paths": [],
+                        "next_action": "read, acknowledge, and handle the event",
+                        "source": "manager_queue",
+                        "wake_reason": "manager_event",
+                        "event_id": event_id,
+                    }
+        else:
+            actionable = _find_actionable(rt, epoch_id, orphaned_leases)
+            if actionable is not None:
+                lane_id, status = actionable
+                result = {
+                    "ok": True,
+                    "code": "WATCH_ACTIONABLE",
+                    "summary": f"{lane_id} is actionable: {status}",
+                    "evidence_paths": [],
+                    "next_action": "act on the condition per the operator-responses table",
+                    "wake_reason": "lane_status",
+                }
+                if lane_id.startswith("resource:"):
+                    result["resource_id"] = lane_id.split(":", 1)[1]
+                return result
         if deadline is not None and time.monotonic() >= deadline:
             return {
                 "ok": False,

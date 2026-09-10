@@ -48,6 +48,8 @@ SEND_LANE_NOT_MANAGED = "SEND_LANE_NOT_MANAGED"
 SEND_LANE_NOT_RUNNING = "SEND_LANE_NOT_RUNNING"
 SEND_LANE_WRITE_FAILED = "SEND_LANE_WRITE_FAILED"
 
+SEVERITIES = frozenset({"info", "warning", "error", "blocking"})
+
 
 class ManagerQueueError(RuntimeError):
     """A manager-queue or worker-inbox operation failed."""
@@ -110,12 +112,20 @@ def promote_event(
     run_id: str,
     summary: str,
     actionable_status: str | None = None,
+    event_class: str | None = None,
+    severity: str | None = None,
+    data: dict[str, Any] | None = None,
+    dedup_key: str | None = None,
 ) -> dict[str, Any]:
     """The monitor's sole-producer admission of one PENDING event."""
     if event_type not in EVENT_TYPES:
         raise ManagerQueueError("MANAGER_QUEUE_INVALID_EVENT_TYPE", event_type)
 
     def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        if dedup_key:
+            for existing in record.get("events", []):
+                if existing.get("dedup_key") == dedup_key:
+                    return existing, False
         event = {
             "event_id": new_id(),
             "type": event_type,
@@ -128,6 +138,18 @@ def promote_event(
         }
         if actionable_status is not None:
             event["actionable_status"] = actionable_status
+        if event_class:
+            event["event_class"] = event_class
+        if severity:
+            if severity not in SEVERITIES:
+                raise ManagerQueueError(
+                    "MANAGER_QUEUE_INVALID_SEVERITY", severity
+                )
+            event["severity"] = severity
+        if data:
+            event["data"] = dict(data)
+        if dedup_key:
+            event["dedup_key"] = dedup_key
         record["events"].append(event)
         return event, True
 
@@ -191,18 +213,79 @@ def close_event(
     return _update_manager_queue(rt, mutate)
 
 
-def append_delivery_history(rt: Path, event_id: str) -> None:
+def append_delivery_history(
+    rt: Path,
+    event_id: str,
+    *,
+    source: str = "hook",
+    queue_id: str | None = None,
+    session_id: str | None = None,
+    binding_id: str | None = None,
+) -> None:
     """The managed PostToolUse hook appends a DELIVERED receipt only."""
     def mutate(record: dict[str, Any]) -> tuple[None, bool]:
         event = _find_event(record, event_id)
         if event is None:
             return None, False
-        event["delivery_history"].append(
-            {"outcome": "DELIVERED", "at": iso_utc()}
-        )
+        receipt: dict[str, Any] = {
+            "outcome": "DELIVERED",
+            "source": source,
+            "event_id": event_id,
+            "at": iso_utc(),
+        }
+        if queue_id:
+            receipt["queue_id"] = queue_id
+        if session_id:
+            receipt["session_id"] = session_id
+        if binding_id:
+            receipt["binding_id"] = binding_id
+        receipt_queue_id = queue_id or record.get("queue_id")
+        if receipt_queue_id:
+            receipt["queue_id"] = receipt_queue_id
+        event.setdefault("delivery_history", []).append(receipt)
         return None, True
 
     _update_manager_queue(rt, mutate)
+
+
+def append_watch_delivery(
+    rt: Path,
+    event_id: str,
+    *,
+    root_session_id: str,
+    binding_id: str,
+) -> bool:
+    """Record one idle-watch delivery unless this ROOT session already saw it."""
+
+    def mutate(record: dict[str, Any]) -> tuple[bool, bool]:
+        event = _find_event(record, event_id)
+        if event is None or event.get("state") not in {"PENDING", "ACKNOWLEDGED"}:
+            return False, False
+        queue_id = record.get("queue_id")
+        history = event.setdefault("delivery_history", [])
+        for receipt in history:
+            if (
+                receipt.get("source") == "watch"
+                and receipt.get("queue_id") == queue_id
+                and receipt.get("event_id") == event_id
+                and receipt.get("session_id") == root_session_id
+                and receipt.get("binding_id") == binding_id
+            ):
+                return False, False
+        history.append(
+            {
+                "outcome": "DELIVERED",
+                "source": "watch",
+                "event_id": event_id,
+                "queue_id": queue_id,
+                "session_id": root_session_id,
+                "binding_id": binding_id,
+                "at": iso_utc(),
+            }
+        )
+        return True, True
+
+    return bool(_update_manager_queue(rt, mutate))
 
 
 def _find_event(record: dict[str, Any], event_id: str) -> dict[str, Any] | None:

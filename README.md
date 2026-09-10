@@ -63,8 +63,9 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 
 `managed_coordination: "enabled"` (managed) stages a manager queue for the epoch: ROOT uses
 `manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
-worker notices into the queue. `disabled` (plain) omits the manager queue; lanes run without
-ROOT-to-worker assignments.
+worker notices into the queue. Managed watch wakes only from an unresolved queue event and
+records a durable per-session/queue delivery receipt. `disabled` (plain) omits the manager
+queue; lanes run without ROOT-to-worker assignments and plain scan/watch never reads it.
 
 ## Providers and the adapter catalog
 
@@ -87,13 +88,18 @@ the immutable configuration is unchanged.
 
 ## Worker RESULT vs ROOT review/acceptance
 
-The worker writes `.agent-workspace/RESULT.json` (`result/v1`). A result is merge-ready only
+The worker writes `RESULT.json` at the worktree root (`result/v1`). A result is merge-ready only
 after schema, lane/run identity, outcome, summary, evidence, and content-hash validation succeed
 against the current branch tip in a clean worktree. ROOT then records the factual finding and the
 separate accept/reject decision with `lane completion-review`, which writes the linked
 `COMPLETION_REVIEW.json` and `ORCHESTRATOR_ACCEPTANCE.json` pair outside the worktree and closes
 its own managed review event. Lifecycle: task card -> RESULT.json -> COMPLETION_REVIEW.json ->
 ORCHESTRATOR_ACCEPTANCE.json.
+
+An invalid result may receive at most five corrective prompts in the same native provider
+session, with per-attempt transcript, stderr, cleanup, and validation evidence. A sixth invalid
+attempt, a missing native resume session, or a provider startup/auth/process failure ends as
+`provider_exited_no_result`; it never starts a fresh context.
 
 ## Resume, force-stop, retire, shutdown
 

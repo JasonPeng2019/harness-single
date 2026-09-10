@@ -34,16 +34,18 @@ class RootHookDispatchTests(unittest.TestCase):
         marker = marker if marker is not None else {"epoch_id": "epoch-1"}
         queue = queue or {"events": []}
         runtime = runtime if runtime is not None else self.open_state
+        health = (None, None) if recovery.get("ok") else (
+            str(recovery.get("code") or "MONITOR_UNHEALTHY"),
+            str(recovery.get("next_action") or "monitor requires recovery"),
+        )
         with (
             patch.object(hooks, "load_config", return_value=self.config),
             patch.object(hooks, "read_runtime_state", return_value=runtime),
             patch.object(hooks, "read_current_epoch", return_value=marker),
             patch.object(hooks, "read_manager_queue", return_value=queue),
-            patch.object(hooks, "run_monitor_recover", return_value=recovery) as recover,
+            patch.object(hooks, "_monitor_health", return_value=health),
         ):
             result = hooks.dispatch(self.root, boundary, "codex")
-        if boundary == "post-tool-use" and runtime.get("state") == "OPEN":
-            recover.assert_called_once_with(self.root.resolve())
         return result
 
     def test_post_tool_use_notice_is_content_free(self) -> None:
@@ -97,28 +99,28 @@ class RootHookDispatchTests(unittest.TestCase):
             patch.object(hooks, "read_current_epoch", return_value=None),
             patch.object(hooks, "current_epoch_path", return_value=self.root / "missing"),
             patch.object(hooks, "read_manager_queue") as queue,
-            patch.object(hooks, "run_monitor_recover") as recover,
+            patch.object(hooks, "_monitor_health") as health,
         ):
             self.assertEqual(hooks.dispatch(self.root, "stop", "codex"), {"decision": "ALLOW"})
         queue.assert_not_called()
-        recover.assert_not_called()
+        health.assert_not_called()
 
     def test_closed_or_plain_runtime_allows_without_recovery(self) -> None:
         closed = {"schema": "runtime-state/v1", "state": "CLOSED"}
         with (
             patch.object(hooks, "load_config", return_value=self.config),
             patch.object(hooks, "read_runtime_state", return_value=closed),
-            patch.object(hooks, "run_monitor_recover") as recover,
+            patch.object(hooks, "_monitor_health") as health,
         ):
             self.assertEqual(hooks.dispatch(self.root, "post-tool-use", "codex"), {"decision": "ALLOW"})
-        recover.assert_not_called()
+        health.assert_not_called()
         plain = HarnessConfig(self.root, self.workspace, "disabled")
         with (
             patch.object(hooks, "load_config", return_value=plain),
-            patch.object(hooks, "run_monitor_recover") as recover,
+            patch.object(hooks, "_monitor_health") as health,
         ):
             self.assertEqual(hooks.dispatch(self.root, "post-tool-use", "codex"), {"decision": "ALLOW"})
-        recover.assert_not_called()
+        health.assert_not_called()
 
 
 if __name__ == "__main__":

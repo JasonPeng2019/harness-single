@@ -24,6 +24,8 @@ Finish an acknowledged ordinary ROOT event with the public close command.
 - Never edit the queue and never restart a lane from this skill.
 - Completion review closes its own event; do not double-close reviewed
   events.
+- Supply a nonblank summary for both `COMPLETE` and `BLOCKED`; the summary is
+  retained in the event history.
 
 ## After
 

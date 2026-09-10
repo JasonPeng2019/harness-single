@@ -11,8 +11,8 @@ Notes for adapter authors maintaining the Codex payload.
   `turn.completed`, `turn.failed`, or `turn.cancelled`; the thread id is
   `thread_id` or `threadId`.
 - Hooks: `hooks.json` declares the PostToolUse hook; the ROOT hook script
-  appends liveness receipts and, for ROOT with `HARNESS_EVENT_ID`, managed
-  delivery receipts.  The worker payload declares PostToolUse and Stop hooks
+  appends liveness receipts and managed receipts for unresolved top-level
+  queue event IDs.  The worker payload declares PostToolUse and Stop hooks
   that run the thin wrappers in `.codex/hooks/`; each wrapper asks the
   worktree-local `.agent-workspace/hook-dispatch.py` for a boundary decision
   and translates it into the Codex hook output contract.

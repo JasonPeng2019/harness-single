@@ -72,7 +72,7 @@ python -m orchestrator_harness.operator_launch manager close --event-id <id> --o
 
 ## 6. Review and accept
 
-The worker writes `.agent-workspace/RESULT.json` (`result/v1`). ROOT records the factual finding
+The worker writes `RESULT.json` at the worktree root (`result/v1`). ROOT records the factual finding
 and the separate accept/reject decision:
 
 ```powershell

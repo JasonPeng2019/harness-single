@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .core import iso_utc
+from .config import load_config
 from .manager_queue import append_delivery_history
-from .root_hook_dispatch import dispatch
+from .root_hook_dispatch import dispatch, unresolved_event_ids
 
 BINDING_SCHEMA = "harness-hook-binding/v1"
 DECISIONS = frozenset({"ALLOW", "NOTICE", "REJECT"})
@@ -121,35 +122,55 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
                 "decision": "REJECT",
                 "reason": "ROOT hook dispatcher returned an invalid decision",
             }
-        event_id = os.environ.get("HARNESS_EVENT_ID")
-        if boundary == "post-tool-use" and event_id:
+        # Plain mode must remain queue-free, including when a provider leaves
+        # an old event-id environment variable behind.
+        try:
+            managed = load_config(Path(binding["harness_root"])).profile == "managed"
+        except Exception:
+            managed = False
+        event_id = os.environ.get("HARNESS_EVENT_ID") if managed else None
+        event_ids = (
+            [event_id]
+            if event_id
+            else (unresolved_event_ids(Path(binding["runtime_root"])) if managed else [])
+        )
+        if boundary == "post-tool-use" and event_ids:
             receipt_path = _workspace_path(
                 binding_path,
                 binding.get("delivery_receipt_path"),
                 "delivery_receipt_path",
             )
-            receipt: dict[str, Any] = {
-                "outcome": "DELIVERED",
-                "event_id": event_id,
-                "provider_id": provider_id,
-                "at": iso_utc(),
-            }
-            try:
-                append_delivery_history(Path(binding["runtime_root"]), event_id)
-            except Exception as exc:
-                receipt.update({"outcome": "DELIVERY_FAILED", "error": str(exc)})
-                if decision.get("decision") == "ALLOW":
-                    decision = {
-                        "decision": "NOTICE",
-                        "notice": {
-                            "provider_id": provider_id,
-                            "unresolved_count": 0,
-                            "event_classes": [],
-                            "at": iso_utc(),
-                            "message": f"manager delivery receipt failed: {exc}",
-                        },
-                    }
-            _append_jsonl(receipt_path, receipt)
+            for selected_event_id in event_ids:
+                receipt: dict[str, Any] = {
+                    "outcome": "DELIVERED",
+                    "source": "hook",
+                    "event_id": selected_event_id,
+                    "provider_id": provider_id,
+                    "at": iso_utc(),
+                }
+                try:
+                    # Keep the two-argument call compatible with the shipped
+                    # queue API; its default source is the ROOT hook.
+                    append_delivery_history(
+                        Path(binding["runtime_root"]), selected_event_id
+                    )
+                except Exception as exc:
+                    receipt.update({"outcome": "DELIVERY_FAILED", "error": str(exc)})
+                    if decision.get("decision") == "ALLOW":
+                        decision = {
+                            "decision": "NOTICE",
+                            "notice": {
+                                "provider_id": provider_id,
+                                "binding_id": provider_id,
+                                "unresolved_count": len(event_ids),
+                                "event_classes": [],
+                                "highest_class": None,
+                                "highest_severity": "error",
+                                "at": iso_utc(),
+                                "message": f"manager delivery receipt failed: {exc}",
+                            },
+                        }
+                _append_jsonl(receipt_path, receipt)
     except Exception as exc:
         decision = {"decision": "REJECT", "reason": str(exc)}
     return translate(boundary, decision)

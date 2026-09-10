@@ -75,10 +75,12 @@ def check_result(
             return False, "run_id mismatch", record
         if record.get("outcome") not in RESULT_OUTCOMES:
             return False, f"outcome not in {sorted(RESULT_OUTCOMES)}", record
-        if not isinstance(record.get("summary"), str) or not record["summary"]:
+        if not isinstance(record.get("summary"), str) or not record["summary"].strip():
             return False, "summary is empty", record
         if not isinstance(record.get("evidence"), list):
             return False, "evidence is not a list", record
+        if not isinstance(record.get("completed_at"), str) or not record["completed_at"].strip():
+            return False, "completed_at is empty", record
         if record.get("content_hash") != content_hash(record):
             return False, "content_hash mismatch", record
         return True, "result is valid", record

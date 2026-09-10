@@ -49,8 +49,11 @@ def parse_line(line: str) -> dict[str, Any] | None:
         return parsed
     if raw_type == "interrupt" or subtype == "interrupt":
         parsed["message"] = value.get("message") or "interrupt"
+        parsed["non_retryable_failure"] = True
         return parsed
     if raw_type == "result":
         parsed["message"] = value.get("result") or subtype or "result"
+        if value.get("is_error") is True or subtype in {"error", "error_during_execution"}:
+            parsed["non_retryable_failure"] = True
         return parsed
     return None

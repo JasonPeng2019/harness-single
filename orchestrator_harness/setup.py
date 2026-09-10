@@ -527,6 +527,8 @@ def _start_monitor_locked(
         "started_at": iso_utc(),
         "health": "starting",
         "last_heartbeat_at": iso_utc(),
+        "watched_lane_count": 0,
+        "diagnostics": [],
         "stop_requested": False,
     }
     atomic_write_json(monitor_record_path(rt), record)

@@ -126,6 +126,12 @@ def _read_result(worktree: Path, lane: dict[str, Any]) -> dict[str, Any]:
         )
     if record.get("outcome") not in {"PASS", "FAIL", "BLOCKED"}:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "result outcome is invalid")
+    if not isinstance(record.get("summary"), str) or not record["summary"].strip():
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "result summary is empty")
+    if not isinstance(record.get("evidence"), list):
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "result evidence is invalid")
+    if not isinstance(record.get("completed_at"), str) or not record["completed_at"].strip():
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "result completed_at is empty")
     if record.get("content_hash") != content_hash(record):
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "result content hash mismatch")
     return record

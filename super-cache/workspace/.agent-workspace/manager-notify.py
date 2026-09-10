@@ -21,7 +21,7 @@ from typing import Any
 
 BINDING_SCHEMA = "harness-hook-binding/v1"
 NOTICE_SCHEMA = "manager-notice/v1"
-SEVERITIES = frozenset({"blocking", "info"})
+SEVERITIES = frozenset({"blocking", "error", "warning", "info"})
 
 try:
     from orchestrator_harness.core import iso_utc as _runtime_iso_utc
@@ -92,6 +92,7 @@ def write_notice(
     severity: str,
     summary: str,
     detail: str | None = None,
+    event_class: str = "WORKER_ESCALATION",
 ) -> dict[str, Any]:
     binding = _binding(agent_workspace)
     notice: dict[str, Any] = {
@@ -100,9 +101,11 @@ def write_notice(
         "lane_id": binding.get("lane_id"),
         "run_id": binding.get("run_id"),
         "severity": severity,
+        "event_class": event_class,
         "summary": summary,
         "created_at": iso_utc(),
     }
+    notice["signal_id"] = notice["notice_id"]
     if detail:
         notice["detail"] = detail
     outbox = _outbox_dir(agent_workspace)
@@ -131,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--summary", required=True, help="the decision or action ROOT needs"
     )
+    parser.add_argument(
+        "--event-class", default="WORKER_ESCALATION",
+        help="structured manager event class (default: WORKER_ESCALATION)",
+    )
     parser.add_argument("--detail", default=None, help="relevant local evidence")
     args = parser.parse_args(argv)
     agent_workspace = (
@@ -144,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             severity=args.severity,
             summary=args.summary,
             detail=args.detail,
+            event_class=args.event_class,
         )
     except (OSError, ValueError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)

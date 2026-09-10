@@ -132,9 +132,15 @@ def _copy_overlay(
 
 
 def _write_worker_prompt(
-    worktree: Path, task_card: dict[str, Any], *, managed: bool
+    worktree: Path,
+    task_card: dict[str, Any],
+    *,
+    managed: bool,
+    rationale: str | None = None,
 ) -> Path:
     lines = [str(task_card["task"]).strip()]
+    if rationale and rationale.strip():
+        lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
         lines.append(
             "\n## Escalation (managed coordination)\n"
@@ -195,6 +201,7 @@ def _write_invocation(
             "controller_events": str(agent_workspace / "controller.events.jsonl"),
             "transcript": str(agent_workspace / "provider-transcript.jsonl"),
             "stderr": str(agent_workspace / "provider-stderr.txt"),
+            "attempts": str(agent_workspace / "controller.attempts.jsonl"),
             "last_message": str(agent_workspace / "last-message.txt"),
             "prompt": str(agent_workspace / "worker-prompt.md"),
         },
@@ -371,6 +378,7 @@ def run_bootstrap(
             "controller_events_path": str(agent_workspace / "controller.events.jsonl"),
             "transcript_path": str(agent_workspace / "provider-transcript.jsonl"),
             "stderr_path": str(agent_workspace / "provider-stderr.txt"),
+            "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
             "last_message_path": str(agent_workspace / "last-message.txt"),
             "provider": {"id": provider, "model": model},
             "session": {},

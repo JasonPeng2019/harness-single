@@ -47,6 +47,7 @@ def parse_line(line: str) -> dict[str, Any] | None:
         return parsed
     if raw_type == "system" and value.get("subtype") == "permission_denied":
         parsed["message"] = value.get("message") or "permission_denied"
+        parsed["non_retryable_failure"] = True
         return parsed
     if raw_type != "result":
         return None
@@ -58,6 +59,7 @@ def parse_line(line: str) -> dict[str, Any] | None:
         or (isinstance(denials, list) and bool(denials))
     ):
         parsed["message"] = value.get("result") or subtype or "error"
+        parsed["non_retryable_failure"] = True
         return parsed
     parsed["message"] = "result"
     return parsed

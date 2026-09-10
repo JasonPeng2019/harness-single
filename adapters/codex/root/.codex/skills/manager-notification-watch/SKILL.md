@@ -24,6 +24,13 @@ Run the public watch command in the current ROOT CLI session:
 The command occupies the current session while it waits.  Do not start it
 while actively working, and do not run it in the background.
 
+In managed mode this is a queue-only wait. A returned `WATCH_EVENT` contains
+the manager event's top-level `event_id` and records a durable watch delivery
+receipt keyed by the current queue identity and ROOT session/binding. Repeating
+the wait in that same session does not redeliver the unresolved event; a new
+ROOT session or replaced queue may receive it again. Plain mode has no queue
+and watches only its local lane/lease snapshot.
+
 ## Rules
 
 - Never start `watch --until-actionable` while ROOT still has work in

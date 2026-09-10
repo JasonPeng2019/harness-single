@@ -9,7 +9,7 @@ Notes for adapter authors maintaining the Claude Code payload.
   `permission_denied`) or `result`; the session id is `session_id` or
   `sessionId`.
 - Hooks: `settings.json` declares the PostToolUse hook; the hook script
-  appends liveness receipts and, for ROOT with `HARNESS_EVENT_ID`, managed
-  delivery receipts.
+  appends liveness receipts and managed receipts for unresolved top-level
+  queue event IDs.
 - The binding directly owns the strict provider contract, so shipped flags and
   parsing stay conformant with the v2 controller.

@@ -7,5 +7,5 @@
   "liveness_path": ".agent-workspace/root-hook-liveness.jsonl",
   "delivery_receipt_path": ".agent-workspace/root-hook-delivery.jsonl",
   "manager_queue_path": null,
-  "note": "ROOT payload binding. The hook resolves the runtime root at run time; HARNESS_EVENT_ID enables the managed delivery receipt."
+  "note": "ROOT payload binding. The hook resolves the runtime root at run time and records durable managed delivery receipts for unresolved top-level event IDs."
 }

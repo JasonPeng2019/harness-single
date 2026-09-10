@@ -8,33 +8,19 @@ an event or advances event state.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import processes
 from .config import ConfigError, load_config
 from .core import iso_utc
 from .epochs import current_epoch_path, read_current_epoch
 from .manager_queue import ManagerQueueError, read_manager_queue
-from .setup import (
-    MONITOR_DELIBERATELY_STOPPED,
-    MONITOR_HEALTHY,
-    MONITOR_RECOVERED,
-    MONITOR_RECOVERY_DISABLED,
-    MONITOR_RUNTIME_NOT_OPEN,
-    read_runtime_state,
-    run_monitor_recover,
-)
+from .setup import monitor_record_path, read_monitor_record, read_runtime_state
 
 BOUNDARIES = frozenset({"post-tool-use", "stop"})
 UNRESOLVED_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
-HEALTHY_RECOVERY_CODES = frozenset({MONITOR_HEALTHY, MONITOR_RECOVERED})
-INACTIVE_RECOVERY_CODES = frozenset(
-    {
-        MONITOR_DELIBERATELY_STOPPED,
-        MONITOR_RECOVERY_DISABLED,
-        MONITOR_RUNTIME_NOT_OPEN,
-    }
-)
 
 
 def _reject(reason: str) -> dict[str, Any]:
@@ -47,20 +33,57 @@ def _notice(
     unresolved: list[dict[str, Any]] | None = None,
     monitor_code: str | None = None,
     message: str | None = None,
+    epoch_id: str | None = None,
+    queue_id: str | None = None,
 ) -> dict[str, Any]:
     events = unresolved or []
+    severity_order = {"info": 0, "warning": 1, "error": 2, "blocking": 3}
+    severities = [str(event.get("severity") or "warning") for event in events]
+    diagnostic_class = (
+        str(monitor_code or "HARNESS_DIAGNOSTIC")
+        if (monitor_code or (message and not events))
+        else None
+    )
+    if diagnostic_class:
+        severities.append("error")
+    highest_severity = max(
+        severities,
+        key=lambda item: severity_order.get(item, 1),
+        default="info",
+    )
+    highest_classes = sorted(
+        {
+            str(event.get("event_class") or event.get("type"))
+            for event in events
+            if str(event.get("severity") or "warning") == highest_severity
+            and (event.get("event_class") or event.get("type"))
+        }
+    )
+    if diagnostic_class and severity_order.get(highest_severity, 1) <= severity_order["error"]:
+        highest_classes.append(diagnostic_class)
+        highest_classes = sorted(set(highest_classes))
     payload: dict[str, Any] = {
         "provider_id": provider_id,
+        "binding_id": provider_id,
+        "binding_identity": provider_id,
         "unresolved_count": len(events),
         "event_classes": sorted(
             {
-                str(event.get("type"))
+                str(event.get("event_class") or event.get("type"))
                 for event in events
-                if isinstance(event.get("type"), str) and event.get("type")
+                if isinstance(event.get("event_class") or event.get("type"), str)
+                and (event.get("event_class") or event.get("type"))
             }
+            | ({diagnostic_class} if diagnostic_class else set())
         ),
+        "highest_class": highest_classes[0] if highest_classes else None,
+        "highest_severity": highest_severity,
         "at": iso_utc(),
     }
+    if epoch_id is not None:
+        payload["epoch_id"] = epoch_id
+    if queue_id is not None:
+        payload["queue_id"] = queue_id
     if monitor_code:
         payload["monitor_code"] = monitor_code
     if message:
@@ -85,6 +108,59 @@ def _unresolved_events(rt: Path) -> tuple[list[dict[str, Any]] | None, str | Non
     return [
         event for event in events if event.get("state") in UNRESOLVED_STATES
     ], None
+
+
+def unresolved_event_ids(rt: Path) -> list[str]:
+    """Return unresolved event IDs for normal ROOT delivery receipts."""
+    events, error = _unresolved_events(rt)
+    if error is not None or events is None:
+        return []
+    return [
+        str(event["event_id"])
+        for event in events
+        if isinstance(event.get("event_id"), str) and event["event_id"]
+    ]
+
+
+def _heartbeat_fresh(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    from .monitor import HEARTBEAT_STALENESS_SECONDS
+
+    return (
+        datetime.now(timezone.utc) - parsed
+    ).total_seconds() <= HEARTBEAT_STALENESS_SECONDS
+
+
+def _monitor_health(rt: Path) -> tuple[str | None, str | None]:
+    """Inspect monitor liveness without starting, stopping, or replacing it."""
+    record = read_monitor_record(rt)
+    if record is None:
+        return "MONITOR_UNHEALTHY", f"monitor record is missing: {monitor_record_path(rt)}"
+    pid = record.get("pid")
+    creation = record.get("creation_time")
+    try:
+        alive = isinstance(pid, int) and processes.identity_matches(pid, creation)
+    except Exception as exc:
+        return "MONITOR_UNHEALTHY", f"monitor identity could not be checked: {exc}"
+    deliberately_stopped = bool(record.get("stop_requested")) or record.get("health") == "STOPPED"
+    if deliberately_stopped and not alive:
+        return None, None
+    if not alive:
+        return "MONITOR_UNHEALTHY", "recorded monitor process is not alive"
+    if not _heartbeat_fresh(record.get("last_heartbeat_at")):
+        return "MONITOR_UNHEALTHY", "monitor heartbeat is stale; it may be hung"
+    if record.get("health") == "degraded":
+        return "MONITOR_UNHEALTHY", "monitor reports degraded health"
+    if deliberately_stopped:
+        return "MONITOR_STOP_INCOMPLETE", "monitor is marked stopped but its process is still alive"
+    return None, None
 
 
 def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, Any]:
@@ -115,13 +191,9 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
     recovery_code: str | None = None
     recovery_message: str | None = None
     if boundary == "post-tool-use":
-        recovery = run_monitor_recover(root)
-        recovery_code = str(recovery.get("code") or "MONITOR_RECOVERY_UNKNOWN")
-        if recovery_code not in HEALTHY_RECOVERY_CODES | INACTIVE_RECOVERY_CODES:
-            recovery_message = (
-                str(recovery.get("next_action") or recovery.get("summary") or "")
-                or "run `health monitor-recover` and inspect MONITOR.json"
-            )
+        recovery_code, health_message = _monitor_health(config.runtime_root)
+        if recovery_code is not None:
+            recovery_message = f"{health_message}; ROOT must run `health monitor-recover`"
 
     unresolved, queue_error = _unresolved_events(config.runtime_root)
     if queue_error is not None:
@@ -131,6 +203,9 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
             message=queue_error,
         )
     assert unresolved is not None
+    marker = read_current_epoch(config.runtime_root)
+    epoch_id = str(marker.get("epoch_id")) if marker else None
+    queue_id = str(marker.get("queue_id")) if marker and marker.get("queue_id") else None
     if boundary == "stop":
         if unresolved:
             return _reject(
@@ -143,5 +218,7 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
             unresolved=unresolved,
             monitor_code=recovery_code,
             message=recovery_message,
+            epoch_id=epoch_id,
+            queue_id=queue_id,
         )
     return {"decision": "ALLOW"}

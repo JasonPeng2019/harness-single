@@ -19,10 +19,11 @@ from .bootstrap import (
     _write_worker_prompt,
 )
 from .config import find_harness_root, load_config
-from .core import iso_utc, new_id, read_json, require_schema
+from .core import content_hash, iso_utc, new_id, read_json, require_schema
 from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .records import atomic_write_json, remove_record
+from .manager_queue import acknowledge_event, close_event, read_manager_queue
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -39,8 +40,33 @@ INVALID_RESUME_TASK_CARD = "INVALID_RESUME_TASK_CARD"
 RESUME_LANE_WRITE_FAILED = "RESUME_LANE_WRITE_FAILED"
 
 _RESUMABLE_LIFECYCLES = frozenset(
-    {"review_pending", "result_invalid", "blocked", "abandoned"}
+    {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
 )
+
+
+def _consume_resume_signal(rt: Path, lane_id: str, prior_run_id: str) -> None:
+    """Close the rejected-review signal after the fresh run is prepared."""
+    try:
+        queue = read_manager_queue(rt)
+    except Exception:
+        return
+    for event in queue.get("events", []):
+        if not (
+            event.get("type") == "LANE_RESUME_REQUIRED"
+            and event.get("lane_id") == lane_id
+            and event.get("run_id") == prior_run_id
+            and event.get("state") in {"PENDING", "ACKNOWLEDGED"}
+        ):
+            continue
+        event_id = str(event["event_id"])
+        if event.get("state") == "PENDING":
+            acknowledge_event(rt, event_id)
+        close_event(
+            rt,
+            event_id,
+            "COMPLETE",
+            summary=f"lane {lane_id} resumed under a fresh run",
+        )
 
 
 def _read_task_card(path: Path) -> dict[str, Any]:
@@ -227,12 +253,26 @@ def run_resume(
                 "next_action": "supply a valid project-task-card/v1 resume card",
             }
 
+        prior_run_id = str(lane.get("run_id") or "")
         run_id = new_id()
         managed = config.profile == "managed"
+        update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            lambda current: {
+                **current,
+                "lifecycle": "resuming",
+                "resume_started_at": iso_utc(),
+                "resume_from_run_id": prior_run_id,
+            },
+        )
         _clear_prior_run(rt, epoch_id, lane)
         if managed:
             _reset_worker_inbox(worktree, lane_id, run_id)
-        _write_worker_prompt(worktree, task_card, managed=managed)
+        _write_worker_prompt(
+            worktree, task_card, managed=managed, rationale=rationale
+        )
         _write_result_template(worktree, lane_id, run_id)
         invocation_path = worktree / ".agent-workspace" / "invocation.json"
         try:
@@ -243,7 +283,7 @@ def run_resume(
             ]
         except (OSError, ValueError):
             exclusive_resources = []
-        _write_invocation(
+        invocation = _write_invocation(
             worktree,
             lane_id=lane_id,
             run_id=run_id,
@@ -251,6 +291,16 @@ def run_resume(
             model=lane["provider"]["model"],
             exclusive_resources=exclusive_resources,
         )
+        invocation_path = worktree / ".agent-workspace" / "invocation.json"
+        written_invocation = read_json(invocation_path)
+        require_schema(written_invocation, INVOCATION_SCHEMA, invocation_path)
+        if (
+            written_invocation.get("lane_id") != lane_id
+            or written_invocation.get("run_id") != run_id
+            or written_invocation.get("provider", {}).get("id") != lane["provider"]["id"]
+            or written_invocation.get("content_hash") != content_hash(written_invocation)
+        ):
+            raise ValueError("fresh resume invocation failed identity or hash validation")
         _rewrite_overlay_receipt(worktree, lane, run_id, managed=managed)
         if managed:
             _write_worker_binding(worktree, rt, lane_id, run_id)
@@ -268,8 +318,11 @@ def run_resume(
                 "process": {},
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
+                "resume_from_run_id": prior_run_id,
             },
         )
+        if managed:
+            _consume_resume_signal(rt, lane_id, prior_run_id)
     except Exception as exc:
         return {
             "ok": False,

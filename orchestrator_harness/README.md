@@ -93,7 +93,9 @@ stored config selects everything.
 
 `managed_coordination: enabled` (managed) stages a manager queue for the epoch: ROOT uses
 `manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
-worker notices into the queue. `disabled` (plain) omits the manager queue.
+worker notices into the queue. Managed watch is queue-only and returns the top-level event ID
+after a durable per-queue/current-ROOT-session delivery receipt; plain watch has no queue.
+`disabled` (plain) omits the manager queue.
 
 ## Providers and the adapter catalog
 
@@ -129,7 +131,7 @@ outbox.
 
 ## Lane lifecycle and evidence
 
-Lifecycle: task card -> `.agent-workspace/RESULT.json` -> `COMPLETION_REVIEW.json` ->
+Lifecycle: task card -> worktree-root `RESULT.json` -> `COMPLETION_REVIEW.json` ->
 `ORCHESTRATOR_ACCEPTANCE.json`. The worker writes the result; ROOT records the factual finding
 and the separate accept/reject decision with `lane completion-review`. A result is merge-ready
 only after schema, lane/run identity, outcome, summary, evidence, and content-hash validation
@@ -141,6 +143,13 @@ never safe absence, and no process is ever killed by broad name or command match
 examples and fixtures are never live provider proof: only a real recorded live run with exact
 identity evidence (provider, session, command provenance, delivery receipts) can claim provider
 proof.
+
+The monitor records a heartbeat on every pass, including zero watched lanes and promotion or
+inspection diagnostics. ROOT PostToolUse records `DELIVERED` receipts without advancing queue
+state; hooks only report an unhealthy monitor and direct ROOT to the public
+`health monitor-recover` command. Invalid results receive at most five corrective prompts in
+the same native provider session; a sixth invalid attempt or a provider startup/auth/process
+failure ends as `provider_exited_no_result` without a fresh context.
 
 ## Read-only shipped source
 

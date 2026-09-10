@@ -18,6 +18,10 @@ worker skills call.
   the worker binding and inbox (`harness-hook-binding/v1`, `lane-inbox/v1`);
   it never reads the manager queue and never advances assignment state.
 
+`RESULT.json` is always at the worktree root. The result checker requires a nonblank summary,
+evidence list, completed timestamp, and valid content hash; `.agent-workspace` contains the
+template and control records.
+
 ## Rules
 
 - Helpers are provider-neutral and portable on Windows and Linux.

@@ -30,7 +30,8 @@ never write the manager queue.
   `provider_id`; the worker payload also declares `inbox_path`, `outbox_dir`,
   `result_path`, and `result_stop_check`.
 - `hooks/` — portable PostToolUse hook scripts that append liveness receipts
-  and, for ROOT with `HARNESS_EVENT_ID`, managed delivery receipts.
+  and, for ROOT, durable managed delivery receipts for unresolved top-level
+  queue event IDs.
 - Bootstrap writes the authoritative worker binding with runtime paths into
   `.agent-workspace/harness-hook-binding.json`; payload bindings are the
   static templates the hooks read.

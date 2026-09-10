@@ -22,15 +22,19 @@ from .leases import (
     FORCE_RELEASE_DELETE_FAILED,
     FORCE_RELEASE_HOLDER_LIVE,
     FORCE_RELEASE_HOLDER_UNPROVEN,
+    FORCE_RELEASE_AUDIT_START_FAILED,
+    FORCE_RELEASE_AUDIT_TERMINAL_FAILED,
     FORCE_RELEASE_LEASE_INVALID,
     FORCE_RELEASE_LEASE_MISSING,
     FORCE_RELEASE_OK,
     FORCE_RELEASE_UNDECLARED,
     LeaseError,
-    force_release_lease,
+    force_release_lease_audited,
+    force_release_audit_path,
     lease_path,
 )
 from .manager_queue import (
+    EVENT_TYPES,
     MANAGER_ACK_ALREADY_ACKNOWLEDGED,
     MANAGER_ACK_EVENT_NOT_FOUND,
     MANAGER_ACK_NOT_ROOT_EVENT,
@@ -84,7 +88,7 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
             raise ManagerQueueError(
                 MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
             )
-        if not event.get("lane_id") or not event.get("run_id"):
+        if event.get("type") not in EVENT_TYPES:
             raise ManagerQueueError(
                 MANAGER_ACK_NOT_ROOT_EVENT,
                 f"event {event_id} is not a valid ROOT event",
@@ -140,7 +144,7 @@ def _manager_close(
             raise ManagerQueueError(
                 MANAGER_CLOSE_NOT_ACKNOWLEDGED, f"event not found: {event_id}"
             )
-        if not event.get("lane_id") or not event.get("run_id"):
+        if event.get("type") not in EVENT_TYPES:
             raise ManagerQueueError(
                 MANAGER_CLOSE_NOT_ACKNOWLEDGED,
                 f"event {event_id} is not a valid ROOT event",
@@ -265,29 +269,42 @@ def _lease_force_release(resource_id: str) -> dict[str, Any]:
         return lane
 
     try:
-        force_release_lease(
+        audit_result = force_release_lease_audited(
             rt, resource_id, lane_resolver=resolve_current_lane
         )
     except LeaseError as exc:
-        return {
+        released = bool(getattr(exc, "released", False))
+        audit_path = str(force_release_audit_path(rt))
+        evidence = [audit_path, str(lease_path(rt, resource_id))]
+        result: dict[str, Any] = {
             "ok": False,
             "code": exc.code,
             "summary": str(exc),
-            "evidence_paths": [str(lease_path(rt, resource_id))],
+            "evidence_paths": evidence,
             "next_action": {
+                FORCE_RELEASE_AUDIT_START_FAILED: "repair runtime audit storage; the lease was not deleted",
+                FORCE_RELEASE_AUDIT_TERMINAL_FAILED: (
+                    "the lease release already happened; retain STARTED evidence and repair audit storage"
+                ),
                 FORCE_RELEASE_LEASE_MISSING: "the resource has no lease; nothing to release",
                 FORCE_RELEASE_LEASE_INVALID: "resolve the invalid lease record and retry",
                 FORCE_RELEASE_HOLDER_LIVE: "stop the exact holder process before force-releasing",
                 FORCE_RELEASE_HOLDER_UNPROVEN: "prove the holder dead or retire/abandon the lane before retrying",
                 FORCE_RELEASE_DELETE_FAILED: "resolve the error and retry",
             }.get(exc.code, "resolve the error and retry"),
+            "released": released,
         }
+        if hasattr(exc, "lease_absent"):
+            result["lease_absent"] = bool(exc.lease_absent)
+        return result
     return {
         "ok": True,
         "code": FORCE_RELEASE_OK,
-        "summary": f"lease force-released: {resource_id}",
-        "evidence_paths": [str(lease_path(rt, resource_id))],
+        "summary": f"lease force-released: {resource_id}; audit recorded",
+        "evidence_paths": [str(lease_path(rt, resource_id)), audit_result["audit_path"]],
         "next_action": "none",
+        "released": True,
+        "lease_absent": bool(audit_result["lease_absent"]),
     }
 
 
