@@ -10,7 +10,7 @@ class ClaimMapTests(unittest.TestCase):
 
     def test_every_check_has_independent_scenario_trigger_oracle_and_cleanup(self) -> None:
         names = {item.name for item in CLAIMS}
-        self.assertEqual({f"CHECK-U{number}" for number in range(1, 6)} | {f"CHECK-LIVE-{number}" for number in range(1, 5)}, names)
+        self.assertEqual({f"CHECK-U{number}" for number in range(1, 6)} | {f"CHECK-LIVE-{number}" for number in range(1, 17)}, names)
         for item in CLAIMS:
             with self.subTest(item.name):
                 self.assertTrue(item.requirements)
@@ -26,5 +26,5 @@ class ClaimMapTests(unittest.TestCase):
     def test_static_assets_cover_every_non_live_requirement_and_live_is_reserved(self) -> None:
         self.assertTrue({f"REQ-{number:03d}" for number in range(1, 17)} <= covered_requirements())
         live = [item for item in CLAIMS if item.evidence_class == "live-only"]
-        self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3", "CHECK-LIVE-4"], [item.name for item in live])
+        self.assertEqual([f"CHECK-LIVE-{number}" for number in range(1, 17)], [item.name for item in live])
         self.assertEqual({"REQ-017"}, covered_requirements(live))
