@@ -93,8 +93,9 @@ stored config selects everything.
 
 `managed_coordination: enabled` (managed) stages a manager queue for the epoch: ROOT uses
 `manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
-worker notices into the queue. Managed watch is queue-only and returns the top-level event ID
-after a durable per-queue/current-ROOT-session delivery receipt; plain watch has no queue.
+worker notices into the queue. Managed watch wakes from an unresolved queue event or an
+actionable lane/resource state and returns the top-level event ID after a durable
+per-queue/current-ROOT-session delivery receipt; plain watch has no queue.
 `disabled` (plain) omits the manager queue.
 
 ## Providers and the adapter catalog

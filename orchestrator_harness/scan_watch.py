@@ -293,21 +293,20 @@ def run_watch(
                         "wake_reason": "manager_event",
                         "event_id": event_id,
                     }
-        else:
-            actionable = _find_actionable(rt, epoch_id, orphaned_leases)
-            if actionable is not None:
-                lane_id, status = actionable
-                result = {
-                    "ok": True,
-                    "code": "WATCH_ACTIONABLE",
-                    "summary": f"{lane_id} is actionable: {status}",
-                    "evidence_paths": [],
-                    "next_action": "act on the condition per the operator-responses table",
-                    "wake_reason": "lane_status",
-                }
-                if lane_id.startswith("resource:"):
-                    result["resource_id"] = lane_id.split(":", 1)[1]
-                return result
+        actionable = _find_actionable(rt, epoch_id, orphaned_leases)
+        if actionable is not None:
+            lane_id, status = actionable
+            result = {
+                "ok": True,
+                "code": "WATCH_ACTIONABLE",
+                "summary": f"{lane_id} is actionable: {status}",
+                "evidence_paths": [],
+                "next_action": "act on the condition per the operator-responses table",
+                "wake_reason": "lane_status",
+            }
+            if lane_id.startswith("resource:"):
+                result["resource_id"] = lane_id.split(":", 1)[1]
+            return result
         if deadline is not None and time.monotonic() >= deadline:
             return {
                 "ok": False,

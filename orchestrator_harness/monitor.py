@@ -371,6 +371,8 @@ def _transcript_contradicts(lane: dict[str, Any], status: dict[str, Any] | None)
         return False
     recorded = status.get("recorded_status")
     if recorded == "review_pending" and exit_code != 0:
+        if status.get("result_state") == "valid" or _valid_current_result(lane):
+            return False
         return True
     if recorded == "result_invalid" and exit_code == 0:
         return True
@@ -423,6 +425,8 @@ def derive_lane_status(
     controller_alive = processes.identity_matches(
         process.get("pid"), process.get("creation_time")
     )
+    if lane.get("launch_pending") is True:
+        return None
     recorded = (status or {}).get("recorded_status")
     if recorded == "correction_pending":
         return None if controller_alive else "controller_exited"

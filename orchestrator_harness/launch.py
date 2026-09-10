@@ -141,6 +141,7 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                         "pid": controller_identity["pid"],
                         "creation_time": controller_identity["creation_time"],
                     },
+                    "launch_pending": False,
                 },
             )
         except Exception as exc:

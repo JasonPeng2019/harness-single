@@ -316,18 +316,20 @@ def append_assignment(
 ) -> dict[str, Any]:
     """ROOT appends one PENDING assignment to a running managed lane's inbox."""
     worktree = Path(lane["worktree_path"])
-    inbox = read_lane_inbox(worktree)
-    if inbox.get("run_id") != lane.get("run_id"):
-        raise ManagerQueueError(SEND_LANE_WRITE_FAILED, "lane inbox run_id is stale")
-    assignment = {
-        "event_id": new_id(),
-        "lane_id": lane["lane_id"],
-        "run_id": lane["run_id"],
-        "prompt": prompt,
-        "created_at": iso_utc(),
-        "state": "PENDING",
-        "history": [{"state": "PENDING", "at": iso_utc()}],
-    }
-    inbox["assignments"].append(assignment)
-    write_lane_inbox(worktree, inbox)
+    path = worktree / ".agent-workspace" / "QUEUE.json"
+    with RecordLock(path):
+        inbox = read_lane_inbox(worktree)
+        if inbox.get("run_id") != lane.get("run_id"):
+            raise ManagerQueueError(SEND_LANE_WRITE_FAILED, "lane inbox run_id is stale")
+        assignment = {
+            "event_id": new_id(),
+            "lane_id": lane["lane_id"],
+            "run_id": lane["run_id"],
+            "prompt": prompt,
+            "created_at": iso_utc(),
+            "state": "PENDING",
+            "history": [{"state": "PENDING", "at": iso_utc()}],
+        }
+        inbox["assignments"].append(assignment)
+        atomic_write_json(path, inbox)
     return assignment

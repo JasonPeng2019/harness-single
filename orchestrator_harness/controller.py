@@ -293,9 +293,11 @@ def _run_provider(
         resume=resume,
     )
     _append_event(lane, "provider_started", " ".join(argv))
+    pre_spawn_offset: int = 0
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
+        pre_spawn_offset = transcript_handle.tell()
         try:
             child = processes.spawn_provider(
                 argv,
@@ -390,7 +392,7 @@ def _run_provider(
     session: str | None = None
     non_retryable_failure = False
     with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
-        handle.seek(0, os.SEEK_END)
+        handle.seek(pre_spawn_offset)
         next_observation = time.monotonic()
         while child.poll() is None:
             if time.monotonic() >= next_observation:

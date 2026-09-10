@@ -63,8 +63,9 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 
 `managed_coordination: "enabled"` (managed) stages a manager queue for the epoch: ROOT uses
 `manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
-worker notices into the queue. Managed watch wakes only from an unresolved queue event and
-records a durable per-session/queue delivery receipt. `disabled` (plain) omits the manager
+worker notices into the queue. Managed watch wakes from an unresolved queue event or an
+actionable lane/resource state and records a durable per-session/queue delivery receipt for
+queue events. `disabled` (plain) omits the manager
 queue; lanes run without ROOT-to-worker assignments and plain scan/watch never reads it.
 
 ## Providers and the adapter catalog

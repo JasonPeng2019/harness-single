@@ -316,6 +316,7 @@ def run_resume(
                 "run_id": value,
                 "lifecycle": "running",
                 "process": {},
+                "launch_pending": True,
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
                 "resume_from_run_id": prior_run_id,
