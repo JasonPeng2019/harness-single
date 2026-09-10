@@ -34,7 +34,7 @@ from .epochs import (
 )
 from .lanes import LANE_SCHEMA, read_lane, update_lane
 from .manager_queue import ManagerQueueError, promote_event, read_manager_queue
-from .records import RecordLock, atomic_write_json, read_record, remove_record
+from .records import RecordLock, atomic_write_json, read_record
 from .review import validate_acceptance_chain
 from .setup import MONITOR_SCHEMA, monitor_record_path, read_monitor_record
 
@@ -245,12 +245,16 @@ def _recover_broken_review_pair(
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
-    if not (review_path.exists() or acceptance_path.exists()):
-        return False
-    if _review_pair_is_valid(rt, epoch_id, lane):
-        return False
-    remove_record(review_path)
-    remove_record(acceptance_path)
+    with RecordLock(review_path):
+        if not (review_path.exists() or acceptance_path.exists()):
+            return False
+        if _review_pair_is_valid(rt, epoch_id, lane):
+            return False
+        for path in (review_path, acceptance_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
     if _valid_current_result(lane):
         update_lane(
             rt,
@@ -421,7 +425,7 @@ def derive_lane_status(
     )
     recorded = (status or {}).get("recorded_status")
     if recorded == "correction_pending":
-        return None
+        return None if controller_alive else "controller_exited"
     if recorded == "provider_exited_no_result":
         return recorded
     if not controller_alive:

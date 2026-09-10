@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from orchestrator_harness import controller, leases, monitor, scan_watch
+from orchestrator_harness import controller, leases, monitor, review, scan_watch
 from orchestrator_harness.controller import ProviderExecution
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA
@@ -230,6 +231,107 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("COMPLETION_REVIEW_REQUIRED", events[0]["type"])
 
+    def test_review_recovery_waits_for_pair_publication(self) -> None:
+        lane_dir = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1"
+        worktree = self.runtime / "review-publication-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        lane_dir.mkdir(parents=True)
+        lane = {
+            "schema": "lane/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worktree_path": str(worktree),
+            "result_path": str(worktree / "RESULT.json"),
+            "lifecycle": "review_pending",
+        }
+        atomic_write_json(lane_dir / "lane.json", lane)
+        atomic_write_json(
+            workspace / "task-card.json",
+            {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"},
+        )
+        result = {
+            "schema": "result/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "outcome": "PASS",
+            "summary": "completed",
+            "evidence": [],
+            "completed_at": "2026-09-09T00:00:00Z",
+        }
+        result["content_hash"] = content_hash(result)
+        atomic_write_json(worktree / "RESULT.json", result)
+        review_path = lane_dir / "COMPLETION_REVIEW.json"
+        first_write = threading.Event()
+        allow_second_write = threading.Event()
+        recovery_lock_requested = threading.Event()
+        writer_errors: list[BaseException] = []
+        recovery_errors: list[BaseException] = []
+        recovery_result: list[bool] = []
+
+        from orchestrator_harness.records import RecordLock
+
+        real_atomic_write_json = review.atomic_write_json
+
+        def write_pair(path: Path, value: object) -> None:
+            real_atomic_write_json(path, value)
+            if path == review_path:
+                first_write.set()
+                if not allow_second_write.wait(5):
+                    raise AssertionError("timed out waiting to complete review publication")
+
+        def tracked_lock(path: Path) -> RecordLock:
+            if Path(path).absolute() == review_path.absolute():
+                recovery_lock_requested.set()
+            return RecordLock(path)
+
+        def publish_pair() -> None:
+            try:
+                review._write_pair(
+                    self.runtime,
+                    "epoch-1",
+                    lane,
+                    review_outcome="PASS",
+                    review_summary="reviewed",
+                    evidence=[],
+                    approval="ACCEPTED",
+                    force_accept_reason=None,
+                )
+            except BaseException as exc:
+                writer_errors.append(exc)
+
+        def recover_pair() -> None:
+            try:
+                recovery_result.append(
+                    monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane)
+                )
+            except BaseException as exc:
+                recovery_errors.append(exc)
+
+        with (
+            patch.object(review, "atomic_write_json", side_effect=write_pair),
+            patch.object(review, "_worktree_commit", return_value="commit-1"),
+            patch.object(monitor, "RecordLock", side_effect=tracked_lock),
+        ):
+            writer = threading.Thread(target=publish_pair)
+            writer.start()
+            self.assertTrue(first_write.wait(5))
+            recovery = threading.Thread(target=recover_pair)
+            recovery.start()
+            lock_observed = recovery_lock_requested.wait(2)
+            allow_second_write.set()
+            writer.join(5)
+            recovery.join(5)
+
+        self.assertTrue(lock_observed, "recovery must acquire the writer's review lock")
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(recovery.is_alive())
+        self.assertEqual([], writer_errors)
+        self.assertEqual([], recovery_errors)
+        self.assertEqual([False], recovery_result)
+        self.assertTrue(monitor._review_pair_is_valid(self.runtime, "epoch-1", lane))
+
+
     def test_invalid_result_uses_native_session_for_at_most_five_corrections(self) -> None:
         worktree = self.runtime / "controller-worktree"
         workspace = worktree / ".agent-workspace"
@@ -308,6 +410,111 @@ class Addendum3ProductTests(unittest.TestCase):
         attempts = read_jsonl(Path(lane["attempts_path"]))
         self.assertEqual(3, len(attempts) - 1)  # one schema header plus three attempts
         self.assertEqual(2, len(list((workspace / "attempts").glob("correction-prompt-*.md"))))
+
+    def test_valid_result_wins_over_nonzero_provider_exit(self) -> None:
+        worktree = self.runtime / "controller-valid-result-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "worker-prompt.md").write_text("do the work\n", encoding="utf-8")
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worktree_path": str(worktree),
+            "result_path": str(worktree / "RESULT.json"),
+            "controller_status_path": str(workspace / "controller.status.json"),
+            "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "transcript_path": str(workspace / "provider-transcript.jsonl"),
+            "stderr_path": str(workspace / "provider-stderr.txt"),
+            "attempts_path": str(workspace / "controller.attempts.jsonl"),
+            "last_message_path": str(workspace / "last-message.txt"),
+            "provider": {"id": "codex", "model": "model-1"},
+            "process": {},
+            "session": {},
+            "lifecycle": "prepared",
+        }
+        invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "provider": {"id": "codex", "model": "model-1"},
+            "exclusive_resources": [],
+        }
+        boundary = MagicMock(
+            root_pid=101,
+            root_creation_time="provider-created",
+            process_group_id=101,
+            session_id="provider-boundary",
+        )
+        boundary.record.return_value = {"root": {"pid": 101}}
+        boundary.cleanup.return_value = True
+        execution = ProviderExecution(
+            17,
+            boundary,
+            "native-session-1",
+            ("codex", "exec", "new"),
+            True,
+        )
+        with (
+            patch.object(controller, "find_harness_root", return_value=Path("root")),
+            patch.object(controller, "load_config", return_value=type("Config", (), {"runtime_root": self.runtime})()),
+            patch.object(controller, "find_active_lane", return_value=("epoch-1", lane)),
+            patch.object(controller, "read_record", return_value=invocation),
+            patch.object(controller, "_write_status") as write_status,
+            patch.object(controller, "_append_event") as append_event,
+            patch.object(controller.processes, "process_identity", return_value={"pid": 7, "creation_time": "controller"}),
+            patch.object(controller, "update_lane", return_value=lane),
+            patch.object(controller, "_load_binding", return_value=object()),
+            patch.object(controller, "acquire_leases"),
+            patch.object(controller, "release_leases"),
+            patch.object(controller, "_run_provider", return_value=execution),
+            patch.object(controller, "_validate_result", return_value=("valid", {"outcome": "PASS"})),
+            patch.object(controller, "_read_acceptance_chain", return_value={"acceptance": {"approval": "REJECTED"}}),
+        ):
+            self.assertEqual(0, controller.run_controller("lane-1"))
+
+        review_status = next(
+            call.args[1]
+            for call in write_status.call_args_list
+            if call.args[1].get("recorded_status") == "review_pending"
+        )
+        self.assertEqual("valid", review_status["result_state"])
+        event_types = [call.args[1] for call in append_event.call_args_list]
+        self.assertIn("provider_exited", event_types)
+        self.assertIn("result_valid", event_types)
+        self.assertNotIn("correction_requested", event_types)
+        attempts = read_jsonl(Path(lane["attempts_path"]))
+        self.assertEqual(17, attempts[-1]["exit_code"])
+        self.assertEqual("valid", attempts[-1]["result_state"])
+
+    def test_dead_controller_does_not_hide_correction_pending(self) -> None:
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "lifecycle": "running",
+            "process": {"pid": 7, "creation_time": "controller-created"},
+        }
+        status = {"recorded_status": "correction_pending"}
+        with patch.object(monitor.processes, "identity_matches", return_value=True):
+            self.assertIsNone(
+                monitor.derive_lane_status(
+                    self.runtime,
+                    "epoch-1",
+                    lane,
+                    status,
+                    lease_records=[],
+                )
+            )
+        with patch.object(monitor.processes, "identity_matches", return_value=False):
+            self.assertEqual(
+                "controller_exited",
+                monitor.derive_lane_status(
+                    self.runtime,
+                    "epoch-1",
+                    lane,
+                    status,
+                    lease_records=[],
+                ),
+            )
 
 
 if __name__ == "__main__":

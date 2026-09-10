@@ -157,7 +157,10 @@ def _monitor_health(rt: Path) -> tuple[str | None, str | None]:
     if not _heartbeat_fresh(record.get("last_heartbeat_at")):
         return "MONITOR_UNHEALTHY", "monitor heartbeat is stale; it may be hung"
     if record.get("health") == "degraded":
-        return "MONITOR_UNHEALTHY", "monitor reports degraded health"
+        return (
+            "MONITOR_DEGRADED",
+            "monitor reports degraded health; ROOT must inspect and correct the recorded diagnostics",
+        )
     if deliberately_stopped:
         return "MONITOR_STOP_INCOMPLETE", "monitor is marked stopped but its process is still alive"
     return None, None
@@ -193,7 +196,9 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
     if boundary == "post-tool-use":
         recovery_code, health_message = _monitor_health(config.runtime_root)
         if recovery_code is not None:
-            recovery_message = f"{health_message}; ROOT must run `health monitor-recover`"
+            recovery_message = health_message
+            if recovery_code != "MONITOR_DEGRADED":
+                recovery_message = f"{health_message}; ROOT must run `health monitor-recover`"
 
     unresolved, queue_error = _unresolved_events(config.runtime_root)
     if queue_error is not None:

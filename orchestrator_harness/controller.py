@@ -662,7 +662,9 @@ def run_controller(lane_id: str) -> int:
         cleanup_proven = execution.boundary.cleanup(force=True)
         result_state, _result = _validate_result(lane)
         effective_result_state = (
-            "invalid" if execution.non_retryable_failure else result_state
+            result_state
+            if result_state == "valid"
+            else ("invalid" if execution.non_retryable_failure else result_state)
         )
         if not cleanup_proven:
             _append_attempt(
@@ -705,9 +707,13 @@ def run_controller(lane_id: str) -> int:
             result_state=effective_result_state,
             cleanup_proven=True,
             validation_error=(
-                "provider startup/auth/process failure"
-                if execution.non_retryable_failure
-                else (None if result_state == "valid" else "missing or invalid RESULT.json")
+                None
+                if result_state == "valid"
+                else (
+                    "provider startup/auth/process failure"
+                    if execution.non_retryable_failure
+                    else "missing or invalid RESULT.json"
+                )
             ),
         )
         if execution.session_id:

@@ -88,6 +88,30 @@ class RootHookDispatchTests(unittest.TestCase):
         self.assertEqual(result["notice"]["monitor_code"], "MONITOR_CLEANUP_UNPROVEN")
         self.assertIn("verify exact process", result["notice"]["message"])
 
+    def test_live_degraded_monitor_directs_diagnostic_correction(self) -> None:
+        record = {
+            "pid": 41,
+            "creation_time": "created-1",
+            "last_heartbeat_at": hooks.iso_utc(),
+            "health": "degraded",
+            "diagnostics": [{"error": "secret-detail"}],
+        }
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value=self.open_state),
+            patch.object(hooks, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(hooks, "read_manager_queue", return_value={"events": []}),
+            patch.object(hooks, "read_monitor_record", return_value=record),
+            patch.object(hooks.processes, "identity_matches", return_value=True),
+        ):
+            result = hooks.dispatch(self.root, "post-tool-use", "codex")
+        self.assertEqual(result["decision"], "NOTICE")
+        notice = result["notice"]
+        self.assertEqual("MONITOR_DEGRADED", notice["monitor_code"])
+        self.assertIn("inspect and correct the recorded diagnostics", notice["message"])
+        self.assertNotIn("health monitor-recover", notice["message"])
+        self.assertNotIn("secret-detail", str(notice))
+
     def test_queue_corruption_fails_closed(self) -> None:
         self.assertEqual(self.call("post-tool-use", queue={"events": "bad"})["decision"], "NOTICE")
         self.assertEqual(self.call("stop", queue={"events": "bad"})["decision"], "REJECT")
