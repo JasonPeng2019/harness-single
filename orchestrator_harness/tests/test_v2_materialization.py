@@ -321,6 +321,153 @@ class V2MaterializationTests(unittest.TestCase):
         )
         spawn_detached.assert_called_once()
 
+
+    def _snapshot(self, root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    def test_setup_second_unchanged_run_is_idempotent(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ) as spawn_detached,
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+            patch.object(
+                setup.processes, "identity_matches", return_value=True
+            ),
+        ):
+            first = setup.run_setup()
+            runtime = self.fixture.root_workspace / ".harness-runtime"
+            root_after_first = self._snapshot(self.fixture.root_workspace)
+            cache_after_first = self._snapshot(runtime / "super-cache")
+            manifest_after_first = (
+                runtime / "resources" / "RESOURCE_MANIFEST.json"
+            ).read_bytes()
+            monitor_after_first = (runtime / "monitor" / "MONITOR.json").read_bytes()
+            second = setup.run_setup()
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual("SETUP_OK", first["code"])
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(setup.SETUP_MONITOR_ALREADY_RUNNING, second["code"])
+        self.assertNotIn("overwritten_paths", second)
+        spawn_detached.assert_called_once()
+
+        self.assertEqual(
+            root_after_first, self._snapshot(self.fixture.root_workspace)
+        )
+        self.assertEqual(cache_after_first, self._snapshot(runtime / "super-cache"))
+        self.assertEqual(
+            manifest_after_first,
+            (runtime / "resources" / "RESOURCE_MANIFEST.json").read_bytes(),
+        )
+        self.assertEqual(
+            monitor_after_first, (runtime / "monitor" / "MONITOR.json").read_bytes()
+        )
+        for provider_id, dotdir in (
+            ("codex", ".codex"),
+            ("disposable-custom", ".custom"),
+        ):
+            binding = json.loads(
+                (
+                    self.fixture.root_workspace
+                    / dotdir
+                    / "orchestrator-harness-binding.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                str(self.fixture.harness.resolve()), binding["harness_root"]
+            )
+            self.assertEqual(str(runtime.resolve()), binding["runtime_root"])
+            self.assertEqual(provider_id, binding["provider_id"])
+
+    def test_setup_second_run_rejects_byte_changed_installed_payload(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ),
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+        ):
+            first = setup.run_setup()
+        self.assertTrue(first["ok"], first)
+        changed = self.fixture.root_workspace / ".codex" / "root.txt"
+        changed.write_text("tampered\n", encoding="utf-8")
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            second = setup.run_setup()
+        self.assertFalse(second["ok"])
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, second["code"])
+        self.assertEqual("tampered\n", changed.read_text(encoding="utf-8"))
+
+    def test_setup_second_run_rejects_binding_materialized_elsewhere(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ),
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+        ):
+            first = setup.run_setup()
+        self.assertTrue(first["ok"], first)
+        binding_path = (
+            self.fixture.root_workspace
+            / ".codex"
+            / "orchestrator-harness-binding.json"
+        )
+        foreign = json.loads(binding_path.read_text(encoding="utf-8"))
+        foreign["harness_root"] = str(self.fixture.root / "elsewhere")
+        self.fixture._write_json(binding_path, foreign)
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            second = setup.run_setup()
+        self.assertFalse(second["ok"])
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, second["code"])
+        self.assertEqual(
+            foreign, json.loads(binding_path.read_text(encoding="utf-8"))
+        )
     def test_setup_rejects_hooked_provider_without_binding_before_writes(self) -> None:
         (
             self.fixture.harness

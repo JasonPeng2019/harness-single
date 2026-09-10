@@ -241,15 +241,56 @@ def _plan_root_payloads(harness_root: Path) -> list[tuple[Path, Path]]:
     return planned
 
 
+def _materialized_binding(
+    template: dict[str, Any],
+    harness_root: Path,
+    runtime_root: Path,
+) -> dict[str, Any]:
+    """Return the shipped binding template bound to this exact runtime."""
+    bound = dict(template)
+    bound["harness_root"] = str(harness_root.resolve())
+    bound["runtime_root"] = str(runtime_root.resolve())
+    return bound
+
+
+def _is_valid_installed_payload(
+    target: Path,
+    source_file: Path,
+    *,
+    harness_root: Path | None,
+    runtime_root: Path | None,
+    binding_templates: dict[Path, dict[str, Any]] | None,
+) -> bool:
+    """Return whether an existing destination is the valid installed form of
+    a planned payload: byte-identical to the shipped source, or a ROOT hook
+    binding correctly materialized for the exact current harness/runtime."""
+    if target.is_file() and target.read_bytes() == source_file.read_bytes():
+        return True
+    if harness_root is None or runtime_root is None or binding_templates is None:
+        return False
+    template = binding_templates.get(target)
+    if template is None:
+        return False
+    try:
+        copied = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return copied == _materialized_binding(template, harness_root, runtime_root)
+
+
 def _preflight_root_payloads(
     plan: list[tuple[Path, Path]],
     root_workspace: Path,
     *,
     overwrite: bool,
+    harness_root: Path | None = None,
+    runtime_root: Path | None = None,
+    binding_templates: dict[Path, dict[str, Any]] | None = None,
 ) -> None:
     """Reject any destination collision across the whole ROOT payload plan
     before anything is written; ``--overwrite`` replaces only catalog-planned
-    files."""
+    files.  An existing destination that is the valid installed form of its
+    planned payload is preserved, not a collision."""
     seen: set[Path] = set()
     plan_collisions: list[Path] = []
     for _, relative in plan:
@@ -263,11 +304,20 @@ def _preflight_root_payloads(
         )
     if overwrite:
         return
-    collisions = [
-        root_workspace / relative
-        for _, relative in plan
-        if (root_workspace / relative).exists()
-    ]
+    collisions: list[Path] = []
+    for source, relative in plan:
+        target = root_workspace / relative
+        if not target.exists():
+            continue
+        if _is_valid_installed_payload(
+            target,
+            source,
+            harness_root=harness_root,
+            runtime_root=runtime_root,
+            binding_templates=binding_templates,
+        ):
+            continue
+        collisions.append(target)
     if collisions:
         raise SetupError(
             SETUP_ADAPTER_COLLISION,
@@ -351,10 +401,12 @@ def _materialize_root_hook_bindings(
     runtime_root: Path,
     bindings: list[tuple[str, Path, dict[str, Any]]],
 ) -> list[Path]:
-    """Atomically bind verified installed ROOT hook payloads to this runtime."""
+    """Atomically bind verified installed ROOT hook payloads to this runtime.
+
+    The installed binding is accepted as the raw shipped template or as the
+    template already materialized for this exact harness/runtime; a foreign or
+    changed installed binding is a collision."""
     bound_paths: list[Path] = []
-    resolved_harness = str(harness_root.resolve())
-    resolved_runtime = str(runtime_root.resolve())
     for provider_id, relative, template in bindings:
         target = root_workspace / relative
         try:
@@ -364,21 +416,21 @@ def _materialize_root_hook_bindings(
                 SETUP_CONFIG_INVALID,
                 f"installed {provider_id} hook has no harness binding: {exc}",
             ) from exc
-        if copied != template:
+        expected = _materialized_binding(template, harness_root, runtime_root)
+        if copied != template and copied != expected:
             raise SetupError(
-                SETUP_CONFIG_INVALID,
-                f"installed ROOT hook binding for {provider_id} does not match its verified template",
+                SETUP_ADAPTER_COLLISION,
+                f"installed ROOT hook binding for {provider_id} is neither its "
+                "verified template nor a binding for this exact harness/runtime",
             )
-        bound = dict(copied)
-        bound["harness_root"] = resolved_harness
-        bound["runtime_root"] = resolved_runtime
-        try:
-            atomic_write_json(target, bound)
-        except OSError as exc:
-            raise SetupError(
-                SETUP_CONFIG_INVALID,
-                f"cannot bind installed ROOT hook for {provider_id}: {exc}",
-            ) from exc
+        if copied != expected:
+            try:
+                atomic_write_json(target, expected)
+            except OSError as exc:
+                raise SetupError(
+                    SETUP_CONFIG_INVALID,
+                    f"cannot bind installed ROOT hook for {provider_id}: {exc}",
+                ) from exc
         bound_paths.append(target)
     return bound_paths
 
@@ -389,9 +441,13 @@ def _install_root_payloads(
     *,
     plan: list[tuple[Path, Path]],
     overwrite: bool,
+    runtime_root: Path | None = None,
+    binding_templates: dict[Path, dict[str, Any]] | None = None,
 ) -> tuple[list[Path], list[Path]]:
     """Install the preflighted ROOT payloads and return ``(installed,
-    overwritten)`` paths.  Never writes back into the shipped harness trees."""
+    overwritten)`` paths.  Never writes back into the shipped harness trees.
+    An already-installed valid payload is preserved exactly on an unchanged
+    re-run; ``--overwrite`` re-copies every planned payload."""
     harness_identity = path_identity(harness_root)
     workspace_identity = path_identity(root_workspace)
     if workspace_identity == harness_identity or workspace_identity.startswith(
@@ -405,6 +461,15 @@ def _install_root_payloads(
     overwritten: list[Path] = []
     for source_file, relative in plan:
         target = root_workspace / relative
+        if not overwrite and _is_valid_installed_payload(
+            target,
+            source_file,
+            harness_root=harness_root,
+            runtime_root=runtime_root,
+            binding_templates=binding_templates,
+        ):
+            installed.append(target)
+            continue
         replaced = target.exists()
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_file, target)
@@ -764,8 +829,19 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                 f"root workspace must not be inside the harness root: {config.root_workspace}",
             )
         root_plan = _plan_root_payloads(harness_root)
-        _preflight_root_payloads(root_plan, config.root_workspace, overwrite=overwrite)
         root_bindings = _plan_root_hook_bindings(harness_root, root_plan)
+        binding_templates = {
+            config.root_workspace / relative: template
+            for _, relative, template in root_bindings
+        }
+        _preflight_root_payloads(
+            root_plan,
+            config.root_workspace,
+            overwrite=overwrite,
+            harness_root=harness_root,
+            runtime_root=rt,
+            binding_templates=binding_templates,
+        )
         cache_plan = _plan_active_cache(harness_root)
         destination = rt / "super-cache"
         if destination.is_dir():
@@ -826,6 +902,8 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             config.root_workspace,
             plan=root_plan,
             overwrite=overwrite,
+            runtime_root=rt,
+            binding_templates=binding_templates,
         )
         installed_set = set(installed)
         if any(config.root_workspace / relative not in installed_set for _, relative, _ in root_bindings):
