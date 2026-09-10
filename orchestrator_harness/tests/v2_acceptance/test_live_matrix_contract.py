@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from orchestrator_harness.tests.v2_acceptance.contract import PLATFORM_CLAIMS
-from examples.v2_live_matrix import CHECKS, NATIVE_GAPS, expected_cells
+from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NATIVE_GAPS, execute, expected_cells
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -42,4 +45,53 @@ class LiveMatrixContractTests(unittest.TestCase):
             with self.subTest(platform=platform):
                 native_rows = [row for row in rows if row["platform"] == platform]
                 self.assertTrue(native_rows)
-                self.assertTrue(all(row["outcome"] in {gap, "NOT_APPLICABLE"} for row in native_rows))
+                for row in native_rows:
+                    expected = "NOT_APPLICABLE" if row["applicable"] == "false" else gap
+                    self.assertEqual(expected, row["outcome"])
+
+        for platform in ("Windows", "macOS", "Linux"):
+            for command in MANAGED_ONLY:
+                with self.subTest(platform=platform, command=command):
+                    managed_only_plain = [
+                        row for row in rows
+                        if row["platform"] == platform and row["command"] == command and row["profile"] == "plain"
+                    ]
+                    self.assertTrue(managed_only_plain)
+                    self.assertTrue(all(row["applicable"] == "false" for row in managed_only_plain))
+                    self.assertTrue(all(row["outcome"] == "NOT_APPLICABLE" for row in managed_only_plain))
+
+    def test_same_input_failed_attempt_is_terminal_without_duplicate_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            counter = root / "counter.txt"
+            evidence = {kind: str(root / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+            increment = (
+                "from pathlib import Path; "
+                f"counter = Path({str(counter)!r}); "
+                "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')"
+            )
+            manifest = {
+                "native_runner_identity": {"platform": "Windows"},
+                "attempts": [{
+                    "name": "CHECK-LIVE-1",
+                    "target": "counter regression",
+                    "provider": "codex",
+                    "profile": "managed",
+                    "platform": "Windows",
+                    "command": [sys.executable, "-c", increment],
+                    "cleanup_command": [sys.executable, "-c", "pass"],
+                    "evidence": evidence,
+                    "evidence_oracles": {kind: ["required token"] for kind in evidence},
+                    "agent_expectations": [{"classification": "Observed"}],
+                }],
+            }
+            checkpoint = root / "checkpoint.json"
+            with patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}):
+                first = execute(manifest, checkpoint)
+                resumed = execute(manifest, checkpoint)
+
+            self.assertEqual("1", counter.read_text(encoding="utf-8"))
+            self.assertEqual("FAIL", first["outcome"])
+            self.assertEqual("FAIL", resumed["outcome"])
+            self.assertEqual(["CHECK-LIVE-1"], [row["name"] for row in resumed["checks"]])
+            self.assertEqual("FAIL", resumed["checks"][0]["outcome"])

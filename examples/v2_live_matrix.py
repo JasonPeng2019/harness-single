@@ -85,7 +85,7 @@ def _reserved() -> dict[str, Any]:
     rows = []
     for cell in expected_cells():
         gap = NATIVE_GAPS.get(cell["platform"])
-        outcome = "NOT_RUN_LIVE" if cell["applicable"] == "true" and not gap else (gap or "NOT_APPLICABLE")
+        outcome = "NOT_APPLICABLE" if cell["applicable"] != "true" else (gap or "NOT_RUN_LIVE")
         rows.append({**cell, "outcome": outcome})
     return {"schema": "harness-v2-live-matrix-result/v2", "outcome": "RESERVED_FOR_M09", "authorization": "not requested", "checks": [{"name": name, "scenario": scenario, "outcome": "NOT_RUN_LIVE"} for name, scenario in CHECKS.items()], "cells": rows}
 
@@ -186,7 +186,11 @@ def execute(manifest: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
         raise PermissionError(f"--execute requires {AUTHORIZATION_ENV}=M09 from the authorized M09 executor")
     inputs = _digest(manifest)
     rows = _prior_rows(checkpoint_path, inputs)
-    complete = {row.get("name") for row in rows if row.get("outcome") in {"PASS", "GAP-NATIVE-MACOS", "GAP-NATIVE-LINUX"}}
+    # A same-input checkpoint is a durable attempt ledger, not a retry queue.
+    # In particular, retaining a FAIL preserves truthful final accounting while
+    # preventing a resumed invocation from repeating side effects or duplicating
+    # its check name.
+    complete = {row.get("name") for row in rows if row.get("name") in CHECKS}
     for attempt in manifest["attempts"]:
         if attempt["name"] in complete:
             continue
