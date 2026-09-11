@@ -356,6 +356,7 @@ def run_bootstrap(
         if managed:
             receipt["provider_payload"] = f"adapter-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
+        atomic_write_json(agent_workspace / "task-card.json", task_card)
 
         _write_worker_prompt(worktree_path, task_card, managed=managed)
         _write_result_template(worktree_path, lane_id, run_id)

@@ -603,6 +603,29 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertFalse((worktree / ".codex").exists())
         self.assertFalse((worktree / ".custom").exists())
 
+    def test_managed_bootstrap_preserves_validated_task_card_copy(self) -> None:
+        self._assert_bootstrap_preserves_validated_task_card_copy(managed=True)
+
+    def test_plain_bootstrap_preserves_validated_task_card_copy(self) -> None:
+        self._assert_bootstrap_preserves_validated_task_card_copy(managed=False)
+
+    def _assert_bootstrap_preserves_validated_task_card_copy(
+        self, *, managed: bool
+    ) -> None:
+        profile = "managed" if managed else "plain"
+        lane_id = f"{profile}-task-card-lane"
+        result, worktree = self._bootstrap(
+            lane_id, managed=managed, provider="codex"
+        )
+        self.assertTrue(result["ok"], result)
+        copied_path = worktree / ".agent-workspace" / "task-card.json"
+        self.assertTrue(copied_path.is_file(), copied_path)
+        source_path = self.fixture.root / f"{lane_id}.json"
+        self.assertEqual(
+            json.loads(source_path.read_text(encoding="utf-8")),
+            json.loads(copied_path.read_text(encoding="utf-8")),
+        )
+
     def _bootstrap(
         self, lane_id: str, *, managed: bool, provider: str
     ) -> tuple[dict[str, object], Path]:
