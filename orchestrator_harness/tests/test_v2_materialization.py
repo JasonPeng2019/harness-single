@@ -429,6 +429,52 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(setup.SETUP_ADAPTER_COLLISION, second["code"])
         self.assertEqual("tampered\n", changed.read_text(encoding="utf-8"))
 
+    def test_setup_second_run_unreadable_installed_payload_returns_collision(
+        self,
+    ) -> None:
+        child = MagicMock(pid=1701)
+        original_read_bytes = Path.read_bytes
+        target = self.fixture.root_workspace / ".codex" / "root.txt"
+
+        def read_bytes_guard(path: Path) -> bytes:
+            if str(path) == str(target):
+                raise PermissionError("simulated unreadable installed payload")
+            return original_read_bytes(path)
+
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ) as spawn_detached,
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+        ):
+            first = setup.run_setup()
+        self.assertTrue(first["ok"], first)
+        before = target.read_bytes()
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(Path, "read_bytes", read_bytes_guard),
+        ):
+            second = setup.run_setup()
+        self.assertFalse(second["ok"])
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, second["code"])
+        self.assertEqual(before, target.read_bytes())
+        self.assertNotIn("overwritten_paths", second)
+        spawn_detached.assert_called_once()
+
     def test_setup_second_run_rejects_binding_materialized_elsewhere(self) -> None:
         child = MagicMock(pid=1701)
         with (

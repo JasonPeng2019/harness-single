@@ -264,8 +264,12 @@ def _is_valid_installed_payload(
     """Return whether an existing destination is the valid installed form of
     a planned payload: byte-identical to the shipped source, or a ROOT hook
     binding correctly materialized for the exact current harness/runtime."""
-    if target.is_file() and target.read_bytes() == source_file.read_bytes():
-        return True
+    if target.is_file():
+        try:
+            if target.read_bytes() == source_file.read_bytes():
+                return True
+        except OSError:
+            return False
     if harness_root is None or runtime_root is None or binding_templates is None:
         return False
     template = binding_templates.get(target)
