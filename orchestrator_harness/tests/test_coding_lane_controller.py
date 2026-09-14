@@ -13,7 +13,7 @@ from orchestrator_harness.tests.support import TemporaryGitRepository
 
 
 FAKE_CODEX = r'''
-import json, os, sys
+import json, os, sys, subprocess
 argv = sys.argv[1:]
 capture = os.environ.get("CODING_CONTROLLER_CAPTURE")
 if capture:
@@ -22,6 +22,13 @@ sys.stdin.read()
 if os.environ.get("CODING_CONTROLLER_NO_THREAD") != "1":
     print(json.dumps({"type": "thread.started", "thread_id": os.environ.get("CODING_CONTROLLER_THREAD", "coding-thread")}), flush=True)
 print(json.dumps({"type": "turn.completed"}), flush=True)
+if os.environ.get("CODING_CONTROLLER_NO_RESULT") != "1":
+    git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+    result = {"schema": "orchestrator-lane-result/v1", "lane_id": "coding:worker-1",
+              "worker_invocation_id": "worker-1", "branch": git("branch", "--show-current"),
+              "commit": git("rev-parse", "HEAD"), "outcome": "PASS", "summary": "fixture", "checks": []}
+    with open(".agent-workspace/RESULT.json", "w", encoding="utf-8") as stream:
+        json.dump(result, stream)
 raise SystemExit(int(os.environ.get("CODING_CONTROLLER_EXIT", "0")))
 '''
 
@@ -36,14 +43,17 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.workspace.mkdir(parents=True)
         self.runtime_root = self.root / "runtime"
         self.runtime_root.mkdir()
-        self.prompt = self.run_root / "prompt.md"
+        (self.run_root / ".gitignore").write_text(".agent-workspace/\n", encoding="utf-8")
+        self.repository.git("add", ".gitignore")
+        self.repository.git("commit", "-m", "ignore runtime")
+        self.prompt = self.workspace / "prompt.md"
         self.prompt.write_text("Implement the focused change.\n", encoding="utf-8")
         self.fake = self.root / "fake_codex.py"
         self.fake.write_text(FAKE_CODEX, encoding="utf-8")
         self.capture = self.root / "argv.json"
 
     def tearDown(self) -> None:
-        for key in ("CODING_CONTROLLER_CAPTURE", "CODING_CONTROLLER_NO_THREAD", "CODING_CONTROLLER_THREAD", "CODING_CONTROLLER_EXIT"):
+        for key in ("CODING_CONTROLLER_CAPTURE", "CODING_CONTROLLER_NO_THREAD", "CODING_CONTROLLER_THREAD", "CODING_CONTROLLER_EXIT", "CODING_CONTROLLER_NO_RESULT"):
             os.environ.pop(key, None)
         self.temporary.cleanup()
 
@@ -97,6 +107,33 @@ class CodingLaneControllerTests(unittest.TestCase):
         self.assertEqual({}, parsed.server_snapshot)
         self.assertIsNone(parsed.policy_path)
         self.assertIsNone(parsed.policy_sha256)
+
+    def test_missing_result_is_unsuccessful_even_when_provider_exits_zero(self) -> None:
+        os.environ["CODING_CONTROLLER_NO_RESULT"] = "1"
+        path, _ = self.invocation()
+        self.assertEqual(1, controller.main([str(path)]))
+        status = json.loads((self.workspace / "controller.status.json").read_text())
+        self.assertEqual(0, status["exit_code"])
+        self.assertEqual("MISSING", status["result_validation"]["state"])
+        self.assertFalse(status["result_valid"])
+        self.assertEqual("coding-thread", status["thread_id"])
+
+    def test_missing_result_correction_resumes_same_thread(self) -> None:
+        from orchestrator_harness.result_emit import emit
+
+        os.environ["CODING_CONTROLLER_NO_RESULT"] = "1"
+        path, _ = self.invocation()
+        self.assertEqual(1, controller.main([str(path)]))
+        facts = self.workspace / "facts.json"
+        facts.write_text(json.dumps({"outcome": "BLOCKED", "summary": "Need a decision.",
+                                     "checks": [{"name": "unavailable", "outcome": "NOT_RUN"}]}))
+        emit(path, facts)
+        resume, _ = self.invocation(action="resume")
+        self.assertEqual(0, controller.main([str(resume)]))
+        status = json.loads((self.workspace / "controller.status.json").read_text())
+        self.assertEqual("VALID", status["result_validation"]["state"])
+        self.assertEqual("coding-thread", status["thread_id"])
+        self.assertEqual("BLOCKED", json.loads((self.workspace / "RESULT.json").read_text())["outcome"])
 
     def test_unknown_schema_and_prompt_integrity_or_confinement_are_rejected(self) -> None:
         path, raw = self.invocation()

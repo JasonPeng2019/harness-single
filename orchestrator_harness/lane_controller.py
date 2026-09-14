@@ -510,7 +510,7 @@ def _coding_result_validation(invocation: Invocation) -> tuple[dict[str, Any], b
     assert invocation.repository is not None and invocation.worker_invocation_id is not None
     path = invocation.workspace / "RESULT.json"
     if not path.exists():
-        return {"state": "MISSING", "path": str(path)}, True
+        return {"state": "MISSING", "path": str(path)}, False
     sha256 = None
     try:
         data = path.read_bytes()

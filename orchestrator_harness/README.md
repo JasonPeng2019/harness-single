@@ -259,6 +259,12 @@ revalidated immediately before launch.
 A coding lane completes only with `.agent-workspace/RESULT.json` using
 `orchestrator-lane-result/v1` and these fields:
 
+Prefer `python -m orchestrator_harness.result_emit --context <invocation.json> --facts <facts.json>`
+to construct and validate this envelope; [Quick Start section 5](../QUICK_START.md#5-finish-each-lane)
+documents the worker facts, external context and error recovery. Missing or invalid coding results
+make the controller return nonzero even when the provider exits 0. The provider's actual exit code
+and resumable thread remain recorded in controller status.
+
 ```json
 {
   "schema": "orchestrator-lane-result/v1",
