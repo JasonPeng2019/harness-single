@@ -49,6 +49,8 @@ RETIRE_CLEANUP_UNPROVEN = "RETIRE_CLEANUP_UNPROVEN"
 RETIRE_LEASE_RELEASE_FAILED = "RETIRE_LEASE_RELEASE_FAILED"
 
 HANDSHAKE_TIMEOUT_SECONDS = 30.0
+RETIRE_CONTROLLER_EXIT_WAIT_SECONDS = 5.0
+RETIRE_CONTROLLER_EXIT_POLL_SECONDS = 0.1
 
 
 class LaunchError(RuntimeError):
@@ -74,6 +76,51 @@ def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
         return status
     except (OSError, ValueError):
         return None
+
+
+def _clear_exited_controller_identity(
+    rt: Path,
+    epoch_id: str,
+    lane_id: str,
+    identity: dict[str, Any],
+) -> None:
+    """Clear the launch-owned controller identity after its handle exits.
+
+    The controller writes terminal status before returning, so the detached
+    launch handle is the authority that proves the controller has actually
+    exited.  The mutation is conditional on the same PID-plus-creation pair
+    still being recorded, preserving a newer owner if one was installed.
+    """
+    pid = identity.get("pid")
+    creation_time = identity.get("creation_time")
+
+    def clear(current: dict[str, Any]) -> dict[str, Any]:
+        process = current.get("process") or {}
+        if (
+            process.get("pid") == pid
+            and process.get("creation_time") == creation_time
+        ):
+            return {**current, "process": {}}
+        return current
+
+    update_lane(rt, epoch_id, lane_id, clear)
+
+
+def _wait_for_controller_exit(
+    lane: dict[str, Any], timeout_seconds: float
+) -> bool:
+    """Wait for the recorded controller incarnation to disappear exactly."""
+    process = lane.get("process") or {}
+    pid = process.get("pid")
+    creation = process.get("creation_time")
+    if not (isinstance(pid, int) and processes.identity_matches(pid, creation)):
+        return True
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not processes.identity_matches(pid, creation):
+            return True
+        time.sleep(RETIRE_CONTROLLER_EXIT_POLL_SECONDS)
+    return not processes.identity_matches(pid, creation)
 
 
 def run_launch(lane_id: str) -> dict[str, Any]:
@@ -196,6 +243,19 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     summary = "the provider process could not be started"
         status = _read_controller_status(lane)
         evidence = [str(Path(lane["controller_status_path"]))] if status else []
+        if (
+            code == LAUNCH_PROVIDER_START_FAILED
+            and status is not None
+            and status.get("controller_state") == "exited"
+            and status.get("cleanup_proven") is True
+            and child.poll() is not None
+        ):
+            _clear_exited_controller_identity(
+                rt,
+                epoch_id,
+                lane_id,
+                controller_identity,
+            )
         raise LaunchError(code, summary, evidence_paths=evidence)
     except LaunchError as exc:
         return {
@@ -355,6 +415,14 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         controller_gone = not processes.identity_matches(
             process.get("pid"), process.get("creation_time")
         )
+        if (
+            not controller_gone
+            and (status or {}).get("controller_state") == "exited"
+            and (status or {}).get("cleanup_proven") is True
+        ):
+            controller_gone = _wait_for_controller_exit(
+                lane, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
+            )
         cleanup_proven = bool((status or {}).get("cleanup_proven", False))
         boundary = (status or {}).get("process_boundary")
         boundary_gone = (

@@ -36,7 +36,7 @@ from .config import (
 )
 from .core import iso_utc
 from .epochs import MANAGER_QUEUE_SCHEMA, manager_queue_path, read_current_epoch
-from .records import RecordLock, atomic_write_json, read_record
+from .records import RecordLock, _replace_with_retry, atomic_write_json, read_record
 
 RUNTIME_STATE_SCHEMA = "runtime-state/v1"
 MONITOR_SCHEMA = "monitor/v1"
@@ -177,12 +177,12 @@ def _replace_tree(staging: Path, destination: Path) -> None:
     if backup.exists():
         shutil.rmtree(backup, ignore_errors=True)
     if destination.exists():
-        os.replace(destination, backup)
+        _replace_with_retry(destination, backup)
     try:
-        os.replace(staging, destination)
+        _replace_with_retry(staging, destination)
     except BaseException:
         if backup.exists() and not destination.exists():
-            os.replace(backup, destination)
+            _replace_with_retry(backup, destination)
         raise
     if backup.exists():
         shutil.rmtree(backup, ignore_errors=True)
