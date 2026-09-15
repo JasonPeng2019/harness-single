@@ -111,8 +111,15 @@ def _wait_for_controller_exit(
 ) -> bool:
     """Wait for the recorded controller incarnation to disappear exactly."""
     process = lane.get("process") or {}
-    pid = process.get("pid")
-    creation = process.get("creation_time")
+    return _wait_for_pid_exit(
+        process.get("pid"), process.get("creation_time"), timeout_seconds
+    )
+
+
+def _wait_for_pid_exit(
+    pid: int, creation: str | None, timeout_seconds: float
+) -> bool:
+    """Wait until the exact PID-plus-creation incarnation is unobservable."""
     if not (isinstance(pid, int) and processes.identity_matches(pid, creation)):
         return True
     deadline = time.monotonic() + timeout_seconds
@@ -120,6 +127,37 @@ def _wait_for_controller_exit(
         if not processes.identity_matches(pid, creation):
             return True
         time.sleep(RETIRE_CONTROLLER_EXIT_POLL_SECONDS)
+    return not processes.identity_matches(pid, creation)
+
+
+def _reap_controller_and_prove_exit(
+    child: subprocess.Popen[Any],
+    identity: dict[str, Any],
+) -> bool:
+    """Reap the launch-owned controller handle and prove the exact exit.
+
+    The controller already declared terminal cleanup in its own status, so a
+    launch-owned controller that is still observable after that proof is only
+    the residual process of this launch.  Give the exact incarnation a bounded
+    grace period for a natural exit, terminate only that exact incarnation when
+    it lingers, reap the Popen handle, and return True only when the exact
+    identity is no longer observable.  A live or unprovable identity is never
+    reported as exited.
+    """
+    pid = identity.get("pid")
+    creation = identity.get("creation_time")
+    if not isinstance(pid, int):
+        return False
+    if processes.identity_matches(pid, creation):
+        if not _wait_for_pid_exit(
+            pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
+        ):
+            if not processes.terminate_process(pid, creation, force=True):
+                return False
+    try:
+        child.wait(timeout=RETIRE_CONTROLLER_EXIT_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False
     return not processes.identity_matches(pid, creation)
 
 
@@ -248,14 +286,20 @@ def run_launch(lane_id: str) -> dict[str, Any]:
             and status is not None
             and status.get("controller_state") == "exited"
             and status.get("cleanup_proven") is True
-            and child.poll() is not None
         ):
-            _clear_exited_controller_identity(
-                rt,
-                epoch_id,
-                lane_id,
-                controller_identity,
+            # Terminal cleanup is proven; the controller handle is still
+            # launch-owned, so reap it and prove the exact incarnation exited
+            # before clearing the recorded identity.
+            controller_exited = _reap_controller_and_prove_exit(
+                child, controller_identity
             )
+            if controller_exited:
+                _clear_exited_controller_identity(
+                    rt,
+                    epoch_id,
+                    lane_id,
+                    controller_identity,
+                )
         raise LaunchError(code, summary, evidence_paths=evidence)
     except LaunchError as exc:
         return {
