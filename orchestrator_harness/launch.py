@@ -1,4 +1,4 @@
-﻿"""``lane launch``, ``lane force-stop``, and ``lane retire``.
+"""``lane launch``, ``lane force-stop``, and ``lane retire``.
 
 Launch consumes the prepared invocation and starts the lane controller (which
 starts the provider and owns the leases).  Force-stop is the targeted single-
@@ -456,9 +456,20 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         epoch_id, lane = find_active_lane(rt, lane_id)
         status = _read_controller_status(lane)
         process = lane.get("process") or {}
-        controller_gone = not processes.identity_matches(
-            process.get("pid"), process.get("creation_time")
-        )
+        pid = process.get("pid")
+        creation = process.get("creation_time")
+        controller_gone = not processes.identity_matches(pid, creation)
+        deadline = time.monotonic() + RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
+        while (
+            not controller_gone
+            and (status or {}).get("controller_state") != "exited"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(RETIRE_CONTROLLER_EXIT_POLL_SECONDS)
+            status = _read_controller_status(lane)
+            if status is None:
+                break
+            controller_gone = not processes.identity_matches(pid, creation)
         if (
             not controller_gone
             and (status or {}).get("controller_state") == "exited"
