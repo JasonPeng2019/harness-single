@@ -16,6 +16,7 @@ from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NAT
 
 ROOT = Path(__file__).resolve().parents[3]
 MATRIX = ROOT / "examples" / "v2_live_matrix.py"
+ENTRYPOINT = ROOT / ".agent-workspace" / "execute-matrix.py"
 
 
 class LiveMatrixContractTests(unittest.TestCase):
@@ -94,6 +95,34 @@ class LiveMatrixContractTests(unittest.TestCase):
             resumed = execute(changed, checkpoint)
         self.assertEqual(2, len(calls), "only the changed coordinate receives command plus cleanup")
         self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2"], [row["name"] for row in resumed["checks"]])
+
+    def test_parameterized_entrypoint_collects_same_check_across_two_provider_manifests(self) -> None:
+        """Use the real outer entrypoint with controlled commands, never a historical wrapper."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifests, checkpoints = [], []
+            for provider in ("codex", "qwen-code"):
+                evidence = {kind: str(root / provider / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+                manifest = {
+                    "schema": "harness-v2-live-matrix/v2", "native_runner_identity": {"platform": "Windows", "provider": provider},
+                    "coverage_cells": expected_cells(), "attempts": [{
+                        "name": "CHECK-LIVE-1", "coordinate_key": f"Windows/{provider}/managed/CHECK-LIVE-1",
+                        "target": "controlled-fake", "provider": provider, "profile": "managed", "platform": "Windows",
+                        "command": [sys.executable, "-c", "pass"], "cleanup_command": [sys.executable, "-c", "pass"],
+                        "evidence": evidence, "evidence_oracles": {kind: ["required token"] for kind in evidence},
+                        "agent_expectations": [{"classification": "Observed"}], "depends_on": [], "exclusive_resources": [], "budget_seconds": 1,
+                    }],
+                }
+                manifest_path, checkpoint_path = root / f"{provider}.json", root / f"{provider}.checkpoint.json"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                checkpoint_path.write_text(json.dumps({}), encoding="utf-8")
+                manifests.append(manifest_path)
+                checkpoints.append(checkpoint_path)
+            command = [sys.executable, str(ENTRYPOINT), *sum((["--manifest", str(path)] for path in manifests), []), *sum((["--checkpoint", str(path)] for path in checkpoints), [])]
+            completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, env={**os.environ, AUTHORIZATION_ENV: "M09"})
+        self.assertEqual(1, completed.returncode, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual({"Windows/codex/managed/CHECK-LIVE-1", "Windows/qwen-code/managed/CHECK-LIVE-1"}, {row["coordinate_key"] for row in result["checks"]})
     """Controls prove that M08 rehearsal cannot impersonate M09 native proof."""
 
     def test_platform_matrix_has_three_explicit_native_only_claims(self) -> None:

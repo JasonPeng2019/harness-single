@@ -232,7 +232,9 @@ def _coordinates(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[s
         visiting.add(name)
         item = by_name[name]
         direct = {key: value for key, value in item.items() if key != "depends_on"}
-        digests[name] = _digest({"coordinate": direct, "upstream": {dep: digest(dep) for dep in item.get("depends_on", [])}})
+        # The runner identity is consumed by every coordinate, so changing it
+        # invalidates retained rows rather than silently reusing old evidence.
+        digests[name] = _digest({"coordinate": direct, "native_runner_identity": manifest.get("native_runner_identity"), "upstream": {dep: digest(dep) for dep in item.get("depends_on", [])}})
         visiting.remove(name)
         return digests[name]
 
