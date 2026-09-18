@@ -21,6 +21,186 @@ ENTRYPOINT = ROOT / ".agent-workspace" / "execute-matrix.py"
 
 class LiveMatrixContractTests(unittest.TestCase):
 
+    def _entrypoint(self, manifests, checkpoints, *, checks=(), total_budget=3):
+        command = [sys.executable, str(ENTRYPOINT)]
+        for manifest in manifests:
+            command.extend(("--manifest", str(manifest)))
+        for checkpoint in checkpoints:
+            command.extend(("--checkpoint", str(checkpoint)))
+        for check in checks:
+            command.extend(("--check", check))
+        command.extend(("--total-budget-seconds", str(total_budget)))
+        return subprocess.run(
+            command, cwd=ROOT, text=True, capture_output=True,
+            env={**os.environ, AUTHORIZATION_ENV: "M09"},
+        )
+
+    @staticmethod
+    def _outer_manifest(root, provider, attempts, *, total_budget=3):
+        return {
+            "schema": "harness-v2-live-matrix/v2",
+            "candidate": "fake-candidate",
+            "native_runner_identity": {"platform": "Windows", "provider": provider, "profile": "managed", "candidate": "fake-candidate"},
+            "coverage_cells": expected_cells(),
+            "maximum_qualified_coordinate_processes": 2,
+            "total_budget_seconds": total_budget,
+            "attempts": attempts,
+        }
+
+    @staticmethod
+    def _outer_attempt(root, name, provider, command, cleanup, *, depends_on=(), resource=None, budget=2):
+        evidence = {kind: str(root / provider / name / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+        return {
+            "name": name, "coordinate_key": f"Windows/{provider}/managed/{name}",
+            "target": f"fake-{provider}-{name}", "provider": provider, "profile": "managed", "platform": "Windows",
+            "command": command, "cleanup_command": cleanup, "evidence": evidence,
+            "evidence_oracles": {"transcript": [f"{name}-transcript", "provider-session"], "hook": [f"{name}-hook", "manager-notify"], "state": [f"{name}-state", "controller-status"], "cleanup": [f"{name}-cleanup", "process-absent"]},
+            "agent_expectations": [{"classification": "Observed"}], "depends_on": list(depends_on),
+            "exclusive_resources": [resource] if resource else [], "budget_seconds": budget,
+        }
+
+    @staticmethod
+    def _fake_cell_script(path):
+        path.write_text(
+            "import argparse, pathlib, subprocess, sys, time\n"
+            "p=argparse.ArgumentParser(); p.add_argument('--root'); p.add_argument('--name'); p.add_argument('--sleep',type=float,default=0); p.add_argument('--log'); p.add_argument('--spawn-child',action='store_true'); a=p.parse_args()\n"
+            "root=pathlib.Path(a.root); root.mkdir(parents=True,exist_ok=True)\n"
+            "if a.log: pathlib.Path(a.log).open('a',encoding='utf8').write(f'start {a.name} {time.monotonic()}\\n')\n"
+            "if a.spawn_child: (root/'child.pid').write_text(str(subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']).pid))\n"
+            "time.sleep(a.sleep)\n"
+            "for kind, tokens in {'transcript':[f'{a.name}-transcript','provider-session'],'hook':[f'{a.name}-hook','manager-notify'],'state':[f'{a.name}-state','controller-status'],'cleanup':[f'{a.name}-cleanup','process-absent']}.items(): (root/f'{kind}.txt').write_text(' '.join(tokens),encoding='utf8')\n"
+            "if a.log: pathlib.Path(a.log).open('a',encoding='utf8').write(f'end {a.name} {time.monotonic()}\\n')\n",
+            encoding="utf-8",
+        )
+
+    def test_outer_entrypoint_refills_capacity_and_persists_terminal_pool(self) -> None:
+        """Three real fake commands prove completion-driven refill, not executor waves."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cell, log = root / "cell.py", root / "starts.log"
+            self._fake_cell_script(cell)
+            def command(provider, name, delay):
+                return [sys.executable, str(cell), "--root", str(root / provider / name), "--name", name, "--sleep", str(delay), "--log", str(log)]
+            cleanup = [sys.executable, "-c", "pass"]
+            attempts = [
+                self._outer_attempt(root, "CHECK-LIVE-1", "codex", command("codex", "CHECK-LIVE-1", .06), cleanup),
+                self._outer_attempt(root, "CHECK-LIVE-2", "qwen-code", command("qwen-code", "CHECK-LIVE-2", .35), cleanup),
+                self._outer_attempt(root, "CHECK-LIVE-3", "codex", command("codex", "CHECK-LIVE-3", .06), cleanup),
+            ]
+            manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", attempts)), encoding="utf-8")
+            completed = self._entrypoint([manifest], [checkpoint])
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            rows = json.loads(completed.stdout)["checks"]
+            self.assertTrue(all(row["outcome"] == "PASS" for row in rows))
+            persisted = json.loads(checkpoint.read_text(encoding="utf-8"))["results"]
+            self.assertEqual(3, len(persisted))
+            logged = {(line.split()[0], line.split()[1]): float(line.split()[2]) for line in log.read_text(encoding="utf-8").splitlines()}
+            self.assertGreaterEqual(logged[("start", "CHECK-LIVE-3")], logged[("end", "CHECK-LIVE-1")], "same provider home excludes C until A exits")
+            self.assertLess(logged[("start", "CHECK-LIVE-3")], logged[("end", "CHECK-LIVE-2")], "C must start when A frees capacity, before slow B ends")
+
+    def test_outer_entrypoint_runs_check16_after_failed_terminal_evidence(self) -> None:
+        """A failed prerequisite remains retained evidence; it is not a reason to skip CHECK16."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cell, marker = root / "cell.py", root / "check16-ran.txt"
+            self._fake_cell_script(cell)
+            def good(name):
+                return [sys.executable, str(cell), "--root", str(root / "codex" / name), "--name", name]
+            bad = [str(root / "missing-command")]
+            mark = [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"]
+            cleanup = [sys.executable, "-c", "pass"]
+            attempts = [
+                self._outer_attempt(root, "CHECK-LIVE-8", "codex", bad, cleanup),
+                self._outer_attempt(root, "CHECK-LIVE-11", "codex", good("CHECK-LIVE-11"), [str(root / "missing-cleanup")]),
+                self._outer_attempt(root, "CHECK-LIVE-16", "codex", mark, cleanup, depends_on=("CHECK-LIVE-8", "CHECK-LIVE-11")),
+            ]
+            # CHECK16's command independently writes its required evidence before succeeding.
+            attempts[2]["command"] = [sys.executable, "-c", (
+                f"from pathlib import Path; r=Path({str(root / 'codex' / 'CHECK-LIVE-16')!r}); r.mkdir(parents=True,exist_ok=True); "
+                f"Path({str(marker)!r}).write_text('ran'); "
+                "[(r/f'{k}.txt').write_text(v) for k,v in {'transcript':'CHECK-LIVE-16-transcript provider-session','hook':'CHECK-LIVE-16-hook manager-notify','state':'CHECK-LIVE-16-state controller-status','cleanup':'CHECK-LIVE-16-cleanup process-absent'}.items()]"
+            )]
+            manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", attempts)), encoding="utf-8")
+            completed = self._entrypoint([manifest], [checkpoint])
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            rows = {row["name"]: row for row in json.loads(completed.stdout)["checks"]}
+            self.assertTrue(marker.is_file(), "CHECK16 command must run after terminal failed upstream evidence")
+            self.assertEqual("FAIL", rows["CHECK-LIVE-8"]["outcome"])
+            self.assertEqual("FAIL", rows["CHECK-LIVE-11"]["outcome"], "cleanup launch failure is terminal evidence, not an outer abort")
+            self.assertEqual("DEPENDENCY_EVIDENCE_FAILED", rows["CHECK-LIVE-16"]["acceptance_outcome"])
+
+    def test_outer_entrypoint_total_budget_times_out_owned_tree_without_touching_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cell, sentinel = root / "cell.py", root / "sentinel.txt"
+            self._fake_cell_script(cell)
+            sentinel.write_text("untouched", encoding="utf-8")
+            command = [sys.executable, str(cell), "--root", str(root / "codex" / "CHECK-LIVE-1"), "--name", "CHECK-LIVE-1", "--sleep", "2", "--spawn-child"]
+            attempt = self._outer_attempt(root, "CHECK-LIVE-1", "codex", command, [sys.executable, "-c", "pass"], budget=2)
+            manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", [attempt], total_budget=.3)), encoding="utf-8")
+            began = time.monotonic(); completed = self._entrypoint([manifest], [checkpoint], total_budget=.3); elapsed = time.monotonic() - began
+            self.assertEqual(1, completed.returncode, completed.stderr)
+            self.assertLess(elapsed, 1.5, "outer deadline must bound the selected process tree")
+            self.assertEqual("untouched", sentinel.read_text(encoding="utf-8"))
+            child = int((root / "codex" / "CHECK-LIVE-1" / "child.pid").read_text(encoding="utf-8"))
+            child_status = subprocess.run(["powershell", "-NoProfile", "-Command", f"Get-Process -Id {child} -ErrorAction SilentlyContinue"], text=True, capture_output=True)
+            self.assertFalse(child_status.stdout.strip(), "only the owned command tree is stopped; the unrelated sentinel remains untouched")
+            row = json.loads(completed.stdout)["checks"][0]
+            self.assertIn(row["outcome"], {"FAIL", "BUDGET_EXHAUSTED"})
+
+    def test_builder_validator_entrypoint_restart_and_consumed_file_invalidation(self) -> None:
+        """The real producer, validator and outer entrypoint share one durable contract."""
+        builder = ROOT / ".agent-workspace" / "live-matrix" / "driver" / "build_manifests.py"
+        validator = ROOT / ".agent-workspace" / "live-matrix" / "driver" / "validate_manifests.py"
+        candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            root, epoch, retained, matrix_root = Path(temporary), Path(temporary) / "epoch", Path(temporary) / "retained", Path(temporary) / "matrix"
+            (matrix_root / "driver").mkdir(parents=True)
+            run_cell = matrix_root / "driver" / "run-cell.py"
+            run_cell.write_text(
+                "import argparse, time\nfrom pathlib import Path\np=argparse.ArgumentParser(); p.add_argument('--check'); p.add_argument('--evidence-root'); p.add_argument('--target'); p.add_argument('--provider'); p.add_argument('--profile'); p.add_argument('--manifest'); p.add_argument('--attempt-root'); a=p.parse_args(); r=Path(a.evidence_root); r.mkdir(parents=True,exist_ok=True)\nfor k,v in {'transcript':f'{a.check}-transcript provider-session','hook':f'{a.check}-hook manager-notify','state':f'{a.check}-state controller-status','cleanup':f'{a.check}-cleanup process-absent'}.items(): (r/f'{k}.jsonl' if k in {'transcript','hook'} else r/('state.json' if k=='state' else 'cleanup.log')).write_text(v + str(time.time_ns()))\n",
+                encoding="utf-8",
+            )
+            (matrix_root / "driver" / "cleanup-cell.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+            for provider in ("codex", "claude-code", "qwen-code"):
+                for profile in ("managed", "plain"):
+                    target, attempt = f"{provider}-{profile}-accepted", f"{provider}-{profile}-attempt"
+                    target_root = retained / target
+                    evidence = target_root / "evidence"; evidence.mkdir(parents=True)
+                    review, acceptance = target_root / "COMPLETION_REVIEW.json", target_root / "ORCHESTRATOR_ACCEPTANCE.json"
+                    review.write_text(json.dumps({"review_outcome": "PASS"}), encoding="utf-8")
+                    acceptance.write_text(json.dumps({"approval": "ACCEPTED"}), encoding="utf-8")
+                    (evidence / "RESULT.json").write_text(json.dumps({"schema": "result/v1", "outcome": "PASS", "content_hash": "fixture"}), encoding="utf-8")
+                    (target_root / "TARGET-STATE.json").write_text(json.dumps({"schema": "addendum3-live-target-state/v1", "target": target, "attempt_id": attempt, "candidate": candidate, "model": "fixture", "root_runtime_state": {"state": "CLOSED"}, "review": {"code": "COMPLETION_REVIEW_OK", "evidence_paths": [str(review), str(acceptance)]}}), encoding="utf-8")
+                    classifications = [{"check": check, "classification": "Observed", "credit": check == "CHECK-LIVE-7", "outcome": "PASS", "reason": "fixture"} for check in CHECKS]
+                    record = {"schema": "tier4-addendum3-windows-feature-classification/v1", "candidate": candidate, "provider": provider, "profile": profile, "target": target, "attempt_id": attempt, "credited_cell_count": 1, "credited_cells": [f"Windows/{provider}/{profile}/CHECK-LIVE-7"], "classifications": classifications}
+                    epoch.mkdir(parents=True, exist_ok=True)
+                    (epoch / f"WINDOWS-CELL-{provider.upper()}-{profile.upper()}-NORMAL-001.json").write_text(json.dumps(record), encoding="utf-8")
+            build = subprocess.run([sys.executable, str(builder), "--candidate", candidate, "--runtime-root", str(root), "--epoch-root", str(epoch), "--retained-root", str(retained), "--matrix-root", str(matrix_root)], cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(0, build.returncode, build.stderr)
+            valid = subprocess.run([sys.executable, str(validator), "--candidate", candidate, "--runtime-root", str(root), "--epoch-root", str(epoch), "--retained-root", str(retained), "--matrix-root", str(matrix_root)], cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(0, valid.returncode, valid.stderr)
+            manifests = [matrix_root / "manifests" / f"windows-{provider}-managed-normal-001.json" for provider in ("codex", "qwen-code")]
+            checkpoints = [matrix_root / "checkpoints" / f"checkpoint-windows-{provider}-managed-normal-001.json" for provider in ("codex", "qwen-code")]
+            first = self._entrypoint(manifests, checkpoints, checks=("CHECK-LIVE-1",), total_budget=3)
+            self.assertEqual(0, first.returncode, first.stderr + first.stdout)
+            before = [json.loads(path.read_text(encoding="utf-8")) for path in checkpoints]
+            before_digests = [{row["name"]: row["input_digest"] for row in checkpoint["results"]} for checkpoint in before]
+            second = self._entrypoint(manifests, checkpoints, checks=("CHECK-LIVE-1",), total_budget=3)
+            self.assertEqual(0, second.returncode, second.stderr + second.stdout)
+            self.assertEqual(before, [json.loads(path.read_text(encoding="utf-8")) for path in checkpoints], "unchanged restart must reuse every terminal row")
+            run_cell.write_text(run_cell.read_text(encoding="utf-8") + "# changed consumed runner\n", encoding="utf-8")
+            third = self._entrypoint(manifests, checkpoints, checks=("CHECK-LIVE-1",), total_budget=3)
+            self.assertEqual(0, third.returncode, third.stderr + third.stdout)
+            for checkpoint in checkpoints:
+                rows = json.loads(checkpoint.read_text(encoding="utf-8"))["results"]
+                self.assertEqual("PASS", next(row["outcome"] for row in rows if row["name"] == "CHECK-LIVE-7"), "accepted seed remains reusable")
+            after_digests = [{row["name"]: row["input_digest"] for row in json.loads(path.read_text(encoding="utf-8"))["results"]} for path in checkpoints]
+            self.assertTrue(all(after["CHECK-LIVE-1"] != before["CHECK-LIVE-1"] and after["CHECK-LIVE-7"] == before["CHECK-LIVE-7"] for before, after in zip(before_digests, after_digests)))
+
     @staticmethod
     def _coordinate(name, provider, *, depends_on=(), input_hashes=None):
         """A deliberately disposable coordinate; the outer runner never receives a live argv here."""
@@ -37,7 +217,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_coordinate_scheduler_overlaps_only_different_provider_homes(self) -> None:
         """Two providers may overlap; a shared provider home remains exclusive."""
-        manifest = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+        manifest = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
             self._coordinate("CHECK-LIVE-1", "codex"),
             self._coordinate("CHECK-LIVE-2", "qwen-code"),
             self._coordinate("CHECK-LIVE-3", "codex"),
@@ -59,7 +239,7 @@ class LiveMatrixContractTests(unittest.TestCase):
         self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3"], [row["name"] for row in result["checks"]])
 
     def test_dependency_failure_blocks_only_its_dependent_and_keeps_collecting(self) -> None:
-        manifest = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+        manifest = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
             self._coordinate("CHECK-LIVE-1", "codex"),
             self._coordinate("CHECK-LIVE-2", "qwen-code", depends_on=("CHECK-LIVE-1",)),
             self._coordinate("CHECK-LIVE-3", "claude-code"),
@@ -73,11 +253,12 @@ class LiveMatrixContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
             result = execute(manifest, Path(temporary) / "checkpoint.json")
         rows = {row["name"]: row for row in result["checks"]}
-        self.assertEqual("BLOCKED_DEPENDENCY", rows["CHECK-LIVE-2"]["outcome"])
-        self.assertEqual(4, len(calls), "the failed prerequisite and independent coordinate each receive command plus cleanup")
+        self.assertEqual("FAIL", rows["CHECK-LIVE-2"]["outcome"])
+        self.assertEqual("DEPENDENCY_EVIDENCE_FAILED", rows["CHECK-LIVE-2"]["acceptance_outcome"])
+        self.assertEqual(6, len(calls), "terminal failed evidence still permits CHECK16-style dependent collection")
 
     def test_resume_reuses_matching_coordinate_and_invalidates_changed_consumed_input(self) -> None:
-        first = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+        first = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
             self._coordinate("CHECK-LIVE-1", "codex", input_hashes={"fixture": "a"}),
             self._coordinate("CHECK-LIVE-2", "qwen-code", input_hashes={"fixture": "b"}),
         ]}
@@ -104,7 +285,7 @@ class LiveMatrixContractTests(unittest.TestCase):
             for provider in ("codex", "qwen-code"):
                 evidence = {kind: str(root / provider / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
                 manifest = {
-                    "schema": "harness-v2-live-matrix/v2", "native_runner_identity": {"platform": "Windows", "provider": provider},
+                    "schema": "harness-v2-live-matrix/v2", "native_runner_identity": {"platform": "Windows", "provider": provider}, "total_budget_seconds": 3,
                     "coverage_cells": expected_cells(), "attempts": [{
                         "name": "CHECK-LIVE-1", "coordinate_key": f"Windows/{provider}/managed/CHECK-LIVE-1",
                         "target": "controlled-fake", "provider": provider, "profile": "managed", "platform": "Windows",
@@ -118,7 +299,7 @@ class LiveMatrixContractTests(unittest.TestCase):
                 checkpoint_path.write_text(json.dumps({}), encoding="utf-8")
                 manifests.append(manifest_path)
                 checkpoints.append(checkpoint_path)
-            command = [sys.executable, str(ENTRYPOINT), *sum((["--manifest", str(path)] for path in manifests), []), *sum((["--checkpoint", str(path)] for path in checkpoints), [])]
+            command = [sys.executable, str(ENTRYPOINT), *sum((["--manifest", str(path)] for path in manifests), []), *sum((["--checkpoint", str(path)] for path in checkpoints), []), "--total-budget-seconds", "3"]
             completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, env={**os.environ, AUTHORIZATION_ENV: "M09"})
         self.assertEqual(1, completed.returncode, completed.stderr)
         result = json.loads(completed.stdout)
@@ -176,7 +357,7 @@ class LiveMatrixContractTests(unittest.TestCase):
                 "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')"
             )
             manifest = {
-                "native_runner_identity": {"platform": "Windows"},
+                "native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3,
                 "attempts": [{
                     "name": "CHECK-LIVE-1",
                     "target": "counter regression",
