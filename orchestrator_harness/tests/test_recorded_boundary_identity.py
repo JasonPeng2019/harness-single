@@ -13,9 +13,13 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import processes as p
-from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
+from orchestrator_harness.models import ProcessInfo, ProcessSnapshot, iso_utc
 
 CREATED = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+# Snapshot facts in the motivating regressions capture the old child
+# incarnation at 04:00; live probes report the reused incarnation at 04:01.
+SNAPSHOT_CHILD_CREATED = datetime(2026, 9, 18, 4, 0, tzinfo=timezone.utc)
+REUSED_CHILD_CREATED = datetime(2026, 9, 18, 4, 1, tzinfo=timezone.utc)
 
 
 def recorded_boundary() -> dict[str, object]:
@@ -88,7 +92,7 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             ProcessInfo(22002, 90000, "child.exe", "owned child", CREATED),
             ProcessInfo(33003, 22002, "descendant.exe", "legitimate descendant", CREATED),
         )
-        identities = {22002: "old-child", 33003: "new-descendant"}
+        identities = {22002: "old-child", 33003: iso_utc(CREATED)}
         with (
             patch.object(p, "process_identity", side_effect=fake_identity(identities)),
             patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
@@ -96,13 +100,120 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         ):
             boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
             self.assertTrue(boundary.observe())
-            self.assertIn((33003, "new-descendant"), boundary._owned)
+            self.assertIn((33003, iso_utc(CREATED)), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
             self.assertEqual(
-                {(22002, "old-child"), (33003, "new-descendant")}, set(remaining)
+                {(22002, "old-child"), (33003, iso_utc(CREATED))}, set(remaining)
             )
             self.assertFalse(p.process_boundary_is_gone(record))
+
+    def test_snapshot_child_reused_beneath_exact_surviving_parent_fails_closed(
+        self,
+    ) -> None:
+        # ROOT-664: the recorded parent 22002 survives exact, but the
+        # descendant PID 33003 was reused after the snapshot captured its stale
+        # ppid edge. The live 33003 is a different incarnation and must not be
+        # adopted nor terminated.
+        record = recorded_boundary()
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", SNAPSHOT_CHILD_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "unrelated-child.exe",
+                "unrelated descendant",
+                SNAPSHOT_CHILD_CREATED,
+            ),
+        )
+        identities = {
+            22002: "old-child",
+            33003: iso_utc(REUSED_CHILD_CREATED),
+        }
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertFalse(boundary.observe())
+            self.assertNotIn((33003, iso_utc(REUSED_CHILD_CREATED)), boundary._owned)
+            self.assertIn((22002, "old-child"), boundary._owned)
+            self.assertEqual(
+                {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
+            )
+            self.assertEqual([(22002, "old-child")], boundary._remaining())
+            self.assertFalse(p.process_boundary_is_gone(record))
+            self.assertFalse(boundary.cleanup())
+            self.assertFalse(
+                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+            )
+        reused_terminations = [
+            call
+            for call in terminate.call_args_list
+            if call.args[0] == 33003
+            or call.args[1] == iso_utc(REUSED_CHILD_CREATED)
+        ]
+        self.assertEqual([], reused_terminations)
+
+    def test_stale_group_snapshot_reused_child_fails_closed_and_never_terminated(
+        self,
+    ) -> None:
+        # ROOT-664 group/session variant: the recorded group containment fact
+        # comes from the snapshot, but PID 22002 was reused after that snapshot.
+        # The stale group affiliation must not lend ownership to the new
+        # incarnation; no unrelated termination may be authorized.
+        record = recorded_boundary()
+        record["process_group_id"] = 9000
+        processes = snapshot(
+            ProcessInfo(
+                11001,
+                90000,
+                "root.exe",
+                "root",
+                SNAPSHOT_CHILD_CREATED,
+                process_group_id=9000,
+            ),
+            ProcessInfo(
+                22002,
+                11001,
+                "child.exe",
+                "owned child",
+                SNAPSHOT_CHILD_CREATED,
+                process_group_id=9000,
+            ),
+        )
+        identities = {
+            11001: "old-root",
+            22002: iso_utc(REUSED_CHILD_CREATED),
+        }
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertFalse(boundary.observe())
+            self.assertNotIn((22002, iso_utc(REUSED_CHILD_CREATED)), boundary._owned)
+            self.assertEqual(
+                {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
+            )
+            self.assertFalse(p.process_boundary_is_gone(record))
+            self.assertFalse(boundary.cleanup())
+            self.assertFalse(
+                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+            )
+        reused_terminations = [
+            call
+            for call in terminate.call_args_list
+            if call.args[0] == 22002
+            and call.args[1] == iso_utc(REUSED_CHILD_CREATED)
+        ]
+        self.assertEqual([], reused_terminations)
 
     def test_unknown_live_identity_fails_closed_without_termination(self) -> None:
         record = recorded_boundary()
