@@ -1174,7 +1174,8 @@ class ProcessBoundary:
             if self.session_id is None:
                 self.session_id = root.session_id
         selected: list[ProcessInfo] = []
-        known_pids = {pid for pid, _ in self._owned}
+        recorded_identities = set(self._owned)
+        known_pids = {pid for pid, _ in recorded_identities}
         for item in snapshot.processes:
             in_boundary = (
                 self.process_group_id is not None
@@ -1182,7 +1183,13 @@ class ProcessBoundary:
             ) or (
                 self.session_id is not None and item.session_id == self.session_id
             )
-            if item.pid in known_pids or in_boundary:
+            if in_boundary:
+                selected.append(item)
+                continue
+            if item.pid not in known_pids:
+                continue
+            creation = self._snapshot_identity(item)
+            if creation is not None and (item.pid, creation) in recorded_identities:
                 selected.append(item)
         changed = True
         while changed:
