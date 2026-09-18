@@ -959,8 +959,10 @@ def _identity_time(value: str) -> datetime | None:
 
     Mirrors the repository's real identity parsing: ISO-8601 identities
     through ``models.parse_utc``, the native ``windows-filetime:`` form
-    through the watcher poller's conversion, and the native
-    ``darwin-start-time:`` form through the exact arithmetic the
+    through the integer microsecond conversion that matches the CIM snapshot's
+    truncation, the native ``linux-start-ticks:`` form through the same
+    boot-time/clock-ticks arithmetic the ``/proc`` snapshot uses, and the
+    native ``darwin-start-time:`` form through the exact arithmetic the
     ``harness_common.process_identity`` snapshot path uses to build it.  Any
     other, malformed, or unprovable representation returns ``None`` so
     callers fail closed; an unparseable live identity is never a safe
@@ -976,9 +978,27 @@ def _identity_time(value: str) -> datetime | None:
             return None
         if ticks < 0:
             return None
-        return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
-            microseconds=ticks / 10
-        )
+        try:
+            return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
+                microseconds=ticks // 10
+            )
+        except (OverflowError, OSError, ValueError):
+            return None
+    if value.startswith("linux-start-ticks:"):
+        try:
+            start_ticks = int(value.split(":", 1)[1])
+        except ValueError:
+            return None
+        if start_ticks < 0:
+            return None
+        try:
+            boot = _linux_boot_time()
+            ticks = _linux_clock_ticks()
+        except Exception:
+            return None
+        if ticks <= 0:
+            return None
+        return boot + timedelta(seconds=start_ticks / ticks)
     if value.startswith("darwin-start-time:"):
         try:
             seconds_text, microseconds_text = value.split(":", 2)[1:]

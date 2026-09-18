@@ -9,7 +9,7 @@ and termination functions only; no real process is observed or terminated.
 """
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import processes as p
@@ -20,6 +20,26 @@ CREATED = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 # incarnation at 04:00; live probes report the reused incarnation at 04:01.
 SNAPSHOT_CHILD_CREATED = datetime(2026, 9, 18, 4, 0, tzinfo=timezone.utc)
 REUSED_CHILD_CREATED = datetime(2026, 9, 18, 4, 1, tzinfo=timezone.utc)
+# Native identity fixtures mirror the repository's real snapshot
+# construction: Linux /proc start_ticks from boot/clock ticks, Windows CIM
+# FILETIME truncation to whole microseconds (ROOT-681 readback), and Darwin
+# libproc start_tvsec/start_tvusec.
+LINUX_BOOT = datetime(2026, 9, 18, 0, 0, tzinfo=timezone.utc)
+LINUX_CLOCK_TICKS = 100
+LINUX_START_TICKS = 360_000
+LINUX_CHILD_CREATED = LINUX_BOOT + timedelta(
+    seconds=LINUX_START_TICKS / LINUX_CLOCK_TICKS
+)
+WINDOWS_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
+WINDOWS_FILETIME = 134341817652159491
+WINDOWS_NATIVE_CREATED = WINDOWS_FILETIME_EPOCH + timedelta(
+    microseconds=WINDOWS_FILETIME // 10
+)
+DARWIN_SECONDS = 1789708165
+DARWIN_MICROSECONDS = 215949
+DARWIN_NATIVE_CREATED = datetime.fromtimestamp(
+    DARWIN_SECONDS + DARWIN_MICROSECONDS / 1_000_000, tz=timezone.utc
+)
 
 
 def recorded_boundary() -> dict[str, object]:
@@ -317,6 +337,224 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             or call.args[1] in ("new-unrelated", "new-descendant")
         ]
         self.assertEqual([], unrelated_terminations)
+
+    def test_linux_native_start_ticks_binds_unchanged_new_descendant(self) -> None:
+        # Finding S1: _identity_time must convert linux-start-ticks through
+        # the same boot/clock-ticks primitives the /proc snapshot uses, so an
+        # unchanged never-recorded descendant remains legitimate and can be
+        # adopted through the stale snapshot edge.
+        record = recorded_boundary()
+        token = f"linux-start-ticks:{LINUX_START_TICKS}"
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", LINUX_CHILD_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "descendant.exe",
+                "legitimate descendant",
+                LINUX_CHILD_CREATED,
+            ),
+        )
+        identities = {22002: "old-child", 33003: token}
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "_linux_boot_time", return_value=LINUX_BOOT),
+            patch.object(p, "_linux_clock_ticks", return_value=LINUX_CLOCK_TICKS),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            self.assertEqual(p._identity_time(token), LINUX_CHILD_CREATED)
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertTrue(boundary.observe())
+            self.assertIn((33003, token), boundary._owned)
+            remaining = boundary._remaining()
+            self.assertIsNotNone(remaining)
+            self.assertEqual({(22002, "old-child"), (33003, token)}, set(remaining))
+            self.assertFalse(p.process_boundary_is_gone(record))
+            # Adoption itself never terminates anything.
+            self.assertEqual([], terminate.call_args_list)
+
+    def test_linux_native_reused_start_ticks_rejected_and_never_terminated(self) -> None:
+        # A reused Linux incarnation (different start_ticks) discovered
+        # through the stale snapshot edge must fail closed and never be
+        # adopted or terminated.
+        record = recorded_boundary()
+        reused_token = f"linux-start-ticks:{LINUX_START_TICKS + 1}"
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", LINUX_CHILD_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "unrelated-child.exe",
+                "later incarnation",
+                LINUX_CHILD_CREATED,
+            ),
+        )
+        identities = {22002: "old-child", 33003: reused_token}
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "_linux_boot_time", return_value=LINUX_BOOT),
+            patch.object(p, "_linux_clock_ticks", return_value=LINUX_CLOCK_TICKS),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertFalse(boundary.observe())
+            self.assertNotIn((33003, reused_token), boundary._owned)
+            self.assertEqual(
+                {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
+            )
+            self.assertEqual([(22002, "old-child")], boundary._remaining())
+            self.assertFalse(p.process_boundary_is_gone(record))
+            self.assertFalse(boundary.cleanup())
+            self.assertFalse(
+                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+            )
+        reused_terminations = [
+            call
+            for call in terminate.call_args_list
+            if call.args[0] == 33003 or call.args[1] == reused_token
+        ]
+        self.assertEqual([], reused_terminations)
+
+    def test_windows_native_filetime_conversion_matches_snapshot_precision(self) -> None:
+        # Finding S2: the live FILETIME must floor to whole microseconds like
+        # the CIM snapshot's .NET 'o' string truncation. Float division would
+        # round ROOT-681's 134341817652159491 (and remainder >= 5
+        # neighbours) upward to ...215950, breaking the exact equality.
+        self.assertEqual(
+            p._identity_time(f"windows-filetime:{WINDOWS_FILETIME}"),
+            WINDOWS_NATIVE_CREATED,
+        )
+        for nearby in (
+            WINDOWS_FILETIME - 1,
+            WINDOWS_FILETIME,
+            WINDOWS_FILETIME + 4,
+            WINDOWS_FILETIME + 8,
+        ):
+            self.assertEqual(
+                p._identity_time(f"windows-filetime:{nearby}"),
+                WINDOWS_NATIVE_CREATED,
+                f"FILETIME {nearby} must floor to {WINDOWS_NATIVE_CREATED}",
+            )
+        later = WINDOWS_FILETIME + 10
+        self.assertNotEqual(
+            p._identity_time(f"windows-filetime:{later}"), WINDOWS_NATIVE_CREATED
+        )
+        # Malformed and unprovable values fail closed (no safe absence).
+        self.assertIsNone(p._identity_time("windows-filetime:not-a-number"))
+        self.assertIsNone(p._identity_time("windows-filetime:-1"))
+        self.assertIsNone(p._identity_time("windows-filetime:18446744073709551615"))
+
+    def test_windows_native_filetime_binds_unchanged_new_descendant(self) -> None:
+        record = recorded_boundary()
+        token = f"windows-filetime:{WINDOWS_FILETIME}"
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "descendant.exe",
+                "legitimate descendant",
+                WINDOWS_NATIVE_CREATED,
+            ),
+        )
+        identities = {22002: "old-child", 33003: token}
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertTrue(boundary.observe())
+            self.assertIn((33003, token), boundary._owned)
+            remaining = boundary._remaining()
+            self.assertIsNotNone(remaining)
+            self.assertEqual({(22002, "old-child"), (33003, token)}, set(remaining))
+            self.assertFalse(p.process_boundary_is_gone(record))
+            self.assertEqual([], terminate.call_args_list)
+
+    def test_windows_native_filetime_reused_incarnation_rejected_and_never_terminated(
+        self,
+    ) -> None:
+        record = recorded_boundary()
+        later_token = f"windows-filetime:{WINDOWS_FILETIME + 10}"
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "unrelated-child.exe",
+                "later incarnation",
+                WINDOWS_NATIVE_CREATED,
+            ),
+        )
+        identities = {22002: "old-child", 33003: later_token}
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertFalse(boundary.observe())
+            self.assertNotIn((33003, later_token), boundary._owned)
+            self.assertEqual(
+                {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
+            )
+            self.assertEqual([(22002, "old-child")], boundary._remaining())
+            self.assertFalse(boundary.cleanup())
+            self.assertFalse(
+                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+            )
+        reused_terminations = [
+            call
+            for call in terminate.call_args_list
+            if call.args[0] == 33003 or call.args[1] == later_token
+        ]
+        self.assertEqual([], reused_terminations)
+
+    def test_darwin_native_start_time_binds_unchanged_new_descendant(self) -> None:
+        # The Darwin conversion must keep matching its native snapshot math
+        # (libproc start_tvsec + start_tvusec).
+        record = recorded_boundary()
+        token = f"darwin-start-time:{DARWIN_SECONDS}:{DARWIN_MICROSECONDS}"
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", DARWIN_NATIVE_CREATED),
+            ProcessInfo(
+                33003,
+                22002,
+                "descendant.exe",
+                "legitimate descendant",
+                DARWIN_NATIVE_CREATED,
+            ),
+        )
+        identities = {22002: "old-child", 33003: token}
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            self.assertEqual(p._identity_time(token), DARWIN_NATIVE_CREATED)
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertTrue(boundary.observe())
+            self.assertIn((33003, token), boundary._owned)
+            remaining = boundary._remaining()
+            self.assertIsNotNone(remaining)
+            self.assertEqual({(22002, "old-child"), (33003, token)}, set(remaining))
+            self.assertFalse(p.process_boundary_is_gone(record))
+            self.assertEqual([], terminate.call_args_list)
+        self.assertIsNone(p._identity_time("darwin-start-time:abc:def"))
+        self.assertIsNone(p._identity_time("darwin-start-time:5:1000000"))
 
 
 if __name__ == "__main__":
