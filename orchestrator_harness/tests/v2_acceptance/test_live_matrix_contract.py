@@ -64,41 +64,45 @@ class LiveMatrixContractTests(unittest.TestCase):
     def _fake_cell_script(path):
         path.write_text(
             "import argparse, pathlib, subprocess, sys, time\n"
-            "p=argparse.ArgumentParser(); p.add_argument('--root'); p.add_argument('--name'); p.add_argument('--sleep',type=float,default=0); p.add_argument('--log'); p.add_argument('--spawn-child',action='store_true'); a=p.parse_args()\n"
+            "p=argparse.ArgumentParser(); p.add_argument('--root'); p.add_argument('--name'); p.add_argument('--sleep',type=float,default=0); p.add_argument('--log'); p.add_argument('--spawn-child',action='store_true'); p.add_argument('--signal'); p.add_argument('--wait-for'); p.add_argument('--wait-seconds',type=float,default=5); a=p.parse_args()\n"
             "root=pathlib.Path(a.root); root.mkdir(parents=True,exist_ok=True)\n"
             "if a.log: pathlib.Path(a.log).open('a',encoding='utf8').write(f'start {a.name} {time.monotonic()}\\n')\n"
+            "if a.wait_for:\n deadline=time.monotonic()+a.wait_seconds\n while not pathlib.Path(a.wait_for).exists() and time.monotonic()<deadline: time.sleep(.02)\n if not pathlib.Path(a.wait_for).exists(): sys.exit(23)\n"
             "if a.spawn_child: (root/'child.pid').write_text(str(subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']).pid))\n"
             "time.sleep(a.sleep)\n"
+            "if a.signal: pathlib.Path(a.signal).write_text(a.name,encoding='utf8')\n"
             "for kind, tokens in {'transcript':[f'{a.name}-transcript','provider-session'],'hook':[f'{a.name}-hook','manager-notify'],'state':[f'{a.name}-state','controller-status'],'cleanup':[f'{a.name}-cleanup','process-absent']}.items(): (root/f'{kind}.txt').write_text(' '.join(tokens),encoding='utf8')\n"
             "if a.log: pathlib.Path(a.log).open('a',encoding='utf8').write(f'end {a.name} {time.monotonic()}\\n')\n",
             encoding="utf-8",
         )
 
     def test_outer_entrypoint_refills_capacity_and_persists_terminal_pool(self) -> None:
-        """Three real fake commands prove completion-driven refill, not executor waves."""
+        """A causal B/C handshake proves completion-driven refill, not executor waves."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cell, log = root / "cell.py", root / "starts.log"
             self._fake_cell_script(cell)
-            def command(provider, name, delay):
-                return [sys.executable, str(cell), "--root", str(root / provider / name), "--name", name, "--sleep", str(delay), "--log", str(log)]
+            c_started = root / "c-started"
+            def command(provider, name, delay, *extra):
+                return [sys.executable, str(cell), "--root", str(root / provider / name), "--name", name, "--sleep", str(delay), "--log", str(log), *extra]
             cleanup = [sys.executable, "-c", "pass"]
             attempts = [
                 self._outer_attempt(root, "CHECK-LIVE-1", "codex", command("codex", "CHECK-LIVE-1", .06), cleanup),
-                self._outer_attempt(root, "CHECK-LIVE-2", "qwen-code", command("qwen-code", "CHECK-LIVE-2", .35), cleanup),
-                self._outer_attempt(root, "CHECK-LIVE-3", "codex", command("codex", "CHECK-LIVE-3", .06), cleanup),
+                self._outer_attempt(root, "CHECK-LIVE-2", "qwen-code", command("qwen-code", "CHECK-LIVE-2", 0, "--wait-for", str(c_started), "--wait-seconds", "5"), cleanup, budget=6),
+                self._outer_attempt(root, "CHECK-LIVE-3", "codex", command("codex", "CHECK-LIVE-3", 0, "--signal", str(c_started)), cleanup),
             ]
             manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
-            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", attempts)), encoding="utf-8")
-            completed = self._entrypoint([manifest], [checkpoint])
+            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", attempts, total_budget=10)), encoding="utf-8")
+            completed = self._entrypoint([manifest], [checkpoint], total_budget=10)
             self.assertEqual(0, completed.returncode, completed.stderr)
             rows = json.loads(completed.stdout)["checks"]
             self.assertTrue(all(row["outcome"] == "PASS" for row in rows))
             persisted = json.loads(checkpoint.read_text(encoding="utf-8"))["results"]
             self.assertEqual(3, len(persisted))
-            logged = {(line.split()[0], line.split()[1]): float(line.split()[2]) for line in log.read_text(encoding="utf-8").splitlines()}
-            self.assertGreaterEqual(logged[("start", "CHECK-LIVE-3")], logged[("end", "CHECK-LIVE-1")], "same provider home excludes C until A exits")
-            self.assertLess(logged[("start", "CHECK-LIVE-3")], logged[("end", "CHECK-LIVE-2")], "C must start when A frees capacity, before slow B ends")
+            events = [(line.split()[0], line.split()[1]) for line in log.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(c_started.is_file(), "C must signal actual start before B may finish")
+            self.assertLess(events.index(("end", "CHECK-LIVE-1")), events.index(("start", "CHECK-LIVE-3")), "same provider home excludes C until A exits")
+            self.assertLess(events.index(("start", "CHECK-LIVE-3")), events.index(("end", "CHECK-LIVE-2")), "B completion is causally gated on C start")
 
     def test_outer_entrypoint_runs_check16_after_failed_terminal_evidence(self) -> None:
         """A failed prerequisite remains retained evidence; it is not a reason to skip CHECK16."""
