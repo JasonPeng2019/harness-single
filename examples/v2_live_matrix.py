@@ -15,9 +15,17 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(_WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
+
+from orchestrator_harness import processes
 
 AUTHORIZATION_ENV = "HARNESS_V2_M09_AUTHORIZED"
 PROVIDERS = ("codex", "claude-code", "qwen-code")
@@ -152,30 +160,24 @@ def _fingerprint(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
-def _stop_owned_process_tree(process: subprocess.Popen[str], identity: dict[str, Any]) -> str | None:
-    """Stop only the recorded command root and its descendants after timeout.
+def _remaining(deadline: float) -> float:
+    return max(.01, deadline - time.monotonic())
 
-    The exact PID and its launch timestamp travel in the terminal row.  This is
-    intentionally not a name/command-line sweep: unrelated processes are never
-    considered for cleanup.
-    """
-    if process.poll() is not None:
-        return None
+
+def _stop_owned_process_tree(
+    process: Any, boundary: processes.ProcessBoundary, deadline: float,
+) -> str | None:
+    """Stop and prove only the recorded process boundary within its deadline."""
+    if not boundary.root_creation_time:
+        return "CLEANUP_IDENTITY_UNAVAILABLE"
     try:
-        if os.name == "nt":
-            stopped = subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                text=True, capture_output=True, check=False, timeout=10,
-            )
-            if stopped.returncode:
-                return stopped.stderr.strip() or stopped.stdout.strip() or "taskkill failed"
-        else:
-            import signal
-            os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=10)
-        return None
-    except (OSError, subprocess.SubprocessError) as exc:
-        return str(exc)
+        # ProcessBoundary performs an observation/termination proof pair; give
+        # each bounded phase only half of the remaining coordinate allowance.
+        if boundary.cleanup(force=True, timeout_seconds=_remaining(deadline) / 2):
+            return None
+        return "CLEANUP_UNRESOLVED"
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return f"CLEANUP_UNRESOLVED: {exc}"
 
 
 def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, Any]:
@@ -186,28 +188,57 @@ def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, 
     the caller still runs its reviewed cleanup command and collects independent
     coordinates.
     """
-    started_at = _now()
-    options: dict[str, Any] = {"text": True, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-    if os.name == "nt":
-        options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        options["start_new_session"] = True
+    limit = float(timeout_seconds if timeout_seconds is not None else 300.0)
+    if not 0 < limit <= 3600:
+        raise ValueError("command timeout must be finite and positive")
+    deadline = time.monotonic() + limit
+    stdin = open(os.devnull, "r", encoding="utf-8")
+    stdout = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+    stderr = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
     try:
-        process = subprocess.Popen(argv, **options)
+        process = processes.spawn_provider(argv, cwd=Path.cwd(), stdin=stdin, stdout=stdout, stderr=stderr)
     except OSError as exc:
+        stdin.close(); stdout.close(); stderr.close()
         return {"argv": argv, "returncode": -1, "stdout": "", "stderr": str(exc), "terminal": "COMMAND_LAUNCH_ERROR"}
-    identity = {"pid": process.pid, "started_at": started_at}
+    job_handle = process.take_job_handle() if hasattr(process, "take_job_handle") else None
+    identity = processes.process_identity(process.pid)
+    boundary = processes.ProcessBoundary(
+        process.pid,
+        identity["creation_time"] if identity is not None else None,
+        process_group_id=(None if os.name == "nt" else os.getpgid(process.pid)),
+        session_id=(None if os.name == "nt" else os.getsid(process.pid)),
+        windows_job_handle=job_handle,
+    )
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-        return {"argv": argv, "returncode": process.returncode, "stdout": stdout, "stderr": stderr, "owned_process": identity}
-    except subprocess.TimeoutExpired as exc:
-        cleanup_error = _stop_owned_process_tree(process, identity)
-        stdout, stderr = process.communicate()
+        if hasattr(process, "resume"):
+            process.resume()
+        boundary.observe()
+        terminal: str | None = None
+        try:
+            returncode = process.wait(timeout=_remaining(deadline))
+        except subprocess.TimeoutExpired:
+            returncode = 124
+            terminal = "COORDINATE_DEADLINE_EXCEEDED"
+        cleanup_error = _stop_owned_process_tree(process, boundary, deadline)
+        try:
+            process.wait(timeout=_remaining(deadline))
+        except subprocess.TimeoutExpired:
+            cleanup_error = cleanup_error or "CLEANUP_UNRESOLVED"
+        if cleanup_error:
+            returncode = 125
+            terminal = cleanup_error
+        stdout.seek(0); stderr.seek(0)
         return {
-            "argv": argv, "returncode": 124, "stdout": stdout or exc.stdout or "", "stderr": stderr or exc.stderr or "",
-            "terminal": "COORDINATE_DEADLINE_EXCEEDED", "owned_process": identity,
-            "cleanup_error": cleanup_error,
+            "argv": argv, "returncode": returncode, "stdout": stdout.read(), "stderr": stderr.read(),
+            "terminal": terminal, "owned_boundary": boundary.record(), "cleanup_error": cleanup_error,
         }
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        cleanup_error = _stop_owned_process_tree(process, boundary, deadline)
+        stdout.seek(0); stderr.seek(0)
+        return {"argv": argv, "returncode": 125, "stdout": stdout.read(), "stderr": stderr.read() or str(exc),
+                "terminal": cleanup_error or "COMMAND_COLLECTION_ERROR", "owned_boundary": boundary.record(), "cleanup_error": cleanup_error}
+    finally:
+        stdin.close(); stdout.close(); stderr.close()
 
 
 def _evidence_is_fresh(paths: dict[str, Path], before: dict[str, str | None], expected: dict[str, list[str]]) -> tuple[bool, dict[str, str]]:

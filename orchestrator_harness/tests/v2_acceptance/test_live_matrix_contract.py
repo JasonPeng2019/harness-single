@@ -7,10 +7,11 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 from orchestrator_harness.tests.v2_acceptance.contract import PLATFORM_CLAIMS
+from examples import v2_live_matrix as matrix
 from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NATIVE_GAPS, execute, expected_cells
 
 
@@ -150,6 +151,106 @@ class LiveMatrixContractTests(unittest.TestCase):
             self.assertFalse(child_status.stdout.strip(), "only the owned command tree is stopped; the unrelated sentinel remains untouched")
             row = json.loads(completed.stdout)["checks"][0]
             self.assertIn(row["outcome"], {"FAIL", "BUDGET_EXHAUSTED"})
+
+    def test_timeout_records_exact_owned_boundary_and_preserves_live_unrelated_process(self) -> None:
+        """A real child/grandchild tree is bounded without touching a live sentinel process."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tree = root / "tree.py"
+            tree.write_text(
+                "from pathlib import Path\nimport subprocess,sys,time\nr=Path(sys.argv[1]); r.mkdir(parents=True,exist_ok=True)\n"
+                "child=subprocess.Popen([sys.executable,'-c',\"from pathlib import Path; import subprocess,sys,time; r=Path(sys.argv[1]); grand=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); (r/'grand.pid').write_text(str(grand.pid)); time.sleep(30)\",str(r)])\n"
+                "(r/'child.pid').write_text(str(child.pid)); time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                command_root = root / "codex" / "CHECK-LIVE-1"
+                attempt = self._outer_attempt(root, "CHECK-LIVE-1", "codex", [sys.executable, str(tree), str(command_root)], [sys.executable, "-c", "pass"], budget=2)
+                manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+                manifest.write_text(json.dumps(self._outer_manifest(root, "codex", [attempt], total_budget=.4)), encoding="utf-8")
+                completed = self._entrypoint([manifest], [checkpoint], total_budget=.4)
+                self.assertEqual(1, completed.returncode, completed.stderr)
+                row = json.loads(completed.stdout)["checks"][0]
+                self.assertIn("owned_boundary", row["command"])
+                self.assertTrue(row["command"]["owned_boundary"]["processes"], "root/children/grandchildren require recorded creation identities")
+                recorded = {
+                    item["pid"]: item["creation_time"]
+                    for item in row["command"]["owned_boundary"]["processes"]
+                }
+                for pid_path in (command_root / "child.pid", command_root / "grand.pid"):
+                    pid = int(pid_path.read_text(encoding="utf-8"))
+                    self.assertTrue(recorded.get(pid), f"{pid_path.name} must carry its own creation identity")
+                    gone = subprocess.run(["powershell", "-NoProfile", "-Command", f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"], text=True, capture_output=True)
+                    self.assertFalse(gone.stdout.strip(), f"owned {pid_path.name} must be absent")
+                self.assertIsNone(sentinel.poll(), "live unrelated sentinel process must remain alive")
+            finally:
+                sentinel.terminate()
+                sentinel.wait(timeout=5)
+
+    def test_cleanup_failure_is_finite_nonpass_and_does_not_abort_independent_coordinate(self) -> None:
+        """Deterministic boundary-cleanup failure is terminal evidence, not a hung pool."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cell = root / "cell.py"; self._fake_cell_script(cell)
+            def command(name):
+                return [sys.executable, str(cell), "--root", str(root / "qwen-code" / name), "--name", name]
+            bad = self._outer_attempt(root, "CHECK-LIVE-1", "codex", [sys.executable, "-c", "import time; time.sleep(2)"], [sys.executable, "-c", "pass"], budget=1)
+            good = self._outer_attempt(root, "CHECK-LIVE-2", "qwen-code", command("CHECK-LIVE-2"), [sys.executable, "-c", "pass"], budget=1)
+            manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+            manifest.write_text(json.dumps(self._outer_manifest(root, "codex", [bad, good], total_budget=1.2)), encoding="utf-8")
+            began = time.monotonic(); completed = self._entrypoint([manifest], [checkpoint], total_budget=1.2); elapsed = time.monotonic() - began
+            self.assertLess(elapsed, 2.5)
+            rows = {row["name"]: row for row in json.loads(completed.stdout)["checks"]}
+            self.assertEqual("FAIL", rows["CHECK-LIVE-1"]["outcome"])
+            self.assertEqual("PASS", rows["CHECK-LIVE-2"]["outcome"])
+        child = Mock(pid=9137)
+        child.wait.side_effect = subprocess.TimeoutExpired(["fake"], .01)
+        boundary = Mock(root_creation_time="created-9137")
+        boundary.observe.return_value = True
+        boundary.cleanup.return_value = False
+        boundary.record.return_value = {"root": {"pid": 9137, "creation_time": "created-9137"}, "processes": [{"pid": 9137, "creation_time": "created-9137"}]}
+        with (
+            patch.object(matrix.processes, "spawn_provider", return_value=child),
+            patch.object(matrix.processes, "process_identity", return_value={"pid": 9137, "creation_time": "created-9137"}),
+            patch.object(matrix.processes, "ProcessBoundary", return_value=boundary),
+        ):
+            began = time.monotonic(); failed = matrix._run(["fake"], timeout_seconds=.03); elapsed = time.monotonic() - began
+        self.assertLess(elapsed, .5, "deterministic cleanup refusal cannot make pipe/wait collection unbounded")
+        self.assertEqual(125, failed["returncode"])
+        self.assertEqual("CLEANUP_UNRESOLVED", failed["terminal"])
+
+    def test_outer_checkpoint_schema_gate_and_stale_unselected_quarantine(self) -> None:
+        """Only validated checkpoint rows can reuse; stale unselected evidence is retained, never credited."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root, marker = Path(temporary), Path(temporary) / "calls.txt"
+            cell = root / "cell.py"; self._fake_cell_script(cell)
+            def command(name):
+                return [sys.executable, "-c", (
+                    f"from pathlib import Path; m=Path({str(marker)!r}); m.write_text(str(int(m.read_text())+1) if m.exists() else '1'); "
+                    f"r=Path({str(root / 'codex' / name)!r}); r.mkdir(parents=True,exist_ok=True); "
+                    f"[(r/f'{{k}}.txt').write_text(v) for k,v in {{'transcript':'{name}-transcript provider-session','hook':'{name}-hook manager-notify','state':'{name}-state controller-status','cleanup':'{name}-cleanup process-absent'}}.items()]"
+                )]
+            cleanup = [sys.executable, "-c", "pass"]
+            first = self._outer_attempt(root, "CHECK-LIVE-1", "codex", command("CHECK-LIVE-1"), cleanup)
+            unselected = self._outer_attempt(root, "CHECK-LIVE-2", "codex", command("CHECK-LIVE-2"), cleanup)
+            manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
+            document = self._outer_manifest(root, "codex", [first, unselected]); manifest.write_text(json.dumps(document), encoding="utf-8")
+            digests = matrix._coordinates(document)[1]
+            runner = document["native_runner_identity"]
+            wrong_schema = {"schema": "wrong/v1", "results": [{"name": "CHECK-LIVE-1", "coordinate_key": "Windows/codex/managed/CHECK-LIVE-1", "outcome": "PASS", "input_digest": digests["CHECK-LIVE-1"], "candidate": "fake-candidate", "native_runner_identity": runner}]}
+            checkpoint.write_text(json.dumps(wrong_schema), encoding="utf-8")
+            first_run = self._entrypoint([manifest], [checkpoint], checks=("CHECK-LIVE-1",))
+            self.assertEqual(0, first_run.returncode, first_run.stderr)
+            self.assertEqual("1", marker.read_text(encoding="utf-8"), "wrong-schema row must not be reused")
+            stale = {"name": "CHECK-LIVE-2", "coordinate_key": "Windows/codex/managed/CHECK-LIVE-2", "outcome": "PASS", "input_digest": "obsolete", "candidate": "fake-candidate", "native_runner_identity": runner}
+            current = json.loads(checkpoint.read_text(encoding="utf-8")); current["results"].append(stale); checkpoint.write_text(json.dumps(current), encoding="utf-8")
+            resumed = self._entrypoint([manifest], [checkpoint], checks=("CHECK-LIVE-1",))
+            self.assertEqual(0, resumed.returncode, resumed.stderr)
+            self.assertEqual("1", marker.read_text(encoding="utf-8"), "unchanged validated selected row remains reusable")
+            rows = {row["name"]: row for row in json.loads(checkpoint.read_text(encoding="utf-8"))["results"]}
+            self.assertEqual("STALE_INPUT", rows["CHECK-LIVE-2"]["reuse_state"])
+            self.assertFalse(rows["CHECK-LIVE-2"]["reusable"])
 
     def test_builder_validator_entrypoint_restart_and_consumed_file_invalidation(self) -> None:
         """The real producer, validator and outer entrypoint share one durable contract."""
