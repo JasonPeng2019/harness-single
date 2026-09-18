@@ -9,6 +9,7 @@ never satisfy a live row.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -151,9 +152,23 @@ def _fingerprint(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
-def _run(argv: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(argv, text=True, capture_output=True, check=False)
-    return {"argv": argv, "returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
+def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, Any]:
+    """Run one reviewed coordinate command with its finite coordinate budget.
+
+    This is deliberately only a command boundary: it neither discovers work nor
+    retries a coordinate.  A timeout is terminal evidence for that coordinate;
+    the caller still runs its reviewed cleanup command and collects independent
+    coordinates.
+    """
+    try:
+        completed = subprocess.run(argv, text=True, capture_output=True, check=False, timeout=timeout_seconds)
+        return {"argv": argv, "returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv, "returncode": 124,
+            "stdout": exc.stdout or "", "stderr": exc.stderr or "",
+            "terminal": "COORDINATE_DEADLINE_EXCEEDED",
+        }
 
 
 def _evidence_is_fresh(paths: dict[str, Path], before: dict[str, str | None], expected: dict[str, list[str]]) -> tuple[bool, dict[str, str]]:
@@ -168,47 +183,146 @@ def _evidence_is_fresh(paths: dict[str, Path], before: dict[str, str | None], ex
 def _checkpoint(path: Path, input_digest: str, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(_canonical({"schema": "harness-v2-live-checkpoint/v2", "input_digest": input_digest, "updated_at": _now(), "results": rows}) + "\n", encoding="utf-8")
+    temporary.write_text(_canonical({"schema": "harness-v2-live-checkpoint/v3", "input_digest": input_digest, "updated_at": _now(), "results": rows}) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def _prior_rows(path: Path, input_digest: str) -> list[dict[str, Any]]:
+def _prior_rows(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     value = json.loads(path.read_text(encoding="utf-8"))
-    if value.get("schema") != "harness-v2-live-checkpoint/v2" or value.get("input_digest") != input_digest:
+    if value.get("schema") != "harness-v2-live-checkpoint/v3":
         return []
     return value["results"] if isinstance(value.get("results"), list) else []
+
+
+def _coordinates(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Validate the reviewed coordinate graph and bind every consumed input.
+
+    Provider homes are resources even if a manifest author omits them.  That
+    makes a shared provider session root exclusive without serialising distinct
+    providers.  Dependency digests include every upstream digest, so a changed
+    producer cannot leave a dependent PASS credited on stale input.
+    """
+    attempts = manifest["attempts"]
+    names = [item.get("name") for item in attempts]
+    if len(names) != len(set(names)) or any(not isinstance(name, str) for name in names):
+        raise ValueError("coordinate names must be unique strings")
+    by_name = {item["name"]: item for item in attempts}
+    for item in attempts:
+        deps = item.get("depends_on", [])
+        resources = item.get("exclusive_resources", [])
+        budget = item.get("budget_seconds", 300)
+        if not isinstance(deps, list) or any(not isinstance(dep, str) or dep not in by_name or dep == item["name"] for dep in deps):
+            raise ValueError(f"{item['name']} has invalid dependencies")
+        if len(deps) != len(set(deps)) or not isinstance(resources, list) or any(not isinstance(resource, str) or not resource for resource in resources):
+            raise ValueError(f"{item['name']} has invalid resource declaration")
+        if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not 0 < budget <= 3600:
+            raise ValueError(f"{item['name']} must have a finite positive coordinate budget")
+        if not isinstance(item.get("input_hashes", {}), dict):
+            raise ValueError(f"{item['name']} input_hashes must be an object")
+    digests: dict[str, str] = {}
+    visiting: set[str] = set()
+
+    def digest(name: str) -> str:
+        if name in digests:
+            return digests[name]
+        if name in visiting:
+            raise ValueError("coordinate dependencies must be acyclic")
+        visiting.add(name)
+        item = by_name[name]
+        direct = {key: value for key, value in item.items() if key != "depends_on"}
+        digests[name] = _digest({"coordinate": direct, "upstream": {dep: digest(dep) for dep in item.get("depends_on", [])}})
+        visiting.remove(name)
+        return digests[name]
+
+    for name in names:
+        digest(name)
+    return attempts, digests
+
+
+def _coordinate_resources(attempt: dict[str, Any]) -> set[str]:
+    return {f"provider-home:{attempt['provider']}", *attempt.get("exclusive_resources", [])}
+
+
+def _run_coordinate(attempt: dict[str, Any], input_digest: str) -> dict[str, Any]:
+    """Collect one terminal coordinate result; no retry and no inferred PASS."""
+    if attempt["platform"] in NATIVE_GAPS:
+        return {"name": attempt["name"], "coordinate_id": attempt.get("coordinate_id", attempt["name"]),
+                "outcome": NATIVE_GAPS[attempt["platform"]], "reason": "native runner unavailable; retained for future execution",
+                "input_digest": input_digest, "attempted_at": _now()}
+    paths = _paths(attempt["evidence"], f"{attempt['name']}.evidence")
+    before = {kind: _fingerprint(path) for kind, path in paths.items()}
+    budget = float(attempt.get("budget_seconds", 300))
+    command = _run(_argv(attempt["command"], f"{attempt['name']}.command"), timeout_seconds=budget)
+    cleanup = _run(_argv(attempt["cleanup_command"], f"{attempt['name']}.cleanup_command"), timeout_seconds=min(budget, 120.0))
+    fresh, evidence = _evidence_is_fresh(paths, before, attempt["evidence_oracles"])
+    classifications = all(isinstance(item, dict) and item.get("classification") in {"Observed", "Not observed", "Deviation"} for item in attempt["agent_expectations"])
+    outcome = "PASS" if command["returncode"] == 0 and cleanup["returncode"] == 0 and fresh and classifications else "FAIL"
+    return {"name": attempt["name"], "coordinate_id": attempt.get("coordinate_id", attempt["name"]),
+            "target": attempt["target"], "provider": attempt["provider"], "profile": attempt["profile"],
+            "platform": attempt["platform"], "outcome": outcome, "command": command, "cleanup": cleanup,
+            "evidence": evidence, "agent_expectations": attempt["agent_expectations"], "input_digest": input_digest,
+            "attempted_at": _now()}
 
 
 def execute(manifest: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
     if os.environ.get(AUTHORIZATION_ENV) != "M09":
         raise PermissionError(f"--execute requires {AUTHORIZATION_ENV}=M09 from the authorized M09 executor")
     inputs = _digest(manifest)
-    rows = _prior_rows(checkpoint_path, inputs)
-    # A same-input checkpoint is a durable attempt ledger, not a retry queue.
-    # In particular, retaining a FAIL preserves truthful final accounting while
-    # preventing a resumed invocation from repeating side effects or duplicating
-    # its check name.
-    complete = {row.get("name") for row in rows if row.get("name") in CHECKS}
-    for attempt in manifest["attempts"]:
-        if attempt["name"] in complete:
+    attempts, digests = _coordinates(manifest)
+    prior = {row.get("name"): row for row in _prior_rows(checkpoint_path)
+             if isinstance(row, dict) and isinstance(row.get("name"), str)}
+    rows = {name: row for name, row in prior.items() if name in digests and row.get("input_digest") == digests[name]}
+    pending = {item["name"] for item in attempts if item["name"] not in rows}
+    by_name = {item["name"]: item for item in attempts}
+    success = {"PASS", "GAP-NATIVE-MACOS", "GAP-NATIVE-LINUX"}
+    maximum = int(manifest.get("maximum_qualified_coordinate_processes", 2))
+    if maximum != 2:
+        raise ValueError("the reviewed matrix permits exactly two qualified coordinate processes")
+    total_budget = float(manifest.get("total_budget_seconds", sum(float(item.get("budget_seconds", 300)) for item in attempts)))
+    if not 0 < total_budget <= 14400:
+        raise ValueError("matrix total budget must be finite and reviewed")
+    began = __import__("time").monotonic()
+    while pending:
+        progressed = False
+        for name in list(pending):
+            dependencies = by_name[name].get("depends_on", [])
+            if any(dep in rows and rows[dep].get("outcome") not in success for dep in dependencies):
+                rows[name] = {"name": name, "coordinate_id": by_name[name].get("coordinate_id", name),
+                              "outcome": "BLOCKED_DEPENDENCY", "dependencies": {dep: rows[dep].get("outcome") for dep in dependencies if dep in rows},
+                              "input_digest": digests[name], "attempted_at": _now()}
+                pending.remove(name)
+                progressed = True
+        ready = [item for item in attempts if item["name"] in pending and all(dep in rows and rows[dep].get("outcome") in success for dep in item.get("depends_on", []))]
+        if not ready:
+            if pending and not progressed:
+                raise ValueError("coordinate graph has unresolved dependencies")
             continue
-        if attempt["platform"] in NATIVE_GAPS:
-            row = {"name": attempt["name"], "outcome": NATIVE_GAPS[attempt["platform"]], "reason": "native runner unavailable; retained for future execution", "attempted_at": _now()}
-        else:
-            paths = _paths(attempt["evidence"], f"{attempt['name']}.evidence")
-            before = {kind: _fingerprint(path) for kind, path in paths.items()}
-            command = _run(_argv(attempt["command"], f"{attempt['name']}.command"))
-            cleanup = _run(_argv(attempt["cleanup_command"], f"{attempt['name']}.cleanup_command"))
-            fresh, evidence = _evidence_is_fresh(paths, before, attempt["evidence_oracles"])
-            classifications = all(isinstance(item, dict) and item.get("classification") in {"Observed", "Not observed", "Deviation"} for item in attempt["agent_expectations"])
-            row = {"name": attempt["name"], "target": attempt["target"], "provider": attempt["provider"], "profile": attempt["profile"], "platform": attempt["platform"], "outcome": "PASS" if command["returncode"] == 0 and cleanup["returncode"] == 0 and fresh and classifications else "FAIL", "command": command, "cleanup": cleanup, "evidence": evidence, "agent_expectations": attempt["agent_expectations"], "attempted_at": _now()}
-        rows.append(row)
-        _checkpoint(checkpoint_path, inputs, rows)
-    missing = sorted(set(CHECKS) - {row.get("name") for row in rows})
-    outcome = "PASS" if not missing and all(row.get("outcome") in {"PASS", "GAP-NATIVE-MACOS", "GAP-NATIVE-LINUX"} for row in rows) else "FAIL"
-    return {"schema": "harness-v2-live-matrix-result/v2", "outcome": outcome, "authorization": "M09", "input_digest": inputs, "native_runner_identity": manifest["native_runner_identity"], "checks": rows, "missing_checks": missing, "checkpoint": str(checkpoint_path)}
+        selected, held = [], set()
+        for item in ready:
+            resources = _coordinate_resources(item)
+            if len(selected) < maximum and not held.intersection(resources):
+                selected.append(item)
+                held.update(resources)
+        if not selected:
+            raise ValueError("no feasible coordinate resource selection")
+        if __import__("time").monotonic() - began > total_budget:
+            for item in selected:
+                rows[item["name"]] = {"name": item["name"], "outcome": "BUDGET_EXHAUSTED", "input_digest": digests[item["name"]], "attempted_at": _now()}
+                pending.remove(item["name"])
+            continue
+        with ThreadPoolExecutor(max_workers=maximum) as pool:
+            futures = {pool.submit(_run_coordinate, item, digests[item["name"]]): item["name"] for item in selected}
+            for future in as_completed(futures):
+                name = futures[future]
+                rows[name] = future.result()
+                pending.remove(name)
+                _checkpoint(checkpoint_path, inputs, [rows[item["name"]] for item in attempts if item["name"] in rows])
+    ordered_rows = [rows[item["name"]] for item in attempts]
+    missing = sorted(set(CHECKS) - {row.get("name") for row in ordered_rows})
+    outcome = "PASS" if not missing and all(row.get("outcome") in success for row in ordered_rows) else "FAIL"
+    return {"schema": "harness-v2-live-matrix-result/v2", "outcome": outcome, "authorization": "M09", "input_digest": inputs, "native_runner_identity": manifest["native_runner_identity"], "checks": ordered_rows, "missing_checks": missing, "checkpoint": str(checkpoint_path)}
 
 
 def main(argv: list[str] | None = None) -> int:

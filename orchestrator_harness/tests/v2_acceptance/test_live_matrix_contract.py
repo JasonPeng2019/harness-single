@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -18,6 +19,81 @@ MATRIX = ROOT / "examples" / "v2_live_matrix.py"
 
 
 class LiveMatrixContractTests(unittest.TestCase):
+
+    @staticmethod
+    def _coordinate(name, provider, *, depends_on=(), input_hashes=None):
+        """A deliberately disposable coordinate; the outer runner never receives a live argv here."""
+        root = Path(tempfile.gettempdir()) / "a3-live-matrix-contract"
+        evidence = {kind: str(root / name / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+        return {
+            "name": name, "coordinate_id": name, "target": name, "provider": provider,
+            "profile": "managed", "platform": "Windows", "command": [sys.executable, "-c", "pass"],
+            "cleanup_command": [sys.executable, "-c", "pass"], "evidence": evidence,
+            "evidence_oracles": {kind: ["required token"] for kind in evidence},
+            "agent_expectations": [{"classification": "Observed"}], "depends_on": list(depends_on),
+            "input_hashes": input_hashes or {"fixture": name}, "budget_seconds": 1,
+        }
+
+    def test_coordinate_scheduler_overlaps_only_different_provider_homes(self) -> None:
+        """Two providers may overlap; a shared provider home remains exclusive."""
+        manifest = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+            self._coordinate("CHECK-LIVE-1", "codex"),
+            self._coordinate("CHECK-LIVE-2", "qwen-code"),
+            self._coordinate("CHECK-LIVE-3", "codex"),
+        ]}
+        calls = []
+
+        def fake_run(argv, *, timeout_seconds=None):
+            calls.append((argv[-1], time.monotonic()))
+            time.sleep(.12)
+            return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+            started = time.monotonic()
+            result = execute(manifest, Path(temporary) / "checkpoint.json")
+            elapsed = time.monotonic() - started
+        self.assertEqual(6, len(calls))
+        self.assertLess(elapsed, .58, "different providers should overlap under the two-coordinate cap")
+        self.assertGreaterEqual(calls[4][1] - calls[0][1], .20, "same-provider coordinates must not overlap")
+        self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3"], [row["name"] for row in result["checks"]])
+
+    def test_dependency_failure_blocks_only_its_dependent_and_keeps_collecting(self) -> None:
+        manifest = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+            self._coordinate("CHECK-LIVE-1", "codex"),
+            self._coordinate("CHECK-LIVE-2", "qwen-code", depends_on=("CHECK-LIVE-1",)),
+            self._coordinate("CHECK-LIVE-3", "claude-code"),
+        ]}
+        calls = []
+
+        def fake_run(argv, *, timeout_seconds=None):
+            calls.append(argv)
+            return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+            result = execute(manifest, Path(temporary) / "checkpoint.json")
+        rows = {row["name"]: row for row in result["checks"]}
+        self.assertEqual("BLOCKED_DEPENDENCY", rows["CHECK-LIVE-2"]["outcome"])
+        self.assertEqual(4, len(calls), "the failed prerequisite and independent coordinate each receive command plus cleanup")
+
+    def test_resume_reuses_matching_coordinate_and_invalidates_changed_consumed_input(self) -> None:
+        first = {"native_runner_identity": {"platform": "Windows"}, "attempts": [
+            self._coordinate("CHECK-LIVE-1", "codex", input_hashes={"fixture": "a"}),
+            self._coordinate("CHECK-LIVE-2", "qwen-code", input_hashes={"fixture": "b"}),
+        ]}
+        changed = {**first, "attempts": [first["attempts"][0], {**first["attempts"][1], "input_hashes": {"fixture": "changed"}}]}
+        calls = []
+
+        def fake_run(argv, *, timeout_seconds=None):
+            calls.append(argv)
+            return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+            checkpoint = Path(temporary) / "checkpoint.json"
+            execute(first, checkpoint)
+            calls.clear()
+            resumed = execute(changed, checkpoint)
+        self.assertEqual(2, len(calls), "only the changed coordinate receives command plus cleanup")
+        self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2"], [row["name"] for row in resumed["checks"]])
     """Controls prove that M08 rehearsal cannot impersonate M09 native proof."""
 
     def test_platform_matrix_has_three_explicit_native_only_claims(self) -> None:
