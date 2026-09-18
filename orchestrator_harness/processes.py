@@ -1174,6 +1174,7 @@ class ProcessBoundary:
             if self.session_id is None:
                 self.session_id = root.session_id
         selected: list[ProcessInfo] = []
+        captured: dict[int, str] = {}
         recorded_identities = set(self._owned)
         known_pids = {pid for pid, _ in recorded_identities}
         for item in snapshot.processes:
@@ -1183,30 +1184,51 @@ class ProcessBoundary:
             ) or (
                 self.session_id is not None and item.session_id == self.session_id
             )
-            if in_boundary:
-                selected.append(item)
-                continue
-            if item.pid not in known_pids:
+            if not in_boundary and item.pid not in known_pids:
                 continue
             creation = self._snapshot_identity(item)
-            if creation is not None and (item.pid, creation) in recorded_identities:
-                selected.append(item)
+            if creation is None:
+                continue
+            if not in_boundary and (item.pid, creation) not in recorded_identities:
+                continue
+            captured[item.pid] = creation
+            selected.append(item)
         changed = True
         while changed:
             changed = False
             selected_pids = {item.pid for item in selected}
-            owned_current_pids = {
-                item.pid
-                for item in selected
-                if self._snapshot_identity(item) is not None
-            }
             for item in snapshot.processes:
-                if item.pid in selected_pids or item.ppid not in owned_current_pids:
+                if item.pid in selected_pids or item.ppid not in captured:
                     continue
+                creation = self._snapshot_identity(item)
+                if creation is None:
+                    continue
+                current_parent = process_identity(item.ppid)
+                parent_now = (
+                    current_parent["creation_time"]
+                    if current_parent is not None
+                    else None
+                )
+                if parent_now != captured[item.ppid]:
+                    if parent_now is not None:
+                        self.errors.append(
+                            f"parent PID {item.ppid} creation identity drifted during observation"
+                        )
+                    elif process_alive(item.ppid):
+                        self.errors.append(
+                            f"parent PID {item.ppid} identity is unavailable during observation"
+                        )
+                    else:
+                        self.errors.append(
+                            f"parent PID {item.ppid} identity became unavailable during observation"
+                        )
+                    self._last_observation_complete = False
+                    return False
+                captured[item.pid] = creation
                 selected.append(item)
                 changed = True
         for item in selected:
-            creation = self._snapshot_identity(item)
+            creation = captured.get(item.pid)
             if creation is not None:
                 self._owned[_identity_key(item.pid, creation)] = item
         self._last_observation_complete = not self.errors

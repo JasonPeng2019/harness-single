@@ -153,6 +153,60 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             )
         self.assertEqual([], terminate.call_args_list)
 
+    def test_identity_drift_between_admission_and_traversal_fails_closed(self) -> None:
+        record = recorded_boundary()
+        processes = snapshot(
+            ProcessInfo(22002, 90000, "child.exe", "owned child", CREATED),
+            ProcessInfo(33003, 22002, "descendant.exe", "descendant", CREATED),
+        )
+        probe_counts: dict[int, int] = {}
+        reads: list[int] = []
+
+        def identity(pid: int) -> dict[str, object] | None:
+            probe_counts[pid] = probe_counts.get(pid, 0) + 1
+            reads.append(pid)
+            if pid == 22002:
+                # Sequential reads: old-child at admission, new-unrelated on any
+                # later probe (the child exits and its PID is reused mid-observe).
+                creation = "old-child" if probe_counts[pid] == 1 else "new-unrelated"
+                return {"pid": pid, "creation_time": creation}
+            if pid == 33003:
+                return {"pid": pid, "creation_time": "new-descendant"}
+            return None
+
+        terminate = MagicMock(return_value=True)
+        with (
+            patch.object(p, "process_identity", side_effect=identity),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in (22002, 33003)),
+            patch.object(p, "process_snapshot", return_value=processes),
+            patch.object(p, "terminate_process", terminate),
+        ):
+            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            self.assertFalse(boundary.observe())
+            self.assertIn((22002, "old-child"), boundary._owned)
+            self.assertNotIn((22002, "new-unrelated"), boundary._owned)
+            self.assertNotIn((33003, "new-descendant"), boundary._owned)
+            self.assertEqual(
+                {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
+            )
+            self.assertTrue(p.process_boundary_is_gone(record))
+            # The same instance keeps the drift error and fails closed on a
+            # later cleanup attempt; a fresh module-level boundary still
+            # completes using only the recorded identities.
+            self.assertFalse(boundary.cleanup())
+            self.assertTrue(
+                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+            )
+        # Admission probe, descendant capture probe, then parent re-verification.
+        self.assertEqual([22002, 33003, 22002], reads[:3])
+        unrelated_terminations = [
+            call
+            for call in terminate.call_args_list
+            if call.args[0] == 33003
+            or call.args[1] in ("new-unrelated", "new-descendant")
+        ]
+        self.assertEqual([], unrelated_terminations)
+
 
 if __name__ == "__main__":
     unittest.main()
