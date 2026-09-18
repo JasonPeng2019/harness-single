@@ -954,6 +954,69 @@ def _identity_key(pid: int, creation_time: str) -> tuple[int, str]:
     return pid, creation_time
 
 
+def _identity_time(value: str) -> datetime | None:
+    """Parse one creation identity to its exact UTC creation instant.
+
+    Mirrors the repository's real identity parsing: ISO-8601 identities
+    through ``models.parse_utc``, the native ``windows-filetime:`` form
+    through the integer microsecond conversion that matches the CIM snapshot's
+    truncation, the native ``linux-start-ticks:`` form through the same
+    boot-time/clock-ticks arithmetic the ``/proc`` snapshot uses, and the
+    native ``darwin-start-time:`` form through the exact arithmetic the
+    ``harness_common.process_identity`` snapshot path uses to build it.  Any
+    other, malformed, or unprovable representation returns ``None`` so
+    callers fail closed; an unparseable live identity is never a safe
+    absence.
+    """
+    parsed = parse_utc(value)
+    if parsed is not None:
+        return parsed
+    if value.startswith("windows-filetime:"):
+        try:
+            ticks = int(value.split(":", 1)[1])
+        except ValueError:
+            return None
+        if ticks < 0:
+            return None
+        try:
+            return datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
+                microseconds=ticks // 10
+            )
+        except (OverflowError, OSError, ValueError):
+            return None
+    if value.startswith("linux-start-ticks:"):
+        try:
+            start_ticks = int(value.split(":", 1)[1])
+        except ValueError:
+            return None
+        if start_ticks < 0:
+            return None
+        try:
+            boot = _linux_boot_time()
+            ticks = _linux_clock_ticks()
+        except Exception:
+            return None
+        if ticks <= 0:
+            return None
+        return boot + timedelta(seconds=start_ticks / ticks)
+    if value.startswith("darwin-start-time:"):
+        try:
+            seconds_text, microseconds_text = value.split(":", 2)[1:]
+            seconds = int(seconds_text)
+            microseconds = int(microseconds_text)
+        except ValueError:
+            return None
+        if seconds < 0 or microseconds < 0 or microseconds >= 1_000_000:
+            return None
+        try:
+            return datetime.fromtimestamp(
+                seconds + microseconds / 1_000_000, tz=timezone.utc
+            )
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 class ProcessBoundary:
     """Controller-owned provider/helper process boundary.
 
@@ -1149,6 +1212,33 @@ class ProcessBoundary:
             return None
         return identity["creation_time"]
 
+    def _snapshot_identity_bound(self, item: ProcessInfo, creation_time: str) -> bool:
+        """Require the live identity to be the snapshot's exact incarnation.
+
+        A snapshot parent, group, or session fact may grant membership only
+        when the live process is the exact process the snapshot described.
+        The comparison is semantic on the creation instant (no tolerance)
+        using the repository's real identity parsing; any unprovable
+        representation fails closed.
+        """
+        snapshot_instant = item.created_utc
+        if snapshot_instant is None:
+            return False
+        if snapshot_instant.tzinfo is None:
+            snapshot_instant = snapshot_instant.replace(tzinfo=timezone.utc)
+        live_instant = _identity_time(creation_time)
+        if live_instant is None:
+            self.errors.append(
+                f"PID {item.pid} snapshot creation identity cannot be proven against the live process"
+            )
+            return False
+        if live_instant != snapshot_instant:
+            self.errors.append(
+                f"PID {item.pid} creation identity changed since the snapshot"
+            )
+            return False
+        return True
+
     def observe(self) -> bool:
         """Observe and retain exact members of the provider boundary."""
 
@@ -1174,7 +1264,9 @@ class ProcessBoundary:
             if self.session_id is None:
                 self.session_id = root.session_id
         selected: list[ProcessInfo] = []
-        known_pids = {pid for pid, _ in self._owned}
+        captured: dict[int, str] = {}
+        recorded_identities = set(self._owned)
+        known_pids = {pid for pid, _ in recorded_identities}
         for item in snapshot.processes:
             in_boundary = (
                 self.process_group_id is not None
@@ -1182,24 +1274,58 @@ class ProcessBoundary:
             ) or (
                 self.session_id is not None and item.session_id == self.session_id
             )
-            if item.pid in known_pids or in_boundary:
-                selected.append(item)
+            if not in_boundary and item.pid not in known_pids:
+                continue
+            creation = self._snapshot_identity(item)
+            if creation is None:
+                continue
+            if (item.pid, creation) not in recorded_identities:
+                if not in_boundary:
+                    continue
+                # Membership would rest on a snapshot containment fact alone;
+                # the snapshot incarnation must be the live incarnation.
+                if not self._snapshot_identity_bound(item, creation):
+                    continue
+            captured[item.pid] = creation
+            selected.append(item)
         changed = True
         while changed:
             changed = False
             selected_pids = {item.pid for item in selected}
-            owned_current_pids = {
-                item.pid
-                for item in selected
-                if self._snapshot_identity(item) is not None
-            }
             for item in snapshot.processes:
-                if item.pid in selected_pids or item.ppid not in owned_current_pids:
+                if item.pid in selected_pids or item.ppid not in captured:
                     continue
+                creation = self._snapshot_identity(item)
+                if creation is None:
+                    continue
+                current_parent = process_identity(item.ppid)
+                parent_now = (
+                    current_parent["creation_time"]
+                    if current_parent is not None
+                    else None
+                )
+                if parent_now != captured[item.ppid]:
+                    if parent_now is not None:
+                        self.errors.append(
+                            f"parent PID {item.ppid} creation identity drifted during observation"
+                        )
+                    elif process_alive(item.ppid):
+                        self.errors.append(
+                            f"parent PID {item.ppid} identity is unavailable during observation"
+                        )
+                    else:
+                        self.errors.append(
+                            f"parent PID {item.ppid} identity became unavailable during observation"
+                        )
+                    self._last_observation_complete = False
+                    return False
+                if not self._snapshot_identity_bound(item, creation):
+                    continue
+                captured[item.pid] = creation
                 selected.append(item)
                 changed = True
         for item in selected:
-            creation = self._snapshot_identity(item)
+            creation = captured.get(item.pid)
             if creation is not None:
                 self._owned[_identity_key(item.pid, creation)] = item
         self._last_observation_complete = not self.errors
