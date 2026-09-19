@@ -421,6 +421,8 @@ def derive_lane_status(
             return None
         if acceptance.get("approval") == "REJECTED":
             return "resume_required"
+    if lane.get("lifecycle") == "prepared":
+        return None
     process = lane.get("process") or {}
     controller_alive = processes.identity_matches(
         process.get("pid"), process.get("creation_time")

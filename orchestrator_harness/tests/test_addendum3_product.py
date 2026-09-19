@@ -19,7 +19,7 @@ from orchestrator_harness.manager_queue import (
     read_lane_inbox,
     read_manager_queue,
 )
-from orchestrator_harness.records import atomic_write_json, read_jsonl
+from orchestrator_harness.records import atomic_write_json, read_jsonl, read_record
 
 
 class Addendum3ProductTests(unittest.TestCase):
@@ -414,6 +414,619 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(3, len(attempts) - 1)  # one schema header plus three attempts
         self.assertEqual(2, len(list((workspace / "attempts").glob("correction-prompt-*.md"))))
 
+    def _run_candidate_correction_boundary(
+        self, *, valid_on_sixth: bool, scenario: str = "bounded"
+    ) -> dict[str, object]:
+        suffix = {
+            "bounded": "valid-sixth" if valid_on_sixth else "exhausted-sixth",
+            "no-session": "no-session",
+            "resume-unavailable": "resume-unavailable",
+            "provider-start-failed": "provider-start-failed",
+        }[scenario]
+        worktree = self.runtime / f"controller-{suffix}-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "worker-prompt.md").write_text("do the work\n", encoding="utf-8")
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worktree_path": str(worktree),
+            "result_path": str(worktree / "RESULT.json"),
+            "controller_status_path": str(workspace / "controller.status.json"),
+            "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "transcript_path": str(workspace / "provider-transcript.jsonl"),
+            "stderr_path": str(workspace / "provider-stderr.txt"),
+            "attempts_path": str(workspace / "controller.attempts.jsonl"),
+            "last_message_path": str(workspace / "last-message.txt"),
+            "provider": {"id": "codex", "model": "model-1"},
+            "process": {},
+            "session": {},
+            "lifecycle": "prepared",
+        }
+        lane_path = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1" / "lane.json"
+        atomic_write_json(lane_path, {"schema": "lane/v1", **lane})
+        atomic_write_json(
+            workspace / "invocation.json",
+            {
+                "schema": "controller-invocation/v1",
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "provider": {"id": "codex", "model": "model-1"},
+                "exclusive_resources": ["resource-1"],
+            },
+        )
+
+        calls: list[dict[str, object]] = []
+        boundaries: list[MagicMock] = []
+        lease_observations: list[dict[str, object]] = []
+        lane_transitions: list[dict[str, object]] = []
+        status_transitions: list[dict[str, object]] = []
+        release_observations: list[dict[str, object]] = []
+
+        real_update_lane = controller.update_lane
+        real_write_status = controller._write_status
+        real_release_leases = controller.release_leases
+
+        def track_update_lane(*args: object, **kwargs: object) -> dict[str, object]:
+            updated = real_update_lane(*args, **kwargs)
+            lane_transitions.append(updated)
+            return updated
+
+        def track_write_status(
+            current_lane: dict[str, object], fields: dict[str, object]
+        ) -> None:
+            status_transitions.append(dict(fields))
+            real_write_status(current_lane, fields)
+
+        def track_release_leases(
+            runtime: Path, lane_id: str, run_id: str
+        ) -> None:
+            held = leases.read_lease(runtime, "resource-1")
+            self.assertIsNotNone(held)
+            for boundary in boundaries:
+                boundary.cleanup.assert_called_once()
+            release_observations.append(
+                {
+                    "lane_id": lane_id,
+                    "run_id": run_id,
+                    "lease": held,
+                    "cleaned_boundaries": len(boundaries),
+                }
+            )
+            real_release_leases(runtime, lane_id, run_id)
+
+        def run_provider(*args: object, **kwargs: object) -> ProviderExecution:
+            attempt_number = int(kwargs["attempt_number"])
+            resume = bool(kwargs["resume"])
+            current_lane = args[2]
+            self.assertIsInstance(current_lane, dict)
+            assert isinstance(current_lane, dict)
+            prompt_path = Path(str(args[5]))
+            if boundaries:
+                boundaries[-1].cleanup.assert_called_once()
+            held = leases.read_lease(self.runtime, "resource-1")
+            self.assertIsNotNone(held, f"lease missing before attempt {attempt_number}")
+            assert held is not None
+            lease_observations.append(held)
+
+            if attempt_number == 1:
+                self.assertFalse(resume)
+                self.assertEqual({}, current_lane.get("session"))
+                self.assertEqual(workspace / "worker-prompt.md", prompt_path)
+            else:
+                self.assertTrue(resume)
+                self.assertEqual(
+                    {"session_id": "native-session-1"}, current_lane.get("session")
+                )
+                self.assertEqual(
+                    workspace
+                    / "attempts"
+                    / f"correction-prompt-{attempt_number - 1}.md",
+                    prompt_path,
+                )
+
+            if scenario == "provider-start-failed":
+                calls.append(
+                    {
+                        "attempt_number": attempt_number,
+                        "resume": resume,
+                        "prompt_path": str(prompt_path),
+                        "argv": (),
+                        "lane_session": current_lane.get("session"),
+                    }
+                )
+                raise controller.ControllerError(
+                    controller.LAUNCH_PROVIDER_START_FAILED,
+                    "provider did not start",
+                    no_provider_started=True,
+                )
+            if scenario == "resume-unavailable" and attempt_number == 2:
+                calls.append(
+                    {
+                        "attempt_number": attempt_number,
+                        "resume": resume,
+                        "prompt_path": str(prompt_path),
+                        "argv": (),
+                        "lane_session": current_lane.get("session"),
+                    }
+                )
+                raise ValueError("custom adapter cannot build a native resume command")
+
+            paths = controller._attempt_paths(lane, attempt_number)
+            paths["transcript"].parent.mkdir(parents=True, exist_ok=True)
+            paths["transcript"].write_text(
+                f'{{"attempt": {attempt_number}, "session_id": "native-session-1"}}\n',
+                encoding="utf-8",
+            )
+            paths["stderr"].write_text("", encoding="utf-8")
+
+            if valid_on_sixth and attempt_number == 6:
+                result = {
+                    "schema": "result/v1",
+                    "lane_id": "lane-1",
+                    "run_id": "run-1",
+                    "outcome": "PASS",
+                    "summary": "valid after the fifth correction",
+                    "evidence": [str(paths["transcript"])],
+                    "completed_at": "2026-09-18T00:00:00Z",
+                }
+                result["content_hash"] = content_hash(result)
+                atomic_write_json(Path(str(lane["result_path"])), result)
+
+            boundary = MagicMock(
+                root_pid=200 + attempt_number,
+                root_creation_time=f"created-{attempt_number}",
+                process_group_id=200 + attempt_number,
+                session_id=f"process-session-{attempt_number}",
+            )
+            boundary.record.return_value = {
+                "root": {
+                    "pid": 200 + attempt_number,
+                    "creation_time": f"created-{attempt_number}",
+                }
+            }
+            boundary.cleanup.return_value = True
+            boundaries.append(boundary)
+            argv = (
+                ("codex", "exec", "resume", "native-session-1")
+                if resume
+                else ("codex", "exec", "--json")
+            )
+            calls.append(
+                {
+                    "attempt_number": attempt_number,
+                    "resume": resume,
+                    "prompt_path": str(prompt_path),
+                    "argv": argv,
+                    "lane_session": current_lane.get("session"),
+                }
+            )
+            session_id = None if scenario == "no-session" else "native-session-1"
+            return ProviderExecution(0, boundary, session_id, argv)
+
+        with (
+            patch.object(controller, "find_harness_root", return_value=Path("root")),
+            patch.object(
+                controller,
+                "load_config",
+                return_value=type("Config", (), {"runtime_root": self.runtime})(),
+            ),
+            patch.object(controller.processes, "process_identity", return_value={"pid": 7, "creation_time": "controller-created"}),
+            patch.object(controller, "_load_binding", return_value=object()),
+            patch.object(controller, "update_lane", side_effect=track_update_lane),
+            patch.object(controller, "_write_status", side_effect=track_write_status),
+            patch.object(controller, "release_leases", side_effect=track_release_leases),
+            patch.object(controller, "_run_provider", side_effect=run_provider),
+            patch.object(
+                controller,
+                "_read_acceptance_chain",
+                return_value={"acceptance": {"approval": "REJECTED"}},
+            ),
+        ):
+            exit_code = controller.run_controller("lane-1")
+
+        correction_prompts = sorted(
+            (workspace / "attempts").glob("correction-prompt-*.md"),
+            key=lambda path: int(path.stem.rsplit("-", 1)[-1]),
+        )
+        return {
+            "exit_code": exit_code,
+            "lane": read_record(lane_path, "lane/v1"),
+            "status": read_record(
+                Path(str(lane["controller_status_path"])),
+                controller.CONTROLLER_STATUS_SCHEMA,
+            ),
+            "events": read_jsonl(Path(str(lane["controller_events_path"]))),
+            "attempts": read_jsonl(Path(str(lane["attempts_path"]))),
+            "calls": calls,
+            "boundaries": boundaries,
+            "lease_observations": lease_observations,
+            "lane_transitions": lane_transitions,
+            "status_transitions": status_transitions,
+            "release_observations": release_observations,
+            "lease_after": leases.read_lease(self.runtime, "resource-1"),
+            "correction_prompts": correction_prompts,
+            "result_path": Path(str(lane["result_path"])),
+        }
+
+    def _assert_five_correction_prompts(self, prompts: object) -> None:
+        self.assertIsInstance(prompts, list)
+        assert isinstance(prompts, list)
+        self.assertEqual(5, len(prompts))
+        required = (
+            '"schema": "result/v1"',
+            '"lane_id": "lane-1"',
+            '"run_id": "run-1"',
+            '"outcome": "PASS|FAIL|BLOCKED"',
+            '"summary": "nonempty factual summary"',
+            '"evidence": []',
+            '"completed_at": "ISO-8601 UTC timestamp"',
+            '"content_hash": "sha256 of canonical JSON excluding content_hash"',
+        )
+        for prompt in prompts:
+            self.assertIsInstance(prompt, Path)
+            text = prompt.read_text(encoding="utf-8")
+            self.assertIn(
+                "Continue this same lane and native provider session", text
+            )
+            self.assertIn("Write a valid RESULT.json at the worktree root", text)
+            self.assertIn("Do not answer with prose alone", text)
+            for field in required:
+                self.assertIn(field, text)
+
+    def _assert_candidate_attempt_ledger(
+        self, observed: dict[str, object], expected_states: list[str]
+    ) -> None:
+        calls = observed["calls"]
+        attempts = observed["attempts"]
+        self.assertIsInstance(calls, list)
+        self.assertIsInstance(attempts, list)
+        assert isinstance(calls, list)
+        assert isinstance(attempts, list)
+        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        rows = attempts[1:]
+        self.assertEqual(list(range(1, 7)), [row["attempt"] for row in rows])
+        self.assertEqual(expected_states, [row["result_state"] for row in rows])
+        for index, (call, row) in enumerate(zip(calls, rows, strict=True), start=1):
+            self.assertEqual({"id": "codex", "model": "model-1"}, row["provider"])
+            self.assertEqual(list(call["argv"]), row["argv"])
+            self.assertEqual("native-session-1", row["session_id"])
+            self.assertEqual(call["prompt_path"], row["prompt_path"])
+            self.assertEqual(0, row["exit_code"])
+            self.assertTrue(row["cleanup_proven"])
+            self.assertTrue(row["at"])
+            self.assertTrue(Path(row["transcript_path"]).is_file())
+            self.assertTrue(Path(row["stderr_path"]).is_file())
+            expected_error = (
+                None if expected_states[index - 1] == "valid" else "missing or invalid RESULT.json"
+            )
+            self.assertEqual(expected_error, row["validation_error"])
+
+        leases_seen = observed["lease_observations"]
+        self.assertEqual(6, len(leases_seen))
+        self.assertTrue(all(item == leases_seen[0] for item in leases_seen))
+        self.assertEqual(
+            {
+                "schema": "resource-lease/v1",
+                "resource_id": "resource-1",
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "pid": 7,
+                "creation_time": "controller-created",
+            },
+            {key: leases_seen[0][key] for key in (
+                "schema",
+                "resource_id",
+                "lane_id",
+                "run_id",
+                "pid",
+                "creation_time",
+            )},
+        )
+        self.assertTrue(leases_seen[0]["acquired_at"])
+        releases = observed["release_observations"]
+        self.assertEqual(1, len(releases))
+        self.assertEqual(6, releases[0]["cleaned_boundaries"])
+        self.assertEqual(leases_seen[0], releases[0]["lease"])
+        self.assertIsNone(observed["lease_after"])
+        for boundary in observed["boundaries"]:
+            boundary.cleanup.assert_called_once()
+
+    def _assert_candidate_event_sequence(
+        self, observed: dict[str, object], *, valid_on_sixth: bool
+    ) -> None:
+        events = [item for item in observed["events"] if "event_type" in item]
+        actual = [item["event_type"] for item in events]
+        expected = ["controller_started", "leases_acquired"]
+        for _ in range(5):
+            expected.extend(
+                ["provider_exited", "cleanup_proven", "correction_requested"]
+            )
+        expected.extend(["provider_exited", "cleanup_proven"])
+        if valid_on_sixth:
+            expected.extend(["leases_released", "result_valid", "acceptance_rejected"])
+        else:
+            expected.extend(["provider_exited_no_result", "leases_released"])
+        self.assertEqual(expected, actual)
+
+    def test_run_provider_passes_saved_session_and_resume_to_binding(self) -> None:
+        worktree = self.runtime / "provider-wiring-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        prompt = workspace / "attempts" / "correction-prompt-1.md"
+        prompt.parent.mkdir(parents=True)
+        prompt.write_text("continue the same session\n", encoding="utf-8")
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worktree_path": str(worktree),
+            "controller_status_path": str(workspace / "controller.status.json"),
+            "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "transcript_path": str(workspace / "provider-transcript.jsonl"),
+            "stderr_path": str(workspace / "provider-stderr.txt"),
+            "last_message_path": str(workspace / "last-message.txt"),
+            "session": {"session_id": "saved-native-session"},
+        }
+        invocation = {"provider": {"id": "provider-1", "model": "model-1"}}
+        expected_argv = [
+            "provider-cli",
+            "--resume",
+            "saved-native-session",
+            "--prompt",
+            str(prompt),
+        ]
+        binding = MagicMock()
+        binding.build_argv.return_value = expected_argv
+        binding.parse_line.return_value = None
+        child = MagicMock(pid=456, returncode=0)
+        child.poll.return_value = 0
+        child.take_job_handle.return_value = 789
+        boundary = MagicMock(
+            root_pid=456,
+            root_creation_time="provider-created",
+            process_group_id=456,
+            session_id="provider-boundary",
+        )
+        boundary.record.return_value = {
+            "root": {"pid": 456, "creation_time": "provider-created"}
+        }
+
+        def spawn(
+            argv: list[str],
+            *,
+            cwd: str,
+            stdin: object,
+            stdout: object,
+            stderr: object,
+        ) -> MagicMock:
+            self.assertEqual(expected_argv, argv)
+            self.assertEqual(str(worktree), cwd)
+            self.assertFalse(getattr(stdin, "closed"))
+            self.assertFalse(getattr(stdout, "closed"))
+            self.assertFalse(getattr(stderr, "closed"))
+            stdout.write('{"type":"result"}\n')
+            stdout.flush()
+            return child
+
+        with (
+            patch.object(controller.processes, "spawn_provider", side_effect=spawn) as spawned,
+            patch.object(
+                controller.processes.ProcessBoundary,
+                "for_process",
+                return_value=boundary,
+            ) as make_boundary,
+        ):
+            execution = controller._run_provider(
+                self.runtime,
+                "epoch-1",
+                lane,
+                invocation,
+                binding,
+                prompt,
+                attempt_number=2,
+                resume=True,
+            )
+
+        binding.build_argv.assert_called_once_with(
+            model="model-1",
+            worktree=str(worktree),
+            prompt_path=str(prompt),
+            session_id="saved-native-session",
+            resume=True,
+        )
+        spawned.assert_called_once()
+        make_boundary.assert_called_once_with(456, windows_job_handle=789)
+        child.resume.assert_called_once_with()
+        self.assertEqual(tuple(expected_argv), execution.argv)
+        self.assertEqual("saved-native-session", execution.session_id)
+
+    def test_fifth_correction_succeeds_on_sixth_attempt_with_full_durable_evidence(
+        self,
+    ) -> None:
+        observed = self._run_candidate_correction_boundary(valid_on_sixth=True)
+        self.assertEqual(0, observed["exit_code"])
+        self._assert_five_correction_prompts(observed["correction_prompts"])
+
+        calls = observed["calls"]
+        self.assertIsInstance(calls, list)
+        assert isinstance(calls, list)
+        self.assertEqual(list(range(1, 7)), [call["attempt_number"] for call in calls])
+        self.assertEqual([False] + [True] * 5, [call["resume"] for call in calls])
+        self.assertEqual({}, calls[0]["lane_session"])
+        self.assertTrue(
+            all(
+                call["lane_session"] == {"session_id": "native-session-1"}
+                for call in calls[1:]
+            )
+        )
+        self.assertEqual(
+            ["codex", "exec", "--json"], list(calls[0]["argv"])
+        )
+        for index, call in enumerate(calls[1:], start=1):
+            self.assertEqual(
+                ["codex", "exec", "resume", "native-session-1"],
+                list(call["argv"]),
+            )
+            self.assertTrue(str(call["prompt_path"]).endswith(
+                f"correction-prompt-{index}.md"
+            ))
+
+        attempts = observed["attempts"]
+        self.assertIsInstance(attempts, list)
+        assert isinstance(attempts, list)
+        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        attempt_rows = attempts[1:]
+        self.assertEqual(list(range(1, 7)), [row["attempt"] for row in attempt_rows])
+        self.assertEqual(["invalid"] * 5 + ["valid"], [row["result_state"] for row in attempt_rows])
+        self.assertTrue(all(row["cleanup_proven"] for row in attempt_rows))
+        self.assertTrue(all(row["provider"] == {"id": "codex", "model": "model-1"} for row in attempt_rows))
+        self.assertTrue(all(Path(row["transcript_path"]).is_file() for row in attempt_rows))
+        self.assertTrue(all(Path(row["stderr_path"]).is_file() for row in attempt_rows))
+        self._assert_candidate_attempt_ledger(
+            observed, ["invalid"] * 5 + ["valid"]
+        )
+
+        status = observed["status"]
+        self.assertEqual("review_pending", status["recorded_status"])
+        self.assertEqual("valid", status["result_state"])
+        self.assertEqual(5, status["correction_attempts"])
+        self.assertTrue(status["cleanup_proven"])
+        self.assertEqual("review_pending", observed["lane"]["lifecycle"])
+        self.assertNotIn(
+            "result_invalid",
+            [item.get("lifecycle") for item in observed["lane_transitions"]],
+        )
+        self.assertNotIn(
+            "provider_exited_no_result",
+            [item.get("recorded_status") for item in observed["status_transitions"]],
+        )
+
+        result = read_record(observed["result_path"], "result/v1")
+        self.assertEqual("lane-1", result["lane_id"])
+        self.assertEqual("run-1", result["run_id"])
+        self.assertEqual("PASS", result["outcome"])
+        self.assertTrue(result["summary"])
+        self.assertIsInstance(result["evidence"], list)
+        self.assertTrue(result["completed_at"])
+        self.assertEqual(content_hash(result), result["content_hash"])
+
+        self._assert_candidate_event_sequence(observed, valid_on_sixth=True)
+
+    def test_sixth_invalid_attempt_escalates_once_with_full_durable_evidence(self) -> None:
+        observed = self._run_candidate_correction_boundary(valid_on_sixth=False)
+        self.assertEqual(0, observed["exit_code"])
+        self._assert_five_correction_prompts(observed["correction_prompts"])
+        self.assertFalse(observed["result_path"].exists())
+
+        calls = observed["calls"]
+        self.assertEqual(list(range(1, 7)), [call["attempt_number"] for call in calls])
+        self.assertEqual([False] + [True] * 5, [call["resume"] for call in calls])
+        self.assertEqual({}, calls[0]["lane_session"])
+        self.assertTrue(
+            all(
+                call["lane_session"] == {"session_id": "native-session-1"}
+                for call in calls[1:]
+            )
+        )
+
+        attempts = observed["attempts"]
+        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        attempt_rows = attempts[1:]
+        self.assertEqual(list(range(1, 7)), [row["attempt"] for row in attempt_rows])
+        self.assertEqual(["invalid"] * 6, [row["result_state"] for row in attempt_rows])
+        self.assertTrue(all(row["cleanup_proven"] for row in attempt_rows))
+        self.assertTrue(all(row["provider"] == {"id": "codex", "model": "model-1"} for row in attempt_rows))
+        self.assertTrue(all(Path(row["transcript_path"]).is_file() for row in attempt_rows))
+        self.assertTrue(all(Path(row["stderr_path"]).is_file() for row in attempt_rows))
+        self._assert_candidate_attempt_ledger(observed, ["invalid"] * 6)
+
+        status = observed["status"]
+        self.assertEqual("provider_exited_no_result", status["recorded_status"])
+        self.assertEqual("invalid", status["result_state"])
+        self.assertEqual(5, status["correction_attempts"])
+        self.assertTrue(status["cleanup_proven"])
+        self.assertEqual("result_invalid", observed["lane"]["lifecycle"])
+        lifecycle_updates = [
+            item.get("lifecycle") for item in observed["lane_transitions"]
+        ]
+        self.assertEqual("result_invalid", lifecycle_updates[-1])
+        self.assertNotIn("result_invalid", lifecycle_updates[:-1])
+        recorded_updates = [
+            item.get("recorded_status") for item in observed["status_transitions"]
+        ]
+        self.assertEqual("provider_exited_no_result", recorded_updates[-1])
+        self.assertNotIn("provider_exited_no_result", recorded_updates[:-1])
+
+        self._assert_candidate_event_sequence(observed, valid_on_sixth=False)
+
+    def test_unavailable_native_resume_escalates_without_a_fresh_retry(self) -> None:
+        no_session = self._run_candidate_correction_boundary(
+            valid_on_sixth=False, scenario="no-session"
+        )
+        self.assertEqual(0, no_session["exit_code"])
+        self.assertEqual(1, len(no_session["calls"]))
+        self.assertEqual([], no_session["correction_prompts"])
+        self.assertEqual(
+            "provider_exited_no_result", no_session["status"]["recorded_status"]
+        )
+        self.assertEqual("result_invalid", no_session["lane"]["lifecycle"])
+        self.assertEqual(
+            1,
+            [
+                item["event_type"]
+                for item in no_session["events"]
+                if "event_type" in item
+            ].count("provider_exited_no_result"),
+        )
+
+        unavailable = self._run_candidate_correction_boundary(
+            valid_on_sixth=False, scenario="resume-unavailable"
+        )
+        self.assertEqual(0, unavailable["exit_code"])
+        self.assertEqual(2, len(unavailable["calls"]))
+        self.assertEqual([False, True], [call["resume"] for call in unavailable["calls"]])
+        self.assertEqual(1, len(unavailable["correction_prompts"]))
+        self.assertEqual(
+            "provider_exited_no_result", unavailable["status"]["recorded_status"]
+        )
+        self.assertEqual("result_invalid", unavailable["lane"]["lifecycle"])
+        self.assertEqual(
+            1,
+            [
+                item["event_type"]
+                for item in unavailable["events"]
+                if "event_type" in item
+            ].count("provider_exited_no_result"),
+        )
+        attempt_rows = unavailable["attempts"][1:]
+        self.assertEqual([1, 2], [row["attempt"] for row in attempt_rows])
+        self.assertEqual([], attempt_rows[1]["argv"])
+        self.assertEqual("native-session-1", attempt_rows[1]["session_id"])
+        self.assertIn("native resume unavailable", attempt_rows[1]["validation_error"])
+
+    def test_provider_start_failure_does_not_enter_the_correction_loop(self) -> None:
+        observed = self._run_candidate_correction_boundary(
+            valid_on_sixth=False, scenario="provider-start-failed"
+        )
+        self.assertEqual(4, observed["exit_code"])
+        self.assertEqual(1, len(observed["calls"]))
+        self.assertEqual([], observed["correction_prompts"])
+        self.assertEqual("provider_start_failed", observed["status"]["recorded_status"])
+        event_types = [
+            item["event_type"]
+            for item in observed["events"]
+            if "event_type" in item
+        ]
+        self.assertEqual(1, event_types.count("provider_start_failed"))
+        self.assertEqual(0, event_types.count("correction_requested"))
+        self.assertEqual(0, event_types.count("provider_exited_no_result"))
+        self.assertEqual(1, event_types.count("leases_released"))
+        self.assertIsNone(observed["lease_after"])
+        attempt_rows = observed["attempts"][1:]
+        self.assertEqual(1, len(attempt_rows))
+        self.assertEqual([], attempt_rows[0]["argv"])
+        self.assertIn("provider did not start", attempt_rows[0]["validation_error"])
+
     def test_valid_result_wins_over_nonzero_provider_exit(self) -> None:
         worktree = self.runtime / "controller-valid-result-worktree"
         workspace = worktree / ".agent-workspace"
@@ -749,6 +1362,21 @@ class Addendum3ProductTests(unittest.TestCase):
                 monitor.derive_lane_status(
                     self.runtime, "epoch-1", lane, None, lease_records=[]
                 ),
+            )
+
+    def test_prepared_lane_does_not_report_controller_exited_before_launch(self) -> None:
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "lifecycle": "prepared",
+            "process": {},
+            "launch_pending": False,
+        }
+        with patch.object(monitor.processes, "identity_matches", return_value=False):
+            self.assertIsNone(
+                monitor.derive_lane_status(
+                    self.runtime, "epoch-1", lane, None, lease_records=[]
+                )
             )
 
     def test_resume_marks_launch_pending_for_fresh_running_lane(self) -> None:

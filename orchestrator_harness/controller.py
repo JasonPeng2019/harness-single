@@ -603,9 +603,20 @@ def run_controller(lane_id: str) -> int:
                         "cleanup_proven": cleanup_proven,
                     },
                 )
+                _append_event(
+                    lane,
+                    "provider_exited_no_result",
+                    f"native resume unavailable: {exc}",
+                )
                 if cleanup_proven:
                     release_leases(rt, lane_id, lane["run_id"])
                     _append_event(lane, "leases_released", ",".join(declared) or "(none)")
+                update_lane(
+                    rt,
+                    epoch_id,
+                    lane_id,
+                    lambda current: {**current, "lifecycle": "result_invalid"},
+                )
                 return 0
             provider_state = dict(status.get("provider_state") or {}) if isinstance(status, dict) else {}
             provider_state.update(

@@ -315,6 +315,26 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
         self.assertIn("--verbose", argv)
+        claude_resume = claude.build_argv(
+            model="sonnet",
+            worktree="C:/wt",
+            prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
+            session_id="claude-session-1",
+            resume=True,
+        )
+        self.assertEqual(
+            ["--resume", "claude-session-1"],
+            claude_resume[
+                claude_resume.index("--resume") : claude_resume.index("--resume") + 2
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "session ID"):
+            claude.build_argv(
+                model="sonnet",
+                worktree="C:/wt",
+                prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
+                resume=True,
+            )
 
         qwen = self._load_registered("qwen-code")
         with mock.patch.object(qwen.shutil, "which", return_value=None):
@@ -327,6 +347,27 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--approval-mode=yolo", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
+        with mock.patch.object(qwen.shutil, "which", return_value=None):
+            qwen_resume = qwen.build_argv(
+                model="qwen3-coder",
+                worktree="C:/wt",
+                prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
+                session_id="qwen-session-1",
+                resume=True,
+            )
+            with self.assertRaisesRegex(ValueError, "session ID"):
+                qwen.build_argv(
+                    model="qwen3-coder",
+                    worktree="C:/wt",
+                    prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
+                    resume=True,
+                )
+        self.assertEqual(
+            ["--resume", "qwen-session-1"],
+            qwen_resume[
+                qwen_resume.index("--resume") : qwen_resume.index("--resume") + 2
+            ],
+        )
 
     def test_qwen_binding_uses_portable_executable_discovery(self) -> None:
         qwen = self._load_registered("qwen-code")
