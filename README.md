@@ -59,6 +59,13 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
    directory, and starts the persistent monitor. It starts no lane or provider and never creates
    an epoch or worktree.
 
+Setup preserves existing `.codex/` and `.claude/` directories. It adds the harness-owned skills,
+hook scripts, and binding files, while structurally merging harness hook registrations into an
+existing `.codex/hooks.json` or `.claude/settings.json`. Existing fields, permissions, and hook
+groups remain in place. An existing `.codex/config.toml` is preserved byte-for-byte and must already
+set `[features] hooks = true`. `--overwrite` replaces only harness-owned payload files; it does not
+replace these shared provider configuration files.
+
 ### Managed vs plain
 
 `managed_coordination: "enabled"` (managed) stages a manager queue for the epoch: ROOT uses

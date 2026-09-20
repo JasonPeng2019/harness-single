@@ -49,3 +49,10 @@ that call only the provider-neutral helpers
 active super-cache (workspace base plus per-provider payloads), and registers
 the launcher bindings.  `lane bootstrap` materializes the workspace base and
 the selected provider payload into each new worktree.
+
+ROOT installation is additive when `.codex/` or `.claude/` already exists.
+Harness-owned skills, scripts, and bindings remain strictly owned files.
+Provider hook JSON is shared configuration: setup preserves existing fields and
+hook groups and appends missing harness hook groups. Existing Codex TOML is
+preserved and must already enable hooks. `--overwrite` does not replace shared
+provider configuration.

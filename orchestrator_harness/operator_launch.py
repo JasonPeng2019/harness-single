@@ -326,7 +326,11 @@ def _build_parser() -> argparse.ArgumentParser:
     harness = subparsers.add_parser("harness", help="runtime lifecycle commands")
     harness_sub = harness.add_subparsers(dest="harness_command", required=True)
     setup_parser = harness_sub.add_parser("setup", help="one-time idempotent integration")
-    setup_parser.add_argument("--overwrite", action="store_true")
+    setup_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace harness-owned payloads; shared provider configuration is merged",
+    )
     harness_sub.add_parser("shutdown", help="end the whole runtime")
 
     lane = subparsers.add_parser("lane", help="lane lifecycle commands")

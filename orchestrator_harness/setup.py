@@ -20,6 +20,8 @@ import os
 import shutil
 import sys
 import tempfile
+import tomllib
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,13 +38,24 @@ from .config import (
 )
 from .core import iso_utc
 from .epochs import MANAGER_QUEUE_SCHEMA, manager_queue_path, read_current_epoch
-from .records import RecordLock, _replace_with_retry, atomic_write_json, read_record
+from .records import (
+    RecordLock,
+    _replace_with_retry,
+    atomic_write_bytes,
+    atomic_write_json,
+    read_record,
+)
 
 RUNTIME_STATE_SCHEMA = "runtime-state/v1"
 MONITOR_SCHEMA = "monitor/v1"
 RESOURCE_MANIFEST_SCHEMA = "resource-manifest/v1"
 ROOT_HOOK_BINDING_SCHEMA = "harness-hook-binding/v1"
 ROOT_HOOK_BINDING_NAME = "orchestrator-harness-binding.json"
+CODEX_ROOT_CONFIG = Path(".codex") / "config.toml"
+SHARED_ROOT_HOOK_CONFIGS = {
+    Path(".codex") / "hooks.json",
+    Path(".claude") / "settings.json",
+}
 
 SETUP_CONFIG_INVALID = "SETUP_CONFIG_INVALID"
 SETUP_CACHE_INVALID = "SETUP_CACHE_INVALID"
@@ -282,6 +295,134 @@ def _is_valid_installed_payload(
     return copied == _materialized_binding(template, harness_root, runtime_root)
 
 
+def _read_json_object(path: Path, *, description: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION, f"{description} is unreadable: {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION, f"{description} must be a JSON object: {path}"
+        )
+    return value
+
+
+def _hook_commands(group: Any) -> set[str]:
+    if not isinstance(group, dict):
+        return set()
+    hooks = group.get("hooks")
+    if not isinstance(hooks, list):
+        return set()
+    return {
+        hook["command"]
+        for hook in hooks
+        if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+    }
+
+
+def _merge_root_hook_config(source: Path, target: Path) -> dict[str, Any]:
+    """Add shipped harness hook groups to an existing provider config.
+
+    Existing top-level fields, permissions, event order, and hook groups remain
+    authoritative.  A shipped command that is already present with a changed
+    group is treated as a collision instead of being duplicated or overwritten.
+    """
+    shipped = _read_json_object(source, description="shipped hook configuration")
+    existing = _read_json_object(target, description="existing hook configuration")
+    shipped_hooks = shipped.get("hooks")
+    if not isinstance(shipped_hooks, dict):
+        raise SetupError(
+            SETUP_CONFIG_INVALID,
+            f"shipped hook configuration has no hooks object: {source}",
+        )
+    existing_hooks = existing.get("hooks")
+    if existing_hooks is None:
+        existing_hooks = {}
+    if not isinstance(existing_hooks, dict):
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"existing hook configuration has a non-object hooks field: {target}",
+        )
+
+    merged = deepcopy(existing)
+    merged_hooks = deepcopy(existing_hooks)
+    merged["hooks"] = merged_hooks
+    existing_commands = {
+        command
+        for groups in existing_hooks.values()
+        if isinstance(groups, list)
+        for group in groups
+        for command in _hook_commands(group)
+    }
+    for event_name, shipped_groups in shipped_hooks.items():
+        if not isinstance(event_name, str) or not isinstance(shipped_groups, list):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"shipped hook event is malformed in {source}",
+            )
+        existing_groups = merged_hooks.get(event_name)
+        if existing_groups is None:
+            existing_groups = []
+            merged_hooks[event_name] = existing_groups
+        if not isinstance(existing_groups, list):
+            raise SetupError(
+                SETUP_ADAPTER_COLLISION,
+                f"existing hook event {event_name!r} is not a list: {target}",
+            )
+        for shipped_group in shipped_groups:
+            if not isinstance(shipped_group, dict) or not _hook_commands(shipped_group):
+                raise SetupError(
+                    SETUP_CONFIG_INVALID,
+                    f"shipped hook group is malformed in {source}",
+                )
+            if shipped_group in existing_groups:
+                continue
+            shipped_commands = _hook_commands(shipped_group)
+            if shipped_commands.intersection(existing_commands):
+                raise SetupError(
+                    SETUP_ADAPTER_COLLISION,
+                    f"existing hook configuration changes a harness-owned "
+                    f"{event_name!r} command: {target}",
+                )
+            existing_groups.append(deepcopy(shipped_group))
+    return merged
+
+
+def _validate_existing_codex_config(target: Path) -> None:
+    """Preserve an existing Codex config after proving hooks are enabled."""
+    try:
+        value = tomllib.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"existing Codex configuration is unreadable: {target}: {exc}",
+        ) from exc
+    features = value.get("features")
+    if not isinstance(features, dict) or features.get("hooks") is not True:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"existing Codex configuration must enable [features] hooks = true: {target}",
+        )
+
+
+def _preflight_shared_root_config(source: Path, target: Path, relative: Path) -> bool:
+    """Validate one existing shared provider config; return whether handled."""
+    if relative == CODEX_ROOT_CONFIG:
+        _validate_existing_codex_config(target)
+        return True
+    if relative in SHARED_ROOT_HOOK_CONFIGS:
+        _merge_root_hook_config(source, target)
+        return True
+    return False
+
+
+def _write_root_hook_config(path: Path, value: dict[str, Any]) -> None:
+    rendered = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    atomic_write_bytes(path, rendered)
+
+
 def _preflight_root_payloads(
     plan: list[tuple[Path, Path]],
     root_workspace: Path,
@@ -291,10 +432,13 @@ def _preflight_root_payloads(
     runtime_root: Path | None = None,
     binding_templates: dict[Path, dict[str, Any]] | None = None,
 ) -> None:
-    """Reject any destination collision across the whole ROOT payload plan
-    before anything is written; ``--overwrite`` replaces only catalog-planned
-    files.  An existing destination that is the valid installed form of its
-    planned payload is preserved, not a collision."""
+    """Reject destination collisions before anything is written.
+
+    ``--overwrite`` replaces only harness-owned catalog files. Existing Codex
+    and Claude shared configuration is validated and merged or preserved. An
+    existing destination that is the valid installed form of its planned
+    payload is preserved, not a collision.
+    """
     seen: set[Path] = set()
     plan_collisions: list[Path] = []
     for _, relative in plan:
@@ -306,12 +450,14 @@ def _preflight_root_payloads(
             SETUP_ADAPTER_COLLISION,
             f"catalog payload collision at {plan_collisions[0]}",
         )
-    if overwrite:
-        return
     collisions: list[Path] = []
     for source, relative in plan:
         target = root_workspace / relative
         if not target.exists():
+            continue
+        if _preflight_shared_root_config(source, target, relative):
+            continue
+        if overwrite:
             continue
         if _is_valid_installed_payload(
             target,
@@ -447,11 +593,13 @@ def _install_root_payloads(
     overwrite: bool,
     runtime_root: Path | None = None,
     binding_templates: dict[Path, dict[str, Any]] | None = None,
-) -> tuple[list[Path], list[Path]]:
-    """Install the preflighted ROOT payloads and return ``(installed,
-    overwritten)`` paths.  Never writes back into the shipped harness trees.
+) -> tuple[list[Path], list[Path], list[Path]]:
+    """Install ROOT payloads and return ``(installed, overwritten, merged)``.
+
+    Never writes back into the shipped harness trees. Shared provider
+    configuration is merged or preserved even under ``--overwrite``.
     An already-installed valid payload is preserved exactly on an unchanged
-    re-run; ``--overwrite`` re-copies every planned payload."""
+    re-run; ``--overwrite`` re-copies every harness-owned planned payload."""
     harness_identity = path_identity(harness_root)
     workspace_identity = path_identity(root_workspace)
     if workspace_identity == harness_identity or workspace_identity.startswith(
@@ -463,8 +611,23 @@ def _install_root_payloads(
         )
     installed: list[Path] = []
     overwritten: list[Path] = []
+    merged: list[Path] = []
     for source_file, relative in plan:
         target = root_workspace / relative
+        if target.exists() and relative == CODEX_ROOT_CONFIG:
+            _validate_existing_codex_config(target)
+            installed.append(target)
+            continue
+        if target.exists() and relative in SHARED_ROOT_HOOK_CONFIGS:
+            combined = _merge_root_hook_config(source_file, target)
+            current = _read_json_object(
+                target, description="existing hook configuration"
+            )
+            if combined != current:
+                _write_root_hook_config(target, combined)
+                merged.append(target)
+            installed.append(target)
+            continue
         if not overwrite and _is_valid_installed_payload(
             target,
             source_file,
@@ -485,7 +648,7 @@ def _install_root_payloads(
         installed.append(target)
         if replaced:
             overwritten.append(target)
-    return installed, overwritten
+    return installed, overwritten, merged
 
 
 def _load_binding(path: Path) -> Any:
@@ -859,7 +1022,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         return _failure(
             exc.code,
             str(exc),
-            "resolve the named target or re-run with --overwrite",
+            "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
     except ConfigError as exc:
         return _failure(
@@ -901,7 +1064,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                     )
 
         _install_active_cache(harness_root, rt, plan=cache_plan, overwrite=overwrite)
-        installed, overwritten = _install_root_payloads(
+        installed, overwritten, merged = _install_root_payloads(
             harness_root,
             config.root_workspace,
             plan=root_plan,
@@ -982,13 +1145,13 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         return _failure(
             exc.code,
             str(exc),
-            "resolve the named target or re-run with --overwrite",
+            "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
     except ConfigError as exc:
         return _failure(
             SETUP_CONFIG_INVALID,
             str(exc),
-            "resolve the named target or re-run with --overwrite",
+            "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
 
     result: dict[str, Any] = {
@@ -1003,4 +1166,6 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
     }
     if overwritten:
         result["overwritten_paths"] = [str(path) for path in overwritten]
+    if merged:
+        result["merged_paths"] = [str(path) for path in merged]
     return result

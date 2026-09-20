@@ -20,7 +20,9 @@ results, operates hardware, or replaces the root orchestrator.
   `harness-config.json` and `resource-manifest.json`, preflights the entire catalog before
   writing anything, stages and byte-verifies the active super-cache, installs the ROOT payloads,
   writes the active resource manifest and lease directory, and starts the persistent monitor.
-  It starts no lane or provider and never creates an epoch or worktree. `--overwrite` re-integrates.
+  It starts no lane or provider and never creates an epoch or worktree. Existing Codex and Claude
+  configuration is preserved while harness hook groups are merged idempotently. An existing Codex
+  config must already enable hooks. `--overwrite` re-integrates only harness-owned payload files.
 - `harness shutdown` — end the whole runtime: OPEN -> SHUTTING_DOWN, each lane's controller cleans
   its own processes, the monitor stops, the active-epoch marker clears, and the runtime closes.
   It never kills by broad process name.

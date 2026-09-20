@@ -152,6 +152,77 @@ class MaterializationFixture:
             if path.is_file()
         }
 
+    def add_shared_root_configs(self) -> None:
+        self._write_text(
+            self.harness / "adapters" / "codex" / "root" / ".codex" / "config.toml",
+            '[features]\nhooks = true\n',
+        )
+        self._write_json(
+            self.harness / "adapters" / "codex" / "root" / ".codex" / "hooks.json",
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+                                }
+                            ],
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python .codex/hooks/orchestrator_harness_stop.py",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            },
+        )
+        self._write_provider(
+            "claude-code", ".claude", "claude-root\n", "claude-worker\n"
+        )
+        self._write_json(
+            self.harness
+            / "adapters"
+            / "claude-code"
+            / "root"
+            / ".claude"
+            / "settings.json",
+            {
+                "permissions": {"defaultMode": "bypassPermissions"},
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python .claude/hooks/orchestrator_harness_post_tool_use.py",
+                                }
+                            ],
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python .claude/hooks/orchestrator_harness_stop.py",
+                                }
+                            ]
+                        }
+                    ],
+                },
+            },
+        )
+
 
 class V2MaterializationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -193,6 +264,138 @@ class V2MaterializationTests(unittest.TestCase):
             )
         self.assertEqual(setup.SETUP_CACHE_INVALID, raised.exception.code)
         self.assertEqual("corrupt\n", corrupt.read_text(encoding="utf-8"))
+
+    def test_root_provider_configs_merge_without_replacing_existing_setup(self) -> None:
+        self.fixture.add_shared_root_configs()
+        codex_config = self.fixture.root_workspace / ".codex" / "config.toml"
+        codex_hooks = self.fixture.root_workspace / ".codex" / "hooks.json"
+        claude_settings = self.fixture.root_workspace / ".claude" / "settings.json"
+        self.fixture._write_text(
+            codex_config,
+            '# existing setup\nmodel = "custom"\n\n[features]\nhooks = true\n',
+        )
+        self.fixture._write_json(
+            codex_hooks,
+            {
+                "description": "existing Codex setup",
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "session"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command": "verify"}]}],
+                },
+            },
+        )
+        self.fixture._write_json(
+            claude_settings,
+            {
+                "$schema": "existing-schema",
+                "permissions": {"defaultMode": "ask"},
+                "custom": {"keep": True},
+                "hooks": {
+                    "PreToolUse": [{"hooks": [{"type": "command", "command": "guard"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command": "verify"}]}],
+                },
+            },
+        )
+        config_before = codex_config.read_bytes()
+        plan = setup._plan_root_payloads(self.fixture.harness)
+
+        setup._preflight_root_payloads(
+            plan, self.fixture.root_workspace, overwrite=False
+        )
+        _installed, overwritten, merged = setup._install_root_payloads(
+            self.fixture.harness,
+            self.fixture.root_workspace,
+            plan=plan,
+            overwrite=False,
+        )
+
+        self.assertEqual(config_before, codex_config.read_bytes())
+        self.assertEqual([], overwritten)
+        self.assertEqual({codex_hooks, claude_settings}, set(merged))
+        codex = json.loads(codex_hooks.read_text(encoding="utf-8"))
+        self.assertEqual("existing Codex setup", codex["description"])
+        self.assertIn("SessionStart", codex["hooks"])
+        self.assertEqual("verify", codex["hooks"]["Stop"][0]["hooks"][0]["command"])
+        self.assertEqual(2, len(codex["hooks"]["Stop"]))
+        self.assertIn("PostToolUse", codex["hooks"])
+        claude = json.loads(claude_settings.read_text(encoding="utf-8"))
+        self.assertEqual({"defaultMode": "ask"}, claude["permissions"])
+        self.assertEqual({"keep": True}, claude["custom"])
+        self.assertIn("PreToolUse", claude["hooks"])
+        self.assertEqual(2, len(claude["hooks"]["Stop"]))
+        self.assertIn("PostToolUse", claude["hooks"])
+
+        first_bytes = {path: path.read_bytes() for path in (codex_hooks, claude_settings)}
+        setup._preflight_root_payloads(
+            plan, self.fixture.root_workspace, overwrite=False
+        )
+        _installed, overwritten, merged = setup._install_root_payloads(
+            self.fixture.harness,
+            self.fixture.root_workspace,
+            plan=plan,
+            overwrite=False,
+        )
+        self.assertEqual([], overwritten)
+        self.assertEqual([], merged)
+        self.assertEqual(
+            first_bytes,
+            {path: path.read_bytes() for path in (codex_hooks, claude_settings)},
+        )
+
+    def test_existing_codex_config_must_enable_hooks_before_any_write(self) -> None:
+        self.fixture.add_shared_root_configs()
+        codex_config = self.fixture.root_workspace / ".codex" / "config.toml"
+        self.fixture._write_text(
+            codex_config, '[features]\nhooks = false\ncustom = true\n'
+        )
+        plan = setup._plan_root_payloads(self.fixture.harness)
+
+        with self.assertRaises(setup.SetupError) as raised:
+            setup._preflight_root_payloads(
+                plan, self.fixture.root_workspace, overwrite=True
+            )
+
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, raised.exception.code)
+        self.assertIn("must enable [features] hooks = true", str(raised.exception))
+        self.assertFalse((self.fixture.root_workspace / ".custom").exists())
+        self.assertEqual(
+            '[features]\nhooks = false\ncustom = true\n',
+            codex_config.read_text(encoding="utf-8"),
+        )
+
+    def test_changed_harness_owned_hook_entry_is_a_collision(self) -> None:
+        self.fixture.add_shared_root_configs()
+        codex_hooks = self.fixture.root_workspace / ".codex" / "hooks.json"
+        self.fixture._write_json(
+            codex_hooks,
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+                                    "timeout": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+        before = codex_hooks.read_bytes()
+        plan = setup._plan_root_payloads(self.fixture.harness)
+
+        with self.assertRaises(setup.SetupError) as raised:
+            setup._preflight_root_payloads(
+                plan, self.fixture.root_workspace, overwrite=True
+            )
+
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, raised.exception.code)
+        self.assertIn("harness-owned", str(raised.exception))
+        self.assertEqual(before, codex_hooks.read_bytes())
 
     def test_overlay_collision_is_rejected_before_partial_write(self) -> None:
         source = self.fixture.root / "overlay-source"
@@ -238,7 +441,7 @@ class V2MaterializationTests(unittest.TestCase):
         unrelated.write_text("preserve\n", encoding="utf-8")
         plan = setup._plan_root_payloads(self.fixture.harness)
         setup._preflight_root_payloads(plan, self.fixture.root_workspace, overwrite=True)
-        _, overwritten = setup._install_root_payloads(
+        _, overwritten, merged = setup._install_root_payloads(
             self.fixture.harness,
             self.fixture.root_workspace,
             plan=plan,
@@ -250,6 +453,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
         self.assertEqual("preserve\n", unrelated.read_text(encoding="utf-8"))
         self.assertEqual([planned_target], overwritten)
+        self.assertEqual([], merged)
 
     def test_setup_root_collision_has_no_partial_runtime_write(self) -> None:
         collision = self.fixture.root_workspace / ".codex" / "root.txt"

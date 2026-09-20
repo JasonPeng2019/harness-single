@@ -36,7 +36,10 @@ Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `res
 python -m orchestrator_harness.operator_launch harness setup
 ```
 
-Setup is idempotent; re-run with `--overwrite` to re-integrate. It starts no lane or provider.
+Setup is idempotent; re-run with `--overwrite` to re-integrate harness-owned files. Existing Codex
+and Claude configuration is preserved, with harness hooks merged into the provider hook files. An
+existing `.codex/config.toml` must already set `[features] hooks = true`. Setup starts no lane or
+provider.
 
 ## 3. Bootstrap one lane
 
