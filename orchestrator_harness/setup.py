@@ -1096,7 +1096,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                             "resource manifest changed while an epoch is active; "
                             "shut down the runtime before changing it",
                         )
-                    if any((rt / "resources" / "leases").glob("*")):
+                    if any((rt / "resources" / "leases").glob("*.lease")):
                         raise SetupError(
                             SETUP_RESOURCE_MANIFEST_INVALID,
                             "resource manifest changed while a lease is live; "

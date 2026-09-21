@@ -688,6 +688,55 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertEqual(str(runtime.resolve()), binding["runtime_root"])
             self.assertEqual(provider_id, binding["provider_id"])
 
+    def test_setup_manifest_change_ignores_persistent_lease_lock_file(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(
+                setup, "find_harness_root", return_value=self.fixture.harness
+            ),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", return_value=child
+            ) as spawn_detached,
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+            patch.object(
+                setup.processes, "identity_matches", return_value=True
+            ),
+        ):
+            first = setup.run_setup()
+            runtime = self.fixture.root_workspace / ".harness-runtime"
+            lease_dir = runtime / "resources" / "leases"
+            (lease_dir / "..leases.lock.lock").write_bytes(b"")
+            self.fixture._write_json(
+                self.fixture.harness / "resource-manifest.json",
+                {
+                    "schema": "resource-manifest/v1",
+                    "resources": [{"id": "ollama-provider-home", "exclusive": True}],
+                },
+            )
+            second = setup.run_setup()
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(setup.SETUP_MONITOR_ALREADY_RUNNING, second["code"])
+        spawn_detached.assert_called_once()
+        self.assertEqual(
+            [{"exclusive": True, "id": "ollama-provider-home"}],
+            json.loads(
+                (runtime / "resources" / "RESOURCE_MANIFEST.json").read_text(
+                    encoding="utf-8"
+                )
+            )["resources"],
+        )
+
     def test_setup_second_run_rejects_byte_changed_installed_payload(self) -> None:
         child = MagicMock(pid=1701)
         with (
