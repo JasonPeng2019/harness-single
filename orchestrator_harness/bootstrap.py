@@ -179,6 +179,7 @@ def _write_invocation(
     run_id: str,
     provider_id: str,
     model: str,
+    launch_config: dict[str, str],
     exclusive_resources: list[str],
 ) -> dict[str, Any]:
     agent_workspace = worktree / ".agent-workspace"
@@ -186,7 +187,11 @@ def _write_invocation(
         "schema": INVOCATION_SCHEMA,
         "lane_id": lane_id,
         "run_id": run_id,
-        "provider": {"id": provider_id, "model": model},
+        "provider": {
+            "id": provider_id,
+            "model": model,
+            "launch_config": dict(launch_config),
+        },
         "exclusive_resources": exclusive_resources,
         "launcher": {
             "entry": "python -m orchestrator_harness.controller",
@@ -258,11 +263,70 @@ def _install_managed_material(
     _write_worker_binding(worktree, rt, lane_id, run_id)
 
 
+def _validate_provider_launch_config(
+    harness_root: Path,
+    *,
+    provider_id: str,
+    model: str,
+    launch_config: dict[str, Any],
+) -> dict[str, str]:
+    """Resolve and validate provider preferences before any lane mutation."""
+    from .setup import _load_binding
+
+    binding_path = (
+        harness_root
+        / "orchestrator_harness"
+        / "provider_adapters"
+        / provider_id
+        / "launcher_binding.py"
+    )
+    if not binding_path.is_file():
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding missing for provider {provider_id}: {binding_path}",
+        )
+    try:
+        binding = _load_binding(binding_path)
+    except Exception as exc:
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding cannot be loaded for provider {provider_id}: {exc}",
+        ) from exc
+    if getattr(binding, "PROVIDER_ID", None) != provider_id:
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding identity does not match provider {provider_id}",
+        )
+    validate = getattr(binding, "validate_launch_config", None)
+    if not callable(validate):
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding lacks validate_launch_config for provider {provider_id}",
+        )
+    try:
+        configured = validate(model=model, launch_config=launch_config)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
+    if not isinstance(configured, dict) or not all(
+        isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+        for key, value in configured.items()
+    ):
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID,
+            f"launcher binding returned invalid launch configuration for {provider_id}",
+        )
+    return dict(configured)
+
+
 def run_bootstrap(
     *,
     lane_id: str,
     provider: str,
     model: str,
+    launch_config: dict[str, Any],
     exclusive_resources: list[str],
     task_card_path: str,
 ) -> dict[str, Any]:
@@ -297,6 +361,21 @@ def run_bootstrap(
             "summary": "provider and model are required",
             "evidence_paths": [],
             "next_action": "pass --provider and --model",
+        }
+    try:
+        configured_launch = _validate_provider_launch_config(
+            harness_root,
+            provider_id=provider,
+            model=model,
+            launch_config=launch_config,
+        )
+    except BootstrapError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "configure every provider launch preference and re-run bootstrap",
         }
     for resource_id in exclusive_resources:
         if not manifest.is_declared(resource_id):
@@ -366,6 +445,7 @@ def run_bootstrap(
             run_id=run_id,
             provider_id=provider,
             model=model,
+            launch_config=configured_launch,
             exclusive_resources=list(exclusive_resources),
         )
 
@@ -381,7 +461,11 @@ def run_bootstrap(
             "stderr_path": str(agent_workspace / "provider-stderr.txt"),
             "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
             "last_message_path": str(agent_workspace / "last-message.txt"),
-            "provider": {"id": provider, "model": model},
+            "provider": {
+                "id": provider,
+                "model": model,
+                "launch_config": configured_launch,
+            },
             "session": {},
             "process": {},
             "lifecycle": "prepared",

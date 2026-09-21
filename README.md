@@ -27,7 +27,8 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 
 - `harness setup [--overwrite]` — one-time idempotent integration; `harness shutdown` — end the
   whole runtime.
-- `lane bootstrap --lane-id --provider --model [--exclusive-resource] --task-card` — prepare one
+- `lane bootstrap --lane-id --provider --model [--provider-option NAME=VALUE]
+  [--exclusive-resource] --task-card` — prepare one
   lane; `lane launch --lane-id` — start one prepared lane.
 - `lane completion-review (--event-id|--lane-id) --review-outcome {PASS,FAIL,BLOCKED} --approval
   {ACCEPTED,REJECTED} --review-summary [--evidence] [--force-accept] [--force-reason]` — record
@@ -84,6 +85,12 @@ Three provider IDs ship: `codex`, `claude-code`, and `qwen-code`. Each has one t
 custom file-only adapter tree: reserved for local, non-shipped payload files. The shipped tree
 keeps only a marker README, and runtime staging never reads it unless an operator explicitly
 places payloads there.
+
+Every lane model and model preference is explicit bootstrap configuration and is preserved for
+native resume. Codex requires `reasoning_effort` and `service_tier` provider options; Claude Code
+requires `effort`; Qwen Code currently has no provider option beyond its required model. Missing,
+unknown, or duplicate options fail before an epoch, worktree, controller, or provider is created.
+Launcher bindings never select a model, effort, service tier, or fallback.
 
 ## Super-cache and bootstrap
 

@@ -29,11 +29,18 @@ results, operates hardware, or replaces the root orchestrator.
 
 ### `lane` — lane lifecycle
 
-- `lane bootstrap --lane-id <id> --provider <id> --model <model> [--exclusive-resource <id>]
+- `lane bootstrap --lane-id <id> --provider <id> --model <model>
+  [--provider-option <name>=<value>] [--exclusive-resource <id>]
   --task-card <path>` — prepare one lane: create the worktree, stage the super-cache base and the
   selected provider payload, write the worker binding and inbox/outbox, and open the epoch on
   first use. `--exclusive-resource` may repeat; every name must be declared in
   `resource-manifest.json`.
+
+  All provider model preferences must be supplied before bootstrap. Codex requires
+  `reasoning_effort` and `service_tier`; Claude Code requires `effort`; Qwen Code currently has no
+  provider option beyond its model. `--provider-option` may repeat. The selected adapter rejects
+  missing, duplicate, or unknown preferences before lane mutation, and the signed invocation
+  preserves the exact configuration for launch and resume. No launcher binding chooses defaults.
 - `lane launch --lane-id <id>` — start one prepared lane's controller and provider.
 - `lane completion-review (--event-id <id> | --lane-id <id>) --review-outcome {PASS,FAIL,BLOCKED}
   --approval {ACCEPTED,REJECTED} --review-summary <text> [--evidence <path>] [--force-accept]

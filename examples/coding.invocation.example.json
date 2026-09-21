@@ -4,7 +4,11 @@
   "run_id": "parser-001",
   "provider": {
     "id": "codex",
-    "model": "gpt-5.6-terra"
+    "model": "configured-model",
+    "launch_config": {
+      "reasoning_effort": "configured-effort",
+      "service_tier": "configured-tier"
+    }
   },
   "exclusive_resources": [
     "service:integration-database"

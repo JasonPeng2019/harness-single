@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import processes
+from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
 from .core import read_json, require_schema
 from .epochs import (
@@ -196,6 +197,20 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         except (OSError, ValueError) as exc:
             raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
         provider_id = invocation["provider"]["id"]
+        try:
+            configured_launch = _validate_provider_launch_config(
+                harness_root,
+                provider_id=provider_id,
+                model=invocation["provider"].get("model"),
+                launch_config=invocation["provider"].get("launch_config"),
+            )
+        except BootstrapError as exc:
+            raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
+        if configured_launch != invocation["provider"].get("launch_config"):
+            raise LaunchError(
+                LAUNCH_INVOCATION_INVALID,
+                "provider launch configuration is not in its validated canonical form",
+            )
         binding_path = (
             harness_root / "orchestrator_harness" / "provider_adapters" / provider_id / "launcher_binding.py"
         )

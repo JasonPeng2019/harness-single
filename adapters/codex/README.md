@@ -11,5 +11,5 @@ Shipped adapter tree for the `codex` provider.
   `hooks/orchestrator_harness_stop.py`), worker binding, and the two worker
   skills (`manager-notify`, `lane-assignment`).
 - `harness/launcher_binding.py` — registered launcher binding
-  (`PROVIDER_ID = "codex"`, `ADAPTER_VERSION = "codex-v1"`).
+  (`PROVIDER_ID = "codex"`, `ADAPTER_VERSION = "codex-v2"`).
 - `shipped-machinery/` — adapter-author notes for the Codex transport.

@@ -54,6 +54,23 @@ SEND_LANE_NOT_RUNNING = "SEND_LANE_NOT_RUNNING"
 SEND_LANE_WRITE_FAILED = "SEND_LANE_WRITE_FAILED"
 
 
+def _provider_option(value: str) -> tuple[str, str]:
+    """Parse one explicit provider preference without interpreting its value."""
+    key, separator, configured = value.partition("=")
+    if not separator or not key.strip() or not configured.strip():
+        raise argparse.ArgumentTypeError("provider options must use NAME=VALUE")
+    return key.strip(), configured.strip()
+
+
+def _provider_options(values: list[tuple[str, str]]) -> dict[str, str]:
+    configured: dict[str, str] = {}
+    for key, value in values:
+        if key in configured:
+            raise ValueError(f"duplicate provider option: {key}")
+        configured[key] = value
+    return configured
+
+
 def _emit(result: dict[str, Any], *, as_json: bool) -> int:
     """Print one structured result and return the process exit code."""
     if as_json:
@@ -339,6 +356,14 @@ def _build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--lane-id", required=True)
     bootstrap_parser.add_argument("--provider", required=True)
     bootstrap_parser.add_argument("--model", required=True)
+    bootstrap_parser.add_argument(
+        "--provider-option",
+        action="append",
+        default=[],
+        type=_provider_option,
+        metavar="NAME=VALUE",
+        help="explicit provider launch preference; repeat for each adapter-required option",
+    )
     bootstrap_parser.add_argument("--exclusive-resource", action="append", default=[])
     bootstrap_parser.add_argument("--task-card", required=True)
     launch_parser = lane_sub.add_parser("launch", help="start one prepared lane")
@@ -414,6 +439,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 lane_id=args.lane_id,
                 provider=args.provider,
                 model=args.model,
+                launch_config=_provider_options(args.provider_option),
                 exclusive_resources=list(args.exclusive_resource),
                 task_card_path=args.task_card,
             )

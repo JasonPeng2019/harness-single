@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import controller, launch
+from orchestrator_harness.bootstrap import BOOTSTRAP_REQUEST_INVALID, BootstrapError
 from orchestrator_harness.controller import ControllerError
 from orchestrator_harness.leases import LeaseError
 
@@ -30,8 +31,37 @@ class LaunchHandshakeTests(unittest.TestCase):
         }
         self.invocation = {
             "schema": "controller-invocation/v1", "lane_id": "lane-1",
-            "run_id": "run-1", "provider": {"id": "codex"},
+            "run_id": "run-1", "provider": {
+                "id": "codex", "model": "configured-model",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            },
         }
+
+    def test_missing_provider_preferences_refuse_launch_before_spawn(self) -> None:
+        invocation = {
+            **self.invocation,
+            "provider": {"id": "codex", "model": "configured-model"},
+        }
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
+            patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
+            patch.object(launch, "read_record", return_value=invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                side_effect=BootstrapError(
+                    BOOTSTRAP_REQUEST_INVALID,
+                    "Codex launch_config must be an object",
+                ),
+            ),
+            patch.object(launch.processes, "spawn_detached") as spawn,
+        ):
+            result = launch.run_launch("lane-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
 
     def test_fast_terminal_status_is_a_successful_handshake(self) -> None:
         child = MagicMock(pid=41)
@@ -48,6 +78,11 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value={"pid": 41, "creation_time": "created-1"}),
             patch.object(launch, "update_lane", return_value=running_lane) as update,
@@ -68,6 +103,11 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value=None),
         ):
@@ -84,6 +124,11 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value={"pid": 41, "creation_time": "created-1"}),
             patch.object(launch, "update_lane", side_effect=OSError("write failed")),

@@ -31,26 +31,33 @@ class WatcherConfig:
     primary_owner_identity_path: Path | None = None
     attention_epoch_id: str | None = None
     evaluator_enabled: bool = False
+    evaluator_identity: tuple[tuple[str, str], ...] = ()
 
 
-def _command(raw: Any) -> tuple[str, ...]:
-    default = (
-        "codex",
-        "exec",
-        "--model",
-        "gpt-5.6-terra",
-        "-c",
-        'model_reasoning_effort="high"',
-        "--output-schema",
-        str(SCHEMA_PATH),
-        "-",
-    )
-    command = raw if raw is not None else list(default)
+def _command(raw: Any, *, enabled: bool) -> tuple[str, ...]:
+    command = [] if raw is None else raw
     if not isinstance(command, list) or not all(
         isinstance(x, str) and x for x in command
     ):
         raise ValueError("evaluator_command must be command strings")
+    if enabled and not command:
+        raise ValueError("evaluator_command is required when evaluator_enabled")
     return tuple(str(SCHEMA_PATH) if x == "REPLACED_BY_LOADER" else x for x in command)
+
+
+def _identity(raw: Any, *, enabled: bool) -> tuple[tuple[str, str], ...]:
+    identity = {} if raw is None else raw
+    if not isinstance(identity, dict) or not all(
+        isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+        for key, value in identity.items()
+    ):
+        raise ValueError("evaluator_identity must contain non-empty string fields")
+    if enabled and not identity:
+        raise ValueError("evaluator_identity is required when evaluator_enabled")
+    return tuple(sorted(identity.items()))
 
 
 def load_config(path: str | Path | None = None) -> WatcherConfig:
@@ -172,7 +179,7 @@ def load_config(path: str | Path | None = None) -> WatcherConfig:
         interval,
         threshold,
         tail,
-        _command(raw.get("evaluator_command")),
+        _command(raw.get("evaluator_command"), enabled=enabled),
         tuple(sources),
         attention_enabled,
         tuple(producers),
@@ -180,4 +187,5 @@ def load_config(path: str | Path | None = None) -> WatcherConfig:
         identity_path,
         epoch,
         enabled,
+        _identity(raw.get("evaluator_identity"), enabled=enabled),
     )

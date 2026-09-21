@@ -227,7 +227,7 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
 
 
 def _attention_only_source(cfg: WatcherConfig, path: str) -> bool:
-    """Attention timelines are ingested separately and must not drive Terra reviews."""
+    """Attention timelines are ingested separately and must not drive evaluator reviews."""
     return any(
         str(source.path) == path
         and source.role == "harness"
@@ -598,7 +598,12 @@ def poll(config: WatcherConfig, evaluator: Evaluator | None = None) -> dict[str,
             {"packet_id": packet["packet_id"], "error": str(exc)},
         )
         return {"packet": packet, "alert": None, "evaluation_error": str(exc)}
-    alert = save_alert(config.runtime_root, verdict, packet)
+    alert = save_alert(
+        config.runtime_root,
+        verdict,
+        packet,
+        dict(config.evaluator_identity),
+    )
     log(
         config.runtime_root,
         "watcher",

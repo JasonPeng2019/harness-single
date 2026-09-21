@@ -7,12 +7,36 @@ from pathlib import Path
 from typing import Any
 
 PROVIDER_ID = "codex"
-ADAPTER_VERSION = "codex-v1"
+ADAPTER_VERSION = "codex-v2"
+
+_LAUNCH_CONFIG_KEYS = frozenset({"reasoning_effort", "service_tier"})
+
+
+def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+    """Validate every Codex model preference before a provider can start."""
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Codex model must be configured")
+    if not isinstance(launch_config, dict):
+        raise ValueError("Codex launch_config must be an object")
+    missing = sorted(_LAUNCH_CONFIG_KEYS - set(launch_config))
+    if missing:
+        raise ValueError(f"Codex launch_config is missing: {', '.join(missing)}")
+    unsupported = sorted(set(launch_config) - _LAUNCH_CONFIG_KEYS)
+    if unsupported:
+        raise ValueError(f"Codex launch_config has unsupported options: {', '.join(unsupported)}")
+    normalized: dict[str, str] = {}
+    for key in sorted(_LAUNCH_CONFIG_KEYS):
+        value = launch_config[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Codex launch_config {key} must be a non-empty string")
+        normalized[key] = value.strip()
+    return normalized
 
 
 def build_argv(
     *,
     model: str,
+    launch_config: dict[str, Any],
     worktree: str,
     prompt_path: str,
     session_id: str | None = None,
@@ -20,6 +44,7 @@ def build_argv(
 ) -> list[str]:
     """Build the provider-owned, stdin-prompted Codex launch vector."""
     del prompt_path
+    configured = validate_launch_config(model=model, launch_config=launch_config)
     argv = ["codex", "exec"]
     if resume:
         if not session_id:
@@ -34,9 +59,9 @@ def build_argv(
             "-m",
             model,
             "-c",
-            'model_reasoning_effort="medium"',
+            f"model_reasoning_effort={json.dumps(configured['reasoning_effort'])}",
             "-c",
-            'service_tier="priority"',
+            f"service_tier={json.dumps(configured['service_tier'])}",
             "--dangerously-bypass-hook-trust",
             "-c",
             "features.hooks=true",

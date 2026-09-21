@@ -289,6 +289,7 @@ def run_resume(
             run_id=run_id,
             provider_id=lane["provider"]["id"],
             model=lane["provider"]["model"],
+            launch_config=lane["provider"]["launch_config"],
             exclusive_resources=exclusive_resources,
         )
         invocation_path = worktree / ".agent-workspace" / "invocation.json"

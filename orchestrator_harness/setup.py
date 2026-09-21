@@ -670,7 +670,7 @@ def _load_binding(path: Path) -> Any:
 
 
 def _validate_binding_module(path: Path, provider_id: str) -> None:
-    """Require exact PROVIDER_ID plus ADAPTER_VERSION/build_argv/parse_line."""
+    """Require exact identity plus the complete configurable-launch contract."""
     try:
         module = _load_binding(path)
     except Exception as exc:
@@ -690,7 +690,7 @@ def _validate_binding_module(path: Path, provider_id: str) -> None:
             SETUP_CONFIG_INVALID,
             f"launcher binding {path} lacks a non-empty ADAPTER_VERSION",
         )
-    for symbol in ("build_argv", "parse_line"):
+    for symbol in ("validate_launch_config", "build_argv", "parse_line"):
         if not callable(getattr(module, symbol, None)):
             raise SetupError(
                 SETUP_CONFIG_INVALID,

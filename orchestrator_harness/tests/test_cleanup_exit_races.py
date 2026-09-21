@@ -65,7 +65,11 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "configured-model",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            },
         }
         self.terminal_status = {
             "schema": "controller-status/v1",
@@ -152,6 +156,11 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             ),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
+            patch.object(
                 launch.processes, "spawn_detached", return_value=child
             ),
             patch.object(launch, "update_lane", side_effect=update),
@@ -197,6 +206,11 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
                 launch, "find_active_lane", return_value=("epoch-1", self.lane)
             ),
             patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
             patch.object(
                 launch.processes, "spawn_detached", return_value=child
             ),

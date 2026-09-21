@@ -21,7 +21,7 @@ from .attention import (
     make_source_record,
 )
 from .config import load_config
-from .evaluator import TerraHighEvaluator
+from .evaluator import CommandEvaluator
 from .logging import log
 from .poller import initialize_service_cursor, poll
 
@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "alert": poll(
                         cfg,
-                        TerraHighEvaluator(cfg.evaluator_command)
+                        CommandEvaluator(cfg.evaluator_command, cfg.evaluator_identity)
                         if cfg.evaluator_enabled
                         else None,
                     )["alert"]
@@ -345,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 poll(
                     cfg,
-                    TerraHighEvaluator(cfg.evaluator_command)
+                    CommandEvaluator(cfg.evaluator_command, cfg.evaluator_identity)
                     if cfg.evaluator_enabled
                     else None,
                 )

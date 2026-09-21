@@ -131,20 +131,23 @@ class FakeEvaluator:
         return validate_verdict(self.verdict, packet=packet)
 
 
-class TerraHighEvaluator:
+class CommandEvaluator:
     """Launcher contract: configured command receives packet JSON on stdin and emits one verdict JSON."""
 
-    model = "gpt-5.6-terra"
-    reasoning = "high"
-
-    def __init__(self, command: tuple[str, ...]):
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        identity: tuple[tuple[str, str], ...] = (),
+    ):
         self.command = command
+        self.identity = dict(identity)
 
     def evaluate(self, packet: dict[str, Any]) -> Verdict:
         if not self.command:
-            raise RuntimeError("Terra-high evaluator command is required")
+            raise RuntimeError("configured evaluator command is required")
         prompt = {
-            "role": "GPT-5.6-terra-high harness watcher",
+            "role": "configured harness watcher evaluator",
+            "evaluator_identity": self.identity,
             "instructions": evaluator_instructions(),
             "packet": packet,
         }
@@ -157,5 +160,5 @@ class TerraHighEvaluator:
             check=False,
         )
         if result.returncode:
-            raise RuntimeError("Terra-high evaluator failed")
+            raise RuntimeError("configured evaluator failed")
         return validate_verdict(json.loads(result.stdout), packet=packet)

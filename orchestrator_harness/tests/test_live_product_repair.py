@@ -181,7 +181,11 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "configured-model",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            },
         }
         binding = (
             "PROVIDER_ID = 'codex'\n"
@@ -239,6 +243,11 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.invocation["provider"]["launch_config"],
+            ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(
                 launch.processes,

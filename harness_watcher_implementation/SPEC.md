@@ -4,7 +4,8 @@
 
 Add an optional, passive deterministic watcher service around `orchestrator_harness`. It observes
 manager, harness, and lane logs every five minutes. Outside M5, an optional isolated evaluator may
-ask one persistent `gpt-5.6-terra` high-reasoning role to classify only clear orchestration defects.
+ask one explicitly configured role to classify only clear orchestration defects. The watcher has
+no built-in evaluator provider, model, effort, tier, or command.
 The service itself is not an AI subagent. In M5 its evaluator is disabled, so it only records and
 diagnoses evidence and cannot notify or wake the manager. Healthy work continues without
 interruption. When evaluation is enabled outside M5, a confirmed defect becomes one durable alert
@@ -26,10 +27,11 @@ pauses work, repairs the harness, and resumes the suite.
    - exits if disabled or cooperatively stopped;
    - records PID plus process creation identity so stale/reused PIDs are not trusted.
 4. Each poll reads only configured, bounded log tails and builds an immutable review packet.
-5. The deterministic watcher service has no model role. Its optional evaluator is configured as
-   `gpt-5.6-terra`, high reasoning, and isolated behind an interface so host tests can use
-   deterministic fakes. When enabled, a verdict must conform to a strict schema and cite observed
-   evidence. Counted M5 sprints set `evaluator_enabled: false`.
+5. The deterministic watcher service has no model role. Its optional evaluator requires an
+   explicit `evaluator_command` and `evaluator_identity` before it can be enabled and is isolated
+   behind an interface so host tests can use deterministic fakes. When enabled, a verdict must
+   conform to a strict schema and cite observed evidence. Counted M5 sprints set
+   `evaluator_enabled: false`.
 6. Detection admits only meaningful harness defects:
    - repeated/looping/redundant stages;
    - progress starvation beyond the configured bound;
@@ -99,7 +101,7 @@ pending-notification and exact-event acknowledgement path. Alert data includes:
 - implicated roles/lanes;
 - cited log paths, hashes/offsets, and signatures;
 - the required safe-response sequence;
-- watcher model/reasoning metadata.
+- configured evaluator identity metadata.
 
 Acknowledging the harness notification means “manager received it,” not “fixed.” Resolution
 requires the ordered recovery ledger to reach `RESOLVED`.

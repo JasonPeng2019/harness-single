@@ -20,14 +20,19 @@ Each `harness/launcher_binding.py` must define the strict symbols:
 
 - `PROVIDER_ID` — the provider id, matching the catalog directory name.
 - `ADAPTER_VERSION` — a version string for the binding.
-- `build_argv(*, model, worktree, prompt_path, session_id=None, resume=False)`
+- `validate_launch_config(*, model, launch_config)` — reject missing, unknown, or invalid provider
+  preferences and return their canonical string mapping before any lane mutation.
+- `build_argv(*, model, launch_config, worktree, prompt_path, session_id=None, resume=False)`
   — assemble the provider's headless launch argument vector.
 - `parse_line(line)` — read one provider output line into a dict with
   optional `message`, `session_id`, and `non_retryable_failure` keys, or `None`.
 
 Each binding implements native continuation in its own `build_argv`: a resume call uses the
 saved provider session and `resume=True`; a missing session is an honest error, never a
-fresh-context fallback. Provider startup/auth/process failures are marked non-retryable.
+fresh-context fallback. The exact model and canonical launch configuration are recorded at
+bootstrap and reused on continuation. Bindings may hard-code transport and safety flags required
+by the harness contract, but never a model, reasoning effort, service tier, fallback model, or
+other model preference. Provider startup/auth/process failures are marked non-retryable.
 
 The controller loads the single registered binding and checks that its
 `PROVIDER_ID` matches before use.

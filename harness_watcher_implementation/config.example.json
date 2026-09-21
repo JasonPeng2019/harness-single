@@ -25,17 +25,8 @@
   "runtime_root": "harness_watcher",
   "no_progress_seconds": 900,
   "max_tail_bytes": 65536,
-  "evaluator_command": [
-    "codex",
-    "exec",
-    "--model",
-    "gpt-5.6-terra",
-    "-c",
-    "model_reasoning_effort=\"high\"",
-    "--output-schema",
-    "REPLACED_BY_LOADER",
-    "-"
-  ],
+  "evaluator_command": [],
+  "evaluator_identity": {},
   "attention_logging_enabled": false,
   "evaluator_enabled": false,
   "attention_producers": [

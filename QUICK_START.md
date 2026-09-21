@@ -45,13 +45,21 @@ provider.
 
 ```powershell
 python -m orchestrator_harness.operator_launch lane bootstrap `
-  --lane-id lane-01 --provider codex --model <model> --task-card <path-to-task-card.json>
+  --lane-id lane-01 --provider codex --model <model> `
+  --provider-option reasoning_effort=<effort> `
+  --provider-option service_tier=<tier> `
+  --task-card <path-to-task-card.json>
 ```
 
 `--task-card` names a `project-task-card/v1` file (task text, branch, base commit). Add
 `--exclusive-resource <id>` for each resource declared in the manifest. Bootstrap creates the
 worktree, stages the super-cache base and the selected provider payload, and writes the worker
 binding. Shipped provider IDs: `codex`, `claude-code`, `qwen-code`.
+
+Launch preferences have no harness defaults. Codex requires `reasoning_effort` and `service_tier`;
+Claude Code requires `effort`; Qwen Code currently requires only `--model`. Each option uses a
+repeated `--provider-option NAME=VALUE`. Bootstrap rejects missing, duplicate, or unsupported
+preferences before creating the lane, and resume reuses the recorded values unchanged.
 
 ## 4. Launch
 

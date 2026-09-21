@@ -287,6 +287,7 @@ def _run_provider(
         resume = bool(session_id)
     argv = binding.build_argv(
         model=invocation["provider"]["model"],
+        launch_config=invocation["provider"]["launch_config"],
         worktree=str(worktree),
         prompt_path=str(prompt_path),
         session_id=session_id,

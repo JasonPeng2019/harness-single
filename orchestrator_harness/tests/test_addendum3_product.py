@@ -767,7 +767,13 @@ class Addendum3ProductTests(unittest.TestCase):
             "last_message_path": str(workspace / "last-message.txt"),
             "session": {"session_id": "saved-native-session"},
         }
-        invocation = {"provider": {"id": "provider-1", "model": "model-1"}}
+        invocation = {
+            "provider": {
+                "id": "provider-1",
+                "model": "model-1",
+                "launch_config": {"effort": "configured-effort"},
+            }
+        }
         expected_argv = [
             "provider-cli",
             "--resume",
@@ -829,6 +835,7 @@ class Addendum3ProductTests(unittest.TestCase):
 
         binding.build_argv.assert_called_once_with(
             model="model-1",
+            launch_config={"effort": "configured-effort"},
             worktree=str(worktree),
             prompt_path=str(prompt),
             session_id="saved-native-session",
@@ -1206,7 +1213,12 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider": {"id": "codex", "model": "model-1"},
             "session": {},
         }
-        invocation = {"provider": {"model": "model-1"}}
+        invocation = {
+            "provider": {
+                "model": "model-1",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            }
+        }
         binding = MagicMock()
         binding.build_argv.return_value = ["codex", "exec"]
         binding.parse_line.return_value = {
@@ -1389,7 +1401,11 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-old",
             "worktree_path": str(worktree),
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            },
             "session": {"session_id": "session-1"},
             "lifecycle": "review_pending",
             "process": {},
@@ -1460,7 +1476,11 @@ class Addendum3ProductTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "configured-model",
+                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+            },
         }
         child = MagicMock(pid=41)
         child.poll.return_value = 0
@@ -1483,6 +1503,11 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
             patch.object(launch, "read_record", return_value=invocation),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=invocation["provider"]["launch_config"],
+            ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(
                 launch.processes,

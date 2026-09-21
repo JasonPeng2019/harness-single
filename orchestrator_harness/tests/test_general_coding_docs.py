@@ -54,6 +54,10 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
         )
         self.assertEqual("controller-invocation/v1", invocation["schema"])
         self.assertEqual("codex", invocation["provider"]["id"])
+        self.assertEqual(
+            {"reasoning_effort", "service_tier"},
+            set(invocation["provider"]["launch_config"]),
+        )
         self.assertIn("exclusive_resources", invocation)
 
     def test_v2_operator_contract_is_explicit_and_scoped(self) -> None:

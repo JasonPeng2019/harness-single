@@ -2,9 +2,10 @@
 
 Notes for adapter authors maintaining the Qwen Code payload.
 
-- Launch transport: `qwen --approval-mode=yolo --model <model>
+- Launch transport: `qwen --approval-mode=yolo --model <configured-model>
   --output-format stream-json` with the prompt on stdin; resume adds
   `--resume <session-id>`.
+- The model is required bootstrap configuration; the adapter supplies no model or fallback.
 - Transcript facts: JSON lines with `type` `interrupt`, `system` (`subtype`
   `init`), or `result`; the session id is `session_id` or `sessionId`.
 - Hooks: the ROOT payload declares the PostToolUse hook in `hooks.json`

@@ -69,6 +69,7 @@ class MaterializationFixture:
         binding = (
             f"PROVIDER_ID = {provider_id!r}\n"
             "ADAPTER_VERSION = 'test-v1'\n"
+            "def validate_launch_config(*, model, launch_config): return dict(launch_config)\n"
             "def build_argv(**kwargs): return [PROVIDER_ID]\n"
             "def parse_line(line): return None\n"
         )
@@ -106,6 +107,7 @@ class MaterializationFixture:
         binding = (
             f"PROVIDER_ID = {provider_id!r}\n"
             "ADAPTER_VERSION = 'test-v1'\n"
+            "def validate_launch_config(*, model, launch_config): return dict(launch_config)\n"
             "def build_argv(**kwargs): return [PROVIDER_ID]\n"
             "def parse_line(line): return None\n"
         )
@@ -795,6 +797,49 @@ class V2MaterializationTests(unittest.TestCase):
             (worktree / ".agent-workspace" / "manager-notifications").is_dir()
         )
 
+    def test_bootstrap_rejects_missing_provider_preferences_before_mutation(self) -> None:
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "enabled",
+            },
+        )
+        task_card = self.fixture.root / "invalid-launch-task.json"
+        self.fixture._write_json(
+            task_card,
+            {"schema": "project-task-card/v1", "task": "must not create a worktree"},
+        )
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch") as open_epoch,
+            patch.object(bootstrap, "_git_worktree_add") as git_add,
+            patch.object(
+                bootstrap,
+                "_validate_provider_launch_config",
+                side_effect=bootstrap.BootstrapError(
+                    bootstrap.BOOTSTRAP_REQUEST_INVALID,
+                    "codex launch configuration requires reasoning_effort",
+                ),
+            ),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="missing-preferences",
+                provider="codex",
+                model="configured-model",
+                launch_config={},
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(bootstrap.BOOTSTRAP_REQUEST_INVALID, result["code"])
+        self.assertIn("reasoning_effort", result["summary"])
+        open_epoch.assert_not_called()
+        git_add.assert_not_called()
+
     def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(self) -> None:
         result, worktree = self._bootstrap(
             "plain-lane", managed=False, provider="codex"
@@ -874,6 +919,13 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id=lane_id,
                 provider=provider,
                 model="test-model",
+                launch_config=(
+                    {"reasoning_effort": "high", "service_tier": "priority"}
+                    if provider == "codex"
+                    else {"effort": "high"}
+                    if provider == "claude-code"
+                    else {}
+                ),
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )

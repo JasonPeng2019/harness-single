@@ -32,7 +32,7 @@ from harness_watcher_implementation.evaluator import (
     FakeEvaluator,
     OWNERSHIP_PHASE_RULES,
     STALE_STATUS_QUARANTINE_RULE,
-    TerraHighEvaluator,
+    CommandEvaluator,
     validate_verdict,
 )
 from harness_watcher_implementation.poller import initialize_service_cursor, poll
@@ -377,7 +377,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertIn('"event_type":"EVALUATOR_SKIPPED"', events)
         self.assertIn('"evaluator_enabled":false', events)
 
-    def test_evaluator_enabled_config_defaults_false_and_rejects_non_boolean(
+    def test_evaluator_enabled_requires_explicit_command_and_identity(
         self,
     ) -> None:
         config = self.root / "watcher.json"
@@ -392,7 +392,33 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             json.dumps({"runtime_root": "runtime", "evaluator_enabled": True}),
             encoding="utf-8",
         )
-        self.assertTrue(load_config(config).evaluator_enabled)
+        with self.assertRaisesRegex(ValueError, "evaluator_command is required"):
+            load_config(config)
+        config.write_text(
+            json.dumps(
+                {
+                    "runtime_root": "runtime",
+                    "evaluator_enabled": True,
+                    "evaluator_command": ["configured-provider", "--configured"],
+                    "evaluator_identity": {
+                        "provider": "configured-provider",
+                        "model": "configured-model",
+                        "effort": "configured-effort",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_config(config)
+        self.assertTrue(loaded.evaluator_enabled)
+        self.assertEqual(
+            {
+                "provider": "configured-provider",
+                "model": "configured-model",
+                "effort": "configured-effort",
+            },
+            dict(loaded.evaluator_identity),
+        )
         config.write_text(
             json.dumps({"runtime_root": "runtime", "evaluator_enabled": "true"}),
             encoding="utf-8",
@@ -696,7 +722,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                 runner, "_identity", return_value={"pid": 12, "created_utc": "watcher"}
             ),
             patch.object(runner, "initialize_service_cursor"),
-            patch.object(runner, "TerraHighEvaluator", return_value=evaluator),
+            patch.object(runner, "CommandEvaluator", return_value=evaluator),
             patch.object(runner, "_sleep_until", side_effect=sleep_until),
         ):
             self.assertEqual(0, runner.main(["serve", "--startup-token", "token"]))
@@ -1062,51 +1088,22 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             cfg.observed_log_roots[0],
         )
 
-    def test_default_config_requires_a_real_terra_evaluator_command(self) -> None:
-        """Production defaults cannot silently replace the mandated Terra-high reviewer with a fake."""
+    def test_default_config_has_no_evaluator_launch_preferences(self) -> None:
         cfg = load_config()
-        self.assertTrue(
-            cfg.evaluator_command,
-            "missing evaluator command silently produces a FakeEvaluator healthy verdict",
-        )
-        rendered = " ".join(cfg.evaluator_command)
-        self.assertIn("codex", rendered)
-        self.assertIn("gpt-5.6-terra", rendered)
-        self.assertIn("high", rendered)
-        help_text = subprocess.run(
-            ["codex", "exec", "--help"], text=True, capture_output=True, check=True
-        ).stdout
-        unsupported = [
-            part
-            for part in cfg.evaluator_command
-            if part.startswith("--") and part not in help_text
-        ]
-        self.assertEqual(
-            [], unsupported, f"default codex flags are unsupported: {unsupported}"
-        )
+        self.assertFalse(cfg.evaluator_enabled)
+        self.assertEqual((), cfg.evaluator_command)
+        self.assertEqual((), cfg.evaluator_identity)
 
-    def test_example_config_has_a_usable_real_evaluator_command(self) -> None:
+    def test_example_config_does_not_choose_an_evaluator(self) -> None:
         cfg = load_config("harness_watcher_implementation/config.example.json")
-        self.assertTrue(
-            cfg.evaluator_command,
-            "config.example.json must not override the real default with []",
-        )
+        self.assertFalse(cfg.evaluator_enabled)
+        self.assertEqual((), cfg.evaluator_command)
+        self.assertEqual((), cfg.evaluator_identity)
         self.assertTrue(
             {"orchestrator", "harness", "subagent"}.issubset(
                 {item.role for item in cfg.observed_sources}
             ),
             "production example must declare manager, harness, and lane sources so a real epoch can populate all four trees",
-        )
-        help_text = subprocess.run(
-            ["codex", "exec", "--help"], text=True, capture_output=True, check=True
-        ).stdout
-        unsupported = [
-            part
-            for part in cfg.evaluator_command
-            if part.startswith("--") and part not in help_text
-        ]
-        self.assertEqual(
-            [], unsupported, f"configured codex flags are unsupported: {unsupported}"
         )
 
     def test_alert_is_deduplicated_then_resolved_in_strict_order(self) -> None:
@@ -1530,7 +1527,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             poll(self.config, evaluator)
         self.assertIn("STALE_STATUS", evaluator.packets[-1]["observations"][-1]["text"])
 
-    def test_terra_prompt_and_review_packet_bind_the_ownership_phase_rules(
+    def test_configured_evaluator_prompt_and_review_packet_bind_the_ownership_phase_rules(
         self,
     ) -> None:
         class CapturingEvaluator:
@@ -1552,7 +1549,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             capture.packet["constraints"]["stale_status_quarantine_rule"],
         )
         completed = subprocess.CompletedProcess(
-            ("terra",),
+            ("configured-evaluator",),
             0,
             json.dumps(
                 {
@@ -1570,7 +1567,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            TerraHighEvaluator(("terra",)).evaluate(capture.packet)
+            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(
             capture.packet["constraints"]["ownership_phase_rules"],
@@ -1580,7 +1577,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             self.assertIn(rule["rule"], prompt["instructions"])
         self.assertIn(STALE_STATUS_QUARANTINE_RULE["rule"], prompt["instructions"])
 
-    def test_recorded_pre_request_ambiguity_and_request_awaiting_loss_remain_distinct_for_terra(
+    def test_recorded_pre_request_ambiguity_and_request_awaiting_loss_remain_distinct_for_evaluator(
         self,
     ) -> None:
         class CapturingEvaluator:
@@ -1633,7 +1630,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertIn("setup_preparation", observed)
         self.assertIn("awaiting_permission_relay", observed)
         completed = subprocess.CompletedProcess(
-            ("terra",),
+            ("configured-evaluator",),
             0,
             json.dumps(
                 {
@@ -1651,7 +1648,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            TerraHighEvaluator(("terra",)).evaluate(capture.packet)
+            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertIn("setup_preparation", prompt["packet"]["observations"][0]["text"])
         self.assertIn(

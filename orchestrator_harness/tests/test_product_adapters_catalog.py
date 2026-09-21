@@ -288,14 +288,20 @@ class RegisteredBindingTests(unittest.TestCase):
         codex = self._load_registered("codex")
         argv = codex.build_argv(
             model="gpt-5.4",
+            launch_config={"reasoning_effort": "high", "service_tier": "flex"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
         self.assertEqual(argv[0], "codex")
         self.assertIn("exec", argv)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertIn('service_tier="flex"', argv)
+        self.assertNotIn('model_reasoning_effort="medium"', argv)
+        self.assertNotIn('service_tier="priority"', argv)
         resume_argv = codex.build_argv(
             model="gpt-5.4",
+            launch_config={"reasoning_effort": "xhigh", "service_tier": "priority"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
             session_id="s1",
@@ -307,6 +313,7 @@ class RegisteredBindingTests(unittest.TestCase):
         claude = self._load_registered("claude-code")
         argv = claude.build_argv(
             model="deepseek-v4-flash:0731-cloud",
+            launch_config={"effort": "low"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
@@ -315,8 +322,10 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
         self.assertIn("--verbose", argv)
+        self.assertEqual(["--effort", "low"], argv[argv.index("--effort") : argv.index("--effort") + 2])
         claude_resume = claude.build_argv(
             model="sonnet",
+            launch_config={"effort": "max"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
             session_id="claude-session-1",
@@ -331,6 +340,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "session ID"):
             claude.build_argv(
                 model="sonnet",
+                launch_config={"effort": "high"},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                 resume=True,
@@ -340,6 +350,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with mock.patch.object(qwen.shutil, "which", return_value=None):
             argv = qwen.build_argv(
                 model="qwen3-coder",
+                launch_config={},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
             )
@@ -350,6 +361,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with mock.patch.object(qwen.shutil, "which", return_value=None):
             qwen_resume = qwen.build_argv(
                 model="qwen3-coder",
+                launch_config={},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                 session_id="qwen-session-1",
@@ -358,6 +370,7 @@ class RegisteredBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "session ID"):
                 qwen.build_argv(
                     model="qwen3-coder",
+                    launch_config={},
                     worktree="C:/wt",
                     prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                     resume=True,
@@ -373,6 +386,7 @@ class RegisteredBindingTests(unittest.TestCase):
         qwen = self._load_registered("qwen-code")
         kwargs = {
             "model": "qwen3-coder",
+            "launch_config": {},
             "worktree": "C:/wt",
             "prompt_path": "C:/wt/.agent-workspace/worker-prompt.md",
         }
@@ -390,6 +404,46 @@ class RegisteredBindingTests(unittest.TestCase):
         discover.assert_called_once_with("qwen")
         self.assertEqual(argv[0], "qwen")
         self.assertIn("--approval-mode=yolo", argv)
+
+    def test_launch_preferences_are_required_and_adapter_validated(self) -> None:
+        codex = self._load_registered("codex")
+        claude = self._load_registered("claude-code")
+        qwen = self._load_registered("qwen-code")
+        common = {
+            "model": "configured-model",
+            "worktree": "C:/wt",
+            "prompt_path": "C:/wt/.agent-workspace/worker-prompt.md",
+        }
+        with self.assertRaisesRegex(ValueError, "reasoning_effort"):
+            codex.build_argv(**common, launch_config={"service_tier": "priority"})
+        with self.assertRaisesRegex(ValueError, "service_tier"):
+            codex.build_argv(**common, launch_config={"reasoning_effort": "high"})
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            codex.build_argv(
+                **common,
+                launch_config={
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                    "fallback_model": "hidden-default",
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "effort"):
+            claude.build_argv(**common, launch_config={})
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            qwen.build_argv(**common, launch_config={"effort": "medium"})
+        for binding, launch_config in (
+            (codex, {"reasoning_effort": "high", "service_tier": "priority"}),
+            (claude, {"effort": "high"}),
+            (qwen, {}),
+        ):
+            with self.subTest(provider=binding.PROVIDER_ID):
+                with self.assertRaisesRegex(ValueError, "model"):
+                    binding.build_argv(
+                        model="",
+                        launch_config=launch_config,
+                        worktree="C:/wt",
+                        prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
+                    )
 
     def test_parse_line_facts(self) -> None:
         codex = self._load_registered("codex")

@@ -10,5 +10,5 @@ Shipped adapter tree for the `claude-code` provider.
   `hooks/orchestrator_harness_stop.py`, worker binding, and the two
   worker skills (`manager-notify`, `lane-assignment`).
 - `harness/launcher_binding.py` — registered launcher binding
-  (`PROVIDER_ID = "claude-code"`, `ADAPTER_VERSION = "claude-code-v1"`).
+  (`PROVIDER_ID = "claude-code"`, `ADAPTER_VERSION = "claude-code-v2"`).
 - `shipped-machinery/` — adapter-author notes for the Claude Code transport.
