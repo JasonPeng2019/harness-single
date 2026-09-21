@@ -10,6 +10,7 @@ PROVIDER_ID = "codex"
 ADAPTER_VERSION = "codex-v2"
 
 _LAUNCH_CONFIG_KEYS = frozenset({"reasoning_effort", "service_tier"})
+_OPTIONAL_LAUNCH_CONFIG_KEYS = frozenset({"launcher"})
 
 
 def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
@@ -21,7 +22,7 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
     missing = sorted(_LAUNCH_CONFIG_KEYS - set(launch_config))
     if missing:
         raise ValueError(f"Codex launch_config is missing: {', '.join(missing)}")
-    unsupported = sorted(set(launch_config) - _LAUNCH_CONFIG_KEYS)
+    unsupported = sorted(set(launch_config) - _LAUNCH_CONFIG_KEYS - _OPTIONAL_LAUNCH_CONFIG_KEYS)
     if unsupported:
         raise ValueError(f"Codex launch_config has unsupported options: {', '.join(unsupported)}")
     normalized: dict[str, str] = {}
@@ -30,6 +31,10 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"Codex launch_config {key} must be a non-empty string")
         normalized[key] = value.strip()
+    if "launcher" in launch_config:
+        if launch_config["launcher"] not in ("codex", "ollama"):
+            raise ValueError("Codex launch_config launcher must be codex or ollama")
+        normalized["launcher"] = launch_config["launcher"]
     return normalized
 
 
@@ -75,6 +80,12 @@ def build_argv(
     if not resume:
         argv.extend(["--cd", worktree])
     argv.append("-")
+    if configured.get("launcher") == "ollama":
+        # Ollama owns the model/profile arguments and forwards stdin unchanged.
+        # Passing Codex's -m as an extra argument is rejected by ollama launch.
+        model_index = argv.index("-m")
+        del argv[model_index:model_index + 2]
+        return ["ollama", "launch", "codex", "--model", model, "--yes", "--", *argv[1:]]
     return argv
 
 
