@@ -12,6 +12,75 @@ from unittest.mock import MagicMock, patch
 from orchestrator_harness import bootstrap, setup
 
 
+class GitWorktreeFailureCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _completed(returncode: int, *, stderr: str = "") -> MagicMock:
+        return MagicMock(returncode=returncode, stderr=stderr, stdout="")
+
+    def test_failed_add_removes_branch_created_by_the_attempt(self) -> None:
+        root = Path("root-workspace")
+        target = Path("runtime/worktrees/epoch/lane")
+        branch = "lane/failed-add"
+        completed = [
+            self._completed(1),
+            self._completed(128, stderr="checkout failed"),
+            self._completed(128, stderr="not a registered worktree"),
+            self._completed(0),
+            self._completed(0),
+            self._completed(1),
+        ]
+        with patch.object(bootstrap.subprocess, "run", side_effect=completed) as run:
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "checkout failed"):
+                bootstrap._git_worktree_add(root, branch, target, "base")
+
+        commands = [entry.args[0] for entry in run.call_args_list]
+        branch_ref = f"refs/heads/{branch}"
+        self.assertEqual(
+            ["git", "-C", str(root), "show-ref", "--verify", "--quiet", branch_ref],
+            commands[0],
+        )
+        self.assertEqual(
+            [
+                "git",
+                "-C",
+                str(root),
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(target),
+                "base",
+            ],
+            commands[1],
+        )
+        self.assertIn(
+            ["git", "-C", str(root), "branch", "-D", "--", branch], commands
+        )
+        self.assertEqual(
+            ["git", "-C", str(root), "show-ref", "--verify", "--quiet", branch_ref],
+            commands[-1],
+        )
+
+    def test_failed_add_preserves_preexisting_branch(self) -> None:
+        root = Path("root-workspace")
+        target = Path("runtime/worktrees/epoch/lane")
+        branch = "lane/existing"
+        completed = [
+            self._completed(0),
+            self._completed(128, stderr="branch already exists"),
+            self._completed(128, stderr="not a registered worktree"),
+            self._completed(0),
+        ]
+        with patch.object(bootstrap.subprocess, "run", side_effect=completed) as run:
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "branch already exists"):
+                bootstrap._git_worktree_add(root, branch, target, "base")
+
+        commands = [entry.args[0] for entry in run.call_args_list]
+        self.assertNotIn(
+            ["git", "-C", str(root), "branch", "-D", "--", branch], commands
+        )
+
+
 class MaterializationFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -427,6 +496,22 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(setup.SETUP_ADAPTER_COLLISION, duplicate.exception.code)
         self.assertFalse((self.fixture.root_workspace / "same.txt").exists())
 
+    def test_overlay_reuses_identical_existing_file(self) -> None:
+        source = self.fixture.root / "identical-overlay-source"
+        destination = self.fixture.root / "identical-overlay-destination"
+        self.fixture._write_text(source / "existing.txt", "same\n")
+        self.fixture._write_text(source / "new.txt", "new\n")
+        self.fixture._write_text(destination / "existing.txt", "same\n")
+        before = (destination / "existing.txt").stat().st_mtime_ns
+
+        bootstrap._copy_overlay(source, destination)
+
+        self.assertEqual(
+            "same\n", (destination / "existing.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(before, (destination / "existing.txt").stat().st_mtime_ns)
+        self.assertEqual("new\n", (destination / "new.txt").read_text(encoding="utf-8"))
+
     def test_overwrite_replaces_only_planned_root_payloads(self) -> None:
         planned = (
             self.fixture.harness
@@ -796,6 +881,192 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertTrue(
             (worktree / ".agent-workspace" / "manager-notifications").is_dir()
         )
+
+    def test_managed_codex_payload_preserves_valid_existing_config(self) -> None:
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        self.fixture.active_cache()
+        payload_config = (
+            runtime
+            / "super-cache"
+            / "adapter-payloads"
+            / "codex"
+            / ".codex"
+            / "config.toml"
+        )
+        self.fixture._write_text(
+            payload_config,
+            '[features]\nhooks = true\nmodel = "managed-default"\n',
+        )
+        worktree = runtime / "worktrees" / "epoch-1" / "codex-config"
+        existing_config = worktree / ".codex" / "config.toml"
+        original = b'# product-owned config\n[features]\nhooks = true\n'
+        existing_config.parent.mkdir(parents=True, exist_ok=True)
+        existing_config.write_bytes(original)
+        payload_hooks = payload_config.with_name("hooks.json")
+        shipped_hook = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python .codex/hooks/orchestrator_harness_stop.py",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        self.fixture._write_json(payload_hooks, shipped_hook)
+        existing_hooks = worktree / ".codex" / "hooks.json"
+        combined_hooks = {
+            "description": "product hooks",
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "start"}]}],
+                **shipped_hook["hooks"],
+            },
+        }
+        self.fixture._write_json(existing_hooks, combined_hooks)
+        original_hooks = existing_hooks.read_bytes()
+        (worktree / ".agent-workspace").mkdir(parents=True)
+
+        bootstrap._install_managed_material(
+            self.fixture.harness,
+            runtime,
+            worktree,
+            provider_id="codex",
+            lane_id="codex-config",
+            run_id="run-1",
+        )
+
+        self.assertEqual(original, existing_config.read_bytes())
+        self.assertEqual(original_hooks, existing_hooks.read_bytes())
+        self.assertEqual(
+            "codex-worker\n",
+            (worktree / ".codex" / "worker.txt").read_text(encoding="utf-8"),
+        )
+        self.assertTrue(
+            (worktree / ".agent-workspace" / "harness-hook-binding.json").is_file()
+        )
+
+    def test_managed_payload_replaces_only_exact_root_owned_file(self) -> None:
+        relative = Path(".codex") / "hooks" / "shared.py"
+        root_payload = self.fixture.harness / "adapters" / "codex" / "root" / relative
+        worker_payload = (
+            self.fixture.harness / "adapters" / "codex" / "super-cache" / relative
+        )
+        self.fixture._write_text(root_payload, "# root hook\n")
+        self.fixture._write_text(worker_payload, "# worker hook\n")
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        self.fixture.active_cache()
+
+        worktree = runtime / "worktrees" / "epoch-1" / "owned-replacement"
+        self.fixture._write_text(worktree / relative, "# root hook\n")
+        (worktree / ".agent-workspace").mkdir(parents=True)
+        bootstrap._install_managed_material(
+            self.fixture.harness,
+            runtime,
+            worktree,
+            provider_id="codex",
+            lane_id="owned-replacement",
+            run_id="run-1",
+        )
+        self.assertEqual(
+            "# worker hook\n", (worktree / relative).read_text(encoding="utf-8")
+        )
+
+        changed = runtime / "worktrees" / "epoch-1" / "changed-replacement"
+        self.fixture._write_text(changed / relative, "# user change\n")
+        (changed / ".agent-workspace").mkdir(parents=True)
+        with self.assertRaises(bootstrap.BootstrapError) as raised:
+            bootstrap._install_managed_material(
+                self.fixture.harness,
+                runtime,
+                changed,
+                provider_id="codex",
+                lane_id="changed-replacement",
+                run_id="run-2",
+            )
+        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, raised.exception.code)
+        self.assertEqual(
+            "# user change\n", (changed / relative).read_text(encoding="utf-8")
+        )
+
+    def test_bootstrap_overlay_failure_rolls_back_attempt_worktree(self) -> None:
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "enabled",
+            },
+        )
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        self.fixture.active_cache()
+        lane_id = "overlay-failure"
+        branch = f"lane/{lane_id}"
+        task_card = self.fixture.root / f"{lane_id}.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "prove failed materialization rollback",
+                "branch": branch,
+                "base_commit": "test-base",
+            },
+        )
+        epoch = {"epoch_id": "epoch-1"}
+        worktree = runtime / "worktrees" / "epoch-1" / lane_id
+
+        def fake_git_add(
+            root: Path, selected_branch: str, target: Path, base_commit: str
+        ) -> None:
+            self.assertEqual(self.fixture.root_workspace, root)
+            self.assertEqual(branch, selected_branch)
+            self.assertEqual("test-base", base_commit)
+            collision = target / ".agent-workspace" / "README.md"
+            collision.parent.mkdir(parents=True, exist_ok=True)
+            collision.write_text("tracked product file\n", encoding="utf-8")
+
+        def fake_rollback(root: Path, selected_branch: str, target: Path) -> list[str]:
+            self.assertEqual(self.fixture.root_workspace, root)
+            self.assertEqual(branch, selected_branch)
+            self.assertEqual(worktree, target)
+            shutil.rmtree(target)
+            return []
+
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value=epoch),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "_git_worktree_add", side_effect=fake_git_add),
+            patch.object(
+                bootstrap,
+                "_rollback_bootstrap_worktree",
+                side_effect=fake_rollback,
+                create=True,
+            ) as rollback,
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id=lane_id,
+                provider="codex",
+                model="test-model",
+                launch_config={
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"])
+        rollback.assert_called_once_with(
+            self.fixture.root_workspace, branch, worktree
+        )
+        self.assertFalse(worktree.exists())
 
     def test_bootstrap_rejects_missing_provider_preferences_before_mutation(self) -> None:
         self.fixture._write_json(

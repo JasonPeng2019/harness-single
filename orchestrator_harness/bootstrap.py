@@ -69,6 +69,66 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     return record
 
 
+def _run_git(
+    root_workspace: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(root_workspace), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _rollback_bootstrap_worktree(
+    root_workspace: Path, branch: str, worktree_path: Path
+) -> list[str]:
+    """Roll back one exact bootstrap-owned worktree and branch.
+
+    Callers may use this only after proving the target path and branch did not
+    exist before their attempt.  Cleanup remains Git-owned; this helper never
+    recursively deletes a directory.
+    """
+
+    notes: list[str] = []
+    removed = _run_git(
+        root_workspace, "worktree", "remove", "--force", "--", str(worktree_path)
+    )
+
+    branch_ref = f"refs/heads/{branch}"
+    branch_after = _run_git(
+        root_workspace, "show-ref", "--verify", "--quiet", branch_ref
+    )
+    if branch_after.returncode == 0:
+        deleted = _run_git(root_workspace, "branch", "-D", "--", branch)
+        if deleted.returncode != 0:
+            notes.append(
+                f"attempt-created branch cleanup failed: {deleted.stderr.strip()}"
+            )
+        branch_remaining = _run_git(
+            root_workspace, "show-ref", "--verify", "--quiet", branch_ref
+        )
+        if branch_remaining.returncode == 0:
+            notes.append(f"attempt-created branch remains: {branch_ref}")
+        elif branch_remaining.returncode != 1:
+            notes.append(
+                "could not verify attempt-created branch cleanup: "
+                f"{branch_remaining.stderr.strip()}"
+            )
+    elif branch_after.returncode != 1:
+        notes.append(
+            "could not inspect attempt-created branch after failure: "
+            f"{branch_after.stderr.strip()}"
+        )
+
+    if worktree_path.exists():
+        detail = removed.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        notes.append(f"partial worktree path remains: {worktree_path}{suffix}")
+    return notes
+
+
 def _git_worktree_add(
     root_workspace: Path,
     branch: str,
@@ -77,17 +137,45 @@ def _git_worktree_add(
 ) -> None:
     if worktree_path.exists():
         raise BootstrapError(BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}")
-    completed = subprocess.run(
-        ["git", "-C", str(root_workspace), "worktree", "add", "-b", branch, str(worktree_path), base_commit],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+
+    branch_ref = f"refs/heads/{branch}"
+    branch_before = _run_git(
+        root_workspace, "show-ref", "--verify", "--quiet", branch_ref
     )
-    if completed.returncode != 0:
+    if branch_before.returncode not in (0, 1):
         raise BootstrapError(
             BOOTSTRAP_REQUEST_INVALID,
-            f"git worktree add failed: {completed.stderr.strip()}",
+            f"git could not inspect target branch {branch!r}: {branch_before.stderr.strip()}",
+        )
+    branch_existed = branch_before.returncode == 0
+
+    completed = _run_git(
+        root_workspace,
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        str(worktree_path),
+        base_commit,
+    )
+    if completed.returncode != 0:
+        # ``git worktree add -b`` creates the branch before checkout.  A checkout
+        # failure (for example a Windows long-path refusal) can therefore leave a
+        # branch that makes every retry fail.  Roll back only identities proven to
+        # have been absent before this exact attempt.
+        rollback_notes = (
+            _rollback_bootstrap_worktree(root_workspace, branch, worktree_path)
+            if not branch_existed
+            else []
+        )
+        rollback_suffix = (
+            f"; rollback incomplete: {'; '.join(rollback_notes)}"
+            if rollback_notes
+            else ""
+        )
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID,
+            f"git worktree add failed: {completed.stderr.strip()}{rollback_suffix}",
         )
 
 
@@ -96,6 +184,7 @@ def _overlay_plan(
     destination: Path,
     *,
     exclude: tuple[str, ...] = (),
+    replace_if_matches: dict[str, Path] | None = None,
 ) -> list[tuple[Path, Path]]:
     """Plan one overlay tree and reject collisions before any write.
 
@@ -105,6 +194,7 @@ def _overlay_plan(
     if not source.is_dir():
         return []
     excluded = {Path(relative).as_posix() for relative in exclude}
+    replaceable = replace_if_matches or {}
     planned: list[tuple[Path, Path]] = []
     for item in source.rglob("*"):
         if not item.is_file():
@@ -114,6 +204,17 @@ def _overlay_plan(
             continue
         target = destination / relative
         if target.exists():
+            if target.is_file() and target.read_bytes() == item.read_bytes():
+                continue
+            expected = replaceable.get(relative.as_posix())
+            if (
+                expected is not None
+                and expected.is_file()
+                and target.is_file()
+                and target.read_bytes() == expected.read_bytes()
+            ):
+                planned.append((item, target))
+                continue
             raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"collision at {target}")
         planned.append((item, target))
     return planned
@@ -124,9 +225,15 @@ def _copy_overlay(
     destination: Path,
     *,
     exclude: tuple[str, ...] = (),
+    replace_if_matches: dict[str, Path] | None = None,
 ) -> None:
     """Copy one overlay tree after preflighting all destination paths."""
-    for item, target in _overlay_plan(source, destination, exclude=exclude):
+    for item, target in _overlay_plan(
+        source,
+        destination,
+        exclude=exclude,
+        replace_if_matches=replace_if_matches,
+    ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item, target)
 
@@ -235,6 +342,7 @@ def _write_worker_binding(worktree: Path, rt: Path, lane_id: str, run_id: str) -
 
 
 def _install_managed_material(
+    harness_root: Path,
     rt: Path,
     worktree: Path,
     *,
@@ -250,7 +358,58 @@ def _install_managed_material(
             BOOTSTRAP_ADAPTER_MISSING,
             f"adapter payload missing for provider {provider_id}: {payload}",
         )
-    _copy_overlay(payload, worktree)
+    payload_exclusions: list[str] = []
+    if provider_id == "codex":
+        config_relative = Path(".codex") / "config.toml"
+        payload_config = payload / config_relative
+        worktree_config = worktree / config_relative
+        if payload_config.is_file() and worktree_config.exists():
+            # Setup's public contract preserves a product-owned Codex config
+            # byte-for-byte once it has explicitly enabled hooks.  Materialized
+            # worktrees must honor the same contract instead of treating the
+            # valid tracked file as an overlay collision.
+            from .setup import SetupError, _validate_existing_codex_config
+
+            try:
+                _validate_existing_codex_config(worktree_config)
+            except SetupError as exc:
+                raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+            payload_exclusions.append(config_relative.as_posix())
+
+    shared_hook_relative = {
+        "codex": Path(".codex") / "hooks.json",
+        "claude-code": Path(".claude") / "settings.json",
+    }.get(provider_id)
+    if shared_hook_relative is not None:
+        payload_hooks = payload / shared_hook_relative
+        worktree_hooks = worktree / shared_hook_relative
+        if payload_hooks.is_file() and worktree_hooks.exists():
+            from .setup import SetupError, _merge_root_hook_config
+
+            try:
+                merged = _merge_root_hook_config(payload_hooks, worktree_hooks)
+                existing = read_json(worktree_hooks)
+            except (OSError, ValueError, SetupError) as exc:
+                raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+            if merged != existing:
+                raise BootstrapError(
+                    BOOTSTRAP_CACHE_COLLISION,
+                    f"existing worker hook configuration lacks the shipped harness hooks: "
+                    f"{worktree_hooks}",
+                )
+            payload_exclusions.append(shared_hook_relative.as_posix())
+    root_payload = harness_root / "adapters" / provider_id / "root"
+    replace_if_matches = {
+        item.relative_to(root_payload).as_posix(): item
+        for item in root_payload.rglob("*")
+        if item.is_file() and "__pycache__" not in item.parts
+    }
+    _copy_overlay(
+        payload,
+        worktree,
+        exclude=tuple(payload_exclusions),
+        replace_if_matches=replace_if_matches,
+    )
     inbox = {
         "schema": LANE_INBOX_SCHEMA,
         "lane_id": lane_id,
@@ -388,6 +547,28 @@ def run_bootstrap(
             }
 
     rt = config.runtime_root
+    worktree_path: Path | None = None
+    branch: str | None = None
+    worktree_created = False
+    lane_record_written = False
+
+    def rollback_failure_summary(summary: str) -> str:
+        if not worktree_created:
+            return summary
+        if lane_record_written:
+            return f"{summary}; rollback withheld because a lane record was published"
+        if worktree_path is None or branch is None:
+            return f"{summary}; rollback incomplete: attempt identity is unavailable"
+        try:
+            notes = _rollback_bootstrap_worktree(
+                config.root_workspace, branch, worktree_path
+            )
+        except Exception as rollback_exc:
+            return f"{summary}; rollback incomplete: {rollback_exc}"
+        if notes:
+            return f"{summary}; rollback incomplete: {'; '.join(notes)}"
+        return f"{summary}; attempt worktree rolled back"
+
     try:
         task_card = _read_task_card(Path(task_card_path))
         state = open_epoch(rt, config, manifest)
@@ -403,6 +584,7 @@ def run_bootstrap(
         branch = str(task_card.get("branch") or f"lane/{lane_id}")
         base_commit = str(task_card.get("base_commit") or "HEAD")
         _git_worktree_add(config.root_workspace, branch, worktree_path, base_commit)
+        worktree_created = True
         agent_workspace = worktree_path / ".agent-workspace"
         agent_workspace.mkdir(parents=True, exist_ok=True)
 
@@ -416,7 +598,12 @@ def run_bootstrap(
         if managed:
             _copy_overlay(base_overlay, worktree_path)
             _install_managed_material(
-                rt, worktree_path, provider_id=provider, lane_id=lane_id, run_id=run_id
+                harness_root,
+                rt,
+                worktree_path,
+                provider_id=provider,
+                lane_id=lane_id,
+                run_id=run_id,
             )
         else:
             _copy_overlay(
@@ -476,6 +663,7 @@ def run_bootstrap(
             lane["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
             lane["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
         write_lane(rt, epoch_id, lane_id, lane)
+        lane_record_written = True
 
         entries = read_active_lanes(rt, epoch_id)
         entries.append(
@@ -490,7 +678,7 @@ def run_bootstrap(
         return {
             "ok": False,
             "code": exc.code,
-            "summary": str(exc),
+            "summary": rollback_failure_summary(str(exc)),
             "evidence_paths": [],
             "next_action": "resolve the named target and re-run bootstrap",
         }
@@ -498,7 +686,7 @@ def run_bootstrap(
         return {
             "ok": False,
             "code": BOOTSTRAP_REQUEST_INVALID,
-            "summary": str(exc),
+            "summary": rollback_failure_summary(str(exc)),
             "evidence_paths": [],
             "next_action": "resolve the error and re-run bootstrap",
         }
