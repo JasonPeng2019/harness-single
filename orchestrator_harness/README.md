@@ -36,6 +36,13 @@ results, operates hardware, or replaces the root orchestrator.
   first use. `--exclusive-resource` may repeat; every name must be declared in
   `resource-manifest.json`.
 
+  The `project-task-card/v1` object requires a non-empty `task`, non-empty string arrays named
+  `acceptance_criteria` and `deliverables`, and a non-empty
+  `reason_for_acceptance_and_deliverables` string. These fields are rendered into the worker
+  prompt, preserved in `.agent-workspace/task-card.json`, and covered by its review hash. Cards
+  missing them are invalid; add valid values and retry. See
+  `examples/project-task-card.example.json` for the complete template.
+
   All provider model preferences must be supplied before bootstrap. Codex requires
   `reasoning_effort` and `service_tier`; Claude Code requires `effort`; Qwen Code currently has no
   provider option beyond its model. `--provider-option` may repeat. The selected adapter rejects

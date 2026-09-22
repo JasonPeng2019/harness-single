@@ -27,8 +27,8 @@ from .epochs import (
 )
 from .lanes import LANE_SCHEMA, write_lane
 from .records import atomic_write_json
+from .task_cards import validate_task_card
 
-TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
 OVERLAY_RECEIPT_SCHEMA = "overlay-receipt/v1"
 LANE_INBOX_SCHEMA = "lane-inbox/v1"
@@ -60,12 +60,9 @@ def _read_task_card(path: Path) -> dict[str, Any]:
         raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"task card missing: {path}")
     try:
         record = read_json(path)
-        require_schema(record, TASK_CARD_SCHEMA, path)
+        validate_task_card(record, path)
     except (OSError, ValueError) as exc:
         raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
-    task = record.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "task card has no task text")
     return record
 
 
@@ -245,7 +242,19 @@ def _write_worker_prompt(
     managed: bool,
     rationale: str | None = None,
 ) -> Path:
-    lines = [str(task_card["task"]).strip()]
+    acceptance_criteria = "\n".join(
+        f"- {item.strip()}" for item in task_card["acceptance_criteria"]
+    )
+    deliverables = "\n".join(
+        f"- {item.strip()}" for item in task_card["deliverables"]
+    )
+    lines = [
+        str(task_card["task"]).strip(),
+        f"## Acceptance criteria\n{acceptance_criteria}",
+        f"## Deliverables\n{deliverables}",
+        "## Reason for acceptance and deliverables\n"
+        + str(task_card["reason_for_acceptance_and_deliverables"]).strip(),
+    ]
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:

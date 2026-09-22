@@ -43,6 +43,23 @@ provider.
 
 ## 3. Bootstrap one lane
 
+Create a task card using `examples/project-task-card.example.json` as the template. Every
+`project-task-card/v1` card requires non-empty `task`, `acceptance_criteria`, `deliverables`, and
+`reason_for_acceptance_and_deliverables` fields. The criteria and deliverables are non-empty arrays
+of non-empty strings; the reason is a non-empty string. `branch` and `base_commit` remain optional.
+
+```json
+{
+  "schema": "project-task-card/v1",
+  "task": "Implement the assigned change.",
+  "acceptance_criteria": ["The focused regression tests pass."],
+  "deliverables": ["Implementation, tests, and documentation."],
+  "reason_for_acceptance_and_deliverables": "Together these prove the requested behavior is complete.",
+  "branch": "lane/example",
+  "base_commit": "HEAD"
+}
+```
+
 ```powershell
 python -m orchestrator_harness.operator_launch lane bootstrap `
   --lane-id lane-01 --provider codex --model <model> `
@@ -51,10 +68,10 @@ python -m orchestrator_harness.operator_launch lane bootstrap `
   --task-card <path-to-task-card.json>
 ```
 
-`--task-card` names a `project-task-card/v1` file (task text, branch, base commit). Add
-`--exclusive-resource <id>` for each resource declared in the manifest. Bootstrap creates the
-worktree, stages the super-cache base and the selected provider payload, and writes the worker
-binding. Shipped provider IDs: `codex`, `claude-code`, `qwen-code`.
+`--task-card` names that file. Invalid or legacy v1 cards missing any required field are rejected;
+add valid values and retry. Add `--exclusive-resource <id>` for each resource declared in the
+manifest. Bootstrap creates the worktree, stages the super-cache base and the selected provider
+payload, and writes the worker binding. Shipped provider IDs: `codex`, `claude-code`, `qwen-code`.
 
 Launch preferences have no harness defaults. Codex requires `reasoning_effort` and `service_tier`;
 Claude Code requires `effort`; Qwen Code currently requires only `--model`. Each option uses a

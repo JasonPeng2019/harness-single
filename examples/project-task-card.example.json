@@ -1,0 +1,14 @@
+{
+  "schema": "project-task-card/v1",
+  "task": "Describe the work the lane must perform.",
+  "acceptance_criteria": [
+    "State one objectively reviewable success condition.",
+    "State another success condition when needed."
+  ],
+  "deliverables": [
+    "Name each artifact or completed change the lane must return."
+  ],
+  "reason_for_acceptance_and_deliverables": "Explain why these criteria and deliverables are sufficient to accept the work.",
+  "branch": "lane/example",
+  "base_commit": "HEAD"
+}

@@ -238,6 +238,12 @@ class PackageWheelBuildTests(unittest.TestCase):
                 self.assertIn(entry, names, entry)
             self.assertTrue(any(".data/data/examples/" in name for name in names))
             self.assertTrue(
+                any(
+                    name.endswith(".data/data/examples/project-task-card.example.json")
+                    for name in names
+                )
+            )
+            self.assertTrue(
                 any(".data/data/release_evidence_templates/" in name for name in names)
             )
             for name in names:

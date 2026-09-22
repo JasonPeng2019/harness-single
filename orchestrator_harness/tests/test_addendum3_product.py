@@ -251,7 +251,17 @@ class Addendum3ProductTests(unittest.TestCase):
         atomic_write_json(lane_dir / "lane.json", lane)
         atomic_write_json(
             workspace / "task-card.json",
-            {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"},
+            {
+                "schema": "project-task-card/v1",
+                "card_id": "card-1",
+                "task": "review the completed lane",
+                "acceptance_criteria": ["The review pair is published atomically"],
+                "deliverables": ["Completion review and acceptance records"],
+                "reason_for_acceptance_and_deliverables": (
+                    "Recovery must observe only a complete review pair."
+                ),
+                "base_commit": "commit-1",
+            },
         )
         result = {
             "schema": "result/v1",
@@ -1414,6 +1424,11 @@ class Addendum3ProductTests(unittest.TestCase):
             "schema": "project-task-card/v1",
             "card_id": "card-1",
             "task": "do the work",
+            "acceptance_criteria": ["The lane is ready for its next run"],
+            "deliverables": ["A fresh invocation and worker prompt"],
+            "reason_for_acceptance_and_deliverables": (
+                "Resume must preserve an explicit definition of completion."
+            ),
         }
         updates: list[dict[str, object]] = []
 

@@ -1059,6 +1059,11 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": "prove failed materialization rollback",
+                "acceptance_criteria": ["The failed bootstrap is reported"],
+                "deliverables": ["Rollback evidence"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The test must prove the failed attempt leaves no worktree."
+                ),
                 "branch": branch,
                 "base_commit": "test-base",
             },
@@ -1128,7 +1133,15 @@ class V2MaterializationTests(unittest.TestCase):
         task_card = self.fixture.root / "invalid-launch-task.json"
         self.fixture._write_json(
             task_card,
-            {"schema": "project-task-card/v1", "task": "must not create a worktree"},
+            {
+                "schema": "project-task-card/v1",
+                "task": "must not create a worktree",
+                "acceptance_criteria": ["Invalid launch preferences fail early"],
+                "deliverables": ["A structured bootstrap failure"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The test isolates launch-config validation from task-card validation."
+                ),
+            },
         )
         with (
             patch(
@@ -1213,6 +1226,11 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": f"materialize {lane_id}",
+                "acceptance_criteria": [f"The {lane_id} lane is materialized"],
+                "deliverables": ["A prepared worker worktree"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The fixture needs a complete task card to exercise materialization."
+                ),
                 "branch": f"lane/{lane_id}",
                 "base_commit": "test-base",
             },

@@ -45,6 +45,7 @@ orchestrator_harness = [
     "../examples/coding.named-lock.example.json",
     "../examples/coding.result.example.json",
     "../examples/harness.example.json",
+    "../examples/project-task-card.example.json",
     "../examples/watcher.diagnostic.example.json",
     "assets/release/examples/*.json",
     "assets/release/examples/*.md",

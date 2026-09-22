@@ -24,8 +24,8 @@ from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .records import atomic_write_json, remove_record
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
+from .task_cards import validate_task_card
 
-TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
 OVERLAY_RECEIPT_SCHEMA = "overlay-receipt/v1"
 LANE_INBOX_SCHEMA = "lane-inbox/v1"
@@ -73,10 +73,7 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"resume task card missing: {path}")
     record = read_json(path)
-    require_schema(record, TASK_CARD_SCHEMA, path)
-    task = record.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError("resume task card has no task text")
+    validate_task_card(record, path)
     return record
 
 

@@ -24,11 +24,11 @@ from .manager_queue import (
     read_manager_queue,
 )
 from .records import RecordLock, atomic_write_json
+from .task_cards import validate_task_card
 
 COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
 ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
 RESULT_SCHEMA = "result/v1"
-TASK_CARD_SCHEMA = "project-task-card/v1"
 
 REVIEW_OUTCOMES = frozenset({"PASS", "FAIL", "BLOCKED"})
 APPROVALS = frozenset({"ACCEPTED", "REJECTED"})
@@ -104,7 +104,7 @@ def _read_task_card(worktree: Path) -> dict[str, Any]:
         )
     try:
         record = read_json(path)
-        require_schema(record, TASK_CARD_SCHEMA, path)
+        validate_task_card(record, path)
     except (OSError, ValueError) as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
     return record
