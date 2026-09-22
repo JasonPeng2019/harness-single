@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +99,49 @@ class RootHookWrapperTests(unittest.TestCase):
 
 
 class RootProviderPayloadTests(unittest.TestCase):
+    def test_restored_codex_root_hooks_delegate_to_worker_binding(self) -> None:
+        """A Git-restored tracked hook must remain usable inside a worker lane."""
+        source_hooks = (
+            REPOSITORY_ROOT / "adapters" / "codex" / "root" / ".codex" / "hooks"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            installed_hooks = workspace / ".codex" / "hooks"
+            installed_hooks.mkdir(parents=True)
+            agent_workspace = workspace / ".agent-workspace"
+            agent_workspace.mkdir()
+            (agent_workspace / "harness-hook-binding.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "harness-hook-binding/v1",
+                        "role": "worker",
+                        "lane_id": "lane-1",
+                        "run_id": "run-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (agent_workspace / "hook-dispatch.py").write_text(
+                "import json\nprint(json.dumps({'decision': 'ALLOW'}))\n",
+                encoding="utf-8",
+            )
+
+            for filename in (
+                "orchestrator_harness_post_tool_use.py",
+                "orchestrator_harness_stop.py",
+            ):
+                with self.subTest(filename=filename):
+                    installed = installed_hooks / filename
+                    shutil.copy2(source_hooks / filename, installed)
+                    completed = subprocess.run(
+                        [sys.executable, str(installed)],
+                        cwd=workspace,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    self.assertEqual({}, json.loads(completed.stdout))
+
     def test_native_root_wrappers_and_declarations(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
             with self.subTest(provider=provider_id):
