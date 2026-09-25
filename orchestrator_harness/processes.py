@@ -88,6 +88,15 @@ def process_alive(pid: int) -> bool:
             return False
     try:
         os.kill(pid, 0)
+        if sys.platform.startswith("linux"):
+            try:
+                stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+                close = stat.rfind(b")")
+                if close >= 0 and stat[close + 2 : close + 3] == b"Z":
+                    return False
+            except OSError:
+                # A live but unreadable identity remains unknown, not absent.
+                pass
         return True
     except ProcessLookupError:
         return False
@@ -187,6 +196,7 @@ def spawn_detached(
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
         close_fds=True,
+        start_new_session=os.name != "nt",
     )
 
 
@@ -906,8 +916,8 @@ def linux_process_snapshot() -> ProcessSnapshot:
             processes.append(query.process)
         if not query.complete:
             errors.extend(query.errors)
-        elif query.process is None:
-            errors.append(f"{entry}: process disappeared during observation")
+        elif query.process is None and process_alive(int(entry.name)):
+            errors.append(f"{entry}: live process identity is unavailable")
     return ProcessSnapshot(
         complete=not errors,
         processes=tuple(sorted(processes, key=lambda p: p.pid)),
