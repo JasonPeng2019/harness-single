@@ -15,7 +15,7 @@ from typing import Any
 from . import processes
 from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
-from .core import read_json, require_schema
+from .core import iso_utc, read_json, require_schema
 from .epochs import (
     close_epoch,
     epoch_dir,
@@ -28,7 +28,7 @@ from .epochs import (
 from .lanes import find_active_lane, read_lane, update_lane
 from .leases import force_release_leases, release_leases
 from .manager_queue import read_manager_queue
-from .records import read_record
+from .records import RecordLock, atomic_write_json, read_record
 from .setup import read_runtime_state
 
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -367,6 +367,31 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
     return ok and boundary_ok
 
 
+def _record_force_stopped(lane: dict[str, Any]) -> None:
+    """Make a proven forced cleanup visible in the durable controller status."""
+    path = Path(lane["controller_status_path"])
+    if not path.is_file():
+        return  # A prepared lane may never have started a controller.
+    with RecordLock(path):
+        status = read_record(path, CONTROLLER_STATUS_SCHEMA)
+        if (
+            status.get("lane_id") != lane["lane_id"]
+            or status.get("run_id") != lane["run_id"]
+        ):
+            raise ValueError("controller status changed ownership during force-stop")
+        provider_state = dict(status.get("provider_state") or {})
+        if provider_state.get("state") in ("starting", "running"):
+            provider_state["state"] = "exited"
+        status.update(
+            controller_state="exited",
+            provider_state=provider_state,
+            cleanup_proven=True,
+            cleanup_error=None,
+            updated_at=iso_utc(),
+        )
+        atomic_write_json(path, status)
+
+
 def run_force_stop(lane_id: str) -> dict[str, Any]:
     """Execute ``lane force-stop`` and return the structured result."""
     try:
@@ -400,6 +425,7 @@ def run_force_stop(lane_id: str) -> dict[str, Any]:
                 "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
                 "next_action": "escalate to the operator/host; an unkillable process is outside the harness's authority",
             }
+        _record_force_stopped(lane)
         try:
             force_release_leases(rt, lane_id)
         except Exception as exc:
