@@ -7,12 +7,27 @@ import shutil
 from typing import Any
 
 PROVIDER_ID = "qwen-code"
-ADAPTER_VERSION = "qwen-code-v1"
+ADAPTER_VERSION = "qwen-code-v2"
+
+
+def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+    """Validate Qwen's explicit model selection and reject hidden preferences."""
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Qwen Code model must be configured")
+    if not isinstance(launch_config, dict):
+        raise ValueError("Qwen Code launch_config must be an object")
+    if launch_config:
+        raise ValueError(
+            "Qwen Code launch_config has unsupported options: "
+            + ", ".join(sorted(str(key) for key in launch_config))
+        )
+    return {}
 
 
 def build_argv(
     *,
     model: str,
+    launch_config: dict[str, Any],
     worktree: str,
     prompt_path: str,
     session_id: str | None = None,
@@ -20,6 +35,7 @@ def build_argv(
 ) -> list[str]:
     """Build the provider-owned, stdin-prompted Qwen Code launch vector."""
     del worktree, prompt_path
+    validate_launch_config(model=model, launch_config=launch_config)
     executable = shutil.which("qwen") or "qwen"
     argv = [executable, "--approval-mode=yolo", "--model", model, "--output-format", "stream-json"]
     if resume:

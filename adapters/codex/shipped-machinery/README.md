@@ -4,9 +4,11 @@ Notes for adapter authors maintaining the Codex payload.
 
 - Launch transport: `codex exec` with
   `--dangerously-bypass-approvals-and-sandbox`, `--skip-git-repo-check`,
-  `-c approval_policy=...`, `-m <model>`, `-c model_reasoning_effort=...`,
-  `-c service_tier=...`, `--json`, `--output-last-message <path>`, and the
-  prompt on stdin (`-`).
+  `-c approval_policy=...`, `-m <configured-model>`,
+  `-c model_reasoning_effort=<configured-effort>`,
+  `-c service_tier=<configured-tier>`, `--json`, `--output-last-message <path>`, and the
+  prompt on stdin (`-`). Model, reasoning effort, and service tier are required bootstrap
+  configuration; the adapter supplies no defaults.
 - Transcript facts: JSON lines with `type` `thread.started`,
   `turn.completed`, `turn.failed`, or `turn.cancelled`; the thread id is
   `thread_id` or `threadId`.

@@ -30,8 +30,9 @@ results, operates hardware, or replaces the root orchestrator.
 
 ### `lane` — lane lifecycle
 
-- `lane bootstrap --lane-id <id> --provider <id> --model <model> [--exclusive-resource <id>]
-  --task-card <path>` — prepare one lane: create the worktree, stage the super-cache base and the
+- `lane bootstrap --lane-id <id> --provider <id> --model <model>
+  [--provider-option NAME=VALUE] [--exclusive-resource <id>] --task-card <path>` — prepare one
+  lane: create the worktree, stage the super-cache base and the
   selected provider payload, write the worker binding and inbox/outbox, and open the epoch on
   first use. `--exclusive-resource` may repeat; every name must be declared in
   `resource-manifest.json`.
@@ -138,6 +139,19 @@ Bootstrap writes the authoritative worker binding with runtime paths into
 `.agent-workspace/harness-hook-binding.json`; payload bindings are the static templates the
 helpers read. Helpers never write the manager queue; the worker only touches its own inbox and
 outbox.
+
+Task cards use the complete `project-task-card/v1` contract: task, base commit, optional branch,
+nonempty acceptance criteria and deliverables, and a reason those acceptance fields are
+sufficient. Provider preferences are explicit: Codex requires `reasoning_effort` and
+`service_tier` (with optional `launcher=ollama`), Claude Code requires `effort`, and Qwen Code
+accepts no provider options.
+
+An optional validated `memory_handoff` adds the integrated `memory_harness` preparation path.
+Only a ROOT `execution_accepted` plan can produce a dispatch envelope; absent and candidate plans
+remain durable, nondispatchable states. Ordinary cards do not create memory state or perform an
+optional search. The enhanced path also carries bounded template/search context, privacy and
+network decisions, native attempt evidence, and exact terminal/supersession bindings across
+review and resume.
 
 ## Lane lifecycle and evidence
 

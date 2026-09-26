@@ -12,15 +12,18 @@ skills.  Source trees stay unchanged.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .config import load_config, load_resource_manifest
-from .core import content_hash, iso_utc, new_id, read_json, require_schema
+from .core import content_hash, iso_utc, new_id, read_json
 from .epochs import (
     lane_record_dir,
     open_epoch,
@@ -28,9 +31,10 @@ from .epochs import (
     write_active_lanes,
 )
 from .lanes import LANE_SCHEMA, update_lane, write_lane
+from . import memory_handoff
 from .records import RecordLock, atomic_write_json
+from .task_cards import validate_task_card
 
-TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
 OVERLAY_RECEIPT_SCHEMA = "overlay-receipt/v1"
 LANE_INBOX_SCHEMA = "lane-inbox/v1"
@@ -43,6 +47,8 @@ BOOTSTRAP_CACHE_COLLISION = "BOOTSTRAP_CACHE_COLLISION"
 BOOTSTRAP_ADAPTER_MISSING = "BOOTSTRAP_ADAPTER_MISSING"
 BOOTSTRAP_CACHE_MISSING = "BOOTSTRAP_CACHE_MISSING"
 BOOTSTRAP_RESOURCE_UNDECLARED = "BOOTSTRAP_RESOURCE_UNDECLARED"
+BOOTSTRAP_PLAN_PENDING = "BOOTSTRAP_PLAN_PENDING"
+BOOTSTRAP_ALLOWANCE_EXPIRED = "BOOTSTRAP_ALLOWANCE_EXPIRED"
 BOOTSTRAP_CLEANUP_FAILED = "BOOTSTRAP_CLEANUP_FAILED"
 
 AMBIGUOUS_ADD_DIAGNOSTIC = (
@@ -69,12 +75,10 @@ def _read_task_card(path: Path) -> dict[str, Any]:
         raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"task card missing: {path}")
     try:
         record = read_json(path)
-        require_schema(record, TASK_CARD_SCHEMA, path)
+        validate_task_card(record, path)
+        memory_handoff.validate_task_card(record)
     except (OSError, ValueError) as exc:
         raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
-    task = record.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "task card has no task text")
     return record
 
 
@@ -433,6 +437,7 @@ def _overlay_plan(
     destination: Path,
     *,
     exclude: tuple[str, ...] = (),
+    replace_if_matches: dict[str, Path] | None = None,
 ) -> list[tuple[Path, Path]]:
     """Plan one overlay tree and reject collisions before any write.
 
@@ -442,6 +447,7 @@ def _overlay_plan(
     if not source.is_dir():
         return []
     excluded = {Path(relative).as_posix() for relative in exclude}
+    replaceable = replace_if_matches or {}
     planned: list[tuple[Path, Path]] = []
     for item in source.rglob("*"):
         if not item.is_file():
@@ -451,6 +457,17 @@ def _overlay_plan(
             continue
         target = destination / relative
         if target.exists():
+            if target.is_file() and target.read_bytes() == item.read_bytes():
+                continue
+            expected = replaceable.get(relative.as_posix())
+            if (
+                expected is not None
+                and expected.is_file()
+                and target.is_file()
+                and target.read_bytes() == expected.read_bytes()
+            ):
+                planned.append((item, target))
+                continue
             raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"collision at {target}")
         planned.append((item, target))
     return planned
@@ -461,11 +478,79 @@ def _copy_overlay(
     destination: Path,
     *,
     exclude: tuple[str, ...] = (),
+    replace_if_matches: dict[str, Path] | None = None,
 ) -> None:
     """Copy one overlay tree after preflighting all destination paths."""
-    for item, target in _overlay_plan(source, destination, exclude=exclude):
+    for item, target in _overlay_plan(
+        source,
+        destination,
+        exclude=exclude,
+        replace_if_matches=replace_if_matches,
+    ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item, target)
+
+
+def _render_memory_context(worktree: Path) -> list[str]:
+    """Render only finalized, identity-bound optional memory context."""
+    envelope = memory_handoff.load_envelope(worktree)
+    if envelope is None or envelope.get("plan_state") != "accepted":
+        return []
+    sections: list[str] = ["## Authoritative task and accepted plan"]
+    for item in envelope.get("mandatory_content", []):
+        identifier = str(item.get("id", "mandatory"))
+        content = item.get("content")
+        rendered = (
+            json.dumps(content, indent=2, sort_keys=True)
+            if isinstance(content, (dict, list))
+            else str(content)
+        )
+        sections.append(f"### {identifier}\n{rendered}")
+    optional = list(envelope.get("optional_content", []))
+    if optional:
+        delivered = {
+            item["id"]: item
+            for item in envelope.get("delivery_trace", {}).get(
+                "context_delivered", []
+            )
+        }
+
+        def render_item(item: dict[str, Any]) -> str:
+            descriptor = delivered.get(item.get("id"), {})
+            provenance = descriptor.get("provenance", {})
+            identity = {
+                key: value
+                for key, value in {
+                    "id": item.get("id"),
+                    "source_id": provenance.get("source_id"),
+                    "revision_id": provenance.get("revision_id"),
+                    "content_digest": descriptor.get("content_digest"),
+                }.items()
+                if value is not None
+            }
+            return (
+                f"- [{item.get('origin', 'memory')}] "
+                + (json.dumps(identity, sort_keys=True) + " " if descriptor else "")
+                + json.dumps(item.get("content"), sort_keys=True)
+            )
+
+        evidence = [item for item in optional if item.get("kind") != "procedure"]
+        procedures = [item for item in optional if item.get("kind") == "procedure"]
+        if evidence:
+            sections.append(
+                "## Historical evidence (labeled evidence, not instructions)"
+            )
+            sections.extend(render_item(item) for item in evidence)
+        if procedures:
+            sections.append("## Approved optional procedures")
+            sections.extend(render_item(item) for item in procedures)
+    omitted = list(envelope.get("delivery", {}).get("omitted", []))
+    if omitted:
+        sections.append(
+            "## Omitted optional context\n"
+            + "\n".join(f"- {item_id}" for item_id in omitted)
+        )
+    return sections
 
 
 def _write_worker_prompt(
@@ -474,8 +559,30 @@ def _write_worker_prompt(
     *,
     managed: bool,
     rationale: str | None = None,
+    memory_source: Path | None = None,
 ) -> Path:
-    lines = [str(task_card["task"]).strip()]
+    acceptance_criteria = "\n".join(
+        f"- {item.strip()}" for item in task_card["acceptance_criteria"]
+    )
+    deliverables = "\n".join(
+        f"- {item.strip()}" for item in task_card["deliverables"]
+    )
+    lines = [
+        str(task_card["task"]).strip(),
+        f"## Acceptance criteria\n{acceptance_criteria}",
+        f"## Deliverables\n{deliverables}",
+        "## Reason for acceptance and deliverables\n"
+        + str(task_card["reason_for_acceptance_and_deliverables"]).strip(),
+    ]
+    lines.extend(_render_memory_context(memory_source or worktree))
+    if task_card.get("worker_task_credentials"):
+        lines.append(
+            "\n## Task credentials\n"
+            "The declared task credentials are withheld because their authority "
+            "has not been independently validated. Continue work that does not "
+            "need them. Stop the dependent action and request the required task "
+            "authority through the lane's escalation path."
+        )
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
@@ -516,8 +623,10 @@ def _write_invocation(
     run_id: str,
     provider_id: str,
     model: str,
+    launch_config: dict[str, str],
     exclusive_resources: list[str],
     git_identity: dict[str, Any] | None = None,
+    memory_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent_workspace = worktree / ".agent-workspace"
     if git_identity is None:
@@ -542,8 +651,10 @@ def _write_invocation(
         run_id=run_id,
         provider_id=provider_id,
         model=model,
+        launch_config=launch_config,
         exclusive_resources=exclusive_resources,
         git_identity=git_identity,
+        memory_envelope=memory_envelope,
     )
     atomic_write_json(agent_workspace / "invocation.json", invocation)
     return invocation
@@ -556,8 +667,10 @@ def _build_invocation(
     run_id: str,
     provider_id: str,
     model: str,
+    launch_config: dict[str, str],
     exclusive_resources: list[str],
     git_identity: dict[str, Any],
+    memory_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a hashed invocation without publishing it.
 
@@ -570,7 +683,11 @@ def _build_invocation(
         "schema": INVOCATION_SCHEMA,
         "lane_id": lane_id,
         "run_id": run_id,
-        "provider": {"id": provider_id, "model": model},
+        "provider": {
+            "id": provider_id,
+            "model": model,
+            "launch_config": dict(launch_config),
+        },
         "exclusive_resources": exclusive_resources,
         "git": dict(git_identity),
         "launcher": {
@@ -592,6 +709,16 @@ def _build_invocation(
         },
         "created_at": iso_utc(),
     }
+    if memory_envelope is not None:
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=memory_envelope
+        )
+        invocation["dispatch_binding"] = memory_handoff.dispatch_binding(
+            envelope=memory_envelope, context=context
+        )
+        invocation["prompt_digest"] = hashlib.sha256(
+            (agent_workspace / "worker-prompt.md").read_bytes()
+        ).hexdigest()
     invocation["content_hash"] = content_hash(invocation)
     return invocation
 
@@ -614,6 +741,7 @@ def _write_worker_binding(worktree: Path, rt: Path, lane_id: str, run_id: str) -
 
 
 def _install_managed_material(
+    harness_root: Path,
     rt: Path,
     worktree: Path,
     *,
@@ -623,13 +751,57 @@ def _install_managed_material(
 ) -> None:
     """Install the managed worker payload: provider payload + inbox/outbox."""
     agent_workspace = worktree / ".agent-workspace"
-    payload = rt / "super-cache" / "adapter-payloads" / provider_id
-    if not payload.is_dir():
-        raise BootstrapError(
-            BOOTSTRAP_ADAPTER_MISSING,
-            f"adapter payload missing for provider {provider_id}: {payload}",
-        )
-    _copy_overlay(payload, worktree)
+    payload = _managed_payload(harness_root, rt, provider_id)
+    payload_exclusions: list[str] = []
+    if provider_id == "codex":
+        config_relative = Path(".codex") / "config.toml"
+        payload_config = payload / config_relative
+        worktree_config = worktree / config_relative
+        if payload_config.is_file() and worktree_config.exists():
+            from .setup import SetupError, _validate_existing_codex_config
+
+            try:
+                _validate_existing_codex_config(worktree_config)
+            except SetupError as exc:
+                raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+            payload_exclusions.append(config_relative.as_posix())
+
+    shared_hook_relative = {
+        "codex": Path(".codex") / "hooks.json",
+        "claude-code": Path(".claude") / "settings.json",
+        "qwen-code": Path(".qwen") / "settings.json",
+    }.get(provider_id)
+    if shared_hook_relative is not None:
+        payload_hooks = payload / shared_hook_relative
+        worktree_hooks = worktree / shared_hook_relative
+        if payload_hooks.is_file() and worktree_hooks.exists():
+            from .setup import SetupError, _merge_root_hook_config
+
+            try:
+                merged = _merge_root_hook_config(payload_hooks, worktree_hooks)
+                existing = read_json(worktree_hooks)
+            except (OSError, ValueError, SetupError) as exc:
+                raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+            if merged != existing:
+                raise BootstrapError(
+                    BOOTSTRAP_CACHE_COLLISION,
+                    "existing worker hook configuration lacks the shipped harness hooks: "
+                    f"{worktree_hooks}",
+                )
+            payload_exclusions.append(shared_hook_relative.as_posix())
+
+    root_payload = harness_root / "adapters" / provider_id / "root"
+    replace_if_matches = {
+        item.relative_to(root_payload).as_posix(): item
+        for item in root_payload.rglob("*")
+        if item.is_file() and "__pycache__" not in item.parts
+    }
+    _copy_overlay(
+        payload,
+        worktree,
+        exclude=tuple(payload_exclusions),
+        replace_if_matches=replace_if_matches,
+    )
     inbox = {
         "schema": LANE_INBOX_SCHEMA,
         "lane_id": lane_id,
@@ -642,15 +814,118 @@ def _install_managed_material(
     _write_worker_binding(worktree, rt, lane_id, run_id)
 
 
+def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
+    """Return only setup's byte-exact installed worker composition."""
+    from .setup import (
+        COMPOSED_PAYLOADS,
+        SETUP_CACHE_INVALID,
+        SetupError,
+        _require_plain_workspace_boundary,
+        _validated_worker_payload,
+    )
+
+    payload = rt / "super-cache" / COMPOSED_PAYLOADS / provider_id
+    try:
+        _require_plain_workspace_boundary(rt, code=SETUP_CACHE_INVALID)
+        if not payload.is_dir():
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_MISSING,
+                f"installed worker composition missing: {payload}",
+            )
+        return _validated_worker_payload(harness_root, rt, provider_id)
+    except (SetupError, OSError) as exc:
+        raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+
+
+def _validate_provider_launch_config(
+    harness_root: Path,
+    *,
+    provider_id: str,
+    model: str,
+    launch_config: dict[str, Any],
+) -> dict[str, str]:
+    """Resolve provider-owned launch preferences before mutating lane state."""
+    from .setup import _load_binding
+
+    binding_path = (
+        harness_root
+        / "orchestrator_harness"
+        / "provider_adapters"
+        / provider_id
+        / "launcher_binding.py"
+    )
+    if not binding_path.is_file():
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding missing for provider {provider_id}: {binding_path}",
+        )
+    try:
+        binding = _load_binding(binding_path)
+    except Exception as exc:
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding cannot be loaded for provider {provider_id}: {exc}",
+        ) from exc
+    if getattr(binding, "PROVIDER_ID", None) != provider_id:
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding identity does not match provider {provider_id}",
+        )
+    validate = getattr(binding, "validate_launch_config", None)
+    if not callable(validate):
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"launcher binding lacks validate_launch_config for provider {provider_id}",
+        )
+    try:
+        configured = validate(model=model, launch_config=launch_config)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
+    if not isinstance(configured, dict) or not all(
+        isinstance(key, str)
+        and key
+        and isinstance(value, str)
+        and value
+        for key, value in configured.items()
+    ):
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID,
+            f"launcher binding returned invalid launch configuration for {provider_id}",
+        )
+    return dict(configured)
+
+
 def run_bootstrap(
     *,
     lane_id: str,
     provider: str,
     model: str,
+    launch_config: dict[str, Any],
     exclusive_resources: list[str],
     task_card_path: str,
+    allowance_seconds: float | None = None,
+    search_stores: Sequence[Any] = (),
 ) -> dict[str, Any]:
-    """Execute ``lane bootstrap`` and return the structured result."""
+    """Execute ``lane bootstrap`` with one optional enclosing time allowance."""
+    allowance_deadline: float | None = None
+    if allowance_seconds is not None:
+        allowance_deadline = time.monotonic() + float(allowance_seconds)
+        if allowance_seconds <= 0:
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "summary": "the enclosing allowance is spent; no lane was created",
+                "evidence_paths": [],
+                "attempt_effects": {
+                    "worktree_created": False,
+                    "lane_record_written": False,
+                    "rollback_proven": True,
+                },
+                "next_action": "prepare again inside the remaining decision time",
+            }
+
+    def allowance_expired() -> bool:
+        return allowance_deadline is not None and time.monotonic() >= allowance_deadline
     try:
         from .config import find_harness_root
 
@@ -682,6 +957,21 @@ def run_bootstrap(
             "evidence_paths": [],
             "next_action": "pass --provider and --model",
         }
+    try:
+        configured_launch = _validate_provider_launch_config(
+            harness_root,
+            provider_id=provider,
+            model=model,
+            launch_config=launch_config,
+        )
+    except BootstrapError as exc:
+        return {
+            "ok": False,
+            "code": exc.code,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "configure every provider launch preference and re-run bootstrap",
+        }
     for resource_id in exclusive_resources:
         if not manifest.is_declared(resource_id):
             return {
@@ -701,6 +991,7 @@ def run_bootstrap(
     published_run_id: str | None = None
     lane_record_hashes: set[str] = set()
     active_index_published = False
+    pending_memory_state: str | None = None
     bootstrap_lock = RecordLock(rt / ".bootstrap.lock")
     lock_held = False
     try:
@@ -716,18 +1007,27 @@ def run_bootstrap(
         # worktree behind.
         managed = config.profile == "managed"
         base_overlay = rt / "super-cache" / "workspace"
-        if not base_overlay.is_dir():
-            raise BootstrapError(
-                BOOTSTRAP_CACHE_MISSING,
-                f"active workspace base missing: {base_overlay} (run harness setup first)",
-            )
-        provider_payload = rt / "super-cache" / "adapter-payloads" / provider
-        if not provider_payload.is_dir():
-            raise BootstrapError(
-                BOOTSTRAP_ADAPTER_MISSING,
-                f"adapter payload missing for provider {provider}: {provider_payload}",
-            )
+        if managed:
+            provider_payload = _managed_payload(harness_root, rt, provider)
+        else:
+            from .setup import SetupError, _validated_cache_for_dispatch
 
+            try:
+                _validated_cache_for_dispatch(harness_root, rt)
+            except (SetupError, OSError) as exc:
+                raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
+            if not base_overlay.is_dir():
+                raise BootstrapError(
+                    BOOTSTRAP_CACHE_MISSING,
+                    f"active workspace base missing: {base_overlay} (run harness setup first)",
+                )
+            provider_payload = rt / "super-cache" / "composed-payloads" / provider
+
+        if allowance_expired():
+            raise BootstrapError(
+                BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "the enclosing allowance expired before opening an epoch",
+            )
         state = open_epoch(rt, config, manifest)
         epoch_id = state["epoch_id"]
         for entry in read_active_lanes(rt, epoch_id):
@@ -750,6 +1050,11 @@ def run_bootstrap(
         # Branch and path were both absent at preflight.  Rollback ownership is
         # established only after `git worktree add` reports success and the
         # linked-worktree administrative identity is captured below.
+        if allowance_expired():
+            raise BootstrapError(
+                BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "the enclosing allowance expired before creating the lane worktree",
+            )
         _git_worktree_add(
             config.root_workspace,
             branch,
@@ -771,9 +1076,13 @@ def run_bootstrap(
                 for item in provider_payload.rglob("*")
                 if item.is_file()
             )
-            _copy_overlay(base_overlay, worktree_path)
             _install_managed_material(
-                rt, worktree_path, provider_id=provider, lane_id=lane_id, run_id=run_id
+                harness_root,
+                rt,
+                worktree_path,
+                provider_id=provider,
+                lane_id=lane_id,
+                run_id=run_id,
             )
         else:
             _copy_overlay(
@@ -791,21 +1100,46 @@ def run_bootstrap(
             "applied_at": iso_utc(),
         }
         if managed:
-            receipt["provider_payload"] = f"adapter-payloads/{provider}"
+            receipt["provider_payload"] = f"composed-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
         atomic_write_json(agent_workspace / "task-card.json", task_card)
 
-        _write_worker_prompt(worktree_path, task_card, managed=managed)
-        _write_result_template(worktree_path, lane_id, run_id)
-        invocation = _write_invocation(
-            worktree_path,
+        memory = memory_handoff.prepare_lane_memory(
+            task_card=task_card,
             lane_id=lane_id,
             run_id=run_id,
-            provider_id=provider,
-            model=model,
-            exclusive_resources=list(exclusive_resources),
-            git_identity=git_identity,
+            worktree_path=worktree_path,
+            base_commit=str(git_identity["base_commit"]),
+            search_stores=search_stores,
         )
+        if memory.envelope is not None:
+            network = memory_handoff.captured_network_resolution(
+                worktree_path=worktree_path,
+                envelope=memory.envelope,
+                task_card=task_card,
+            )
+            if network["effective_mode"] != "normal":
+                from .provider_network_payload import install_soft_controls
+
+                install_soft_controls(provider, worktree_path)
+
+        invocation: dict[str, Any] | None = None
+        if not memory.pending_plan:
+            _write_worker_prompt(worktree_path, task_card, managed=managed)
+            _write_result_template(worktree_path, lane_id, run_id)
+            invocation = _write_invocation(
+                worktree_path,
+                lane_id=lane_id,
+                run_id=run_id,
+                provider_id=provider,
+                model=model,
+                launch_config=configured_launch,
+                exclusive_resources=list(exclusive_resources),
+                git_identity=git_identity,
+                memory_envelope=memory.envelope,
+            )
+        else:
+            pending_memory_state = str(memory.state)
 
         lane = {
             "schema": LANE_SCHEMA,
@@ -819,9 +1153,15 @@ def run_bootstrap(
             "stderr_path": str(agent_workspace / "provider-stderr.txt"),
             "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
             "last_message_path": str(agent_workspace / "last-message.txt"),
-            "provider": {"id": provider, "model": model},
+            "provider": {
+                "id": provider,
+                "model": model,
+                "launch_config": configured_launch,
+            },
             "git": git_identity,
-            "invocation_hash": invocation["content_hash"],
+            "invocation_hash": (
+                invocation["content_hash"] if invocation is not None else None
+            ),
             "task_card_hash": content_hash(task_card),
             "result_validation": None,
             "session": {},
@@ -831,9 +1171,24 @@ def run_bootstrap(
             "last_reported_actionable_status": None,
             "publication_state": "staged",
         }
+        declared_environment = task_card.get("worker_environment")
+        if isinstance(declared_environment, str) and declared_environment:
+            lane["worker_environment"] = declared_environment
+        if memory.state is not None:
+            lane["memory_plan_state"] = memory.state
+            lane["dispatchable"] = memory.dispatchable
+        if memory.pending_plan:
+            lane["memory_pending_reason"] = memory_handoff.plan_state_summary(
+                str(memory.state)
+            )
         if managed:
             lane["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
             lane["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
+        if allowance_expired():
+            raise BootstrapError(
+                BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "the enclosing allowance expired before publishing the lane record",
+            )
         written_lane = write_lane(rt, epoch_id, lane_id, lane)
         published_epoch_id = epoch_id
         published_run_id = run_id
@@ -969,6 +1324,24 @@ def run_bootstrap(
     finally:
         if lock_held:
             bootstrap_lock.__exit__(None, None, None)
+
+    if pending_memory_state is not None:
+        return {
+            "ok": False,
+            "code": BOOTSTRAP_PLAN_PENDING,
+            "summary": (
+                f"lane {lane_id} has no ROOT-accepted execution plan: "
+                + memory_handoff.plan_state_summary(pending_memory_state)
+            ),
+            "evidence_paths": [
+                str(lane_record_dir(rt, epoch_id, lane_id) / "lane.json"),
+                str(memory_handoff.memory_paths(worktree_path)[0]),
+            ],
+            "next_action": (
+                "ROOT must accept the exact plan before preparing a worker; "
+                "no worker was created or launched"
+            ),
+        }
 
     return {
         "ok": True,

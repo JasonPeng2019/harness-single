@@ -51,7 +51,14 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             / "launcher_binding.py"
         )
         binding.parent.mkdir(parents=True)
-        binding.write_text("# binding\n", encoding="utf-8")
+        binding.write_bytes(
+            (
+                Path(launch.__file__).resolve().parent
+                / "provider_adapters"
+                / "codex"
+                / "launcher_binding.py"
+            ).read_bytes()
+        )
         self.lane = {
             "schema": "lane/v1",
             "lane_id": "lane-1",
@@ -67,7 +74,14 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "git": self.lane["git"],
         }
         self.invocation["content_hash"] = content_hash(self.invocation)

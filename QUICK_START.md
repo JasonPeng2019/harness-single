@@ -54,13 +54,27 @@ provider.
 
 ```powershell
 python -m orchestrator_harness.operator_launch lane bootstrap `
-  --lane-id lane-01 --provider codex --model <model> --task-card <path-to-task-card.json>
+  --lane-id lane-01 --provider codex --model <model> `
+  --provider-option reasoning_effort=high --provider-option service_tier=priority `
+  --task-card <path-to-task-card.json>
 ```
 
-`--task-card` names a `project-task-card/v1` file (task text, branch, base commit). Add
+`--task-card` names a `project-task-card/v1` file containing task text, a nonempty
+`acceptance_criteria` list, a nonempty `deliverables` list,
+`reason_for_acceptance_and_deliverables`, branch, and base commit; copy
+`examples/project-task-card.example.json` as the starting point. Add
 `--exclusive-resource <id>` for each resource declared in the manifest. Bootstrap creates the
 worktree, stages the super-cache base and the selected provider payload, and writes the worker
-binding. Shipped provider IDs: `codex`, `claude-code`, `qwen-code`.
+binding. Repeat `--provider-option NAME=VALUE` for every adapter-required preference: Codex
+requires `reasoning_effort` and `service_tier` (and optionally accepts `launcher=ollama`), Claude
+Code requires `effort`, and Qwen Code accepts no provider options. Shipped provider IDs: `codex`,
+`claude-code`, `qwen-code`.
+
+An ordinary card takes the inherited harness path. An enhanced card may add a validated
+`memory_handoff` created with `memory_harness.contracts`; only the exact
+`execution_accepted` plan state is dispatchable. `absent` and `candidate_review` are durably
+prepared but stop before creating a worker. See `memory_harness/README.md` for the memory,
+template, privacy, snapshot, Atlas, and EverOS contracts.
 
 ## 4. Launch
 

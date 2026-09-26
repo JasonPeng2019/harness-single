@@ -288,6 +288,7 @@ class RegisteredBindingTests(unittest.TestCase):
         codex = self._load_registered("codex")
         argv = codex.build_argv(
             model="gpt-5.4",
+            launch_config={"reasoning_effort": "high", "service_tier": "priority"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
@@ -296,6 +297,7 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
         resume_argv = codex.build_argv(
             model="gpt-5.4",
+            launch_config={"reasoning_effort": "high", "service_tier": "priority"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
             session_id="s1",
@@ -307,6 +309,7 @@ class RegisteredBindingTests(unittest.TestCase):
         claude = self._load_registered("claude-code")
         argv = claude.build_argv(
             model="deepseek-v4-flash:0731-cloud",
+            launch_config={"effort": "high"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
@@ -317,6 +320,7 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--verbose", argv)
         claude_resume = claude.build_argv(
             model="sonnet",
+            launch_config={"effort": "high"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
             session_id="claude-session-1",
@@ -331,6 +335,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "session ID"):
             claude.build_argv(
                 model="sonnet",
+                launch_config={"effort": "high"},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                 resume=True,
@@ -340,6 +345,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with mock.patch.object(qwen.shutil, "which", return_value=None):
             argv = qwen.build_argv(
                 model="qwen3-coder",
+                launch_config={},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
             )
@@ -350,6 +356,7 @@ class RegisteredBindingTests(unittest.TestCase):
         with mock.patch.object(qwen.shutil, "which", return_value=None):
             qwen_resume = qwen.build_argv(
                 model="qwen3-coder",
+                launch_config={},
                 worktree="C:/wt",
                 prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                 session_id="qwen-session-1",
@@ -358,6 +365,7 @@ class RegisteredBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "session ID"):
                 qwen.build_argv(
                     model="qwen3-coder",
+                    launch_config={},
                     worktree="C:/wt",
                     prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
                     resume=True,
@@ -373,6 +381,7 @@ class RegisteredBindingTests(unittest.TestCase):
         qwen = self._load_registered("qwen-code")
         kwargs = {
             "model": "qwen3-coder",
+            "launch_config": {},
             "worktree": "C:/wt",
             "prompt_path": "C:/wt/.agent-workspace/worker-prompt.md",
         }

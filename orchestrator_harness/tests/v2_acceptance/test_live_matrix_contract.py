@@ -22,6 +22,12 @@ ENTRYPOINT = ROOT / ".agent-workspace" / "execute-matrix.py"
 
 class LiveMatrixContractTests(unittest.TestCase):
 
+    def setUp(self) -> None:
+        if not ENTRYPOINT.is_file():
+            self.skipTest(
+                "live-matrix product fixtures are not present under .agent-workspace"
+            )
+
     def _entrypoint(self, manifests, checkpoints, *, checks=(), total_budget=3):
         command = [sys.executable, str(ENTRYPOINT)]
         for manifest in manifests:

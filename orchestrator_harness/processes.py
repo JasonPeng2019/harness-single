@@ -215,18 +215,35 @@ def spawn_detached(
     cwd: str | Path | None = None,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
+    env: dict[str, str] | None = None,
 ) -> subprocess.Popen[Any]:
     """Start one detached monitor/helper process and return its Popen handle."""
 
     creationflags = WINDOWS_CREATE_NO_WINDOW if os.name == "nt" else 0
+    child_argv = list(argv)
+    child_env = env
+    if (
+        os.name == "nt"
+        and sys.prefix != sys.base_prefix
+        and child_argv
+        and os.path.normcase(os.path.abspath(child_argv[0]))
+        == os.path.normcase(os.path.abspath(sys.executable))
+    ):
+        # The Windows venv redirector starts another process, so its Popen PID
+        # cannot attest the Python child. Launch the base executable directly
+        # while asking Python to retain the venv's interpreter identity.
+        child_argv[0] = sys._base_executable
+        child_env = dict(os.environ if env is None else env)
+        child_env["__PYVENV_LAUNCHER__"] = sys.executable
     return subprocess.Popen(
-        list(argv),
+        child_argv,
         cwd=str(cwd) if cwd is not None else None,
         stdout=stdout,
         stderr=stderr,
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
         close_fds=True,
+        env=child_env,
     )
 
 

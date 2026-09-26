@@ -6,12 +6,35 @@ import json
 from typing import Any
 
 PROVIDER_ID = "claude-code"
-ADAPTER_VERSION = "claude-code-v1"
+ADAPTER_VERSION = "claude-code-v2"
+
+_LAUNCH_CONFIG_KEYS = frozenset({"effort"})
+
+
+def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+    """Validate every Claude model preference before a provider can start."""
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Claude Code model must be configured")
+    if not isinstance(launch_config, dict):
+        raise ValueError("Claude Code launch_config must be an object")
+    missing = sorted(_LAUNCH_CONFIG_KEYS - set(launch_config))
+    if missing:
+        raise ValueError(f"Claude Code launch_config is missing: {', '.join(missing)}")
+    unsupported = sorted(set(launch_config) - _LAUNCH_CONFIG_KEYS)
+    if unsupported:
+        raise ValueError(
+            f"Claude Code launch_config has unsupported options: {', '.join(unsupported)}"
+        )
+    effort = launch_config["effort"]
+    if not isinstance(effort, str) or not effort.strip():
+        raise ValueError("Claude Code launch_config effort must be a non-empty string")
+    return {"effort": effort.strip()}
 
 
 def build_argv(
     *,
     model: str,
+    launch_config: dict[str, Any],
     worktree: str,
     prompt_path: str,
     session_id: str | None = None,
@@ -19,13 +42,13 @@ def build_argv(
 ) -> list[str]:
     """Build the provider-owned, stdin-prompted Claude Code launch vector."""
     del worktree, prompt_path
+    configured = validate_launch_config(model=model, launch_config=launch_config)
     argv = ["claude", "--print", "--output-format", "stream-json", "--verbose"]
     if resume:
         if not session_id:
             raise ValueError("Claude Code resume requires a session ID")
         argv.extend(["--resume", session_id])
-    if model:
-        argv.extend(["--model", model])
+    argv.extend(["--model", model, "--effort", configured["effort"]])
     argv.extend(["--permission-mode", "bypassPermissions"])
     return argv
 

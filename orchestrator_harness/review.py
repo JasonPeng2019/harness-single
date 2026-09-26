@@ -14,21 +14,22 @@ from pathlib import Path
 from typing import Any
 
 from .config import find_harness_root, load_config
-from .core import content_hash, iso_utc, read_json, require_schema
+from .core import content_hash, iso_utc, read_json, require_schema, sha256_hex
 from .epochs import lane_record_dir
-from .lanes import find_active_lane, read_lane
+from .lanes import LaneError, find_active_lane, read_lane
+from . import memory_handoff, terminal_evidence
 from .manager_queue import (
     MANAGER_ACK_EVENT_NOT_FOUND,
     ManagerQueueError,
     close_event,
     read_manager_queue,
 )
-from .records import RecordLock, atomic_write_json
+from .records import RecordLock, atomic_write_json, read_record
+from .task_cards import validate_task_card
 
 COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
 ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
 RESULT_SCHEMA = "result/v1"
-TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
 
 FRESH_LANE_INTEGRITY_DIAGNOSTIC = (
@@ -36,7 +37,7 @@ FRESH_LANE_INTEGRITY_DIAGNOSTIC = (
     "in a fresh epoch"
 )
 
-REVIEW_OUTCOMES = frozenset({"PASS", "FAIL", "BLOCKED"})
+REVIEW_OUTCOMES = frozenset({"PASS", "FAIL", "BLOCKED", "UNKNOWN"})
 APPROVALS = frozenset({"ACCEPTED", "REJECTED"})
 _REVIEW_EVENT_TYPES = frozenset({"COMPLETION_REVIEW_REQUIRED", "LANE_RESULT_INVALID"})
 
@@ -67,8 +68,16 @@ def lane_integrity_contract_error(lane: dict[str, Any]) -> str | None:
         or "current_tip" in git
         or not isinstance(git.get("bootstrap_tip"), str)
         or not git.get("bootstrap_tip")
-        or not isinstance(lane.get("invocation_hash"), str)
-        or not lane.get("invocation_hash")
+    ):
+        return FRESH_LANE_INTEGRITY_DIAGNOSTIC
+    invocation_hash = lane.get("invocation_hash")
+    pending_plan = (
+        lane.get("memory_plan_state") in {"absent", "candidate_review"}
+        and lane.get("dispatchable") is False
+        and invocation_hash is None
+    )
+    if not pending_plan and (
+        not isinstance(invocation_hash, str) or not invocation_hash
     ):
         return FRESH_LANE_INTEGRITY_DIAGNOSTIC
     return None
@@ -250,8 +259,6 @@ def validate_acceptance_chain(
         "run_id",
         "task_card_id",
         "task_card_hash",
-        "result_id",
-        "result_hash",
         "invocation_hash",
         "commit",
     )
@@ -271,8 +278,26 @@ def validate_acceptance_chain(
     if not isinstance(acceptance.get("accepted_by"), str) or not acceptance["accepted_by"]:
         return False
     outcome = review.get("review_outcome")
+    if outcome == "UNKNOWN":
+        proof = review.get("terminal_proof_digest")
+        return (
+            review.get("result_id") is None
+            and review.get("result_hash") is None
+            and acceptance.get("result_id") is None
+            and acceptance.get("result_hash") is None
+            and isinstance(proof, str)
+            and bool(proof)
+            and acceptance.get("terminal_proof_digest") == proof
+            and acceptance.get("approval") == "ACCEPTED"
+            and isinstance(acceptance.get("force_accept_reason"), str)
+            and bool(acceptance["force_accept_reason"].strip())
+        )
     if outcome not in REVIEW_OUTCOMES:
         return False
+    for field in ("result_id", "result_hash"):
+        value = review.get(field)
+        if not isinstance(value, str) or not value or acceptance.get(field) != value:
+            return False
     if acceptance.get("approval") == "ACCEPTED" and outcome != "PASS":
         reason = acceptance.get("force_accept_reason")
         if not isinstance(reason, str) or not reason.strip():
@@ -297,15 +322,18 @@ def validate_lane_acceptance_chain(
         return False
     if review.get("task_card_hash") != lane.get("task_card_hash"):
         return False
-    if review.get("result_id") != run_id:
-        return False
     if review.get("invocation_hash") != lane.get("invocation_hash"):
         return False
     git = lane.get("git")
     validation = lane.get("result_validation")
-    if not isinstance(git, dict) or not isinstance(validation, dict):
+    if not isinstance(git, dict):
         return False
     if "current_tip" in git or not isinstance(git.get("bootstrap_tip"), str):
+        return False
+    if review.get("review_outcome") == "UNKNOWN":
+        advancement = lane.get("acceptance_advancement")
+        return advancement is None or advancement == acceptance
+    if review.get("result_id") != run_id or not isinstance(validation, dict):
         return False
     expected_validation = {
         "run_id": run_id,
@@ -333,7 +361,8 @@ def _read_task_card(worktree: Path) -> dict[str, Any]:
         )
     try:
         record = read_json(path)
-        require_schema(record, TASK_CARD_SCHEMA, path)
+        validate_task_card(record, path)
+        memory_handoff.validate_task_card(record)
     except (OSError, ValueError) as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
     return record
@@ -400,24 +429,153 @@ def _resolve_lane_managed(
         raise ReviewError(
             COMPLETION_REVIEW_EVENT_INVALID, f"review event not found: {event_id}"
         )
-    if event.get("type") not in _REVIEW_EVENT_TYPES:
+    if event.get("type") not in _REVIEW_EVENT_TYPES and not (
+        event.get("type") == "LANE_STATUS_CHANGED"
+        and event.get("actionable_status") == "provider_exited_no_result"
+    ):
         raise ReviewError(
             COMPLETION_REVIEW_EVENT_INVALID,
             f"event {event_id} is not a review event (type={event.get('type')})",
         )
-    if event.get("state") != "ACKNOWLEDGED":
+    if event.get("state") not in {"ACKNOWLEDGED", "COMPLETE"}:
         raise ReviewError(
             COMPLETION_REVIEW_NOT_ACKNOWLEDGED,
             f"event {event_id} is not ACKNOWLEDGED (state={event.get('state')})",
         )
     lane_id = str(event.get("lane_id") or "")
-    epoch_id, lane = find_active_lane(rt, lane_id)
+    try:
+        epoch_id, lane = find_active_lane(rt, lane_id)
+    except LaneError:
+        # An older publication may already have advanced and retired its lane
+        # before manager close was acknowledged. The queue still names its
+        # exact epoch/run; replay can finish from retained publication.
+        epoch_id = str(queue["epoch_id"])
+        lane = read_lane(rt, epoch_id, lane_id)
     if lane.get("run_id") != event.get("run_id"):
         raise ReviewError(
             COMPLETION_REVIEW_EVENT_INVALID,
             f"event {event_id} does not match the lane's current run",
         )
     return epoch_id, lane, event
+
+
+def _native_source(
+    lane: dict[str, Any], task_card: dict[str, Any], worktree: Path,
+) -> dict[str, Any] | None:
+    """Resolve only an enhanced parent's exact delivered STEP-07 observation."""
+    try:
+        state = memory_handoff.lane_handoff_state(task_card, lane)
+        if state is None:
+            return None
+        if state != "execution_accepted" or memory_handoff.enabled_memory_handoff(task_card) is None:
+            raise memory_handoff.MemoryHandoffError(
+                "the lane is not an execution-accepted enhanced parent"
+            )
+        plan = memory_handoff.require_accepted_handoff(task_card)
+        envelope = memory_handoff.load_envelope(worktree)
+        if envelope is None:
+            raise memory_handoff.MemoryHandoffError("enhanced parent has no finalized dispatch envelope")
+        memory_handoff.validate_envelope_for_launch(
+            envelope=envelope, task_card=task_card, lane_id=lane["lane_id"],
+            run_id=lane["run_id"], worktree_path=worktree,
+            base_commit=task_card["base_commit"],
+        )
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=envelope,
+        )
+        memory_handoff.validate_final_context_for_launch(
+            context=context, envelope=envelope, task_card=task_card,
+            lane_id=lane["lane_id"], run_id=lane["run_id"],
+            worktree_path=worktree, base_commit=task_card["base_commit"],
+        )
+        operation = memory_handoff.get_dispatch_operation(
+            worktree_path=worktree, envelope=envelope,
+        )
+        decision = memory_handoff.get_dispatch_decision(
+            worktree_path=worktree, envelope=envelope,
+        )
+        if not isinstance(operation, dict) or operation.get("status") != "delivered":
+            raise memory_handoff.MemoryHandoffError(
+                "enhanced parent has no delivered native dispatch observation"
+            )
+        observed = operation.get("observed_invocation")
+        if not isinstance(observed, dict):
+            raise memory_handoff.MemoryHandoffError("delivered dispatch has no native invocation")
+        expected = memory_handoff.native_observation(
+            envelope=envelope, context=context, controller_identity=observed,
+        )
+        process = lane.get("process") or {}
+        if (
+            operation.get("run_id") != lane["run_id"]
+            or operation.get("decision_id") != envelope["decision_id"]
+            or operation.get("envelope_digest") != envelope["content_hash"]
+            or observed != expected
+            or any(process.get(field) != observed[field] for field in ("pid", "creation_time"))
+        ):
+            raise memory_handoff.MemoryHandoffError(
+                "delivered native observation conflicts with this lane and run"
+            )
+        return {
+            "plan": plan, "decision": decision, "envelope": envelope,
+            "context": context, "operation": operation, "observed": observed,
+        }
+    except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
+
+
+def _unknown_proof(lane: dict[str, Any], worktree: Path) -> dict[str, Any]:
+    """Require controller-owned, same-run no-result and cleanup proof."""
+    result_path = worktree / "RESULT.json"
+    if result_path.exists():
+        try:
+            candidate = read_json(result_path)
+        except (OSError, ValueError):
+            candidate = None
+        if isinstance(candidate, dict):
+            if candidate.get("lane_id") != lane["lane_id"] or candidate.get("run_id") != lane["run_id"]:
+                raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "wrong-run result cannot establish UNKNOWN")
+            if candidate.get("content_hash") == content_hash(candidate) and candidate.get("outcome") in {"PASS", "FAIL", "BLOCKED"}:
+                raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "a valid result exists; UNKNOWN is not justified")
+    path_value = lane.get("controller_status_path")
+    if not isinstance(path_value, str) or not path_value:
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "controller proof path is missing")
+    try:
+        status = read_record(Path(path_value), "controller-status/v1")
+    except (OSError, ValueError) as exc:
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, f"controller proof is missing or invalid: {exc}") from exc
+    if not (
+        status.get("lane_id") == lane["lane_id"]
+        and status.get("run_id") == lane["run_id"]
+        and status.get("controller_state") == "exited"
+        and isinstance(status.get("provider_state"), dict)
+        and status["provider_state"].get("state") == "exited"
+        and status.get("result_state") in {"absent", "invalid"}
+        and status.get("recorded_status") == "provider_exited_no_result"
+        and status.get("cleanup_proven") is True
+    ):
+        raise ReviewError(
+            COMPLETION_REVIEW_STALE_SOURCE,
+            "exact same-run provider_exited_no_result and cleanup proof are required",
+        )
+    return status
+
+
+def _existing_record(path: Path, schema: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        value = read_record(path, schema)
+    except (OSError, ValueError) as exc:
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT,
+            f"existing publication at {path} is invalid and was preserved: {exc}",
+        ) from exc
+    if value.get("content_hash") != content_hash(value):
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT,
+            f"existing publication at {path} has an invalid hash and was preserved",
+        )
+    return value
 
 
 def _write_pair(
@@ -430,18 +588,27 @@ def _write_pair(
     evidence: list[str],
     approval: str,
     force_accept_reason: str | None,
+    managed_event: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    root_folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    if folder != root_folder:
+        for name, schema in (
+            ("COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA),
+            ("ORCHESTRATOR_ACCEPTANCE.json", ACCEPTANCE_SCHEMA),
+            (terminal_evidence.TERMINAL_EVIDENCE_NAME, terminal_evidence.TERMINAL_EVIDENCE_SCHEMA),
+        ):
+            historical = _existing_record(root_folder / name, schema)
+            if historical is not None and historical.get("run_id") == lane["run_id"]:
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    "the root publication already owns this exact run",
+                )
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
-    if review_path.is_file() or acceptance_path.is_file():
-        raise ReviewError(
-            COMPLETION_REVIEW_OUTPUT_CONFLICT,
-            "a review/acceptance pair already exists for this lane",
-        )
+    terminal_path = folder / terminal_evidence.TERMINAL_EVIDENCE_NAME
     worktree = Path(lane["worktree_path"])
     task_card = _read_task_card(worktree)
-    result = _read_result(worktree, lane)
     invocation_path = worktree / ".agent-workspace" / "invocation.json"
     try:
         invocation = read_json(invocation_path)
@@ -458,6 +625,18 @@ def _write_pair(
         git_state = validate_merge_ready_git(lane)
     except GitStateError as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
+    native = _native_source(lane, task_card, worktree)
+    if review_outcome == "UNKNOWN":
+        if native is None or approval != "ACCEPTED" or force_accept_reason is None:
+            raise ReviewError(
+                COMPLETION_REVIEW_FORCE_REASON_INVALID,
+                "UNKNOWN requires an enhanced parent and explicit exceptional ROOT acceptance",
+            )
+        result = None
+        terminal_proof = _unknown_proof(lane, worktree)
+    else:
+        result = _read_result(worktree, lane)
+        terminal_proof = None
     commit = _worktree_commit(worktree, task_card)
     if commit != git_state["commit"]:
         raise ReviewError(
@@ -468,60 +647,224 @@ def _write_pair(
     if not task_card_id:
         task_card_id = content_hash(task_card)
     task_card_hash = content_hash(task_card)
-    result_id = str(lane.get("run_id") or "")
-    result_hash = content_hash(result)
-    validation = lane.get("result_validation")
-    expected_validation = {
-        "run_id": lane["run_id"],
-        "result_hash": result_hash,
-        "branch": git_state["branch"],
-        "commit": commit,
-    }
-    if not isinstance(validation, dict) or any(
-        validation.get(field) != value
-        for field, value in expected_validation.items()
-    ) or validation.get("clean") is not True:
-        raise ReviewError(
-            COMPLETION_REVIEW_STALE_SOURCE,
-            "result is not bound to the lane's current clean branch tip",
-        )
-    reviewed_at = iso_utc()
-    review = {
-        "schema": COMPLETION_REVIEW_SCHEMA,
-        "lane_id": lane["lane_id"],
-        "run_id": lane["run_id"],
-        "review_outcome": review_outcome,
-        "review_summary": review_summary,
-        "evidence": list(evidence),
-        "task_card_id": task_card_id,
-        "task_card_hash": task_card_hash,
-        "result_id": result_id,
-        "result_hash": result_hash,
-        "invocation_hash": lane["invocation_hash"],
-        "commit": commit,
-        "reviewed_at": reviewed_at,
-    }
-    review["content_hash"] = content_hash(review)
-    acceptance = {
-        "schema": ACCEPTANCE_SCHEMA,
-        "lane_id": lane["lane_id"],
-        "run_id": lane["run_id"],
-        "approval": approval,
-        "accepted_by": "ROOT",
-        "review_ref": review["content_hash"],
-        "task_card_id": task_card_id,
-        "task_card_hash": task_card_hash,
-        "result_id": result_id,
-        "result_hash": result_hash,
-        "invocation_hash": lane["invocation_hash"],
-        "commit": commit,
-        "decided_at": reviewed_at,
-    }
-    if force_accept_reason is not None:
-        acceptance["force_accept_reason"] = force_accept_reason
-    acceptance["content_hash"] = content_hash(acceptance)
+    result_id = lane["run_id"] if result is not None else None
+    result_hash = content_hash(result) if result is not None else None
+    if result is not None:
+        validation = lane.get("result_validation")
+        expected_validation = {
+            "run_id": lane["run_id"],
+            "result_hash": result_hash,
+            "branch": git_state["branch"],
+            "commit": commit,
+        }
+        if not isinstance(validation, dict) or any(
+            validation.get(field) != value
+            for field, value in expected_validation.items()
+        ) or validation.get("clean") is not True:
+            raise ReviewError(
+                COMPLETION_REVIEW_STALE_SOURCE,
+                "result is not bound to the lane's current clean branch tip",
+            )
     with RecordLock(review_path):
-        atomic_write_json(review_path, review)
+        existing_review = _existing_record(review_path, COMPLETION_REVIEW_SCHEMA)
+        existing_acceptance = _existing_record(acceptance_path, ACCEPTANCE_SCHEMA)
+        existing_terminal = _existing_record(
+            terminal_path, terminal_evidence.TERMINAL_EVIDENCE_SCHEMA,
+        )
+        if existing_terminal is not None and existing_review is None:
+            raise ReviewError(
+                COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                "terminal evidence exists without its review and was preserved",
+            )
+        reviewed_at = (
+            existing_review.get("reviewed_at") if existing_review is not None
+            else existing_acceptance.get("decided_at") if existing_acceptance is not None
+            else iso_utc()
+        )
+        review = {
+            "schema": COMPLETION_REVIEW_SCHEMA,
+            "lane_id": lane["lane_id"],
+            "run_id": lane["run_id"],
+            "review_outcome": review_outcome,
+            "review_summary": review_summary,
+            "evidence": list(evidence),
+            "task_card_id": task_card_id,
+            "task_card_hash": task_card_hash,
+            "result_id": result_id,
+            "result_hash": result_hash,
+            "invocation_hash": lane["invocation_hash"],
+            "commit": commit,
+            "reviewed_at": reviewed_at,
+        }
+        if terminal_proof is not None:
+            review["terminal_proof_digest"] = sha256_hex(terminal_proof)
+        review["content_hash"] = content_hash(review)
+        acceptance = {
+            "schema": ACCEPTANCE_SCHEMA,
+            "lane_id": lane["lane_id"],
+            "run_id": lane["run_id"],
+            "approval": approval,
+            "accepted_by": "ROOT",
+            "review_ref": review["content_hash"],
+            "task_card_id": task_card_id,
+            "task_card_hash": task_card_hash,
+            "result_id": result_id,
+            "result_hash": result_hash,
+            "invocation_hash": lane["invocation_hash"],
+            "commit": commit,
+            "decided_at": reviewed_at,
+        }
+        if terminal_proof is not None:
+            acceptance["terminal_proof_digest"] = sha256_hex(terminal_proof)
+        if force_accept_reason is not None:
+            acceptance["force_accept_reason"] = force_accept_reason
+        acceptance["content_hash"] = content_hash(acceptance)
+        if not validate_acceptance_chain(
+            review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"],
+        ):
+            raise ReviewError(COMPLETION_REVIEW_WRITE_FAILED, "constructed review chain is invalid")
+        if native is not None:
+            envelope = native["envelope"]
+            terminal = terminal_evidence.make_terminal_evidence(
+                epoch_id=epoch_id, lane_id=lane["lane_id"], run_id=lane["run_id"],
+                task_card=task_card, accepted_plan=native["plan"],
+                objective_id=envelope["objective_id"], decision_id=envelope["decision_id"],
+                decision=native["decision"], envelope=envelope,
+                final_context=native["context"],
+                dispatch_operation=native["operation"],
+                envelope_digest=envelope["content_hash"],
+                observed_invocation=native["observed"],
+                configuration=envelope["configuration"],
+                configuration_digest=envelope["configuration_digest"],
+                result=result, review=review, acceptance=acceptance,
+                terminal_proof=terminal_proof,
+            )
+        else:
+            terminal = None
+        for old, new, name in (
+            (existing_review, review, "review"),
+            (existing_acceptance, acceptance, "acceptance"),
+            (existing_terminal, terminal, "terminal evidence"),
+        ):
+            if old is not None and old != new:
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    f"existing {name} conflicts with this exact review and was preserved",
+                )
+        if existing_review is None:
+            atomic_write_json(review_path, review)
+        if terminal is not None and existing_terminal is None:
+            atomic_write_json(terminal_path, terminal)
+        if terminal is not None:
+            terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
+        if terminal is not None and managed_event is not None and managed_event.get("state") != "COMPLETE":
+            try:
+                close_event(
+                    rt, managed_event["event_id"], "COMPLETE",
+                    summary=f"completion review recorded: {review_outcome} / {approval}",
+                )
+            except ManagerQueueError as exc:
+                raise ReviewError(
+                    COMPLETION_REVIEW_WRITE_FAILED,
+                    f"review prepared but the event could not be closed: {exc}",
+                ) from exc
+        # Acceptance is the existing harness advancement signal. Publish it
+        # only after the enhanced evidence and managed close are durable.
+        if existing_acceptance is None:
+            atomic_write_json(acceptance_path, acceptance)
+    return review, acceptance
+
+
+def _replay_retained_pair(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, review_outcome: str,
+    review_summary: str, evidence: list[str], approval: str,
+    force_accept_reason: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retry manager close from an exact publication, even after retirement."""
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    review = _existing_record(folder / "COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA)
+    acceptance = _existing_record(folder / "ORCHESTRATOR_ACCEPTANCE.json", ACCEPTANCE_SCHEMA)
+    if review is None or acceptance is None or not validate_acceptance_chain(
+        review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"],
+    ):
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained review pair is absent or invalid")
+    if (
+        review.get("review_outcome") != review_outcome
+        or review.get("review_summary") != review_summary
+        or review.get("evidence") != evidence
+        or acceptance.get("approval") != approval
+        or acceptance.get("force_accept_reason") != force_accept_reason
+    ):
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained review conflicts with this retry")
+    if lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError as exc:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained native evidence is absent or conflicts")
+        terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
+    return review, acceptance
+
+
+def _replay_retained_preparation(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, review_outcome: str,
+    review_summary: str, evidence: list[str], approval: str,
+    force_accept_reason: str | None, managed_event: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Finish only the missing acceptance from validated native preparation."""
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    review_path = folder / "COMPLETION_REVIEW.json"
+    acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+    with RecordLock(review_path):
+        review = _existing_record(review_path, COMPLETION_REVIEW_SCHEMA)
+        terminal = _existing_record(
+            folder / terminal_evidence.TERMINAL_EVIDENCE_NAME,
+            terminal_evidence.TERMINAL_EVIDENCE_SCHEMA,
+        )
+        if review is None or terminal is None or acceptance_path.exists():
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained preparation is absent or already published")
+        try:
+            terminal_evidence.validate_terminal_evidence(
+                terminal, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError as exc:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        acceptance = terminal["acceptance"]
+        if (
+            terminal["epoch_id"] != epoch_id
+            or terminal["review"] != review
+            or not validate_acceptance_chain(
+                review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+            or review.get("review_outcome") != review_outcome
+            or review.get("review_summary") != review_summary
+            or review.get("evidence") != evidence
+            or acceptance.get("approval") != approval
+            or acceptance.get("force_accept_reason") != force_accept_reason
+        ):
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained preparation conflicts with this retry")
+        if folder != lane_record_dir(rt, epoch_id, lane["lane_id"]):
+            try:
+                terminal_evidence.validate_root_siblings(
+                    rt, epoch_id, lane["lane_id"], lane["run_id"], terminal,
+                )
+            except terminal_evidence.TerminalEvidenceError as exc:
+                raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
+        if managed_event.get("state") != "COMPLETE":
+            try:
+                close_event(
+                    rt, managed_event["event_id"], "COMPLETE",
+                    summary=f"completion review recorded: {review_outcome} / {approval}",
+                )
+            except ManagerQueueError as exc:
+                raise ReviewError(
+                    COMPLETION_REVIEW_WRITE_FAILED,
+                    f"review prepared but the event could not be closed: {exc}",
+                ) from exc
         atomic_write_json(acceptance_path, acceptance)
     return review, acceptance
 
@@ -560,6 +903,11 @@ def run_completion_review(
             raise ReviewError(
                 COMPLETION_REVIEW_WRITE_FAILED, f"invalid approval: {approval}"
             )
+        if review_outcome == "UNKNOWN" and approval != "ACCEPTED":
+            raise ReviewError(
+                COMPLETION_REVIEW_FORCE_REASON_INVALID,
+                "UNKNOWN requires explicit exceptional ROOT acceptance",
+            )
         if approval == "ACCEPTED" and review_outcome != "PASS":
             if not force_accept:
                 raise ReviewError(
@@ -581,36 +929,81 @@ def run_completion_review(
                 COMPLETION_REVIEW_EVENT_INVALID,
                 "select the lane with --event-id (managed) or --lane-id (plain)",
             )
-        if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
-            raise ReviewError(
-                COMPLETION_REVIEW_STALE_SOURCE,
-                f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
-            )
-        review, acceptance = _write_pair(
-            rt,
-            epoch_id,
-            lane,
-            review_outcome=review_outcome,
-            review_summary=review_summary,
-            evidence=evidence,
-            approval=approval,
-            force_accept_reason=force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None,
+        folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+        retained_preparation = (
+            event is not None
+            and lane.get("memory_plan_state") == "execution_accepted"
+            and (folder / "COMPLETION_REVIEW.json").is_file()
+            and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+            and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
         )
-        if event is not None:
-            try:
-                close_event(
-                    rt,
-                    event["event_id"],
-                    "COMPLETE",
-                    summary=(
-                        f"completion review recorded: {review_outcome} / {approval}"
-                    ),
-                )
-            except ManagerQueueError as exc:
+        if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
+            if not (
+                (lane.get("lifecycle") == "accepted" or (
+                    lane.get("lifecycle") == "retired" and event is not None
+                ))
+                and (folder / "COMPLETION_REVIEW.json").is_file()
+                and ((folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file() or retained_preparation)
+            ):
                 raise ReviewError(
-                    COMPLETION_REVIEW_WRITE_FAILED,
-                    f"review pair written but the event could not be closed: {exc}",
-                ) from exc
+                    COMPLETION_REVIEW_STALE_SOURCE,
+                    f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
+                )
+        if event is not None and event.get("state") == "COMPLETE":
+            if not (folder / "COMPLETION_REVIEW.json").is_file() or (
+                lane.get("memory_plan_state") == "execution_accepted"
+                and not (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+            ) or (
+                lane.get("memory_plan_state") != "execution_accepted"
+                and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+            ):
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    "completed review event has no durable review preparation",
+                )
+        exact_reason = force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
+        if retained_preparation:
+            review, acceptance = _replay_retained_preparation(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+                managed_event=event,
+            )
+        elif event is not None and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file():
+            review, acceptance = _replay_retained_pair(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+            )
+            if event.get("state") != "COMPLETE":
+                try:
+                    close_event(
+                        rt, event["event_id"], "COMPLETE",
+                        summary=f"completion review recorded: {review_outcome} / {approval}",
+                    )
+                except ManagerQueueError as exc:
+                    raise ReviewError(
+                        COMPLETION_REVIEW_WRITE_FAILED,
+                        f"retained review is valid but the event could not be closed: {exc}",
+                    ) from exc
+        else:
+            review, acceptance = _write_pair(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+                managed_event=event,
+            )
+            if event is not None and event.get("state") != "COMPLETE" and lane.get("memory_plan_state") != "execution_accepted":
+                try:
+                    close_event(
+                        rt, event["event_id"], "COMPLETE",
+                        summary=f"completion review recorded: {review_outcome} / {approval}",
+                    )
+                except ManagerQueueError as exc:
+                    raise ReviewError(
+                        COMPLETION_REVIEW_WRITE_FAILED,
+                        f"review pair written but the event could not be closed: {exc}",
+                    ) from exc
     except ReviewError as exc:
         return {
             "ok": False,
@@ -628,7 +1021,7 @@ def run_completion_review(
             "next_action": "resolve the error and retry the review",
         }
 
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     next_action = (
         "retire the lane with `lane retire --acceptance-ref <file>` when done"
         if approval == "ACCEPTED"
@@ -641,6 +1034,7 @@ def run_completion_review(
         "evidence_paths": [
             str(folder / "COMPLETION_REVIEW.json"),
             str(folder / "ORCHESTRATOR_ACCEPTANCE.json"),
-        ],
+        ] + ([str(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)]
+             if (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file() else []),
         "next_action": next_action,
     }

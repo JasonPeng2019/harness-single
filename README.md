@@ -28,8 +28,9 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 
 - `harness setup [--overwrite]` — one-time idempotent integration; `harness shutdown` — end the
   whole runtime.
-- `lane bootstrap --lane-id --provider --model [--exclusive-resource] --task-card` — prepare one
-  lane; `lane launch --lane-id` — start one prepared lane.
+- `lane bootstrap --lane-id --provider --model [--provider-option NAME=VALUE]
+  [--exclusive-resource] --task-card` — prepare one lane; `lane launch --lane-id` — start one
+  prepared lane.
 - `lane completion-review (--event-id|--lane-id) --review-outcome {PASS,FAIL,BLOCKED} --approval
   {ACCEPTED,REJECTED} --review-summary [--evidence] [--force-accept] [--force-reason]` — record
   ROOT's review and acceptance.
@@ -93,6 +94,10 @@ custom file-only adapter tree: reserved for local, non-shipped payload files. Th
 keeps only a marker README, and runtime staging never reads it unless an operator explicitly
 places payloads there.
 
+Provider launch preferences are explicit and closed: Codex requires `reasoning_effort` and
+`service_tier` and optionally accepts `launcher=ollama`; Claude Code requires `effort`; Qwen Code
+accepts no launch preferences. Pass each value with a repeated `--provider-option NAME=VALUE`.
+
 ## Super-cache and bootstrap
 
 `super-cache/workspace/` is the provider-neutral base staged into every managed worktree by
@@ -116,6 +121,21 @@ An invalid result may receive at most five corrective prompts in the same native
 session, with per-attempt transcript, stderr, cleanup, and validation evidence. A sixth invalid
 attempt, a missing native resume session, or a provider startup/auth/process failure ends as
 `provider_exited_no_result`; it never starts a fresh context.
+
+## Optional memory and accepted-plan handoff
+
+The integrated `memory_harness` package supplies deterministic task/plan contracts, bounded local
+and optional Atlas/EverOS search, reviewed template reuse, privacy filtering, durable dispatch
+operations, usage evidence, and SQLite snapshot/restore. Ordinary task cards remain on the
+inherited path with no memory store or optional call. Enhanced cards add a validated
+`memory_handoff`; `absent` and `candidate_review` remain fail-closed planning states, while only an
+exact ROOT `execution_accepted` plan is finalized into worker context and may launch.
+
+Every task card, ordinary or enhanced, must include nonempty `acceptance_criteria`, `deliverables`,
+and `reason_for_acceptance_and_deliverables` fields. Enhanced scrubbed lanes isolate provider
+configuration under the worktree (`.codex`, `.claude`, or `.qwen`) and retain that boundary across
+resume. See `examples/project-task-card.example.json` and `memory_harness/README.md` for the full
+contracts and optional dependency setup.
 
 ## Resume, force-stop, retire, shutdown
 

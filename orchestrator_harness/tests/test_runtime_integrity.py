@@ -63,6 +63,9 @@ class GitResultBindingTests(unittest.TestCase):
             "schema": "project-task-card/v1",
             "card_id": "card-1",
             "task": "test",
+            "acceptance_criteria": ["The requested test behavior is proven"],
+            "deliverables": ["Test evidence"],
+            "reason_for_acceptance_and_deliverables": "The evidence directly covers the test objective.",
             "branch": "lane/test",
             "base_commit": self.base,
         }
@@ -549,6 +552,9 @@ class RetirementArchiveSafetyTests(unittest.TestCase):
             "schema": "project-task-card/v1",
             "card_id": "card-1",
             "task": "archive safely",
+            "acceptance_criteria": ["The accepted lane is archived safely"],
+            "deliverables": ["A verified retirement archive"],
+            "reason_for_acceptance_and_deliverables": "The archive proves safe retirement.",
             "branch": "main",
             "base_commit": self.commit,
         }

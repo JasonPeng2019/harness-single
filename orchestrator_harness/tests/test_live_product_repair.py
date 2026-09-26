@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ def _windows_error(code: int) -> OSError:
     return error
 
 
+@unittest.skipUnless(os.name == "nt", "Windows replacement semantics require Windows pathlib")
 class WindowsReplacementRetryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -184,17 +186,19 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "git": dict(self.lane["git"]),
         }
         self.invocation["content_hash"] = content_hash(self.invocation)
         self.lane["provider"] = self.invocation["provider"]
         self.lane["invocation_hash"] = self.invocation["content_hash"]
-        binding = (
-            "PROVIDER_ID = 'codex'\n"
-            "def build_argv(**kwargs): return ['codex']\n"
-            "def parse_line(line): return None\n"
-        )
         binding_path = (
             self.root
             / "orchestrator_harness"
@@ -203,7 +207,14 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             / "launcher_binding.py"
         )
         binding_path.parent.mkdir(parents=True)
-        binding_path.write_text(binding, encoding="utf-8")
+        binding_path.write_bytes(
+            (
+                Path(launch.__file__).resolve().parent
+                / "provider_adapters"
+                / "codex"
+                / "launcher_binding.py"
+            ).read_bytes()
+        )
 
     def test_provider_start_failure_clears_exact_controller_identity_after_handle_exit(
         self,

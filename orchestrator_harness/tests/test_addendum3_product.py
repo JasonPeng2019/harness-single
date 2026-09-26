@@ -35,6 +35,19 @@ def bind_invocation(lane: dict[str, object], invocation: dict[str, object]) -> N
     lane["invocation_hash"] = invocation["content_hash"]
 
 
+def complete_task_card(*, task: str, base_commit: str = "commit-1") -> dict[str, object]:
+    return {
+        "schema": "project-task-card/v1",
+        "task": task,
+        "acceptance_criteria": ["The requested behavior is verified"],
+        "deliverables": ["Implementation and verification evidence"],
+        "reason_for_acceptance_and_deliverables": (
+            "The criteria and deliverables define the observable completion boundary."
+        ),
+        "base_commit": base_commit,
+    }
+
+
 class Addendum3ProductTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -269,14 +282,21 @@ class Addendum3ProductTests(unittest.TestCase):
             },
         }
         atomic_write_json(lane_dir / "lane.json", lane)
-        task_card = {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"}
+        task_card = complete_task_card(task="review the completed work")
         atomic_write_json(workspace / "task-card.json", task_card)
         lane["task_card_hash"] = content_hash(task_card)
         invocation = {
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
         }
         bind_invocation(lane, invocation)
         atomic_write_json(workspace / "invocation.json", invocation)
@@ -386,7 +406,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "stderr_path": str(workspace / "provider-stderr.txt"),
             "attempts_path": str(workspace / "controller.attempts.jsonl"),
             "last_message_path": str(workspace / "last-message.txt"),
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "process": {},
             "session": {},
             "lifecycle": "prepared",
@@ -395,7 +422,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "exclusive_resources": ["resource-1"],
         }
         bind_invocation(lane, invocation)
@@ -883,6 +917,7 @@ class Addendum3ProductTests(unittest.TestCase):
 
         binding.build_argv.assert_called_once_with(
             model="model-1",
+            launch_config={},
             worktree=str(worktree),
             prompt_path=str(prompt),
             session_id="saved-native-session",
@@ -1450,7 +1485,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-old",
             "worktree_path": str(worktree),
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "session": {"session_id": "session-1"},
             "lifecycle": "running",
             "launch_pending": False,
@@ -1467,11 +1509,7 @@ class Addendum3ProductTests(unittest.TestCase):
         }
         bind_invocation(lane, prior_invocation)
         atomic_write_json(workspace / "invocation.json", prior_invocation)
-        task_card = {
-            "schema": "project-task-card/v1",
-            "card_id": "card-1",
-            "task": "do the work",
-        }
+        task_card = complete_task_card(task="do the work")
         updates: list[dict[str, object]] = []
         state = dict(lane)
 
@@ -1516,7 +1554,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-old",
             "worktree_path": str(worktree),
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "session": {"session_id": "session-1"},
             "lifecycle": "review_pending",
             "process": {},
@@ -1554,11 +1599,7 @@ class Addendum3ProductTests(unittest.TestCase):
                 ],
             },
         )
-        task_card = {
-            "schema": "project-task-card/v1",
-            "card_id": "card-retry",
-            "task": "resume transactionally",
-        }
+        task_card = complete_task_card(task="resume transactionally")
         calls = 0
 
         def update(_rt, _epoch, _lane_id, mutate):
@@ -1624,7 +1665,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-old",
             "worktree_path": str(worktree),
-            "provider": {"id": "codex", "model": "model-1"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
             "session": {"session_id": "session-1"},
             "lifecycle": "review_pending",
             "process": {},
@@ -1662,11 +1710,9 @@ class Addendum3ProductTests(unittest.TestCase):
                 ],
             },
         )
-        task_card = {
-            "schema": "project-task-card/v1",
-            "card_id": "card-signal-retry",
-            "task": "resume once despite queue cleanup failure",
-        }
+        task_card = complete_task_card(
+            task="resume once despite queue cleanup failure"
+        )
 
         def update(_rt, _epoch, _lane_id, mutate):
             value = mutate(dict(state))
@@ -1728,7 +1774,14 @@ class Addendum3ProductTests(unittest.TestCase):
             / "launcher_binding.py"
         )
         binding.parent.mkdir(parents=True)
-        binding.write_text("# binding\n", encoding="utf-8")
+        binding.write_bytes(
+            (
+                Path(launch.__file__).resolve().parent
+                / "provider_adapters"
+                / "codex"
+                / "launcher_binding.py"
+            ).read_bytes()
+        )
         lane = {
             "schema": "lane/v1",
             "lane_id": "lane-1",
@@ -1744,7 +1797,14 @@ class Addendum3ProductTests(unittest.TestCase):
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
-            "provider": {"id": "codex"},
+            "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
         }
         bind_invocation(lane, invocation)
         child = MagicMock(pid=41)

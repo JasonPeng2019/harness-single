@@ -62,6 +62,24 @@ class OperatorLaunchV2Tests(unittest.TestCase):
             )
             self.assertEqual("operator decision", parsed.summary)
 
+    def test_bootstrap_collects_explicit_provider_options(self) -> None:
+        parser = operator_launch._build_parser()
+        parsed = parser.parse_args(
+            [
+                "lane", "bootstrap", "--lane-id", "lane-1",
+                "--provider", "codex", "--model", "configured-model",
+                "--provider-option", "reasoning_effort=xhigh",
+                "--provider-option", "service_tier=flex",
+                "--task-card", "task.json",
+            ]
+        )
+        self.assertEqual(
+            {"reasoning_effort": "xhigh", "service_tier": "flex"},
+            operator_launch._provider_options(parsed.provider_option),
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate provider option"):
+            operator_launch._provider_options([("effort", "high"), ("effort", "low")])
+
     def test_v2_commands_dispatch_through_native_modules(self) -> None:
         with mock.patch.object(
             operator_launch.setup,

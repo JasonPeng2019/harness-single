@@ -31,7 +31,14 @@ class LaunchHandshakeTests(unittest.TestCase):
         (self.worktree / ".agent-workspace").mkdir(parents=True)
         binding = self.root / "orchestrator_harness" / "provider_adapters" / "codex" / "launcher_binding.py"
         binding.parent.mkdir(parents=True)
-        binding.write_text("# binding\n", encoding="utf-8")
+        binding.write_bytes(
+            (
+                Path(launch.__file__).resolve().parent
+                / "provider_adapters"
+                / "codex"
+                / "launcher_binding.py"
+            ).read_bytes()
+        )
         self.lane = {
             "schema": "lane/v1", "lane_id": "lane-1", "run_id": "run-1",
             "lifecycle": "prepared", "process": {}, "worktree_path": str(self.worktree),
@@ -40,7 +47,14 @@ class LaunchHandshakeTests(unittest.TestCase):
         }
         self.invocation = {
             "schema": "controller-invocation/v1", "lane_id": "lane-1",
-            "run_id": "run-1", "provider": {"id": "codex"},
+            "run_id": "run-1", "provider": {
+                "id": "codex",
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
         }
         bind_invocation(self.lane, self.invocation)
 

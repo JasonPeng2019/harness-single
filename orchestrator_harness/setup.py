@@ -15,16 +15,27 @@ binding; it never copies a binding into product source.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
-import tempfile
 import tomllib
+import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
+
+# The historical project metadata lives beside this runtime module, so
+# setuptools executes this file as its build entry point. Give that execution
+# a real package context before the runtime's relative imports are evaluated.
+# Normal imports and ``python -m`` execution do not take this path.
+_SETUPTOOLS_BUILD_ENTRYPOINT = __name__ == "__main__" and not __package__
+if _SETUPTOOLS_BUILD_ENTRYPOINT:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "orchestrator_harness"
 
 from . import processes
 from .config import (
@@ -55,7 +66,22 @@ CODEX_ROOT_CONFIG = Path(".codex") / "config.toml"
 SHARED_ROOT_HOOK_CONFIGS = {
     Path(".codex") / "hooks.json",
     Path(".claude") / "settings.json",
+    Path(".qwen") / "settings.json",
 }
+COMPOSED_PAYLOADS = Path("composed-payloads")
+CACHE_TRANSACTION_SCHEMA = "super-cache-transaction/v1"
+CACHE_TRANSACTION_NAME = "super-cache.transaction.json"
+SHARED_WORKER_FILES = (
+    Path(".agent-workspace") / "hook-dispatch.py",
+    Path(".agent-workspace") / "lane-queue.py",
+    Path(".agent-workspace") / "manager-notify.py",
+    Path(".agent-workspace") / "result-stop-check.py",
+)
+PROVIDER_WORKER_FILES = (
+    Path("orchestrator-harness-binding.json"),
+    Path("skills") / "lane-assignment" / "SKILL.md",
+    Path("skills") / "manager-notify" / "SKILL.md",
+)
 
 SETUP_CONFIG_INVALID = "SETUP_CONFIG_INVALID"
 SETUP_CACHE_INVALID = "SETUP_CACHE_INVALID"
@@ -77,9 +103,10 @@ MONITOR_RUNTIME_NOT_OPEN = "MONITOR_RUNTIME_NOT_OPEN"
 class SetupError(ConfigError):
     """A setup failure carrying a stable result code."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, next_action: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.next_action = next_action
 
 
 def runtime_state_path(rt: Path) -> Path:
@@ -125,17 +152,165 @@ def _plan_tree(source: Path) -> list[tuple[Path, Path]]:
     if not source.is_dir():
         raise ConfigError(f"source tree missing: {source}")
     planned: list[tuple[Path, Path]] = []
-    for item in source.rglob("*"):
+    for item in sorted(source.rglob("*")):
         if not item.is_file() or "__pycache__" in item.parts:
             continue
         planned.append((item, item.relative_to(source)))
     return planned
 
 
-def _plan_active_cache(harness_root: Path) -> list[tuple[Path, Path]]:
-    """Plan the active cache: ``super-cache/workspace`` plus every
-    ``adapters/<provider-id>/super-cache`` payload, each relative to
-    ``<rt>/super-cache``."""
+def _claim_destination(claims: dict[str, str], relative: Path, owner: str) -> None:
+    """Claim one installed path, including its parent directories."""
+    parts = [part.casefold() for part in relative.parts]
+    key = "/".join(parts)
+    if key in claims:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"worker destination {relative} is claimed by {claims[key]} and {owner}",
+        )
+    for index in range(1, len(parts)):
+        parent = "/".join(parts[:index])
+        if parent in claims:
+            raise SetupError(
+                SETUP_ADAPTER_COLLISION,
+                f"worker destination {relative} is below a file owned by {claims[parent]}",
+            )
+    if any(existing.startswith(key + "/") for existing in claims):
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"worker destination {relative} replaces a planned directory",
+        )
+    claims[key] = owner
+
+
+def _validate_worker_commands(
+    provider_id: str, dotdir: str, files: dict[Path, Path]
+) -> None:
+    """Shipped hook commands must name files owned by the same worker payload."""
+    for config_name in ("hooks.json", "settings.json"):
+        config = files.get(Path(dotdir) / config_name)
+        if config is None:
+            continue
+        try:
+            record = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SetupError(SETUP_CONFIG_INVALID, f"invalid {provider_id} worker hooks: {config}: {exc}") from exc
+        hooks = record.get("hooks") if isinstance(record, dict) else None
+        if not isinstance(hooks, dict):
+            raise SetupError(SETUP_CONFIG_INVALID, f"worker hook commands missing for {provider_id}: {config}")
+        seen: set[str] = set()
+        owned = {path.as_posix().casefold() for path in files}
+        for groups in hooks.values():
+            if not isinstance(groups, list):
+                raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook groups for {provider_id}: {config}")
+            for group in groups:
+                entries = group.get("hooks") if isinstance(group, dict) else None
+                if not isinstance(entries, list) or not entries:
+                    raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
+                for entry in entries:
+                    command = entry.get("command") if isinstance(entry, dict) else None
+                    if not isinstance(command, str):
+                        raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
+                    parts = command.split()
+                    relative = PurePosixPath(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
+                    destination = relative.as_posix().casefold() if relative is not None else None
+                    if (
+                        relative is None
+                        or not relative.parts
+                        or relative.is_absolute()
+                        or ".." in relative.parts
+                        or relative.parts[0].casefold() != dotdir.casefold()
+                        or destination not in owned
+                        or destination in seen
+                    ):
+                        raise SetupError(
+                            SETUP_ADAPTER_COLLISION,
+                            f"duplicate or unknown {provider_id} worker command: {command}",
+                        )
+                    seen.add(destination)
+
+
+def _plan_worker_compositions(
+    harness_root: Path,
+    *,
+    root_plan: list[tuple[Path, Path]] | None = None,
+) -> dict[str, list[tuple[Path, Path]]]:
+    """Resolve every provider's shared and provider-owned worker destination."""
+    workspace = harness_root / "super-cache" / "workspace"
+    if not workspace.is_dir():
+        raise SetupError(SETUP_CACHE_INVALID, f"shipped super-cache workspace missing: {workspace}")
+    base = _plan_tree(workspace)
+    base_paths = {relative for _, relative in base}
+    missing = next((path for path in SHARED_WORKER_FILES if path not in base_paths), None)
+    if missing is not None:
+        raise SetupError(SETUP_CACHE_INVALID, f"shared worker lifecycle file missing: {missing}")
+    if any(not (workspace / path).read_bytes() for path in SHARED_WORKER_FILES):
+        raise SetupError(SETUP_CACHE_INVALID, "shared worker lifecycle file is empty")
+    root_owners: dict[str, str] = {}
+    root_dotdirs: dict[str, set[str]] = {}
+    adapters_dir = harness_root / "adapters"
+    for source, relative in root_plan if root_plan is not None else _plan_root_payloads(harness_root):
+        owner = source.relative_to(adapters_dir).parts[0]
+        root_dotdirs.setdefault(owner, set()).add(relative.parts[0].casefold())
+        key = relative.as_posix().casefold()
+        if key in root_owners and root_owners[key] != owner:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"ROOT destination {relative} has multiple provider owners")
+        root_owners[key] = owner
+    compositions: dict[str, list[tuple[Path, Path]]] = {}
+    dotdir_owners: dict[str, str] = {}
+    for adapter in sorted(adapters_dir.iterdir()):
+        if not adapter.is_dir():
+            continue
+        provider_id = adapter.name
+        payload = adapter / "super-cache"
+        if payload.is_dir() and not (adapter / "harness" / "launcher_binding.py").is_file():
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown worker provider owns {payload}")
+        if not (adapter / "harness" / "launcher_binding.py").is_file():
+            continue
+        if not payload.is_dir():
+            raise SetupError(SETUP_CACHE_INVALID, f"worker payload missing for {provider_id}: {payload}")
+        worker = _plan_tree(payload)
+        dotdirs = {relative.parts[0] for _, relative in worker}
+        if len(dotdirs) != 1 or not next(iter(dotdirs)).startswith(".") or ".agent-workspace" in dotdirs:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown provider-owned destination in {payload}")
+        dotdir = next(iter(dotdirs))
+        if dotdir.casefold() not in root_dotdirs.get(provider_id, set()):
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown {provider_id} worker destination: {dotdir}")
+        prior_owner = dotdir_owners.setdefault(dotdir.casefold(), provider_id)
+        if prior_owner != provider_id:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"provider destination {dotdir} is owned by {prior_owner} and {provider_id}")
+        worker_files = {relative: source for source, relative in worker}
+        missing = next((Path(dotdir) / path for path in PROVIDER_WORKER_FILES if Path(dotdir) / path not in worker_files), None)
+        if missing is not None:
+            raise SetupError(SETUP_CACHE_INVALID, f"{provider_id} worker tool missing: {missing}")
+        for skill, helper in (("lane-assignment", "lane-queue.py"), ("manager-notify", "manager-notify.py")):
+            skill_path = worker_files[Path(dotdir) / "skills" / skill / "SKILL.md"]
+            if f".agent-workspace/{helper}" not in skill_path.read_text(encoding="utf-8"):
+                raise SetupError(SETUP_CACHE_INVALID, f"{provider_id} worker skill does not call {helper}: {skill_path}")
+        binding = _read_json_object(worker_files[Path(dotdir) / PROVIDER_WORKER_FILES[0]], description="worker binding")
+        if binding.get("schema") != ROOT_HOOK_BINDING_SCHEMA or binding.get("role") != "worker" or binding.get("provider_id") != provider_id:
+            raise SetupError(SETUP_CONFIG_INVALID, f"worker binding identity invalid for {provider_id}")
+        _validate_worker_commands(provider_id, dotdir, worker_files)
+        claims: dict[str, str] = {}
+        for source, relative in [*base, *worker]:
+            if relative.name.casefold() in {"agents.md", "claude.md"}:
+                raise SetupError(SETUP_ADAPTER_COLLISION, f"repository instruction destination is checkout-owned: {relative}")
+            owner = "shared lifecycle" if source.is_relative_to(workspace) else provider_id
+            _claim_destination(claims, relative, owner)
+            if owner == provider_id:
+                root_owner = root_owners.get(relative.as_posix().casefold())
+                if root_owner is not None and root_owner != provider_id:
+                    raise SetupError(SETUP_ADAPTER_COLLISION, f"worker destination {relative} belongs to ROOT provider {root_owner}")
+        compositions[provider_id] = [*base, *worker]
+    if not compositions:
+        raise SetupError(SETUP_CACHE_INVALID, f"no managed worker payloads in {adapters_dir}")
+    return compositions
+
+
+def _plan_active_cache(
+    harness_root: Path, *, root_plan: list[tuple[Path, Path]] | None = None
+) -> list[tuple[Path, Path]]:
+    """Plan the shipped cache and each provider's exact composed worker tree."""
     source_cache = harness_root / "super-cache"
     if not source_cache.is_dir():
         raise SetupError(SETUP_CACHE_INVALID, f"shipped super-cache missing: {source_cache}")
@@ -163,42 +338,436 @@ def _plan_active_cache(harness_root: Path) -> list[tuple[Path, Path]]:
                 planned.append(
                     (source_file, Path("adapter-payloads") / adapter.name / relative)
                 )
+    for provider_id, files in _plan_worker_compositions(harness_root, root_plan=root_plan).items():
+        for source_file, relative in files:
+            planned.append((source_file, COMPOSED_PAYLOADS / provider_id / relative))
     return planned
 
 
-def _validate_active_cache(
-    plan: list[tuple[Path, Path]], destination: Path
-) -> None:
-    """Reject an existing active cache that is incomplete or differs from the
-    shipped catalog; a valid cache is preserved exactly."""
-    for source_file, relative in plan:
-        target = destination / relative
-        if not target.is_file():
+def _cache_entries(root: Path) -> tuple[set[str], set[str]]:
+    """List a cache without following links or Windows reparse points."""
+    directories: set[str] = set()
+    files: set[str] = set()
+    try:
+        root_stat = root.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode) or _is_reparse(root_stat):
+            raise SetupError(SETUP_CACHE_INVALID, f"cache is not a plain directory: {root}")
+        pending = [root]
+        while pending:
+            parent = pending.pop()
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    relative = path.relative_to(root).as_posix()
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if _is_reparse(entry_stat):
+                        raise SetupError(SETUP_CACHE_INVALID, f"cache contains a link or reparse point: {path}")
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        directories.add(relative)
+                        pending.append(path)
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        files.add(relative)
+                    else:
+                        raise SetupError(SETUP_CACHE_INVALID, f"cache contains an unknown path: {path}")
+    except OSError as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"cache cannot be inspected: {root}: {exc}") from exc
+    return directories, files
+
+
+def _is_reparse(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _require_plain_workspace_boundary(rt: Path, *, code: str) -> None:
+    """Reject redirects at the configured workspace and runtime roots."""
+    for path in (rt.parent, rt):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SetupError(code, f"workspace boundary cannot be inspected: {path}: {exc}") from exc
+        if _is_reparse(info):
+            raise SetupError(code, f"workspace boundary is a link or reparse point: {path}")
+
+
+def _require_plain_root_destination(root_workspace: Path, relative: Path) -> None:
+    """Check each existing component of a planned ROOT payload destination."""
+    path = root_workspace
+    for part in (None, *relative.parts):
+        if part is not None:
+            path = path / part
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"ROOT payload path cannot be inspected: {path}: {exc}") from exc
+        if _is_reparse(info):
             raise SetupError(
-                SETUP_CACHE_INVALID, f"active cache incomplete: missing {relative}"
+                SETUP_ADAPTER_COLLISION,
+                f"ROOT payload path is a link or reparse point: {path}",
+                next_action=f"inspect and restore a plain ROOT payload path at {path}, then re-run setup",
             )
-        if target.read_bytes() != source_file.read_bytes():
+
+
+def _manifest_for_tree(root: Path) -> dict[str, Any]:
+    directories, files = _cache_entries(root)
+    try:
+        hashes = {
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in sorted(files)
+        }
+    except OSError as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"cache bytes cannot be read: {root}: {exc}") from exc
+    return {"directories": sorted(directories), "files": hashes}
+
+
+def _manifest_for_plan(plan: list[tuple[Path, Path]]) -> dict[str, Any]:
+    directories = {
+        parent.as_posix()
+        for _, relative in plan
+        for parent in relative.parents
+        if parent != Path(".")
+    }
+    try:
+        files = {
+            relative.as_posix(): hashlib.sha256(source.read_bytes()).hexdigest()
+            for source, relative in plan
+        }
+    except OSError as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"shipped cache bytes cannot be read: {exc}") from exc
+    return {"directories": sorted(directories), "files": files}
+
+
+def _validate_active_cache(plan: list[tuple[Path, Path]], destination: Path) -> None:
+    """Validate every installed path before reading any cache file bytes."""
+    directories, files = _cache_entries(destination)
+    expected_files = {relative.as_posix() for _, relative in plan}
+    expected_directories = {
+        parent.as_posix()
+        for _, relative in plan
+        for parent in relative.parents
+        if parent != Path(".")
+    }
+    if directories != expected_directories or files != expected_files:
+        raise SetupError(SETUP_CACHE_INVALID, f"active cache has missing or unknown paths: {destination}")
+    try:
+        for source, relative in plan:
+            if (destination / relative).read_bytes() != source.read_bytes():
+                raise SetupError(
+                    SETUP_CACHE_INVALID,
+                    f"active cache malformed: {relative} differs from the shipped source",
+                )
+    except OSError as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"active cache cannot be verified: {destination}: {exc}") from exc
+
+
+def _validated_cache_for_dispatch(harness_root: Path, rt: Path) -> None:
+    """Keep both bootstrap profiles outside an unresolved cache transaction."""
+    _require_plain_workspace_boundary(rt, code=SETUP_CACHE_INVALID)
+    live_valid, _ = _inspect_active_cache(
+        _plan_active_cache(harness_root), rt, overwrite=False, for_dispatch=True
+    )
+    if not live_valid:
+        raise SetupError(
+            SETUP_CACHE_INVALID, f"installed active cache is missing: {rt / 'super-cache'}"
+        )
+
+
+def _validated_worker_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
+    """Return only the installed composed tree whose bytes match its planned owners."""
+    _validated_cache_for_dispatch(harness_root, rt)
+    compositions = _plan_worker_compositions(harness_root)
+    files = compositions.get(provider_id)
+    if files is None:
+        raise SetupError(SETUP_CACHE_INVALID, f"unsupported worker provider: {provider_id}")
+    payload = rt / "super-cache" / COMPOSED_PAYLOADS / provider_id
+    for source, relative in files:
+        installed = payload / relative
+        if not installed.is_file():
+            raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition missing: {installed}")
+        if installed.read_bytes() != source.read_bytes():
+            raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition changed: {installed}")
+    expected = {relative.as_posix() for _, relative in files}
+    actual = {path.relative_to(payload).as_posix() for path in payload.rglob("*") if path.is_file()}
+    if actual != expected:
+        raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition has unknown files: {payload}")
+    return payload
+
+
+def _path_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"cache path cannot be inspected: {path}: {exc}") from exc
+    return True
+
+
+def _transaction_path(rt: Path) -> Path:
+    return rt / CACHE_TRANSACTION_NAME
+
+
+def _valid_cache_relative(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and "\\" not in name
+        and ":" not in name
+        and not name.startswith("/")
+        and all(part not in ("", ".", "..") for part in name.split("/"))
+    )
+
+
+def _valid_manifest(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"directories", "files"}:
+        return False
+    directories = value["directories"]
+    files = value["files"]
+    if not isinstance(directories, list) or not isinstance(files, dict):
+        return False
+    if not all(_valid_cache_relative(name) for name in directories + list(files)):
+        return False
+    if len(set(directories)) != len(directories) or set(directories) & set(files):
+        return False
+    if not all(
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        for digest in files.values()
+    ):
+        return False
+    return all(
+        all(parent.as_posix() in directories for parent in Path(name).parents if parent != Path("."))
+        for name in [*directories, *files]
+    )
+
+
+def _read_cache_transaction(rt: Path) -> dict[str, Any] | None:
+    path = _transaction_path(rt)
+    if not _path_present(path):
+        return None
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or _is_reparse(info) or info.st_nlink != 1:
+            raise ValueError("transaction record is not a plain file")
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SetupError(SETUP_CACHE_INVALID, f"invalid cache transaction {path}: {exc}") from exc
+    required = {"schema", "runtime_root", "transaction_id", "stage_name", "previous", "target"}
+    if not isinstance(record, dict) or set(record) != required:
+        raise SetupError(SETUP_CACHE_INVALID, f"invalid cache transaction fields: {path}")
+    transaction_id = record["transaction_id"]
+    if (
+        record["schema"] != CACHE_TRANSACTION_SCHEMA
+        or not isinstance(record["runtime_root"], str)
+        or os.path.normcase(os.path.abspath(record["runtime_root"]))
+        != os.path.normcase(os.path.abspath(rt))
+        or not isinstance(transaction_id, str)
+        or len(transaction_id) != 32
+        or any(character not in "0123456789abcdef" for character in transaction_id)
+        or record["stage_name"] != f".super-cache.{transaction_id}"
+        or not _valid_manifest(record["target"])
+        or (record["previous"] is not None and not _valid_manifest(record["previous"]))
+    ):
+        raise SetupError(SETUP_CACHE_INVALID, f"invalid cache transaction identity or manifest: {path}")
+    return record
+
+
+def _manifest_matches(path: Path, manifest: dict[str, Any] | None) -> bool:
+    return manifest is not None and _path_present(path) and _manifest_for_tree(path) == manifest
+
+
+def _require_exact_manifest(path: Path, manifest: dict[str, Any] | None) -> None:
+    if not _manifest_matches(path, manifest):
+        raise SetupError(SETUP_CACHE_INVALID, f"transaction backup differs from recorded prior cache: {path}")
+
+
+def _check_owned_tree(path: Path, manifest: dict[str, Any], *, verify_bytes: bool) -> None:
+    directories, files = _cache_entries(path)
+    if not directories <= set(manifest["directories"]) or not files <= set(manifest["files"]):
+        raise SetupError(SETUP_CACHE_INVALID, f"transaction artifact has unknown paths: {path}")
+    if verify_bytes:
+        try:
+            for name in files:
+                if hashlib.sha256((path / name).read_bytes()).hexdigest() != manifest["files"][name]:
+                    raise SetupError(SETUP_CACHE_INVALID, f"transaction artifact has changed bytes: {path / name}")
+        except OSError as exc:
+            raise SetupError(SETUP_CACHE_INVALID, f"transaction artifact cannot be verified: {path}: {exc}") from exc
+
+
+def _remove_owned_tree(path: Path, manifest: dict[str, Any], *, verify_bytes: bool) -> None:
+    _check_owned_tree(path, manifest, verify_bytes=verify_bytes)
+    shutil.rmtree(path)
+
+
+def _inspect_active_cache(
+    plan: list[tuple[Path, Path]], rt: Path, *, overwrite: bool, for_dispatch: bool = False
+) -> tuple[bool, dict[str, Any] | None]:
+    """Preflight the exact live, backup, and staged cache paths without mutation."""
+    destination = rt / "super-cache"
+    backup = destination.with_name(f"{destination.name}.old")
+    transaction = _read_cache_transaction(rt)
+    try:
+        stages = sorted(
+            (path for path in rt.iterdir() if path.name.startswith(".super-cache.")),
+            key=lambda path: path.name,
+        ) if rt.is_dir() else []
+    except OSError as exc:
+        raise SetupError(
+            SETUP_CACHE_INVALID, f"active cache stages cannot be inspected: {rt}: {exc}"
+        ) from exc
+    backup_present = _path_present(backup)
+    if transaction is None and (backup_present or stages):
+        artifacts = ([backup] if backup_present else []) + stages
+        paths = ", ".join(str(path) for path in artifacts)
+        raise SetupError(
+            SETUP_CACHE_INVALID,
+            f"unowned cache backup or stage needs resolution: {paths}",
+            next_action=f"inspect and preserve bytes at {paths}; after confirming ownership, move each artifact outside the runtime root and re-run setup",
+        )
+    if for_dispatch and (transaction is not None or backup_present or stages):
+        raise SetupError(SETUP_CACHE_INVALID, f"cache transaction needs setup recovery: {rt}")
+    if transaction is not None:
+        stage = rt / transaction["stage_name"]
+        extra_stages = [path for path in stages if path != stage]
+        if extra_stages:
+            paths = ", ".join(str(path) for path in extra_stages)
             raise SetupError(
                 SETUP_CACHE_INVALID,
-                f"active cache malformed: {relative} differs from the shipped source",
+                f"unowned cache stage needs resolution: {paths}",
+                next_action=f"inspect and preserve bytes at {paths}; after confirming ownership, move each artifact outside the runtime root and re-run setup",
             )
+        if _path_present(stage):
+            _check_owned_tree(stage, transaction["target"], verify_bytes=False)
+        previous = transaction["previous"]
+        if backup_present:
+            if previous is None:
+                raise SetupError(SETUP_CACHE_INVALID, f"unexpected cache backup: {backup}")
+            _check_owned_tree(backup, previous, verify_bytes=True)
+        live_present = _path_present(destination)
+        live_target = _manifest_matches(destination, transaction["target"])
+        live_previous = _manifest_matches(destination, previous)
+        backup_exact = _manifest_matches(backup, previous)
+        if backup_present:
+            if not (backup_exact or live_target):
+                raise SetupError(SETUP_CACHE_INVALID, f"partial cache backup lacks a valid promoted cache: {backup}")
+            if live_present and not (live_target or live_previous):
+                _check_owned_tree(destination, transaction["target"], verify_bytes=False)
+        elif live_present and not (live_target or live_previous):
+            raise SetupError(SETUP_CACHE_INVALID, f"transaction live cache is ambiguous: {destination}")
+        elif not live_present and previous is not None:
+            raise SetupError(SETUP_CACHE_INVALID, f"transaction prior cache is missing: {destination}")
+        return False, transaction
+    live_valid = False
+    if _path_present(destination):
+        directories, files = _cache_entries(destination)
+        planned_files = {relative.as_posix() for _, relative in plan}
+        planned_directories = {
+            parent.as_posix()
+            for _, relative in plan
+            for parent in relative.parents
+            if parent != Path(".")
+        }
+        unknown = sorted((directories - planned_directories) | (files - planned_files))
+        if unknown:
+            paths = ", ".join(str(destination / name) for name in unknown)
+            raise SetupError(
+                SETUP_CACHE_INVALID,
+                f"active cache contains unknown paths: {paths}",
+                next_action=f"inspect and preserve any needed bytes at {paths}; resolve unknown paths before re-running setup",
+            )
+        try:
+            _validate_active_cache(plan, destination)
+            live_valid = True
+        except SetupError:
+            if not overwrite:
+                raise
+    return live_valid, None
 
 
-def _replace_tree(staging: Path, destination: Path) -> None:
-    """Atomically replace ``destination`` with the fully staged ``staging``."""
+def _recover_cache_transaction(rt: Path, transaction: dict[str, Any]) -> None:
+    """Finish only the transaction whose exact paths and old bytes were recorded."""
+    destination = rt / "super-cache"
+    backup = rt / "super-cache.old"
+    stage = rt / transaction["stage_name"]
+    previous = transaction["previous"]
+    target = transaction["target"]
+    backup_present = _path_present(backup)
+    live_target = _manifest_matches(destination, target)
+    if backup_present and not (_manifest_matches(backup, previous) or live_target):
+        raise SetupError(SETUP_CACHE_INVALID, f"partial cache backup cannot be recovered: {backup}")
+    if _path_present(stage):
+        _remove_owned_tree(stage, target, verify_bytes=False)
+    if backup_present and not live_target and not _manifest_matches(destination, previous):
+        if _path_present(destination):
+            _check_owned_tree(destination, target, verify_bytes=False)
+            _replace_with_retry(destination, stage)
+            _remove_owned_tree(stage, target, verify_bytes=False)
+        _replace_with_retry(backup, destination)
+    elif backup_present:
+        _remove_owned_tree(backup, previous, verify_bytes=True)
+    if _path_present(stage) or _path_present(backup) or not (
+        _manifest_matches(destination, target)
+        or _manifest_matches(destination, previous)
+        or (previous is None and not _path_present(destination))
+    ):
+        raise SetupError(SETUP_CACHE_INVALID, f"cache transaction remains unresolved: {rt}")
+    _transaction_path(rt).unlink()
+
+
+def _replace_tree(
+    staging: Path,
+    destination: Path,
+    *,
+    validate: Callable[[Path], None] | None = None,
+    validate_backup: Callable[[Path], None] | None = None,
+) -> None:
+    """Promote a staged tree, retaining the old destination through validation."""
     backup = destination.with_name(f"{destination.name}.old")
-    if backup.exists():
-        shutil.rmtree(backup, ignore_errors=True)
-    if destination.exists():
-        _replace_with_retry(destination, backup)
+    if _path_present(backup):
+        raise SetupError(
+            SETUP_CACHE_INVALID, f"active cache backup needs recovery: {backup}"
+        )
+    had_destination = _path_present(destination)
     try:
+        if had_destination:
+            _replace_with_retry(destination, backup)
         _replace_with_retry(staging, destination)
+        if validate is not None:
+            validate(destination)
     except BaseException:
-        if backup.exists() and not destination.exists():
-            _replace_with_retry(backup, destination)
+        try:
+            if _path_present(backup):
+                if _path_present(destination):
+                    if _path_present(staging):
+                        raise SetupError(
+                            SETUP_OVERWRITE_FAILED,
+                            f"cannot isolate promoted cache: {destination}",
+                        )
+                    _replace_with_retry(destination, staging)
+                _replace_with_retry(backup, destination)
+            elif (
+                not had_destination
+                and _path_present(destination)
+                and not _path_present(staging)
+            ):
+                _replace_with_retry(destination, staging)
+        except BaseException as exc:
+            raise SetupError(
+                SETUP_OVERWRITE_FAILED,
+                f"active cache rollback needs recovery at {destination} and {backup}: {exc}",
+            ) from exc
         raise
-    if backup.exists():
-        shutil.rmtree(backup, ignore_errors=True)
+    if _path_present(backup):
+        if validate_backup is not None:
+            validate_backup(backup)
+        shutil.rmtree(backup)
 
 
 def _install_active_cache(
@@ -214,26 +783,70 @@ def _install_active_cache(
     cache is rejected unless ``overwrite`` rebuilds it from the catalog.
     """
     destination = rt / "super-cache"
-    if destination.is_dir():
+    live_valid, transaction = _inspect_active_cache(plan, rt, overwrite=overwrite)
+    if transaction is not None:
         try:
-            _validate_active_cache(plan, destination)
-            return
-        except SetupError:
-            if not overwrite:
-                raise
-    staging = Path(tempfile.mkdtemp(prefix=".super-cache.", dir=str(rt)))
+            _recover_cache_transaction(rt, transaction)
+        except OSError as exc:
+            raise SetupError(SETUP_OVERWRITE_FAILED, f"active cache recovery failed: {exc}") from exc
+        live_valid, _ = _inspect_active_cache(plan, rt, overwrite=overwrite)
+    if live_valid:
+        return
+    previous = _manifest_for_tree(destination) if _path_present(destination) else None
+    target = _manifest_for_plan(plan)
+    transaction_id = uuid.uuid4().hex
+    staging = rt / f".super-cache.{transaction_id}"
+    while _path_present(staging):
+        transaction_id = uuid.uuid4().hex
+        staging = rt / f".super-cache.{transaction_id}"
+    transaction = {
+        "schema": CACHE_TRANSACTION_SCHEMA,
+        "runtime_root": str(rt.absolute()),
+        "transaction_id": transaction_id,
+        "stage_name": staging.name,
+        "previous": previous,
+        "target": target,
+    }
+    try:
+        atomic_write_json(_transaction_path(rt), transaction)
+        staging.mkdir()
+    except OSError as exc:
+        raise SetupError(SETUP_OVERWRITE_FAILED, f"active cache staging failed: {exc}") from exc
     try:
         for source_file, relative in plan:
-            target = staging / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_file, target)
-            if target.read_bytes() != source_file.read_bytes():
+            staged_file = staging / relative
+            staged_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, staged_file)
+            if staged_file.read_bytes() != source_file.read_bytes():
                 raise SetupError(
                     SETUP_CACHE_INVALID, f"byte verification failed for {relative}"
                 )
-        _replace_tree(staging, destination)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        _validate_active_cache(plan, staging)
+        if _manifest_for_tree(staging) != target:
+            raise SetupError(SETUP_CACHE_INVALID, f"staged cache changed during transaction: {staging}")
+        _replace_tree(
+            staging,
+            destination,
+            validate=lambda target: _validate_active_cache(plan, target),
+            validate_backup=lambda path: _require_exact_manifest(path, previous),
+        )
+        _transaction_path(rt).unlink()
+    except BaseException as exc:
+        if _path_present(staging):
+            try:
+                _remove_owned_tree(staging, target, verify_bytes=False)
+            except (OSError, SetupError):
+                pass
+        if not _path_present(rt / "super-cache.old") and (
+            (previous is None and not _path_present(destination))
+            or _manifest_matches(destination, previous)
+        ) and not _path_present(staging):
+            try:
+                _transaction_path(rt).unlink()
+            except OSError:
+                pass
+        if isinstance(exc, OSError):
+            raise SetupError(SETUP_OVERWRITE_FAILED, f"active cache replacement failed: {exc}") from exc
         raise
 
 
@@ -453,6 +1066,7 @@ def _preflight_root_payloads(
     collisions: list[Path] = []
     for source, relative in plan:
         target = root_workspace / relative
+        _require_plain_root_destination(root_workspace, relative)
         if not target.exists():
             continue
         if _preflight_shared_root_config(source, target, relative):
@@ -559,6 +1173,7 @@ def _materialize_root_hook_bindings(
     bound_paths: list[Path] = []
     for provider_id, relative, template in bindings:
         target = root_workspace / relative
+        _require_plain_root_destination(root_workspace, relative)
         try:
             copied = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -614,6 +1229,7 @@ def _install_root_payloads(
     merged: list[Path] = []
     for source_file, relative in plan:
         target = root_workspace / relative
+        _require_plain_root_destination(root_workspace, relative)
         if target.exists() and relative == CODEX_ROOT_CONFIG:
             _validate_existing_codex_config(target)
             installed.append(target)
@@ -981,11 +1597,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                 SETUP_CONFIG_INVALID,
                 "harness config does not declare root_workspace",
             )
-        if config.root_workspace.is_symlink() or rt.is_symlink():
-            raise SetupError(
-                SETUP_CONFIG_INVALID,
-                f"workspace and runtime root must not be symbolic links: {rt}",
-            )
+        _require_plain_workspace_boundary(rt, code=SETUP_CONFIG_INVALID)
         harness_identity = path_identity(harness_root)
         workspace_identity = path_identity(config.root_workspace)
         if workspace_identity == harness_identity or workspace_identity.startswith(
@@ -1009,20 +1621,14 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             runtime_root=rt,
             binding_templates=binding_templates,
         )
-        cache_plan = _plan_active_cache(harness_root)
-        destination = rt / "super-cache"
-        if destination.is_dir():
-            try:
-                _validate_active_cache(cache_plan, destination)
-            except SetupError:
-                if not overwrite:
-                    raise
+        cache_plan = _plan_active_cache(harness_root, root_plan=root_plan)
+        _inspect_active_cache(cache_plan, rt, overwrite=overwrite)
         _check_launcher_bindings(harness_root)
     except SetupError as exc:
         return _failure(
             exc.code,
             str(exc),
-            "resolve the named target; --overwrite replaces only harness-owned payloads",
+            exc.next_action or "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
     except ConfigError as exc:
         return _failure(
@@ -1096,7 +1702,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                             "resource manifest changed while an epoch is active; "
                             "shut down the runtime before changing it",
                         )
-                    if any((rt / "resources" / "leases").glob("*")):
+                    if any((rt / "resources" / "leases").glob("*.lease")):
                         raise SetupError(
                             SETUP_RESOURCE_MANIFEST_INVALID,
                             "resource manifest changed while a lease is live; "
@@ -1145,7 +1751,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         return _failure(
             exc.code,
             str(exc),
-            "resolve the named target; --overwrite replaces only harness-owned payloads",
+            exc.next_action or "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
     except ConfigError as exc:
         return _failure(
@@ -1169,3 +1775,9 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
     if merged:
         result["merged_paths"] = [str(path) for path in merged]
     return result
+
+
+if _SETUPTOOLS_BUILD_ENTRYPOINT:
+    from setuptools import setup as _setuptools_setup
+
+    _setuptools_setup()

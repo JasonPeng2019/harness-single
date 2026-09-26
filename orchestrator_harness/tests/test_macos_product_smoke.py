@@ -355,6 +355,9 @@ class HermeticMacOSProductSmokeTests(unittest.TestCase):
                     "Produce a synthetic RESULT.json only. This is a hermetic fake-provider "
                     "macOS product demonstration and never live-provider proof."
                 ),
+                "acceptance_criteria": ["The synthetic lifecycle completes through shutdown"],
+                "deliverables": ["A valid synthetic result and retirement evidence"],
+                "reason_for_acceptance_and_deliverables": "The artifacts demonstrate the complete public CLI lifecycle.",
                 "branch": "lane/synthetic-product-smoke",
                 "base_commit": base_commit,
             },
@@ -368,6 +371,10 @@ class HermeticMacOSProductSmokeTests(unittest.TestCase):
             "codex",
             "--model",
             "synthetic-model",
+            "--provider-option",
+            "reasoning_effort=medium",
+            "--provider-option",
+            "service_tier=priority",
             "--task-card",
             str(task_card),
         )

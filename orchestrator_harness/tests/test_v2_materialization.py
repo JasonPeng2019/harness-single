@@ -36,6 +36,7 @@ class MaterializationFixture:
         agent_workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
         for name, contents in {
             "README.md": "base workspace\n",
+            "hook-dispatch.py": "# hook dispatch\n",
             "lane-queue.py": "# lane queue\n",
             "manager-notify.py": "# manager notify\n",
             "result-stop-check.py": "# result stop check\n",
@@ -71,6 +72,7 @@ class MaterializationFixture:
         binding = (
             f"PROVIDER_ID = {provider_id!r}\n"
             "ADAPTER_VERSION = 'test-v1'\n"
+            "def validate_launch_config(*, model, launch_config): return dict(launch_config)\n"
             "def build_argv(**kwargs): return [PROVIDER_ID]\n"
             "def parse_line(line): return None\n"
         )
@@ -101,6 +103,22 @@ class MaterializationFixture:
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", worker_contents
         )
+        self._write_json(
+            adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "provider_id": provider_id,
+            },
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "lane-assignment" / "SKILL.md",
+            ".agent-workspace/lane-queue.py\n",
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "manager-notify" / "SKILL.md",
+            ".agent-workspace/manager-notify.py\n",
+        )
 
     def _write_provider_to(self, harness: Path, provider_id: str, dotdir: str) -> None:
         """Install a disposable provider fixture next to a copied shipped tree."""
@@ -108,6 +126,7 @@ class MaterializationFixture:
         binding = (
             f"PROVIDER_ID = {provider_id!r}\n"
             "ADAPTER_VERSION = 'test-v1'\n"
+            "def validate_launch_config(*, model, launch_config): return dict(launch_config)\n"
             "def build_argv(**kwargs): return [PROVIDER_ID]\n"
             "def parse_line(line): return None\n"
         )
@@ -129,6 +148,22 @@ class MaterializationFixture:
         )
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", "fixture\n"
+        )
+        self._write_json(
+            adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "provider_id": provider_id,
+            },
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "lane-assignment" / "SKILL.md",
+            ".agent-workspace/lane-queue.py\n",
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "manager-notify" / "SKILL.md",
+            ".agent-workspace/manager-notify.py\n",
         )
         self._write_text(
             harness
@@ -427,6 +462,22 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(setup.SETUP_ADAPTER_COLLISION, duplicate.exception.code)
         self.assertFalse((self.fixture.root_workspace / "same.txt").exists())
 
+    def test_overlay_reuses_identical_existing_file(self) -> None:
+        source = self.fixture.root / "identical-overlay-source"
+        destination = self.fixture.root / "identical-overlay-destination"
+        self.fixture._write_text(source / "existing.txt", "same\n")
+        self.fixture._write_text(source / "new.txt", "new\n")
+        self.fixture._write_text(destination / "existing.txt", "same\n")
+        before = (destination / "existing.txt").stat().st_mtime_ns
+
+        bootstrap._copy_overlay(source, destination)
+
+        self.assertEqual(
+            "same\n", (destination / "existing.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(before, (destination / "existing.txt").stat().st_mtime_ns)
+        self.assertEqual("new\n", (destination / "new.txt").read_text(encoding="utf-8"))
+
     def test_overwrite_replaces_only_planned_root_payloads(self) -> None:
         planned = (
             self.fixture.harness
@@ -602,6 +653,51 @@ class V2MaterializationTests(unittest.TestCase):
             )
             self.assertEqual(str(runtime.resolve()), binding["runtime_root"])
             self.assertEqual(provider_id, binding["provider_id"])
+
+    def test_setup_manifest_change_ignores_persistent_lease_lock_file(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+            patch.object(
+                setup.processes,
+                "python_argv",
+                return_value=["python", "-m", "monitor"],
+            ),
+            patch.object(setup.processes, "spawn_detached", return_value=child) as spawn_detached,
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+            patch.object(setup.processes, "identity_matches", return_value=True),
+        ):
+            first = setup.run_setup()
+            runtime = self.fixture.root_workspace / ".harness-runtime"
+            lease_dir = runtime / "resources" / "leases"
+            (lease_dir / "..leases.lock.lock").write_bytes(b"")
+            self.fixture._write_json(
+                self.fixture.harness / "resource-manifest.json",
+                {
+                    "schema": "resource-manifest/v1",
+                    "resources": [
+                        {"id": "ollama-provider-home", "exclusive": True}
+                    ],
+                },
+            )
+            second = setup.run_setup()
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(setup.SETUP_MONITOR_ALREADY_RUNNING, second["code"])
+        spawn_detached.assert_called_once()
+        self.assertEqual(
+            [{"exclusive": True, "id": "ollama-provider-home"}],
+            json.loads(
+                (runtime / "resources" / "RESOURCE_MANIFEST.json").read_text(
+                    encoding="utf-8"
+                )
+            )["resources"],
+        )
 
     def test_setup_second_run_rejects_byte_changed_installed_payload(self) -> None:
         child = MagicMock(pid=1701)
@@ -797,6 +893,185 @@ class V2MaterializationTests(unittest.TestCase):
             (worktree / ".agent-workspace" / "manager-notifications").is_dir()
         )
 
+    def test_managed_codex_payload_preserves_valid_existing_config(self) -> None:
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        source_config = (
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "root"
+            / ".codex"
+            / "config.toml"
+        )
+        self.fixture._write_text(
+            source_config,
+            '[features]\nhooks = true\nmodel = "managed-default"\n',
+        )
+        shipped_hook = {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "python .codex/hooks/orchestrator_harness_stop.py",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        self.fixture._write_json(source_config.with_name("hooks.json"), shipped_hook)
+        self.fixture._write_text(
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "super-cache"
+            / ".codex"
+            / "hooks"
+            / "orchestrator_harness_stop.py",
+            "# worker stop hook\n",
+        )
+        self.fixture.active_cache()
+        payload_config = (
+            runtime
+            / "super-cache"
+            / "composed-payloads"
+            / "codex"
+            / ".codex"
+            / "config.toml"
+        )
+        worktree = runtime / "worktrees" / "epoch-1" / "codex-config"
+        existing_config = worktree / ".codex" / "config.toml"
+        original = b'# product-owned config\n[features]\nhooks = true\n'
+        existing_config.parent.mkdir(parents=True, exist_ok=True)
+        existing_config.write_bytes(original)
+        payload_hooks = payload_config.with_name("hooks.json")
+        existing_hooks = worktree / ".codex" / "hooks.json"
+        combined_hooks = {
+            "description": "product hooks",
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "start"}]}],
+                **shipped_hook["hooks"],
+            },
+        }
+        self.fixture._write_json(existing_hooks, combined_hooks)
+        original_hooks = existing_hooks.read_bytes()
+        (worktree / ".agent-workspace").mkdir(parents=True)
+
+        bootstrap._install_managed_material(
+            self.fixture.harness,
+            runtime,
+            worktree,
+            provider_id="codex",
+            lane_id="codex-config",
+            run_id="run-1",
+        )
+
+        self.assertEqual(original, existing_config.read_bytes())
+        self.assertEqual(original_hooks, existing_hooks.read_bytes())
+        self.assertEqual(
+            "codex-worker\n",
+            (worktree / ".codex" / "worker.txt").read_text(encoding="utf-8"),
+        )
+        self.assertTrue(
+            (worktree / ".agent-workspace" / "harness-hook-binding.json").is_file()
+        )
+
+    def test_managed_payload_replaces_only_exact_root_owned_file(self) -> None:
+        relative = Path(".codex") / "hooks" / "shared.py"
+        root_payload = self.fixture.harness / "adapters" / "codex" / "root" / relative
+        worker_payload = (
+            self.fixture.harness / "adapters" / "codex" / "super-cache" / relative
+        )
+        self.fixture._write_text(root_payload, "# root hook\n")
+        self.fixture._write_text(worker_payload, "# worker hook\n")
+        runtime = self.fixture.root_workspace / ".harness-runtime"
+        self.fixture.active_cache()
+
+        worktree = runtime / "worktrees" / "epoch-1" / "owned-replacement"
+        self.fixture._write_text(worktree / relative, "# root hook\n")
+        (worktree / ".agent-workspace").mkdir(parents=True)
+        bootstrap._install_managed_material(
+            self.fixture.harness,
+            runtime,
+            worktree,
+            provider_id="codex",
+            lane_id="owned-replacement",
+            run_id="run-1",
+        )
+        self.assertEqual(
+            "# worker hook\n", (worktree / relative).read_text(encoding="utf-8")
+        )
+
+        changed = runtime / "worktrees" / "epoch-1" / "changed-replacement"
+        self.fixture._write_text(changed / relative, "# user change\n")
+        (changed / ".agent-workspace").mkdir(parents=True)
+        with self.assertRaises(bootstrap.BootstrapError) as raised:
+            bootstrap._install_managed_material(
+                self.fixture.harness,
+                runtime,
+                changed,
+                provider_id="codex",
+                lane_id="changed-replacement",
+                run_id="run-2",
+            )
+        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, raised.exception.code)
+        self.assertEqual(
+            "# user change\n", (changed / relative).read_text(encoding="utf-8")
+        )
+
+    def test_bootstrap_rejects_missing_provider_preferences_before_mutation(self) -> None:
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "enabled",
+            },
+        )
+        task_card = self.fixture.root / "invalid-launch-task.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "must not create a worktree",
+                "acceptance_criteria": ["Invalid launch preferences fail early"],
+                "deliverables": ["A structured bootstrap failure"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The test isolates launch-config validation from task-card validation."
+                ),
+            },
+        )
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch") as open_epoch,
+            patch.object(bootstrap, "_git_worktree_add") as git_add,
+            patch.object(
+                bootstrap,
+                "_validate_provider_launch_config",
+                side_effect=bootstrap.BootstrapError(
+                    bootstrap.BOOTSTRAP_REQUEST_INVALID,
+                    "codex launch configuration requires reasoning_effort",
+                ),
+            ),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="missing-preferences",
+                provider="codex",
+                model="configured-model",
+                launch_config={},
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(bootstrap.BOOTSTRAP_REQUEST_INVALID, result["code"])
+        self.assertIn("reasoning_effort", result["summary"])
+        open_epoch.assert_not_called()
+        git_add.assert_not_called()
+
     def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(self) -> None:
         result, worktree = self._bootstrap(
             "plain-lane", managed=False, provider="codex"
@@ -857,6 +1132,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="missing-provider",
                 provider="does-not-exist",
                 model="test-model",
+                launch_config={},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -901,6 +1177,9 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": "simulate a nonzero worktree-add after partial creation",
+                "acceptance_criteria": ["Externally created Git state is preserved"],
+                "deliverables": ["A fail-closed bootstrap result"],
+                "reason_for_acceptance_and_deliverables": "The result proves ambiguous ownership is never deleted.",
                 "branch": branch,
                 "base_commit": "HEAD",
             },
@@ -950,6 +1229,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="partial-add",
                 provider="codex",
                 model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -1042,6 +1322,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="never-created",
                 provider="codex",
                 model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -1066,6 +1347,9 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": "preserve a pre-existing exact target",
+                "acceptance_criteria": ["The pre-existing target remains unchanged"],
+                "deliverables": ["A worktree-exists result"],
+                "reason_for_acceptance_and_deliverables": "The result and sentinel prove ownership preservation.",
                 "branch": "lane/preexisting-path",
                 "base_commit": "HEAD",
             },
@@ -1103,6 +1387,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="preexisting-path",
                 provider="codex",
                 model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -1143,6 +1428,9 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": "preserve an externally raced target",
+                "acceptance_criteria": ["The external sentinel survives"],
+                "deliverables": ["An ambiguous-ownership failure"],
+                "reason_for_acceptance_and_deliverables": "The evidence proves a racing external owner is preserved.",
                 "branch": "lane/external-race",
                 "base_commit": "HEAD",
             },
@@ -1177,6 +1465,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="external-race",
                 provider="codex",
                 model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -1245,6 +1534,7 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id="publication-failure",
                 provider="codex",
                 model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
@@ -1288,6 +1578,9 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": "only one contender may publish",
+                "acceptance_criteria": ["Exactly one contender succeeds"],
+                "deliverables": ["One published lane"],
+                "reason_for_acceptance_and_deliverables": "The outcome proves bootstrap serialization.",
                 "branch": "lane/contended",
                 "base_commit": "HEAD",
             },
@@ -1344,6 +1637,7 @@ class V2MaterializationTests(unittest.TestCase):
                     lane_id="contended",
                     provider="codex",
                     model="test-model",
+                    launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                     exclusive_resources=[],
                     task_card_path=str(task_card),
                 )
@@ -1413,6 +1707,11 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "schema": "project-task-card/v1",
                 "task": f"materialize {lane_id}",
+                "acceptance_criteria": [f"The {lane_id} lane is materialized"],
+                "deliverables": ["A prepared worker worktree"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The fixture needs a complete task card to exercise materialization."
+                ),
                 "branch": f"lane/{lane_id}",
                 "base_commit": "test-base",
             },
@@ -1457,6 +1756,13 @@ class V2MaterializationTests(unittest.TestCase):
                 lane_id=lane_id,
                 provider=provider,
                 model="test-model",
+                launch_config=(
+                    {"reasoning_effort": "high", "service_tier": "priority"}
+                    if provider == "codex"
+                    else {"effort": "high"}
+                    if provider == "claude-code"
+                    else {}
+                ),
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )

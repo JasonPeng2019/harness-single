@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import processes, terminal_evidence
 from .config import (
     compute_config_identity,
     find_harness_root,
@@ -85,7 +85,7 @@ def _read_acceptance_chain(
     lane: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the acceptance decision when a complete linked pair exists."""
-    folder = lane_record_dir(rt, epoch_id, lane_id)
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane) if lane is not None else lane_record_dir(rt, epoch_id, lane_id)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -106,6 +106,15 @@ def _read_acceptance_chain(
     )
     if not valid:
         return None
+    if lane is not None and lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane_id, run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return None
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            return None
     return acceptance
 
 
@@ -224,7 +233,7 @@ def _valid_current_result(lane: dict[str, Any]) -> bool:
 def _review_pair_is_valid(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -236,14 +245,23 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    return validate_lane_acceptance_chain(review, acceptance, lane)
+    valid = validate_lane_acceptance_chain(review, acceptance, lane)
+    if not valid or lane.get("memory_plan_state") != "execution_accepted":
+        return valid
+    try:
+        terminal = terminal_evidence.read_terminal_evidence(
+            rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+        )
+    except terminal_evidence.TerminalEvidenceError:
+        return False
+    return terminal is not None and terminal["review"] == review and terminal["acceptance"] == acceptance
 
 
 def _recover_broken_review_pair(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
     """Remove a broken pair and leave the lane awaiting a fresh review."""
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if review_path.exists() or acceptance_path.exists():
@@ -258,6 +276,13 @@ def _recover_broken_review_pair(
         if not (review_path.exists() or acceptance_path.exists()):
             return False
         if _review_pair_is_valid(rt, epoch_id, lane):
+            return False
+        # An enhanced parent's partially published review may be completed by
+        # an exact retry. Its existing bytes are also the conflict witness if
+        # they disagree with that retry, so recovery must not remove them.
+        if lane.get("memory_plan_state") == "execution_accepted" or (
+            folder / "NATIVE_TERMINAL_EVIDENCE.json"
+        ).exists():
             return False
         for path in (review_path, acceptance_path):
             try:
@@ -291,7 +316,13 @@ def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
         return False
     for event in queue.get("events", []):
         if (
-            event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+            (
+                event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+                or (
+                    event.get("type") == "LANE_STATUS_CHANGED"
+                    and event.get("actionable_status") == "provider_exited_no_result"
+                )
+            )
             and event.get("lane_id") == lane.get("lane_id")
             and event.get("run_id") == lane.get("run_id")
             and event.get("state") in {"PENDING", "ACKNOWLEDGED"}
@@ -303,8 +334,45 @@ def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
 def _recover_lost_review_event(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Restore one review request when a valid result has no open request."""
-    if lane.get("lifecycle") != "review_pending" or not _valid_current_result(lane):
+    """Restore one review request when valid work has no open request."""
+    lifecycle = lane.get("lifecycle")
+    if lifecycle not in {"review_pending", "result_invalid"}:
+        return []
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    result_path = Path(lane.get("result_path") or Path(lane["worktree_path"]) / "RESULT.json")
+    retained_unknown = False
+    if (
+        lane.get("memory_plan_state") == "execution_accepted"
+        and not result_path.exists()
+        and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
+        and (folder / "COMPLETION_REVIEW.json").is_file()
+        and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+    ):
+        try:
+            review = read_json(folder / "COMPLETION_REVIEW.json")
+            terminal = read_json(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+            terminal_evidence.validate_terminal_evidence(
+                terminal, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+            if folder != lane_record_dir(rt, epoch_id, lane["lane_id"]):
+                terminal_evidence.validate_root_siblings(
+                    rt, epoch_id, lane["lane_id"], lane["run_id"], terminal,
+                )
+            retained_unknown = (
+                terminal["epoch_id"] == epoch_id
+                and terminal["review"] == review
+                and review.get("review_outcome") == "UNKNOWN"
+                and terminal["result"] is None
+                and validate_acceptance_chain(
+                    review, terminal["acceptance"],
+                    lane_id=lane["lane_id"], run_id=lane["run_id"],
+                )
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if lifecycle == "result_invalid" and not retained_unknown:
+        return []
+    if not (_valid_current_result(lane) or retained_unknown):
         return []
     if _review_pair_is_valid(rt, epoch_id, lane):
         return []
