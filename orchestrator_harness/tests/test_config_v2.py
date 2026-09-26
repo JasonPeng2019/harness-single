@@ -1,6 +1,7 @@
 from __future__ import annotations
 # pyright: reportImplicitRelativeImport=false
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,7 +10,11 @@ from unittest.mock import patch
 
 from orchestrator_harness.config import (
     ConfigError,
+    CONFIG_FILE_NAME,
+    LOCAL_CONFIG_DIR_NAME,
+    MANIFEST_FILE_NAME,
     RUNTIME_DIR_NAME,
+    find_harness_root,
     load_config,
     load_resource_manifest,
 )
@@ -33,6 +38,125 @@ class HarnessV2RootConfigTests(unittest.TestCase):
         path = root / "resource-manifest.json"
         write_json(path, value)
         return path
+
+    def _write_product_markers(self, root: Path) -> None:
+        package = root / "orchestrator_harness"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (root / "adapters").mkdir()
+        (root / "super-cache").mkdir()
+
+    def test_local_config_pair_is_preferred_and_records_its_path(self) -> None:
+        root = self._root()
+        legacy_workspace = root / "legacy-workspace"
+        local_workspace = root / "local-workspace"
+        legacy_workspace.mkdir()
+        local_workspace.mkdir()
+        self._write_config(root, {"root_workspace": str(legacy_workspace)})
+        self._write_manifest(
+            root, {"schema": "resource-manifest/v1", "resources": []}
+        )
+        local = root / LOCAL_CONFIG_DIR_NAME
+        write_json(local / CONFIG_FILE_NAME, {"root_workspace": str(local_workspace)})
+        write_json(
+            local / MANIFEST_FILE_NAME,
+            {
+                "schema": "resource-manifest/v1",
+                "resources": [{"id": "local-only", "exclusive": True}],
+            },
+        )
+
+        config = load_config(root)
+        manifest = load_resource_manifest(root)
+
+        self.assertEqual(local_workspace, config.root_workspace)
+        self.assertEqual(local / CONFIG_FILE_NAME, config.config_path)
+        self.assertEqual(("local-only",), manifest.resource_ids())
+
+    def test_partial_local_pair_never_mixes_with_legacy_root_pair(self) -> None:
+        root = self._root()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        self._write_config(root, {"root_workspace": str(workspace)})
+        self._write_manifest(
+            root, {"schema": "resource-manifest/v1", "resources": []}
+        )
+        local = root / LOCAL_CONFIG_DIR_NAME
+        write_json(local / CONFIG_FILE_NAME, {"root_workspace": str(workspace)})
+
+        with self.assertRaisesRegex(ConfigError, "local resource manifest missing"):
+            load_resource_manifest(root)
+
+    def test_empty_local_directory_disables_legacy_fallback(self) -> None:
+        root = self._root()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        self._write_config(root, {"root_workspace": str(workspace)})
+        self._write_manifest(
+            root, {"schema": "resource-manifest/v1", "resources": []}
+        )
+        (root / LOCAL_CONFIG_DIR_NAME).mkdir()
+
+        with self.assertRaisesRegex(ConfigError, "local harness config missing"):
+            load_config(root)
+        with self.assertRaisesRegex(ConfigError, "local resource manifest missing"):
+            load_resource_manifest(root)
+
+    def test_discovery_stops_at_unconfigured_product_root(self) -> None:
+        outer = self._root()
+        stale_workspace = outer / "stale-workspace"
+        stale_workspace.mkdir()
+        self._write_config(outer, {"root_workspace": str(stale_workspace)})
+        product = outer / "harness-single"
+        product.mkdir()
+        self._write_product_markers(product)
+        nested = product / "orchestrator_harness" / "tests"
+        nested.mkdir()
+
+        found = find_harness_root(nested)
+
+        self.assertEqual(product, found)
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"local harness config missing: .*local-config.*copy examples/",
+        ):
+            load_config(found)
+
+    def test_discovery_rejects_a_config_only_ancestor(self) -> None:
+        outer = self._root()
+        self._write_config(outer, {"root_workspace": str(outer / "workspace")})
+        nested = outer / "not-a-product" / "child"
+        nested.mkdir(parents=True)
+
+        with self.assertRaisesRegex(ConfigError, "harness product root not found"):
+            find_harness_root(nested)
+
+    def test_tracked_local_config_examples_validate_after_copy(self) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        examples = repository_root / "examples"
+        root = self._root()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        local = root / LOCAL_CONFIG_DIR_NAME
+        config_example = json.loads(
+            (examples / "harness-config.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "REPLACE_WITH_ABSOLUTE_PATH_TO_TARGET_REPOSITORY",
+            config_example["root_workspace"],
+        )
+        write_json(local / CONFIG_FILE_NAME, config_example)
+        with self.assertRaisesRegex(ConfigError, "root_workspace must be absolute"):
+            load_config(root)
+        config_example["root_workspace"] = str(workspace)
+        write_json(local / CONFIG_FILE_NAME, config_example)
+        manifest_example = json.loads(
+            (examples / "resource-manifest.example.json").read_text(encoding="utf-8")
+        )
+        write_json(local / MANIFEST_FILE_NAME, manifest_example)
+
+        self.assertEqual(workspace, load_config(root).root_workspace)
+        self.assertEqual((), load_resource_manifest(root).resources)
 
     def test_config_exact_two_key_shape_loads(self) -> None:
         root = self._root()

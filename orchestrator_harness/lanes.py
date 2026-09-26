@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from .core import read_json
+from .core import content_hash, read_json
 from .epochs import (
     lane_record_dir,
     lane_record_path,
@@ -85,10 +85,38 @@ def find_active_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
     if marker is None:
         raise LaneError("LANE_NOT_FOUND", f"no active epoch; lane {lane_id} not found")
     epoch_id = str(marker["epoch_id"])
+    entries = read_active_lanes(rt, epoch_id)
+    matching = [entry for entry in entries if entry.get("lane_id") == lane_id]
+    if len(matching) != 1:
+        raise LaneError("LANE_NOT_FOUND", f"active lane not found: {lane_id}")
     try:
         lane = read_lane(rt, epoch_id, lane_id)
     except LaneError:
         raise LaneError("LANE_NOT_FOUND", f"lane not found: {lane_id}")
+    entry = matching[0]
+    expected_path = lane_record_path(rt, epoch_id, lane_id)
+    pending = lane.get("pending_resume")
+    pending_index_transition = bool(
+        lane.get("lifecycle") == "resuming"
+        and isinstance(pending, dict)
+        and pending.get("schema") == "pending-resume/v1"
+        and pending.get("content_hash") == content_hash(pending)
+        and lane.get("run_id") == pending.get("prior_run_id")
+        and entry.get("run_id") == pending.get("new_run_id")
+    )
+    if (
+        (
+            entry.get("run_id") != lane.get("run_id")
+            and not pending_index_transition
+        )
+        or Path(str(entry.get("lane_record_path") or "")).resolve()
+        != expected_path.resolve()
+        or lane.get("publication_state") == "staged"
+    ):
+        raise LaneError(
+            "LANE_NOT_FOUND",
+            f"lane {lane_id} is not consistently published in the active index",
+        )
     return epoch_id, lane
 
 

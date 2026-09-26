@@ -86,6 +86,16 @@ def process_alive(pid: int) -> bool:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
             return False
+    if os.name != "nt":
+        # ``kill(pid, 0)`` reports an unreaped child zombie as present.  A
+        # nonblocking exact-PID reap is available only to its parent; for an
+        # unrelated process this raises ChildProcessError and changes nothing.
+        try:
+            reaped, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            reaped = 0
+        if reaped == pid:
+            return False
     try:
         os.kill(pid, 0)
         return True
@@ -106,6 +116,36 @@ def identity_matches(pid: int, creation_time: str | None) -> bool:
         return False
     current = process_identity(pid)
     return current is not None and current["creation_time"] == creation_time
+
+
+IDENTITY_MATCH = "MATCH"
+IDENTITY_GONE_OR_REUSED = "GONE_OR_REUSED"
+IDENTITY_LIVE_UNPROVABLE = "LIVE_UNPROVABLE"
+
+
+def exact_identity_state(pid: object, creation_time: object) -> str:
+    """Classify one recorded PID without collapsing uncertainty into exit.
+
+    A reused PID is safely distinct from the recorded incarnation.  A PID
+    that is still live while its creation identity cannot be read is not
+    safely gone and must remain cleanup-unproven.
+    """
+
+    if not _valid_pid(pid):
+        return IDENTITY_GONE_OR_REUSED
+    assert isinstance(pid, int)
+    if not process_alive(pid):
+        return IDENTITY_GONE_OR_REUSED
+    current = process_identity(pid)
+    if current is None:
+        return (
+            IDENTITY_LIVE_UNPROVABLE
+            if process_alive(pid)
+            else IDENTITY_GONE_OR_REUSED
+        )
+    if isinstance(creation_time, str) and current.get("creation_time") == creation_time:
+        return IDENTITY_MATCH
+    return IDENTITY_GONE_OR_REUSED
 
 
 def terminate_process(
@@ -938,6 +978,54 @@ def darwin_process_snapshot() -> ProcessSnapshot:
     )
 
 
+def _darwin_boundary_snapshot(
+    process_group_id: int | None,
+    session_id: int | None,
+    owned_pids: set[int],
+) -> ProcessSnapshot:
+    """Inventory only one POSIX boundary on macOS.
+
+    A host-wide libproc snapshot can race with unrelated system processes that
+    disappear between PID enumeration and identity lookup.  Those processes
+    cannot affect this boundary once ``getpgid``/``getsid`` proves they are in
+    another group/session.  Matching and previously-owned PIDs still require
+    complete exact identity evidence.
+    """
+
+    pids = darwin_process_ids()
+    if pids is None:
+        return ProcessSnapshot(
+            False, (), ("libproc process inventory is unavailable",), "darwin-libproc-boundary"
+        )
+    selected: list[ProcessInfo] = []
+    errors: list[str] = []
+    for pid in pids:
+        try:
+            pgid = os.getpgid(pid)
+            sid = os.getsid(pid)
+        except ProcessLookupError:
+            continue
+        except (PermissionError, OSError) as exc:
+            errors.append(f"PID {pid} boundary membership is unavailable: {exc}")
+            continue
+        in_boundary = (
+            process_group_id is not None and pgid == process_group_id
+        ) or (session_id is not None and sid == session_id)
+        if not in_boundary and pid not in owned_pids:
+            continue
+        query = _darwin_process_query(pid)
+        if query.process is not None:
+            selected.append(query.process)
+        elif not query.complete:
+            errors.extend(query.errors)
+    return ProcessSnapshot(
+        complete=not errors,
+        processes=tuple(sorted(selected, key=lambda item: item.pid)),
+        errors=tuple(errors),
+        provider="darwin-libproc-boundary",
+    )
+
+
 def process_snapshot() -> ProcessSnapshot:
     """Read one complete process snapshot through the current platform path."""
 
@@ -1047,6 +1135,10 @@ class ProcessBoundary:
         self.boundary_kind = boundary_kind or (
             "windows-job" if os.name == "nt" else "posix-process-group"
         )
+        self._uses_default_snapshot = (
+            snapshot_provider is None
+            and getattr(process_snapshot, "__module__", None) == __name__
+        )
         self.snapshot_provider = snapshot_provider or process_snapshot
         self._owned: dict[tuple[int, str], ProcessInfo | None] = {}
         self.errors: list[str] = []
@@ -1056,6 +1148,7 @@ class ProcessBoundary:
             self.errors.append("provider root creation identity is unavailable")
         if _valid_pid(root_pid) and isinstance(root_creation_time, str) and root_creation_time:
             self._owned[_identity_key(root_pid, root_creation_time)] = root_process
+        self._permanent_errors = tuple(self.errors)
         self._job_handle: Any = windows_job_handle
         if windows_job_handle is not None:
             self.boundary_kind = "windows-job"
@@ -1114,7 +1207,34 @@ class ProcessBoundary:
                 boundary.errors.append("recorded boundary creation identity is missing")
                 continue
             boundary._owned[_identity_key(item["pid"], creation)] = None
+        boundary._permanent_errors = tuple(boundary.errors)
         return boundary
+
+    def reconcile_observation(
+        self, timeout_seconds: float = BOUNDARY_WAIT_SECONDS
+    ) -> bool:
+        """Retry a fresh exact boundary observation for a bounded interval.
+
+        macOS ``libproc`` can briefly enumerate a process after its identity
+        query has disappeared during reap.  Observation errors from one such
+        snapshot must not poison every later complete snapshot.  Structural
+        record errors remain permanent; each retry otherwise starts fresh and
+        still requires one complete native inventory.
+        """
+
+        if not (self._uses_default_snapshot and sys.platform == "darwin"):
+            if self.errors:
+                self._last_observation_complete = False
+                return False
+            return self.observe()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            self.errors = list(self._permanent_errors)
+            if self.observe():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def _close_job(self) -> None:
         if self._job_handle is None or os.name != "nt":
@@ -1244,7 +1364,15 @@ class ProcessBoundary:
 
         if self._job_handle is not None:
             return self._observe_job()
-        snapshot = self.snapshot_provider()
+        snapshot = (
+            _darwin_boundary_snapshot(
+                self.process_group_id,
+                self.session_id,
+                {pid for pid, _creation in self._owned},
+            )
+            if self._uses_default_snapshot and sys.platform == "darwin"
+            else self.snapshot_provider()
+        )
         if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
             self._last_observation_complete = False
             self.errors.extend(
@@ -1392,8 +1520,7 @@ class ProcessBoundary:
             self.errors.append("provider root creation identity is unavailable")
             return False
 
-        self.observe()
-        if not self._last_observation_complete:
+        if not self.reconcile_observation(timeout_seconds):
             return False
         members = list(self._owned)
         members.sort(key=lambda value: value[0] == self.root_pid)
@@ -1406,8 +1533,9 @@ class ProcessBoundary:
             )
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            self.observe()
-            if not self._last_observation_complete:
+            if not self.reconcile_observation(
+                min(0.25, max(0.0, deadline - time.monotonic()))
+            ):
                 return False
             remaining = self._remaining()
             if remaining is None:
@@ -1417,8 +1545,7 @@ class ProcessBoundary:
             for pid, creation in remaining:
                 terminate_process(pid, creation, force=True, timeout_seconds=0.5)
             time.sleep(0.1)
-        self.observe()
-        return self._last_observation_complete and self._remaining() == []
+        return self.reconcile_observation(0.25) and self._remaining() == []
 
     def _wait_job_empty(self, timeout_seconds: float) -> bool:
         deadline = time.monotonic() + timeout_seconds
@@ -1464,6 +1591,6 @@ def process_boundary_is_gone(record: dict[str, Any]) -> bool:
     """Prove a serialized boundary is absent without terminating anything."""
 
     boundary = ProcessBoundary.from_record(record)
-    if not boundary.root_creation_time or not boundary.observe():
+    if not boundary.root_creation_time or not boundary.reconcile_observation():
         return False
     return boundary._remaining() == []

@@ -8,6 +8,13 @@ branches/worktrees, provider-neutral `orchestrator-worker-invocation/v1` and ret
 exclusive named resources. The persistent manager owns planning, split/merge ordering, launches, decisions,
 acceptance, promotion, and cleanup.
 
+The canonical source product root and launch directory is `harness-single/`. Local operator
+configuration is the paired, ignored `local-config/harness-config.json` and
+`local-config/resource-manifest.json` surface. Product-root discovery stops at source markers even
+when that pair is missing; it must not capture configuration from an ancestor directory. A
+same-root pair remains a compatibility fallback only, and records from the two locations are
+never mixed.
+
 Both supported input shapes feed the same lane-management/controller path. The removed schema-less
 firmware shape is unsupported and fails ordinary invocation validation; no compatibility rejection
 branch exists for it.

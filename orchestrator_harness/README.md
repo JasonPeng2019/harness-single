@@ -17,7 +17,8 @@ results, operates hardware, or replaces the root orchestrator.
 ### `harness` — runtime lifecycle
 
 - `harness setup [--overwrite]` — one-time idempotent integration. Validates
-  `harness-config.json` and `resource-manifest.json`, preflights the entire catalog before
+  `local-config/harness-config.json` and `local-config/resource-manifest.json`, preflights the
+  entire catalog before
   writing anything, stages and byte-verifies the active super-cache, installs the ROOT payloads,
   writes the active resource manifest and lease directory, and starts the persistent monitor.
   It starts no lane or provider and never creates an epoch or worktree. Existing Codex and Claude
@@ -85,13 +86,19 @@ results, operates hardware, or replaces the root orchestrator.
 
 ## Configuration and one-time integration
 
-`harness-config.json` at the harness root is the closed two-key `harness-config/v1` shape: a
-required absolute `root_workspace` and optional `managed_coordination` (`enabled` or `disabled`;
-default `enabled`). No other keys are legal. `resource-manifest.json` is the closed
-`resource-manifest/v1` shape: a literal `schema` field plus a `resources` list; every nonempty
-entry declares a nonempty `id` and `exclusive: true`, and duplicate IDs or unknown fields are
-invalid. ROOT never passes paths, feature flags, or a profile again on any later command; the
-stored config selects everything.
+Run the public launcher from the `harness-single/` product root. Copy the tracked examples to the
+ignored `local-config/harness-config.json` and `local-config/resource-manifest.json` paths before
+setup. The config is the closed two-key `harness-config/v1` shape: a required absolute
+`root_workspace` and optional `managed_coordination` (`enabled` or `disabled`; default `enabled`).
+No other keys are legal. The manifest is the closed `resource-manifest/v1` shape: a literal
+`schema` field plus a `resources` list; every nonempty entry declares a nonempty `id` and
+`exclusive: true`, and duplicate IDs or unknown fields are invalid. ROOT never passes paths,
+feature flags, or a profile again on any later command; the stored config selects everything.
+
+The local pair takes precedence over the legacy same-root pair, which remains readable only for
+backwards compatibility; files from the two locations are never mixed. Product-root discovery
+does not search parent directories for config, so missing local configuration fails with an exact
+copy/setup instruction instead of selecting stale ancestor state.
 
 `managed_coordination: enabled` (managed) stages a manager queue for the epoch: ROOT uses
 `manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
@@ -169,3 +176,11 @@ output.
 affected, full, and release checks. Credit requires declared-input fingerprints plus exact source
 root, Git common directory, and branch identity, with the recorded origin tip still an ancestor
 of the current tip; unknown, divergent, mixed, or stale credit is not green evidence.
+
+## Hermetic macOS product demonstration
+
+`python -m unittest orchestrator_harness.tests.test_macos_product_smoke -v` exercises the real
+public CLI path from setup through shutdown using a disposable Git repository, sanitized ambient
+Git routing/config, empty template/hook directories, and a controlled fake Codex executable. Its
+result and transcript evidence is synthetic and is never live-provider proof. This dedicated
+macOS demonstration skips on every non-macOS host rather than reporting a cross-platform pass.

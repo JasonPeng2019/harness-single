@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import launch, records, setup
+from orchestrator_harness.core import content_hash
 
 
 def _windows_error(code: int) -> OSError:
@@ -176,13 +178,18 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             "worktree_path": str(self.worktree),
             "controller_status_path": str(workspace / "controller.status.json"),
             "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "git": {"branch": "lane/lane-1", "bootstrap_tip": "commit-1"},
         }
         self.invocation = {
             "schema": "controller-invocation/v1",
             "lane_id": "lane-1",
             "run_id": "run-1",
             "provider": {"id": "codex"},
+            "git": dict(self.lane["git"]),
         }
+        self.invocation["content_hash"] = content_hash(self.invocation)
+        self.lane["provider"] = self.invocation["provider"]
+        self.lane["invocation_hash"] = self.invocation["content_hash"]
         binding = (
             "PROVIDER_ID = 'codex'\n"
             "def build_argv(**kwargs): return ['codex']\n"
@@ -262,6 +269,13 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             **self.lane,
             "lifecycle": "accepted",
             "process": {"pid": 41, "creation_time": "created-1"},
+            "result_validation": {
+                "run_id": "run-1",
+                "result_hash": "result-hash-1",
+                "branch": "lane/lane-1",
+                "commit": "commit-1",
+                "clean": True,
+            },
         }
         status = {
             "schema": "controller-status/v1",
@@ -276,33 +290,110 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             "process_boundary": {"root": {"pid": 42, "creation_time": "provider-created"}},
             "cleanup_proven": True,
         }
-        acceptance = {"lane_id": "lane-1", "approval": "ACCEPTED"}
-        with (
-            patch.object(launch, "find_harness_root", return_value=self.root),
-            patch.object(
+        acceptance = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "approval": "ACCEPTED",
+            "content_hash": "acceptance-hash-1",
+        }
+        review = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "result_hash": "result-hash-1",
+            "commit": "commit-1",
+        }
+        current = dict(lane)
+
+        def update(
+            _rt: object,
+            _epoch: object,
+            _lane_id: object,
+            mutate: object,
+        ) -> dict[str, object]:
+            value = mutate(dict(current))
+            current.update(value)
+            return dict(current)
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(launch, "find_harness_root", return_value=self.root)
+            )
+            stack.enter_context(
+                patch.object(
                 launch,
                 "load_config",
                 return_value=SimpleNamespace(
                     runtime_root=self.runtime, root_workspace=self.root
                 ),
-            ),
-            patch.object(launch, "_validate_acceptance_ref", return_value=acceptance),
-            patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
-            patch.object(launch, "_read_controller_status", return_value=status),
-            patch.object(
+                )
+            )
+            stack.enter_context(
+                patch.object(launch, "_validate_acceptance_ref", return_value=acceptance)
+            )
+            stack.enter_context(
+                patch.object(
+                    launch, "find_active_lane", return_value=("epoch-1", lane)
+                )
+            )
+            stack.enter_context(patch.object(
+                launch,
+                "_validate_retirement_chain",
+                return_value=(review, acceptance),
+            ))
+            stack.enter_context(
+                patch.object(launch, "_read_controller_status", return_value=status)
+            )
+            stack.enter_context(patch.object(
                 launch.processes,
                 "identity_matches",
                 side_effect=[True, False, False],
-            ),
-            patch.object(launch.processes, "process_alive", return_value=False),
-            patch.object(launch.processes, "process_boundary_is_gone", return_value=True),
-            patch.object(launch, "release_leases"),
-            patch.object(launch, "update_lane"),
-            patch.object(launch, "read_active_lanes", return_value=[]),
-            patch.object(launch, "write_active_lanes"),
-            patch.object(launch, "_prune_worktrees"),
-            patch.object(launch, "_maybe_close_epoch"),
-        ):
+            ))
+            stack.enter_context(
+                patch.object(launch.processes, "process_alive", return_value=False)
+            )
+            stack.enter_context(
+                patch.object(
+                    launch.processes, "process_boundary_is_gone", return_value=True
+                )
+            )
+            stack.enter_context(patch.object(
+                launch,
+                "validate_merge_ready_git",
+                return_value={
+                    "branch": "lane/lane-1",
+                    "commit": "commit-1",
+                    "clean": True,
+                },
+            ))
+            stack.enter_context(patch.object(
+                launch,
+                "_archive_retirement_evidence",
+                return_value=self.runtime / "archive",
+            ))
+            stack.enter_context(patch.object(
+                launch,
+                "_read_retirement_archive",
+                return_value={"files": {}, "worktree_files": {}},
+            ))
+            stack.enter_context(patch.object(
+                launch,
+                "_plan_worktree_quarantine",
+                return_value={
+                    "path": str(launch._quarantine_path(lane)),
+                    "gitfile": {"fixture": True},
+                },
+            ))
+            for context in (
+                patch.object(launch, "_remove_exact_worktree"),
+                patch.object(launch, "_prove_retained_branch_tip"),
+                patch.object(launch, "release_leases"),
+                patch.object(launch, "update_lane", side_effect=update),
+                patch.object(launch, "read_active_lanes", return_value=[]),
+                patch.object(launch, "write_active_lanes"),
+                patch.object(launch, "_prune_worktrees"),
+                patch.object(launch, "_maybe_close_epoch"),
+            ):
+                stack.enter_context(context)
             result = launch.run_retire("acceptance.json")
 
         self.assertTrue(result["ok"], result)

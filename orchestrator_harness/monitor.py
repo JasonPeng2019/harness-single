@@ -35,7 +35,11 @@ from .epochs import (
 from .lanes import LANE_SCHEMA, read_lane, update_lane
 from .manager_queue import ManagerQueueError, promote_event, read_manager_queue
 from .records import RecordLock, atomic_write_json, read_record
-from .review import validate_acceptance_chain
+from .review import (
+    lane_integrity_contract_error,
+    validate_acceptance_chain,
+    validate_lane_acceptance_chain,
+)
 from .setup import MONITOR_SCHEMA, monitor_record_path, read_monitor_record
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
@@ -93,12 +97,14 @@ def _read_acceptance_chain(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return None
-    if not validate_acceptance_chain(
-        review,
-        acceptance,
-        lane_id=lane_id,
-        run_id=lane.get("run_id") if lane is not None else None,
-    ):
+    valid = (
+        validate_lane_acceptance_chain(review, acceptance, lane)
+        if lane is not None
+        else validate_acceptance_chain(
+            review, acceptance, lane_id=lane_id, run_id=None
+        )
+    )
+    if not valid:
         return None
     return acceptance
 
@@ -230,12 +236,7 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    return validate_acceptance_chain(
-        review,
-        acceptance,
-        lane_id=lane["lane_id"],
-        run_id=lane.get("run_id"),
-    )
+    return validate_lane_acceptance_chain(review, acceptance, lane)
 
 
 def _recover_broken_review_pair(
@@ -245,6 +246,14 @@ def _recover_broken_review_pair(
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+    if review_path.exists() or acceptance_path.exists():
+        legacy = lane_integrity_contract_error(lane)
+        if legacy is not None:
+            # These records may be perfectly valid under the old contract.
+            # Preserve them and surface an explicit migration diagnostic; the
+            # monitor is not permitted to turn a version mismatch into data
+            # deletion.
+            raise ValueError(legacy)
     with RecordLock(review_path):
         if not (review_path.exists() or acceptance_path.exists()):
             return False
@@ -465,7 +474,10 @@ def reconcile_active_lanes(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
                 lane = read_record(lane_path, LANE_SCHEMA)
             except (OSError, ValueError):
                 continue
-            if lane.get("lifecycle") in ("retired", "abandoned"):
+            if (
+                lane.get("lifecycle") in ("retired", "abandoned")
+                or lane.get("publication_state") == "staged"
+            ):
                 continue
             entries.append(
                 {

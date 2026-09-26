@@ -30,18 +30,53 @@ def _identity(pid: int) -> dict[str, object] | None:
     return exact_process_identity(pid)
 
 
-def _same(record: object) -> bool:
+IDENTITY_MATCH = "MATCH"
+IDENTITY_GONE_OR_REUSED = "GONE_OR_REUSED"
+IDENTITY_LIVE_UNPROVABLE = "LIVE_UNPROVABLE"
+IDENTITY_RETRY_ATTEMPTS = 3
+IDENTITY_RETRY_DELAY_SECONDS = 0.02
+
+
+def _pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _identity_state(record: object, *, attempts: int = IDENTITY_RETRY_ATTEMPTS) -> str:
     if (
         not isinstance(record, dict)
         or not isinstance(record.get("pid"), int)
         or not isinstance(record.get("created_utc"), str)
     ):
-        return False
-    actual = _identity(record["pid"])
-    return actual is not None and actual == {
-        "pid": record["pid"],
-        "created_utc": record["created_utc"],
-    }
+        return IDENTITY_GONE_OR_REUSED
+    pid = record["pid"]
+    for attempt in range(max(1, attempts)):
+        actual = _identity(pid)
+        if actual is not None:
+            return (
+                IDENTITY_MATCH
+                if actual
+                == {"pid": pid, "created_utc": record["created_utc"]}
+                else IDENTITY_GONE_OR_REUSED
+            )
+        if not _pid_alive(pid):
+            return IDENTITY_GONE_OR_REUSED
+        if attempt + 1 < max(1, attempts):
+            time.sleep(IDENTITY_RETRY_DELAY_SECONDS)
+    return IDENTITY_LIVE_UNPROVABLE
+
+
+def _same(record: object) -> bool:
+    return _identity_state(record, attempts=1) == IDENTITY_MATCH
 
 
 def _read(path: Path) -> dict[str, object] | None:
@@ -194,18 +229,45 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "status":
         state = _read(service)
-        running = bool(
-            state
-            and _same(state.get("watcher"))
-            and _same(state.get("owner"))
-            and not state.get("stop_requested")
-            and not state.get("exit_reason")
+        # A stop request and terminal record describe intent/progress, not OS
+        # exit.  Keep reporting running until the exact watcher incarnation is
+        # actually gone so callers cannot race ahead of cleanup.
+        identity_state = _identity_state(
+            state.get("watcher") if state else None
         )
-        print(json.dumps({"running": running, "state": state}))
+        running: bool | None = (
+            True
+            if identity_state == IDENTITY_MATCH
+            else None
+            if identity_state == IDENTITY_LIVE_UNPROVABLE
+            else False
+        )
+        print(
+            json.dumps(
+                {
+                    "running": running,
+                    "identity_state": identity_state,
+                    "state": state,
+                }
+            )
+        )
         return 0
     if args.cmd == "stop":
         state = _read(service)
-        if not state or not _same(state.get("watcher")):
+        identity_state = _identity_state(
+            state.get("watcher") if state else None
+        )
+        if identity_state == IDENTITY_LIVE_UNPROVABLE:
+            print(
+                json.dumps(
+                    {
+                        "stop_requested": False,
+                        "reason": "live-service-identity-unproven",
+                    }
+                )
+            )
+            return 1
+        if not state or identity_state != IDENTITY_MATCH:
             print(json.dumps({"stop_requested": False, "reason": "no-live-service"}))
             return 0
         state["stop_requested"] = True
@@ -216,9 +278,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "start":
         state = _read(service)
-        if state and _same(state.get("watcher")) and not state.get("stop_requested"):
-            print(json.dumps({"running": True, "result": "already-started"}))
+        identity_state = _identity_state(
+            state.get("watcher") if state else None
+        )
+        if identity_state == IDENTITY_MATCH:
+            print(
+                json.dumps(
+                    {
+                        "running": True,
+                        "result": (
+                            "stop-pending"
+                            if state and state.get("stop_requested")
+                            else "already-started"
+                        ),
+                    }
+                )
+            )
             return 0
+        if identity_state == IDENTITY_LIVE_UNPROVABLE:
+            print(
+                json.dumps(
+                    {
+                        "running": None,
+                        "result": "live-service-identity-unproven",
+                    }
+                )
+            )
+            return 1
         service.parent.mkdir(parents=True, exist_ok=True)
         claim = service.with_suffix(".claim")
         try:

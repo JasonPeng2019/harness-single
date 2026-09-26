@@ -1,15 +1,19 @@
 # Quick Start: Harness v2 Operator Run
 
-The shortest live run: configure once, setup, bootstrap, launch, watch, review, retire. All
+The shortest live run: configure once, setup, bootstrap, launch, watch, review, retire. Start in
+the `harness-single/` directory; it is the one Harness v2 product root and launch directory. All
 commands use the one public launcher:
 
 ```powershell
 python -m orchestrator_harness.operator_launch <group> <command> [options]
 ```
 
-## 1. Configure the harness root
+## 1. Create local configuration
 
-Write `harness-config.json` at the harness root (closed two-key `harness-config/v1` shape):
+Create the ignored `local-config/` directory. Copy
+`examples/harness-config.example.json` to `local-config/harness-config.json`, then replace its
+example path with the absolute path to the Git repository that ROOT will coordinate. The config
+has the closed two-key `harness-config/v1` shape:
 
 ```json
 {
@@ -18,7 +22,8 @@ Write `harness-config.json` at the harness root (closed two-key `harness-config/
 }
 ```
 
-Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
+Copy `examples/resource-manifest.example.json` to
+`local-config/resource-manifest.json` (closed `resource-manifest/v1` shape):
 
 ```json
 {
@@ -29,6 +34,10 @@ Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
 
 Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `resources`.
 `managed_coordination: "disabled"` runs plain lanes without the manager queue.
+
+For compatibility, an existing pair at the `harness-single/` root is still readable, but the
+local pair takes precedence and the two directories are never mixed. The launcher stops
+discovery at the product root, so a missing local config cannot select a stale parent config.
 
 ## 2. One-time setup
 
@@ -110,3 +119,8 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
   name or command matching.
 - Use a fresh epoch and fresh runtime directories for every live run; retire lanes or shut down
   before re-running.
+- Run the hermetic **macOS product demonstration** without a provider account:
+  `python -m unittest orchestrator_harness.tests.test_macos_product_smoke -v`. It uses only
+  disposable repositories, sanitized ambient Git state, and a synthetic fake Codex executable;
+  its evidence is not live-provider proof. This dedicated macOS demonstration skips on every
+  non-macOS host rather than reporting a cross-platform pass.

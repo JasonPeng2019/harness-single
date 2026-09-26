@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import bootstrap, setup
+from orchestrator_harness import bootstrap, lanes, setup
 
 
 class MaterializationFixture:
@@ -813,6 +815,569 @@ class V2MaterializationTests(unittest.TestCase):
     def test_plain_bootstrap_preserves_validated_task_card_copy(self) -> None:
         self._assert_bootstrap_preserves_validated_task_card_copy(managed=False)
 
+    def test_bootstrap_rejects_missing_provider_payload_before_worktree_creation(
+        self,
+    ) -> None:
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "enabled",
+            },
+        )
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "missing-provider.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "must fail before creating a worktree",
+                "branch": "lane/missing-provider",
+                "base_commit": "HEAD",
+            },
+        )
+        identity = {
+            "source_root": str(self.fixture.root_workspace),
+            "common_dir": str(self.fixture.root_workspace / ".git"),
+            "branch": "lane/missing-provider",
+            "base_commit": "a" * 40,
+            "origin_tip": "a" * 40,
+            "bootstrap_tip": "a" * 40,
+        }
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "_resolve_git_identity", return_value=identity),
+            patch.object(bootstrap, "open_epoch") as open_epoch,
+            patch.object(bootstrap, "_git_worktree_add") as git_add,
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="missing-provider",
+                provider="does-not-exist",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(bootstrap.BOOTSTRAP_ADAPTER_MISSING, result["code"])
+        open_epoch.assert_not_called()
+        git_add.assert_not_called()
+
+    def test_nonzero_worktree_add_preserves_external_winner_for_inspection(
+        self,
+    ) -> None:
+        repository = self.fixture.root_workspace
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Harness Test"],
+            cwd=repository,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "harness@example.invalid"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "partial-add.json"
+        branch = "lane/partial-add"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "simulate a nonzero worktree-add after partial creation",
+                "branch": branch,
+                "base_commit": "HEAD",
+            },
+        )
+        target = (
+            repository
+            / ".harness-runtime"
+            / "worktrees"
+            / "epoch-1"
+            / "partial-add"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        def partially_add(
+            root: Path, created_branch: str, path: Path, base_commit: str
+        ) -> None:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "worktree",
+                    "add",
+                    "-b",
+                    created_branch,
+                    str(path),
+                    base_commit,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            raise bootstrap.BootstrapError(
+                bootstrap.BOOTSTRAP_CLEANUP_FAILED,
+                bootstrap.AMBIGUOUS_ADD_DIAGNOSTIC,
+            )
+
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "_git_worktree_add", side_effect=partially_add),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="partial-add",
+                provider="codex",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(bootstrap.BOOTSTRAP_CLEANUP_FAILED, result["code"])
+        self.assertTrue(target.exists())
+        branch_check = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=repository,
+        )
+        self.assertEqual(0, branch_check.returncode)
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn(str(target), worktrees)
+
+    def test_failed_add_with_no_artifacts_has_idempotent_exact_rollback(self) -> None:
+        repository = self.fixture.root_workspace
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Harness Test",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "never-created.json"
+        branch = "lane/never-created"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "fail without creating Git artifacts",
+                "branch": branch,
+                "base_commit": commit,
+            },
+        )
+        target = (
+            repository
+            / ".harness-runtime"
+            / "worktrees"
+            / "epoch-1"
+            / "never-created"
+        )
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(
+                bootstrap,
+                "_git_worktree_add",
+                side_effect=bootstrap.BootstrapError(
+                    bootstrap.BOOTSTRAP_REQUEST_INVALID,
+                    "synthetic failure before Git created anything",
+                ),
+            ),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="never-created",
+                provider="codex",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(bootstrap.BOOTSTRAP_REQUEST_INVALID, result["code"])
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            1,
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=repository,
+            ).returncode,
+        )
+
+    def test_preexisting_exact_worktree_path_is_preserved_before_add_or_rollback(
+        self,
+    ) -> None:
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "preexisting-path.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "preserve a pre-existing exact target",
+                "branch": "lane/preexisting-path",
+                "base_commit": "HEAD",
+            },
+        )
+        target = (
+            self.fixture.root_workspace
+            / ".harness-runtime"
+            / "worktrees"
+            / "epoch-1"
+            / "preexisting-path"
+        )
+        target.mkdir(parents=True)
+        sentinel = target / "sentinel.txt"
+        sentinel.write_text("must survive\n", encoding="utf-8")
+        identity = {
+            "source_root": str(self.fixture.root_workspace.resolve()),
+            "common_dir": str((self.fixture.root_workspace / ".git").resolve()),
+            "branch": "lane/preexisting-path",
+            "base_commit": "a" * 40,
+            "origin_tip": "a" * 40,
+            "bootstrap_tip": "a" * 40,
+        }
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "_resolve_git_identity", return_value=identity),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "_git_worktree_add") as git_add,
+            patch.object(bootstrap, "_rollback_created_worktree") as rollback,
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="preexisting-path",
+                provider="codex",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertEqual(bootstrap.BOOTSTRAP_WORKTREE_EXISTS, result["code"])
+        git_add.assert_not_called()
+        rollback.assert_not_called()
+        self.assertEqual("must survive\n", sentinel.read_text(encoding="utf-8"))
+
+    def test_external_path_race_after_preflight_is_preserved_fail_closed(self) -> None:
+        repository = self.fixture.root_workspace
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Harness Test",
+                "-c",
+                "user.email=harness@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "external-race.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "preserve an externally raced target",
+                "branch": "lane/external-race",
+                "base_commit": "HEAD",
+            },
+        )
+        target = (
+            repository
+            / ".harness-runtime"
+            / "worktrees"
+            / "epoch-1"
+            / "external-race"
+        )
+        sentinel = target / "external-sentinel.txt"
+
+        def external_race(_root, _branch, path, _base_commit):
+            path.mkdir(parents=True)
+            sentinel.write_text("external owner\n", encoding="utf-8")
+            raise bootstrap.BootstrapError(
+                bootstrap.BOOTSTRAP_CLEANUP_FAILED,
+                bootstrap.AMBIGUOUS_ADD_DIAGNOSTIC,
+            )
+
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "_git_worktree_add", side_effect=external_race),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="external-race",
+                provider="codex",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertEqual(bootstrap.BOOTSTRAP_CLEANUP_FAILED, result["code"])
+        self.assertIn("ownership is ambiguous", result["summary"])
+        self.assertEqual("external owner\n", sentinel.read_text(encoding="utf-8"))
+        self.assertEqual(
+            1,
+            subprocess.run(
+                [
+                    "git",
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/lane/external-race",
+                ],
+                cwd=repository,
+            ).returncode,
+        )
+
+    def test_failed_active_index_publication_leaves_no_operational_phantom(self) -> None:
+        repository = self.fixture.root_workspace
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.name", "Harness Test"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.email", "harness@example.invalid"], cwd=repository, check=True)
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "publication-failure.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "publication must be transactional",
+                "branch": "lane/publication-failure",
+                "base_commit": "HEAD",
+            },
+        )
+        runtime = repository / ".harness-runtime"
+        self.fixture._write_json(
+            runtime / "CURRENT_EPOCH.json",
+            {"schema": "current-epoch/v1", "epoch_id": "epoch-1", "queue_id": "q"},
+        )
+        real_write = bootstrap.write_active_lanes
+        writes = 0
+
+        def fail_first_write(rt, epoch_id, entries):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise OSError("injected active-index publication failure")
+            return real_write(rt, epoch_id, entries)
+
+        with (
+            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "write_active_lanes", side_effect=fail_first_write),
+        ):
+            result = bootstrap.run_bootstrap(
+                lane_id="publication-failure",
+                provider="codex",
+                model="test-model",
+                exclusive_resources=[],
+                task_card_path=str(task_card),
+            )
+        self.assertFalse(result["ok"], result)
+        lane_path = runtime / "epochs" / "epoch-1" / "lanes" / "publication-failure" / "lane.json"
+        self.assertFalse(lane_path.exists())
+        self.assertFalse((runtime / "worktrees" / "epoch-1" / "publication-failure").exists())
+        with self.assertRaises(lanes.LaneError):
+            lanes.find_active_lane(runtime, "publication-failure")
+
+    def test_bootstrap_lock_prevents_loser_from_deleting_winner(self) -> None:
+        repository = self.fixture.root_workspace
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Harness Test"],
+            cwd=repository,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "harness@example.invalid"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        self.fixture.active_cache()
+        task_card = self.fixture.root / "contended.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "only one contender may publish",
+                "branch": "lane/contended",
+                "base_commit": "HEAD",
+            },
+        )
+        target = (
+            repository
+            / ".harness-runtime"
+            / "worktrees"
+            / "epoch-1"
+            / "contended"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        add_created = threading.Event()
+        release_add = threading.Event()
+        second_resolve = threading.Event()
+        resolve_count = 0
+        count_lock = threading.Lock()
+        real_resolve = bootstrap._resolve_git_identity
+
+        def observed_resolve(*args, **kwargs):
+            nonlocal resolve_count
+            with count_lock:
+                resolve_count += 1
+                if resolve_count == 2:
+                    second_resolve.set()
+            return real_resolve(*args, **kwargs)
+
+        def held_add(
+            root: Path, branch: str, path: Path, base_commit: str
+        ) -> None:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(path),
+                    base_commit,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            add_created.set()
+            self.assertTrue(release_add.wait(5))
+
+        results: list[dict[str, object]] = []
+
+        def contender() -> None:
+            results.append(
+                bootstrap.run_bootstrap(
+                    lane_id="contended",
+                    provider="codex",
+                    model="test-model",
+                    exclusive_resources=[],
+                    task_card_path=str(task_card),
+                )
+            )
+
+        with (
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(bootstrap, "open_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "write_active_lanes"),
+            patch.object(bootstrap, "_resolve_git_identity", side_effect=observed_resolve),
+            patch.object(bootstrap, "_git_worktree_add", side_effect=held_add),
+        ):
+            first = threading.Thread(target=contender)
+            second = threading.Thread(target=contender)
+            first.start()
+            self.assertTrue(add_created.wait(5))
+            second.start()
+            self.assertFalse(
+                second_resolve.wait(0.2),
+                "the second contender reached Git preflight while the first held the lock",
+            )
+            release_add.set()
+            first.join(10)
+            second.join(10)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(1, sum(bool(item["ok"]) for item in results))
+        self.assertTrue(target.is_dir(), "the losing contender deleted the winner")
+        self.assertEqual(2, resolve_count)
+
     def _assert_bootstrap_preserves_validated_task_card_copy(
         self, *, managed: bool
     ) -> None:
@@ -858,6 +1423,15 @@ class V2MaterializationTests(unittest.TestCase):
         def fake_git(root: Path, branch: str, target: Path, base_commit: str) -> None:
             target.mkdir(parents=True, exist_ok=True)
 
+        git_identity = {
+            "source_root": str(self.fixture.root_workspace.resolve()),
+            "common_dir": str((self.fixture.root_workspace / ".git").resolve()),
+            "branch": f"lane/{lane_id}",
+            "base_commit": "a" * 40,
+            "origin_tip": "a" * 40,
+            "bootstrap_tip": "a" * 40,
+        }
+
         with (
             patch(
                 "orchestrator_harness.config.find_harness_root",
@@ -866,8 +1440,17 @@ class V2MaterializationTests(unittest.TestCase):
             patch.object(bootstrap, "open_epoch", return_value=epoch),
             patch.object(bootstrap, "read_active_lanes", return_value=[]),
             patch.object(
+                bootstrap, "_resolve_git_identity", return_value=git_identity
+            ),
+            patch.object(
                 bootstrap, "_git_worktree_add", side_effect=fake_git
             ) as git_add,
+            patch.object(
+                bootstrap,
+                "_capture_created_worktree_identity",
+                return_value={"fixture": "owned"},
+            ),
+            patch.object(bootstrap, "_verify_created_worktree"),
             patch.object(bootstrap.subprocess, "run") as provider_cli,
         ):
             result = bootstrap.run_bootstrap(

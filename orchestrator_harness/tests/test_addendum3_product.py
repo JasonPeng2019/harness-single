@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
@@ -20,6 +21,18 @@ from orchestrator_harness.manager_queue import (
     read_manager_queue,
 )
 from orchestrator_harness.records import atomic_write_json, read_jsonl, read_record
+
+
+def bind_invocation(lane: dict[str, object], invocation: dict[str, object]) -> None:
+    git = lane.get("git") or {
+        "fixture": "addendum-controller",
+        "bootstrap_tip": "a" * 40,
+    }
+    lane["git"] = git
+    lane["provider"] = invocation["provider"]
+    invocation["git"] = git
+    invocation["content_hash"] = content_hash(invocation)
+    lane["invocation_hash"] = invocation["content_hash"]
 
 
 class Addendum3ProductTests(unittest.TestCase):
@@ -209,6 +222,8 @@ class Addendum3ProductTests(unittest.TestCase):
             "result_path": str(worktree / "RESULT.json"),
             "lifecycle": "review_pending",
             "last_reported_actionable_status": None,
+            "git": {"fixture": "review-recovery", "bootstrap_tip": "a" * 40},
+            "invocation_hash": "fixture-invocation-hash",
         }
         atomic_write_json(lane_dir / "lane.json", lane)
         result = {
@@ -247,12 +262,24 @@ class Addendum3ProductTests(unittest.TestCase):
             "worktree_path": str(worktree),
             "result_path": str(worktree / "RESULT.json"),
             "lifecycle": "review_pending",
+            "git": {
+                "fixture": "review-publication",
+                "branch": "lane/test",
+                "bootstrap_tip": "commit-1",
+            },
         }
         atomic_write_json(lane_dir / "lane.json", lane)
-        atomic_write_json(
-            workspace / "task-card.json",
-            {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"},
-        )
+        task_card = {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"}
+        atomic_write_json(workspace / "task-card.json", task_card)
+        lane["task_card_hash"] = content_hash(task_card)
+        invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "provider": {"id": "codex", "model": "model-1"},
+        }
+        bind_invocation(lane, invocation)
+        atomic_write_json(workspace / "invocation.json", invocation)
         result = {
             "schema": "result/v1",
             "lane_id": "lane-1",
@@ -264,6 +291,14 @@ class Addendum3ProductTests(unittest.TestCase):
         }
         result["content_hash"] = content_hash(result)
         atomic_write_json(worktree / "RESULT.json", result)
+        lane["result_validation"] = {
+            "run_id": "run-1",
+            "result_hash": content_hash(result),
+            "invocation_hash": lane["invocation_hash"],
+            "branch": "lane/test",
+            "commit": "commit-1",
+            "clean": True,
+        }
         review_path = lane_dir / "COMPLETION_REVIEW.json"
         first_write = threading.Event()
         allow_second_write = threading.Event()
@@ -313,6 +348,7 @@ class Addendum3ProductTests(unittest.TestCase):
 
         with (
             patch.object(review, "atomic_write_json", side_effect=write_pair),
+            patch.object(review, "validate_merge_ready_git", return_value={"branch": "lane/test", "commit": "commit-1", "clean": True}),
             patch.object(review, "_worktree_commit", return_value="commit-1"),
             patch.object(monitor, "RecordLock", side_effect=tracked_lock),
         ):
@@ -362,6 +398,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider": {"id": "codex", "model": "model-1"},
             "exclusive_resources": ["resource-1"],
         }
+        bind_invocation(lane, invocation)
 
         executions = []
         for index in range(3):
@@ -381,7 +418,7 @@ class Addendum3ProductTests(unittest.TestCase):
                     ("codex", "exec", "resume" if index else "new"),
                 )
             )
-        validate_results = [("invalid", None), ("invalid", None), ("valid", {"outcome": "PASS"})]
+        validate_results = [("invalid", None), ("invalid", None), ("valid", {"outcome": "PASS", "_validated_git": {"branch": "lane/test", "commit": "a" * 40}})]
         calls = []
 
         def record_call(*args, **kwargs):
@@ -444,16 +481,32 @@ class Addendum3ProductTests(unittest.TestCase):
             "lifecycle": "prepared",
         }
         lane_path = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1" / "lane.json"
+        invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "provider": {"id": "codex", "model": "model-1"},
+            "exclusive_resources": ["resource-1"],
+        }
+        bind_invocation(lane, invocation)
         atomic_write_json(lane_path, {"schema": "lane/v1", **lane})
         atomic_write_json(
-            workspace / "invocation.json",
+            self.runtime / "epochs" / "epoch-1" / "active-lanes.json",
             {
-                "schema": "controller-invocation/v1",
-                "lane_id": "lane-1",
-                "run_id": "run-1",
-                "provider": {"id": "codex", "model": "model-1"},
-                "exclusive_resources": ["resource-1"],
+                "schema": "active-lanes/v1",
+                "epoch_id": "epoch-1",
+                "lanes": [
+                    {
+                        "lane_id": "lane-1",
+                        "run_id": "run-1",
+                        "lane_record_path": str(lane_path),
+                    }
+                ],
             },
+        )
+        atomic_write_json(
+            workspace / "invocation.json",
+            invocation,
         )
 
         calls: list[dict[str, object]] = []
@@ -617,6 +670,7 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(controller, "_write_status", side_effect=track_write_status),
             patch.object(controller, "release_leases", side_effect=track_release_leases),
             patch.object(controller, "_run_provider", side_effect=run_provider),
+            patch.object(controller, "validate_merge_ready_git", return_value={"branch": "lane/test", "commit": "a" * 40, "clean": True}),
             patch.object(
                 controller,
                 "_read_acceptance_chain",
@@ -835,8 +889,14 @@ class Addendum3ProductTests(unittest.TestCase):
             resume=True,
         )
         spawned.assert_called_once()
-        make_boundary.assert_called_once_with(456, windows_job_handle=789)
-        child.resume.assert_called_once_with()
+        expected_job_handle = 789 if os.name == "nt" else None
+        make_boundary.assert_called_once_with(
+            456, windows_job_handle=expected_job_handle
+        )
+        if os.name == "nt":
+            child.resume.assert_called_once_with()
+        else:
+            child.resume.assert_not_called()
         self.assertEqual(tuple(expected_argv), execution.argv)
         self.assertEqual("saved-native-session", execution.session_id)
 
@@ -1055,6 +1115,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider": {"id": "codex", "model": "model-1"},
             "exclusive_resources": [],
         }
+        bind_invocation(lane, invocation)
         boundary = MagicMock(
             root_pid=101,
             root_creation_time="provider-created",
@@ -1083,7 +1144,7 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(controller, "acquire_leases"),
             patch.object(controller, "release_leases"),
             patch.object(controller, "_run_provider", return_value=execution),
-            patch.object(controller, "_validate_result", return_value=("valid", {"outcome": "PASS"})),
+            patch.object(controller, "_validate_result", return_value=("valid", {"outcome": "PASS", "_validated_git": {"branch": "lane/test", "commit": "a" * 40}})),
             patch.object(controller, "_read_acceptance_chain", return_value={"acceptance": {"approval": "REJECTED"}}),
         ):
             self.assertEqual(0, controller.run_controller("lane-1"))
@@ -1379,7 +1440,7 @@ class Addendum3ProductTests(unittest.TestCase):
                 )
             )
 
-    def test_resume_marks_launch_pending_for_fresh_running_lane(self) -> None:
+    def test_resume_dead_running_lane_without_launch_pending_starts_fresh_run(self) -> None:
         from orchestrator_harness import resume
 
         worktree = self.runtime / "resume-worktree"
@@ -1391,22 +1452,37 @@ class Addendum3ProductTests(unittest.TestCase):
             "worktree_path": str(worktree),
             "provider": {"id": "codex", "model": "model-1"},
             "session": {"session_id": "session-1"},
-            "lifecycle": "review_pending",
+            "lifecycle": "running",
+            "launch_pending": False,
             "process": {},
+            "git": {"fixture": "resume", "bootstrap_tip": "a" * 40},
+            "result_validation": {"commit": "stale"},
         }
+        prior_invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-old",
+            "provider": lane["provider"],
+            "exclusive_resources": [],
+        }
+        bind_invocation(lane, prior_invocation)
+        atomic_write_json(workspace / "invocation.json", prior_invocation)
         task_card = {
             "schema": "project-task-card/v1",
             "card_id": "card-1",
             "task": "do the work",
         }
         updates: list[dict[str, object]] = []
+        state = dict(lane)
 
         def update(
             _rt: object, _epoch: object, _lane_id: object, mutate: object
         ) -> dict[str, object]:
-            value = mutate(dict(lane))
+            value = mutate(dict(state))
+            state.clear()
+            state.update(value)
             updates.append(value)
-            return {**lane, **value}
+            return dict(state)
 
         with (
             patch.object(resume, "find_harness_root", return_value=Path("root")),
@@ -1418,9 +1494,7 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(resume, "find_active_lane", return_value=("epoch-1", lane)),
             patch.object(resume, "_read_task_card", return_value=task_card),
             patch.object(resume, "_clear_prior_run"),
-            patch.object(resume, "_write_worker_prompt"),
-            patch.object(resume, "_write_result_template"),
-            patch.object(resume, "_rewrite_overlay_receipt"),
+            patch.object(resume, "_publish_resume_active_index"),
             patch.object(resume, "update_lane", side_effect=update),
         ):
             result = resume.run_resume(lane_id="lane-1", resume_task_card="card.json")
@@ -1429,6 +1503,216 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("running", running_update["lifecycle"])
         self.assertEqual({}, running_update["process"])
         self.assertTrue(running_update["launch_pending"])
+        self.assertEqual(content_hash(task_card), running_update["task_card_hash"])
+        self.assertIsNone(running_update["result_validation"])
+
+    def test_resume_retries_durable_pending_transaction_after_final_write_failure(self) -> None:
+        from orchestrator_harness import resume
+
+        worktree = self.runtime / "resume-retry-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        state: dict[str, object] = {
+            "lane_id": "lane-1",
+            "run_id": "run-old",
+            "worktree_path": str(worktree),
+            "provider": {"id": "codex", "model": "model-1"},
+            "session": {"session_id": "session-1"},
+            "lifecycle": "review_pending",
+            "process": {},
+            "git": {"fixture": "resume", "bootstrap_tip": "a" * 40},
+            "result_validation": {"commit": "stale"},
+        }
+        prior_invocation: dict[str, object] = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-old",
+            "provider": state["provider"],
+            "exclusive_resources": ["resource-1"],
+        }
+        bind_invocation(state, prior_invocation)
+        atomic_write_json(workspace / "invocation.json", prior_invocation)
+        lane_path = (
+            self.runtime
+            / "epochs"
+            / "epoch-1"
+            / "lanes"
+            / "lane-1"
+            / "lane.json"
+        )
+        atomic_write_json(
+            self.runtime / "epochs" / "epoch-1" / "active-lanes.json",
+            {
+                "schema": "active-lanes/v1",
+                "epoch_id": "epoch-1",
+                "lanes": [
+                    {
+                        "lane_id": "lane-1",
+                        "run_id": "run-old",
+                        "lane_record_path": str(lane_path),
+                    }
+                ],
+            },
+        )
+        task_card = {
+            "schema": "project-task-card/v1",
+            "card_id": "card-retry",
+            "task": "resume transactionally",
+        }
+        calls = 0
+
+        def update(_rt, _epoch, _lane_id, mutate):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("injected final lane publication failure")
+            value = mutate(dict(state))
+            state.clear()
+            state.update(value)
+            return dict(state)
+
+        with (
+            patch.object(resume, "find_harness_root", return_value=Path("root")),
+            patch.object(
+                resume,
+                "load_config",
+                return_value=SimpleNamespace(runtime_root=self.runtime, profile="plain"),
+            ),
+            patch.object(
+                resume,
+                "find_active_lane",
+                side_effect=lambda *_: ("epoch-1", dict(state)),
+            ),
+            patch.object(resume, "_read_task_card", return_value=task_card),
+            patch.object(resume, "update_lane", side_effect=update),
+        ):
+            first = resume.run_resume(
+                lane_id="lane-1", resume_task_card="card.json", rationale="retry"
+            )
+            self.assertFalse(first["ok"], first)
+            self.assertEqual("resuming", state["lifecycle"])
+            pending = dict(state["pending_resume"])
+            self.assertEqual("staged", pending["phase"])
+            new_run_id = pending["new_run_id"]
+
+            second = resume.run_resume(
+                lane_id="lane-1", resume_task_card="card.json", rationale="retry"
+            )
+
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(new_run_id, state["run_id"])
+        self.assertEqual("running", state["lifecycle"])
+        self.assertIsNone(state["pending_resume"])
+        published = read_record(
+            workspace / "invocation.json", "controller-invocation/v1"
+        )
+        self.assertEqual(new_run_id, published["run_id"])
+        self.assertEqual(state["invocation_hash"], published["content_hash"])
+        active = read_record(
+            self.runtime / "epochs" / "epoch-1" / "active-lanes.json",
+            "active-lanes/v1",
+        )
+        self.assertEqual(new_run_id, active["lanes"][0]["run_id"])
+
+    def test_resume_signal_failure_after_commit_is_idempotent_on_retry(self) -> None:
+        from orchestrator_harness import resume
+
+        worktree = self.runtime / "resume-signal-retry-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        state: dict[str, object] = {
+            "lane_id": "lane-1",
+            "run_id": "run-old",
+            "worktree_path": str(worktree),
+            "provider": {"id": "codex", "model": "model-1"},
+            "session": {"session_id": "session-1"},
+            "lifecycle": "review_pending",
+            "process": {},
+            "git": {"fixture": "resume", "bootstrap_tip": "a" * 40},
+            "result_validation": {"commit": "stale"},
+        }
+        prior_invocation: dict[str, object] = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-old",
+            "provider": state["provider"],
+            "exclusive_resources": ["resource-1"],
+        }
+        bind_invocation(state, prior_invocation)
+        atomic_write_json(workspace / "invocation.json", prior_invocation)
+        lane_path = (
+            self.runtime
+            / "epochs"
+            / "epoch-1"
+            / "lanes"
+            / "lane-1"
+            / "lane.json"
+        )
+        atomic_write_json(
+            self.runtime / "epochs" / "epoch-1" / "active-lanes.json",
+            {
+                "schema": "active-lanes/v1",
+                "epoch_id": "epoch-1",
+                "lanes": [
+                    {
+                        "lane_id": "lane-1",
+                        "run_id": "run-old",
+                        "lane_record_path": str(lane_path),
+                    }
+                ],
+            },
+        )
+        task_card = {
+            "schema": "project-task-card/v1",
+            "card_id": "card-signal-retry",
+            "task": "resume once despite queue cleanup failure",
+        }
+
+        def update(_rt, _epoch, _lane_id, mutate):
+            value = mutate(dict(state))
+            state.clear()
+            state.update(value)
+            return dict(state)
+
+        with (
+            patch.object(resume, "find_harness_root", return_value=Path("root")),
+            patch.object(
+                resume,
+                "load_config",
+                return_value=SimpleNamespace(runtime_root=self.runtime, profile="managed"),
+            ),
+            patch.object(
+                resume,
+                "find_active_lane",
+                side_effect=lambda *_: ("epoch-1", dict(state)),
+            ),
+            patch.object(resume, "_read_task_card", return_value=task_card),
+            patch.object(resume, "update_lane", side_effect=update),
+            patch.object(resume, "new_id", return_value="fresh-run") as allocate,
+            patch.object(
+                resume,
+                "_consume_resume_signal",
+                side_effect=[OSError("injected queue cleanup failure"), None],
+            ) as consume,
+        ):
+            first = resume.run_resume(
+                lane_id="lane-1", resume_task_card="card.json"
+            )
+            committed = (
+                state["run_id"], state["invocation_hash"], state["lifecycle"]
+            )
+            second = resume.run_resume(
+                lane_id="lane-1", resume_task_card="card.json"
+            )
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertIn("already committed", second["summary"])
+        self.assertEqual(committed, ("fresh-run", state["invocation_hash"], "running"))
+        self.assertEqual("fresh-run", state["run_id"])
+        self.assertIsNone(state["pending_resume"])
+        allocate.assert_called_once_with()
+        self.assertEqual(2, consume.call_count)
 
     def test_launch_clears_launch_pending_when_identity_is_recorded(self) -> None:
         from orchestrator_harness import launch
@@ -1462,6 +1746,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "run_id": "run-1",
             "provider": {"id": "codex"},
         }
+        bind_invocation(lane, invocation)
         child = MagicMock(pid=41)
         child.poll.return_value = 0
         updates: list[dict[str, object]] = []

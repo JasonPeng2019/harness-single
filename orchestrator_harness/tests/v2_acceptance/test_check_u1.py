@@ -21,8 +21,8 @@ class CheckU1Tests(unittest.TestCase):
         """This is a source-layout acceptance check, not a candidate API import."""
         root = Path(__file__).resolve().parents[3]
         required = (
-            "harness-config.json",
-            "resource-manifest.json",
+            "examples/harness-config.example.json",
+            "examples/resource-manifest.example.json",
             "adapters",
             "super-cache",
             "orchestrator_harness/provider_adapters",

@@ -20,6 +20,7 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.runtime = self.root / "runtime"
         self.runtime.mkdir()
+        (self.root / "worktree").mkdir()
 
     def _spawn_short_controller(self, sleep_seconds: float = 0.35):
         child = launch.processes.spawn_detached(
@@ -55,6 +56,7 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
             "lifecycle": "accepted",
             "worktree_path": str(self.root / "worktree"),
             "process": identity,
+            "result_validation": {"run_id": "run-1", "result_hash": "result", "branch": "lane/test", "commit": "a" * 40, "clean": True},
         }
         running = {
             "schema": "controller-status/v1",
@@ -86,15 +88,33 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
             patch.object(
                 launch,
                 "_validate_acceptance_ref",
-                return_value={"lane_id": "lane-1", "approval": "ACCEPTED"},
+                return_value={"lane_id": "lane-1", "run_id": "run-1", "approval": "ACCEPTED"},
             ),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
+            patch.object(launch, "_validate_retirement_chain", return_value=({"commit": "a" * 40}, {"content_hash": "acceptance"})),
             patch.object(launch, "_read_controller_status", side_effect=read_status),
             patch.object(
                 launch.processes, "process_boundary_is_gone", return_value=True
             ),
             patch.object(launch, "release_leases"),
-            patch.object(launch, "update_lane"),
+            patch.object(launch, "validate_merge_ready_git", return_value={"branch": "lane/test", "commit": "a" * 40, "clean": True}),
+            patch.object(launch, "_archive_retirement_evidence", return_value=self.root / "archive"),
+            patch.object(
+                launch,
+                "_read_retirement_archive",
+                return_value={"files": {}, "worktree_files": {}},
+            ),
+            patch.object(
+                launch,
+                "_plan_worktree_quarantine",
+                return_value={
+                    "path": str(launch._quarantine_path(lane)),
+                    "gitfile": {"fixture": True},
+                },
+            ),
+            patch.object(launch, "_remove_exact_worktree"),
+            patch.object(launch, "_prove_retained_branch_tip"),
+            patch.object(launch, "update_lane", side_effect=lambda _rt, _epoch, _lane, mutate: mutate(dict(lane))),
             patch.object(launch, "read_active_lanes", return_value=[]),
             patch.object(launch, "write_active_lanes"),
             patch.object(launch, "_prune_worktrees"),
@@ -129,6 +149,7 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
             "lifecycle": "accepted",
             "worktree_path": str(self.root / "worktree"),
             "process": identity,
+            "result_validation": {"run_id": "run-1", "result_hash": "result", "branch": "lane/test", "commit": "a" * 40, "clean": True},
         }
         with ExitStack() as stack:
             stack.enter_context(
@@ -147,13 +168,16 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
                 patch.object(
                     launch,
                     "_validate_acceptance_ref",
-                    return_value={"lane_id": "lane-1", "approval": "ACCEPTED"},
+                    return_value={"lane_id": "lane-1", "run_id": "run-1", "approval": "ACCEPTED"},
                 )
             )
             stack.enter_context(
                 patch.object(
                     launch, "find_active_lane", return_value=("epoch-1", lane)
                 )
+            )
+            stack.enter_context(
+                patch.object(launch, "_validate_retirement_chain", return_value=({"commit": "a" * 40}, {"content_hash": "acceptance"}))
             )
             stack.enter_context(
                 patch.object(
@@ -170,7 +194,21 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
             release_leases = stack.enter_context(
                 patch.object(launch, "release_leases")
             )
-            update_lane = stack.enter_context(patch.object(launch, "update_lane"))
+            stack.enter_context(patch.object(launch, "validate_merge_ready_git", return_value={"branch": "lane/test", "commit": "a" * 40, "clean": True}))
+            stack.enter_context(patch.object(launch, "_archive_retirement_evidence", return_value=self.root / "archive"))
+            stack.enter_context(
+                patch.object(
+                    launch,
+                    "_plan_worktree_quarantine",
+                    return_value={
+                        "path": str(launch._quarantine_path(lane)),
+                        "gitfile": {"fixture": True},
+                    },
+                )
+            )
+            stack.enter_context(patch.object(launch, "_remove_exact_worktree"))
+            stack.enter_context(patch.object(launch, "_prove_retained_branch_tip"))
+            update_lane = stack.enter_context(patch.object(launch, "update_lane", side_effect=lambda _rt, _epoch, _lane, mutate: mutate(dict(lane))))
             stack.enter_context(
                 patch.object(launch, "read_active_lanes", return_value=[])
             )

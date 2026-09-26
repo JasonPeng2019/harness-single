@@ -29,7 +29,13 @@ from .records import (
     atomic_write_json,
     read_record,
 )
-from .review import validate_acceptance_chain
+from .review import (
+    GitStateError,
+    lane_integrity_contract_error,
+    validate_lane_acceptance_chain,
+    validate_invocation_binding,
+    validate_merge_ready_git,
+)
 from .setup import read_runtime_state
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
@@ -151,8 +157,11 @@ def _validate_result(lane: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
             return "invalid", None
         if record.get("content_hash") != content_hash(record):
             return "invalid", None
-        return "valid", record
-    except (OSError, ValueError):
+        git_state = validate_merge_ready_git(lane)
+        validated = dict(record)
+        validated["_validated_git"] = git_state
+        return "valid", validated
+    except (OSError, ValueError, GitStateError):
         return "invalid", None
 
 
@@ -253,12 +262,7 @@ def _read_acceptance_chain(
         acceptance = read_record(acceptance_path, ACCEPTANCE_SCHEMA)
     except (OSError, ValueError):
         return None
-    if not validate_acceptance_chain(
-        review,
-        acceptance,
-        lane_id=lane["lane_id"],
-        run_id=lane["run_id"],
-    ):
+    if not validate_lane_acceptance_chain(review, acceptance, lane):
         return None
     return {"review": review, "acceptance": acceptance}
 
@@ -462,15 +466,14 @@ def run_controller(lane_id: str) -> int:
     config = load_config(harness_root)
     rt = config.runtime_root
     epoch_id, lane = find_active_lane(rt, lane_id)
+    legacy = lane_integrity_contract_error(lane)
+    if legacy is not None:
+        raise ControllerError(LAUNCH_INVOCATION_INVALID, legacy, no_provider_started=True)
     invocation_path = Path(lane["worktree_path"]) / ".agent-workspace" / "invocation.json"
     try:
         invocation = read_record(invocation_path, INVOCATION_SCHEMA)
-        if invocation.get("lane_id") != lane_id or invocation.get("run_id") != lane.get("run_id"):
-            raise ControllerError(
-                LAUNCH_INVOCATION_INVALID,
-                "invocation does not match the lane's current run",
-            )
-    except (OSError, ValueError) as exc:
+        validate_invocation_binding(lane, invocation)
+    except (OSError, ValueError, GitStateError) as exc:
         raise ControllerError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
     provider_id = invocation["provider"]["id"]
 
@@ -673,7 +676,7 @@ def run_controller(lane_id: str) -> int:
         _append_event(lane, "provider_exited", f"attempt={attempt_number}; exit_code={exit_code}")
 
         cleanup_proven = execution.boundary.cleanup(force=True)
-        result_state, _result = _validate_result(lane)
+        result_state, validated_result = _validate_result(lane)
         effective_result_state = (
             result_state
             if result_state == "valid"
@@ -733,6 +736,32 @@ def run_controller(lane_id: str) -> int:
             lane = {**lane, "session": {"session_id": execution.session_id}}
 
         if effective_result_state == "valid":
+            if not isinstance(validated_result, dict) or not isinstance(
+                validated_result.get("_validated_git"), dict
+            ):
+                # A valid production result always carries the private Git
+                # validation proof returned by _validate_result.  Fail closed
+                # if validation was replaced or raced without that binding.
+                effective_result_state = "invalid"
+            else:
+                git_state = dict(validated_result["_validated_git"])
+                result_validation = {
+                    "run_id": lane["run_id"],
+                    "result_hash": content_hash(
+                        {
+                            key: value
+                            for key, value in validated_result.items()
+                            if key != "_validated_git"
+                        }
+                    ),
+                    "invocation_hash": lane["invocation_hash"],
+                    "branch": git_state["branch"],
+                    "commit": git_state["commit"],
+                    "clean": True,
+                    "validated_at": iso_utc(),
+                }
+
+        if effective_result_state == "valid":
             # Cleanup proof covers the complete provider/helper boundary; only
             # now may the controller release the lane's exclusive leases.
             _write_status(
@@ -746,11 +775,15 @@ def run_controller(lane_id: str) -> int:
             release_leases(rt, lane_id, lane["run_id"])
             _append_event(lane, "leases_released", ",".join(declared) or "(none)")
             _append_event(lane, "result_valid", "review_pending")
-            update_lane(
+            lane = update_lane(
                 rt,
                 epoch_id,
                 lane_id,
-                lambda current: {**current, "lifecycle": "review_pending"},
+                lambda current, proof=result_validation: {
+                    **current,
+                    "lifecycle": "review_pending",
+                    "result_validation": proof,
+                },
             )
             recorded = "review_pending"
             break

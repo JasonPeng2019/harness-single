@@ -70,6 +70,21 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
                 "MCP-Trial", document.read_text(encoding="utf-8"), document
             )
 
+    def test_product_demonstration_is_explicitly_macos_only(self) -> None:
+        command = (
+            "python -m unittest "
+            "orchestrator_harness.tests.test_macos_product_smoke -v"
+        )
+        for document in PRIMARY_DOCS:
+            text = document.read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            self.assertIn("macOS product demonstration", normalized, document)
+            self.assertIn(command, normalized, document)
+            self.assertIn("skips on every non-macOS host", normalized, document)
+            self.assertNotIn(
+                "orchestrator_harness.tests.test_product_smoke", text, document
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

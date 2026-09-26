@@ -8,7 +8,17 @@ from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import controller, launch
 from orchestrator_harness.controller import ControllerError
+from orchestrator_harness.core import content_hash
 from orchestrator_harness.leases import LeaseError
+
+
+def bind_invocation(lane, invocation):
+    git = {"fixture": "launch-lifecycle", "bootstrap_tip": "a" * 40}
+    lane["git"] = git
+    lane["provider"] = invocation["provider"]
+    invocation["git"] = git
+    invocation["content_hash"] = content_hash(invocation)
+    lane["invocation_hash"] = invocation["content_hash"]
 
 
 class LaunchHandshakeTests(unittest.TestCase):
@@ -32,6 +42,7 @@ class LaunchHandshakeTests(unittest.TestCase):
             "schema": "controller-invocation/v1", "lane_id": "lane-1",
             "run_id": "run-1", "provider": {"id": "codex"},
         }
+        bind_invocation(self.lane, self.invocation)
 
     def test_fast_terminal_status_is_a_successful_handshake(self) -> None:
         child = MagicMock(pid=41)
@@ -116,6 +127,7 @@ class ControllerLeaseTests(unittest.TestCase):
     def test_lease_busy_is_terminal_clean_and_restores_prepared(self) -> None:
         lane = {"lane_id": "lane-1", "run_id": "run-1", "worktree_path": "worktree", "controller_status_path": "status", "controller_events_path": "events"}
         invocation = {"lane_id": "lane-1", "run_id": "run-1", "provider": {"id": "codex"}, "exclusive_resources": ["shared"]}
+        bind_invocation(lane, invocation)
         updates: list[dict[str, object]] = []
         def update(_rt, _epoch, _lane, mutate):
             value = mutate(dict(lane))
@@ -144,6 +156,7 @@ class ControllerLeaseTests(unittest.TestCase):
     def test_provider_not_created_releases_only_current_run_lease(self) -> None:
         lane = {"lane_id": "lane-1", "run_id": "run-1", "worktree_path": "worktree", "controller_status_path": "status", "controller_events_path": "events"}
         invocation = {"lane_id": "lane-1", "run_id": "run-1", "provider": {"id": "codex"}, "exclusive_resources": ["shared"]}
+        bind_invocation(lane, invocation)
         with (
             patch.object(controller, "find_harness_root", return_value=Path("root")),
             patch.object(controller, "load_config", return_value=SimpleNamespace(runtime_root=Path("runtime"))),

@@ -1672,3 +1672,89 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertTrue(_same(live))
         stale = {**live, "created_utc": str(live["created_utc"]) + "-different"}
         self.assertFalse(_same(stale))
+
+    def test_status_remains_running_after_stop_request_until_exact_pid_is_gone(
+        self,
+    ) -> None:
+        runner = importlib.import_module("harness_watcher_implementation.__main__")
+        service = self.config.runtime_root / "watcher" / "service.json"
+        state = {
+            "watcher": {"pid": 41, "created_utc": "watcher"},
+            "owner": {"pid": 40, "created_utc": "owner"},
+            "stop_requested": True,
+            "exit_reason": None,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(runner, "_identity_state", return_value=runner.IDENTITY_MATCH),
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(0, runner.main(["status"]))
+        self.assertTrue(json.loads(output.getvalue())["running"])
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(
+                runner,
+                "_identity_state",
+                return_value=runner.IDENTITY_GONE_OR_REUSED,
+            ),
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(0, runner.main(["status"]))
+        self.assertFalse(json.loads(output.getvalue())["running"])
+
+    def test_live_pid_with_unreadable_identity_is_unknown_and_never_replaced(self) -> None:
+        runner = importlib.import_module("harness_watcher_implementation.__main__")
+        state = {
+            "watcher": {"pid": os.getpid(), "created_utc": "temporarily-unreadable"},
+            "owner": {"pid": os.getpid(), "created_utc": "owner"},
+            "stop_requested": False,
+            "exit_reason": None,
+        }
+
+        def invoke(command: str):
+            output = io.StringIO()
+            with (
+                patch.object(settings, "harness_watcher_active", True),
+                patch.object(runner, "load_config", return_value=self.config),
+                patch.object(runner, "_read", return_value=state),
+                patch.object(runner, "_identity", return_value=None),
+                patch.object(runner.time, "sleep"),
+                patch("sys.stdout", output),
+            ):
+                code = runner.main([command])
+            return code, json.loads(output.getvalue())
+
+        status_code, status = invoke("status")
+        self.assertEqual(0, status_code)
+        self.assertIsNone(status["running"])
+        self.assertEqual(runner.IDENTITY_LIVE_UNPROVABLE, status["identity_state"])
+
+        stop_code, stopped = invoke("stop")
+        self.assertEqual(1, stop_code)
+        self.assertFalse(stopped["stop_requested"])
+        self.assertEqual("live-service-identity-unproven", stopped["reason"])
+
+        output = io.StringIO()
+        with (
+            patch.object(settings, "harness_watcher_active", True),
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(runner, "_identity", return_value=None),
+            patch.object(runner.time, "sleep"),
+            patch.object(runner, "_atomic") as write_service,
+            patch.object(runner.subprocess, "Popen") as spawn,
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(1, runner.main(["start"]))
+        self.assertEqual(
+            "live-service-identity-unproven",
+            json.loads(output.getvalue())["result"],
+        )
+        write_service.assert_not_called()
+        spawn.assert_not_called()
