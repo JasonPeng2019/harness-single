@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from orchestrator_harness import root_hook_wrapper as wrapper
@@ -85,6 +86,11 @@ class RootHookWrapperTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"HARNESS_EVENT_ID": "event-1"}),
             patch.object(wrapper, "dispatch", return_value={"decision": "ALLOW"}),
+            patch.object(
+                wrapper,
+                "load_config",
+                return_value=SimpleNamespace(profile="managed"),
+            ),
             patch.object(wrapper, "append_delivery_history") as delivery,
         ):
             self.assertEqual({}, wrapper.run("codex", "post-tool-use", self.binding))
@@ -100,7 +106,6 @@ class RootHookWrapperTests(unittest.TestCase):
 
 class RootProviderPayloadTests(unittest.TestCase):
     def test_restored_codex_root_hooks_delegate_to_worker_binding(self) -> None:
-        """A Git-restored tracked hook must remain usable inside a worker lane."""
         source_hooks = (
             REPOSITORY_ROOT / "adapters" / "codex" / "root" / ".codex" / "hooks"
         )
@@ -125,7 +130,6 @@ class RootProviderPayloadTests(unittest.TestCase):
                 "import json\nprint(json.dumps({'decision': 'ALLOW'}))\n",
                 encoding="utf-8",
             )
-
             for filename in (
                 "orchestrator_harness_post_tool_use.py",
                 "orchestrator_harness_stop.py",

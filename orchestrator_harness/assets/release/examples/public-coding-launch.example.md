@@ -9,9 +9,7 @@ python -m orchestrator_harness.operator_launch harness setup
 python -m orchestrator_harness.operator_launch lane bootstrap `
   --lane-id coding-lane `
   --provider codex `
-  --model <configured-model> `
-  --provider-option reasoning_effort=<configured-effort> `
-  --provider-option service_tier=<configured-tier> `
+  --model gpt-5.6-terra `
   --task-card <task-card.json>
 python -m orchestrator_harness.operator_launch lane launch --lane-id coding-lane
 ```

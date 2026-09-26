@@ -32,7 +32,7 @@ from harness_watcher_implementation.evaluator import (
     FakeEvaluator,
     OWNERSHIP_PHASE_RULES,
     STALE_STATUS_QUARANTINE_RULE,
-    CommandEvaluator,
+    TerraHighEvaluator,
     validate_verdict,
 )
 from harness_watcher_implementation.poller import initialize_service_cursor, poll
@@ -377,7 +377,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertIn('"event_type":"EVALUATOR_SKIPPED"', events)
         self.assertIn('"evaluator_enabled":false', events)
 
-    def test_evaluator_enabled_requires_explicit_command_and_identity(
+    def test_evaluator_enabled_config_defaults_false_and_rejects_non_boolean(
         self,
     ) -> None:
         config = self.root / "watcher.json"
@@ -392,33 +392,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             json.dumps({"runtime_root": "runtime", "evaluator_enabled": True}),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValueError, "evaluator_command is required"):
-            load_config(config)
-        config.write_text(
-            json.dumps(
-                {
-                    "runtime_root": "runtime",
-                    "evaluator_enabled": True,
-                    "evaluator_command": ["configured-provider", "--configured"],
-                    "evaluator_identity": {
-                        "provider": "configured-provider",
-                        "model": "configured-model",
-                        "effort": "configured-effort",
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        loaded = load_config(config)
-        self.assertTrue(loaded.evaluator_enabled)
-        self.assertEqual(
-            {
-                "provider": "configured-provider",
-                "model": "configured-model",
-                "effort": "configured-effort",
-            },
-            dict(loaded.evaluator_identity),
-        )
+        self.assertTrue(load_config(config).evaluator_enabled)
         config.write_text(
             json.dumps({"runtime_root": "runtime", "evaluator_enabled": "true"}),
             encoding="utf-8",
@@ -722,7 +696,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                 runner, "_identity", return_value={"pid": 12, "created_utc": "watcher"}
             ),
             patch.object(runner, "initialize_service_cursor"),
-            patch.object(runner, "CommandEvaluator", return_value=evaluator),
+            patch.object(runner, "TerraHighEvaluator", return_value=evaluator),
             patch.object(runner, "_sleep_until", side_effect=sleep_until),
         ):
             self.assertEqual(0, runner.main(["serve", "--startup-token", "token"]))
@@ -1088,22 +1062,51 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             cfg.observed_log_roots[0],
         )
 
-    def test_default_config_has_no_evaluator_launch_preferences(self) -> None:
+    def test_default_config_requires_a_real_terra_evaluator_command(self) -> None:
+        """Production defaults cannot silently replace the mandated Terra-high reviewer with a fake."""
         cfg = load_config()
-        self.assertFalse(cfg.evaluator_enabled)
-        self.assertEqual((), cfg.evaluator_command)
-        self.assertEqual((), cfg.evaluator_identity)
+        self.assertTrue(
+            cfg.evaluator_command,
+            "missing evaluator command silently produces a FakeEvaluator healthy verdict",
+        )
+        rendered = " ".join(cfg.evaluator_command)
+        self.assertIn("codex", rendered)
+        self.assertIn("gpt-5.6-terra", rendered)
+        self.assertIn("high", rendered)
+        help_text = subprocess.run(
+            ["codex", "exec", "--help"], text=True, capture_output=True, check=True
+        ).stdout
+        unsupported = [
+            part
+            for part in cfg.evaluator_command
+            if part.startswith("--") and part not in help_text
+        ]
+        self.assertEqual(
+            [], unsupported, f"default codex flags are unsupported: {unsupported}"
+        )
 
-    def test_example_config_does_not_choose_an_evaluator(self) -> None:
+    def test_example_config_has_a_usable_real_evaluator_command(self) -> None:
         cfg = load_config("harness_watcher_implementation/config.example.json")
-        self.assertFalse(cfg.evaluator_enabled)
-        self.assertEqual((), cfg.evaluator_command)
-        self.assertEqual((), cfg.evaluator_identity)
+        self.assertTrue(
+            cfg.evaluator_command,
+            "config.example.json must not override the real default with []",
+        )
         self.assertTrue(
             {"orchestrator", "harness", "subagent"}.issubset(
                 {item.role for item in cfg.observed_sources}
             ),
             "production example must declare manager, harness, and lane sources so a real epoch can populate all four trees",
+        )
+        help_text = subprocess.run(
+            ["codex", "exec", "--help"], text=True, capture_output=True, check=True
+        ).stdout
+        unsupported = [
+            part
+            for part in cfg.evaluator_command
+            if part.startswith("--") and part not in help_text
+        ]
+        self.assertEqual(
+            [], unsupported, f"configured codex flags are unsupported: {unsupported}"
         )
 
     def test_alert_is_deduplicated_then_resolved_in_strict_order(self) -> None:
@@ -1527,7 +1530,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             poll(self.config, evaluator)
         self.assertIn("STALE_STATUS", evaluator.packets[-1]["observations"][-1]["text"])
 
-    def test_configured_evaluator_prompt_and_review_packet_bind_the_ownership_phase_rules(
+    def test_terra_prompt_and_review_packet_bind_the_ownership_phase_rules(
         self,
     ) -> None:
         class CapturingEvaluator:
@@ -1549,7 +1552,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             capture.packet["constraints"]["stale_status_quarantine_rule"],
         )
         completed = subprocess.CompletedProcess(
-            ("configured-evaluator",),
+            ("terra",),
             0,
             json.dumps(
                 {
@@ -1567,7 +1570,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
+            TerraHighEvaluator(("terra",)).evaluate(capture.packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(
             capture.packet["constraints"]["ownership_phase_rules"],
@@ -1577,7 +1580,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             self.assertIn(rule["rule"], prompt["instructions"])
         self.assertIn(STALE_STATUS_QUARANTINE_RULE["rule"], prompt["instructions"])
 
-    def test_recorded_pre_request_ambiguity_and_request_awaiting_loss_remain_distinct_for_evaluator(
+    def test_recorded_pre_request_ambiguity_and_request_awaiting_loss_remain_distinct_for_terra(
         self,
     ) -> None:
         class CapturingEvaluator:
@@ -1630,7 +1633,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertIn("setup_preparation", observed)
         self.assertIn("awaiting_permission_relay", observed)
         completed = subprocess.CompletedProcess(
-            ("configured-evaluator",),
+            ("terra",),
             0,
             json.dumps(
                 {
@@ -1648,7 +1651,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
+            TerraHighEvaluator(("terra",)).evaluate(capture.packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertIn("setup_preparation", prompt["packet"]["observations"][0]["text"])
         self.assertIn(
@@ -1669,3 +1672,89 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertTrue(_same(live))
         stale = {**live, "created_utc": str(live["created_utc"]) + "-different"}
         self.assertFalse(_same(stale))
+
+    def test_status_remains_running_after_stop_request_until_exact_pid_is_gone(
+        self,
+    ) -> None:
+        runner = importlib.import_module("harness_watcher_implementation.__main__")
+        service = self.config.runtime_root / "watcher" / "service.json"
+        state = {
+            "watcher": {"pid": 41, "created_utc": "watcher"},
+            "owner": {"pid": 40, "created_utc": "owner"},
+            "stop_requested": True,
+            "exit_reason": None,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(runner, "_identity_state", return_value=runner.IDENTITY_MATCH),
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(0, runner.main(["status"]))
+        self.assertTrue(json.loads(output.getvalue())["running"])
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(
+                runner,
+                "_identity_state",
+                return_value=runner.IDENTITY_GONE_OR_REUSED,
+            ),
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(0, runner.main(["status"]))
+        self.assertFalse(json.loads(output.getvalue())["running"])
+
+    def test_live_pid_with_unreadable_identity_is_unknown_and_never_replaced(self) -> None:
+        runner = importlib.import_module("harness_watcher_implementation.__main__")
+        state = {
+            "watcher": {"pid": os.getpid(), "created_utc": "temporarily-unreadable"},
+            "owner": {"pid": os.getpid(), "created_utc": "owner"},
+            "stop_requested": False,
+            "exit_reason": None,
+        }
+
+        def invoke(command: str):
+            output = io.StringIO()
+            with (
+                patch.object(settings, "harness_watcher_active", True),
+                patch.object(runner, "load_config", return_value=self.config),
+                patch.object(runner, "_read", return_value=state),
+                patch.object(runner, "_identity", return_value=None),
+                patch.object(runner.time, "sleep"),
+                patch("sys.stdout", output),
+            ):
+                code = runner.main([command])
+            return code, json.loads(output.getvalue())
+
+        status_code, status = invoke("status")
+        self.assertEqual(0, status_code)
+        self.assertIsNone(status["running"])
+        self.assertEqual(runner.IDENTITY_LIVE_UNPROVABLE, status["identity_state"])
+
+        stop_code, stopped = invoke("stop")
+        self.assertEqual(1, stop_code)
+        self.assertFalse(stopped["stop_requested"])
+        self.assertEqual("live-service-identity-unproven", stopped["reason"])
+
+        output = io.StringIO()
+        with (
+            patch.object(settings, "harness_watcher_active", True),
+            patch.object(runner, "load_config", return_value=self.config),
+            patch.object(runner, "_read", return_value=state),
+            patch.object(runner, "_identity", return_value=None),
+            patch.object(runner.time, "sleep"),
+            patch.object(runner, "_atomic") as write_service,
+            patch.object(runner.subprocess, "Popen") as spawn,
+            patch("sys.stdout", output),
+        ):
+            self.assertEqual(1, runner.main(["start"]))
+        self.assertEqual(
+            "live-service-identity-unproven",
+            json.loads(output.getvalue())["result"],
+        )
+        write_service.assert_not_called()
+        spawn.assert_not_called()

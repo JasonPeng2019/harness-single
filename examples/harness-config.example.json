@@ -1,0 +1,4 @@
+{
+  "root_workspace": "REPLACE_WITH_ABSOLUTE_PATH_TO_TARGET_REPOSITORY",
+  "managed_coordination": "enabled"
+}

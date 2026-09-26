@@ -34,3 +34,4 @@ def validate_task_card(record: dict[str, Any], path: Any) -> None:
         raise ValueError(
             f"task card {TASK_CARD_REASON_FIELD} must be a non-empty string"
         )
+

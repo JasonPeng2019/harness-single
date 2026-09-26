@@ -27,12 +27,16 @@ REQUIRED_PACKAGES = (
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.release",
+    "orchestrator_harness.assets.release.examples",
+    "orchestrator_harness.assets.release.templates",
     "orchestrator_harness.assets.rules",
     "orchestrator_harness.provider_adapters",
     "orchestrator_harness.provider_adapters.claude-code",
     "orchestrator_harness.provider_adapters.codex",
     "orchestrator_harness.provider_adapters.qwen-code",
     "harness_common",
+    "memory_harness",
 )
 
 # Package-owned assets that must be declared as package data.
@@ -139,6 +143,10 @@ class PackageMetadataStaticTests(unittest.TestCase):
             "../harness_common",
             pyproject["tool"]["setuptools"]["package-dir"]["harness_common"],
         )
+        self.assertEqual(
+            "../memory_harness",
+            pyproject["tool"]["setuptools"]["package-dir"]["memory_harness"],
+        )
 
     def test_package_data_covers_registered_bindings_and_required_assets(
         self,
@@ -199,6 +207,11 @@ class PackageWheelBuildTests(unittest.TestCase):
                 ignore=ignored,
             )
             shutil.copytree(
+                REPOSITORY_ROOT / "memory_harness",
+                source / "memory_harness",
+                ignore=ignored,
+            )
+            shutil.copytree(
                 REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
             )
             previous = os.getcwd()
@@ -233,16 +246,13 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "orchestrator_harness/assets/release/templates/COMPLETION.md",
                 "harness_common/__init__.py",
                 "harness_common/process_identity.py",
+                "memory_harness/__init__.py",
+                "memory_harness/contracts.py",
+                "memory_harness/py.typed",
             )
             for entry in required_entries:
                 self.assertIn(entry, names, entry)
             self.assertTrue(any(".data/data/examples/" in name for name in names))
-            self.assertTrue(
-                any(
-                    name.endswith(".data/data/examples/project-task-card.example.json")
-                    for name in names
-                )
-            )
             self.assertTrue(
                 any(".data/data/release_evidence_templates/" in name for name in names)
             )

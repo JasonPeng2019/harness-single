@@ -1,9 +1,10 @@
 ﻿"""Configuration: harness-config/v1, resource-manifest/v1, and config identity.
 
-The configuration is a closed two-key set in ``<harness-root>/harness-config.json``
-plus the ROOT-authored resource manifest.  ROOT never passes paths, feature
-flags, or a profile again on any later command; the stored config selects
-everything.
+Local configuration is a paired set beneath ``<harness-root>/local-config``.
+The old same-root pair remains readable for compatibility, but discovery never
+walks past the product root in search of configuration. ROOT never passes paths,
+feature flags, or a profile again on any later command; the stored config
+selects everything.
 """
 
 from __future__ import annotations
@@ -20,6 +21,9 @@ from .core import read_json, sha256_hex
 CONFIG_SCHEMA = "harness-config/v1"  # logical schema name; never a literal field
 MANIFEST_SCHEMA = "resource-manifest/v1"  # literal schema field in the manifest
 RUNTIME_DIR_NAME = ".harness-runtime"
+LOCAL_CONFIG_DIR_NAME = "local-config"
+CONFIG_FILE_NAME = "harness-config.json"
+MANIFEST_FILE_NAME = "resource-manifest.json"
 PROFILE_MANAGED = "managed"
 PROFILE_PLAIN = "plain"
 
@@ -96,18 +100,69 @@ class ResourceManifest:
         return resource_id in self.resource_ids()
 
 
+def _is_product_root(path: Path) -> bool:
+    """Return whether ``path`` is the canonical source product root."""
+
+    return (
+        (path / "orchestrator_harness" / "__init__.py").is_file()
+        and (path / "adapters").is_dir()
+        and (path / "super-cache").is_dir()
+    )
+
+
 def find_harness_root(start: str | os.PathLike[str] | None = None) -> Path:
-    """Walk upward from ``start`` (default: the current directory) to the
-    directory that holds ``harness-config.json``."""
+    """Find the nearest Harness v2 product root.
+
+    Product markers, rather than a configuration filename, establish the
+    root. This is deliberately fail-closed: a checkout with no local config is
+    still the harness root and cannot accidentally capture a stale config from
+    a parent directory.
+    """
     current = Path(start or os.getcwd()).absolute()
     if not current.is_dir():
         current = current.parent
     for candidate in (current, *current.parents):
-        if (candidate / "harness-config.json").is_file():
+        if _is_product_root(candidate):
             return candidate
     raise ConfigError(
-        f"harness root not found: no harness-config.json at or above {current}"
+        "harness product root not found: run the command from the "
+        f"harness-single checkout (searched from {current})"
     )
+
+
+def _configuration_directory(harness_root: Path) -> Path:
+    """Select one paired configuration surface for ``harness_root``.
+
+    ``local-config`` is authoritative whenever either member of the local pair
+    exists. The same-root pair is a compatibility fallback only; files from
+    different directories are never mixed.
+    """
+
+    local = harness_root / LOCAL_CONFIG_DIR_NAME
+    if local.exists() or (local / CONFIG_FILE_NAME).is_symlink() or (
+        local / MANIFEST_FILE_NAME
+    ).is_symlink() or (local / CONFIG_FILE_NAME).exists() or (
+        local / MANIFEST_FILE_NAME
+    ).exists():
+        return local
+    if (harness_root / CONFIG_FILE_NAME).exists() or (
+        harness_root / MANIFEST_FILE_NAME
+    ).exists():
+        return harness_root
+    return local
+
+
+def _missing_local_config_message(path: Path, *, manifest: bool = False) -> str:
+    example_name = (
+        "resource-manifest.example.json" if manifest else "harness-config.example.json"
+    )
+    noun = "resource manifest" if manifest else "harness config"
+    instruction = f"copy examples/{example_name} to {path}"
+    if not manifest:
+        instruction += (
+            " and replace root_workspace with an absolute target repository path"
+        )
+    return f"local {noun} missing: {path}; {instruction}"
 
 
 def _number(raw: dict[str, Any], key: str, default: float, *, minimum: float) -> float:
@@ -260,17 +315,18 @@ def _load_legacy_config(
 
 
 def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
-    """Read and validate the stored harness-config.json.
+    """Read and validate the stored ``harness-config.json``.
 
-    The stored record is the closed two-key ``harness-config/v1`` shape:
-    required absolute ``root_workspace`` and optional ``managed_coordination``
-    (``enabled`` or ``disabled``, default ``enabled``).  The record carries no
-    literal ``schema`` field and no other keys are legal.
+    The preferred path is ``local-config/harness-config.json``. The stored
+    record is the closed two-key ``harness-config/v1`` shape: required absolute
+    ``root_workspace`` and optional ``managed_coordination`` (``enabled`` or
+    ``disabled``, default ``enabled``). The record carries no literal ``schema``
+    field and no other keys are legal.
     """
     root = Path(harness_root).absolute()
-    path = root / "harness-config.json"
+    path = _configuration_directory(root) / CONFIG_FILE_NAME
     if not path.is_file():
-        raise ConfigError(f"harness config missing: {path}")
+        raise ConfigError(_missing_local_config_message(path))
     try:
         record = read_json(path)
     except (OSError, ValueError) as exc:
@@ -300,6 +356,7 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         harness_root=root,
         root_workspace=workspace,
         managed_coordination=managed,
+        config_path=path,
     )
 
 
@@ -310,8 +367,8 @@ def load_config(
 ) -> HarnessConfig:
     """Load the harness configuration in either supported form.
 
-    `load_config(<harness-root>)` reads the stored `harness-config.json`
-    (harness-config/v1).  `load_config(<config-file>, harness_root=<root>)`
+    `load_config(<harness-root>)` reads the stored local configuration
+    (harness-config/v1). `load_config(<config-file>, harness_root=<root>)`
     (or a bare legacy config file path) reads a legacy `config.json` and
     derives the legacy settings.
     """
@@ -323,18 +380,19 @@ def load_config(
 
 
 def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceManifest:
-    """Read and validate ``<harness-root>/resource-manifest.json``.
+    """Read and validate the paired ``resource-manifest.json``.
 
-    The stored record is the closed ``resource-manifest/v1`` shape: a literal
-    ``schema`` field equal to ``resource-manifest/v1`` plus a single
-    ``resources`` list.  Every nonempty entry is a closed object with a
+    The preferred path is ``local-config/resource-manifest.json``. The stored
+    record is the closed ``resource-manifest/v1`` shape: a literal ``schema``
+    field equal to ``resource-manifest/v1`` plus a single ``resources`` list.
+    Every nonempty entry is a closed object with a
     nonempty literal ``id`` and ``exclusive: true``; duplicate IDs and unknown
     fields are invalid.
     """
     root = Path(harness_root).absolute()
-    path = root / "resource-manifest.json"
+    path = _configuration_directory(root) / MANIFEST_FILE_NAME
     if not path.is_file():
-        raise ConfigError(f"resource manifest missing: {path}")
+        raise ConfigError(_missing_local_config_message(path, manifest=True))
     try:
         record = read_json(path)
     except (OSError, ValueError) as exc:

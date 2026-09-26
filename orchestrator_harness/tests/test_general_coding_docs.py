@@ -54,10 +54,6 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
         )
         self.assertEqual("controller-invocation/v1", invocation["schema"])
         self.assertEqual("codex", invocation["provider"]["id"])
-        self.assertEqual(
-            {"reasoning_effort", "service_tier"},
-            set(invocation["provider"]["launch_config"]),
-        )
         self.assertIn("exclusive_resources", invocation)
 
     def test_v2_operator_contract_is_explicit_and_scoped(self) -> None:
@@ -72,6 +68,21 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
         for document in PRIMARY_DOCS:
             self.assertNotIn(
                 "MCP-Trial", document.read_text(encoding="utf-8"), document
+            )
+
+    def test_product_demonstration_is_explicitly_macos_only(self) -> None:
+        command = (
+            "python -m unittest "
+            "orchestrator_harness.tests.test_macos_product_smoke -v"
+        )
+        for document in PRIMARY_DOCS:
+            text = document.read_text(encoding="utf-8")
+            normalized = " ".join(text.split())
+            self.assertIn("macOS product demonstration", normalized, document)
+            self.assertIn(command, normalized, document)
+            self.assertIn("skips on every non-macOS host", normalized, document)
+            self.assertNotIn(
+                "orchestrator_harness.tests.test_product_smoke", text, document
             )
 
 

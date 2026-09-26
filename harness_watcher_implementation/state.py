@@ -41,10 +41,7 @@ def _save(root: Path, value: dict[str, Any]) -> None:
 
 
 def save_alert(
-    root: Path,
-    verdict: Any,
-    packet: dict[str, Any],
-    evaluator_identity: dict[str, str] | None = None,
+    root: Path, verdict: Any, packet: dict[str, Any]
 ) -> dict[str, Any] | None:
     if not verdict.defect:
         return None
@@ -74,7 +71,8 @@ def save_alert(
         "implicated": list(verdict.implicated),
         "evidence": list(verdict.evidence),
         "packet_id": packet["packet_id"],
-        "evaluator_identity": dict(evaluator_identity or {}),
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
         "acknowledged": False,
         "recovery_state": None,
         "recovery_history": [],

@@ -328,6 +328,7 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
             "task_card_hash": "card-hash",
             "result_id": "result-1",
             "result_hash": "result-hash",
+            "invocation_hash": "invocation-hash",
             "commit": "commit-1",
             "reviewed_at": "2026-09-02T00:00:00Z",
         }
@@ -343,6 +344,7 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
             "task_card_hash": "card-hash",
             "result_id": "result-1",
             "result_hash": "result-hash",
+            "invocation_hash": "invocation-hash",
             "commit": "commit-1",
             "decided_at": "2026-09-02T00:00:00Z",
         }

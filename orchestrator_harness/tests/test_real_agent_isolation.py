@@ -90,7 +90,12 @@ class RealAgentIsolationTests(unittest.TestCase):
     def test_connect_proxy_denies_nonallowlisted_destination(self) -> None:
         with TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit.jsonl"
-            proxy = AllowlistProxy("127.0.0.1", {("allowed.invalid", 443)}, audit)
+            try:
+                proxy = AllowlistProxy(
+                    "127.0.0.1", {("allowed.invalid", 443)}, audit
+                )
+            except PermissionError:
+                self.skipTest("the test environment does not permit loopback sockets")
             proxy.start()
             try:
                 with socket.create_connection(
@@ -107,7 +112,11 @@ class RealAgentIsolationTests(unittest.TestCase):
 
     def test_connect_proxy_relays_exact_allowlisted_destination(self) -> None:
         upstream = socket.socket()
-        upstream.bind(("127.0.0.1", 0))
+        try:
+            upstream.bind(("127.0.0.1", 0))
+        except PermissionError:
+            upstream.close()
+            self.skipTest("the test environment does not permit loopback sockets")
         upstream.listen(1)
         upstream_port = upstream.getsockname()[1]
 

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from orchestrator_harness import launch, processes
+from orchestrator_harness.core import content_hash
 
 
 _CONTROLLER_EVENTS_SCRIPT = r"""
@@ -50,7 +51,14 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             / "launcher_binding.py"
         )
         binding.parent.mkdir(parents=True)
-        binding.write_text("# binding\n", encoding="utf-8")
+        binding.write_bytes(
+            (
+                Path(launch.__file__).resolve().parent
+                / "provider_adapters"
+                / "codex"
+                / "launcher_binding.py"
+            ).read_bytes()
+        )
         self.lane = {
             "schema": "lane/v1",
             "lane_id": "lane-1",
@@ -60,6 +68,7 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             "worktree_path": str(self.worktree),
             "controller_status_path": str(workspace / "controller.status.json"),
             "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "git": {"fixture": "cleanup-exit-race", "bootstrap_tip": "a" * 40},
         }
         self.invocation = {
             "schema": "controller-invocation/v1",
@@ -67,10 +76,17 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             "run_id": "run-1",
             "provider": {
                 "id": "codex",
-                "model": "configured-model",
-                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+                "model": "model-1",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
             },
+            "git": self.lane["git"],
         }
+        self.invocation["content_hash"] = content_hash(self.invocation)
+        self.lane["provider"] = self.invocation["provider"]
+        self.lane["invocation_hash"] = self.invocation["content_hash"]
         self.terminal_status = {
             "schema": "controller-status/v1",
             "lane_id": "lane-1",
@@ -156,11 +172,6 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             ),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
-                launch,
-                "_validate_provider_launch_config",
-                return_value=self.invocation["provider"]["launch_config"],
-            ),
-            patch.object(
                 launch.processes, "spawn_detached", return_value=child
             ),
             patch.object(launch, "update_lane", side_effect=update),
@@ -207,11 +218,6 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             ),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
-                launch,
-                "_validate_provider_launch_config",
-                return_value=self.invocation["provider"]["launch_config"],
-            ),
-            patch.object(
                 launch.processes, "spawn_detached", return_value=child
             ),
             patch.object(launch, "update_lane", side_effect=update),
@@ -234,6 +240,25 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             updates[-1]["process"],
             "a live or unprovable controller identity must never be cleared",
         )
+
+    def test_live_pid_with_unreadable_identity_is_cleanup_unproven(self) -> None:
+        child, identity = self._spawn_controller()
+        with patch.object(processes, "process_identity", return_value=None):
+            self.assertEqual(
+                processes.IDENTITY_LIVE_UNPROVABLE,
+                processes.exact_identity_state(
+                    identity["pid"], identity["creation_time"]
+                ),
+            )
+            self.assertFalse(
+                launch._wait_for_pid_exit(
+                    identity["pid"], identity["creation_time"], 0.05
+                )
+            )
+        processes.terminate_process(
+            identity["pid"], identity["creation_time"], force=True
+        )
+        child.wait(timeout=5)
 
 
 if __name__ == "__main__":

@@ -5,23 +5,35 @@ description = "Durable event observation and lane control for parallel coding wo
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+everos = ["everos==1.3.1; python_version >= '3.12'"]
+atlas = ["langchain-mongodb==0.12.0"]
+memory = [
+    "everos==1.3.1; python_version >= '3.12'",
+    "langchain-mongodb==0.12.0",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
-package-dir = { orchestrator_harness = ".", harness_common = "../harness_common" }
+package-dir = { orchestrator_harness = ".", harness_common = "../harness_common", memory_harness = "../memory_harness" }
 packages = [
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.release",
+    "orchestrator_harness.assets.release.examples",
+    "orchestrator_harness.assets.release.templates",
     "orchestrator_harness.assets.rules",
     "orchestrator_harness.provider_adapters",
     "orchestrator_harness.provider_adapters.claude-code",
     "orchestrator_harness.provider_adapters.codex",
     "orchestrator_harness.provider_adapters.qwen-code",
     "harness_common",
+    "memory_harness",
 ]
 
 [tool.setuptools.package-data]
@@ -38,6 +50,7 @@ orchestrator_harness = [
     "install_wsl_codex.ps1",
     "provider_adapters/*/launcher_binding.py",
 ]
+memory_harness = ["py.typed", "README.md"]
 
 [tool.setuptools.data-files]
 "examples" = [
