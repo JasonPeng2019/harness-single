@@ -38,7 +38,12 @@ depend on it. A new task with no stored history receives an explicit “no simil
 experience” message. A backend failure is recorded separately from an empty
 search; bootstrap stops if both backends are unavailable.
 
-The launcher requires substantive workers and gives each worker memory
-selected for its task card. ROOT handles planning, integration, review, and
-final checks. The important log records recall queries, results, selection, and final
-worker prompts. Credentials are removed from worker and controller environments.
+The launcher requires substantive worker delegation (including an implementing
+worker for implementation tasks) and favors two early workers when ROOT can
+assign independent, substantial work with disjoint source custody. If one
+worker is enough, ROOT records why another would add coordination without
+useful parallel work. More workers need distinct work that justifies them.
+Each worker receives memory selected for its task card. ROOT handles planning,
+integration, review, and final checks. The important log records recall
+queries, results, selection, and final worker prompts. Credentials are removed
+from worker and controller environments.

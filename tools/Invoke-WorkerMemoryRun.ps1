@@ -131,15 +131,20 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $effectivePrompt) -Force 
 @"
 # Required worker delegation
 
-Delegate the task's main work to substantive workers through the
-native harness; do not complete the task alone. For an implementation task,
-at least one worker must do substantive implementation. A validation-only lane
-does not satisfy this requirement. ROOT owns
-planning, integration, review, and final checks. Give each worker a
-specific task card. The harness automatically searches shared memory using
-that task and gives the recalled experiences only to that worker. Do not read
-or request recalled worker content for ROOT planning. Do not disable worker
-memory or bypass native worker lanes.
+Before substantial ROOT implementation, split the task into bounded worker
+assignments. Launch two implementing workers early when there are two
+independent, substantial assignments with disjoint source custody. Otherwise
+launch one and briefly record why a second would add more coordination than
+useful parallel work. Add further workers only for distinct work that justifies
+the coordination. At least one worker must do substantive implementation for
+an implementation task; a validation-only lane does not count. Confirm actual
+worker launch and reviewable output, not just lane creation. ROOT owns planning,
+integration, review, and final checks. Give each worker a specific task card.
+The harness automatically searches shared memory using that task and gives the
+recalled experiences only to that worker. Do not read or request recalled worker
+content for ROOT planning. Do not disable worker memory or bypass native worker
+lanes. This delegation requirement supersedes any optional coding-worker
+wording in the supplied prompt or AGENTS.md.
 
 $prompt
 "@ | Set-Content -LiteralPath $effectivePrompt -Encoding UTF8
