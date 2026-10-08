@@ -138,13 +138,22 @@ launch one and briefly record why a second would add more coordination than
 useful parallel work. Add further workers only for distinct work that justifies
 the coordination. At least one worker must do substantive implementation for
 an implementation task; a validation-only lane does not count. Confirm actual
-worker launch and reviewable output, not just lane creation. ROOT owns planning,
-integration, review, and final checks. Give each worker a specific task card.
-The harness automatically searches shared memory using that task and gives the
-recalled experiences only to that worker. Do not read or request recalled worker
-content for ROOT planning. Do not disable worker memory or bypass native worker
-lanes. This delegation requirement supersedes any optional coding-worker
-wording in the supplied prompt or AGENTS.md.
+worker launch and reviewable output, not just lane creation. After integration,
+launch a separate validator from the exact integrated candidate revision. Give
+it task-specific build/test commands. The validator runs the checks it can
+access and returns a PASS/FAIL finding backed by evidence. Use additional
+validators when independent risk areas or a disputed finding justify them,
+not merely to increase the count. If a validator cannot run a host-only
+command, ROOT relays the exact command and output for independent assessment.
+A failed or missing validation blocks a
+completion claim until repaired and revalidated. ROOT plans, assigns work,
+integrates, and records the harness's formal acceptance with the validator's
+evidence; ROOT's own impression is not validation. Give each worker a specific
+task card. The harness automatically searches shared memory using that task and
+gives the recalled experiences only to that worker. Do not read or request
+recalled worker content for ROOT planning. Do not disable worker memory or
+bypass native worker lanes. This delegation requirement supersedes any optional
+coding-worker wording in the supplied prompt or AGENTS.md.
 
 $prompt
 "@ | Set-Content -LiteralPath $effectivePrompt -Encoding UTF8

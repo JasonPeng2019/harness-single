@@ -44,6 +44,12 @@ assign independent, substantial work with disjoint source custody. If one
 worker is enough, ROOT records why another would add coordination without
 useful parallel work. More workers need distinct work that justifies them.
 Each worker receives memory selected for its task card. ROOT handles planning,
-integration, review, and final checks. The important log records recall
-queries, results, selection, and final worker prompts. Credentials are removed
-from worker and controller environments.
+integration, and the formal harness acceptance record. A separate validator
+builds and tests the integrated candidate where it has tool access, then
+supplies an evidence-based PASS/FAIL finding. Additional validators cover
+independent risks or resolve a disputed finding.
+Where only ROOT can execute a host-only test command, it relays the exact
+command and output for the validator's assessment. ROOT cannot claim task
+completion on its own judgment or on failed/missing validation. The important
+log records recall queries, results, selection, and final worker prompts.
+Credentials are removed from worker and controller environments.
