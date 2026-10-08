@@ -130,53 +130,31 @@ Remove-Item Env:MEMORY_HARNESS_ACTOR -ErrorAction SilentlyContinue
 $effectivePrompt = Join-Path $workspacePath '.agent-workspace\ROOT_WORKER_MEMORY_PROMPT.md'
 New-Item -ItemType Directory -Path (Split-Path -Parent $effectivePrompt) -Force | Out-Null
 @"
-# Required native worker delegation
+# Required worker delegation
 
-After harness setup, launch a native planner lane named planner-<id> before
-ROOT writes a substantive implementation plan or code. Give the planner the
-full task and ask it for architecture, dependencies, interfaces, bounded
-implementation assignments, and test risks. Ask it to find independent,
-substantial slices that separate implementers can own. It does not implement. Verify an
-actual provider_started event and a valid planner result, then record an
-ACCEPTED planner review before launching implementation.
-ROOT may do brief triage and assign the planner, but must not substitute its own
-plan for this lane.
-
-Next launch at least one distinct native implementer lane named
-implementer-<id>, using the reviewed planner output in its task card. The
-implementer must do substantive task code, not merely review or validation.
-Use as many implementers as the task justifies: one per substantial,
-independent assignment with clear source custody and useful parallel progress.
-Three or more are welcome when the work supports them. Use one when splitting
-would add more coordination than useful progress; briefly record why. Do not
-invent assignments just to increase the worker count. Verify actual
-provider_started events and reviewable implementation results. Record an
-ACCEPTED review for each implementation lane before validation. ROOT
-coordinates and integrates; it must not do the substantive implementation itself.
-
-After integration, launch native reviewer(s) in distinct validator-<id> lanes.
-Give each a clear specialty and the exact integrated candidate revision. One
-reviewer may inspect code, design, and edge cases; another may write and run
-tests and builds. When both are substantial, prefer separate reviewers for
-them. Add security, performance, or integration reviewers when their separate
-work adds meaningful coverage; do not create extra lanes for duplicate or
-trivial reviews. Reviewer(s) run checks they can access and return evidence-
-backed PASS/FAIL findings. At least one reviewer runs task-specific build/test
-checks where it has access. If a host-only command is inaccessible to them,
-ROOT relays the exact command and output for independent assessment. If review
-or tests change the candidate, validate the final revision. Missing or failed
-validation blocks completion until repaired and revalidated. ROOT records a
-formal review for every reviewer result and accepts the task only with their
-evidence; ROOT's own impression is not validation.
-
-At least one planner, one implementer, and one reviewer/validator must be
-distinct provider launches with valid and ACCEPTED results, in that order.
-ROOT cannot count as any of them, and a created lane without a provider process
-does not count. Give each worker a specific task card. The harness recalls
-shared memory from that task and gives it only to that worker. ROOT must not
-read worker recall for its planning. Do
-not bypass native worker lanes. This requirement supersedes optional worker
-wording in the supplied prompt or AGENTS.md.
+Before substantial ROOT implementation, split the task into bounded worker
+assignments. Launch two implementing workers early when there are two
+independent, substantial assignments with disjoint source custody. Otherwise
+launch one and briefly record why a second would add more coordination than
+useful parallel work. Add further workers only for distinct work that justifies
+the coordination. At least one worker must do substantive implementation for
+an implementation task; a validation-only lane does not count. Confirm actual
+worker launch and reviewable output, not just lane creation. After integration,
+launch a separate validator from the exact integrated candidate revision. Give
+it task-specific build/test commands. The validator runs the checks it can
+access and returns a PASS/FAIL finding backed by evidence. Use additional
+validators when independent risk areas or a disputed finding justify them,
+not merely to increase the count. If a validator cannot run a host-only
+command, ROOT relays the exact command and output for independent assessment.
+A failed or missing validation blocks a
+completion claim until repaired and revalidated. ROOT plans, assigns work,
+integrates, and records the harness's formal acceptance with the validator's
+evidence; ROOT's own impression is not validation. Give each worker a specific
+task card. The harness automatically searches shared memory using that task and
+gives the recalled experiences only to that worker. Do not read or request
+recalled worker content for ROOT planning. Do not disable worker memory or
+bypass native worker lanes. This delegation requirement supersedes any optional
+coding-worker wording in the supplied prompt or AGENTS.md.
 
 $prompt
 "@ | Set-Content -LiteralPath $effectivePrompt -Encoding UTF8
