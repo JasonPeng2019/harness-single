@@ -121,6 +121,24 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
 - Hard-stop a stuck lane: `lane force-stop --lane-id lane-01`.
 - End the whole runtime: `harness shutdown`.
 
+## Follow the run
+
+```powershell
+.\tools\Watch-MonitorLog.ps1
+```
+
+The viewer follows `<runtime>\monitor\MONITOR_IMPORTANT.log`, which contains
+worker prompts, useful worker messages, queue admissions, lane outcomes, and
+failures. Routine scans and full provider events go to `MONITOR_DETAIL.log`.
+For the full trace, run:
+
+```powershell
+.\tools\Watch-DetailedMonitorLog.ps1 -RuntimeRoot <runtime> -Tail 100 -All
+```
+
+Use `-NoWait` to print once and `-Raw` for the JSONL records. Credential-shaped
+values are redacted in the views; task and prompt text remains visible.
+
 ## Notes
 
 - Run `scan --no-write` before launch for a read-only lane-status snapshot.

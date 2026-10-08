@@ -12,6 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from . import processes
+from .setup import COMPOSED_PAYLOADS
 from .bootstrap import (
     _write_invocation,
     _write_result_template,
@@ -42,6 +44,28 @@ RESUME_LANE_WRITE_FAILED = "RESUME_LANE_WRITE_FAILED"
 _RESUMABLE_LIFECYCLES = frozenset(
     {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
 )
+
+
+def _live_controller(lane: dict[str, Any]) -> bool:
+    """Check both the lane process and the controller's exact attestation."""
+    identities = [lane.get("process") or {}]
+    status_value = lane.get("controller_status_path")
+    status_path = Path(status_value) if isinstance(status_value, str) and status_value else None
+    if status_path is not None and status_path.is_file():
+        try:
+            status = read_json(status_path)
+            require_schema(status, "controller-status/v1", status_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "controller status is unreadable; resume cannot prove prior ownership"
+            ) from exc
+        if status.get("lane_id") == lane["lane_id"] and status.get("run_id") == lane["run_id"]:
+            identities.append(status.get("controller_identity") or {})
+    return any(
+        isinstance(identity, dict)
+        and processes.identity_matches(identity.get("pid"), identity.get("creation_time"))
+        for identity in identities
+    )
 
 
 def _consume_resume_signal(rt: Path, lane_id: str, prior_run_id: str) -> None:
@@ -135,7 +159,7 @@ def _rewrite_overlay_receipt(
         "applied_at": iso_utc(),
     }
     if managed:
-        receipt["provider_payload"] = f"adapter-payloads/{lane['provider']['id']}"
+        receipt["provider_payload"] = f"{COMPOSED_PAYLOADS.as_posix()}/{lane['provider']['id']}"
     atomic_write_json(worktree / ".agent-workspace" / "overlay-receipt.json", receipt)
 
 
@@ -197,12 +221,7 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "bootstrap a fresh lane",
             }
-        process = lane.get("process") or {}
-        from . import processes
-
-        if lifecycle == "running" and processes.identity_matches(
-            process.get("pid"), process.get("creation_time")
-        ):
+        if _live_controller(lane):
             return {
                 "ok": False,
                 "code": LANE_RUNNING,

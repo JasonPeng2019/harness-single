@@ -173,7 +173,7 @@ def _resolve_lane_managed(
             COMPLETION_REVIEW_EVENT_INVALID,
             f"event {event_id} is not a review event (type={event.get('type')})",
         )
-    if event.get("state") != "ACKNOWLEDGED":
+    if event.get("state") not in {"ACKNOWLEDGED", "COMPLETE"}:
         raise ReviewError(
             COMPLETION_REVIEW_NOT_ACKNOWLEDGED,
             f"event {event_id} is not ACKNOWLEDGED (state={event.get('state')})",
@@ -256,6 +256,42 @@ def _write_pair(
     return review, acceptance
 
 
+def _replay_pair(
+    folder: Path, lane: dict[str, Any], *, review_outcome: str,
+    review_summary: str, evidence: list[str], approval: str,
+    force_accept_reason: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify an already published pair before retrying manager close."""
+    review_path = folder / "COMPLETION_REVIEW.json"
+    acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+    if not review_path.is_file() or not acceptance_path.is_file():
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT,
+            "an incomplete review publication exists and was preserved",
+        )
+    try:
+        review = read_json(review_path)
+        acceptance = read_json(acceptance_path)
+        require_schema(review, COMPLETION_REVIEW_SCHEMA, review_path)
+        require_schema(acceptance, ACCEPTANCE_SCHEMA, acceptance_path)
+    except (OSError, ValueError) as exc:
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+    if not validate_acceptance_chain(
+        review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"]
+    ) or (
+        review.get("review_outcome") != review_outcome
+        or review.get("review_summary") != review_summary
+        or review.get("evidence") != evidence
+        or acceptance.get("approval") != approval
+        or acceptance.get("force_accept_reason") != force_accept_reason
+    ):
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT,
+            "existing review conflicts with this retry and was preserved",
+        )
+    return review, acceptance
+
+
 def run_completion_review(
     *,
     event_id: str | None,
@@ -311,22 +347,28 @@ def run_completion_review(
                 COMPLETION_REVIEW_EVENT_INVALID,
                 "select the lane with --event-id (managed) or --lane-id (plain)",
             )
-        if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
-            raise ReviewError(
-                COMPLETION_REVIEW_STALE_SOURCE,
-                f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
-            )
-        review, acceptance = _write_pair(
-            rt,
-            epoch_id,
-            lane,
-            review_outcome=review_outcome,
-            review_summary=review_summary,
-            evidence=evidence,
-            approval=approval,
-            force_accept_reason=force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None,
+        folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+        exact_reason = (
+            force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
         )
-        if event is not None:
+        if (folder / "COMPLETION_REVIEW.json").exists() or (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists():
+            review, acceptance = _replay_pair(
+                folder, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+            )
+        else:
+            if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
+                raise ReviewError(
+                    COMPLETION_REVIEW_STALE_SOURCE,
+                    f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
+                )
+            review, acceptance = _write_pair(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+            )
+        if event is not None and event.get("state") != "COMPLETE":
             try:
                 close_event(
                     rt,

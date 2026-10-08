@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from orchestrator_harness import bootstrap, setup
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 PROVIDERS = {
@@ -152,6 +154,53 @@ class RootPayloadTests(unittest.TestCase):
 
 
 class WorkerPayloadTests(unittest.TestCase):
+    def test_installed_composition_is_the_worker_overlay_for_each_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            plan = setup._plan_active_cache(REPOSITORY_ROOT)
+            setup._install_active_cache(REPOSITORY_ROOT, runtime, plan=plan, overwrite=False)
+            for provider_id, dotdir in PROVIDERS.items():
+                worktree = root / provider_id
+                worktree.mkdir()
+                instructions = worktree / "AGENTS.md"
+                instructions.write_bytes(b"checked-out product instructions\n")
+                qwen_settings: Path | None = None
+                qwen_settings_before: bytes | None = None
+                if provider_id == "qwen-code":
+                    qwen_settings = worktree / ".qwen" / "settings.json"
+                    qwen_settings.parent.mkdir(parents=True)
+                    config = json.loads(
+                        (REPOSITORY_ROOT / "adapters" / provider_id / "root" / ".qwen" / "settings.json").read_text(encoding="utf-8")
+                    )
+                    config["custom"] = {"product": True}
+                    qwen_settings.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+                    qwen_settings_before = qwen_settings.read_bytes()
+                installed = bootstrap._managed_payload(REPOSITORY_ROOT, runtime, provider_id)
+                self.assertEqual(
+                    runtime / "super-cache" / "composed-payloads" / provider_id,
+                    installed,
+                )
+                bootstrap._install_managed_material(
+                    REPOSITORY_ROOT, runtime, worktree,
+                    provider_id=provider_id, lane_id=f"lane-{provider_id}", run_id="run-1",
+                )
+                for name in HELPERS:
+                    self.assertEqual(
+                        (installed / ".agent-workspace" / name).read_bytes(),
+                        (worktree / ".agent-workspace" / name).read_bytes(),
+                    )
+                for name in WORKER_SKILLS:
+                    relative = Path(dotdir) / "skills" / name / "SKILL.md"
+                    self.assertEqual((installed / relative).read_bytes(), (worktree / relative).read_bytes())
+                self.assertEqual(b"checked-out product instructions\n", instructions.read_bytes())
+                if qwen_settings is not None:
+                    self.assertEqual(qwen_settings_before, qwen_settings.read_bytes())
+                for other_provider, other_dotdir in PROVIDERS.items():
+                    if other_provider != provider_id:
+                        self.assertFalse((worktree / other_dotdir).exists())
+
     def test_exact_two_worker_skills(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
             skills = (
@@ -292,9 +341,11 @@ class RegisteredBindingTests(unittest.TestCase):
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
-        self.assertEqual(argv[0], "codex")
+        self.assertEqual(argv[0], codex._direct_codex_executable())
         self.assertIn("exec", argv)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn('default_permissions="worker-isolated"', argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertIn('model_reasoning_effort="high"', argv)
         self.assertIn('service_tier="flex"', argv)
         self.assertNotIn('model_reasoning_effort="medium"', argv)

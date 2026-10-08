@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .activity_log import append_detail
 from .core import iso_utc, new_id, read_json, require_schema
 from .epochs import (
     MANAGER_QUEUE_SCHEMA,
@@ -120,8 +121,10 @@ def promote_event(
     """The monitor's sole-producer admission of one PENDING event."""
     if event_type not in EVENT_TYPES:
         raise ManagerQueueError("MANAGER_QUEUE_INVALID_EVENT_TYPE", event_type)
+    admitted = False
 
     def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        nonlocal admitted
         if dedup_key:
             for existing in record.get("events", []):
                 if existing.get("dedup_key") == dedup_key:
@@ -151,9 +154,19 @@ def promote_event(
         if dedup_key:
             event["dedup_key"] = dedup_key
         record["events"].append(event)
+        admitted = True
         return event, True
 
-    return _update_manager_queue(rt, mutate)
+    event = _update_manager_queue(rt, mutate)
+    if admitted:
+        append_detail(
+            rt,
+            "queue.manager.added",
+            component="queue",
+            added_event=event,
+            queue_snapshot=read_manager_queue(rt),
+        )
+    return event
 
 
 def acknowledge_event(rt: Path, event_id: str) -> dict[str, Any]:
@@ -332,4 +345,14 @@ def append_assignment(
         }
         inbox["assignments"].append(assignment)
         atomic_write_json(path, inbox)
+    append_detail(
+        rt,
+        "queue.worker.added",
+        component="queue",
+        lane_id=lane["lane_id"],
+        run_id=lane["run_id"],
+        prompt=prompt,
+        added_assignment=assignment,
+        queue_snapshot=inbox,
+    )
     return assignment

@@ -10,9 +10,10 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import processes
+from .activity_log import append_detail
 from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
 from .core import read_json, require_schema
@@ -37,11 +38,13 @@ ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
 COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
 
 LAUNCH_INVOCATION_INVALID = "LAUNCH_INVOCATION_INVALID"
+LAUNCH_ALLOWANCE_EXPIRED = "LAUNCH_ALLOWANCE_EXPIRED"
 LAUNCH_BINDING_FAILED = "LAUNCH_BINDING_FAILED"
 LAUNCH_LEASE_BUSY = "LAUNCH_LEASE_BUSY"
 LAUNCH_CONTROLLER_START_FAILED = "LAUNCH_CONTROLLER_START_FAILED"
 LAUNCH_PROVIDER_START_FAILED = "LAUNCH_PROVIDER_START_FAILED"
 FORCE_STOP_LANE_NOT_FOUND = "FORCE_STOP_LANE_NOT_FOUND"
+FORCE_STOP_ALLOWANCE_EXPIRED = "FORCE_STOP_ALLOWANCE_EXPIRED"
 FORCE_STOP_PROCESS_SURVIVED = "FORCE_STOP_PROCESS_SURVIVED"
 FORCE_STOP_LEASE_RELEASE_FAILED = "FORCE_STOP_LEASE_RELEASE_FAILED"
 RETIRE_LANE_NOT_FOUND = "RETIRE_LANE_NOT_FOUND"
@@ -61,6 +64,37 @@ class LaunchError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.evidence_paths = evidence_paths or []
+
+
+def _spawn_controller_logged(
+    rt: Path,
+    lane: Mapping[str, Any],
+    argv: list[str],
+    spawn_options: Mapping[str, Any],
+) -> subprocess.Popen[Any]:
+    append_detail(
+        rt,
+        "launch.controller.requested",
+        component="launch",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        argv=list(argv),
+        cwd=spawn_options.get("cwd"),
+        environment_mode=(
+            "scrubbed" if "env" in spawn_options else "inherited"
+        ),
+    )
+    child = processes.spawn_detached(argv, **dict(spawn_options))
+    append_detail(
+        rt,
+        "launch.controller.spawned",
+        component="launch",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        pid=child.pid,
+        argv=list(argv),
+    )
+    return child
 
 
 def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
@@ -217,9 +251,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         if not binding_path.is_file():
             raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
 
-        child = processes.spawn_detached(
-            processes.python_argv("orchestrator_harness.controller", lane_id),
-            cwd=str(harness_root),
+        child = _spawn_controller_logged(
+            rt, lane, processes.python_argv("orchestrator_harness.controller", lane_id),
+            {"cwd": str(harness_root)},
         )
         controller_identity = processes.process_identity(child.pid)
         if controller_identity is None:
@@ -367,8 +401,35 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
     return ok and boundary_ok
 
 
-def run_force_stop(lane_id: str) -> dict[str, Any]:
-    """Execute ``lane force-stop`` and return the structured result."""
+def run_force_stop(
+    lane_id: str, *, allowance_seconds: float | None = None
+) -> dict[str, Any]:
+    """Execute ``lane force-stop`` and return the structured result.
+
+    ``allowance_seconds`` is the caller's remaining share of one enclosing
+    absolute deadline.  A spent allowance refuses before any termination,
+    lease, or lane mutation effect, and the same absolute instant is
+    re-checked immediately before termination, so a call that started inside
+    the allowance and then ran long can never terminate or retire the lane
+    after the caller stopped waiting.  ``None`` keeps the ordinary caller's
+    unbounded behaviour.
+    """
+    force_stop_deadline: float | None = None
+    if allowance_seconds is not None:
+        force_stop_deadline = time.monotonic() + float(allowance_seconds)
+    if force_stop_deadline is not None and force_stop_deadline <= time.monotonic():
+        return {
+            "ok": False,
+            "code": FORCE_STOP_ALLOWANCE_EXPIRED,
+            "summary": (
+                "the enclosing allowance is spent; no termination or lease "
+                "effect was started and the lane's ownership stays visible"
+            ),
+            "evidence_paths": [],
+            "next_action": (
+                "reconcile the exact lane inside the remaining decision time"
+            ),
+        }
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
@@ -390,6 +451,23 @@ def run_force_stop(lane_id: str) -> dict[str, Any]:
             "summary": str(exc),
             "evidence_paths": [],
             "next_action": "check the lane id",
+        }
+    if force_stop_deadline is not None and time.monotonic() >= force_stop_deadline:
+        # The call entered inside the allowance and ran long; the termination
+        # phase is the first effect, so it may not start now.  The exact lane
+        # keeps its ownership and no termination or lease effect was started.
+        return {
+            "ok": False,
+            "code": FORCE_STOP_ALLOWANCE_EXPIRED,
+            "summary": (
+                "the enclosing allowance expired before termination started; "
+                "no termination or lease effect was started and the lane's "
+                "ownership stays visible"
+            ),
+            "evidence_paths": [],
+            "next_action": (
+                "reconcile the exact lane inside the remaining decision time"
+            ),
         }
     try:
         if not _terminate_lane_processes(lane):

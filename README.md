@@ -11,6 +11,12 @@ Every public command returns the small structured result `{ ok, code, summary, e
 next_action }`; `--json` emits it as the machine-readable result object. Success prints a short
 status line and exits 0; failure prints one stable failure code on stderr and exits non-zero.
 
+This generic edition starts from commit `5134f6c` and includes later core fixes for
+worker payload composition, setup recovery, process identity, Codex worker isolation,
+manager queue shutdown, provider usage receipts, and monitor logging. Configure
+`harness-config.json` with the ROOT workspace before use. The harness does not
+install or query an experience memory store.
+
 ## What the harness does and does not do
 
 - Does: prepare and launch one coding worker per lane, publish durable lane/event records,

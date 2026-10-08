@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import processes
+from .activity_log import append_activity
 from .config import find_harness_root, load_config
 from .core import iso_utc, read_json, require_schema
 from .epochs import (
@@ -25,6 +26,7 @@ from .epochs import (
 )
 from .lanes import read_lane, update_lane
 from .leases import release_leases
+from .manager_queue import ManagerQueueError, read_manager_queue
 from .records import RecordLock, atomic_write_json, read_record
 from .setup import (
     MONITOR_SCHEMA,
@@ -38,6 +40,7 @@ from .setup import (
 SHUTDOWN_LANE_CLEANUP_UNPROVEN = "SHUTDOWN_LANE_CLEANUP_UNPROVEN"
 SHUTDOWN_MONITOR_UNPROVEN = "SHUTDOWN_MONITOR_UNPROVEN"
 SHUTDOWN_RUNTIME_AMBIGUOUS = "SHUTDOWN_RUNTIME_AMBIGUOUS"
+SHUTDOWN_UNRESOLVED_MANAGER_OBLIGATIONS = "SHUTDOWN_UNRESOLVED_MANAGER_OBLIGATIONS"
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 
@@ -51,6 +54,31 @@ class ShutdownError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _unresolved_manager_obligations(rt: Path) -> list[dict[str, Any]]:
+    """Return queue work that must be resolved before an OPEN runtime closes."""
+
+    marker = read_current_epoch(rt)
+    if marker is None:
+        return []
+    try:
+        queue = read_manager_queue(rt)
+    except (ManagerQueueError, OSError, ValueError) as exc:
+        raise ShutdownError(
+            SHUTDOWN_RUNTIME_AMBIGUOUS,
+            f"cannot prove that the manager queue is resolved: {exc}",
+        ) from exc
+    events = queue.get("events")
+    if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+        raise ShutdownError(
+            SHUTDOWN_RUNTIME_AMBIGUOUS,
+            "cannot prove that the manager queue is resolved: events are invalid",
+        )
+    return [
+        event for event in events
+        if event.get("state") in {"PENDING", "ACKNOWLEDGED"}
+    ]
 
 
 def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
@@ -123,9 +151,14 @@ def _retire_lane(rt: Path, epoch_id: str, lane_id: str) -> None:
 def _stop_monitor(rt: Path) -> None:
     """Set stop_requested under the monitor-record lock, then wait for STOPPED."""
     record_path = monitor_record_path(rt)
+    append_activity(rt, "process.stop_request.started", component="shutdown")
     with RecordLock(record_path):
         record = read_monitor_record(rt)
         if record is None:
+            append_activity(
+                rt, "process.stop_request.completed", component="shutdown",
+                outcome="monitor_record_missing",
+            )
             return
         record["stop_requested"] = True
         atomic_write_json(record_path, record)
@@ -133,12 +166,24 @@ def _stop_monitor(rt: Path) -> None:
     while time.monotonic() < deadline:
         current = read_monitor_record(rt)
         if current is None:
+            append_activity(
+                rt, "process.stop_request.completed", component="shutdown",
+                outcome="monitor_record_removed",
+            )
             return
         if current.get("health") == "STOPPED":
+            append_activity(
+                rt, "process.stop_request.completed", component="shutdown",
+                outcome="stopped",
+            )
             return
         pid = current.get("pid")
         creation = current.get("creation_time")
         if not (isinstance(pid, int) and processes.identity_matches(pid, creation)):
+            append_activity(
+                rt, "process.stop_request.completed", component="shutdown",
+                outcome="process_absent",
+            )
             return
         time.sleep(0.5)
     current = read_monitor_record(rt)
@@ -200,6 +245,18 @@ def run_shutdown() -> dict[str, Any]:
                 f"unexpected runtime state: {current_state}",
             )
         if current_state == "OPEN":
+            if config.profile == "managed":
+                unresolved = _unresolved_manager_obligations(rt)
+                if unresolved:
+                    event_ids = [
+                        str(event.get("event_id") or "<missing-id>")
+                        for event in unresolved
+                    ]
+                    raise ShutdownError(
+                        SHUTDOWN_UNRESOLVED_MANAGER_OBLIGATIONS,
+                        "refusing shutdown with unresolved manager obligation(s): "
+                        + ", ".join(event_ids),
+                    )
             with RecordLock(runtime_state_path(rt)):
                 atomic_write_json(
                     runtime_state_path(rt),

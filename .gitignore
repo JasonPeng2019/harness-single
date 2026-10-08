@@ -4,11 +4,13 @@ __pycache__/
 .ruff_cache/
 local-config/
 runtime/
+.venv/
 multi-agent-logs/
 harness_watcher/
 test_results/
 .agent-workspace/
 .harness-runtime/
+.venv/
 
 # The shipped super-cache workspace base is a committed product tree.
 !super-cache/workspace/.agent-workspace/

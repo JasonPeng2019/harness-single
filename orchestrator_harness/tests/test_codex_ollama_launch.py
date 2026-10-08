@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -23,7 +24,7 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         argv = self.argv()
         self.assertEqual(["ollama", "launch", "codex", "--model", "requested-model:cloud", "--yes", "--"], argv[:7])
         forwarded = argv[7:]
-        self.assertEqual("exec", forwarded[0])
+        self.assertEqual(["exec", "--ignore-user-config"], forwarded[:2])
         self.assertNotIn("-m", forwarded)
         self.assertNotIn("--model", forwarded)
         self.assertIn('model_reasoning_effort="max"', forwarded)
@@ -34,16 +35,21 @@ class CodexOllamaLaunchTests(unittest.TestCase):
 
     def test_resume_keeps_exact_session_and_transport(self):
         argv = self.argv(resume=True, session_id="native-session")
-        self.assertEqual(["exec", "resume", "native-session"], argv[7:10])
+        self.assertEqual(
+            ["exec", "--ignore-user-config", "resume", "native-session"],
+            argv[7:11],
+        )
         self.assertNotIn("--cd", argv)
         with self.assertRaisesRegex(ValueError, "session ID"):
             self.argv(resume=True)
 
-    def test_direct_codex_is_unchanged(self):
+    def test_direct_codex_uses_workspace_sandbox(self):
         argv = self.argv(launch_config={"reasoning_effort": "high", "service_tier": "normal"})
         worktree = str(Path("worker with spaces").resolve())
         self.assertEqual([
-            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+            binding._direct_codex_executable(), "exec", "--ignore-user-config",
+            "-c", 'default_permissions="worker-isolated"',
+            *(["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []),
             "--skip-git-repo-check", "-c", 'approval_policy="never"',
             "-m", "requested-model:cloud", "-c", 'model_reasoning_effort="high"',
             "-c", 'service_tier="normal"', "--dangerously-bypass-hook-trust",
@@ -56,6 +62,9 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         self.assertEqual(argv, self.argv(launch_config={
             "reasoning_effort": "high", "service_tier": "normal", "launcher": "codex",
         }))
+        if os.name == "nt":
+            self.assertEqual(Path(argv[0]).name.lower(), "codex.exe")
+            self.assertTrue(Path(argv[0]).is_file())
 
     def test_invalid_transport_is_rejected(self):
         for launcher in ("", "other", None):
