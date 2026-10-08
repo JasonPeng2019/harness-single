@@ -152,6 +152,8 @@ def _find_actionable(
     rt: Path,
     epoch_id: str,
     orphaned_leases: list[dict[str, Any]] | None = None,
+    *,
+    acknowledged_reviews: set[tuple[str, str]] | None = None,
 ) -> tuple[str, str] | None:
     if orphaned_leases:
         lease = orphaned_leases[0]
@@ -166,6 +168,10 @@ def _find_actionable(
         derived = derive_lane_status(
             rt, epoch_id, lane, status, orphaned_leases=orphaned_leases
         )
+        if derived == "review_pending" and (
+            lane_id, lane.get("run_id", "")
+        ) in (acknowledged_reviews or set()):
+            continue
         if derived in ACTIONABLE_STATUSES:
             return lane_id, derived
     return None
@@ -187,6 +193,23 @@ def _root_session_id(explicit: str | None) -> str:
     return f"root-process-{os.getpid()}"
 
 
+def _watch_delivered(
+    event: dict[str, Any], *, queue_id: Any, root_session_id: str, binding_id: str,
+) -> bool:
+    event_id = event.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    return any(
+        receipt.get("source") == "watch"
+        and receipt.get("queue_id") == queue_id
+        and receipt.get("event_id") == event_id
+        and receipt.get("session_id") == root_session_id
+        and receipt.get("binding_id") == binding_id
+        for receipt in event.get("delivery_history", [])
+        if isinstance(receipt, dict)
+    )
+
+
 def _watch_event(
     queue: dict[str, Any], *, root_session_id: str, binding_id: str,
     requested_event_id: str | None = None,
@@ -200,16 +223,9 @@ def _watch_event(
             continue
         if requested_event_id is not None and event_id != requested_event_id:
             continue
-        already_delivered = any(
-            receipt.get("source") == "watch"
-            and receipt.get("queue_id") == queue_id
-            and receipt.get("event_id") == event_id
-            and receipt.get("session_id") == root_session_id
-            and receipt.get("binding_id") == binding_id
-            for receipt in event.get("delivery_history", [])
-            if isinstance(receipt, dict)
-        )
-        if not already_delivered:
+        if not _watch_delivered(
+            event, queue_id=queue_id, root_session_id=root_session_id, binding_id=binding_id,
+        ):
             return event
     return None
 
@@ -260,6 +276,7 @@ def run_watch(
     watch_binding_id = binding_id or os.environ.get("HARNESS_BINDING_ID") or "root"
     while True:
         orphaned_leases = _discover_orphaned_leases(rt, epoch_id)
+        acknowledged_reviews: set[tuple[str, str]] = set()
         if managed:
             try:
                 queue = read_manager_queue(rt)
@@ -269,6 +286,21 @@ def run_watch(
                     binding_id=watch_binding_id,
                     requested_event_id=until_event,
                 )
+                # ROOT may need other lanes' evidence before deciding an already
+                # acknowledged review. Keep it open without repeatedly waking on
+                # the same status; new invocations/failures still use fallback.
+                acknowledged_reviews = {
+                    (item["lane_id"], item["run_id"])
+                    for item in queue.get("events", [])
+                    if item.get("state") == "ACKNOWLEDGED"
+                    and item.get("event_class") == "COMPLETION_REVIEW_REQUIRED"
+                    and isinstance(item.get("lane_id"), str) and item["lane_id"]
+                    and isinstance(item.get("run_id"), str) and item["run_id"]
+                    and _watch_delivered(
+                        item, queue_id=queue.get("queue_id"),
+                        root_session_id=session_id, binding_id=watch_binding_id,
+                    )
+                }
             except Exception:
                 event = None
             if event is not None:
@@ -293,7 +325,10 @@ def run_watch(
                         "wake_reason": "manager_event",
                         "event_id": event_id,
                     }
-        actionable = _find_actionable(rt, epoch_id, orphaned_leases)
+        actionable = _find_actionable(
+            rt, epoch_id, orphaned_leases,
+            acknowledged_reviews=acknowledged_reviews,
+        )
         if actionable is not None:
             lane_id, status = actionable
             result = {
