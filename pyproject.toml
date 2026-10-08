@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-harness"
+version = "0.1.0"
+description = "Deterministic Stage-A memory and plan-reuse contracts"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# The adapter stays lazy so ordinary Stage-A installs remain dependency-light.
+# EverOS itself requires Python 3.12 or newer; the vendored checkout satisfies
+# this exact extra when installed through the documented portable path.
+everos = ["everos==1.3.1; python_version >= '3.12'"]
+# Atlas is intentionally optional.  The product imports it lazily so local
+# durable-procedure use does not acquire network or provider dependencies.
+atlas = ["langchain-mongodb==0.12.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+memory_harness = ["py.typed", "README.md"]

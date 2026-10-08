@@ -1,0 +1,67 @@
+name: lint
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: "From which folder this pipeline executes"
+
+env:
+  WORKDIR: ${{ inputs.working-directory == '' && '.' || inputs.working-directory }}
+
+  # This env var allows us to get inline annotations when ruff has complaints.
+  RUFF_OUTPUT_FORMAT: github
+
+jobs:
+  build:
+    name: "run lint #${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only lint on the min and max supported Python versions.
+        # It's extremely unlikely that there's a lint issue on any version in between
+        # that doesn't show up on the min or max versions.
+        #
+        # GitHub rate-limits how many jobs can be running at any one time.
+        # Starting new jobs is also relatively slow,
+        # so linting on fewer versions makes CI faster.
+        python-version:
+          - "3.11"
+          - "3.13"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: "${{ inputs.working-directory }}/uv.lock"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: just install
+
+      - name: Get .mypy_cache to speed up mypy
+        uses: actions/cache@v6
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MIN: "2"
+        with:
+          path: |
+            ${{ env.WORKDIR }}/.mypy_cache
+          key: mypy-lint-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}-${{ inputs.working-directory }}-${{ hashFiles(format('{0}/uv.lock', inputs.working-directory)) }}
+
+
+      - name: Analysing the code with our lint
+        working-directory: ${{ inputs.working-directory }}
+        run: just lint
+
+      - name: Checking the types
+        working-directory: ${{ inputs.working-directory }}
+        run: just typing

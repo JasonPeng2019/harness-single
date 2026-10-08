@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 from orchestrator_harness import controller, leases, manager_queue, monitor, review, scan_watch
+from orchestrator_harness.activity_log import detail_log_path
 from orchestrator_harness.controller import ProviderExecution
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA
@@ -133,6 +135,43 @@ class Addendum3ProductTests(unittest.TestCase):
             )
         )
 
+    def test_queue_admissions_emit_full_snapshots_and_prompts(self) -> None:
+        event = promote_event(
+            self.runtime,
+            event_type="LANE_STATUS_CHANGED",
+            lane_id="lane-1",
+            run_id="run-1",
+            summary="review requested",
+        )
+        lane = self._lane()
+        workspace = Path(str(lane["worktree_path"])) / ".agent-workspace"
+        atomic_write_json(
+            workspace / "QUEUE.json",
+            {
+                "schema": manager_queue.LANE_INBOX_SCHEMA,
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "assignments": [],
+            },
+        )
+        assignment = append_assignment(
+            self.runtime, lane, "Review the integrated decoder and report all failures."
+        )
+
+        records = [
+            json.loads(line)
+            for line in detail_log_path(self.runtime)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        manager = next(item for item in records if item["event"] == "queue.manager.added")
+        worker = next(item for item in records if item["event"] == "queue.worker.added")
+        self.assertEqual(event["event_id"], manager["added_event"]["event_id"])
+        self.assertEqual(event["event_id"], manager["queue_snapshot"]["events"][0]["event_id"])
+        self.assertEqual(assignment["event_id"], worker["added_assignment"]["event_id"])
+        self.assertIn("integrated decoder", worker["prompt"])
+        self.assertEqual(assignment["event_id"], worker["queue_snapshot"]["assignments"][0]["event_id"])
+
     def test_force_release_audit_retains_holder_and_reports_partial_terminal_audit(self) -> None:
         path = leases.lease_path(self.runtime, "resource-1")
         holder = {
@@ -251,17 +290,7 @@ class Addendum3ProductTests(unittest.TestCase):
         atomic_write_json(lane_dir / "lane.json", lane)
         atomic_write_json(
             workspace / "task-card.json",
-            {
-                "schema": "project-task-card/v1",
-                "card_id": "card-1",
-                "task": "review the completed lane",
-                "acceptance_criteria": ["The review pair is published atomically"],
-                "deliverables": ["Completion review and acceptance records"],
-                "reason_for_acceptance_and_deliverables": (
-                    "Recovery must observe only a complete review pair."
-                ),
-                "base_commit": "commit-1",
-            },
+            {"schema": "project-task-card/v1", "card_id": "card-1", "base_commit": "commit-1"},
         )
         result = {
             "schema": "result/v1",
@@ -432,6 +461,9 @@ class Addendum3ProductTests(unittest.TestCase):
             "no-session": "no-session",
             "resume-unavailable": "resume-unavailable",
             "provider-start-failed": "provider-start-failed",
+            "receipts": "native-receipts",
+            "receipt-failure": "native-receipt-failure",
+            "malformed-receipt": "malformed-native-receipt",
         }[scenario]
         worktree = self.runtime / f"controller-{suffix}-worktree"
         workspace = worktree / ".agent-workspace"
@@ -564,10 +596,21 @@ class Addendum3ProductTests(unittest.TestCase):
 
             paths = controller._attempt_paths(lane, attempt_number)
             paths["transcript"].parent.mkdir(parents=True, exist_ok=True)
-            paths["transcript"].write_text(
-                f'{{"attempt": {attempt_number}, "session_id": "native-session-1"}}\n',
-                encoding="utf-8",
-            )
+            if scenario == "malformed-receipt":
+                paths["transcript"].write_text(
+                    '{"type":["turn.completed"],"usage":{"input_tokens":5}}\n',
+                    encoding="utf-8",
+                )
+            elif scenario in {"receipts", "receipt-failure"}:
+                paths["transcript"].write_text(
+                    f'{{"type":"turn.completed","turn_id":"turn-{attempt_number}","usage":{{"input_tokens":{attempt_number},"cached_input_tokens":1,"output_tokens":2}}}}\n',
+                    encoding="utf-8",
+                )
+            else:
+                paths["transcript"].write_text(
+                    f'{{"attempt": {attempt_number}, "session_id": "native-session-1"}}\n',
+                    encoding="utf-8",
+                )
             paths["stderr"].write_text("", encoding="utf-8")
 
             if valid_on_sixth and attempt_number == 6:
@@ -612,6 +655,8 @@ class Addendum3ProductTests(unittest.TestCase):
                 }
             )
             session_id = None if scenario == "no-session" else "native-session-1"
+            if scenario in {"receipt-failure", "malformed-receipt"}:
+                return ProviderExecution(9, boundary, session_id, argv, True)
             return ProviderExecution(0, boundary, session_id, argv)
 
         with (
@@ -622,7 +667,14 @@ class Addendum3ProductTests(unittest.TestCase):
                 return_value=type("Config", (), {"runtime_root": self.runtime})(),
             ),
             patch.object(controller.processes, "process_identity", return_value={"pid": 7, "creation_time": "controller-created"}),
-            patch.object(controller, "_load_binding", return_value=object()),
+            patch.object(
+                controller, "_load_binding",
+                return_value=(
+                    SimpleNamespace(parse_line=lambda _line: None)
+                    if scenario in {"receipts", "receipt-failure", "malformed-receipt"}
+                    else object()
+                ),
+            ),
             patch.object(controller, "update_lane", side_effect=track_update_lane),
             patch.object(controller, "_write_status", side_effect=track_write_status),
             patch.object(controller, "release_leases", side_effect=track_release_leases),
@@ -698,6 +750,10 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(list(range(1, 7)), [row["attempt"] for row in rows])
         self.assertEqual(expected_states, [row["result_state"] for row in rows])
         for index, (call, row) in enumerate(zip(calls, rows, strict=True), start=1):
+            self.assertEqual(("lane-1", "run-1", index), (row["lane_id"], row["run_id"], row["attempt"]))
+            self.assertEqual("incomplete", row["native_usage_state"])
+            self.assertEqual([], row["native_usage_observations"])
+            self.assertTrue(row["provider_started"])
             self.assertEqual({"id": "codex", "model": "model-1"}, row["provider"])
             self.assertEqual(list(call["argv"]), row["argv"])
             self.assertEqual("native-session-1", row["session_id"])
@@ -929,6 +985,46 @@ class Addendum3ProductTests(unittest.TestCase):
 
         self._assert_candidate_event_sequence(observed, valid_on_sixth=True)
 
+    def test_correction_and_native_resume_keep_each_receipt_on_its_attempt(self) -> None:
+        observed = self._run_candidate_correction_boundary(valid_on_sixth=True, scenario="receipts")
+        self.assertEqual(0, observed["exit_code"])
+        rows = observed["attempts"][1:]
+        self.assertEqual(list(range(1, 7)), [row["attempt"] for row in rows])
+        for number, row in enumerate(rows, start=1):
+            self.assertEqual(("lane-1", "run-1"), (row["lane_id"], row["run_id"]))
+            self.assertEqual("native-session-1", row["session_id"])
+            self.assertEqual("observed", row["native_usage_state"])
+            self.assertEqual(1, len(row["native_usage_observations"]))
+            receipt = row["native_usage_observations"][0]
+            self.assertEqual(f"turn-{number}", receipt["turn_id"])
+            self.assertEqual(number, receipt["usage"]["input_tokens"])
+            self.assertEqual(number > 1, "resume" in row["argv"])
+
+    def test_failed_provider_still_appends_its_native_receipt(self) -> None:
+        observed = self._run_candidate_correction_boundary(valid_on_sixth=False, scenario="receipt-failure")
+        self.assertEqual(0, observed["exit_code"])
+        rows = observed["attempts"][1:]
+        self.assertEqual(1, len(rows))
+        self.assertEqual(9, rows[0]["exit_code"])
+        self.assertEqual("invalid", rows[0]["result_state"])
+        self.assertEqual("observed", rows[0]["native_usage_state"])
+        self.assertEqual("turn-1", rows[0]["native_usage_observations"][0]["turn_id"])
+
+    def test_malformed_receipt_still_appends_failed_attempt_and_releases_lease(self) -> None:
+        observed = self._run_candidate_correction_boundary(
+            valid_on_sixth=False, scenario="malformed-receipt"
+        )
+        self.assertEqual(0, observed["exit_code"])
+        row = observed["attempts"][1]
+        self.assertEqual(("lane-1", "run-1", 1),
+                         (row["lane_id"], row["run_id"], row["attempt"]))
+        self.assertEqual("incomplete", row["native_usage_state"])
+        self.assertEqual([], row["native_usage_observations"])
+        self.assertIn("malformed", row["native_usage_capture_error"])
+        self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+        self.assertTrue(row["cleanup_proven"])
+        self.assertIsNone(observed["lease_after"])
+
     def test_sixth_invalid_attempt_escalates_once_with_full_durable_evidence(self) -> None:
         observed = self._run_candidate_correction_boundary(valid_on_sixth=False)
         self.assertEqual(0, observed["exit_code"])
@@ -1042,6 +1138,7 @@ class Addendum3ProductTests(unittest.TestCase):
         attempt_rows = observed["attempts"][1:]
         self.assertEqual(1, len(attempt_rows))
         self.assertEqual([], attempt_rows[0]["argv"])
+        self.assertFalse(attempt_rows[0]["provider_started"])
         self.assertIn("provider did not start", attempt_rows[0]["validation_error"])
 
     def test_valid_result_wins_over_nonzero_provider_exit(self) -> None:
@@ -1411,6 +1508,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-old",
             "worktree_path": str(worktree),
+            "controller_status_path": str(workspace / "controller.status.json"),
             "provider": {
                 "id": "codex",
                 "model": "model-1",
@@ -1424,20 +1522,18 @@ class Addendum3ProductTests(unittest.TestCase):
             "schema": "project-task-card/v1",
             "card_id": "card-1",
             "task": "do the work",
-            "acceptance_criteria": ["The lane is ready for its next run"],
-            "deliverables": ["A fresh invocation and worker prompt"],
-            "reason_for_acceptance_and_deliverables": (
-                "Resume must preserve an explicit definition of completion."
-            ),
         }
         updates: list[dict[str, object]] = []
+        current_lane = dict(lane)
 
         def update(
             _rt: object, _epoch: object, _lane_id: object, mutate: object
         ) -> dict[str, object]:
-            value = mutate(dict(lane))
+            nonlocal current_lane
+            value = mutate(dict(current_lane))
             updates.append(value)
-            return {**lane, **value}
+            current_lane = value
+            return value
 
         with (
             patch.object(resume, "find_harness_root", return_value=Path("root")),

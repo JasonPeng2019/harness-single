@@ -1,0 +1,94 @@
+name: test
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: "From which folder this pipeline executes"
+
+jobs:
+  build:
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.13"
+    name: "run test #${{ matrix.python-version }}"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: "${{ inputs.working-directory }}/uv.lock"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install dependencies
+        shell: bash
+        run: just install
+
+      - name: Start MongoDB
+        uses: supercharge/mongodb-github-action@315db7fe45ac2880b7758f1933e6e5d59afd5e94 # 1.12.1
+
+      - name: Run unit tests
+        shell: bash
+        run: just unit_tests
+
+      - name: Start local Atlas
+        working-directory: .
+        run: bash scripts/start_local_atlas.sh
+
+      # just's dotenv-load only applies inside just's own process, so steps
+      # that call uv directly (the minimum-dependency-versions step below)
+      # never see the dynamic port start_local_atlas.sh assigned. Exporting
+      # it to $GITHUB_ENV makes it visible to every step in this job.
+      - name: Export local Atlas connection string
+        working-directory: .
+        run: cat .local_atlas_uri >> "$GITHUB_ENV"
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Run Ollama
+        working-directory: .
+        run: |
+          ollama serve &
+          sleep 5    # wait for the Ollama server to be ready
+          bash scripts/setup_ollama.sh
+
+      - name: Run integration tests
+        run: just integration_tests
+
+      - name: Ensure the tests did not create any additional files
+        shell: bash
+        run: |
+          set -eu
+
+          STATUS="$(git status)"
+          echo "$STATUS"
+
+          # grep will exit non-zero if the target message isn't found,
+          # and `set -e` above will cause the step to fail.
+          echo "$STATUS" | grep 'nothing to commit, working tree clean'
+
+      - name: Run unit tests with minimum dependency versions
+        run: |
+          uv sync --python=${{ matrix.python-version }} --resolution=lowest-direct
+          # Deliberately not `just unit_tests`: that recipe is `uv run pytest`,
+          # and `uv run` re-syncs from the lockfile, silently discarding the
+          # lowest-direct resolution above ("Ignoring existing lockfile due to
+          # change in resolution mode"). --no-sync is what makes this step
+          # actually test minimum versions.
+          uv pip list
+          uv run --no-sync pytest tests/unit_tests

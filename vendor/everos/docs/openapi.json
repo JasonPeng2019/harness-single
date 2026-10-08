@@ -1,0 +1,4293 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "everos",
+    "description": "md-first memory extraction framework",
+    "version": "1.3.1"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health",
+        "description": "Liveness + capabilities + cascade readiness probe.\n\n``status`` stays ``\"ok\"`` whenever the process is up — the HTTP code\nis a *liveness* signal and a degraded cascade must not trigger a\nrestart (a crash-loop fixes neither a bad md file nor disk bloat).\nThe ``cascade`` block is the *readiness* signal: ``healthy=false``\nwith human-readable ``reasons`` **only** when the projection pipeline\nitself is stuck (drain failing, optimize stuck, version cleanup\nstalled). ``failed_permanent`` — files awaiting ``cascade fix`` — is\na data-quality backlog reported as an informational count that does\nnot flip ``healthy``. Alert on ``cascade.healthy``.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Metrics",
+        "description": "Render the current Prometheus registry in exposition format.",
+        "operationId": "metrics_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memory/add": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Add Memory",
+        "description": "Add messages into the user-memory + agent-memory pipelines.",
+        "operationId": "add_memory_api_v1_memory_add_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorizeAddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_AddResponseData_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memory/flush": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Flush Memory",
+        "description": "Force boundary detection over the current ``session_id`` buffer.\n\n[OSS-only] — cloud edition decides boundary timing server-side and\ndoes not expose this endpoint.",
+        "operationId": "flush_memory_api_v1_memory_flush_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorizeFlushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_FlushResponseData_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memory/search": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Post Search",
+        "description": "Hybrid retrieval across the configured memory backends.",
+        "operationId": "post_search_api_v1_memory_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/memory/get": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Post Get",
+        "description": "Paginated listing over the requested ``memory_type``.",
+        "operationId": "post_get_api_v1_memory_get_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/ome/trigger": {
+      "post": {
+        "tags": [
+          "ome"
+        ],
+        "summary": "Trigger",
+        "description": "Manually trigger a registered OME strategy and wait for its runs to\nsettle. Returns without waiting for the LanceDB index — the response\nreflects markdown state only; poll ``GET /health``'s ``cascade.pending``\nfor index convergence (two consecutive zero samples to guard against the\nwatcher-input window). See docs/api.md#eventual-consistency.",
+        "operationId": "trigger_api_v1_ome_trigger_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/documents": {
+      "post": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Create Document Route",
+        "description": "Upload a new knowledge document.",
+        "operationId": "create_document_route_api_v1_knowledge_documents_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_document_route_api_v1_knowledge_documents_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentCreateResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "List Documents Route",
+        "description": "Paginated document listing.",
+        "operationId": "list_documents_route_api_v1_knowledge_documents_get",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "category_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "created_at",
+                "updated_at",
+                "title"
+              ],
+              "type": "string",
+              "default": "created_at",
+              "title": "Sort By"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string",
+              "default": "desc",
+              "title": "Sort Order"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentListResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/documents/{doc_id}": {
+      "put": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Replace Document Route",
+        "description": "Replace an existing knowledge document (atomic backup/restore on failure).",
+        "operationId": "replace_document_route_api_v1_knowledge_documents__doc_id__put",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_replace_document_route_api_v1_knowledge_documents__doc_id__put"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentCreateResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Delete Document Route",
+        "description": "Remove a knowledge document.",
+        "operationId": "delete_document_route_api_v1_knowledge_documents__doc_id__delete",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Get Document Route",
+        "description": "Fetch a single document with its topic list.",
+        "operationId": "get_document_route_api_v1_knowledge_documents__doc_id__get",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentDetailResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Patch Document Route",
+        "description": "Update mutable document metadata fields.",
+        "operationId": "patch_document_route_api_v1_knowledge_documents__doc_id__patch",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentPatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentPatchResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/topics/{topic_id}": {
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Get Topic Route",
+        "description": "Fetch a single topic with full content.",
+        "operationId": "get_topic_route_api_v1_knowledge_topics__topic_id__get",
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}_\\d+$",
+              "title": "Topic Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_TopicDetailResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/search": {
+      "post": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Search Knowledge Route",
+        "description": "Knowledge retrieval (keyword / vector / hybrid).",
+        "operationId": "search_knowledge_route_api_v1_knowledge_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_KnowledgeSearchResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/categories": {
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "List Categories Route",
+        "description": "List taxonomy categories from ``.taxonomy.md``.",
+        "operationId": "list_categories_route_api_v1_knowledge_categories_get",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_CategoryListResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cascade/quiesce": {
+      "post": {
+        "tags": [
+          "cascade"
+        ],
+        "summary": "Quiesce",
+        "description": "Drain the projection queue, then stop watcher + scanner + worker.\n\nReturns when the index is a complete projection of the markdown on disk and\nnothing further will rewrite it. That ordering is the point: stopping first\nwould freeze a *partial* index, which reads as a healthy store that quietly\nfails to recall whatever had not been indexed yet.\n\nIdempotent -- a second call reports ``quiesced=false`` rather than failing.",
+        "operationId": "quiesce_api_v1_cascade_quiesce_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuiesceResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/memory/add": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Add Memory",
+        "description": "Add messages into the user-memory + agent-memory pipelines.",
+        "operationId": "add_memory_api_v2_memory_add_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorizeAddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_AddResponseData_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/memory/flush": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Flush Memory",
+        "description": "Force boundary detection over the current ``session_id`` buffer.\n\n[OSS-only] — cloud edition decides boundary timing server-side and\ndoes not expose this endpoint.",
+        "operationId": "flush_memory_api_v2_memory_flush_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorizeFlushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_FlushResponseData_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/memory/search": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Post Search",
+        "description": "Hybrid retrieval across the configured memory backends.",
+        "operationId": "post_search_api_v2_memory_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/memory/get": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Post Get",
+        "description": "Paginated listing over the requested ``memory_type``.",
+        "operationId": "post_get_api_v2_memory_get_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/ome/trigger": {
+      "post": {
+        "tags": [
+          "ome"
+        ],
+        "summary": "Trigger",
+        "description": "Manually trigger a registered OME strategy and wait for its runs to\nsettle. Returns without waiting for the LanceDB index — the response\nreflects markdown state only; poll ``GET /health``'s ``cascade.pending``\nfor index convergence (two consecutive zero samples to guard against the\nwatcher-input window). See docs/api.md#eventual-consistency.",
+        "operationId": "trigger_api_v2_ome_trigger_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/knowledge/documents": {
+      "post": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Create Document Route",
+        "description": "Upload a new knowledge document.",
+        "operationId": "create_document_route_api_v2_knowledge_documents_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_document_route_api_v2_knowledge_documents_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentCreateResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "List Documents Route",
+        "description": "Paginated document listing.",
+        "operationId": "list_documents_route_api_v2_knowledge_documents_get",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "category_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "created_at",
+                "updated_at",
+                "title"
+              ],
+              "type": "string",
+              "default": "created_at",
+              "title": "Sort By"
+            }
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string",
+              "default": "desc",
+              "title": "Sort Order"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentListResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/knowledge/documents/{doc_id}": {
+      "put": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Replace Document Route",
+        "description": "Replace an existing knowledge document (atomic backup/restore on failure).",
+        "operationId": "replace_document_route_api_v2_knowledge_documents__doc_id__put",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_replace_document_route_api_v2_knowledge_documents__doc_id__put"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentCreateResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Delete Document Route",
+        "description": "Remove a knowledge document.",
+        "operationId": "delete_document_route_api_v2_knowledge_documents__doc_id__delete",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Get Document Route",
+        "description": "Fetch a single document with its topic list.",
+        "operationId": "get_document_route_api_v2_knowledge_documents__doc_id__get",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentDetailResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Patch Document Route",
+        "description": "Update mutable document metadata fields.",
+        "operationId": "patch_document_route_api_v2_knowledge_documents__doc_id__patch",
+        "parameters": [
+          {
+            "name": "doc_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}$",
+              "title": "Doc Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentPatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_DocumentPatchResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/knowledge/topics/{topic_id}": {
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Get Topic Route",
+        "description": "Fetch a single topic with full content.",
+        "operationId": "get_topic_route_api_v2_knowledge_topics__topic_id__get",
+        "parameters": [
+          {
+            "name": "topic_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^d_[a-f0-9]{12,32}_\\d+$",
+              "title": "Topic Id"
+            }
+          },
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_TopicDetailResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/knowledge/search": {
+      "post": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "Search Knowledge Route",
+        "description": "Knowledge retrieval (keyword / vector / hybrid).",
+        "operationId": "search_knowledge_route_api_v2_knowledge_search_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_KnowledgeSearchResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/knowledge/categories": {
+      "get": {
+        "tags": [
+          "knowledge"
+        ],
+        "summary": "List Categories Route",
+        "description": "List taxonomy categories from ``.taxonomy.md``.",
+        "operationId": "list_categories_route_api_v2_knowledge_categories_get",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "App Id"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "default",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_CategoryListResponse_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/cascade/quiesce": {
+      "post": {
+        "tags": [
+          "cascade"
+        ],
+        "summary": "Quiesce",
+        "description": "Drain the projection queue, then stop watcher + scanner + worker.\n\nReturns when the index is a complete projection of the markdown on disk and\nnothing further will rewrite it. That ordering is the point: stopping first\nwould freeze a *partial* index, which reads as a healthy store that quietly\nfails to recall whatever had not been indexed yet.\n\nIdempotent -- a second call reports ``quiesced=false`` rather than failing.",
+        "operationId": "quiesce_api_v2_cascade_quiesce_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuiesceResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddResponseData": {
+        "properties": {
+          "message_count": {
+            "type": "integer",
+            "title": "Message Count"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accumulated",
+              "extracted"
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message_count",
+          "status"
+        ],
+        "title": "AddResponseData"
+      },
+      "Body_create_document_route_api_v1_knowledge_documents_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\w",
+            "title": "Title"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file",
+          "title"
+        ],
+        "title": "Body_create_document_route_api_v1_knowledge_documents_post"
+      },
+      "Body_create_document_route_api_v2_knowledge_documents_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\w",
+            "title": "Title"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file",
+          "title"
+        ],
+        "title": "Body_create_document_route_api_v2_knowledge_documents_post"
+      },
+      "Body_replace_document_route_api_v1_knowledge_documents__doc_id__put": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\w",
+            "title": "Title"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file",
+          "title"
+        ],
+        "title": "Body_replace_document_route_api_v1_knowledge_documents__doc_id__put"
+      },
+      "Body_replace_document_route_api_v2_knowledge_documents__doc_id__put": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\w",
+            "title": "Title"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file",
+          "title"
+        ],
+        "title": "Body_replace_document_route_api_v2_knowledge_documents__doc_id__put"
+      },
+      "CascadeHealthBlock": {
+        "properties": {
+          "healthy": {
+            "type": "boolean",
+            "title": "Healthy"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reasons"
+          },
+          "pending": {
+            "type": "integer",
+            "title": "Pending"
+          },
+          "failed_permanent": {
+            "type": "integer",
+            "title": "Failed Permanent"
+          },
+          "failed_retryable": {
+            "type": "integer",
+            "title": "Failed Retryable"
+          },
+          "drain_consecutive_failures": {
+            "type": "integer",
+            "title": "Drain Consecutive Failures"
+          },
+          "unrecoverable_total": {
+            "type": "integer",
+            "title": "Unrecoverable Total"
+          },
+          "optimize_failure_streak": {
+            "type": "integer",
+            "title": "Optimize Failure Streak"
+          },
+          "prune_stale_seconds": {
+            "type": "number",
+            "title": "Prune Stale Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "healthy",
+          "reasons",
+          "pending",
+          "failed_permanent",
+          "failed_retryable",
+          "drain_consecutive_failures",
+          "unrecoverable_total",
+          "optimize_failure_streak",
+          "prune_stale_seconds"
+        ],
+        "title": "CascadeHealthBlock",
+        "description": "Readiness of the md → LanceDB projection (cascade) subsystem.\n\n``healthy`` reflects **operational** health only — drain loop alive,\noptimize not stuck, version cleanup (prune) not stalled — and is what\nalerting should watch. ``failed_permanent`` (md files awaiting\n``cascade fix``) is a normal data-quality backlog reported as an\ninformational count; it does **not** flip ``healthy``, otherwise the\nsignal would sit red forever."
+      },
+      "CategoryDTO": {
+        "properties": {
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "document_count": {
+            "type": "integer",
+            "title": "Document Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "category_id",
+          "description",
+          "document_count"
+        ],
+        "title": "CategoryDTO",
+        "description": "One taxonomy category."
+      },
+      "CategoryListResponse": {
+        "properties": {
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/CategoryDTO"
+            },
+            "type": "array",
+            "title": "Categories"
+          }
+        },
+        "type": "object",
+        "required": [
+          "categories"
+        ],
+        "title": "CategoryListResponse",
+        "description": "Response for GET /categories."
+      },
+      "ContentItemDTO": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "text",
+              "image",
+              "audio",
+              "doc",
+              "pdf",
+              "html",
+              "email"
+            ],
+            "title": "Type"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uri"
+          },
+          "base64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base64"
+          },
+          "ext": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ext"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "extras": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extras"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "ContentItemDTO",
+        "description": "Content piece (v1 API brief appendix A)."
+      },
+      "DocumentContextDTO": {
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "doc_id",
+          "title",
+          "summary"
+        ],
+        "title": "DocumentContextDTO",
+        "description": "L1 document metadata attached to every search hit."
+      },
+      "DocumentCreateResponse": {
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "topic_count": {
+            "type": "integer",
+            "title": "Topic Count"
+          },
+          "source_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Name"
+          },
+          "md_path": {
+            "type": "string",
+            "title": "Md Path"
+          },
+          "original_file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Original File Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "doc_id",
+          "category_id",
+          "topic_count",
+          "source_name",
+          "md_path",
+          "original_file_path"
+        ],
+        "title": "DocumentCreateResponse",
+        "description": "Response for POST/PUT /documents."
+      },
+      "DocumentDetailResponse": {
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "source_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Name"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "original_file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Original File Path"
+          },
+          "topics": {
+            "items": {
+              "$ref": "#/components/schemas/TopicOverviewDTO"
+            },
+            "type": "array",
+            "title": "Topics"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "doc_id",
+          "category_id",
+          "title",
+          "summary",
+          "source_name",
+          "source_type",
+          "original_file_path",
+          "topics",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "DocumentDetailResponse",
+        "description": "Response for GET /documents/{doc_id}."
+      },
+      "DocumentListResponse": {
+        "properties": {
+          "documents": {
+            "items": {
+              "$ref": "#/components/schemas/DocumentOverviewItemDTO"
+            },
+            "type": "array",
+            "title": "Documents"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          }
+        },
+        "type": "object",
+        "required": [
+          "documents",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "title": "DocumentListResponse",
+        "description": "Response for GET /documents."
+      },
+      "DocumentOverviewItemDTO": {
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "topic_count": {
+            "type": "integer",
+            "title": "Topic Count"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "doc_id",
+          "category_id",
+          "title",
+          "topic_count",
+          "created_at"
+        ],
+        "title": "DocumentOverviewItemDTO",
+        "description": "One row in the paginated document list."
+      },
+      "DocumentPatchRequest": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\w"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "category_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "title": "DocumentPatchRequest",
+        "description": "Request body for PATCH /documents/{doc_id}."
+      },
+      "DocumentPatchResponse": {
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "updated_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Updated Fields"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "doc_id",
+          "updated_fields",
+          "updated_at"
+        ],
+        "title": "DocumentPatchResponse",
+        "description": "Response for PATCH /documents/{doc_id}."
+      },
+      "FilterNode": {
+        "properties": {
+          "AND": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FilterNode"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "And"
+          },
+          "OR": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FilterNode"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Or"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "FilterNode",
+        "description": "One Filters DSL node.\n\nRecursive ``AND`` / ``OR`` arrays mix with arbitrary scalar fields at\nthe same level. Pydantic only checks the combinators; field-level\nsafety is enforced when compiling the node to a LanceDB ``where``\nstring in :mod:`everos.memory.search.filters`."
+      },
+      "FlushResponseData": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "extracted",
+              "no_extraction"
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "FlushResponseData"
+      },
+      "GetAgentCaseItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "task_intent": {
+            "type": "string",
+            "title": "Task Intent"
+          },
+          "approach": {
+            "type": "string",
+            "title": "Approach"
+          },
+          "quality_score": {
+            "type": "number",
+            "title": "Quality Score"
+          },
+          "key_insight": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Insight"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "agent_id",
+          "session_id",
+          "task_intent",
+          "approach",
+          "quality_score",
+          "timestamp"
+        ],
+        "title": "GetAgentCaseItem",
+        "description": "Agent case listing item — always agent-scoped."
+      },
+      "GetAgentSkillItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          },
+          "maturity_score": {
+            "type": "number",
+            "title": "Maturity Score"
+          },
+          "source_case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Case Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "agent_id",
+          "name",
+          "description",
+          "content",
+          "confidence",
+          "maturity_score"
+        ],
+        "title": "GetAgentSkillItem",
+        "description": "Agent skill listing item — always agent-scoped."
+      },
+      "GetData": {
+        "properties": {
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/GetEpisodeItem"
+            },
+            "type": "array",
+            "title": "Episodes"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/GetProfileItem"
+            },
+            "type": "array",
+            "title": "Profiles"
+          },
+          "agent_cases": {
+            "items": {
+              "$ref": "#/components/schemas/GetAgentCaseItem"
+            },
+            "type": "array",
+            "title": "Agent Cases"
+          },
+          "agent_skills": {
+            "items": {
+              "$ref": "#/components/schemas/GetAgentSkillItem"
+            },
+            "type": "array",
+            "title": "Agent Skills"
+          },
+          "total_count": {
+            "type": "integer",
+            "title": "Total Count",
+            "default": 0
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "GetData",
+        "description": "Body of ``response.data``.\n\nAll four arrays are always present so client code can iterate\nwithout branching on ``memory_type``; the route populates exactly\none."
+      },
+      "GetEpisodeItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "sender_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sender Ids"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "episode": {
+            "type": "string",
+            "title": "Episode"
+          },
+          "type": {
+            "type": "string",
+            "const": "Conversation",
+            "title": "Type"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "session_id",
+          "timestamp",
+          "summary",
+          "subject",
+          "episode",
+          "type"
+        ],
+        "title": "GetEpisodeItem",
+        "description": "Episode listing item — always user-scoped."
+      },
+      "GetMemoryType": {
+        "type": "string",
+        "enum": [
+          "episode",
+          "profile",
+          "agent_case",
+          "agent_skill"
+        ],
+        "title": "GetMemoryType",
+        "description": "The four kinds enumerated by ``/get``.\n\n``episode`` and ``profile`` are user-owned; ``agent_case`` and\n``agent_skill`` are agent-owned. Cross-pairs are rejected by\n:meth:`GetRequest._validate_owner_memory_type_pair`.\n\nNaming note: all four values use the bare kind name (no\n``_memory`` suffix) and match the LanceDB table name + everalgo\ntype name for that kind."
+      },
+      "GetProfileItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "profile_data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Profile Data"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "profile_data"
+        ],
+        "title": "GetProfileItem",
+        "description": "Owner profile — at most one per response, only for user owners."
+      },
+      "GetRequest": {
+        "properties": {
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/GetMemoryType"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Page",
+            "default": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "default": 20
+          },
+          "sort_by": {
+            "type": "string",
+            "enum": [
+              "timestamp",
+              "updated_at"
+            ],
+            "title": "Sort By",
+            "default": "timestamp"
+          },
+          "sort_order": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "default": "desc"
+          },
+          "filters": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilterNode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "memory_type"
+        ],
+        "title": "GetRequest",
+        "description": "Request body for ``POST /api/v2/memory/get``.\n\nCallers identify the memory owner via ``user_id`` XOR ``agent_id`` —\nexactly one must be set. Internally the manager keeps using\n``owner_id`` / ``owner_type`` (the storage tables' columns); those\nare exposed as derived properties so the rename only affects the\nwire contract."
+      },
+      "GetResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/GetData"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "GetResponse",
+        "description": "Top-level response envelope."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthCapabilities": {
+        "properties": {
+          "llm": {
+            "type": "boolean",
+            "title": "Llm"
+          },
+          "embed": {
+            "type": "boolean",
+            "title": "Embed"
+          },
+          "rerank": {
+            "type": "boolean",
+            "title": "Rerank"
+          },
+          "multimodal_llm": {
+            "type": "boolean",
+            "title": "Multimodal Llm"
+          },
+          "parser": {
+            "type": "boolean",
+            "title": "Parser"
+          }
+        },
+        "type": "object",
+        "required": [
+          "llm",
+          "embed",
+          "rerank",
+          "multimodal_llm",
+          "parser"
+        ],
+        "title": "HealthCapabilities",
+        "description": "Availability flags for the five capability probes.\n\nField order matches the health-endpoint payload contract; clients\nkey off these names to decide whether to expose optional features."
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/HealthCapabilities"
+          },
+          "disabled_features": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Disabled Features"
+          },
+          "cascade": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CascadeHealthBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "version",
+          "capabilities",
+          "disabled_features"
+        ],
+        "title": "HealthResponse",
+        "description": "Response schema for ``GET /health``.\n\nDeclared as a Pydantic model (not ``dict``) so the generated\nOpenAPI schema carries the full field shape — ``capabilities``,\n``disabled_features`` and ``cascade`` are typed. A bare ``-> dict``\nreturn type degrades the OpenAPI response to\n``additionalProperties: true``, which robs clients (and codegen) of\nany structure to lean on."
+      },
+      "KnowledgeSearchRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Query"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "keyword",
+              "vector",
+              "hybrid"
+            ],
+            "title": "Method",
+            "default": "hybrid"
+          },
+          "top_k": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "default": 10
+          },
+          "score_threshold": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score Threshold"
+          },
+          "include_content": {
+            "type": "boolean",
+            "title": "Include Content",
+            "default": false
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "KnowledgeSearchRequest",
+        "description": "Request body for POST /search."
+      },
+      "KnowledgeSearchResponse": {
+        "properties": {
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDTO"
+            },
+            "type": "array",
+            "title": "Hits"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "took_ms": {
+            "type": "number",
+            "title": "Took Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "hits",
+          "total",
+          "took_ms"
+        ],
+        "title": "KnowledgeSearchResponse",
+        "description": "Response for POST /search."
+      },
+      "MemorizeAddRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Session Id"
+          },
+          "app_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/MessageItemDTO"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Messages"
+          },
+          "defer_extraction": {
+            "type": "boolean",
+            "title": "Defer Extraction",
+            "description": "Persist messages in the durable unprocessed buffer without running boundary detection or extraction. A later /flush commits the batch.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages"
+        ],
+        "title": "MemorizeAddRequest"
+      },
+      "MemorizeFlushRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Session Id"
+          },
+          "app_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "Project Id",
+            "default": "default"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "title": "MemorizeFlushRequest"
+      },
+      "MessageItemDTO": {
+        "properties": {
+          "sender_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "Sender Id"
+          },
+          "sender_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sender Name"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "tool"
+            ],
+            "title": "Role"
+          },
+          "timestamp": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Timestamp",
+            "description": "Message event time as Unix epoch in **milliseconds** (v1 API contract; the algo layer auto-detects sec vs ms for backward compat but the contract is ms)."
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ContentItemDTO"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Content"
+          },
+          "tool_calls": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ToolCallDTO"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Calls"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sender_id",
+          "role",
+          "timestamp",
+          "content"
+        ],
+        "title": "MessageItemDTO"
+      },
+      "QuiesceResponse": {
+        "properties": {
+          "quiesced": {
+            "type": "boolean",
+            "title": "Quiesced"
+          },
+          "drained": {
+            "type": "integer",
+            "title": "Drained"
+          },
+          "pending_before": {
+            "type": "integer",
+            "title": "Pending Before"
+          },
+          "pending_after": {
+            "type": "integer",
+            "title": "Pending After"
+          },
+          "failed_permanent": {
+            "type": "integer",
+            "title": "Failed Permanent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "quiesced",
+          "drained",
+          "pending_before",
+          "pending_after",
+          "failed_permanent"
+        ],
+        "title": "QuiesceResponse",
+        "description": "What the final drain accomplished, and what it left behind.\n\n``pending_before`` is the queue depth on arrival: a caller that expected the\nprojection to be up to date can assert it was 0 and learn otherwise. Anything\nabove 0 in ``pending_after`` means the drain could not finish -- the index is\nNOT a complete projection of the markdown, and searching it will silently\nunder-recall."
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "status"
+        ],
+        "title": "RunSummary",
+        "description": "One strategy run within a trigger response."
+      },
+      "SearchAgentCaseItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "task_intent": {
+            "type": "string",
+            "title": "Task Intent"
+          },
+          "approach": {
+            "type": "string",
+            "title": "Approach"
+          },
+          "quality_score": {
+            "type": "number",
+            "title": "Quality Score"
+          },
+          "key_insight": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Insight"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "agent_id",
+          "session_id",
+          "task_intent",
+          "approach",
+          "quality_score",
+          "timestamp",
+          "score"
+        ],
+        "title": "SearchAgentCaseItem",
+        "description": "Agent case hit — always agent-scoped."
+      },
+      "SearchAgentSkillItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          },
+          "maturity_score": {
+            "type": "number",
+            "title": "Maturity Score"
+          },
+          "source_case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Case Ids"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "agent_id",
+          "name",
+          "description",
+          "content",
+          "confidence",
+          "maturity_score",
+          "score"
+        ],
+        "title": "SearchAgentSkillItem",
+        "description": "Agent skill hit — always agent-scoped."
+      },
+      "SearchAtomicFactItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "content",
+          "score"
+        ],
+        "title": "SearchAtomicFactItem",
+        "description": "A single atomic fact nested inside its parent episode."
+      },
+      "SearchData": {
+        "properties": {
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/SearchEpisodeItem"
+            },
+            "type": "array",
+            "title": "Episodes"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/SearchProfileItem"
+            },
+            "type": "array",
+            "title": "Profiles"
+          },
+          "agent_cases": {
+            "items": {
+              "$ref": "#/components/schemas/SearchAgentCaseItem"
+            },
+            "type": "array",
+            "title": "Agent Cases"
+          },
+          "agent_skills": {
+            "items": {
+              "$ref": "#/components/schemas/SearchAgentSkillItem"
+            },
+            "type": "array",
+            "title": "Agent Skills"
+          },
+          "unprocessed_messages": {
+            "items": {
+              "$ref": "#/components/schemas/UnprocessedMessageDTO"
+            },
+            "type": "array",
+            "title": "Unprocessed Messages"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SearchData",
+        "description": "Body of ``response.data``.\n\nAll five arrays are always present so client code can iterate without\nbranching on ``owner_type``. Routes not applicable to the request's\nowner type stay as ``[]``. ``unprocessed_messages`` is filled only\nwhen ``filters.session_id`` is present as a top-level eq scalar —\nin-flight buffer rows are scope-tagged but unattributed (no\n``user_id``), so session is the only meaningful query dimension."
+      },
+      "SearchEpisodeItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "sender_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sender Ids"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "episode": {
+            "type": "string",
+            "title": "Episode"
+          },
+          "type": {
+            "type": "string",
+            "const": "Conversation",
+            "title": "Type"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "atomic_facts": {
+            "items": {
+              "$ref": "#/components/schemas/SearchAtomicFactItem"
+            },
+            "type": "array",
+            "title": "Atomic Facts"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "timestamp",
+          "summary",
+          "subject",
+          "episode",
+          "type",
+          "score"
+        ],
+        "title": "SearchEpisodeItem",
+        "description": "Episode hit — always user-scoped in the current emission contract.\n\n``type`` is narrowed to ``\"Conversation\"`` because the only emitted\nepisode shape today is conversation-derived; widen when other\nsources ship. Item kind is encoded by class name (no ``owner_type``\nfield on the wire), so episode results never carry ambiguity."
+      },
+      "SearchHitDTO": {
+        "properties": {
+          "topic_id": {
+            "type": "string",
+            "title": "Topic Id"
+          },
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "topic_name": {
+            "type": "string",
+            "title": "Topic Name"
+          },
+          "topic_path": {
+            "type": "string",
+            "title": "Topic Path"
+          },
+          "depth": {
+            "type": "integer",
+            "title": "Depth"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "retrieval_method": {
+            "type": "string",
+            "title": "Retrieval Method"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "document": {
+            "$ref": "#/components/schemas/DocumentContextDTO"
+          }
+        },
+        "type": "object",
+        "required": [
+          "topic_id",
+          "category_id",
+          "topic_name",
+          "topic_path",
+          "depth",
+          "summary",
+          "content",
+          "score",
+          "retrieval_method",
+          "source",
+          "document"
+        ],
+        "title": "SearchHitDTO",
+        "description": "One ranked result from knowledge search."
+      },
+      "SearchMethod": {
+        "type": "string",
+        "enum": [
+          "keyword",
+          "vector",
+          "hybrid",
+          "agentic",
+          "llm_multiround"
+        ],
+        "title": "SearchMethod",
+        "description": "Public method enum. RRF / LR / vector_anchored are hidden under HYBRID."
+      },
+      "SearchProfileItem": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "profile_data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Profile Data"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "profile_data"
+        ],
+        "title": "SearchProfileItem",
+        "description": "Owner profile — at most one per response, only for user owners.\n\n``score`` is ``None`` for direct fetches (``include_profile=true``\non its own does no ranking); a future query-aware lookup may fill\nit in."
+      },
+      "SearchRequest": {
+        "properties": {
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Query"
+          },
+          "method": {
+            "$ref": "#/components/schemas/SearchMethod",
+            "default": "hybrid"
+          },
+          "top_k": {
+            "type": "integer",
+            "title": "Top K",
+            "default": -1
+          },
+          "radius": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Radius"
+          },
+          "min_score": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Score"
+          },
+          "include_profile": {
+            "type": "boolean",
+            "title": "Include Profile",
+            "default": false
+          },
+          "enable_llm_rerank": {
+            "type": "boolean",
+            "title": "Enable Llm Rerank",
+            "description": "Opt-in LLM rerank pass for HYBRID. Applies to agent_case and agent_skill fusion only; the episode hybrid path has built-in fact eviction and ignores this flag. Ignored by keyword / vector / agentic.",
+            "default": false
+          },
+          "filters": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilterNode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest",
+        "description": "Request body for ``POST /api/v2/memory/search``.\n\nCallers identify the memory owner via ``user_id`` XOR ``agent_id`` —\nexactly one must be set. Internally the manager + compile_filters keep\nusing ``owner_id`` / ``owner_type`` (the storage tables' columns);\nthose are exposed as derived properties so the rename only affects\nthe wire contract, not the internal recall plumbing."
+      },
+      "SearchResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/SearchData"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SearchResponse",
+        "description": "Top-level response envelope."
+      },
+      "SuccessEnvelope_AddResponseData_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/AddResponseData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[AddResponseData]"
+      },
+      "SuccessEnvelope_CategoryListResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/CategoryListResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[CategoryListResponse]"
+      },
+      "SuccessEnvelope_DocumentCreateResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DocumentCreateResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[DocumentCreateResponse]"
+      },
+      "SuccessEnvelope_DocumentDetailResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DocumentDetailResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[DocumentDetailResponse]"
+      },
+      "SuccessEnvelope_DocumentListResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DocumentListResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[DocumentListResponse]"
+      },
+      "SuccessEnvelope_DocumentPatchResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DocumentPatchResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[DocumentPatchResponse]"
+      },
+      "SuccessEnvelope_FlushResponseData_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/FlushResponseData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[FlushResponseData]"
+      },
+      "SuccessEnvelope_KnowledgeSearchResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/KnowledgeSearchResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[KnowledgeSearchResponse]"
+      },
+      "SuccessEnvelope_TopicDetailResponse_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/TopicDetailResponse"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[TopicDetailResponse]"
+      },
+      "ToolCallDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "default": "function"
+          },
+          "function": {
+            "$ref": "#/components/schemas/ToolFunctionDTO"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "function"
+        ],
+        "title": "ToolCallDTO"
+      },
+      "ToolFunctionDTO": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "arguments": {
+            "type": "string",
+            "title": "Arguments"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "title": "ToolFunctionDTO"
+      },
+      "TopicDetailResponse": {
+        "properties": {
+          "topic_id": {
+            "type": "string",
+            "title": "Topic Id"
+          },
+          "doc_id": {
+            "type": "string",
+            "title": "Doc Id"
+          },
+          "category_id": {
+            "type": "string",
+            "title": "Category Id"
+          },
+          "topic_name": {
+            "type": "string",
+            "title": "Topic Name"
+          },
+          "topic_path": {
+            "type": "string",
+            "title": "Topic Path"
+          },
+          "depth": {
+            "type": "integer",
+            "title": "Depth"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "content_labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Content Labels"
+          },
+          "parent_topic_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Topic Id"
+          },
+          "children_topic_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Children Topic Ids"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "topic_id",
+          "doc_id",
+          "category_id",
+          "topic_name",
+          "topic_path",
+          "depth",
+          "summary",
+          "content",
+          "content_labels",
+          "parent_topic_id",
+          "children_topic_ids",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "TopicDetailResponse",
+        "description": "Response for GET /topics/{topic_id}."
+      },
+      "TopicOverviewDTO": {
+        "properties": {
+          "topic_id": {
+            "type": "string",
+            "title": "Topic Id"
+          },
+          "topic_name": {
+            "type": "string",
+            "title": "Topic Name"
+          },
+          "topic_path": {
+            "type": "string",
+            "title": "Topic Path"
+          },
+          "depth": {
+            "type": "integer",
+            "title": "Depth"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary"
+          }
+        },
+        "type": "object",
+        "required": [
+          "topic_id",
+          "topic_name",
+          "topic_path",
+          "depth",
+          "summary"
+        ],
+        "title": "TopicOverviewDTO",
+        "description": "Minimal topic summary inside a document detail."
+      },
+      "TriggerRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "default": 120.0
+          },
+          "force": {
+            "type": "boolean",
+            "title": "Force",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TriggerRequest",
+        "description": "Request body for ``POST /api/v2/ome/trigger``."
+      },
+      "TriggerResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "dispatched": {
+            "type": "integer",
+            "title": "Dispatched"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "type": "array",
+            "title": "Runs",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "name",
+          "dispatched"
+        ],
+        "title": "TriggerResponse",
+        "description": "Response body for ``POST /api/v2/ome/trigger``.\n\n``status`` distinguishes three outcomes that were previously masked as\na single ``ok``:\n\n- ``ok``: at least one strategy was dispatched and all runs settled\n  within ``timeout``. Individual run outcomes are in ``runs`` (a\n  ``dead_letter`` there is still ``ok`` at this level — the strategy\n  *ran*, it just failed permanently).\n- ``timeout``: at least one strategy was dispatched but the engine did\n  not go idle within ``timeout``. Runs may be partially complete;\n  poll ``GET /health`` for cascade convergence separately.\n- ``not_dispatched``: no strategy was dispatched — the subscriber was\n  rejected by one of the dispatch gates (``_routes_to`` / ``enabled`` /\n  ``applies_to`` / ``Counter``). Common cause: forgetting\n  ``force=true`` on a strategy that is ``enabled=false`` in ome.toml."
+      },
+      "UnprocessedMessageDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "sender_id": {
+            "type": "string",
+            "title": "Sender Id"
+          },
+          "sender_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sender Name"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "tool"
+            ],
+            "title": "Role"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Content"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp"
+          },
+          "tool_calls": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Calls"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "sender_id",
+          "role",
+          "content",
+          "timestamp"
+        ],
+        "title": "UnprocessedMessageDTO",
+        "description": "A raw message still in the boundary-detection buffer.\n\nNo extracted memcell yet, no owner inference yet (attribution\nhappens at boundary detection). Returned by ``/search`` **only when**\n``filters.session_id`` is present as a top-level eq predicate —\nunprocessed messages have no ``user_id`` / ``agent_id`` to filter\non, so session is the only meaningful query dimension."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

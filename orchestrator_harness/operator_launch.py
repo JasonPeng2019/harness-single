@@ -372,7 +372,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review_selector = review_parser.add_mutually_exclusive_group(required=True)
     review_selector.add_argument("--event-id")
     review_selector.add_argument("--lane-id")
-    review_parser.add_argument("--review-outcome", required=True, choices=["PASS", "FAIL", "BLOCKED"])
+    review_parser.add_argument("--review-outcome", required=True, choices=["PASS", "FAIL", "BLOCKED", "UNKNOWN"])
     review_parser.add_argument("--approval", required=True, choices=["ACCEPTED", "REJECTED"])
     review_parser.add_argument("--review-summary", required=True)
     review_parser.add_argument("--evidence", action="append", default=[])

@@ -1,0 +1,276 @@
+name: release
+run-name: Release ${{ inputs.working-directory }} by @${{ github.actor }}
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+        description: "From which folder this pipeline executes"
+  workflow_dispatch:
+    inputs:
+      working-directory:
+        required: true
+        type: choice
+        options:
+          - libs/langchain-mongodb
+          - libs/langgraph-checkpoint-mongodb
+          - libs/langgraph-store-mongodb
+          - libs/langchain-mongodb-deepagents-vfs
+        default: libs/langchain-mongodb
+        description: "From which folder this pipeline executes"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    outputs:
+      pkg-name: ${{ steps.check-version.outputs.pkg-name }}
+      version: ${{ steps.check-version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # We want to keep this build stage *separate* from the release stage,
+      # so that there's no sharing of permissions between them.
+      # The release stage has trusted publishing and GitHub repo contents write access,
+      # and we want to keep the scope of that access limited just to the release job.
+      # Otherwise, a malicious `build` step (e.g. via a compromised dependency)
+      # could get access to our GitHub or PyPI credentials.
+      #
+      # Per the trusted publishing GitHub Action:
+      # > It is strongly advised to separate jobs for building [...]
+      # > from the publish job.
+      # https://github.com/pypa/gh-action-pypi-publish#non-goals
+      - name: Validate pyproject.toml
+        run: uvx --from 'validate-pyproject[all]' validate-pyproject pyproject.toml
+
+      - name: Build project for distribution
+        run: uv build
+
+      # Local stand-in for the metadata validation the TestPyPI round-trip used
+      # to provide. twine <7 cannot parse Metadata-Version 2.5, which hatchling
+      # now emits, so the floor is required.
+      - name: Check distribution metadata
+        run: uvx --from 'twine>=7' twine check --strict dist/*
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: ${{ inputs.working-directory }}/dist/
+
+      - name: Check Version
+        id: check-version
+        shell: bash
+        run: |
+          set -eu
+          echo pkg-name="$(uvx hatch project metadata | jq -r .name)" >> $GITHUB_OUTPUT
+          echo version="$(uvx hatch version)" >> $GITHUB_OUTPUT
+
+  pre-release-checks:
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # We explicitly *don't* set up caching here. This ensures our tests are
+      # maximally sensitive to catching breakage.
+      #
+      # For example, here's a way that caching can cause a falsely-passing test:
+      # - Make the langchain package manifest no longer list a dependency package
+      #   as a requirement. This means it won't be installed by `pip install`,
+      #   and attempting to use it would cause a crash.
+      # - That dependency used to be required, so it may have been cached.
+      #   When restoring the venv packages from cache, that dependency gets included.
+      # - Tests pass, because the dependency is present even though it wasn't specified.
+      # - The package is published, and it breaks on the missing dependency when
+      #   used in the real world.
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: ${{ inputs.working-directory }}/dist/
+
+      - name: Import built package
+        shell: bash
+        env:
+          PKG_NAME: ${{ needs.build.outputs.pkg-name }}
+        # The built wheel is installed straight from the `dist` artifact rather
+        # than round-tripped through an index. Dependencies still resolve from
+        # real PyPI, so this is a closer match to what a consumer gets than the
+        # previous TestPyPI/PyPI hybrid.
+        run: |
+          uv run pip install dist/*.whl
+
+          # For langchain-mongodb, replace dashes in the package name with underscores.
+          IMPORT_NAME="${PKG_NAME//-/_}"
+          # If langgraph*, it's a namespace package =>  /-/.
+          [[ "$PKG_NAME" == langgraph* ]] && IMPORT_NAME="${PKG_NAME//-/.}"
+
+          uv run python -c "import $IMPORT_NAME; print(dir($IMPORT_NAME))"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Import test dependencies
+        run: just install
+
+      # `just install` puts an editable install of the local source in place;
+      # overwrite it so the tests run against the built artifact.
+      - name: Reinstall built package over the editable install
+        run: uv run pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Start local Atlas
+        working-directory: .
+        run: bash scripts/start_local_atlas.sh
+
+      # just's dotenv-load only applies inside just's own process, so steps
+      # that call uv directly (the minimum-dependency-versions step below)
+      # never see the dynamic port start_local_atlas.sh assigned. Exporting
+      # it to $GITHUB_ENV makes it visible to every step in this job.
+      - name: Export local Atlas connection string
+        working-directory: .
+        run: cat .local_atlas_uri >> "$GITHUB_ENV"
+
+      - name: Run unit tests
+        run: just unit_tests
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Run Ollama
+        working-directory: .
+        run: |
+          ollama serve &
+          sleep 5    # wait for the Ollama server to be ready
+          bash scripts/setup_ollama.sh
+
+      - name: Run integration tests
+        run: just integration_tests
+
+      - name: Run unit tests with minimum dependency versions
+        run: |
+          uv sync --python=${PYTHON_VERSION} --resolution=lowest-direct
+          # Deliberately not `just unit_tests`: that recipe is `uv run pytest`,
+          # and `uv run` re-syncs from the lockfile, silently discarding the
+          # lowest-direct resolution above ("Ignoring existing lockfile due to
+          # change in resolution mode"). --no-sync is what makes this step
+          # actually test minimum versions.
+          uv pip list
+          uv run --no-sync pytest tests/unit_tests
+
+  publish:
+    needs:
+      - build
+      - pre-release-checks
+    runs-on: ubuntu-latest
+    permissions:
+      # This permission is used for trusted publishing:
+      # https://blog.pypi.org/posts/2023-04-20-introducing-trusted-publishers/
+      #
+      # Trusted publishing has to also be configured on PyPI for each package:
+      # https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: ${{ inputs.working-directory }}/dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: ${{ inputs.working-directory }}/dist/
+          verbose: true
+          print-hash: true
+          # Temp workaround since attestations are on by default as of gh-action-pypi-publish v1\.11\.0
+          attestations: false
+
+  mark-release:
+    needs:
+      - build
+      - pre-release-checks
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      # This permission is needed by `ncipollo/release-action` to
+      # create the GitHub release.
+      contents: write
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: ${{ inputs.working-directory }}/dist/
+
+      - name: Create Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1
+        id: create-release
+        with:
+          artifacts: "${{ inputs.working-directory }}/dist/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          generateReleaseNotes: true
+          tag: ${{ inputs.working-directory }}/v${{ needs.build.outputs.version }}
+          commit: main
+
+      - name: Add github release url to summary
+        env:
+          RELEASE_URL: ${{ steps.create-release.outputs.html_url }}
+        run: |
+          echo "GitHub Release: ${RELEASE_URL}" >> $GITHUB_STEP_SUMMARY

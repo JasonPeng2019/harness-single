@@ -1,0 +1,23 @@
+__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.mypy_cache_test
+.env
+.venv*
+.local_atlas_uri
+.ipynb_checkpoints
+docs/langchain_mongodb
+docs/langgraph_checkpoint_mongodb
+docs/langgraph_store_mongodb
+docs/langchain_mongodb_deepagents_vfs
+docs/index.md
+mongo-e2e-*.log
+libs/langchain-mongodb-deepagents-vfs/demo/*
+
+# Editor / IDE project files
+.idea/
+.vscode/
+.cursor/
+.cursorignore
+.cursorindexingignore

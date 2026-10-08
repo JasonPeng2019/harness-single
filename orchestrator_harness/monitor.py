@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import processes, terminal_evidence
+from .activity_log import append_activity
 from .config import (
     compute_config_identity,
     find_harness_root,
@@ -81,7 +82,7 @@ def _read_acceptance_chain(
     lane: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the acceptance decision when a complete linked pair exists."""
-    folder = lane_record_dir(rt, epoch_id, lane_id)
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane) if lane is not None else lane_record_dir(rt, epoch_id, lane_id)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -100,6 +101,15 @@ def _read_acceptance_chain(
         run_id=lane.get("run_id") if lane is not None else None,
     ):
         return None
+    if lane is not None and lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane_id, run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return None
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            return None
     return acceptance
 
 
@@ -218,7 +228,7 @@ def _valid_current_result(lane: dict[str, Any]) -> bool:
 def _review_pair_is_valid(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -230,25 +240,41 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    return validate_acceptance_chain(
+    valid = validate_acceptance_chain(
         review,
         acceptance,
         lane_id=lane["lane_id"],
         run_id=lane.get("run_id"),
     )
+    if not valid or lane.get("memory_plan_state") != "execution_accepted":
+        return valid
+    try:
+        terminal = terminal_evidence.read_terminal_evidence(
+            rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+        )
+    except terminal_evidence.TerminalEvidenceError:
+        return False
+    return terminal is not None and terminal["review"] == review and terminal["acceptance"] == acceptance
 
 
 def _recover_broken_review_pair(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
     """Remove a broken pair and leave the lane awaiting a fresh review."""
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     with RecordLock(review_path):
         if not (review_path.exists() or acceptance_path.exists()):
             return False
         if _review_pair_is_valid(rt, epoch_id, lane):
+            return False
+        # An enhanced parent's partially published review may be completed by
+        # an exact retry. Its existing bytes are also the conflict witness if
+        # they disagree with that retry, so recovery must not remove them.
+        if lane.get("memory_plan_state") == "execution_accepted" or (
+            folder / "NATIVE_TERMINAL_EVIDENCE.json"
+        ).exists():
             return False
         for path in (review_path, acceptance_path):
             try:
@@ -282,7 +308,13 @@ def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
         return False
     for event in queue.get("events", []):
         if (
-            event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+            (
+                event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+                or (
+                    event.get("type") == "LANE_STATUS_CHANGED"
+                    and event.get("actionable_status") == "provider_exited_no_result"
+                )
+            )
             and event.get("lane_id") == lane.get("lane_id")
             and event.get("run_id") == lane.get("run_id")
             and event.get("state") in {"PENDING", "ACKNOWLEDGED"}
@@ -294,8 +326,45 @@ def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
 def _recover_lost_review_event(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Restore one review request when a valid result has no open request."""
-    if lane.get("lifecycle") != "review_pending" or not _valid_current_result(lane):
+    """Restore one review request when valid work has no open request."""
+    lifecycle = lane.get("lifecycle")
+    if lifecycle not in {"review_pending", "result_invalid"}:
+        return []
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    result_path = Path(lane.get("result_path") or Path(lane["worktree_path"]) / "RESULT.json")
+    retained_unknown = False
+    if (
+        lane.get("memory_plan_state") == "execution_accepted"
+        and not result_path.exists()
+        and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
+        and (folder / "COMPLETION_REVIEW.json").is_file()
+        and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+    ):
+        try:
+            review = read_json(folder / "COMPLETION_REVIEW.json")
+            terminal = read_json(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+            terminal_evidence.validate_terminal_evidence(
+                terminal, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+            if folder != lane_record_dir(rt, epoch_id, lane["lane_id"]):
+                terminal_evidence.validate_root_siblings(
+                    rt, epoch_id, lane["lane_id"], lane["run_id"], terminal,
+                )
+            retained_unknown = (
+                terminal["epoch_id"] == epoch_id
+                and terminal["review"] == review
+                and review.get("review_outcome") == "UNKNOWN"
+                and terminal["result"] is None
+                and validate_acceptance_chain(
+                    review, terminal["acceptance"],
+                    lane_id=lane["lane_id"], run_id=lane["run_id"],
+                )
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if lifecycle == "result_invalid" and not retained_unknown:
+        return []
+    if not (_valid_current_result(lane) or retained_unknown):
         return []
     if _review_pair_is_valid(rt, epoch_id, lane):
         return []
@@ -489,16 +558,33 @@ def _consume_outbox(
     workspace = Path(lane["worktree_path"]) / ".agent-workspace"
     outbox = workspace / "manager-notifications"
     processed = workspace / "processed-notifications"
+    append_activity(
+        rt,
+        "outbox.scan",
+        epoch_id=epoch_id,
+        lane_id=lane.get("lane_id"),
+        path=str(outbox),
+        exists=outbox.is_dir(),
+    )
     if not outbox.is_dir():
         return diagnostics
     for path in sorted(outbox.iterdir()):
         if not path.is_file():
             continue
+        append_activity(
+            rt, "outbox.item.started", epoch_id=epoch_id,
+            lane_id=lane.get("lane_id"), path=str(path),
+        )
         try:
             notice = read_json(path)
         except (OSError, ValueError) as exc:
             diagnostics.append(
                 {"kind": "outbox_inspection", "path": str(path), "error": str(exc)}
+            )
+            append_activity(
+                rt, "outbox.item.failed", epoch_id=epoch_id,
+                lane_id=lane.get("lane_id"), path=str(path),
+                error_type=type(exc).__name__,
             )
             continue
         if not isinstance(notice, dict):
@@ -516,7 +602,7 @@ def _consume_outbox(
         notice_id = str(notice.get("notice_id") or path.stem)
         signal_id = str(notice.get("signal_id") or notice_id)
         try:
-            promote_event(
+            event = promote_event(
                 rt,
                 event_type="LANE_STATUS_CHANGED",
                 lane_id=lane["lane_id"],
@@ -533,15 +619,29 @@ def _consume_outbox(
                 },
                 dedup_key=f"worker-notice:{lane['lane_id']}:{lane.get('run_id', '')}:{signal_id}",
             )
+            append_activity(
+                rt, "outbox.item.promoted", epoch_id=epoch_id,
+                lane_id=lane.get("lane_id"), signal_id=signal_id,
+                event_id=event.get("event_id"),
+            )
         except Exception as exc:
             diagnostics.append(
                 {"kind": "outbox_promotion", "path": str(path), "error": str(exc)}
+            )
+            append_activity(
+                rt, "outbox.item.failed", epoch_id=epoch_id,
+                lane_id=lane.get("lane_id"), path=str(path),
+                error_type=type(exc).__name__,
             )
             # The source remains in the outbox for the next monitor pass.
             continue
         try:
             processed.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(processed / path.name))
+            append_activity(
+                rt, "outbox.item.archived", epoch_id=epoch_id,
+                lane_id=lane.get("lane_id"), path=str(processed / path.name),
+            )
         except OSError as exc:
             diagnostics.append(
                 {"kind": "outbox_archive", "path": str(path), "error": str(exc)}
@@ -568,7 +668,7 @@ def _promote_status(rt: Path, epoch_id: str, lane: dict[str, Any], status: str) 
         "provider_exited_no_result": "error",
         "orphaned_lease": "error",
     }.get(status, "warning")
-    promote_event(
+    event = promote_event(
         rt,
         event_type=event_type,
         lane_id=lane["lane_id"],
@@ -580,6 +680,11 @@ def _promote_status(rt: Path, epoch_id: str, lane: dict[str, Any], status: str) 
         data={"lane_id": lane["lane_id"], "run_id": lane.get("run_id", "")},
         dedup_key=f"lane-status:{lane['lane_id']}:{lane.get('run_id', '')}:{status}",
     )
+    append_activity(
+        rt, "lane.status.promoted", epoch_id=epoch_id,
+        lane_id=lane["lane_id"], run_id=lane.get("run_id", ""),
+        status=status, event_id=event.get("event_id"),
+    )
 
 
 def _monitor_pass(
@@ -588,6 +693,9 @@ def _monitor_pass(
     diagnostics: list[dict[str, Any]] = []
     marker = read_current_epoch(rt)
     if marker is None:
+        append_activity(
+            rt, "epoch.unavailable", marker_exists=current_epoch_path(rt).exists()
+        )
         if current_epoch_path(rt).exists():
             return 0, [
                 {
@@ -603,11 +711,20 @@ def _monitor_pass(
     except (OSError, ValueError) as exc:
         return 0, [{"kind": "epoch_inspection", "error": str(exc)}]
     if state.get("lifecycle") != "active":
+        append_activity(
+            rt, "epoch.inactive", epoch_id=epoch_id,
+            lifecycle=state.get("lifecycle"),
+        )
         return 0, diagnostics
     managed = state.get("lane_mode") == "managed"
     lanes = reconcile_active_lanes(rt, epoch_id)
     retained = _retained_lanes(rt, epoch_id)
     orphaned = _discover_orphaned_leases(rt, epoch_id, retained)
+    append_activity(
+        rt, "epoch.scanned", epoch_id=epoch_id, managed=managed,
+        active_lanes=len(lanes), retained_lanes=len(retained),
+        orphaned_leases=len(orphaned),
+    )
     for entry in lanes:
         lane_id = entry["lane_id"]
         try:
@@ -634,6 +751,12 @@ def _monitor_pass(
             lane,
             status,
             orphaned_leases=orphaned,
+        )
+        append_activity(
+            rt, "lane.scanned", epoch_id=epoch_id, lane_id=lane_id,
+            run_id=lane.get("run_id", ""), lifecycle=lane.get("lifecycle"),
+            controller_status=(status or {}).get("recorded_status"),
+            derived_status=derived,
         )
         if managed:
             diagnostics.extend(_consume_outbox(rt, epoch_id, lane))
@@ -675,6 +798,10 @@ def _monitor_pass(
                     data=lease,
                     dedup_key=f"orphan-lease:{resource_id}",
                 )
+                append_activity(
+                    rt, "lease.orphan.promoted", epoch_id=epoch_id,
+                    resource_id=resource_id, lane_id=lease.get("lane_id"),
+                )
             except Exception as exc:
                 diagnostics.append(
                     {
@@ -699,22 +826,35 @@ def _heartbeat(
         except (OSError, ValueError):
             record = None
         if record is None:
+            append_activity(rt, "heartbeat.skipped", reason="monitor_record_missing")
             return
         if record.get("config_identity") != config_identity:
+            append_activity(rt, "heartbeat.skipped", reason="config_identity_mismatch")
             return
         record["health"] = "degraded" if diagnostics else "healthy"
         record["last_heartbeat_at"] = iso_utc()
         record["watched_lane_count"] = watched_lane_count
         record["diagnostics"] = list(diagnostics or [])
         atomic_write_json(record_path, record)
+    append_activity(
+        rt, "heartbeat.written", health=record["health"],
+        watched_lane_count=watched_lane_count,
+        diagnostic_count=len(record["diagnostics"]),
+    )
 
 
 def run_monitor_once(rt: Path, config_identity: str) -> None:
+    append_activity(rt, "pass.started", config_identity=config_identity)
     try:
         watched_lane_count, diagnostics = _monitor_pass(rt, config_identity)
     except Exception as exc:
         watched_lane_count, diagnostics = 0, [{"kind": "monitor_pass", "error": str(exc)}]
+        append_activity(rt, "pass.failed", error_type=type(exc).__name__)
     _heartbeat(rt, config_identity, watched_lane_count, diagnostics)
+    append_activity(
+        rt, "pass.completed", watched_lane_count=watched_lane_count,
+        diagnostic_count=len(diagnostics),
+    )
 
 
 def main() -> int:
@@ -727,13 +867,18 @@ def main() -> int:
     except Exception as exc:
         return 1
     rt = config.runtime_root
+    append_activity(
+        rt, "process.started", config_identity=config_identity,
+        pass_interval_seconds=PASS_INTERVAL_SECONDS,
+    )
     while True:
         try:
             run_monitor_once(rt, config_identity)
-        except Exception:
-            pass
+        except Exception as exc:
+            append_activity(rt, "process.loop.failed", error_type=type(exc).__name__)
         record = read_monitor_record(rt)
         if record is not None and record.get("stop_requested", False):
+            append_activity(rt, "process.stop_requested")
             record_path = monitor_record_path(rt)
             with RecordLock(record_path):
                 try:
@@ -743,6 +888,7 @@ def main() -> int:
                 if current is not None and current.get("stop_requested", False):
                     current["health"] = "STOPPED"
                     atomic_write_json(record_path, current)
+            append_activity(rt, "process.stopped")
             return 0
         time.sleep(PASS_INTERVAL_SECONDS)
 

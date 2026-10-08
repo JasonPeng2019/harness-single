@@ -1,0 +1,342 @@
+[project]
+name = "everos"
+version = "1.3.1"
+description = "EverOS — local-first markdown memory framework for AI agents and user chats; lightweight, dev-friendly, small-team"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    {name = "EverMind AI"},
+]
+keywords = ["memory", "ai-agent", "markdown", "lancedb", "rag", "everos"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    # Core data validation & config
+    "pydantic>=2.7.1",
+    "pydantic-settings>=2.0.0",
+
+    # Storage stack (md-first three-piece set)
+    # Upper bound: 0.35.0 embeds lance-rust v9 (large storage/encoding jump, not
+    # yet stable-released). 0.32-0.34 carry a compaction offset-overflow regression
+    # (lance-format/lance#7653); we run 0.34.0 safely via the with_position=False
+    # FTS workaround. Do not float past 0.34.x until 0.35 has been validated under
+    # sustained churn (bounded + reclaimable index dir, no compaction crash) — see
+    # docs/cascade_runbook.md. Never widen this floor back below 0.34 (older lance
+    # cannot read v8 data).
+    "lancedb>=0.34.0,<0.35.0",    # Vector + BM25 + scalar filter (Arrow-based)
+    "aiosqlite>=0.20.0",          # Async SQLite driver (used by SA async engine)
+    "sqlmodel>=0.0.22",           # ORM (Pydantic + SQLAlchemy 2.0 async)
+    "alembic>=1.13.0",            # SQLite schema migrations
+    "greenlet>=3.0",              # Required by SQLAlchemy async
+
+    # LLM & embedding (one provider per file pattern)
+    "openai>=1.0.0",
+
+    # Markdown / file system
+    "PyYAML>=6.0",                # YAML frontmatter parsing
+    "watchdog>=4.0.0",            # Cross-platform file system events (cascade daemon)
+
+    # Web framework (entrypoints/api)
+    "fastapi>=0.104.0",
+    "python-multipart>=0.0.7",    # Required by FastAPI for Form / UploadFile endpoints
+    "uvicorn[standard]>=0.24.0",
+
+    # Observability (core/observability)
+    "structlog>=24.0.0",
+    "prometheus-client>=0.20.0",
+
+    # CLI + TUI
+    "typer>=0.12.0",
+    # click is a transitive dep of uvicorn today, but our CLI raises
+    # ``click.exceptions.Abort`` directly (e.g. tests that inject aborts)
+    # and typer 0.15+ vendored a copy of click under ``typer._click`` — so
+    # the two classes are DIFFERENT even though users only ever see
+    # ``typer.Abort``. We depend on the standalone click package so
+    # ``click.exceptions.Abort`` stays importable and both classes are
+    # covered in the Ctrl-C catch (see backfill exit-130 path).
+    "click>=8.1",
+    "textual>=8.2.7",
+
+    # Tokenization (BM25 Chinese support)
+    "jieba>=0.42.1,<1.0",
+
+    # OME (Offline Memory Evolution) async scheduler & file I/O
+    "apscheduler>=3.10.4,<4.0",   # async strategy scheduler chassis
+    "portalocker>=2.8.2",          # cross-platform file lock for single-engine guard
+    "watchfiles>=0.21.0",          # native fs watcher for config hot reload
+    "anyio>=4.0",                  # Async file I/O (anyio.Path, to_thread.run_sync) for the markdown layer
+
+    # Algorithm library (everalgo monorepo, published on PyPI).
+    "everalgo-user-memory==0.4.0",
+    "everalgo-agent-memory==0.4.0",
+    "everalgo-rank==0.4.1",
+    "everalgo-knowledge==0.1.1",
+
+    # everalgo's own transitive layer, pinned to what this repo's uv.lock —
+    # and therefore the whole test suite — actually resolves. The packages
+    # above declare it as `>=0.2.0,<2.0.0`, treating a 0.x line as if a major
+    # bump were the only breaking one, so a fresh `pip install everos` picks
+    # up releases the suite has never run against. That is not theoretical:
+    # everalgo-boundary 0.3.0 added a third required field to the public
+    # `DetectionResult` NamedTuple while everalgo-agent-memory 0.4.0 still
+    # builds it with two, so `POST /add` answered 500 on a default
+    # (`memorize.mode = "agent"`) install of 1.2.3 while every local suite
+    # stayed green on the locked 0.2.1. Raise these deliberately, together
+    # with a run of the release smoke against a PyPI-resolved install.
+    "everalgo-boundary==0.2.1",
+    "everalgo-core==0.3.0",
+    "everalgo-clustering==0.2.1",
+]
+
+[project.optional-dependencies]
+multimodal = ["everalgo-parser[svg]>=0.2.1"]  # [svg] bundles cairosvg → SVG works by default
+# Native OpenTelemetry tracing export. Optional — EverOS never imports these
+# unless [observability] is enabled. Install with: pip install everos[otel]
+otel = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+milvus = ["pymilvus>=3.0.0"]
+
+[project.urls]
+Homepage = "https://evermind.ai"
+Repository = "https://github.com/EverMind-AI/EverOS"
+Changelog = "https://github.com/EverMind-AI/EverOS/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/EverMind-AI/EverOS/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/everos"]
+
+# ``env.template`` lives at src/everos/templates/env.template and is
+# auto-included via ``packages``. ``everos init`` reads it through
+# ``importlib.resources``. No force-include needed.
+
+# sdist uses an include-whitelist (not exclude) so we don't accidentally ship
+# things like CLAUDE.md, .claude/, CI configs, or IDE settings. New top-level
+# files default to NOT-shipped — you have to opt them in here.
+#
+# exclude is kept as belt-and-suspenders for build artefacts that CI generates
+# inside the project tree (UV_CACHE_DIR=.uv-cache in .gitlab-ci.yml).
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/pyproject.toml",
+    "/README.md",
+    "/QUICKSTART.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/CODE_OF_CONDUCT.md",
+    "/SECURITY.md",
+    "/ACKNOWLEDGMENTS.md",
+    "/CITATION.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/config.example.toml",
+]
+exclude = [".uv-cache", ".venv"]
+
+[project.scripts]
+everos = "everos.entrypoints.cli.main:app"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Tooling
+# ───────────────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = ["src_old"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC", "RUF"]
+ignore = [
+    "RUF001",  # ambiguous Unicode in strings (intentional × – symbols)
+    "RUF002",  # ambiguous Unicode in docstrings
+    "RUF003",  # ambiguous Unicode in comments
+    "RUF012",  # mutable class attribute default (SQLModel requires this)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The four dataset adapters hold the answer and judge prompts as multi-line string
+# literals, copied byte-for-byte from each benchmark's reference harness. Rewrapping one
+# changes what the model is shown and so changes the score, which is the opposite of what
+# this code is for. Every long line in these four files is inside such a literal --
+# nothing outside one is exempted, and no other file under benchmarks/ is.
+"benchmarks/adapters/locomo.py" = ["E501"]
+"benchmarks/adapters/longmemeval.py" = ["E501"]
+"benchmarks/adapters/subtlememory.py" = ["E501"]
+"benchmarks/adapters/evermembench.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short -m 'not slow and not live_llm'"
+filterwarnings = [
+    "error",
+    # tzlocal (via APScheduler, imported by the OME engine): a container with no
+    # /etc/timezone and no /etc/localtime warns and falls back to UTC. Under `error`
+    # that aborts COLLECTION for every test that imports the app -- measured at 50
+    # files here -- so `make test` fails on a clean container for a reason unrelated
+    # to any test. The fallback is already what this project wants: the display
+    # timezone comes solely from EVEROS_MEMORY__TIMEZONE, never from the OS (see
+    # .claude/rules/datetime-handling.md), so tzlocal's guess is never read.
+    "ignore:Can not find any timezone configuration:UserWarning",
+    # jieba 0.42.1: unescaped backslashes in regex strings (upstream
+    # unmaintained; no fix available).  Python 3.12 emits
+    # SyntaxWarning for invalid escape sequences.
+    "ignore:invalid escape sequence:SyntaxWarning",
+    # aiosqlite teardown: connection-worker thread and Connection.__del__
+    # raise after pytest closes the event loop.  Upstream issue
+    # (aiosqlite + pytest-asyncio); we cannot fix their lifecycle.
+    "ignore:Exception in thread.*_connection_worker_thread:pytest.PytestUnhandledThreadExceptionWarning",
+    # aiosqlite + asyncio teardown: Connection.__del__ and
+    # BaseEventLoop.__del__ fire after pytest closes the event loop.
+    # Upstream lifecycle issue; we cannot fix their cleanup order.
+    "ignore:Exception ignored.*:pytest.PytestUnraisableExceptionWarning",
+]
+markers = [
+    "slow: runs that take >=10s (regardless of dependency); CI default excludes these. Run with `pytest -m slow`.",
+    "live_llm: requires real LLM / embedder / reranker credentials from .env; burns tokens. CI default excludes. Run with `pytest -m live_llm`.",
+]
+
+[tool.coverage.run]
+source = ["src/everos"]
+branch = true
+omit = ["**/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "pragma: no cover",
+]
+
+[tool.importlinter]
+root_packages = ["everos"]
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture"
+type = "layers"
+layers = [
+    "everos.entrypoints",
+    "everos.service",
+    "everos.memory",
+    "everos.infra",
+]
+
+[[tool.importlinter.contracts]]
+name = "Subpackage internals are private"
+type = "forbidden"
+source_modules = ["everos.service", "everos.memory", "everos.entrypoints"]
+# `**` matches any descendant (writer.py, reader.py, sub.foo.bar, ...).
+# Public API must be reached via the subpackage `__init__.py`.
+forbidden_modules = [
+    "everos.infra.persistence.markdown.**",
+    "everos.infra.persistence.lancedb.**",
+    "everos.infra.persistence.sqlite.**",
+    "everos.infra.persistence.index.**",
+    "everos.infra.persistence.milvus.**",
+    "everos.infra.persistence.backends.**",
+]
+# `forbidden` contracts run a *transitive closure* — any path from a
+# source module to a forbidden module fails the check, even when the
+# source only imports the subpackage top-level. The whitelist below
+# carves out **intra-subpackage wiring**: each storage subpackage's
+# own ``__init__.py`` imports its own ``tables`` / ``repos`` / manager
+# children to assemble the public API surface that outer layers reach.
+# These edges are normal Python package wiring, *not* a privacy
+# breach — without these ignores, even a legitimate
+# ``from everos.infra.persistence.sqlite import X`` would be punished
+# because the transitive scan walks one hop further into the package.
+#
+# Direct imports from outer layers into a subpackage internal module
+# (e.g. ``from everos.infra.persistence.sqlite.tables import X`` written
+# in ``service`` or ``entrypoints``) remain blocked — that edge is not
+# in this whitelist.
+ignore_imports = [
+    "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.tables",
+    "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.repos",
+    "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.sqlite_manager",
+    "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.tables",
+    "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.repos",
+    "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.lancedb_manager",
+    "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.mds",
+    "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.writers",
+    "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.readers",
+    "everos.infra.persistence.index -> everos.infra.persistence.index.predicate",
+    "everos.infra.persistence.index -> everos.infra.persistence.index.protocols",
+    "everos.infra.persistence.index -> everos.infra.persistence.index.router",
+    "everos.infra.persistence.index -> everos.infra.persistence.index.schema",
+    "everos.infra.persistence.index -> everos.infra.persistence.backends.lancedb",
+    "everos.infra.persistence.index -> everos.infra.persistence.backends.milvus",
+]
+
+[[tool.importlinter.contracts]]
+# The facade and the router resolve a configured backend, so they import the
+# adapters by design. The port definitions must not: the moment protocols or
+# schema knows a concrete engine, "portable" stops being checkable and the
+# next adapter inherits whatever leaked in. This is the rule that keeps the
+# split from eroding -- moving files alone does not stop anyone moving them
+# back.
+name = "Derived-index ports know no concrete backend"
+type = "forbidden"
+source_modules = [
+    "everos.infra.persistence.index.protocols",
+    "everos.infra.persistence.index.schema",
+    "everos.infra.persistence.predicate",
+]
+forbidden_modules = [
+    "everos.infra.persistence.backends",
+    "everos.infra.persistence.lancedb",
+    "everos.infra.persistence.milvus",
+    "everos.core.persistence.lancedb",
+]
+
+[[tool.importlinter.contracts]]
+name = "OME does not depend on memory/service/entrypoints or sibling infra subpackages"
+type = "forbidden"
+source_modules = ["everos.infra.ome"]
+forbidden_modules = [
+    "everos.infra.persistence",
+    "everos.memory",
+    "everos.service",
+    "everos.entrypoints",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.0",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.1.0",
+    "pytest-cov>=6.0.0",
+    "pytest-rerunfailures>=15.0",
+    "import-linter>=2.0",
+    "pre-commit>=4.0.0",
+    "ipdb>=0.13.13",
+    "pyinstrument>=5.0.0",
+    # Tracing tests must actually run (no skip-when-absent), so the optional
+    # [otel] stack is always present in the dev / CI environment.
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+    "pymilvus>=3.0.0",
+]

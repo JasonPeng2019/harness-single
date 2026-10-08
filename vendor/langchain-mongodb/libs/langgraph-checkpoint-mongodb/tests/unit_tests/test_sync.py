@@ -1,0 +1,341 @@
+import os
+from time import sleep
+from typing import Any
+
+import pytest
+from bson.errors import InvalidDocument
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    CheckpointMetadata,
+    empty_checkpoint,
+)
+from pymongo import MongoClient
+from pymongo.errors import OperationFailure
+
+from langgraph.checkpoint.mongodb import MongoDBSaver
+
+MONGODB_URI = os.environ.get(
+    "MONGODB_URI", "mongodb://localhost:27017/?directConnection=true"
+)
+DB_NAME = os.environ.get("DB_NAME", "langgraph-test")
+COLLECTION_NAME = "sync_checkpoints"
+
+
+def test_search(input_data: dict[str, Any]) -> None:
+    # Clear collections if they exist
+    client: MongoClient = MongoClient(MONGODB_URI)
+    db = client[DB_NAME]
+    for clxn_name in db.list_collection_names():
+        db.drop_collection(clxn_name)
+    client.close()
+
+    with MongoDBSaver.from_conn_string(MONGODB_URI, DB_NAME, COLLECTION_NAME) as saver:
+        # save checkpoints
+        saver.put(
+            input_data["config_1"],
+            input_data["chkpnt_1"],
+            input_data["metadata_1"],
+            {},
+        )
+        saver.put(
+            input_data["config_2"],
+            input_data["chkpnt_2"],
+            input_data["metadata_2"],
+            {},
+        )
+        saver.put(
+            input_data["config_3"],
+            input_data["chkpnt_3"],
+            input_data["metadata_3"],
+            {},
+        )
+
+        # call method / assertions
+        query_1 = {"source": "input"}  # search by 1 key
+        query_2 = {
+            "step": 1,
+            "writes": {"foo": "bar"},
+        }  # search by multiple keys
+        query_3: dict[str, Any] = {}  # search by no keys, return all checkpoints
+        query_4 = {"source": "update", "step": 1}  # no match
+
+        search_results_1 = list(saver.list(None, filter=query_1))
+        assert len(search_results_1) == 1
+        assert search_results_1[0].metadata == input_data["metadata_1"]
+
+        search_results_2 = list(saver.list(None, filter=query_2))
+        assert len(search_results_2) == 1
+        assert search_results_2[0].metadata == input_data["metadata_2"]
+
+        search_results_3 = list(saver.list(None, filter=query_3))
+        assert len(search_results_3) == 3
+
+        search_results_4 = list(saver.list(None, filter=query_4))
+        assert len(search_results_4) == 0
+
+        # search by config (defaults to checkpoints across all namespaces)
+        search_results_5 = list(saver.list({"configurable": {"thread_id": "thread-2"}}))
+        assert len(search_results_5) == 2
+        assert {
+            search_results_5[0].config["configurable"]["checkpoint_ns"],
+            search_results_5[1].config["configurable"]["checkpoint_ns"],
+        } == {"", "inner"}
+
+
+def test_null_chars(input_data: dict[str, Any]) -> None:
+    """Null bytes in metadata *values* are stripped by langgraph's
+    get_checkpoint_metadata before storage. Null bytes in metadata *field
+    names* are not sanitized and are rejected by MongoDB."""
+    with MongoDBSaver.from_conn_string(MONGODB_URI, DB_NAME, COLLECTION_NAME) as saver:
+        null_str = "\x00abc"  # string containing null character
+        sanitized_str = "abc"  # null bytes stripped by get_checkpoint_metadata
+
+        # 1. null string in field *value* -> stripped before storage
+        null_value_cfg = saver.put(
+            input_data["config_1"],
+            input_data["chkpnt_1"],
+            {"my_key": null_str},
+            {},
+        )
+        assert saver.get_tuple(null_value_cfg).metadata["my_key"] == sanitized_str  # type: ignore
+        assert (
+            list(saver.list(None, filter={"my_key": sanitized_str}))[0].metadata[
+                "my_key"
+            ]
+            == sanitized_str
+        )
+
+        # 2. null string in field *name*
+        with pytest.raises(InvalidDocument):
+            saver.put(
+                input_data["config_1"],
+                input_data["chkpnt_1"],
+                {null_str: "my_value"},  # type: ignore
+                {},
+            )
+
+
+def test_nested_filter() -> None:
+    """Test one can filter on nested structure of non-trivial objects.
+
+    This test highlights MongoDBSaver's _loads/(_dumps)_metadata methods,
+    which enable MongoDB's ability to query nested documents,
+    with the caveat that all keys are strings.
+
+    We use a HumanMessage instance as found in the examples.
+    The MQL query created is {metadata.writes.message: <serde dumped HumanMessage>}
+
+    We also use the same message to check values in the Checkpoint.
+    """
+
+    input_message = HumanMessage(content="MongoDB is awesome!")
+    clxn_name = "writes_message"
+    thread_id = "thread-3"
+
+    config = RunnableConfig(
+        configurable=dict(thread_id=thread_id, checkpoint_id="1", checkpoint_ns="")
+    )
+    chkpt = empty_checkpoint()
+    chkpt["channel_values"] = input_message
+
+    metadata = CheckpointMetadata(
+        source="loop", step=1, writes={"message": input_message}
+    )
+
+    with MongoDBSaver.from_conn_string(MONGODB_URI, DB_NAME, clxn_name) as saver:
+        saver.put(config, chkpt, metadata, {})
+
+        results = list(saver.list(None, filter={"writes.message": input_message}))
+        for cptpl in results:
+            assert cptpl.metadata["writes"]["message"] == input_message
+            break
+
+        # Confirm serialization structure of data in collection
+        doc: dict[str, Any] = saver.checkpoint_collection.find_one(
+            {"thread_id": thread_id}
+        )  # type: ignore
+        assert isinstance(doc["checkpoint"], bytes)
+        assert (
+            isinstance(doc["metadata"], dict)
+            and isinstance(doc["metadata"]["writes"], dict)
+            and doc["metadata"]["writes"]["message"][0] == "msgpack"
+            and isinstance(doc["metadata"]["writes"]["message"][1], bytes)
+        )
+
+        # Test values of checkpoint
+        # From checkpointer
+        assert cptpl.checkpoint["channel_values"] == input_message
+        # In database
+        chkpt_db = saver.serde.loads_typed((doc["type"], doc["checkpoint"]))
+        assert chkpt_db["channel_values"] == input_message
+
+        # Drop collections
+        saver.checkpoint_collection.drop()
+        saver.writes_collection.drop()
+
+
+def test_ttl(input_data: dict[str, Any]) -> None:
+    """Checkpoints past their TTL are swept and removed.
+
+    ttl: seconds a checkpoint may live before it's eligible for deletion.
+    monitor_period: ttlMonitorSleepSecs, the interval between MongoDB's
+        background TTL sweeps - a scheduling interval, not a deadline.
+        Worst case, a sweep just finished as the document became
+        eligible, so the next one is up to a full monitor_period away.
+    some_latency: small fixed allowance for the sweep's own execution
+        time to make this test reliable.
+    """
+    collection_name = "ttl_test"
+    ttl = 1
+    monitor_period = 2
+    some_latency = 1
+
+    client: MongoClient = MongoClient(MONGODB_URI)
+    try:
+        # This works for local Atlas CLI.
+        client.admin.command("setParameter", 1, ttlMonitorSleepSecs=monitor_period)
+    except OperationFailure:
+        # For remote, we've adjusted manually via Atlas Administration API.
+        pass
+    finally:
+        client.close()
+
+    with MongoDBSaver.from_conn_string(
+        MONGODB_URI, DB_NAME, collection_name, ttl=ttl
+    ) as saver:
+        try:
+            # save a checkpoint
+            saver.put(
+                input_data["config_2"],
+                input_data["chkpnt_2"],
+                input_data["metadata_2"],
+                {},
+            )
+
+            query: dict[str, Any] = {}  # search by no keys, return all checkpoints
+            search_results_2 = list(saver.list(None, filter=query))
+            assert len(search_results_2) == 1
+            assert search_results_2[0].metadata == input_data["metadata_2"]
+
+            sleep(ttl + monitor_period + some_latency)
+            assert len(list(saver.list(None, filter=query))) == 0
+
+        finally:
+            saver.checkpoint_collection.delete_many({})
+            saver.checkpoint_collection.drop_indexes()
+            saver.writes_collection.delete_many({})
+            saver.writes_collection.drop_indexes()
+
+
+def test_init_creates_indexes() -> None:
+    client: MongoClient = MongoClient(MONGODB_URI)
+    db = client[DB_NAME]
+    checkpoint_coll = "checkpoints_test"
+    writes_coll = "writes_test"
+
+    db.drop_collection(checkpoint_coll)
+    db.drop_collection(writes_coll)
+
+    ttl = 100
+    with MongoDBSaver.from_conn_string(
+        MONGODB_URI, DB_NAME, checkpoint_coll, writes_coll, ttl=ttl
+    ) as saver:
+        cp_indexes = saver.checkpoint_collection.index_information()
+        wr_indexes = saver.writes_collection.index_information()
+
+        def _has_index(index_info: Any, keys: list[tuple[str, int]]) -> bool:
+            for _, info in index_info.items():
+                if info.get("key") == keys:
+                    return True
+            return False
+
+        expected_cp_keys = [
+            ("thread_id", 1),
+            ("checkpoint_ns", 1),
+            ("checkpoint_id", -1),
+        ]
+        assert _has_index(cp_indexes, expected_cp_keys)
+        assert _has_index(cp_indexes, [("created_at", 1)])
+
+        expected_wr_keys = [
+            ("thread_id", 1),
+            ("checkpoint_ns", 1),
+            ("checkpoint_id", -1),
+            ("task_id", 1),
+            ("idx", 1),
+        ]
+        assert _has_index(wr_indexes, expected_wr_keys)
+        assert _has_index(wr_indexes, [("created_at", 1)])
+
+    db.drop_collection(checkpoint_coll)
+    db.drop_collection(writes_coll)
+    client.close()
+
+
+def test_list_rejects_mql_operator_keys() -> None:
+    with MongoDBSaver.from_conn_string(
+        MONGODB_URI, DB_NAME, "reject_mql_operator_keys"
+    ) as saver:
+        # nested operator value — $exists bypass leaks all checkpoints
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"user_id": {"$exists": True}}))
+        # $ne leaks other tenants' checkpoints
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"user_id": {"$ne": "alice"}}))
+        # $gt bypasses numeric metadata filter
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"step": {"$gt": 0}}))
+        # $in enumerates across tenants
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"user_id": {"$in": ["alice", "bob"]}}))
+        # $regex pattern match
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"status": {"$regex": ".*"}}))
+        # top-level $where injection
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"$where": "1==1"}))
+        # top-level $or injection
+        with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+            list(saver.list(None, filter={"$or": [{"source": "loop"}]}))
+
+
+def test_list_filter_normal_behavior(input_data: dict[str, Any]) -> None:
+    """Safe filters — including nested dicts with non-$ keys — work unchanged after the patch."""
+    clxn_name = "filter_normal_behavior"
+    with MongoDBSaver.from_conn_string(MONGODB_URI, DB_NAME, clxn_name) as saver:
+        saver.put(
+            input_data["config_1"], input_data["chkpnt_1"], input_data["metadata_1"], {}
+        )
+        saver.put(
+            input_data["config_2"], input_data["chkpnt_2"], input_data["metadata_2"], {}
+        )
+        saver.put(
+            input_data["config_3"], input_data["chkpnt_3"], input_data["metadata_3"], {}
+        )
+
+        # empty filter: returns all 3 checkpoints
+        assert len(list(saver.list(None, filter={}))) == 3
+
+        # string scalar filter
+        results = list(saver.list(None, filter={"source": "input"}))
+        assert len(results) == 1 and results[0].metadata["source"] == "input"
+
+        # numeric scalar filter
+        results = list(saver.list(None, filter={"step": 1}))
+        assert len(results) == 1 and results[0].metadata["step"] == 1
+
+        # multiple scalar filters (AND)
+        results = list(saver.list(None, filter={"source": "loop", "step": 1}))
+        assert len(results) == 1
+
+        # no match returns empty
+        results = list(saver.list(None, filter={"source": "update", "step": 1}))
+        assert len(results) == 0
+
+        # nested dict with safe (non-$) keys is allowed — not rejected as injection
+        results = list(saver.list(None, filter={"writes": {"foo": "bar"}}))
+        assert len(results) == 1 and results[0].metadata["writes"] == {"foo": "bar"}
+
+        saver.checkpoint_collection.drop()
+        saver.writes_collection.drop()

@@ -1,0 +1,185 @@
+import os
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from bson.errors import InvalidDocument
+from pymongo import MongoClient
+
+from langgraph.checkpoint.mongodb import MongoDBSaver
+
+MONGODB_URI = os.environ.get(
+    "MONGODB_URI", "mongodb://localhost:27017/?directConnection=true"
+)
+DB_NAME = os.environ.get("DB_NAME", "langgraph-test")
+COLLECTION_NAME = "sync_checkpoints_aio"
+
+
+@pytest_asyncio.fixture
+async def saver(request: pytest.FixtureRequest) -> AsyncGenerator:
+    client: MongoClient = MongoClient(MONGODB_URI)
+    db = client[DB_NAME]
+    for clxn in db.list_collection_names():
+        db.drop_collection(clxn)
+    with MongoDBSaver.from_conn_string(
+        MONGODB_URI, DB_NAME, COLLECTION_NAME
+    ) as checkpointer:
+        yield checkpointer
+    client.close()
+
+
+@pytest.mark.asyncio
+async def test_asearch(input_data: dict[str, Any], saver: MongoDBSaver) -> None:
+    # save checkpoints
+    await saver.aput(
+        input_data["config_1"],
+        input_data["chkpnt_1"],
+        input_data["metadata_1"],
+        {},
+    )
+    await saver.aput(
+        input_data["config_2"],
+        input_data["chkpnt_2"],
+        input_data["metadata_2"],
+        {},
+    )
+    await saver.aput(
+        input_data["config_3"],
+        input_data["chkpnt_3"],
+        input_data["metadata_3"],
+        {},
+    )
+
+    # call method / assertions
+    query_1 = {"source": "input"}  # search by 1 key
+    query_2 = {
+        "step": 1,
+        "writes": {"foo": "bar"},
+    }  # search by multiple keys
+    query_3: dict[str, Any] = {}  # search by no keys, return all checkpoints
+    query_4 = {"source": "update", "step": 1}  # no match
+
+    search_results_1 = [c async for c in saver.alist(None, filter=query_1)]
+    assert len(search_results_1) == 1
+    assert search_results_1[0].metadata == input_data["metadata_1"]
+
+    search_results_2 = [c async for c in saver.alist(None, filter=query_2)]
+    assert len(search_results_2) == 1
+    assert search_results_2[0].metadata == input_data["metadata_2"]
+
+    search_results_3 = [c async for c in saver.alist(None, filter=query_3)]
+    assert len(search_results_3) == 3
+
+    search_results_4 = [c async for c in saver.alist(None, filter=query_4)]
+    assert len(search_results_4) == 0
+
+    # search by config (defaults to checkpoints across all namespaces)
+    search_results_5 = [
+        c async for c in saver.alist({"configurable": {"thread_id": "thread-2"}})
+    ]
+    assert len(search_results_5) == 2
+    assert {
+        search_results_5[0].config["configurable"]["checkpoint_ns"],
+        search_results_5[1].config["configurable"]["checkpoint_ns"],
+    } == {"", "inner"}
+
+
+@pytest.mark.asyncio
+async def test_null_chars(input_data: dict[str, Any], saver: MongoDBSaver) -> None:
+    """Null bytes in metadata *values* are stripped by langgraph's
+    get_checkpoint_metadata before storage. Null bytes in metadata *field
+    names* are not sanitized and are rejected by MongoDB."""
+
+    null_str = "\x00abc"  # string containing null character
+    sanitized_str = "abc"  # null bytes stripped by get_checkpoint_metadata
+
+    # 1. null string in field *value* -> stripped before storage
+    null_value_cfg = await saver.aput(
+        input_data["config_1"],
+        input_data["chkpnt_1"],
+        {"my_key": null_str},
+        {},
+    )
+    null_tuple = await saver.aget_tuple(null_value_cfg)
+    assert null_tuple.metadata["my_key"] == sanitized_str  # type: ignore
+    cps = [c async for c in saver.alist(None, filter={"my_key": sanitized_str})]
+    assert cps[0].metadata["my_key"] == sanitized_str
+
+    # 2. null string in field *name*
+    with pytest.raises(InvalidDocument):
+        await saver.aput(
+            input_data["config_1"],
+            input_data["chkpnt_1"],
+            {null_str: "my_value"},  # type: ignore
+            {},
+        )
+
+
+async def test_alist_rejects_mql_operator_keys(saver: MongoDBSaver) -> None:
+    # nested operator value — $exists bypass leaks all checkpoints
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"user_id": {"$exists": True}})]
+    # $ne leaks other tenants' checkpoints
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"user_id": {"$ne": "alice"}})]
+    # $gt bypasses numeric metadata filter
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"step": {"$gt": 0}})]
+    # $in enumerates across tenants
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [
+            c
+            async for c in saver.alist(
+                None, filter={"user_id": {"$in": ["alice", "bob"]}}
+            )
+        ]
+    # $regex pattern match
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"status": {"$regex": ".*"}})]
+    # top-level $where injection
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"$where": "1==1"})]
+    # top-level $or injection
+    with pytest.raises(ValueError, match="MongoDB operator keys are not allowed"):
+        [c async for c in saver.alist(None, filter={"$or": [{"source": "loop"}]})]
+
+
+async def test_alist_filter_normal_behavior(
+    input_data: dict[str, Any], saver: MongoDBSaver
+) -> None:
+    """Safe filters — including nested dicts with non-$ keys — work unchanged after the patch."""
+    await saver.aput(
+        input_data["config_1"], input_data["chkpnt_1"], input_data["metadata_1"], {}
+    )
+    await saver.aput(
+        input_data["config_2"], input_data["chkpnt_2"], input_data["metadata_2"], {}
+    )
+    await saver.aput(
+        input_data["config_3"], input_data["chkpnt_3"], input_data["metadata_3"], {}
+    )
+
+    # empty filter: returns all 3 checkpoints
+    assert len([c async for c in saver.alist(None, filter={})]) == 3
+
+    # string scalar filter
+    results = [c async for c in saver.alist(None, filter={"source": "input"})]
+    assert len(results) == 1 and results[0].metadata["source"] == "input"
+
+    # numeric scalar filter
+    results = [c async for c in saver.alist(None, filter={"step": 1})]
+    assert len(results) == 1 and results[0].metadata["step"] == 1
+
+    # multiple scalar filters (AND)
+    results = [c async for c in saver.alist(None, filter={"source": "loop", "step": 1})]
+    assert len(results) == 1
+
+    # no match returns empty
+    results = [
+        c async for c in saver.alist(None, filter={"source": "update", "step": 1})
+    ]
+    assert len(results) == 0
+
+    # nested dict with safe (non-$) keys is allowed — not rejected as injection
+    results = [c async for c in saver.alist(None, filter={"writes": {"foo": "bar"}})]
+    assert len(results) == 1 and results[0].metadata["writes"] == {"foo": "bar"}

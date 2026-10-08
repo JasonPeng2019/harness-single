@@ -1,0 +1,30 @@
+# gitlint — commit-message format gate (commit-msg pre-commit stage).
+# Enforces Conventional Commits (https://www.conventionalcommits.org):
+#   <type>[(scope)][!]: <description>
+# e.g.  feat: add agentic rerank   |   fix(search): guard empty profile
+# See .claude/skills/commit/SKILL.md for the type list and guidance.
+
+[general]
+# Enable gitlint's built-in Conventional Commits title check.
+contrib=contrib-title-conventional-commits
+
+# Autosquash / generated commits are exempt from the format check.
+ignore-merge-commits=true
+ignore-revert-commits=true
+ignore-fixup-commits=true
+ignore-squash-commits=true
+
+# Allowed Conventional Commit types (extends the spec defaults with the ones
+# this project uses). A commit title's type must be one of these.
+[contrib-title-conventional-commits]
+types=feat,fix,refactor,test,docs,style,perf,chore,build,ci,revert
+
+[title-max-length]
+line-length=72
+
+[body-max-line-length]
+line-length=80
+
+# A single-line commit (no body) is allowed.
+[body-min-length]
+min-length=0

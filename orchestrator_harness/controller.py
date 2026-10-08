@@ -8,6 +8,8 @@ own process cleanup, and copies a valid ACCEPTED advancement into its status.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -16,12 +18,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import memory_handoff, processes, terminal_evidence
+from .activity_log import append_current_detail, append_detail
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .leases import acquire_leases, release_leases
+from .provider_adapters import has_native_counter, usage_observation
 from .records import (
     RecordLock,
     append_jsonl,
@@ -67,6 +71,7 @@ class ProviderExecution:
     session_id: str | None = None
     argv: tuple[str, ...] = ()
     non_retryable_failure: bool = False
+    transcript_start_byte: int = 0
 
 
 def _load_binding(harness_root: Path, provider_id: str) -> Any:
@@ -121,11 +126,128 @@ def _write_status(lane: dict[str, Any], fields: dict[str, Any]) -> None:
         atomic_write_json(path, record)
 
 
+def _validate_enhanced_dispatch(
+    lane: dict[str, Any], invocation: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Attest the accepted dispatch before this controller can own a PID."""
+
+    state = lane.get("memory_plan_state")
+    if state is None:
+        if invocation.get("dispatch_binding") is not None:
+            raise ControllerError(LAUNCH_INVOCATION_INVALID, "unexpected enhanced dispatch binding")
+        if lane.get("worker_environment") == "scrubbed":
+            try:
+                worktree = Path(lane["worktree_path"])
+                card = read_json(worktree / ".agent-workspace" / "task-card.json")
+                if card.get("worker_environment") != "scrubbed":
+                    raise ValueError("scrubbed task card changed")
+                memory_handoff.validate_worker_material(
+                    worktree_path=worktree,
+                    invocation=invocation,
+                    environment=os.environ,
+                    task_card=card,
+                )
+            except Exception as exc:
+                raise ControllerError(
+                    LAUNCH_INVOCATION_INVALID,
+                    "scrubbed controller worker material is invalid",
+                ) from exc
+        return None
+    if state != "execution_accepted":
+        raise ControllerError(LAUNCH_INVOCATION_INVALID, "enhanced lane has no accepted plan")
+    worktree = Path(lane["worktree_path"])
+    workspace = worktree / ".agent-workspace"
+    try:
+        card = read_json(workspace / "task-card.json")
+        envelope = memory_handoff.load_envelope(worktree)
+        if envelope is None:
+            raise ValueError("missing envelope")
+        memory_handoff.validate_envelope_for_launch(
+            envelope=envelope,
+            task_card=card,
+            lane_id=lane["lane_id"],
+            run_id=lane["run_id"],
+            worktree_path=worktree,
+            base_commit=card["base_commit"],
+        )
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=envelope
+        )
+        memory_handoff.validate_final_context_for_launch(
+            context=context,
+            envelope=envelope,
+            task_card=card,
+            lane_id=lane["lane_id"],
+            run_id=lane["run_id"],
+            worktree_path=worktree,
+            base_commit=card["base_commit"],
+        )
+        prompt = workspace / "worker-prompt.md"
+        binding = memory_handoff.dispatch_binding(envelope=envelope, context=context)
+        if (
+            invocation.get("content_hash") != content_hash(invocation)
+            or invocation.get("dispatch_binding") != binding
+            or invocation.get("prompt_digest") != hashlib.sha256(prompt.read_bytes()).hexdigest()
+            or invocation.get("provider") != lane.get("provider")
+            or invocation.get("cwd") != str(worktree)
+            or invocation.get("paths", {}).get("prompt") != str(prompt)
+        ):
+            raise ValueError("invocation binding mismatch")
+        memory_handoff.validate_worker_material(
+            worktree_path=worktree,
+            invocation=invocation,
+            environment=os.environ,
+            task_card=card,
+        )
+        return binding
+    except Exception as exc:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "enhanced controller dispatch identity or worker material is invalid",
+        ) from exc
+
+
 def _append_event(lane: dict[str, Any], event_type: str, detail: str) -> None:
     append_jsonl(
         Path(lane["controller_events_path"]),
         {"ts": iso_utc(), "run_id": lane["run_id"], "event_type": event_type, "detail": detail},
         header={"schema": CONTROLLER_EVENTS_SCHEMA},
+    )
+    append_current_detail(
+        "worker.lifecycle",
+        component="worker",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        worker_event=event_type,
+        detail=detail,
+    )
+
+
+def _append_provider_event(
+    rt: Path,
+    lane: dict[str, Any],
+    *,
+    attempt_number: int,
+    raw_line: str,
+    parsed: dict[str, Any] | None,
+) -> None:
+    """Mirror every provider JSONL event into the live detailed trace."""
+
+    text = raw_line.rstrip("\r\n")
+    try:
+        native_event: Any = json.loads(text)
+    except (ValueError, RecursionError):
+        native_event = None
+    append_detail(
+        rt,
+        "worker.native_event",
+        component="worker",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        attempt=attempt_number,
+        native_event=native_event,
+        parsed_event=parsed,
+        raw_text=None if native_event is not None else text,
     )
 
 
@@ -200,6 +322,15 @@ Continue this same lane and native provider session. Write a valid RESULT.json a
 The outcome must be exactly PASS, FAIL, or BLOCKED; summary must be nonempty; evidence must be a list; completed_at must be nonempty; and content_hash must be correct. Do not answer with prose alone. Do not change lane_id or run_id.
 """
     atomic_write_bytes(path, text.encode("utf-8"))
+    append_current_detail(
+        "prompt.controller_to_worker",
+        component="prompt",
+        prompt_kind="correction",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        prompt_path=str(path),
+        prompt=text,
+    )
     return path
 
 
@@ -215,24 +346,111 @@ def _append_attempt(
     result_state: str,
     cleanup_proven: bool,
     validation_error: str | None = None,
+    binding: Any = None,
+    transcript_start_byte: int = 0,
+    dispatch_binding: dict[str, Any] | None = None,
+    provider_started: bool | None = None,
 ) -> None:
-    """Append immutable provider-attempt evidence."""
+    """Append immutable source facts, not a derived usage or quality verdict.
+
+    The controller-attempts/v1 row binds lane_id/run_id/attempt, provider,
+    argv/session, and optional dispatch_binding to the exact transcript byte
+    range [transcript_start_byte, transcript_end_byte). Its ordered
+    native_usage_observations keep native counter names, event identities and
+    byte offsets. Observations may be replayed, intermediate, cumulative, or
+    terminal; native_usage_state=observed only means at least one recognized
+    native token or cost counter was seen. Missing counters remain absent;
+    state=incomplete when none were seen. Lane 1's future usage store must
+    reconcile these source facts; this row does not assert attributed totals
+    or outcome authority.
+    """
+    observations: list[dict[str, Any]] = []
+    native_session_id = session_id
+    transcript = paths["transcript"]
+    capture_error: str | None = None
+    try:
+        transcript_end_byte = transcript.stat().st_size
+    except OSError:
+        transcript_end_byte = transcript_start_byte
+    parser = getattr(binding, "parse_line", None)
+    if callable(parser) and transcript.is_file():
+        try:
+            with transcript.open("rb") as handle:
+                handle.seek(transcript_start_byte)
+                byte_offset = transcript_start_byte
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    try:
+                        parsed = parser(line)
+                    except Exception as exc:
+                        parsed = None
+                        capture_error = (
+                            f"provider parser failed at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
+                    if (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("session_id"), str)
+                        and 0 < len(parsed["session_id"]) <= 256
+                    ):
+                        native_session_id = parsed["session_id"]
+                    try:
+                        native_event = json.loads(raw_line)
+                    except (ValueError, RecursionError) as exc:
+                        native_event = None
+                        capture_error = (
+                            f"malformed native JSON at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
+                    try:
+                        receipt = (
+                            usage_observation(native_event, lane.get("provider", {}).get("id", ""))
+                            if isinstance(native_event, dict) else None
+                        )
+                    except Exception as exc:
+                        receipt = None
+                        capture_error = (
+                            f"malformed native receipt at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
+                    if receipt is not None:
+                        observations.append({
+                            "line_number": line_number,
+                            "byte_offset": byte_offset,
+                            **receipt,
+                        })
+                    byte_offset += len(raw_line)
+        except OSError as exc:
+            capture_error = f"transcript read failed: {exc}"
     append_jsonl(
         Path(
             lane.get("attempts_path")
             or Path(lane["worktree_path"]) / ".agent-workspace" / "controller.attempts.jsonl"
         ),
         {
+            "lane_id": lane["lane_id"],
+            "run_id": lane["run_id"],
             "attempt": attempt_number,
             "provider": lane.get("provider", {}),
             "argv": list(argv or []),
-            "session_id": session_id,
+            "session_id": native_session_id,
             "prompt_path": str(prompt_path),
             "transcript_path": str(paths["transcript"]),
+            "transcript_start_byte": transcript_start_byte,
+            "transcript_end_byte": transcript_end_byte,
             "stderr_path": str(paths["stderr"]),
+            "provider_started": bool(argv) if provider_started is None else provider_started,
             "exit_code": exit_code,
             "result_state": result_state,
             "validation_error": validation_error,
+            "native_usage_state": (
+                "observed"
+                if any(has_native_counter(item) for item in observations)
+                else "incomplete"
+            ),
+            "native_usage_observations": observations,
+            "native_usage_capture_error": capture_error,
+            **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
             "cleanup_proven": cleanup_proven,
             "at": iso_utc(),
         },
@@ -243,7 +461,7 @@ def _append_attempt(
 def _read_acceptance_chain(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> dict[str, Any] | None:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -260,6 +478,15 @@ def _read_acceptance_chain(
         run_id=lane["run_id"],
     ):
         return None
+    if lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return None
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            return None
     return {"review": review, "acceptance": acceptance}
 
 
@@ -285,6 +512,11 @@ def _run_provider(
     session_id = (lane.get("session") or {}).get("session_id")
     if resume is None:
         resume = bool(session_id)
+    lane["_attempt_argv"] = None
+    lane["_attempt_transcript_start_byte"] = (
+        transcript_path.stat().st_size if transcript_path.is_file() else 0
+    )
+    lane["_attempt_started"] = False
     argv = binding.build_argv(
         model=invocation["provider"]["model"],
         launch_config=invocation["provider"]["launch_config"],
@@ -293,12 +525,70 @@ def _run_provider(
         session_id=session_id,
         resume=resume,
     )
-    _append_event(lane, "provider_started", " ".join(argv))
+    network_facts: dict[str, Any] | None = None
+    if lane.get("memory_plan_state") == "execution_accepted":
+        from .provider_network_payload import resolve_launch
+
+        try:
+            card = read_json(worktree / ".agent-workspace" / "task-card.json")
+            envelope = memory_handoff.load_envelope(worktree)
+            if envelope is None:
+                raise memory_handoff.MemoryHandoffError("accepted network envelope is missing")
+            network = memory_handoff.captured_network_resolution(
+                worktree_path=worktree, envelope=envelope, task_card=card,
+            )
+            requested_network_profile = network["requested_mode"]
+            if network["effective_mode"] != "normal":
+                argv, network_facts = resolve_launch(
+                    binding.PROVIDER_ID, worktree, argv, requested_network_profile,
+                )
+                network_facts["captured_effective_mode"] = network["effective_mode"]
+                network_facts["captured_requested_mode"] = network["requested_mode"]
+                network_facts["captured_enforcement_sources"] = network["enforcement_sources"]
+                network_facts["captured_disclosed_limits"] = network["disclosed_limits"]
+                network_facts["captured_context"] = network.get("context", {})
+                network_facts["inspected_argv"] = list(argv)
+                network_facts["payload_state"] = "inspected_not_started"
+                network_facts["independent_egress_proven_for_launch"] = False
+                network_facts["native_forbidden_call_count"] = None
+            else:
+                network_facts = None
+        except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
+            raise ControllerError(
+                LAUNCH_INVOCATION_INVALID, str(exc), no_provider_started=True,
+            ) from exc
+        if network_facts is not None:
+            lane["_network_payload"] = network_facts
+            if lane.get("controller_status_path"):
+                _write_status(lane, {"network_payload": network_facts})
+            _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
+            if network_facts["effective_profile"] == "uncontrolled_network":
+                raise ControllerError(
+                    LAUNCH_PROVIDER_START_FAILED,
+                    network_facts["reason"],
+                    no_provider_started=True,
+                )
+    lane["_attempt_argv"] = list(argv)
+    append_detail(
+        rt,
+        "launch.worker.requested",
+        component="launch",
+        lane_id=lane.get("lane_id"),
+        run_id=lane.get("run_id"),
+        attempt=attempt_number,
+        provider=invocation.get("provider"),
+        argv=list(argv),
+        cwd=str(worktree),
+        prompt_path=str(prompt_path),
+        prompt=prompt_path.read_text(encoding="utf-8", errors="replace"),
+        resume=resume,
+    )
     pre_spawn_offset: int = 0
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
         pre_spawn_offset = transcript_handle.tell()
+        lane["_attempt_transcript_start_byte"] = pre_spawn_offset
         try:
             child = processes.spawn_provider(
                 argv,
@@ -313,6 +603,7 @@ def _run_provider(
                 f"provider process was not created: {exc}",
                 no_provider_started=True,
             ) from exc
+        lane["_attempt_started"] = True
     boundary: processes.ProcessBoundary | None = None
     try:
         take_job_handle = getattr(child, "take_job_handle", None)
@@ -335,6 +626,25 @@ def _run_provider(
                 LAUNCH_PROVIDER_START_FAILED,
                 "cannot record provider process identity",
             )
+        append_detail(
+            rt,
+            "launch.worker.spawned",
+            component="launch",
+            lane_id=lane.get("lane_id"),
+            run_id=lane.get("run_id"),
+            attempt=attempt_number,
+            provider=invocation.get("provider"),
+            pid=child.pid,
+            creation_time=boundary.root_creation_time,
+            argv=list(argv),
+        )
+        if network_facts is not None:
+            network_facts["payload_state"] = "spawned"
+            network_facts["spawned_argv"] = list(argv)
+            if lane.get("controller_status_path"):
+                _write_status(lane, {"network_payload": network_facts})
+            _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
+        _append_event(lane, "provider_started", " ".join(argv))
         if os.name == "nt":
             # The record is durable before the suspended provider is allowed to
             # execute. The provider was already a Job member when native
@@ -401,7 +711,17 @@ def _run_provider(
                 next_observation = time.monotonic() + 0.5
             line = handle.readline()
             if line:
-                parsed = binding.parse_line(line.rstrip("\n"))
+                try:
+                    parsed = binding.parse_line(line.rstrip("\n"))
+                except Exception:
+                    parsed = None  # The post-exit receipt read records this malformed line.
+                _append_provider_event(
+                    rt,
+                    lane,
+                    attempt_number=attempt_number,
+                    raw_line=line,
+                    parsed=parsed if isinstance(parsed, dict) else None,
+                )
                 if isinstance(parsed, dict):
                     if parsed.get("message"):
                         last_message = str(parsed["message"])
@@ -429,7 +749,17 @@ def _run_provider(
                     break
                 time.sleep(0.2)
         for line in handle:
-            parsed = binding.parse_line(line.rstrip("\n"))
+            try:
+                parsed = binding.parse_line(line.rstrip("\n"))
+            except Exception:
+                parsed = None  # Keep draining the final tail and append the attempt.
+            _append_provider_event(
+                rt,
+                lane,
+                attempt_number=attempt_number,
+                raw_line=line,
+                parsed=parsed if isinstance(parsed, dict) else None,
+            )
             if isinstance(parsed, dict):
                 if parsed.get("message"):
                     last_message = str(parsed["message"])
@@ -454,6 +784,7 @@ def _run_provider(
         provider_session_id,
         tuple(argv),
         non_retryable_failure or exit_code != 0,
+        pre_spawn_offset,
     )
 
 
@@ -475,6 +806,8 @@ def run_controller(lane_id: str) -> int:
         raise ControllerError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
     provider_id = invocation["provider"]["id"]
 
+    dispatch_binding = _validate_enhanced_dispatch(lane, invocation)
+
     _write_status(lane, {"controller_state": "starting"})
     _append_event(lane, "controller_started", lane_id)
 
@@ -493,6 +826,10 @@ def run_controller(lane_id: str) -> int:
             "process": {"pid": identity["pid"], "creation_time": identity["creation_time"]},
         },
     )
+    _write_status(lane, {
+        "controller_identity": identity,
+        **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
+    })
     try:
         binding = _load_binding(harness_root, provider_id)
     except Exception as exc:
@@ -503,6 +840,7 @@ def run_controller(lane_id: str) -> int:
                 "provider_state": {"state": "not_started"},
                 "cleanup_proven": True,
                 "cleanup_error": None,
+                "recorded_status": "binding_failed",
             },
         )
         _append_event(lane, "binding_failed", str(exc))
@@ -533,6 +871,7 @@ def run_controller(lane_id: str) -> int:
                 "provider_state": {"state": "not_started"},
                 "cleanup_proven": True,
                 "cleanup_error": None,
+                "recorded_status": "lease_busy",
             },
         )
         _append_event(lane, "lease_busy", str(exc))
@@ -585,7 +924,7 @@ def run_controller(lane_id: str) -> int:
                 _append_attempt(
                     lane,
                     attempt_number=attempt_number,
-                    argv=None,
+                    argv=lane.get("_attempt_argv"),
                     session_id=(lane.get("session") or {}).get("session_id"),
                     prompt_path=prompt_path,
                     paths=attempt_paths,
@@ -593,6 +932,10 @@ def run_controller(lane_id: str) -> int:
                     result_state="invalid",
                     cleanup_proven=cleanup_proven,
                     validation_error=f"native resume unavailable: {exc}",
+                    binding=binding,
+                    transcript_start_byte=lane.get("_attempt_transcript_start_byte", 0),
+                    dispatch_binding=dispatch_binding,
+                    provider_started=bool(lane.get("_attempt_started")),
                 )
                 _write_status(
                     lane,
@@ -626,7 +969,7 @@ def run_controller(lane_id: str) -> int:
             _append_attempt(
                 lane,
                 attempt_number=attempt_number,
-                argv=None,
+                argv=lane.get("_attempt_argv"),
                 session_id=(lane.get("session") or {}).get("session_id"),
                 prompt_path=prompt_path,
                 paths=attempt_paths,
@@ -634,6 +977,10 @@ def run_controller(lane_id: str) -> int:
                 result_state="invalid",
                 cleanup_proven=cleanup_proven,
                 validation_error=str(exc),
+                binding=binding,
+                transcript_start_byte=lane.get("_attempt_transcript_start_byte", 0),
+                dispatch_binding=dispatch_binding,
+                provider_started=bool(lane.get("_attempt_started")),
             )
             _write_status(
                 lane,
@@ -692,6 +1039,10 @@ def run_controller(lane_id: str) -> int:
                 result_state=effective_result_state,
                 cleanup_proven=False,
                 validation_error="provider/helper process boundary remains unknown or live",
+                binding=binding,
+                transcript_start_byte=execution.transcript_start_byte,
+                dispatch_binding=dispatch_binding,
+                provider_started=True,
             )
             _write_status(
                 lane,
@@ -729,6 +1080,10 @@ def run_controller(lane_id: str) -> int:
                     else "missing or invalid RESULT.json"
                 )
             ),
+            binding=binding,
+            transcript_start_byte=execution.transcript_start_byte,
+            dispatch_binding=dispatch_binding,
+            provider_started=True,
         )
         if execution.session_id:
             lane = {**lane, "session": {"session_id": execution.session_id}}
