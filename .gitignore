@@ -5,6 +5,7 @@ __pycache__/
 local-config/
 runtime/
 .venv/
+.secrets/
 multi-agent-logs/
 harness_watcher/
 test_results/

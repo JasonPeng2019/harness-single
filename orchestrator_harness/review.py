@@ -202,11 +202,6 @@ def _write_pair(
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
-    if review_path.is_file() or acceptance_path.is_file():
-        raise ReviewError(
-            COMPLETION_REVIEW_OUTPUT_CONFLICT,
-            "a review/acceptance pair already exists for this lane",
-        )
     worktree = Path(lane["worktree_path"])
     task_card = _read_task_card(worktree)
     result = _read_result(worktree, lane)
@@ -251,6 +246,65 @@ def _write_pair(
         acceptance["force_accept_reason"] = force_accept_reason
     acceptance["content_hash"] = content_hash(acceptance)
     with RecordLock(review_path):
+        if acceptance_path.exists():
+            if not review_path.exists():
+                try:
+                    existing_acceptance = read_json(acceptance_path)
+                    require_schema(existing_acceptance, ACCEPTANCE_SCHEMA, acceptance_path)
+                except (OSError, ValueError) as exc:
+                    raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+                review["reviewed_at"] = existing_acceptance.get("decided_at")
+                review["content_hash"] = content_hash(review)
+                acceptance["review_ref"] = review["content_hash"]
+                acceptance["decided_at"] = review["reviewed_at"]
+                acceptance["content_hash"] = content_hash(acceptance)
+                if existing_acceptance != acceptance or not validate_acceptance_chain(
+                    review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"]
+                ):
+                    raise ReviewError(
+                        COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                        "orphan acceptance conflicts with current review source",
+                    )
+                atomic_write_json(review_path, review)
+                return review, existing_acceptance
+            existing_review, existing_acceptance = _replay_pair(
+                folder, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=force_accept_reason,
+            )
+            review["reviewed_at"] = existing_review["reviewed_at"]
+            review["content_hash"] = content_hash(review)
+            acceptance["review_ref"] = review["content_hash"]
+            acceptance["decided_at"] = review["reviewed_at"]
+            acceptance["content_hash"] = content_hash(acceptance)
+            if existing_review != review or existing_acceptance != acceptance:
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    "existing review source differs from current task, result, or commit",
+                )
+            return existing_review, existing_acceptance
+        if review_path.exists():
+            try:
+                existing = read_json(review_path)
+                require_schema(existing, COMPLETION_REVIEW_SCHEMA, review_path)
+            except (OSError, ValueError) as exc:
+                raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+            review["reviewed_at"] = existing.get("reviewed_at")
+            review["content_hash"] = content_hash(review)
+            if existing != review:
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    "existing review conflicts with this retry and was preserved",
+                )
+            acceptance["review_ref"] = review["content_hash"]
+            acceptance["decided_at"] = review["reviewed_at"]
+            acceptance["content_hash"] = content_hash(acceptance)
+            if not validate_acceptance_chain(
+                review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"]
+            ):
+                raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "existing review chain is invalid")
+            atomic_write_json(acceptance_path, acceptance)
+            return review, acceptance
         atomic_write_json(review_path, review)
         atomic_write_json(acceptance_path, acceptance)
     return review, acceptance
@@ -351,12 +405,39 @@ def run_completion_review(
         exact_reason = (
             force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
         )
-        if (folder / "COMPLETION_REVIEW.json").exists() or (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists():
-            review, acceptance = _replay_pair(
-                folder, lane, review_outcome=review_outcome,
-                review_summary=review_summary, evidence=evidence,
-                approval=approval, force_accept_reason=exact_reason,
+        if event is not None and event.get("state") == "COMPLETE" and not (
+            (folder / "COMPLETION_REVIEW.json").is_file()
+            and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+        ):
+            raise ReviewError(
+                COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                "completed review event has no durable review pair",
             )
+        review_exists = (folder / "COMPLETION_REVIEW.json").exists()
+        acceptance_exists = (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
+        if review_exists and acceptance_exists:
+            replay_lifecycles = (
+                ("review_pending", "result_invalid", "accepted", "retired")
+                if event is not None else
+                ("review_pending", "result_invalid", "accepted")
+            )
+            if lane.get("lifecycle") not in replay_lifecycles:
+                raise ReviewError(
+                    COMPLETION_REVIEW_STALE_SOURCE,
+                    f"lane {lane['lane_id']} is not reviewable (lifecycle={lane.get('lifecycle')})",
+                )
+            if event is not None:
+                review, acceptance = _replay_pair(
+                    folder, lane, review_outcome=review_outcome,
+                    review_summary=review_summary, evidence=evidence,
+                    approval=approval, force_accept_reason=exact_reason,
+                )
+            else:
+                review, acceptance = _write_pair(
+                    rt, epoch_id, lane, review_outcome=review_outcome,
+                    review_summary=review_summary, evidence=evidence,
+                    approval=approval, force_accept_reason=exact_reason,
+                )
         else:
             if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
                 raise ReviewError(

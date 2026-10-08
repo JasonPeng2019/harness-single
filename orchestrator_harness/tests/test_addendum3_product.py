@@ -1419,6 +1419,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "session": {"session_id": "session-1"},
             "lifecycle": "review_pending",
             "process": {},
+            "controller_status_path": str(workspace / "controller.status.json"),
         }
         task_card = {
             "schema": "project-task-card/v1",
@@ -1431,13 +1432,15 @@ class Addendum3ProductTests(unittest.TestCase):
             ),
         }
         updates: list[dict[str, object]] = []
+        current = dict(lane)
 
         def update(
             _rt: object, _epoch: object, _lane_id: object, mutate: object
         ) -> dict[str, object]:
-            value = mutate(dict(lane))
-            updates.append(value)
-            return {**lane, **value}
+            value = mutate(dict(current))
+            current.update(value)
+            updates.append(dict(current))
+            return dict(current)
 
         with (
             patch.object(resume, "find_harness_root", return_value=Path("root")),
@@ -1453,6 +1456,7 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(resume, "_write_result_template"),
             patch.object(resume, "_rewrite_overlay_receipt"),
             patch.object(resume, "update_lane", side_effect=update),
+            patch.object(resume, "read_lane", side_effect=lambda *_: dict(current)),
         ):
             result = resume.run_resume(lane_id="lane-1", resume_task_card="card.json")
         self.assertTrue(result["ok"], result)
