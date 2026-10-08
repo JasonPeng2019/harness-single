@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "harness"))
+sys.path.insert(0, str(ROOT))
 
 from memory_harness import (
     apc,
@@ -42,7 +42,7 @@ from memory_harness import (
     store,
     templates,
 )
-from orchestrator_harness import bootstrap, core as harness_core, lanes, launch, processes, setup
+from orchestrator_harness import bootstrap, core as harness_core, lanes, launch, memory_handoff, processes, setup
 
 
 BINDING = {
@@ -115,14 +115,23 @@ class NativeChildHarness:
         workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
         for name, contents in {
             "README.md": "base workspace\n",
+            "hook-dispatch.py": "# hook dispatch\n",
             "lane-queue.py": "# lane queue\n",
             "manager-notify.py": "# manager notify\n",
             "result-stop-check.py": "# result stop check\n",
         }.items():
             self.write_text(workspace / name, contents)
+        shutil.copytree(
+            ROOT / "adapters" / "codex", self.harness / "adapters" / "codex",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         self.write_text(
             self.harness / "adapters" / "codex" / "super-cache" / ".codex" / "worker.txt",
             "codex worker payload\n",
+        )
+        self.write_text(
+            self.harness / "adapters" / "codex" / "harness" / "launcher_binding.py",
+            BINDING_SOURCE,
         )
         self.write_text(
             self.harness
@@ -545,7 +554,7 @@ class NativeApcChildTests(unittest.TestCase):
         with patch.dict(os.environ, control, clear=False):
             with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
                 outcome = self._prepare(self._launcher())
-            inherited_minus_control = privacy.worker_environment(os.environ)
+            inherited_minus_control = memory_handoff.worker_environment(provider_id="codex")
             self.assertIn("MEMORY_HARNESS_CONTROL_TOKEN", os.environ)
 
         self.assertEqual("apc_proposal", outcome.disposition["branch"])

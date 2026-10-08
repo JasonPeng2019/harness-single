@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import sqlite3
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
@@ -392,7 +393,7 @@ class TerminalOutcomeTests(unittest.TestCase):
             self.final.envelope, supersedes_rejected_attempt_id=token,
         )
         self.state.close()
-        with sqlite3.connect(self.root / "state.sqlite3") as legacy:
+        with closing(sqlite3.connect(self.root / "state.sqlite3")) as legacy, legacy:
             legacy.execute("DROP TABLE IF EXISTS rejected_authorizations")
             legacy.execute("DROP INDEX IF EXISTS dispatch_rejected_authorization")
             legacy.execute(

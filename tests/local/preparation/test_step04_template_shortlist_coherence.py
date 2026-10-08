@@ -647,9 +647,11 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", tokens)
         self.assertNotIn("value", tokens)
         self.assertIn("redacted", tokens)
-        # Sanitizing a secret yields exactly the same bounded query as writing
-        # the redaction marker literally, so the protected token is inert.
-        self.assertEqual(redacted_query, protected_query)
+        # The opaque policy_context binds each query to its distinct durable
+        # preparation; the sanitized search terms must still be identical.
+        def search_terms(query):
+            return {key: query[key] for key in ("representation", "tokens", "route")}
+        self.assertEqual(search_terms(redacted_query), search_terms(protected_query))
         self.assertEqual(redacted_query["tokens"], protected_query["tokens"])
 
         # The trusted comparable score is computed from that same sanitized
@@ -697,7 +699,10 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", objective_tokens)
         self.assertNotIn("value", objective_tokens)
         self.assertIn("redacted", objective_tokens)
-        self.assertEqual(redacted_objective_query, protected_objective_query)
+        self.assertEqual(
+            search_terms(redacted_objective_query),
+            search_terms(protected_objective_query),
+        )
         self.assertEqual(
             redacted_objective_query["tokens"], protected_objective_query["tokens"]
         )

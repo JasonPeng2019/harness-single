@@ -40,16 +40,16 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 async def _search_everos(query: str) -> list[dict[str, Any]]:
-    from everos.config import load_settings
-    from everos.infra.persistence.lancedb import lancedb_manager
-    import everos.component.embedding.accessor as embedding_accessor
-    import everos.service.search as search_service
-
     scope = _scope()
     base_root = Path(_required("MEMORY_HARNESS_EVEROS_BASE_ROOT")).resolve()
     memory_root = EverOSAdapter.memory_root_for_scope(base_root, scope)
     if not memory_root.is_dir():
         return []  # A new task can have no historical experience yet.
+    from everos.config import load_settings
+    from everos.infra.persistence.lancedb import lancedb_manager
+    import everos.component.embedding.accessor as embedding_accessor
+    import everos.service.search as search_service
+
     os.environ["EVEROS_ROOT"] = str(memory_root)
     load_settings.cache_clear()
     embedding_accessor._capability = None

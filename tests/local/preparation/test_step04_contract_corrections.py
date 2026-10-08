@@ -1143,6 +1143,7 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=accepted,
+                checkpoint="checkpoint-1",
             ),
         )
         first = self.service.prepare(

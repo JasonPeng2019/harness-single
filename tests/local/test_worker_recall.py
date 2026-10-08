@@ -3,10 +3,29 @@ from __future__ import annotations
 import unittest
 import asyncio
 import tempfile
+from types import ModuleType
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from memory_harness import worker_recall
+
+
+def atlas_test_modules(embedding: MagicMock, vector_search: MagicMock) -> dict[str, ModuleType]:
+    """Supply inert optional SDK surfaces while testing our query contract."""
+    everos_embedding = ModuleType("everos.component.embedding")
+    everos_embedding.get_embedding_capability = lambda: embedding
+    langchain_core = ModuleType("langchain_core")
+    langchain_core.__path__ = []
+    langchain_embeddings = ModuleType("langchain_core.embeddings")
+    langchain_embeddings.Embeddings = type("Embeddings", (), {})
+    langchain_mongodb = ModuleType("langchain_mongodb")
+    langchain_mongodb.MongoDBAtlasVectorSearch = vector_search
+    return {
+        "everos.component.embedding": everos_embedding,
+        "langchain_core": langchain_core,
+        "langchain_core.embeddings": langchain_embeddings,
+        "langchain_mongodb": langchain_mongodb,
+    }
 
 
 class WorkerRecallTests(unittest.TestCase):
@@ -73,6 +92,7 @@ class WorkerRecallTests(unittest.TestCase):
         search.similarity_search_with_score.return_value = []
         embedding = MagicMock()
         embedding.require.return_value.embed = AsyncMock(return_value=[0.1, 0.2])
+        vector_search = MagicMock(return_value=search)
         environment = {
             "MEMORY_HARNESS_TASK_ID": "rust-rewrite",
             "MEMORY_HARNESS_ATLAS_URI": "mongodb://unused",
@@ -83,8 +103,7 @@ class WorkerRecallTests(unittest.TestCase):
         with (
             patch.dict("os.environ", environment, clear=True),
             patch("pymongo.MongoClient", return_value=client),
-            patch("everos.component.embedding.get_embedding_capability", return_value=embedding),
-            patch("langchain_mongodb.MongoDBAtlasVectorSearch", return_value=search) as vector_search,
+            patch.dict("sys.modules", atlas_test_modules(embedding, vector_search)),
         ):
             self.assertEqual([], asyncio.run(worker_recall._search_atlas("Implement crate parser")))
         vector_search.assert_called_once()
@@ -107,7 +126,7 @@ class WorkerRecallTests(unittest.TestCase):
                 "MEMORY_HARNESS_ATLAS_COLLECTION": "new_task_memory",
             }, clear=True),
             patch("pymongo.MongoClient", return_value=client),
-            patch("everos.component.embedding.get_embedding_capability", return_value=embedding),
+            patch.dict("sys.modules", atlas_test_modules(embedding, MagicMock())),
         ):
             self.assertEqual([], asyncio.run(worker_recall._search_atlas("First assignment")))
         embedding.assert_not_called()

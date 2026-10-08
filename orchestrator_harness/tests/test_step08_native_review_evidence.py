@@ -999,7 +999,11 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(resume, "new_id", return_value="run-2"),
             patch.object(memory_handoff, "_prepare_memory_outcome", return_value=resumed_context),
         ):
-            resumed = resume.run_resume(lane_id=self.lane_id, resume_task_card=str(resume_card))
+            # This fixture stubs memory preparation but retains optional recalled content.
+            resumed = resume.run_resume(
+                lane_id=self.lane_id, resume_task_card=str(resume_card),
+                search_stores=(SimpleNamespace(store_id="fixture-search"),),
+            )
         self.assertTrue(resumed["ok"], resumed)
         self.assertEqual("run-2", self.lane["run_id"])
         self.assertEqual(rejected["rejected_attempt_id"], self.lane["native_supersession"]["rejected_attempt_id"])

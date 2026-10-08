@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import controller
+from orchestrator_harness import bootstrap, controller
 from orchestrator_harness.records import read_jsonl
 
 
@@ -311,6 +311,9 @@ class NativeAttemptReceipts(unittest.TestCase):
     def test_late_tail_after_exit_is_captured_for_started_attempt(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            bootstrap._install_codex_worker_isolation(
+                root, root / "harness", root / "root-workspace"
+            )
             workspace = root / ".agent-workspace"
             workspace.mkdir()
             prompt = workspace / "prompt.md"

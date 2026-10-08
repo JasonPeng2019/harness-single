@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -203,13 +203,13 @@ class LaunchBoundaryFixture:
         )
         if include_qwen:
             shutil.copytree(
-                ROOT / "harness" / "adapters" / "qwen-code",
+                ROOT / "adapters" / "qwen-code",
                 self.harness / "adapters" / "qwen-code",
             )
             qwen_binding = self.harness / "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py"
             qwen_binding.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(
-                ROOT / "harness/orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
+                ROOT / "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
                 qwen_binding,
             )
         self.runtime = self.root_workspace / ".harness-runtime"
@@ -1231,7 +1231,7 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             {"schema": "current-epoch/v1", "epoch_id": self.fixture.EPOCH},
         )
         env = memory_handoff.worker_environment(self.card, provider_id="codex")
-        env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "harness"), str(SRC)))
+        env["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(SRC)))
         child = processes.spawn_detached(
             processes.python_argv("orchestrator_harness.controller", "launch-lane"),
             cwd=self.fixture.harness, env=env, stderr=subprocess.PIPE,

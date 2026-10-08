@@ -127,6 +127,16 @@ def _qwen_controls_verified(worktree: Path) -> bool:
         return False
 
 
+def _codex_launch_argv(argv: list[str]) -> bool:
+    if len(argv) >= 2 and Path(argv[0]).name.casefold() in {"codex", "codex.exe"}:
+        return argv[1] == "exec"
+    return (
+        len(argv) >= 3
+        and Path(argv[0]).name.casefold() in {"ollama", "ollama.exe"}
+        and argv[1:3] == ["launch", "codex"]
+    )
+
+
 def resolve_launch(
     provider_id: str,
     worktree: Path,
@@ -145,7 +155,7 @@ def resolve_launch(
     launched = list(argv)
     sources: list[str] = []
     suppressed: list[str] = []
-    if provider_id == "codex" and argv and argv[0] in {"codex", "ollama"}:
+    if provider_id == "codex" and _codex_launch_argv(argv):
         # Codex 0.156.1 takes top-level web_search as an exec config override.
         # The prompt marker must remain last, including through ollama launch.
         launched[-1:-1] = ["-c", 'web_search="disabled"']

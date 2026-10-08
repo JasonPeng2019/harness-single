@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator_harness import controller, provider_network_payload
+from orchestrator_harness import bootstrap, controller, provider_network_payload
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +38,9 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.worktree = Path(self.temp.name)
+        bootstrap._install_codex_worker_isolation(
+            self.worktree, self.worktree / "harness", self.worktree / "root-workspace"
+        )
 
     def argv(self, provider: str, *, resume: bool = False):
         return binding(provider).build_argv(
