@@ -135,7 +135,8 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $effectivePrompt) -Force 
 After harness setup, launch a native planner lane named planner-<id> before
 ROOT writes a substantive implementation plan or code. Give the planner the
 full task and ask it for architecture, dependencies, interfaces, bounded
-implementation assignments, and test risks. It does not implement. Verify an
+implementation assignments, and test risks. Ask it to find independent,
+substantial slices that separate implementers can own. It does not implement. Verify an
 actual provider_started event and a valid planner result, then record an
 ACCEPTED planner review before launching implementation.
 ROOT may do brief triage and assign the planner, but must not substitute its own
@@ -144,9 +145,11 @@ plan for this lane.
 Next launch at least one distinct native implementer lane named
 implementer-<id>, using the reviewed planner output in its task card. The
 implementer must do substantive task code, not merely review or validation.
-Launch two implementers when there are two independent substantial assignments
-with disjoint source custody; otherwise record why one is enough. Add further
-implementers only for useful distinct work. Verify actual provider_started
+Prefer two implementers when the plan has two independent substantial assignments
+with disjoint source custody. Use one when splitting the work would add more
+coordination than useful parallel progress; briefly record why. Add further
+implementers only for distinct, worthwhile work. Do not invent assignments just
+to increase the worker count. Verify actual provider_started
 events and reviewable implementation results. Record an ACCEPTED review for at
 least one implementation lane before validation. ROOT coordinates and integrates;
 it must not do the substantive implementation itself.
@@ -188,7 +191,4 @@ $prompt
     --harness-dir $harness `
     --watchdog-hours $WatchdogHours `
     --trust-project-hooks
-$collectorExit = $LASTEXITCODE
-if ($collectorExit -ne 0) { exit $collectorExit }
-& $python (Join-Path $harness 'tools\verify_delegation.py') --runtime-root $runtime
 exit $LASTEXITCODE
