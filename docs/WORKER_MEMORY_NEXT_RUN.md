@@ -29,18 +29,23 @@ receives an explicit “no similar experience” message. A backend failure is
 recorded separately from an empty search; bootstrap stops if both backends
 are unavailable.
 
-The launcher requires substantive worker delegation (including an implementing
-worker for implementation tasks) and favors two early workers when ROOT can
-assign independent, substantial work with disjoint source custody. If one
-worker is enough, ROOT records why another would add coordination without
-useful parallel work. More workers need distinct work that justifies them.
-Each worker receives memory selected for its task card. ROOT handles planning,
-integration, and the formal harness acceptance record. A separate validator
-builds and tests the integrated candidate where it has tool access, then
-supplies an evidence-based PASS/FAIL finding. Additional validators cover
-independent risks or resolve a disputed finding.
+The launcher requires a distinct native planner before implementation, at
+least one substantive native implementer after the planner's accepted result,
+and a separate native validator after integration. Use lane IDs beginning
+`planner-`, `implementer-`, and `validator-` so the final evidence check can
+identify them. Launch two implementers when independent, substantial work with
+disjoint source custody makes that useful; otherwise record why one is enough.
+Each worker receives memory selected for its task card. ROOT coordinates,
+integrates, and records the formal harness acceptance. The validator builds
+and tests the integrated candidate where it has tool access, then supplies an
+evidence-based PASS/FAIL finding. Additional validators cover independent
+risks or resolve a disputed finding.
 Where only ROOT can execute a host-only test command, it relays the exact
 command and output for the validator's assessment. ROOT cannot claim task
-completion on its own judgment or on failed/missing validation. The important
-log records recall queries, results, selection, and final worker prompts.
+completion on its own judgment or on failed/missing validation. After ROOT
+exits, `tools/verify_delegation.py` fails the launch if the important monitor
+log lacks real provider starts, valid results, and accepted review for all
+three distinct roles in order. This checks lane evidence, not the quality of
+the plan or implementation. The important log records recall queries,
+results, selection, and final worker prompts.
 Credentials are removed from worker and controller environments.

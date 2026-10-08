@@ -130,31 +130,45 @@ Remove-Item Env:MEMORY_HARNESS_ACTOR -ErrorAction SilentlyContinue
 $effectivePrompt = Join-Path $workspacePath '.agent-workspace\ROOT_WORKER_MEMORY_PROMPT.md'
 New-Item -ItemType Directory -Path (Split-Path -Parent $effectivePrompt) -Force | Out-Null
 @"
-# Required worker delegation
+# Required native worker delegation
 
-Before substantial ROOT implementation, split the task into bounded worker
-assignments. Launch two implementing workers early when there are two
-independent, substantial assignments with disjoint source custody. Otherwise
-launch one and briefly record why a second would add more coordination than
-useful parallel work. Add further workers only for distinct work that justifies
-the coordination. At least one worker must do substantive implementation for
-an implementation task; a validation-only lane does not count. Confirm actual
-worker launch and reviewable output, not just lane creation. After integration,
-launch a separate validator from the exact integrated candidate revision. Give
-it task-specific build/test commands. The validator runs the checks it can
-access and returns a PASS/FAIL finding backed by evidence. Use additional
-validators when independent risk areas or a disputed finding justify them,
-not merely to increase the count. If a validator cannot run a host-only
-command, ROOT relays the exact command and output for independent assessment.
-A failed or missing validation blocks a
-completion claim until repaired and revalidated. ROOT plans, assigns work,
-integrates, and records the harness's formal acceptance with the validator's
-evidence; ROOT's own impression is not validation. Give each worker a specific
-task card. The harness automatically searches shared memory using that task and
-gives the recalled experiences only to that worker. Do not read or request
-recalled worker content for ROOT planning. Do not disable worker memory or
-bypass native worker lanes. This delegation requirement supersedes any optional
-coding-worker wording in the supplied prompt or AGENTS.md.
+After harness setup, launch a native planner lane named planner-<id> before
+ROOT writes a substantive implementation plan or code. Give the planner the
+full task and ask it for architecture, dependencies, interfaces, bounded
+implementation assignments, and test risks. It does not implement. Verify an
+actual provider_started event and a valid planner result, then record an
+ACCEPTED planner review before launching implementation.
+ROOT may do brief triage and assign the planner, but must not substitute its own
+plan for this lane.
+
+Next launch at least one distinct native implementer lane named
+implementer-<id>, using the reviewed planner output in its task card. The
+implementer must do substantive task code, not merely review or validation.
+Launch two implementers when there are two independent substantial assignments
+with disjoint source custody; otherwise record why one is enough. Add further
+implementers only for useful distinct work. Verify actual provider_started
+events and reviewable implementation results. Record an ACCEPTED review for at
+least one implementation lane before validation. ROOT coordinates and integrates;
+it must not do the substantive implementation itself.
+
+After integration, launch a distinct native validator lane named
+validator-<id> from the exact integrated candidate revision. Give it task-
+specific build/test commands. It runs checks it can access and returns an
+evidence-backed PASS/FAIL finding. Add validators only for independent risks
+or disputed findings. If a host-only command is inaccessible to the validator,
+ROOT relays the exact command and output for independent assessment. Missing
+or failed validation blocks completion until repaired and revalidated. ROOT
+records the formal harness acceptance with the validator's evidence; ROOT's
+own impression is not validation.
+
+Planner, implementer, and validator must be three distinct provider launches
+with valid and ACCEPTED results, in that order. ROOT cannot count as any of
+them, and a
+created lane without a provider process does not count. Give each worker a
+specific task card. The harness recalls shared memory from that task and gives
+it only to that worker. ROOT must not read worker recall for its planning. Do
+not bypass native worker lanes. This requirement supersedes optional worker
+wording in the supplied prompt or AGENTS.md.
 
 $prompt
 "@ | Set-Content -LiteralPath $effectivePrompt -Encoding UTF8
@@ -174,4 +188,7 @@ $prompt
     --harness-dir $harness `
     --watchdog-hours $WatchdogHours `
     --trust-project-hooks
+$collectorExit = $LASTEXITCODE
+if ($collectorExit -ne 0) { exit $collectorExit }
+& $python (Join-Path $harness 'tools\verify_delegation.py') --runtime-root $runtime
 exit $LASTEXITCODE
