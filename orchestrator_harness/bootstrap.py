@@ -482,7 +482,7 @@ def _install_managed_material(
 def _install_codex_worker_isolation(
     worktree: Path, harness_root: Path, root_workspace: Path
 ) -> None:
-    """Install the benchmark worker profile after the provider overlay."""
+    """Keep a worker inside its task worktree and away from operator state."""
     import os
     import tomllib
 
@@ -506,30 +506,19 @@ def _install_codex_worker_isolation(
         )
 
     root_workspace = root_workspace.resolve()
-    runs_root = root_workspace.parent
-    host_workspace = runs_root.parent
+    workspaces_root = root_workspace.parent
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
     denied = {
         codex_home,
         (Path.home() / ".codex").resolve(),
         harness_root.resolve(),
-        harness_root.resolve().parent,
         root_workspace / ".harness-runtime" / "operator-only",
+        root_workspace / ".secrets",
     }
-    denied.update(
-        (host_workspace / name).resolve()
-        for name in (
-            ".secrets",
-            "benchmarks",
-            "Codex_Claude_Setup",
-            "product",
-            "results",
-        )
-    )
-    if runs_root.is_dir():
+    if workspaces_root.is_dir():
         denied.update(
             sibling.resolve()
-            for sibling in runs_root.iterdir()
+            for sibling in workspaces_root.iterdir()
             if sibling.is_dir() and sibling.resolve() != root_workspace
         )
 
