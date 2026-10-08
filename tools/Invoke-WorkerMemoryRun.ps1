@@ -8,18 +8,19 @@ param(
     [string]$PythonExecutable,
     [string]$CredentialRoot,
     [string]$ResultsDir,
-    [string]$AtlasDatabase = 'memory-dev',
-    [string]$AtlasIndex = 'vector_benchmark_memory_v1',
+    [Parameter(Mandatory)] [string]$AtlasDatabase,
+    [Parameter(Mandatory)] [string]$AtlasIndex,
     [string]$AtlasTextKey = 'search_text',
     [string]$AtlasEmbeddingKey = 'procedure_embedding',
-    [string]$EverosApplication = 'memory-harness-benchmark',
+    [string]$EverosApplication = 'coding-harness',
     [string]$EverosProject,
     [string]$EverosNamespace,
-    [string]$EverosOwner = 'root-benchmark',
-    [string]$Model = 'gpt-5.6-terra',
-    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max', 'ultra')] [string]$ReasoningEffort = 'high',
-    [ValidateSet('auto', 'default', 'flex', 'priority')] [string]$ServiceTier = 'priority',
-    [double]$WatchdogHours = 1.5
+    [string]$EverosOwner = 'worker-memory',
+    [Parameter(Mandatory)] [string]$Model,
+    [Parameter(Mandatory)] [ValidateSet('low', 'medium', 'high', 'xhigh', 'max', 'ultra')] [string]$ReasoningEffort,
+    [Parameter(Mandatory)] [ValidateSet('auto', 'default', 'flex', 'priority')] [string]$ServiceTier,
+    [ValidateSet('read-only', 'workspace-write', 'danger-full-access')] [string]$Sandbox = 'workspace-write',
+    [Parameter(Mandatory)] [double]$WatchdogHours
 )
 
 $ErrorActionPreference = "Stop"
@@ -168,7 +169,7 @@ $prompt
     --model $Model `
     --reasoning-effort $ReasoningEffort `
     --service-tier $ServiceTier `
-    --sandbox danger-full-access `
+    --sandbox $Sandbox `
     --harness-runtime $runtime `
     --harness-dir $harness `
     --watchdog-hours $WatchdogHours `

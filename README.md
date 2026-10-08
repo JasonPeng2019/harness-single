@@ -15,8 +15,7 @@ This standalone repository also includes the task-configurable worker memory
 package in `src/memory_harness/`, its tests in `tests/`, and the pinned EverOS
 and MongoDB integrations in `vendor/`. The memory-backed launcher is
 `tools/Invoke-WorkerMemoryRun.ps1`; see
-[`docs/WORKER_MEMORY_NEXT_RUN.md`](docs/WORKER_MEMORY_NEXT_RUN.md). The ZSTD
-launcher remains a preset for the existing ZSTD memory scope. Set
+[`docs/WORKER_MEMORY_NEXT_RUN.md`](docs/WORKER_MEMORY_NEXT_RUN.md). Set
 `harness-config.json` to the ROOT workspace before a run. Runtime files and
 credentials belong under ignored `runtime/` and `.secrets/` directories.
 

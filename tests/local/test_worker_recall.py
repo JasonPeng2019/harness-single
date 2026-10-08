@@ -30,57 +30,59 @@ def atlas_test_modules(embedding: MagicMock, vector_search: MagicMock) -> dict[s
 
 class WorkerRecallTests(unittest.TestCase):
     def test_exact_assignment_queries_both_stores_and_renders_worker_context(self) -> None:
-        query = "Implement Huffman literals for the ZSTD decoder"
-        atlas = [{"text": "Prior Huffman weight defect", "score": 0.82, "metadata": {"task": "zstd-decoder"}}]
-        everos = [{"key_insight": "Prior Huffman weight defect"}, {"key_insight": "Check treeless tables"}]
+        query = "Implement the API client retry policy"
+        atlas = [{"text": "Prior retry timeout defect", "score": 0.82, "metadata": {"task": "api-client"}}]
+        everos = [{"key_insight": "Prior retry timeout defect"}, {"key_insight": "Check idempotency"}]
         with (
-            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "zstd-decoder"}),
+            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "api-client"}),
             patch.object(worker_recall, "_search_atlas", new_callable=AsyncMock, return_value=atlas) as search_atlas,
             patch.object(worker_recall, "_search_everos", new_callable=AsyncMock, return_value=everos) as search_everos,
             patch.object(worker_recall, "write_activity") as activity,
             patch.object(worker_recall, "write_detail") as detail,
         ):
-            context = worker_recall.recall_worker_context(query, lane_id="huffman")
+            context = worker_recall.recall_worker_context(query, lane_id="retry-policy")
         search_atlas.assert_awaited_once_with(query)
         search_everos.assert_awaited_once_with(query)
-        self.assertEqual(1, context.count("Prior Huffman weight defect"))
-        self.assertIn("Check treeless tables", context)
+        self.assertEqual(1, context.count("Prior retry timeout defect"))
+        self.assertIn("Check idempotency", context)
         completed = next(call for call in activity.call_args_list if call.args[0] == "memory.worker.recall.completed")
         self.assertEqual(["atlas", "everos"], [item["source"] for item in completed.kwargs["selected"]])
         self.assertTrue(all(call.kwargs["recipient"] == "worker" for call in detail.call_args_list))
 
     def test_backend_failure_is_not_silently_treated_as_empty_memory(self) -> None:
         with (
-            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "zstd-decoder"}),
+            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "api-client"}),
             patch.object(worker_recall, "_search_everos", new_callable=AsyncMock, side_effect=RuntimeError("offline")),
             patch.object(worker_recall, "_search_atlas", new_callable=AsyncMock, side_effect=RuntimeError("offline")),
             patch.object(worker_recall, "write_activity") as activity,
         ):
             with self.assertRaisesRegex(RuntimeError, "both worker memory stores are unavailable"):
-                worker_recall.recall_worker_context("Build sequences", lane_id="sequences")
+                worker_recall.recall_worker_context("Build retries", lane_id="retries")
         self.assertEqual("memory.worker.recall.failed", activity.call_args_list[-1].args[0])
 
     def test_one_unavailable_store_keeps_available_experience(self) -> None:
         with (
-            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "zstd-decoder"}),
-            patch.object(worker_recall, "_search_everos", new_callable=AsyncMock, return_value=[{"key_insight": "Prior sequence offset defect"}]),
+            patch.dict("os.environ", {"MEMORY_HARNESS_RUN_ID": "run-02", "MEMORY_HARNESS_TASK_ID": "api-client"}),
+            patch.object(worker_recall, "_search_everos", new_callable=AsyncMock, return_value=[{"key_insight": "Prior retry backoff defect"}]),
             patch.object(worker_recall, "_search_atlas", new_callable=AsyncMock, side_effect=RuntimeError("offline")),
             patch.object(worker_recall, "write_activity") as activity,
             patch.object(worker_recall, "write_detail"),
         ):
-            context = worker_recall.recall_worker_context("Build sequences", lane_id="sequences")
-        self.assertIn("Prior sequence offset defect", context)
+            context = worker_recall.recall_worker_context("Build retries", lane_id="retries")
+        self.assertIn("Prior retry backoff defect", context)
         completed = activity.call_args_list[-1]
         self.assertEqual("memory.worker.recall.completed", completed.args[0])
         self.assertEqual(["atlas"], completed.kwargs["unavailable_stores"])
 
-    def test_scope_defaults_keep_zstd_memory_and_isolate_other_tasks(self) -> None:
-        with patch.dict("os.environ", {"MEMORY_HARNESS_TASK_ID": "zstd-decoder"}, clear=True):
-            zstd = worker_recall._scope()
+    def test_scope_defaults_are_generic_and_isolate_tasks(self) -> None:
+        with patch.dict("os.environ", {"MEMORY_HARNESS_TASK_ID": "api-client"}, clear=True):
+            first = worker_recall._scope()
         with patch.dict("os.environ", {"MEMORY_HARNESS_TASK_ID": "rust-rewrite"}, clear=True):
             other = worker_recall._scope()
-        self.assertEqual("zstd-decoder-shared-v1", zstd.namespace)
-        self.assertEqual("zstd-decoder", zstd.project)
+        self.assertEqual("api-client-shared-v1", first.namespace)
+        self.assertEqual("api-client", first.project)
+        self.assertEqual("coding-harness", first.application)
+        self.assertEqual("worker-memory", first.owner)
         self.assertEqual("rust-rewrite-shared-v1", other.namespace)
         self.assertEqual("rust-rewrite", other.project)
 
@@ -96,7 +98,7 @@ class WorkerRecallTests(unittest.TestCase):
         environment = {
             "MEMORY_HARNESS_TASK_ID": "rust-rewrite",
             "MEMORY_HARNESS_ATLAS_URI": "mongodb://unused",
-            "MEMORY_HARNESS_ATLAS_DATABASE": "memory-dev",
+            "MEMORY_HARNESS_ATLAS_DATABASE": "test-memory",
             "MEMORY_HARNESS_ATLAS_COLLECTION": "shared_rust_memories",
             "MEMORY_HARNESS_ATLAS_INDEX": "vector_memories_v1",
         }
@@ -123,6 +125,7 @@ class WorkerRecallTests(unittest.TestCase):
             patch.dict("os.environ", {
                 "MEMORY_HARNESS_TASK_ID": "new-task",
                 "MEMORY_HARNESS_ATLAS_URI": "mongodb://unused",
+                "MEMORY_HARNESS_ATLAS_DATABASE": "test-memory",
                 "MEMORY_HARNESS_ATLAS_COLLECTION": "new_task_memory",
             }, clear=True),
             patch("pymongo.MongoClient", return_value=client),

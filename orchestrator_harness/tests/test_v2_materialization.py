@@ -13,6 +13,27 @@ from unittest.mock import MagicMock, patch
 from orchestrator_harness import bootstrap, setup
 
 
+class CodexWorkerIsolationLayoutTests(unittest.TestCase):
+    def test_isolation_follows_selected_workspace_without_host_names(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            host = Path(raw)
+            workspace = host / "workspaces" / "task"
+            sibling = host / "workspaces" / "another-task"
+            unrelated = host / "unrelated-project"
+            for path in (workspace, sibling, unrelated):
+                path.mkdir(parents=True)
+            worktree = host / "lanes" / "worker"
+            harness = host / "harness-install"
+            bootstrap._install_codex_worker_isolation(worktree, harness, workspace)
+            config = tomllib.loads((worktree / ".codex" / "config.toml").read_text())
+            filesystem = config["permissions"]["worker-isolated"]["filesystem"]
+            self.assertEqual("deny", filesystem[str(sibling.resolve())])
+            self.assertEqual("deny", filesystem[str(harness.resolve())])
+            self.assertEqual("deny", filesystem[str(workspace / ".secrets")])
+            self.assertNotIn(str(host.resolve()), filesystem)
+            self.assertNotIn(str(unrelated.resolve()), filesystem)
+
+
 class GitWorktreeFailureCleanupTests(unittest.TestCase):
     @staticmethod
     def _completed(returncode: int, *, stderr: str = "") -> MagicMock:

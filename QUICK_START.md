@@ -116,7 +116,7 @@ messages, lane outcomes, and failures) in real time with:
 The append-only `<runtime>\monitor\MONITOR_IMPORTANT.log` holds the selected
 events. Routine monitor passes, heartbeats, scans, raw provider events, and
 full launch payloads stay in the separate `MONITOR_DETAIL.log` trace. Operator
-memory registration and post-score storage events go to
+memory registration and storage events go to
 `MONITOR_OPERATOR_MEMORY.log`. For older
 runs without the important-events file, the watcher filters that detailed trace
 at read time. It accepts `-RuntimeRoot`, `-Tail`, and `-NoWait`.
@@ -125,8 +125,7 @@ For runs using `MEMORY_HARNESS_WORKER_RECALL=1`, each worker bootstrap queries
 the shared experience stores using ROOT's exact task assignment, then gives
 the selected context to that worker. Recall records include the query, lane,
 results, and final worker delivery. ROOT receives no recalled context in its
-own prompt. A completed run's earlier operator preflight records remain
-historical operator events. The fresh-run setup is in
+own prompt. The fresh-run setup is in
 `docs/WORKER_MEMORY_NEXT_RUN.md`.
 
 For the full execution trace—including queue snapshots on admission, complete

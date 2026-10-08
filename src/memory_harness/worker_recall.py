@@ -21,10 +21,10 @@ def _required(name: str) -> str:
 def _scope() -> ExperienceScope:
     task = _required("MEMORY_HARNESS_TASK_ID")
     return ExperienceScope(
-        application=os.environ.get("MEMORY_HARNESS_EVEROS_APPLICATION", "memory-harness-benchmark"),
+        application=os.environ.get("MEMORY_HARNESS_EVEROS_APPLICATION", "coding-harness"),
         project=os.environ.get("MEMORY_HARNESS_EVEROS_PROJECT", task),
         namespace=os.environ.get("MEMORY_HARNESS_EVEROS_NAMESPACE", f"{task}-shared-v1"),
-        owner=os.environ.get("MEMORY_HARNESS_EVEROS_OWNER", "root-benchmark"),
+        owner=os.environ.get("MEMORY_HARNESS_EVEROS_OWNER", "worker-memory"),
     )
 
 
@@ -82,7 +82,7 @@ async def _search_atlas(query: str) -> list[dict[str, Any]]:
 
     client = MongoClient(_required("MEMORY_HARNESS_ATLAS_URI"), serverSelectionTimeoutMS=10_000)
     try:
-        database_name = os.environ.get("MEMORY_HARNESS_ATLAS_DATABASE", "memory-dev")
+        database_name = _required("MEMORY_HARNESS_ATLAS_DATABASE")
         collection_name = _required("MEMORY_HARNESS_ATLAS_COLLECTION")
         collection = client[database_name][collection_name]
         if collection.find_one({}, {"_id": 1}) is None:
@@ -101,7 +101,7 @@ async def _search_atlas(query: str) -> list[dict[str, Any]]:
         search = MongoDBAtlasVectorSearch(
             collection=collection,
             embedding=QueryEmbeddings(),
-            index_name=os.environ.get("MEMORY_HARNESS_ATLAS_INDEX", "vector_benchmark_memory_v1"),
+            index_name=_required("MEMORY_HARNESS_ATLAS_INDEX"),
             text_key=os.environ.get("MEMORY_HARNESS_ATLAS_TEXT_KEY", "search_text"),
             embedding_key=os.environ.get("MEMORY_HARNESS_ATLAS_EMBEDDING_KEY", "procedure_embedding"),
             relevance_score_fn="cosine",

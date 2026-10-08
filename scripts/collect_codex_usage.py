@@ -91,7 +91,7 @@ def stop_process_tree(process: subprocess.Popen[str]) -> None:
 
 def shutdown_harness_runtime(expected_runtime: Path, harness_dir: Path | None = None) -> str | None:
     """Ask the native harness to stop any detached lanes after a watchdog fire."""
-    harness_dir = harness_dir or Path(__file__).resolve().parent.parent / "harness-single"
+    harness_dir = harness_dir or Path(__file__).resolve().parent.parent
     config_path = harness_dir / "harness-config.json"
     if not config_path.is_file():
         return f"harness configuration not found: {harness_dir}"
@@ -250,8 +250,8 @@ def run_codex(args: argparse.Namespace) -> int:
     if args.arm == "raw" and args.harness_runtime:
         raise LedgerError("raw runs must not name a harness runtime")
     harness_dir = (Path(args.harness_dir).resolve() if getattr(args, "harness_dir", None)
-                   else Path(__file__).resolve().parent.parent / "harness-single")
-    if args.arm == "harness" and getattr(args, "harness_dir", None):
+                   else Path(__file__).resolve().parent.parent)
+    if args.arm == "harness":
         config_path = harness_dir / "harness-config.json"
         if not config_path.is_file():
             raise LedgerError(f"harness configuration not found: {config_path}")
