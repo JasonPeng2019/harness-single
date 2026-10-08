@@ -154,22 +154,27 @@ provider_started events and reviewable implementation results. Record an
 ACCEPTED review for each implementation lane before validation. ROOT
 coordinates and integrates; it must not do the substantive implementation itself.
 
-After integration, launch a distinct native validator lane named
-validator-<id> from the exact integrated candidate revision. Give it task-
-specific build/test commands. It runs checks it can access and returns an
-evidence-backed PASS/FAIL finding. Add validators only for independent risks
-or disputed findings. If a host-only command is inaccessible to the validator,
-ROOT relays the exact command and output for independent assessment. Missing
-or failed validation blocks completion until repaired and revalidated. ROOT
-records the formal harness acceptance with the validator's evidence; ROOT's
-own impression is not validation.
+After integration, launch native reviewer(s) in distinct validator-<id> lanes.
+Give each a clear specialty and the exact integrated candidate revision. One
+reviewer may inspect code, design, and edge cases; another may write and run
+tests and builds. When both are substantial, prefer separate reviewers for
+them. Add security, performance, or integration reviewers when their separate
+work adds meaningful coverage; do not create extra lanes for duplicate or
+trivial reviews. Reviewer(s) run checks they can access and return evidence-
+backed PASS/FAIL findings. At least one reviewer runs task-specific build/test
+checks where it has access. If a host-only command is inaccessible to them,
+ROOT relays the exact command and output for independent assessment. If review
+or tests change the candidate, validate the final revision. Missing or failed
+validation blocks completion until repaired and revalidated. ROOT records a
+formal review for every reviewer result and accepts the task only with their
+evidence; ROOT's own impression is not validation.
 
-Planner, implementer, and validator must be three distinct provider launches
-with valid and ACCEPTED results, in that order. ROOT cannot count as any of
-them, and a
-created lane without a provider process does not count. Give each worker a
-specific task card. The harness recalls shared memory from that task and gives
-it only to that worker. ROOT must not read worker recall for its planning. Do
+At least one planner, one implementer, and one reviewer/validator must be
+distinct provider launches with valid and ACCEPTED results, in that order.
+ROOT cannot count as any of them, and a created lane without a provider process
+does not count. Give each worker a specific task card. The harness recalls
+shared memory from that task and gives it only to that worker. ROOT must not
+read worker recall for its planning. Do
 not bypass native worker lanes. This requirement supersedes optional worker
 wording in the supplied prompt or AGENTS.md.
 

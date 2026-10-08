@@ -31,18 +31,24 @@ are unavailable.
 
 The launcher requires a distinct native planner before implementation, at
 least one substantive native implementer after the planner's accepted result,
-and a separate native validator after integration. The planner identifies
-independent, substantial implementation slices. Use as many implementers as
-the work justifies, including three or more when each has clear source custody
-and useful parallel progress. Use one when splitting adds more coordination
-than useful progress, and briefly record why.
+and separate native reviewer(s)/validator(s) after integration. The planner
+identifies independent, substantial implementation slices. Use as many
+implementers as the work justifies, including three or more when each has
+clear source custody and useful parallel progress. Use one when splitting
+adds more coordination than useful progress, and briefly record why.
+
 Each worker receives memory selected for its task card. ROOT coordinates,
-integrates, and records the formal harness acceptance. The validator builds
-and tests the integrated candidate where it has tool access, then supplies an
-evidence-based PASS/FAIL finding. Additional validators cover independent
-risks or resolve a disputed finding.
-Where only ROOT can execute a host-only test command, it relays the exact
-command and output for the validator's assessment. ROOT cannot claim task
-completion on its own judgment or on failed/missing validation. The important
-log records recall queries, results, selection, and final worker prompts.
+integrates, and records the formal harness acceptance. Reviewer(s) have clear,
+complementary specialties: for example, one reviews code and edge cases while
+another writes and runs tests and builds. Prefer separate reviewers when both
+jobs are substantial. Additional reviewers can cover security, performance,
+or integration when that is substantial work; avoid duplicate or trivial
+lanes. At least one reviewer runs task-specific builds and tests where it has
+access, and each gives an evidence-based PASS/FAIL finding on the final
+integrated revision. Where only ROOT can execute a host-only test command, it
+relays the exact command and output for independent assessment.
+ROOT cannot claim task completion on its own judgment or on failed/missing
+validation. The important log records recall queries, results, selection,
+and final worker prompts.
+
 Credentials are removed from worker and controller environments.
