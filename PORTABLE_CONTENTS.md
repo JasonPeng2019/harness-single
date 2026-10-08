@@ -6,6 +6,9 @@ Snapshot date: 2026-08-02.
 
 - Complete production Python code from `orchestrator_harness/`.
 - Complete shared `harness_common/` process-identity code.
+- Optional worker-memory code in `src/memory_harness/`, configured through the
+  native harness workflow.
+- Codex usage collection and token accounting tools in `scripts/`.
 - Complete production Python code and schema from `harness_watcher_implementation/`.
 - Harness and watcher unit/integration tests that are self-contained in this portable tree.
 - Example configuration, setup instructions, specifications, attention-logging documentation, and
@@ -20,6 +23,7 @@ Snapshot date: 2026-08-02.
 - Canary state directories, generated JSONL, snapshots, pending notifications, caches, and
   `test_results/`.
 - Historical sprint plans, reviews, checkpoints, handoffs, verdicts, and repair prompts.
+- Benchmark-specific run launchers, forced-delegation prompts, and experiment instructions.
 - The AI watcher-subagent relay model and all collaboration-notification machinery.
 - Obsolete owner/watcher wrappers and their repository-history-only test.
 - External provider service code and experiment artifacts; they are observed targets, not harness

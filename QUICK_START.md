@@ -124,9 +124,8 @@ at read time. It accepts `-RuntimeRoot`, `-Tail`, and `-NoWait`.
 For runs using `MEMORY_HARNESS_WORKER_RECALL=1`, each worker bootstrap queries
 the shared experience stores using ROOT's exact task assignment, then gives
 the selected context to that worker. Recall records include the query, lane,
-results, and final worker delivery. ROOT receives no recalled context in its
-own prompt. The fresh-run setup is in
-`docs/WORKER_MEMORY_NEXT_RUN.md`.
+results, and final worker delivery. Optional memory configuration for the native
+workflow is in [`docs/WORKER_MEMORY.md`](docs/WORKER_MEMORY.md).
 
 For the full execution trace—including queue snapshots on admission, complete
 ROOT-to-worker prompts, controller/provider launches, every native worker JSONL
