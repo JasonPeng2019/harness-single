@@ -145,14 +145,14 @@ plan for this lane.
 Next launch at least one distinct native implementer lane named
 implementer-<id>, using the reviewed planner output in its task card. The
 implementer must do substantive task code, not merely review or validation.
-Prefer two implementers when the plan has two independent substantial assignments
-with disjoint source custody. Use one when splitting the work would add more
-coordination than useful parallel progress; briefly record why. Add further
-implementers only for distinct, worthwhile work. Do not invent assignments just
-to increase the worker count. Verify actual provider_started
-events and reviewable implementation results. Record an ACCEPTED review for at
-least one implementation lane before validation. ROOT coordinates and integrates;
-it must not do the substantive implementation itself.
+Use as many implementers as the task justifies: one per substantial,
+independent assignment with clear source custody and useful parallel progress.
+Three or more are welcome when the work supports them. Use one when splitting
+would add more coordination than useful progress; briefly record why. Do not
+invent assignments just to increase the worker count. Verify actual
+provider_started events and reviewable implementation results. Record an
+ACCEPTED review for each implementation lane before validation. ROOT
+coordinates and integrates; it must not do the substantive implementation itself.
 
 After integration, launch a distinct native validator lane named
 validator-<id> from the exact integrated candidate revision. Give it task-

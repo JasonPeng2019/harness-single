@@ -32,10 +32,10 @@ are unavailable.
 The launcher requires a distinct native planner before implementation, at
 least one substantive native implementer after the planner's accepted result,
 and a separate native validator after integration. The planner identifies
-independent, substantial implementation slices. Prefer two implementers when
-those slices have disjoint source custody. Use one when splitting adds more
-coordination than useful progress, and briefly record why. Add more only for
-distinct, worthwhile work.
+independent, substantial implementation slices. Use as many implementers as
+the work justifies, including three or more when each has clear source custody
+and useful parallel progress. Use one when splitting adds more coordination
+than useful progress, and briefly record why.
 Each worker receives memory selected for its task card. ROOT coordinates,
 integrates, and records the formal harness acceptance. The validator builds
 and tests the integrated candidate where it has tool access, then supplies an
