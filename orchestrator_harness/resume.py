@@ -26,6 +26,7 @@ from .lanes import find_active_lane, read_lane, update_lane
 from .records import RecordLock, atomic_write_json, remove_record
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
 from .setup import COMPOSED_PAYLOADS
+from .retry_policy import MAX_LANE_PROVIDER_INVOCATIONS, WORKER_RETRY_LIMIT, completed_provider_invocations
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -273,6 +274,21 @@ def run_resume(
                 "summary": f"lane {lane_id} is still active; it is not resumed",
                 "evidence_paths": [],
                 "next_action": "wait for the lane to stop, or force-stop it first",
+            }
+        try:
+            prior_invocations = completed_provider_invocations(lane)
+        except (OSError, ValueError, TypeError) as exc:
+            return {
+                "ok": False, "code": WORKER_RETRY_LIMIT, "summary": str(exc),
+                "evidence_paths": [str(lane.get("attempts_path") or "")],
+                "next_action": "bootstrap a fresh lane and native session; preserve prior invocation evidence",
+            }
+        if prior_invocations >= MAX_LANE_PROVIDER_INVOCATIONS:
+            return {
+                "ok": False, "code": WORKER_RETRY_LIMIT,
+                "summary": f"lane {lane_id} used its initial assignment plus one retry (including automatic result corrections)",
+                "evidence_paths": [str(lane.get("attempts_path") or "")],
+                "next_action": "settle the previous lane and bootstrap a fresh lane and native session",
             }
         if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle not in ("running", "prepared"):
             return {
@@ -540,6 +556,8 @@ def run_resume(
         _clear_prior_run(rt, epoch_id, lane)
         if managed:
             _reset_worker_inbox(worktree, lane_id, run_id)
+            from .public_checks import install_route
+            install_route(harness_root, config.root_workspace, worktree, lane_id, run_id)
         _write_worker_prompt(
             worktree, task_card, managed=managed, rationale=rationale
         )

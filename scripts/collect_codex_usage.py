@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from prepare_root_launch import validate_prepared_root
+
 from token_ledger import (
     RUN_SCHEMA,
     TASK_SCHEMA,
@@ -262,6 +264,13 @@ def run_codex(args: argparse.Namespace) -> int:
         if configured != workspace:
             raise LedgerError("harness configuration does not select this ROOT workspace")
 
+    root_prelaunch = None
+    if args.arm == "harness":
+        try:
+            root_prelaunch = validate_prepared_root(harness_dir, workspace, args.run_id, resuming=resuming)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise LedgerError(str(exc)) from exc
+
     task_run_dir = Path(args.results_dir).resolve() / args.run_id
     run_dir = segment_dir if resuming else task_run_dir
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -274,6 +283,11 @@ def run_codex(args: argparse.Namespace) -> int:
         if getattr(args, "trust_project_hooks", False)
         else []
     )
+    if args.arm == "harness":
+        hook_trust_args += [
+            "-c", "features.hooks=true",
+            "-c", f'projects.{json.dumps(str(workspace))}.trust_level="trusted"',
+        ]
     if resuming:
         command = [
             "codex", "exec", "resume", *hook_trust_args, "--json",
@@ -319,6 +333,8 @@ def run_codex(args: argparse.Namespace) -> int:
         "harness_dir": str(harness_dir) if args.arm == "harness" and getattr(args, "harness_dir", None) else None,
         "trust_project_hooks": bool(getattr(args, "trust_project_hooks", False)),
     }
+    if root_prelaunch is not None:
+        launch["root_prelaunch"] = root_prelaunch
     if resuming:
         launch["segment_number"] = segment_number
         launch["resume_session_id"] = session_id

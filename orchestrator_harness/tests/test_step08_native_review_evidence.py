@@ -978,6 +978,9 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         ))
         self.assertEqual("run-1", rejected["run_id"])
         self.lane["session"] = {"session_id": "saved-session"}
+        (self.worktree / ".agent-workspace/controller.attempts.jsonl").write_text(
+            '{"run_id":"run-1","attempt":1,"provider_started":true}\n', encoding="utf-8"
+        )
         self.lane["provider"] = {"id": "codex", "model": "test", "launch_config": {}}
         resume_card = self.root / "resume-card.json"
         atomic_write_json(resume_card, self.card)

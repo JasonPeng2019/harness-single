@@ -428,6 +428,25 @@ def _write_worker_prompt(
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
+        if (worktree / ".agent-workspace/public-check-route.json").is_file():
+            lines.append(
+                "\n## Public build/test feedback\n"
+                "An operator-owned public test service is already running. It needs no ROOT "
+                "model intervention and does not grant you harness or Docker access. Commit "
+                "task code and scratch files, then run:\n"
+                "  python .agent-workspace/public-check.py request --check build\n"
+                "  python .agent-workspace/public-check.py request --check public\n"
+                "For a focused C test, use request --check focused -- <container command argv>. "
+                "The service copies only committed task-visible files and scratch/ to /app "
+                "in the pinned offline container. It returns a request_id. Retrieve feedback:\n"
+                "  python .agent-workspace/public-check.py wait --request-id <id> --timeout 30\n"
+                "Exit 75 means pending: wait again for the same request, in this active worker "
+                "session. Do not submit duplicates, finalize RESULT, or stop while awaiting "
+                "feedback. Other nonzero exits are build/test failures or service errors; read "
+                "the returned revision, stdout, stderr and exit_code, repair and retest. "
+                "Public-check iterations are tool calls, not provider retries. Preserve exact "
+                "request/result paths as evidence. Do not modify fixed public inputs or Makefile."
+            )
         lines.append(
             "\n## Escalation (managed coordination)\n"
             "If this work needs a ROOT decision, authority, missing input, or help, run:\n"
@@ -660,6 +679,36 @@ def _install_codex_worker_isolation(
             if sibling.is_dir() and sibling.resolve() != root_workspace
         )
 
+    # A run-local harness can be beside ROOT inside the same run directory.
+    # Denying that common parent denies ROOT and every lane beneath it on
+    # Windows, even when the lane is separately declared writable. Keep the
+    # specific harness/sibling restrictions, never an ancestor of ROOT.
+    denied = {
+        path for path in denied
+        if path != root_workspace and path not in root_workspace.parents
+    }
+
+    git_writes: set[Path] = set()
+    git_pointer = worktree / ".git"
+    if git_pointer.is_file():
+        common = _run_git(root_workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        lane_git = _run_git(worktree, "rev-parse", "--absolute-git-dir")
+        if common.returncode or lane_git.returncode:
+            raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "cannot resolve worker Git metadata")
+        common_dir = Path(common.stdout.strip()).resolve()
+        lane_git_dir = Path(lane_git.stdout.strip()).resolve()
+        if lane_git_dir == common_dir or common_dir / "worktrees" not in lane_git_dir.parents:
+            raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "worker Git metadata is not a linked worktree")
+        # :workspace protects linked Git metadata by default. Workers must be
+        # able to stage and commit, but do not need ROOT's index, Git config,
+        # hooks, or other lanes' indexes. Keep the .git pointer read-only.
+        git_writes = {
+            lane_git_dir,
+            common_dir / "objects",
+            common_dir / "refs" / "heads",
+            common_dir / "logs" / "refs" / "heads",
+        }
+
     lines = [
         "# Harness-owned worker read isolation; regenerated for every lane.",
         "[permissions.worker-isolated]",
@@ -669,6 +718,10 @@ def _install_codex_worker_isolation(
     lines.extend(
         f'{json.dumps(str(path))} = "deny"'
         for path in sorted(denied, key=lambda value: str(value).casefold())
+    )
+    lines.extend(
+        f'{json.dumps(str(path))} = "write"'
+        for path in sorted(git_writes, key=lambda value: str(value).casefold())
     )
     lines.extend(
         [
@@ -1132,6 +1185,9 @@ def run_bootstrap(
                 ),
             }
 
+        if managed:
+            from .public_checks import install_route
+            install_route(harness_root, config.root_workspace, worktree_path, lane_id, run_id)
         _write_worker_prompt(worktree_path, task_card, managed=managed)
         _write_result_template(worktree_path, lane_id, run_id)
         _write_invocation(

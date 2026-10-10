@@ -19,6 +19,11 @@ usage collector and token ledger remain available in `scripts/`. Set
 `harness-config.json` to the ROOT workspace before a run. Runtime files and
 credentials belong under ignored `runtime/` and `.secrets/` directories.
 
+See [the integrated run fixes](docs/INTEGRATED_RUN_FIXES.md) for Codex ROOT prelaunch
+preparation, the mandatory Windows sandbox health gate, the optional direct worker public
+build/test service, and remaining task-completion work. Reusable benchmark prompt requirements
+are in [ROOT task policy](docs/ROOT_TASK_POLICY.md).
+
 ## What the harness does and does not do
 
 - Does: prepare and launch one coding worker per lane, publish durable lane/event records,
@@ -119,10 +124,14 @@ separate accept/reject decision with `lane completion-review`, which writes the 
 its own managed review event. Lifecycle: task card -> RESULT.json -> COMPLETION_REVIEW.json ->
 ORCHESTRATOR_ACCEPTANCE.json.
 
-An invalid result may receive at most five corrective prompts in the same native provider
-session, with per-attempt transcript, stderr, cleanup, and validation evidence. A sixth invalid
-attempt, a missing native resume session, or a provider startup/auth/process failure ends as
-`provider_exited_no_result`; it never starts a fresh context.
+Each launcher invokes its provider once. An invalid result or provider failure preserves
+per-attempt transcript, stderr, usage and cleanup evidence as `provider_exited_no_result`;
+it never automatically retries, resumes, repairs or switches providers. Diagnose the failure
+before a separate launch. A lane/native session permits its initial assignment plus at most
+one explicit manual retry, counted across run IDs in its append-only invocation ledger.
+
+Managed ROOT Stop requires a CLOSED runtime even when its queue is empty or no epoch exists.
+CLOSED proves cleanup; it does not prove the user's task was completed or independently validated.
 
 ## Resume, force-stop, retire, shutdown
 

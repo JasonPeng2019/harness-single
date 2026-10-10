@@ -1,4 +1,4 @@
-﻿"""The lane controller: one long-lived supervisor process per lane.
+"""The lane controller: one long-lived supervisor process per lane.
 
 The controller starts and cleans up the lane's provider process, captures the
 transcript/stderr/last message, writes the worktree execution records,
@@ -34,7 +34,9 @@ from .records import (
     read_record,
 )
 from .review import validate_acceptance_chain
+from .retry_policy import MAX_LANE_PROVIDER_INVOCATIONS, completed_provider_invocations
 from .setup import read_runtime_state
+from .windows_sandbox_preflight import BLOCK, require_ready, startup_failure
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 CONTROLLER_EVENTS_SCHEMA = "controller-events/v1"
@@ -490,6 +492,23 @@ def _read_acceptance_chain(
     return {"review": review, "acceptance": acceptance}
 
 
+def _record_sandbox_failure(
+    rt: Path, lane: dict[str, Any], child: Any,
+    boundary: processes.ProcessBoundary, failure: str,
+) -> None:
+    """Latch only this owned invocation's failure; never relaunch or repair."""
+    block_path = rt.parent / BLOCK
+    block_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(block_path, {
+        "schema": "sandbox-launch-block/v1", "lane_id": lane["lane_id"],
+        "run_id": lane["run_id"], "reason": failure,
+        "provider_pid": child.pid, "provider_creation_time": boundary.root_creation_time,
+        "recorded_at": iso_utc(), "automatic_retry": False,
+    })
+    _write_status(lane, {"sandbox_startup_error": failure, "sandbox_launch_block": str(block_path)})
+    _append_event(lane, "sandbox_startup_failed", failure)
+
+
 def _run_provider(
     rt: Path,
     epoch_id: str,
@@ -500,6 +519,7 @@ def _run_provider(
     *,
     attempt_number: int = 1,
     resume: bool | None = None,
+    sandbox_health: dict[str, Any] | None = None,
 ) -> ProviderExecution:
     """Start the provider, stream output, and return its exact process boundary."""
     worktree = Path(lane["worktree_path"])
@@ -569,6 +589,16 @@ def _run_provider(
                     no_provider_started=True,
                 )
     lane["_attempt_argv"] = list(argv)
+    if sandbox_health is not None:
+        try:
+            sandbox_health = require_ready(
+                Path(sandbox_health["harness_dir"]), workspace=rt.parent, executable=argv[0],
+            )
+        except (OSError, ValueError) as exc:
+            raise ControllerError(
+                LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True,
+            ) from exc
+    stderr_start_byte = stderr_path.stat().st_size if stderr_path.is_file() else 0
     append_detail(
         rt,
         "launch.worker.requested",
@@ -702,10 +732,26 @@ def _run_provider(
     last_message: str | None = None
     session: str | None = None
     non_retryable_failure = False
+    sandbox_failure_recorded = False
     with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(pre_spawn_offset)
         next_observation = time.monotonic()
         while child.poll() is None:
+            if sandbox_health is not None:
+                failure = startup_failure(sandbox_health, stderr_path, stderr_start_byte)
+                if failure is not None:
+                    # Stop only this invocation's already-owned process boundary.
+                    # Latch the run so ROOT cannot respond by spawning another lane.
+                    _record_sandbox_failure(rt, lane, child, boundary, failure)
+                    sandbox_failure_recorded = True
+                    non_retryable_failure = True
+                    boundary.cleanup(force=True, timeout_seconds=10.0)
+                    try:
+                        child.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
+                        child.kill()  # Exact Popen child, never a process-name search.
+                        child.wait(timeout=10.0)
+                    break
             if time.monotonic() >= next_observation:
                 boundary.observe()
                 next_observation = time.monotonic() + 0.5
@@ -767,6 +813,13 @@ def _run_provider(
                     session = str(parsed["session_id"])
                 if parsed.get("non_retryable_failure") is True:
                     non_retryable_failure = True
+    # A setup helper can fail before the first poll. Preserve that failure
+    # and block later lanes even when the provider has already exited.
+    if sandbox_health is not None and not sandbox_failure_recorded:
+        failure = startup_failure(sandbox_health, stderr_path, stderr_start_byte)
+        if failure is not None:
+            _record_sandbox_failure(rt, lane, child, boundary, failure)
+            non_retryable_failure = True
     exit_code = child.returncode if child.returncode is not None else -1
     if last_message is not None:
         last_message_path.write_text(last_message, encoding="utf-8")
@@ -889,11 +942,36 @@ def run_controller(lane_id: str) -> int:
     if not prompt_path.is_file():
         prompt_path = Path(lane["worktree_path"]) / ".agent-workspace" / "prompt.md"
 
+    try:
+        prior_invocations = completed_provider_invocations(lane)
+    except (OSError, ValueError, TypeError) as exc:
+        prior_invocations = MAX_LANE_PROVIDER_INVOCATIONS
+        _append_event(lane, "retry_history_unproven", str(exc))
+    if prior_invocations >= MAX_LANE_PROVIDER_INVOCATIONS:
+        _write_status(lane, {
+            "controller_state": "exited", "provider_state": {"state": "not_started"},
+            "result_state": "invalid", "recorded_status": "provider_exited_no_result",
+            "cleanup_proven": True, "retry_limit_reached": True,
+        })
+        release_leases(rt, lane_id, lane["run_id"])
+        update_lane(rt, epoch_id, lane_id, lambda current: {**current, "lifecycle": "result_invalid"})
+        _append_event(lane, "provider_exited_no_result", "initial assignment plus one retry exhausted; use a fresh lane/session")
+        return 0
+
     attempt_number = 1
-    correction_count = 0
-    while True:
+    # One provider invocation per launcher call. Failures are evidence for
+    # diagnosis; they never cause an automatic resume/correction/fresh launch.
+    for _ in range(1):
         attempt_paths = _attempt_paths(lane, attempt_number)
         try:
+            sandbox_health = None
+            if provider_id == "codex":
+                try:
+                    sandbox_health = require_ready(harness_root, workspace=rt.parent)
+                except (OSError, ValueError) as exc:
+                    raise ControllerError(
+                        LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True,
+                    ) from exc
             execution = _run_provider(
                 rt,
                 epoch_id,
@@ -903,6 +981,7 @@ def run_controller(lane_id: str) -> int:
                 prompt_path,
                 attempt_number=attempt_number,
                 resume=attempt_number > 1 or bool((lane.get("session") or {}).get("session_id")),
+                **({"sandbox_health": sandbox_health} if sandbox_health is not None else {}),
             )
         except Exception as exc:
             status_path = Path(lane["controller_status_path"])
@@ -1111,8 +1190,7 @@ def run_controller(lane_id: str) -> int:
             recorded = "review_pending"
             break
 
-        # The invalid result is kept as evidence while the provider continues
-        # in its saved native session.  The original run_id and leases remain.
+        # Preserve the session/result evidence for diagnosis without relaunching.
         if execution.session_id:
             update_lane(
                 rt,
@@ -1123,58 +1201,27 @@ def run_controller(lane_id: str) -> int:
                     "session": {"session_id": value},
                 },
             )
-        if (
-            correction_count >= 5
-            or not execution.session_id
-            or execution.non_retryable_failure
-        ):
-            _write_status(
-                lane,
-                {
-                    "controller_state": "exited",
-                    "provider_state": provider_state,
-                    "result_state": "invalid",
-                    "recorded_status": "provider_exited_no_result",
-                    "cleanup_proven": True,
-                    "correction_attempts": correction_count,
-                },
-            )
-            release_leases(rt, lane_id, lane["run_id"])
-            reason = (
-                "provider failure"
-                if execution.non_retryable_failure
-                else "correction limit or native session unavailable"
-            )
-            _append_event(lane, "provider_exited_no_result", reason)
-            _append_event(lane, "leases_released", ",".join(declared) or "(none)")
-            update_lane(
-                rt,
-                epoch_id,
-                lane_id,
-                lambda current: {**current, "lifecycle": "result_invalid"},
-            )
-            return 0
-
-        correction_count += 1
-        correction_prompt = _write_correction_prompt(
-            lane, correction_count, "missing or invalid RESULT.json"
-        )
         _write_status(
             lane,
             {
+                "controller_state": "exited",
+                "provider_state": provider_state,
                 "cleanup_proven": True,
                 "result_state": "invalid",
-                "recorded_status": "correction_pending",
-                "correction_attempts": correction_count,
+                "recorded_status": "provider_exited_no_result",
+                "correction_attempts": 0,
+                "automatic_retry": False,
+                "diagnosis_required": True,
             },
         )
-        _append_event(
-            lane,
-            "correction_requested",
-            f"attempt={correction_count}; prompt={correction_prompt}",
+        release_leases(rt, lane_id, lane["run_id"])
+        _append_event(lane, "provider_exited_no_result", "one launch attempt failed; diagnose before a separate repaired launch")
+        _append_event(lane, "leases_released", ",".join(declared) or "(none)")
+        update_lane(
+            rt, epoch_id, lane_id,
+            lambda current: {**current, "lifecycle": "result_invalid"},
         )
-        prompt_path = correction_prompt
-        attempt_number += 1
+        return 0
 
     # Wait for the acceptance chain (ACCEPTED -> copy + exit; REJECTED -> exit).
     while True:

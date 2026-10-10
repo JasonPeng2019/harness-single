@@ -74,10 +74,28 @@ class RootHookDispatchTests(unittest.TestCase):
                 self.assertEqual(result["decision"], "REJECT")
                 self.assertTrue(result["reason"])
 
-    def test_terminal_queue_allows_both_boundaries(self) -> None:
+    def test_terminal_queue_does_not_allow_open_runtime_to_stop(self) -> None:
         queue = {"events": [{"type": "LANE_STATUS_CHANGED", "state": "COMPLETE"}]}
         self.assertEqual(self.call("post-tool-use", queue=queue), {"decision": "ALLOW"})
-        self.assertEqual(self.call("stop", queue=queue), {"decision": "ALLOW"})
+        self.assertEqual(self.call("stop", queue=queue)["decision"], "REJECT")
+
+    def test_closed_runtime_allows_stop_even_without_monitor_or_queue(self) -> None:
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value={"state": "CLOSED"}),
+            patch.object(hooks, "_unresolved_events") as queue,
+            patch.object(hooks, "_monitor_health") as health,
+        ):
+            self.assertEqual({"decision": "ALLOW"}, hooks.dispatch(self.root, "stop", "codex"))
+        queue.assert_not_called()
+        health.assert_not_called()
+
+    def test_empty_queue_running_worker_cannot_allow_stop(self) -> None:
+        # OPEN is the lifecycle invariant; no delayed monitor event is required.
+        result = self.call("stop", queue={"events": []})
+        self.assertEqual("REJECT", result["decision"])
+        self.assertIn("worker work continues", result["reason"])
+        self.assertIn("shutdown", result["reason"])
 
     def test_monitor_recovery_failure_is_a_notice(self) -> None:
         result = self.call(
@@ -116,7 +134,7 @@ class RootHookDispatchTests(unittest.TestCase):
         self.assertEqual(self.call("post-tool-use", queue={"events": "bad"})["decision"], "NOTICE")
         self.assertEqual(self.call("stop", queue={"events": "bad"})["decision"], "REJECT")
 
-    def test_no_epoch_has_no_queue_obligation(self) -> None:
+    def test_no_epoch_still_requires_shutdown_before_stop(self) -> None:
         with (
             patch.object(hooks, "load_config", return_value=self.config),
             patch.object(hooks, "read_runtime_state", return_value=self.open_state),
@@ -125,7 +143,7 @@ class RootHookDispatchTests(unittest.TestCase):
             patch.object(hooks, "read_manager_queue") as queue,
             patch.object(hooks, "_monitor_health") as health,
         ):
-            self.assertEqual(hooks.dispatch(self.root, "stop", "codex"), {"decision": "ALLOW"})
+            self.assertEqual(hooks.dispatch(self.root, "stop", "codex")["decision"], "REJECT")
         queue.assert_not_called()
         health.assert_not_called()
 

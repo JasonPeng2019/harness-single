@@ -346,6 +346,12 @@ class LaunchBoundaryFixture:
         )
 
     def make_resumable(self, lane_id: str, *, session_id: str = "session-1") -> None:
+        lane = self.lane_record(lane_id)
+        attempts = Path(lane["attempts_path"])
+        if not attempts.exists():
+            attempts.write_text(json.dumps({
+                "run_id": lane["run_id"], "attempt": 1, "provider_started": True,
+            }) + "\n", encoding="utf-8")
         self.write_lane_fields(
             lane_id,
             lifecycle="review_pending",

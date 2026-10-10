@@ -293,6 +293,8 @@ def run_shutdown() -> dict[str, Any]:
                     _retire_lane(rt, epoch_id, lane_id)
                 close_epoch(rt, epoch_id)
 
+        from .public_checks import stop_service
+        stop_service(config.root_workspace)
         _stop_monitor(rt)
         with RecordLock(runtime_state_path(rt)):
             atomic_write_json(
