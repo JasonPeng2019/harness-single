@@ -78,6 +78,13 @@ Claude Code requires `effort`; Qwen Code currently requires only `--model`. Each
 repeated `--provider-option NAME=VALUE`. Bootstrap rejects missing, duplicate, or unsupported
 preferences before creating the lane, and resume reuses the recorded values unchanged.
 
+Codex also accepts `--provider-option permission_mode=yolo` for explicitly requested
+approval/sandbox bypass. The adapter passes `--yolo` and omits worker-isolated and
+Windows sandbox overrides. Without this option the existing worker-isolated mode
+remains in use; `permission_mode=worker-isolated` selects it explicitly. Claude Code
+uses `--permission-mode bypassPermissions`, equivalent to its permission-bypass CLI
+flag. Permission bypass does not change the assigned repository or task ownership.
+
 ## 4. Launch
 
 ```powershell

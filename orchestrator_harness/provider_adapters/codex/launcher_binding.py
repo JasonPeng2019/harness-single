@@ -14,7 +14,7 @@ PROVIDER_ID = "codex"
 ADAPTER_VERSION = "codex-v2"
 
 _LAUNCH_CONFIG_KEYS = frozenset({"reasoning_effort", "service_tier"})
-_OPTIONAL_LAUNCH_CONFIG_KEYS = frozenset({"launcher"})
+_OPTIONAL_LAUNCH_CONFIG_KEYS = frozenset({"launcher", "permission_mode"})
 
 
 def _direct_codex_executable() -> str:
@@ -108,6 +108,10 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
         if launch_config["launcher"] not in ("codex", "ollama"):
             raise ValueError("Codex launch_config launcher must be codex or ollama")
         normalized["launcher"] = launch_config["launcher"]
+    if "permission_mode" in launch_config:
+        if launch_config["permission_mode"] not in ("worker-isolated", "yolo"):
+            raise ValueError("Codex launch_config permission_mode must be worker-isolated or yolo")
+        normalized["permission_mode"] = launch_config["permission_mode"]
     return normalized
 
 
@@ -123,7 +127,15 @@ def build_argv(
     """Build the provider-owned, stdin-prompted Codex launch vector."""
     del prompt_path
     configured = validate_launch_config(model=model, launch_config=launch_config)
-    isolation_overrides = _isolation_overrides(worktree)
+    if configured.get("permission_mode") == "yolo":
+        permission_args = ["--yolo"]
+    else:
+        isolation_overrides = _isolation_overrides(worktree)
+        permission_args = [
+            "-c", 'default_permissions="worker-isolated"',
+            *[part for override in isolation_overrides for part in ("-c", override)],
+            *(["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []),
+        ]
     argv = ["codex", "exec", "--ignore-user-config"]
     if resume:
         if not session_id:
@@ -131,10 +143,7 @@ def build_argv(
         argv.extend(["resume", session_id])
     argv.extend(
         [
-            "-c",
-            'default_permissions="worker-isolated"',
-            *[part for override in isolation_overrides for part in ("-c", override)],
-            *(["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []),
+            *permission_args,
             "--skip-git-repo-check",
             "-c",
             'approval_policy="never"',
@@ -148,7 +157,7 @@ def build_argv(
             "-c",
             "features.hooks=true",
             "-c",
-            f'projects.{json.dumps(worktree)}.trust_level="trusted"',
+            f'projects={{ {json.dumps(worktree, ensure_ascii=False)} = {{ trust_level="trusted" }} }}',
             "--json",
             "--output-last-message",
             str(Path(worktree) / ".agent-workspace" / "last-message.txt"),

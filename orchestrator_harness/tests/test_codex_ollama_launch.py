@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator_harness.provider_adapters.codex import launcher_binding as binding
 
@@ -54,7 +57,7 @@ class CodexOllamaLaunchTests(unittest.TestCase):
             "-m", "requested-model:cloud", "-c", 'model_reasoning_effort="high"',
             "-c", 'service_tier="normal"', "--dangerously-bypass-hook-trust",
             "-c", "features.hooks=true", "-c",
-            f'projects.{json.dumps(worktree)}.trust_level="trusted"',
+            f'projects={{ {json.dumps(worktree, ensure_ascii=False)} = {{ trust_level="trusted" }} }}',
             "--json", "--output-last-message",
             str(Path(worktree) / ".agent-workspace" / "last-message.txt"),
             "--cd", worktree, "-",
@@ -70,6 +73,54 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         for launcher in ("", "other", None):
             with self.subTest(launcher=launcher), self.assertRaises(ValueError):
                 self.argv(launch_config={"reasoning_effort": "max", "service_tier": "normal", "launcher": launcher})
+
+    def test_project_trust_preserves_literal_dotted_unicode_worktree_key(self):
+        worktree = str(Path("worker.with dots/analysis \U0001f600 space").resolve())
+        argv = self.argv(
+            worktree=worktree,
+            launch_config={
+                "reasoning_effort": "max", "service_tier": "default",
+                "permission_mode": "yolo",
+            },
+        )
+        overrides = [argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "-c"]
+        projects = [value.partition("=")[2] for value in overrides if value.partition("=")[0] == "projects"]
+        self.assertEqual(1, len(projects), "Codex needs a projects table, not a dotted path override")
+        decoded = tomllib.loads("projects=" + projects[0])["projects"]
+        self.assertEqual({worktree: {"trust_level": "trusted"}}, decoded)
+
+    def test_explicit_yolo_bypasses_sandbox_and_preserves_launch_preferences(self):
+        with tempfile.TemporaryDirectory() as worktree, patch.object(
+            binding, "_isolation_overrides", side_effect=AssertionError("unexpected sandbox setup")
+        ):
+            argv = self.argv(
+                worktree=worktree,
+                model="gpt-6.1-sol",
+                launch_config={
+                    "reasoning_effort": "max", "service_tier": "default",
+                    "permission_mode": "yolo",
+                },
+            )
+        self.assertIn("--yolo", argv)
+        self.assertEqual("gpt-6.1-sol", argv[argv.index("-m") + 1])
+        self.assertIn('model_reasoning_effort="max"', argv)
+        self.assertIn('service_tier="default"', argv)
+        self.assertIn("features.hooks=true", argv)
+        self.assertFalse(any("worker-isolated" in value or "windows.sandbox" in value for value in argv))
+
+    def test_explicit_yolo_is_preserved_on_resume(self):
+        argv = self.argv(
+            resume=True, session_id="native-session",
+            launch_config={"reasoning_effort": "high", "service_tier": "default", "permission_mode": "yolo"},
+        )
+        self.assertEqual(["resume", "native-session"], argv[3:5])
+        self.assertIn("--yolo", argv)
+        self.assertNotIn("--cd", argv)
+
+    def test_invalid_permission_mode_is_rejected(self):
+        for mode in ("", "other", None, True):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "permission_mode"):
+                self.argv(launch_config={"reasoning_effort": "max", "service_tier": "default", "permission_mode": mode})
 
     def test_catalog_and_registered_binding_are_identical(self):
         root = Path(__file__).resolve().parents[2]

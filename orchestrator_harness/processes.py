@@ -1481,6 +1481,13 @@ def process_boundary_is_gone(record: dict[str, Any]) -> bool:
     """Prove a serialized boundary is absent without terminating anything."""
 
     boundary = ProcessBoundary.from_record(record)
-    if not boundary.root_creation_time or not boundary.observe():
+    if not boundary.root_creation_time or boundary.errors:
+        return False
+    # A closed Windows Job cannot acquire descendants of a reused numeric PID.
+    # Fresh absence of every recorded incarnation needs no global PID snapshot.
+    # Unknown or surviving members still require the ordinary strict observation.
+    if os.name == "nt" and boundary.boundary_kind == "windows-job" and boundary._remaining() == []:
+        return True
+    if not boundary.observe():
         return False
     return boundary._remaining() == []

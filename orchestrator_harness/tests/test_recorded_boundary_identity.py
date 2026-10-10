@@ -8,6 +8,7 @@ These tests use the real ProcessBoundary methods with fake snapshot, identity,
 and termination functions only; no real process is observed or terminated.
 """
 
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -277,7 +278,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             self.assertEqual(
                 {(11001, "old-root"), (22002, "old-child")}, set(boundary._owned)
             )
-            self.assertFalse(p.process_boundary_is_gone(record))
+            # Capture/cleanup still refuses the reused root. Read-only Windows
+            # Job absence can separately prove every recorded incarnation gone.
+            self.assertEqual(os.name == "nt", p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
                 p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
