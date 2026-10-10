@@ -359,11 +359,11 @@ def run_codex(args: argparse.Namespace) -> int:
     # ROOT invokes the host-side harness package outside its writable workspace.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # An uncapped run must not inherit an earlier diagnostic gate by accident.
-    environment.pop("SWE_TOKEN_TASK_FILE", None)
-    environment.pop("SWE_TOKEN_COLLECTOR", None)
+    environment.pop("CODEX_TOKEN_TASK_FILE", None)
+    environment.pop("CODEX_TOKEN_COLLECTOR", None)
     if args.arm == "harness" and args.budget_tokens is not None:
-        environment["SWE_TOKEN_TASK_FILE"] = str(task_path)
-        environment["SWE_TOKEN_COLLECTOR"] = str(Path(__file__).resolve())
+        environment["CODEX_TOKEN_TASK_FILE"] = str(task_path)
+        environment["CODEX_TOKEN_COLLECTOR"] = str(Path(__file__).resolve())
 
     start_clock = time.monotonic()
     exit_code: int | None = None

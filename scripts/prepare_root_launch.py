@@ -95,7 +95,7 @@ def prepare(harness: Path, workspace: Path, run_id: str) -> dict[str, Any]:
     runtime = workspace / ".harness-runtime"
     if runtime.exists():
         # Only this exact run's successful preparation may be reused. Never
-        # adopt an existing benchmark runtime or repeat setup in a live run.
+        # adopt an existing runtime or repeat setup in a live run.
         return validate_prepared_root(harness, workspace, run_id)
     config = read(harness / "harness-config.json")
     if Path(config.get("root_workspace", "")).resolve() != workspace:
