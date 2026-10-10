@@ -22,6 +22,11 @@ class ResumeIdentityGuardTests(unittest.TestCase):
             root = Path(temporary)
             worktree = root / "worktree"
             worktree.mkdir()
+            agent = worktree / ".agent-workspace"
+            agent.mkdir()
+            (agent / "controller.attempts.jsonl").write_text(
+                '{"run_id":"run-old","attempt":1,"provider_started":true}\n', encoding="utf-8"
+            )
             lane = {
                 "lane_id": "lane-1", "run_id": "run-old",
                 "worktree_path": str(worktree), "lifecycle": "review_pending",

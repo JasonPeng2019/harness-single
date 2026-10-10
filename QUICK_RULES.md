@@ -44,6 +44,13 @@
   the prior owner absent.
 - A controller releases only claims owned by its exact invocation.
 - Stop cooperatively and never kill by broad process name or command matching.
+- Each launcher gets one provider attempt; never automatically retry, refresh sandbox setup,
+  switch modes or bypass a health gate. Preserve and diagnose failures before a separate launch.
+- A lane/session permits initial assignment plus at most one explicit manual retry across run IDs.
+- Prepare Codex ROOT hooks/monitor before the ROOT process starts. Windows Codex requires the
+  read-only CLI/home/cache/marker/probe gate; missing local policy cannot disable it.
+- Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,
+  not task success. Carry fresh-validator/public-evidence requirements in the actual run prompt.
 
 ## Runtime hygiene
 

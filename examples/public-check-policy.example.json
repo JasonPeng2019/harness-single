@@ -1,0 +1,6 @@
+{
+  "schema": "public-check-policy/v1",
+  "task": "zstd-decoder",
+  "timeout_seconds": 120,
+  "max_parallel_checks": 2
+}

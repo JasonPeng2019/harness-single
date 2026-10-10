@@ -1,7 +1,7 @@
 # Quick Start: Harness v2 Operator Run
 
 The shortest live run: configure once, setup, bootstrap, launch, watch, review, retire. All
-commands use the one public launcher:
+lane operations use the one public launcher:
 
 ```powershell
 python -m orchestrator_harness.operator_launch <group> <command> [options]
@@ -30,13 +30,31 @@ Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
 Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `resources`.
 `managed_coordination: "disabled"` runs plain lanes without the manager queue.
 
-## 2. One-time setup
+## 2. Prepare before ROOT starts
+
+For a fresh Codex ROOT, the operator prepares the configured run copy before opening ROOT's
+Codex session. On Windows, the read-only sandbox gate requires real operator health evidence
+for the exact CLI/home/process-local LOCALAPPDATA cache. Follow
+[the integration guide](docs/INTEGRATED_RUN_FIXES.md); no PASS receipt ships with the harness.
+
+```powershell
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <absolute-root> --run-id <id>
+```
+
+This calls native setup once, verifies hooks/monitor and records a matching receipt. The usage
+collector requires it before a fresh harness ROOT launch. ROOT continues that prepared runtime.
+An existing runtime without the matching receipt is refused; setup after ROOT starts cannot
+install hooks into that already-running session. Optional public-check policy must be installed
+before preparation so the operator-owned service is ready before any worker starts.
+
+For other providers or explicit manual integration, the native setup command remains:
 
 ```powershell
 python -m orchestrator_harness.operator_launch harness setup
 ```
 
-Setup is idempotent; re-run with `--overwrite` to re-integrate harness-owned files. Existing Codex
+Setup is idempotent; use `--overwrite` only for a separately diagnosed integration change.
+Each invocation gets one attempt; never retry a failed setup or refresh a live session. Existing Codex
 and Claude configuration is preserved, with harness hooks merged into the provider hook files. An
 existing `.codex/config.toml` must already set `[features] hooks = true`. Setup starts no lane or
 provider.
@@ -117,9 +135,11 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
 ## Resume, force-stop, shutdown
 
 - Resume a stopped, unaccepted lane: `resume-lane --lane-id lane-01 --resume-task-card <card>`,
-  then `lane launch --lane-id lane-01`.
+  then `lane launch --lane-id lane-01`. Initial assignment plus at most one explicit manual
+  retry is allowed per lane/session, including launches under new run IDs.
 - Hard-stop a stuck lane: `lane force-stop --lane-id lane-01`.
-- End the whole runtime: `harness shutdown`.
+- End the whole runtime: `harness shutdown`. Managed ROOT Stop rejects OPEN, including an empty
+  queue with a live worker. Verify CLOSED before exiting; cleanup is separate from task success.
 
 ## Follow the run
 

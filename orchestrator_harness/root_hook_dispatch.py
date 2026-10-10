@@ -216,7 +216,12 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
             return _reject(
                 f"ROOT has {len(unresolved)} unresolved manager queue obligation(s)"
             )
-        return {"decision": "ALLOW"}
+        return _reject(
+            "ROOT runtime remains OPEN. Do not exit while worker work continues. "
+            "Use native watch to handle remaining worker results and manager events, "
+            "settle/retire all lanes, then run `harness shutdown` and verify CLOSED "
+            "before returning your final answer. An empty queue alone is not completion."
+        )
     if unresolved or recovery_message:
         return _notice(
             provider_id,

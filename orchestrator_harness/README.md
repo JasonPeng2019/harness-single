@@ -164,8 +164,9 @@ proof.
 The monitor records a heartbeat on every pass, including zero watched lanes and promotion or
 inspection diagnostics. ROOT PostToolUse records `DELIVERED` receipts without advancing queue
 state; hooks only report an unhealthy monitor and direct ROOT to the public
-`health monitor-recover` command. Invalid results receive at most five corrective prompts in
-the same native provider session; a sixth invalid attempt or a provider startup/auth/process
+`health monitor-recover` command. Each launcher invokes its provider once; invalid results never
+trigger automatic corrective launches. The lane/session budget is initial assignment plus one
+explicit manual retry across run IDs. An invalid RESULT or a provider startup/auth/process
 failure ends as `provider_exited_no_result` without a fresh context.
 
 ## Read-only shipped source
@@ -183,3 +184,13 @@ output.
 affected, full, and release checks. Credit requires declared-input fingerprints plus exact source
 root, Git common directory, and branch identity, with the recorded origin tip still an ancestor
 of the current tip; unknown, divergent, mixed, or stale credit is not green evidence.
+
+## Integrated run guards
+
+Managed ROOT Stop requires runtime CLOSED, including empty-queue/live-worker and no-epoch
+cases. CLOSED establishes cleanup, not task completion. Before a fresh Codex ROOT launch, the
+operator must prepare native hooks/monitor and a matching setup receipt with
+`scripts/prepare_root_launch.py`. Windows Codex always requires the read-only environment-bound
+sandbox gate; it never initializes or repairs the sandbox. The optional ZSTD public-check service
+stages a lane-local client and is stopped during shutdown. See
+[the integration guide](../docs/INTEGRATED_RUN_FIXES.md) for setup, limits and remaining work.
