@@ -125,7 +125,17 @@ def _lane_clean(rt: Path, lane: dict[str, Any]) -> bool:
         return False
     status = _read_controller_status(lane)
     if status is None:
-        return False
+        # Resume marks an unlaunched invocation running with launch_pending.
+        # No recorded process and no status file distinguish it from unknown
+        # cleanup of an invocation that actually started.
+        never_launched = lane.get("lifecycle") == "prepared" or (
+            lane.get("lifecycle") == "running" and lane.get("launch_pending") is True
+        )
+        return (
+            never_launched
+            and lane.get("process") == {}
+            and not Path(lane["controller_status_path"]).exists()
+        )
     if status.get("cleanup_proven") is not True:
         return False
     boundary = status.get("process_boundary")

@@ -251,6 +251,18 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         if not binding_path.is_file():
             raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
 
+        # Consume the never-launched state before any process can be created.
+        # Registration or cleanup failures must not look like a pending launch.
+        lane = update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            lambda current: {
+                **current,
+                "lifecycle": "running",
+                "launch_pending": False,
+            },
+        )
         child = _spawn_controller_logged(
             rt, lane, processes.python_argv("orchestrator_harness.controller", lane_id),
             {"cwd": str(harness_root)},

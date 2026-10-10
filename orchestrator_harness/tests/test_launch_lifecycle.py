@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import controller, launch
+from orchestrator_harness import controller, launch, shutdown
 from orchestrator_harness.bootstrap import BOOTSTRAP_REQUEST_INVALID, BootstrapError
 from orchestrator_harness.controller import ControllerError
 from orchestrator_harness.leases import LeaseError
@@ -93,7 +93,7 @@ class LaunchHandshakeTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual("LAUNCH_OK", result["code"])
         self.assertIn("result_invalid", result["summary"])
-        update.assert_called_once()
+        self.assertEqual(2, update.call_count)
 
     def test_unrecordable_controller_identity_stops_exact_child(self) -> None:
         child = MagicMock(pid=41)
@@ -110,6 +110,7 @@ class LaunchHandshakeTests(unittest.TestCase):
             ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value=None),
+            patch.object(launch, "update_lane", return_value=self.lane),
         ):
             result = launch.run_launch("lane-1")
         self.assertFalse(result["ok"])
@@ -131,12 +132,49 @@ class LaunchHandshakeTests(unittest.TestCase):
             ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value={"pid": 41, "creation_time": "created-1"}),
-            patch.object(launch, "update_lane", side_effect=OSError("write failed")),
+            patch.object(launch, "update_lane", side_effect=[self.lane, OSError("write failed")]),
         ):
             result = launch.run_launch("lane-1")
         self.assertFalse(result["ok"])
         child.terminate.assert_called_once_with()
         child.wait.assert_called_once_with(timeout=10.0)
+
+    def test_failed_registration_and_cleanup_cannot_look_unlaunched(self) -> None:
+        for lifecycle in ("prepared", "running"):
+            for failure in ("terminate", "wait"):
+                with self.subTest(lifecycle=lifecycle, failure=failure):
+                    lane = {**self.lane, "lifecycle": lifecycle, "launch_pending": True}
+                    child = MagicMock(pid=41)
+                    getattr(child, failure).side_effect = OSError("cleanup unproven")
+                    events = []
+
+                    def persist(_runtime, _epoch, _lane, mutate):
+                        lane.update(mutate(dict(lane)))
+                        events.append("persist")
+                        return dict(lane)
+
+                    def spawn(*_args, **_kwargs):
+                        events.append("spawn")
+                        return child
+
+                    with (
+                        patch.object(launch, "find_harness_root", return_value=self.root),
+                        patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
+                        patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+                        patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
+                        patch.object(launch, "read_record", return_value=self.invocation),
+                        patch.object(launch, "_validate_provider_launch_config", return_value=self.invocation["provider"]["launch_config"]),
+                        patch.object(launch, "_spawn_controller_logged", side_effect=spawn),
+                        patch.object(launch.processes, "process_identity", return_value=None),
+                        patch.object(launch, "update_lane", side_effect=persist),
+                    ):
+                        result = launch.run_launch("lane-1")
+                    self.assertFalse(result["ok"])
+                    with patch.object(shutdown.processes, "identity_matches", return_value=False):
+                        self.assertFalse(shutdown._lane_clean(self.runtime, lane))
+                    self.assertEqual(["persist", "spawn"], events)
+                    self.assertEqual("running", lane["lifecycle"])
+                    self.assertIs(False, lane["launch_pending"])
 
 
 class CleanupDecisionTests(unittest.TestCase):
