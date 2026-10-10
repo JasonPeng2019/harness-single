@@ -15,10 +15,6 @@ Provides:
 - ``buffer_count`` / ``memcell_count``: raw counts for buffer-delta and
   memcell-growth assertions.
 
-The ``long_conversation`` fixture (LoCoMo conv_0) lives in
-:mod:`tests.conftest` so both ``tests/e2e/`` and
-``tests/integration/search/`` can depend on it.
-
 Conventions:
 
 - ``.env`` is loaded at import time (before any everos module reads
@@ -33,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import json
 import os
 import shutil
 import uuid
@@ -51,8 +46,6 @@ from sqlalchemy import text
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
-_FIXTURE_DIR = _PROJECT_ROOT / "tests" / "fixtures"
-_SEARCH_SEED_DIR = _FIXTURE_DIR / "search_seed"
 
 # Memorize service module-level singletons that survive across tests; we
 # null them out so each test rebuilds against its own ``tmp_path``.
@@ -91,24 +84,6 @@ def _reset_strategy_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # Data fixture
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def search_seed() -> dict[str, list[dict]]:
-    """Load the search seed slice produced by ``_dump_search_seed.py``.
-
-    Returns a dict with four keys (``episode`` / ``atomic_fact`` /
-    ``foresight`` / ``user_profile``); each value is a list of raw row
-    dicts ready to be fed into ``Model.model_validate`` for LanceDB.
-
-    Tests pick the subset they need and may mutate per-row fields
-    (e.g. set distinct ``session_id`` values to exercise filter DSL)
-    before instantiating the pydantic model.
-    """
-    return {
-        name: json.loads((_SEARCH_SEED_DIR / f"{name}.json").read_text())
-        for name in ("episode", "atomic_fact", "foresight", "user_profile")
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -345,3 +320,11 @@ def memcell_count() -> Callable[[str], Awaitable[int]]:
             return int(result.scalar() or 0)
 
     return _count
+
+
+@pytest.fixture
+def search_seed() -> dict[str, list[dict]]:
+    """Fresh original project rows; mutations never leak across tests."""
+    from tests.fixtures.project_data import project_search_rows
+
+    return project_search_rows()

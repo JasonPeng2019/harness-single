@@ -1,9 +1,9 @@
-"""Session-scoped corpus fixture for ``tests/integration/search/``.
+"""Session-scoped project-memory fixture for ``tests/integration/search/``.
 
-The pipeline that produces the search corpus (`/add` × 19 + `/flush` +
+The pipeline that produces searchable memory (`/add` per project batch + `/flush` +
 cascade drain) is the same one exercised by
-``tests/integration/test_add_flush_pipeline_e2e.py`` — and it costs
-~10 minutes against real LLMs. To keep the search test suite usable
+``tests/e2e/test_add_flush_user_pipeline_e2e.py`` — and it costs
+real model calls. To keep the search test suite usable
 in CI we run that pipeline **once per session** here, persist the
 resulting memory_root to a session ``tmp_path``, and let every test
 re-attach a fresh FastAPI lifespan against the on-disk corpus.
@@ -11,7 +11,7 @@ re-attach a fresh FastAPI lifespan against the on-disk corpus.
 Layout::
 
     _ingested_memory_root  (session-scoped)
-        └── ingests LoCoMo conv_0 via the HTTP API, then tears
+        └── ingests the original project conversation via the HTTP API, then tears
             lifespan down. Returns the memory_root path with md +
             sqlite + lancedb populated on disk.
 
@@ -114,7 +114,7 @@ def _ingested_memory_root(
     _session_monkeypatch: pytest.MonkeyPatch,
     long_conversation: dict,
 ) -> Path:
-    """Run /add × 19 + /flush + cascade drain once; return the memory_root.
+    """Run /add per project batch + /flush + cascade drain; return the memory_root.
 
     All on-disk artifacts (md files + sqlite system.db + lancedb
     tables) survive lifespan teardown, so per-test fixtures can
@@ -154,7 +154,7 @@ def _ingested_memory_root(
 
 
 async def _ingest(memory_root: Path, long_conversation: dict) -> None:
-    """Bring up the app once, push the LoCoMo fixture through /add+/flush."""
+    """Push the original project conversation through /add+/flush in a fresh app."""
     from everos.entrypoints.api.app import create_app
 
     app = create_app()

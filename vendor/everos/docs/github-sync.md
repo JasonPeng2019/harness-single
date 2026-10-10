@@ -17,11 +17,6 @@ These files exist on GitHub but are obsolete — delete them during sync:
 
 | File | Reason |
 |---|---|
-| `docs/locomo_benchmark.md` | Replaced by `benchmarks/README.md` |
-| `tests/run_locomo_10x3.sh` | Replaced by `benchmarks/run.py` |
-| `tests/run_locomo_batch.sh` | Replaced by `benchmarks/run.py` |
-| `tests/run_locomo_full.sh` | Replaced by `benchmarks/run.py` |
-| `tests/test_locomo.py` | Replaced by `benchmarks/run.py` |
 | `src/everos/memory/strategies/_partition_locks.py` | Wrong path; correct location is `src/everos/memory/_partition_locks.py` |
 
 ## 2. Must Preserve on GitHub (Do NOT Overwrite)
@@ -76,7 +71,6 @@ including but not limited to:
 - `CHANGELOG.md`, `CITATION.md`, `ACKNOWLEDGMENTS.md`
 - `docs/*.md` (except those listed in Must Delete)
 - `docs/openapi.json`
-- `benchmarks/**`
 - `.gitignore`
 - `.gitlab-ci.yml` (harmless on GitHub, good to keep in sync)
 
@@ -134,9 +128,6 @@ rsync -a --delete \
 
 # 3. Delete obsolete files
 cd github-checkout
-rm -f docs/locomo_benchmark.md
-rm -f tests/run_locomo_10x3.sh tests/run_locomo_batch.sh tests/run_locomo_full.sh
-rm -f tests/test_locomo.py
 rm -f src/everos/memory/strategies/_partition_locks.py
 
 # 4. Verify

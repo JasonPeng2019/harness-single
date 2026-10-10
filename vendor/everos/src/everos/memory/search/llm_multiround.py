@@ -649,7 +649,6 @@ def _build_round_trace(
         if 0 <= i < len(global_cands)
     ]
     record: dict[str, object] = {
-        "dataset": _dataset_from_owner(owner_id),
         "owner_id": owner_id,
         "question_id": None,
         "question": question,
@@ -944,7 +943,8 @@ def _finalize_injection(
     # 1. core-first, ordered by max RRF score across sub-queries. Capped at top_k:
     # steps 2 and 3 honour top_k, so leaving core uncapped silently returned MORE
     # than the caller asked for — measured at 316/1522 questions (20.8%) on
-    # SubtleMemory, up to 68 items for a top_k of 20 (3.4x the budget). That breaks
+    # long conversations, up to 68 items for a top_k of 20 (3.4x the budget).
+    # That breaks
     # the top_k contract and any same-budget comparison across methods. Core beyond
     # the budget is by definition the lowest-scored core, so it is what gets dropped.
     n_core_selected = 0
@@ -997,7 +997,6 @@ def _finalize_injection(
         _append_round_trace(
             dump_path,
             {
-                "dataset": _dataset_from_owner(owner_id),
                 "owner_id": owner_id,
                 "question_id": None,
                 "question": question,
@@ -1037,20 +1036,6 @@ def _trace_dump_path() -> str | None:
     """
     path = os.getenv(_TRACE_DUMP_ENV, "").strip()
     return path or None
-
-
-def _dataset_from_owner(owner_id: str) -> str:
-    """Best-effort dataset tag from the eval ``owner_id`` convention.
-
-    Eval owner ids follow ``"<dataset>_<conv_index>"`` (see MemoryRL
-    ``prepare_data``), e.g. ``longmemeval_0`` ⇒ ``longmemeval``. The trailing
-    numeric conv index is stripped; an id that does not match the convention
-    (no ``_`` or a non-numeric tail) passes through unchanged.
-    """
-    head, sep, tail = owner_id.rpartition("_")
-    if sep and tail.isdigit():
-        return head
-    return owner_id
 
 
 def _trace_cand_pool(cands: object) -> list[dict[str, object]]:

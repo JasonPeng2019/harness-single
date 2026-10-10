@@ -13,8 +13,6 @@ body:
       options:
         - src/everos
         - methods/HyperMem
-        - benchmarks/EverMemBench
-        - benchmarks/EvoAgentBench
         - use-cases
         - documentation
         - other

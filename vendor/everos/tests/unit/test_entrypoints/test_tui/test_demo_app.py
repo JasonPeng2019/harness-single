@@ -149,10 +149,8 @@ def test_signal_rail_light_colors_follow_white_yellow_black() -> None:
 
 def test_capabilities_box_uses_real_website_numbers() -> None:
     text = _capabilities_text().plain
-    # Real highlights from evermind.ai: token efficiency + one SOTA benchmark.
+    # Real highlights from evermind.ai: token efficiency and capabilities.
     assert "1/10 of full context" in text  # real token-efficiency claim
-    assert "93.05%" in text  # one headline benchmark (LoCoMo)
-    assert "83.00%" not in text  # only one score now
     assert "rerank" in text
     # local-first is dropped here (already shown in the field header scope).
     assert "local-first" not in text

@@ -1,6 +1,6 @@
-"""Episode AGENTIC cluster-path orchestration — 1:1 with everalgo benchmark.
+"""Episode AGENTIC cluster-path orchestration — 1:1 with everalgo retrieval pipeline.
 
-Implements the cluster main path from ``benchmarks/common/stages/search.py``
+Implements the cluster retrieval pipeline
 (``enable_cluster_retrieval=True``):
 
     fact-MaxSim (dense + sparse)
@@ -8,7 +8,7 @@ Implements the cluster main path from ``benchmarks/common/stages/search.py``
         -> acluster_retrieve (cluster_scoped, base=hybrid_full)
         -> aagentic_retrieve (base=cluster_scoped, round2=hybrid_full)
 
-Hyperparameters match benchmark ``config.py`` defaults and are frozen as
+Retrieval hyperparameters and are frozen as
 module-level constants — no env/TOML knobs at this layer.
 
 id contract: candidates flowing through the pipeline carry
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from everos.memory.search.recall.atomic_fact import AtomicFactRecaller
     from everos.memory.search.recall.episode import EpisodeRecaller
 
-# ── Benchmark hyperparameters (config.py defaults) ──────────────────────────
+# ── Retrieval hyperparameters ──────────────────────────
 _DENSE_CANDIDATES: int = 50
 _SPARSE_CANDIDATES: int = 50
 _HYBRID_RRF_K: int = 40
@@ -63,13 +63,13 @@ _ROUND2_CAP: int = 40
 _MULTI_QUERY_COUNT: int = 3
 _REFINEMENT_STRATEGY: str = "multi_query"
 
-# Child-pool sizing for amaxsim_retrieve. The benchmark passes
+# Child-pool sizing for amaxsim_retrieve. The reference retrieval pipeline passes
 # len(full_fact_corpus); EverOS doesn't know the corpus size upfront,
 # so we pass a large sentinel and let the LanceDB limit clamp naturally.
 _FACT_CHILD_CANDIDATES: int = 100_000
 
-# Qwen3-Reranker task instruction for the search scene (benchmark
-# ``config.reranker_instruction``). Steers the cross-encoder toward fact /
+# Qwen3-Reranker task instruction for the search scene. Steers the cross-encoder
+# toward fact /
 # entity / detail relevance rather than topical similarity.
 _RERANK_INSTRUCTION: str = (
     "Determine if the passage contains specific facts, entities "
@@ -91,7 +91,7 @@ async def search_episodes_agentic(
     llm: LLMClient,
     top_k: int,
 ) -> list[SearchEpisodeItem]:
-    """Episode AGENTIC search via cluster-scoped MaxSim — 1:1 with benchmark.
+    """Episode AGENTIC search via cluster-scoped MaxSim — using the retrieval pipeline.
 
     Args:
         query: User search query.
@@ -220,7 +220,7 @@ async def search_episodes_agentic(
         reranker, text_field="episode", instruction=_RERANK_INSTRUCTION
     )
 
-    # 8. aagentic_retrieve — benchmark cluster main path.
+    # 8. aagentic_retrieve — cluster retrieval pipeline.
     candidates, decision = await aagentic_retrieve(
         query,
         base_retrieve=cluster_scoped,

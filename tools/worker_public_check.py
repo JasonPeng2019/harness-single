@@ -50,13 +50,16 @@ def request(agent: Path, check: str, command: list[str]) -> dict:
     revision = subprocess.check_output(
         ["git", "-C", str(agent.parent), "rev-parse", "HEAD"], text=True,
     ).strip()
+    paths = route.get("input_paths")
+    if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+        raise ValueError("public check route lacks its configured input paths")
     dirty = subprocess.check_output(
         ["git", "-C", str(agent.parent), "status", "--porcelain", "--",
-         "src", "test_artifacts", "rfc8878.txt", "test.sh", "timer.sh", "scratch"],
+         *paths],
         text=True,
     )
     if dirty.strip():
-        raise ValueError("commit task code and scratch files before requesting a check")
+        raise ValueError("commit the configured project inputs before requesting a check")
     identifier = uuid.uuid4().hex
     value = {
         "schema": REQUEST_SCHEMA, "request_id": identifier,
@@ -84,7 +87,8 @@ def wait(agent: Path, identifier: str, timeout: float) -> tuple[dict, int]:
                 if result.get(field) != original.get(field):
                     raise ValueError("public check result identity mismatch")
             code = result.get("exit_code")
-            return result, code if isinstance(code, int) and 0 <= code <= 255 else 2
+            # Reserve PENDING for absent results, even if a finished backend uses 75.
+            return result, code if isinstance(code, int) and 0 <= code <= 255 and code != PENDING else 2
         if time.monotonic() >= deadline:
             return {"request_id": identifier, "status": "PENDING",
                     "next_action": "wait again for this same request; remain in this worker session"}, PENDING
@@ -107,7 +111,7 @@ def main() -> int:
         if args.action == "request":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if (args.check == "focused") != bool(command):
-                raise ValueError("focused checks require a container command; build/public checks use fixed commands")
+                raise ValueError("focused checks require command argv; build/public checks use configured commands")
             result, code = request(agent, args.check, command), 0
         else:
             result, code = wait(agent, args.request_id, args.timeout)

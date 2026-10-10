@@ -1,4 +1,4 @@
-"""End-to-end ``/api/v1/memory/search`` tests over a real LoCoMo corpus.
+"""End-to-end ``/api/v1/memory/search`` tests over ingested project memory.
 
 Six tests, each pinning one path through :class:`SearchManager`:
 
@@ -42,7 +42,7 @@ from ._helpers import (
 )
 
 # Whole module is opt-in — it depends on ``_ingested_memory_root`` which
-# spends ~10 min running real LLM + embedder against LoCoMo conv_0.
+# runs a real LLM + embedder against an original synthetic project conversation.
 pytestmark = pytest.mark.slow
 
 

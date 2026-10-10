@@ -127,7 +127,7 @@ class DeciderClientConfig:
 
     One resolution, two consumers: :func:`get_decider_llm_client` builds the client
     from it, and a caller that wants to *check* the decider before using it (the
-    benchmark harness probes it before the first question) must ask the same question
+    caller probes it before its first request) must ask the same question
     the same way. Re-deriving the rule at the check site is how a config that runs fine
     -- ``[decider].model`` set, endpoint inherited from ``[llm]`` -- ended up skipping
     the probe entirely, which is the one case the probe exists for.

@@ -75,7 +75,7 @@ class RootPrelaunchTests(unittest.TestCase):
         with (patch.object(preparation, "require_ready", return_value=health),
               patch.object(preparation.subprocess, "run", side_effect=setup_once) as setup,
               patch.object(public_checks, "start_service", side_effect=start_once) as start,
-              patch.object(public_checks, "policy", return_value={"task": "zstd-decoder"}),
+              patch.object(public_checks, "policy", return_value={"schema": "public-check-policy/v2"}),
               patch.object(public_checks, "validate_service", return_value=service)):
             first = preparation.prepare(self.harness, self.workspace, "fixture")
             again = preparation.prepare(self.harness, self.workspace, "fixture")
@@ -96,7 +96,7 @@ class RootPrelaunchTests(unittest.TestCase):
     def test_prepared_service_identity_cannot_change_before_root_launch(self) -> None:
         from orchestrator_harness import public_checks
         self.prepared()
-        with (patch.object(public_checks, "policy", return_value={"task": "zstd-decoder"}),
+        with (patch.object(public_checks, "policy", return_value={"schema": "public-check-policy/v2"}),
               patch.object(public_checks, "validate_service", return_value={"pid": 999})):
             with self.assertRaisesRegex(ValueError, "service changed after"):
                 preparation.validate_prepared_root(self.harness, self.workspace, "fixture")
@@ -155,7 +155,7 @@ class RootPrelaunchTests(unittest.TestCase):
         receipt = preparation.read(self.workspace / preparation.RECEIPT)
         self.write(self.workspace / preparation.RECEIPT, {**receipt, "public_check_service": service})
         self.write(self.workspace / ".harness-runtime/RUNTIME_STATE.json", {"state": "CLOSED"})
-        with (patch.object(public_checks, "policy", return_value={"task": "zstd-decoder"}),
+        with (patch.object(public_checks, "policy", return_value={"schema": "public-check-policy/v2"}),
               patch.object(public_checks, "validate_service", return_value={**service, "status": "STOPPED"}) as validate):
             preparation.validate_prepared_root(self.harness, self.workspace, "fixture", resuming=True)
             validate.assert_called_once_with(self.workspace, self.harness, runtime_closed=True)

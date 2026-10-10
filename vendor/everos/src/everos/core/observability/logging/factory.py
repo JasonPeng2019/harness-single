@@ -122,7 +122,7 @@ def configure_logging(level: str = "INFO") -> None:
 
     # Third-party HTTP clients log every successful request at INFO level —
     # `httpx` is the worst offender (one line per call, called once per
-    # LLM / embedding / rerank request). A single LoCoMo conv run easily
+    # LLM / embedding / rerank request). A long conversation easily
     # produces a thousand such lines, drowning everos's own events. They
     # are useful for debugging API failures, but failures already surface
     # via exceptions + status codes — so demote the success path to WARNING

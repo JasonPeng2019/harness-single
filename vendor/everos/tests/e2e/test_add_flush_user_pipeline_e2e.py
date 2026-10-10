@@ -1,7 +1,7 @@
 """Add + Flush core pipeline smoke — long real-conversation drive.
 
 Goal: prove the user-side add/flush chain is end-to-end live. Feeds
-**419 real LoCoMo messages** through ``POST /api/v1/memory/add`` (in 19
+original project-maintenance messages through ``POST /api/v1/memory/add`` (in several
 batches sharing one session_id) then a final ``POST /flush``, and
 verifies:
 
@@ -129,7 +129,7 @@ async def test_long_conversation_produces_all_memory_types(
     buffer_count: Callable[[str], Awaitable[int]],
     memcell_count: Callable[..., Awaitable[int]],
 ) -> None:
-    """One big seamless run: add 19 batches, flush, poll, assert everything."""
+    """One big seamless run: add project batches, flush, poll, assert everything."""
 
     session_id = long_conversation["everos_session_id"]
     memory_root = core_pipeline_runtime
@@ -138,7 +138,7 @@ async def test_long_conversation_produces_all_memory_types(
     assert await buffer_count(session_id) == 0
     assert await memcell_count(session_id) == 0
 
-    # ── Stage 1: drip 19 batches into /add, asserting buffer delta ────────
+    # ── Stage 1: drip project batches into /add, asserting buffer delta ────────
     last_status: str | None = None
 
     for idx, batch in enumerate(long_conversation["batches"]):
@@ -153,7 +153,7 @@ async def test_long_conversation_produces_all_memory_types(
             timeout=600.0,  # boundary detection may call LLM
         )
         assert resp.status_code == 200, (
-            f"batch {idx} ({batch['locomo_session']}): {resp.status_code} {resp.text}"
+            f"batch {idx} ({batch['scenario']}): {resp.status_code} {resp.text}"
         )
         body = resp.json()
         status: str = body["data"]["status"]
@@ -214,11 +214,11 @@ async def test_long_conversation_produces_all_memory_types(
     if flush_status == "extracted":
         assert cells_after_flush > cells_pre_flush
 
-    # 419 LoCoMo messages produce ~19 memcells in practice (LLM boundary
-    # decides semantic cuts; daily-life chat carves coarsely). Threshold
-    # 15 leaves room for run-to-run variance from the boundary LLM.
-    assert cells_after_flush >= 15, (
-        f"expected ≥ 15 memcells from 419 messages, got {cells_after_flush}; "
+    # The project conversation must leave at least one persisted memcell.
+    # Exact semantic boundaries vary between model invocations.
+    assert cells_after_flush >= 1, (
+        "expected ≥ 1 memcells from the project conversation, "
+        f"got {cells_after_flush}; "
         f"last add status was {last_status!r}, flush was {flush_status!r}"
     )
 
@@ -234,10 +234,11 @@ async def test_long_conversation_produces_all_memory_types(
     episode_files = _list_md_files(memory_root, _EPISODE_DIR)
     assert episode_files, "no episode md files written"
     episode_entries = _count_episode_entries(episode_files)
-    # 19 memcells × 2 owners (caroline + melanie) ≈ 36 episode rows seen
-    # in practice; threshold 15 leaves variance room.
-    assert episode_entries >= 15, (
-        f"expected ≥ 15 episode entries across {len(episode_files)} files, "
+
+    # The project conversation must produce persisted episode entries.
+    # Counts vary with semantic boundaries; exercise the storage path.
+    assert episode_entries >= 1, (
+        f"expected ≥ 1 episode entries across {len(episode_files)} files, "
         f"got {episode_entries}"
     )
 
@@ -245,7 +246,7 @@ async def test_long_conversation_produces_all_memory_types(
     from everos.infra.persistence.index import episode_repo
 
     lance_episode_count = await episode_repo.count()
-    assert lance_episode_count >= 15, (
+    assert lance_episode_count >= 1, (
         f"LanceDB episode rows ({lance_episode_count}) < md entries ({episode_entries})"
     )
 

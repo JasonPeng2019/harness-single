@@ -2,7 +2,7 @@
 
 Regression cover for a silent misconfiguration: ``LLMSettings`` had no timeout
 and no passthrough, so ``LLMConfig`` was built with three arguments and took the
-algo defaults for the rest. A benchmark harness exported
+algo defaults for the rest. A deployment exported
 ``EVEROS_LLM__TIMEOUT_SECONDS=300`` for months and it did nothing, and there was
 no way at all to reach a gateway's own request fields.
 

@@ -9,7 +9,6 @@ body:
       label: Area
       options:
         - architecture methods
-        - benchmarks
         - use cases
         - developer experience
         - documentation

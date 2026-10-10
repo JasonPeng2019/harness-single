@@ -6,8 +6,8 @@ Two defects, one root cause: a run's behaviour was not readable off its configur
   once at import time. Nothing in the config named them, so an operator could not
   discover them, and an import-time read cannot answer to a config reload.
 * When every decider attempt fails, the loop falls back to a fixed top-N core and stops
-  after one round. That produced plausible benchmark results until the structured log
-  and benchmark trace were promoted to hard validation signals.
+  after one round. That produced plausible retrieval results until the structured log
+  and diagnostic trace were promoted to hard validation signals.
 
 The parameters therefore live in ``[decider]`` and are resolved per search; a fallback
 logs at error and carries ``decider_failed`` in the round trace without changing the

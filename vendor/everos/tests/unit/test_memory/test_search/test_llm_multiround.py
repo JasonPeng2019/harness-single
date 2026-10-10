@@ -25,7 +25,6 @@ from everos.memory.search.llm_multiround import (
     RoundDecision,
     _balanced_objects,
     _coerce_core_indices,
-    _dataset_from_owner,
     _parse_decision,
     _render_blocks,
     _render_core_so_far,
@@ -180,11 +179,6 @@ def test_balanced_objects_outermost_first() -> None:
 
 def test_coerce_core_indices_filters_and_dedups() -> None:
     assert _coerce_core_indices([0, "2", 2, 9, -1, True, "x"], n_evidence=3) == [0, 2]
-
-
-def test_dataset_from_owner() -> None:
-    assert _dataset_from_owner("longmemeval_42") == "longmemeval"
-    assert _dataset_from_owner("no_index_here") == "no_index_here"
 
 
 # ── decider ────────────────────────────────────────────────────────────────
@@ -359,7 +353,6 @@ async def test_guarantee_gives_subquery_top1_a_slot() -> None:
 # ── trace completeness (schema C) ───────────────────────────────────────────
 
 _PER_ROUND = {
-    "dataset",
     "owner_id",
     "question_id",
     "question",
@@ -399,7 +392,6 @@ _BLK = {
 }
 _RRK = {"id", "session_id", "rrf_score", "rank", "in_sparse", "in_dense"}
 _FINAL = {
-    "dataset",
     "owner_id",
     "question_id",
     "question",
@@ -433,7 +425,7 @@ async def test_trace_records_every_schema_field(
     llm = _ScriptLLM([_reply([0], ["gap"]), _reply([0], [])])
     await search_episodes_llm_multiround(
         "the question?",
-        owner_id="longmemeval_0",
+        owner_id="project_0",
         where=_WHERE,
         episode_recaller=rec,
         atomic_fact_recaller=_FactRecaller(),
@@ -490,9 +482,9 @@ def test_decider_text_defaults_to_summary_only(monkeypatch: pytest.MonkeyPatch) 
 def test_decider_text_full_mode_picks_the_longer_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stores disagree on which column holds the body: LoCoMo / DeepSeek / Gemini
+    """Stores disagree on which column holds the body: some providers
     keep a 200-char prefix in ``summary`` and the body in ``episode``; the 27B and
-    GPT LongMemEval stores keep the body in ``summary`` with ``episode`` empty.
+    Other stores keep the body in ``summary`` with ``episode`` empty.
     Picking the longer field is correct on both layouts without store detection.
     """
     monkeypatch.setenv("EVEROS_LLMMR_DECIDER_FULL_TEXT", "1")
@@ -508,7 +500,7 @@ async def test_injection_never_exceeds_top_k_when_core_is_large() -> None:
     The guarantee and fill stages already stop at ``top_k``; core-first used to be
     uncapped, so a decider that accumulated more core than the budget silently
     returned more episodes than the caller asked for (measured at 20.8% of
-    SubtleMemory questions, up to 3.4x the budget), which breaks any same-budget
+    long conversation questions, up to 3.4x the budget), which breaks any same-budget
     comparison between retrieval methods.
     """
     seed = [_ep(f"e{i}", 1.0 - i / 100) for i in range(12)]

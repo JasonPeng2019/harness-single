@@ -55,13 +55,3 @@ For new integrations:
 - Use `/search` for ranked recall and `/get` for paginated browsing.
 - Treat old OpenClaw and EverMem Cloud plugin examples as archived
   references unless they have been explicitly updated to the 1.0.0 API.
-
-## Benchmark Guidance
-
-The current LoCoMo reproduction path is documented in
-[benchmarks/README.md](../benchmarks/README.md). The benchmark driver uses
-the server API: add, flush, search, answer, and evaluate.
-
-Old HyperMem / pre-1.0.0 evaluation pipeline reports should not be used
-as 1.0.0 bug reports unless they can be reproduced with the current
-benchmark commands.

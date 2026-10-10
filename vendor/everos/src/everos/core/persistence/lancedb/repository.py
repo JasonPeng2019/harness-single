@@ -447,7 +447,7 @@ class LanceRepoBase[T: BaseLanceTable]:
         (Older lancedb — at/below the ``>=0.13.0`` floor this repo once
         pinned — did **not** flat-scan the FTS tail, so post-build rows
         were genuinely invisible to BM25 until ``optimize()``; that is
-        the behaviour the historical LoCoMo-conv0 note described. The
+        the behaviour the historical retrieval diagnostic described. The
         flat-scan fallback closed that gap, so optimize is now purely
         about keeping that tail small.)
 

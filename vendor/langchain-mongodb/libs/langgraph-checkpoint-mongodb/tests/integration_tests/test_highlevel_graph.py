@@ -1,20 +1,16 @@
 """
-Based on LangGraph's Benchmarking script,
-https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/bench/fanout_to_subgraph.py,
-this pattern of joke generation is used often in the examples.
+This pattern of joke generation is used often in the examples.
 The fanout here is performed by the list comprehension of [class:~langgraph.types.Send] calls.
 The effect of this is a map (fanout) workflow where the graph invokes
 the same node multiple times in parallel.
 The node here is a subgraph.
 The subgraph is linear, with a conditional edge 'bump_loop' that repeatably calls
 the node 'bump' until a condition is met.
-This test can be used for benchmarking.
 It also demonstrates the high-level API of subgraphs, add_conditional_edges, and Send.
 """
 
 import operator
 import os
-import time
 from collections.abc import Generator
 from typing import Annotated
 
@@ -36,7 +32,7 @@ DB_NAME = os.environ.get("DB_NAME", "langgraph-test")
 CHECKPOINT_CLXN_NAME = "fanout_checkpoints"
 WRITES_CLXN_NAME = "fanout_writes"
 
-N_SUBJECTS = 10  # increase for benchmarking
+N_SUBJECTS = 10
 
 
 class OverallState(TypedDict):
@@ -142,7 +138,6 @@ async def test_fanout(
         print(f"\n\nBegin test of {cname}")
         graphc = (fanout_to_subgraph()).compile(checkpointer=checkpointer)
         config: RunnableConfig = {"configurable": {"thread_id": cname}}
-        start = time.monotonic()
         if "async" in cname:
             out = [c async for c in graphc.astream(joke_subjects, config=config)]
         else:
@@ -157,8 +152,6 @@ async def test_fanout(
             )
             for res in out
         )
-        end = time.monotonic()
-        print(f"{cname}: {end - start:.4f} seconds")
 
 
 async def test_custom_properties_async(checkpointer_mongodb: MongoDBSaver) -> None:

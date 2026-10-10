@@ -29,7 +29,7 @@ Open a pull request on GitHub using the `gh` CLI and the repo's PR template.
    ```
    Then edit the body to complete each section:
    - **Summary** — what changed and why.
-   - **Area** — tick the relevant box (architecture / benchmark / use case /
+   - **Area** — tick the relevant box (architecture / use case /
      docs / DX / CI-build-release).
    - **Verification** — paste the commands you ran (`make ci`, manual checks).
    - **Checklist** — tick honestly; don't tick boxes you didn't satisfy.

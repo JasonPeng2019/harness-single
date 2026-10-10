@@ -13,8 +13,8 @@ reader resolves a version, works, and comes back to reclaimed files --
 
     LanceError(IO): Object at location .../_indices/<uuid>/tokens.lance not found
 
-The first full LoCoMo run lost 225 of 493 questions to that: HTTP 500 per search,
-an empty context handed to the answer model, a scored zero. These tests pin the
+Long-running retrieval can return HTTP 500 when projection files are reclaimed.
+These tests pin the
 endpoint that removes the race -- drain first (else the frozen index is an
 incomplete projection), then stop (else prune keeps running).
 """
@@ -76,7 +76,7 @@ async def test_drains_before_stopping() -> None:
 
 async def test_reports_the_queue_on_both_sides() -> None:
     """``pending_before`` is how a caller discovers the projection was behind --
-    which the benchmark's ``add.done`` marker does not tell it, because that
+    which an ingestion completion marker does not tell it, because that
     marker tracks the OME extraction queue, not this one."""
     async with _client(_orch(before=42, after=0, drained=42)) as c:
         resp = await c.post("/api/v1/cascade/quiesce")

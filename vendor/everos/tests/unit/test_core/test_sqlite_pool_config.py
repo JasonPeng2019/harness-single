@@ -1,6 +1,6 @@
 """The SQLite engine's connection pool is configured, not inherited.
 
-Regression cover for a stall that took two benchmark servers down for 2h17m and
+Regression cover for a stall that took two long-running servers down for 2h17m and
 3h33m. ``create_async_engine`` was called with only ``url``/``echo``/``future``,
 so pool behaviour came from library defaults with no timeout, no recycle and no
 pre-ping. A connection checked out and never returned shrinks the pool by one

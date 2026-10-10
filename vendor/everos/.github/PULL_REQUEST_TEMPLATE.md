@@ -7,7 +7,6 @@
 <!-- Mark the relevant option with an x. -->
 
 - [ ] Architecture method
-- [ ] Benchmark
 - [ ] Use case
 - [ ] Documentation
 - [ ] Developer experience

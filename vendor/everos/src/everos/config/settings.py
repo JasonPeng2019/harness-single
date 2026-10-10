@@ -122,7 +122,7 @@ class SqliteSettings(BaseModel):
 
     The reason this is configurable rather than left at the library default: a
     checkout that never returns turns every later caller into a silent hang. Two
-    benchmark servers died exactly that way -- aiosqlite connection threads grew
+    long-running servers failed that way -- aiosqlite connection threads grew
     from a steady 6-10 to 20 and 58, with 7 and 22 of them parked inside
     ``aiosqlite``'s connect path, and every SQLite file stopped being written
     (one froze for 3h33m, the other 2h17m). Neither process was dead: HTTP still
@@ -298,7 +298,8 @@ class DeciderSettings(BaseModel):
     core_overflow: bool = False
     """Let the core-first stage exceed ``top_k`` (the pre-2026-08-06 behaviour).
     Measured at 316/1522 questions (20.8%) returning more items than asked for on
-    SubtleMemory, up to 68 for ``top_k=20`` -- which breaks the ``top_k`` contract and
+    long conversations, up to 68 for ``top_k=20`` -- which breaks the ``top_k``
+    contract and
     invalidates any same-budget comparison. Set only to reproduce a pre-fix run."""
     full_text: bool = False
     """Show the decider the full episode text instead of the stored summary.

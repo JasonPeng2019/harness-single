@@ -18,10 +18,9 @@ to files that were reclaimed underneath it --
     LanceError(IO): Object at location .../_indices/<uuid>/tokens.lance not found
 
 That is not hypothetical. A multi-round retrieval whose decider reads full
-episode text spends 56-72s inside one search call (measured), and a benchmark
-running ingest and retrieval in the same process lost 45% of one dataset's
-questions to exactly this before the endpoint existed: HTTP 500 per search, an
-empty context handed to the answer model, and a scored zero.
+episode text spends 56-72s inside one search call (measured), and concurrent
+ingest and retrieval can reclaim files beneath
+an in-flight search, causing an HTTP 500 and empty retrieval context.
 
 The fix is not a longer window -- that only moves the race. It is to notice that
 a read-only phase creates no new fragments, so there is nothing for optimize or

@@ -1,16 +1,16 @@
-# ROOT task policy for benchmark run prompts
+# ROOT task policy for coding assignments
 
-Include these requirements in the actual ROOT assignment for a benchmark run.
+Include these requirements in the actual ROOT coding assignment.
 They guide ROOT; the native Stop gate currently enforces cleanup rather than
 successful task completion.
 
 1. Keep the objective, task constraints and required planner/implementer/reviewer
    roles explicit. Launch each worker through the native harness with the run's
    recorded model, reasoning effort and service tier. Preserve those settings on
-   resume. If the experiment uses a different worker effort from ROOT, record
+   resume. If the assignment uses a different worker effort from ROOT, record
    that explicit override for every worker.
 2. Have workers build and test their committed code during implementation using
-   the prepared public-check route. Read compiler diagnostics and public case
+   project tools or the configured build/test route. Read compiler diagnostics and test
    results, repair and retest before returning their contribution. Preserve the
    exact checked revision, commands and request/result evidence.
 3. Keep a lane ACCEPT decision before integration and final validation. Accept
@@ -36,6 +36,6 @@ successful task completion.
    truthfully. Neither lane ACCEPT nor CLOSED is final task acceptance.
 
 Do not add an interface-agent supervisor, AI watcher, ROOT relaunch loop, hidden
-benchmark-test access, broad Docker permissions or new memory infrastructure to
+unauthorized test access, broad Docker permissions or new memory infrastructure to
 implement this guidance. Harness-owned final validation is a separate specified
 feature; it has not been added by the fix consolidation.

@@ -21,9 +21,9 @@ Two modes:
                               atomic_fact / foresight).
 
 Examples:
-  scripts/check_consistency.py ~/.everos-locomo-all-kv-fast
-  scripts/check_consistency.py ~/.everos-locomo-all-kv-fast --mode readonly
-  scripts/check_consistency.py ~/.everos-locomo-all-kv-fast --owners joanna,nate
+  scripts/check_consistency.py ~/.everos
+  scripts/check_consistency.py ~/.everos --mode readonly
+  scripts/check_consistency.py ~/.everos --owners joanna,nate
 """
 # This script must mutate sys.path before importing everos/tests, and
 # uses synchronous pathlib because it's a one-shot CLI, not server code.
@@ -310,7 +310,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("corpus", help="memory root (e.g. ~/.everos-locomo-all-kv-fast)")
+    p.add_argument("corpus", help="memory root (e.g. ~/.everos)")
     p.add_argument(
         "--mode",
         choices=("lifespan", "readonly"),

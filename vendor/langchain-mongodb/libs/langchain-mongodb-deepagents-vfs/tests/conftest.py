@@ -261,7 +261,7 @@ def sample_pptx_bytes() -> bytes:
 
     # Slide 2: title + a 2x2 table
     slide2 = prs.slides.add_slide(prs.slide_layouts[5])
-    slide2.shapes.title.text = "Benchmark Snapshot"
+    slide2.shapes.title.text = "Project Snapshot"
     tbl_shape = slide2.shapes.add_table(
         rows=2, cols=2, left=Inches(1), top=Inches(2), width=Inches(6), height=Inches(2)
     )

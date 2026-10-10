@@ -50,7 +50,6 @@ specific thing (drain a queue, recover from a stuck row, etc.).
 |---|---|
 | [cascade_runbook.md](cascade_runbook.md) | Cascade subsystem ops — drain queue, recover stuck rows |
 | [github-sync.md](github-sync.md) | Guardrails for refreshing GitHub from internal exports without overwriting GitHub-only workflow files |
-| [benchmarks/README.md](../benchmarks/README.md) | LoCoMo benchmark — run and evaluate |
 
 ## Engineering / Internal
 

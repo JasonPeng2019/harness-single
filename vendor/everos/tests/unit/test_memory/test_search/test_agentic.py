@@ -1,6 +1,6 @@
 """Unit tests for ``memory.search.agentic.search_episodes_agentic``.
 
-White-box: patches ``aagentic_retrieve`` to assert benchmark hyperparameters
+White-box: patches ``aagentic_retrieve`` to assert retrieval hyperparameters
 are wired correctly, plus a shaping test to verify id remapping.
 """
 
@@ -177,12 +177,12 @@ def clusters() -> list[Cluster]:
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
-async def test_agentic_search_wires_benchmark_hyperparams(
+async def test_agentic_search_wires_retrieval_hyperparams(
     ep_recaller: _StubEpisodeRecaller,
     fact_recaller: _StubFactRecaller,
     clusters: list[Cluster],
 ) -> None:
-    """aagentic_retrieve must be called with the exact benchmark hyperparams."""
+    """aagentic_retrieve must be called with the exact retrieval hyperparameters."""
     captured: dict[str, Any] = {}
 
     async def fake_aagentic(

@@ -158,8 +158,8 @@ def _collect_scan_inputs(root: Path, kinds: set[str] | None = None) -> list[Scan
       it, and we retry on the next interval. A partial scan is worse
       than no scan, because the reconciler can't tell the difference.
 
-    Symptom this guards against (observed 2026-05-28 on LoCoMo
-    benchmark conv_2): a search-time FD exhaustion bled into the
+    Symptom this guards against in long-running conversations: a search-time
+    FD exhaustion bled into the
     concurrent scanner sweep, and 8 healthy md files got marked
     ``change_type=deleted, status=done`` with their LanceDB rows
     cleared — single-direction data loss until external intervention.

@@ -1,4 +1,4 @@
-"""Agent pipeline e2e: 5 SWE-bench trajectories drive /add + /flush.
+"""Agent pipeline e2e: 5 original project-maintenance sessions drive /add + /flush.
 
 Drives the full HTTP route through to storage, exercising the agent-track
 pipeline (boundary → memcell → extract_agent_case → trigger_skill_clustering
@@ -12,15 +12,15 @@ with no coverage benefit.
 
 Mixed tenancy by design (sender_id alignment from fixture):
 
-    agent_pytest  (1 session, pytest-dev/pytest-7236)      ┐ independent
-    agent_sympy   (1 session, sympy/sympy-18763)           ┘ owners
-    agent_django  (3 sessions, django/django-{14311,16255,16263})  shared
+    agent_parser   (1 project session)                 ┐ independent
+    agent_math     (1 project session)                 ┘ owners
+    agent_backend  (3 project sessions)                  shared
 
 Concurrency strategy (workaround for the known
 ``trigger_skill_clustering`` read-modify-write race on a shared owner_id):
 
-    Phase 1: pytest + sympy concurrent via asyncio.gather (disjoint owners)
-    Phase 2: 3 django sessions sequential (same owner, would race)
+    Phase 1: parser + math concurrent via asyncio.gather (disjoint owners)
+    Phase 2: 3 backend sessions sequential (same owner, would race)
 
 Once the cluster race is fixed in production, Phase 2 can collapse into
 the same gather and the test will still pass — the assertions are
@@ -38,7 +38,6 @@ White-box assertions (audit trail of internal surfaces touched):
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
@@ -50,22 +49,19 @@ from everos.infra.ome.records import RunStatus
 from everos.infra.persistence.index import agent_case_repo, agent_skill_repo, eq
 from everos.infra.persistence.markdown import AgentCaseDailyFrontmatter
 from everos.service.memorize import _get_engine
+from tests.fixtures.project_data import project_agent_session
 
-_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "agent_trajectories"
-
-# Hand-picked trajectories (kept in-tree as fixtures; this selection is
-# the source of truth — the original converter is not in the repo).
-_PYTEST_SESSION = "session_pytest_7236"
-_SYMPY_SESSION = "session_sympy_18763"
-_DJANGO_SESSIONS = (
-    "session_django_14311",
-    "session_django_16255",
-    "session_django_16263",
+_PARSER_SESSION = "project_parser"
+_MATH_SESSION = "project_math"
+_BACKEND_SESSIONS = (
+    "project_backend_reset",
+    "project_backend_increment",
+    "project_backend_validation",
 )
 
-_AGENT_PYTEST = "agent_pytest"
-_AGENT_SYMPY = "agent_sympy"
-_AGENT_DJANGO = "agent_django"
+_AGENT_PARSER = "agent_parser"
+_AGENT_MATH = "agent_math"
+_AGENT_BACKEND = "agent_backend"
 
 # Phase 3 drain budget: OME chain (case → cluster → skill) writes md in
 # stages, each picked up by cascade. Multiple drain rounds with brief
@@ -111,7 +107,12 @@ def _opt_in_real_embedding(
 
 
 def _load_fixture(session_id: str) -> dict:
-    return json.loads((_FIXTURE_DIR / f"{session_id}.json").read_text())
+    agent = (
+        _AGENT_PARSER
+        if session_id == _PARSER_SESSION
+        else (_AGENT_MATH if session_id == _MATH_SESSION else _AGENT_BACKEND)
+    )
+    return project_agent_session(session_id, agent)
 
 
 async def _drive_session(
@@ -120,7 +121,7 @@ async def _drive_session(
     """Run /add followed by /flush for one trajectory; return status."""
     sid = session_data["everos_session_id"]
     msgs = session_data["messages"]
-    # MessageItemDTO.max_length=500; our largest fixture has 324 messages.
+    # MessageItemDTO.max_length=500; project sessions stay below the request limit.
     r = await client.post(
         "/api/v1/memory/add",
         json={"session_id": sid, "messages": msgs},
@@ -148,21 +149,21 @@ async def test_agent_pipeline_e2e_mixed_tenancy(
     pipeline_done_poll: Callable[..., Awaitable[None]],
     memcell_count: Callable[..., Awaitable[int]],
 ) -> None:
-    """5 SWE-bench trajectories → agent_case + agent_skill on three agents."""
+    """Five project sessions yield agent_case + agent_skill on three agents."""
     memory_root = core_pipeline_runtime
 
-    pytest_fx = _load_fixture(_PYTEST_SESSION)
-    sympy_fx = _load_fixture(_SYMPY_SESSION)
-    django_fxs = [_load_fixture(s) for s in _DJANGO_SESSIONS]
+    parser_fx = _load_fixture(_PARSER_SESSION)
+    math_fx = _load_fixture(_MATH_SESSION)
+    backend_fxs = [_load_fixture(s) for s in _BACKEND_SESSIONS]
 
     # ── Phase 1: independent owners concurrent ────────────────────────────
     await asyncio.gather(
-        _drive_session(async_client, pytest_fx),
-        _drive_session(async_client, sympy_fx),
+        _drive_session(async_client, parser_fx),
+        _drive_session(async_client, math_fx),
     )
 
     # ── Phase 2: shared owner_id, sequential to dodge cluster race ────────
-    for fx in django_fxs:
+    for fx in backend_fxs:
         await _drive_session(async_client, fx)
 
     # ── Phase 3: drain OME chain + cascade ────────────────────────────────
@@ -173,7 +174,7 @@ async def test_agent_pipeline_e2e_mixed_tenancy(
     # ── Phase 4: assertions ───────────────────────────────────────────────
 
     # 4.1 every session produced ≥1 memcell
-    all_sessions = (_PYTEST_SESSION, _SYMPY_SESSION, *_DJANGO_SESSIONS)
+    all_sessions = (_PARSER_SESSION, _MATH_SESSION, *_BACKEND_SESSIONS)
     for sid in all_sessions:
         n = await memcell_count(sid)
         assert n >= 1, f"no memcell for session {sid!r} (got {n})"
@@ -181,43 +182,44 @@ async def test_agent_pipeline_e2e_mixed_tenancy(
     # 4.2 each agent has a .cases dir with ≥1 .md file
     agents_dir = memory_root / "default_app" / "default_project" / "agents"
     case_dir_name = AgentCaseDailyFrontmatter.DIR_NAME
-    for agent_id in (_AGENT_PYTEST, _AGENT_SYMPY, _AGENT_DJANGO):
+    for agent_id in (_AGENT_PARSER, _AGENT_MATH, _AGENT_BACKEND):
         case_dir = agents_dir / agent_id / case_dir_name
         assert case_dir.is_dir(), f"missing {case_dir!s} for agent={agent_id!r}"
         md_files = list(case_dir.glob("*.md"))
         assert md_files, f"no agent_case md under {case_dir!s}"
 
     # 4.3 LanceDB agent_case rows per owner
-    pytest_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_PYTEST))
-    sympy_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_SYMPY))
-    django_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_DJANGO))
+    parser_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_PARSER))
+    math_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_MATH))
+    backend_cases = await agent_case_repo.find_where(eq("owner_id", _AGENT_BACKEND))
 
-    assert len(pytest_cases) >= 1, (
-        f"no agent_pytest rows in LanceDB (got {len(pytest_cases)})"
+    assert len(parser_cases) >= 1, (
+        f"no agent_parser rows in LanceDB (got {len(parser_cases)})"
     )
-    assert len(sympy_cases) >= 1, (
-        f"no agent_sympy rows in LanceDB (got {len(sympy_cases)})"
+    assert len(math_cases) >= 1, (
+        f"no agent_math rows in LanceDB (got {len(math_cases)})"
     )
-    # Each django session writes at least one cell → at least one case per
+    # Each backend session writes at least one cell → at least one case per
     # session. Lower bound 3 covers the minimum; LLM may produce more.
-    assert len(django_cases) >= 3, (
-        f"agent_django expected ≥3 LanceDB cases (3 sessions), got {len(django_cases)}"
+    assert len(backend_cases) >= 3, (
+        "agent_backend expected ≥3 LanceDB cases (3 sessions), "
+        f"got {len(backend_cases)}"
     )
 
     # 4.4 cross-owner isolation — each agent's cases trace back only to
     # its own sessions
-    pytest_session_ids = {c.session_id for c in pytest_cases}
-    assert pytest_session_ids == {_PYTEST_SESSION}, (
-        f"agent_pytest cases leaked across sessions: {pytest_session_ids}"
+    parser_session_ids = {c.session_id for c in parser_cases}
+    assert parser_session_ids == {_PARSER_SESSION}, (
+        f"agent_parser cases leaked across sessions: {parser_session_ids}"
     )
-    sympy_session_ids = {c.session_id for c in sympy_cases}
-    assert sympy_session_ids == {_SYMPY_SESSION}, (
-        f"agent_sympy cases leaked across sessions: {sympy_session_ids}"
+    math_session_ids = {c.session_id for c in math_cases}
+    assert math_session_ids == {_MATH_SESSION}, (
+        f"agent_math cases leaked across sessions: {math_session_ids}"
     )
-    django_session_ids = {c.session_id for c in django_cases}
-    assert django_session_ids == set(_DJANGO_SESSIONS), (
-        f"agent_django session set mismatch — got {django_session_ids}, "
-        f"want {set(_DJANGO_SESSIONS)}"
+    backend_session_ids = {c.session_id for c in backend_cases}
+    assert backend_session_ids == set(_BACKEND_SESSIONS), (
+        f"agent_backend session set mismatch — got {backend_session_ids}, "
+        f"want {set(_BACKEND_SESSIONS)}"
     )
 
     # 4.5 agent_skill — aggregate floor across all three agents. Per-agent
@@ -225,21 +227,19 @@ async def test_agent_pipeline_e2e_mixed_tenancy(
     # (skip_quality_threshold, see everalgo/agent_memory/skill_ops.py) —
     # extract_agent_skill itself has no cluster-size gate, so a per-agent
     # floor would be genuinely flaky (a single low-quality trajectory can
-    # legitimately yield 0 skills for that agent). Empirically, on this
-    # branch with real credentials, 1 django trajectory alone produced 1
-    # SKILL.md (extract_agent_skill status "success", no retries); driving
-    # 5 trajectories across 3 agents should clear an aggregate floor of 1
-    # even if any single agent's cluster is quality-gated to 0.
-    pytest_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_PYTEST))
-    sympy_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_SYMPY))
-    django_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_DJANGO))
-    total_skills = len(pytest_skills) + len(sympy_skills) + len(django_skills)
+    # legitimately yield 0 skills for that agent). The aggregate floor
+    # checks that the complete five-session workload exercises the skill
+    # chain even if an individual agent's cluster is quality-gated to 0.
+    parser_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_PARSER))
+    math_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_MATH))
+    backend_skills = await agent_skill_repo.find_where(eq("owner_id", _AGENT_BACKEND))
+    total_skills = len(parser_skills) + len(math_skills) + len(backend_skills)
     assert total_skills >= 1, (
         "agent-skill chain produced nothing — the strategy chain "
         "(extract_agent_case → trigger_skill_clustering → extract_agent_skill) "
         "is broken or gated off "
-        f"(pytest={len(pytest_skills)}, sympy={len(sympy_skills)}, "
-        f"django={len(django_skills)})"
+        f"(parser={len(parser_skills)}, math={len(math_skills)}, "
+        f"backend={len(backend_skills)})"
     )
 
     # 4.6 no dead-lettered extract_agent_skill run. Sharper signal than

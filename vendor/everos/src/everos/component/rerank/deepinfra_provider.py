@@ -45,7 +45,7 @@ from .protocol import RerankResult, RerankServiceError
 
 # Qwen3-Reranker chat template. The DeepInfra inference API treats the reranker
 # as a yes/no generator, so the prompt scaffolding must be supplied client-side
-# (verbatim mirror of the EverAlgo benchmark's reranker client). Without it the
+# (verbatim mirror of the EverAlgo reranker client). Without it the
 # model scores raw text off-template and returns uncalibrated relevance.
 _QWEN3_PREFIX = (
     "<|im_start|>system\n"

@@ -1058,11 +1058,10 @@ def _demo_fact_name() -> str:
 
 def _capabilities_text() -> Text:
     # Real highlights from evermind.ai: the token-efficiency claim, one headline
-    # SOTA benchmark, and core capabilities. No fabricated figures. (local-first
+    # core capabilities. No fabricated figures. (local-first
     # is dropped here because the field header already shows scope=local-first.)
     rows = (
         ("token efficiency ", "1/10 of full context", EVEROS_YELLOW),
-        ("LoCoMo           ", "93.05% (SOTA)", EVEROS_GREEN),
         ("context window   ", "unlimited", EVEROS_CYAN),
         ("hybrid retrieval ", "BM25 + vector", EVEROS_ORANGE),
         ("agentic rerank   ", "on", EVEROS_YELLOW_SOFT),

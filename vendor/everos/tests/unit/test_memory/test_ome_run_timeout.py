@@ -7,7 +7,7 @@ attempt. A coroutine parked on an await with no deadline of its own -- an
 its ``max_concurrent_runs`` slot indefinitely: it never raised, so it never
 retried, and its record stayed RUNNING forever.
 
-Observed in a benchmark run: 60 of 64 slots parked on one lock, which starved
+Observed in a long-running deployment: 60 of 64 slots parked on one lock, which starved
 every other strategy in the process. Extraction stopped for 6.7 hours while the
 server still answered HTTP and every liveness signal read healthy -- the queue
 depth was the only thing that moved, and it moved the wrong way.

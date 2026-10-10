@@ -184,6 +184,6 @@ Managed ROOT Stop requires runtime CLOSED, including empty-queue/live-worker and
 cases. CLOSED establishes cleanup, not task completion. Before a fresh Codex ROOT launch, the
 operator must prepare native hooks/monitor and a matching setup receipt with
 `scripts/prepare_root_launch.py`. Windows Codex always requires the read-only environment-bound
-sandbox gate; it never initializes or repairs the sandbox. The optional ZSTD public-check service
+sandbox gate; it never initializes or repairs the sandbox. The optional project-configured build/test service
 stages a lane-local client and is stopped during shutdown. See
 [the integration guide](../docs/INTEGRATED_RUN_FIXES.md) for setup, limits and remaining work.

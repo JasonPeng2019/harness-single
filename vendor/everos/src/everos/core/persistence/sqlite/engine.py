@@ -49,7 +49,7 @@ def create_system_engine(
     # inherited before, and the failure that exposed it is not one the defaults
     # can survive: a connection checked out and never returned leaves the pool
     # one slot smaller forever, and once every slot is gone each later caller
-    # waits on a checkout that no longer completes. Two benchmark servers reached
+    # waits on a checkout that no longer completes. Two long-running servers reached
     # that state -- aiosqlite connection threads at 20 and 58 against a steady
     # 6-10 on their healthy siblings, 7 and 22 of them parked inside aiosqlite's
     # connect path -- and every SQLite file simply stopped being written, for
@@ -89,7 +89,7 @@ def _register_pool_saturation_listener(
     """Log once per checkout that finds the pool at or near capacity.
 
     The point is a signal that exists at all. When the pool drained on two
-    benchmark servers there was nothing to see: no error, no log line, no metric
+    long-running servers there was nothing to see: no error, no log line, no metric
     -- writes simply stopped, and diagnosis came down to counting aiosqlite
     threads in a py-spy dump against a healthy sibling process. A warning at the
     moment of saturation names the condition while the process is still running,

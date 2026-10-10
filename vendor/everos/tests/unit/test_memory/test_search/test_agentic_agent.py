@@ -2,7 +2,7 @@
 
 Two groups of tests:
 
-* White-box (patches ``aagentic_retrieve``): assert benchmark hyperparameters
+* White-box (patches ``aagentic_retrieve``): assert retrieval hyperparameters
   are wired correctly, plus a shaping test to verify DTOs are built
   correctly. These never execute the real ``everalgo._format_docs`` /
   rerank_fn wiring — they are dead coverage for the metadata bridge.
@@ -127,10 +127,10 @@ async def _fake_embed(q: str) -> list[float]:
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
-async def test_search_agent_cases_agentic_calls_aagentic_retrieve_with_benchmark_params() -> (  # noqa: E501
+async def test_search_agent_cases_agentic_calls_aagentic_retrieve_with_retrieval_params() -> (  # noqa: E501
     None
 ):
-    """Verify aagentic_retrieve called with benchmark hyperparams for agent_case."""
+    """Verify aagentic_retrieve called with retrieval hyperparameters for agent_case."""
     captured: dict[str, Any] = {}
 
     async def fake_aagentic(
@@ -181,10 +181,10 @@ async def test_search_agent_cases_agentic_calls_aagentic_retrieve_with_benchmark
     assert captured["refinement_strategy"] == "multi_query"
 
 
-async def test_search_agent_skills_agentic_calls_aagentic_retrieve_with_benchmark_params() -> (  # noqa: E501
+async def test_search_agent_skills_agentic_calls_aagentic_retrieve_with_retrieval_params() -> (  # noqa: E501
     None
 ):
-    """Verify aagentic_retrieve called with benchmark hyperparams for agent_skill."""
+    """Verify aagentic_retrieve uses retrieval hyperparameters for agent_skill."""
     captured: dict[str, Any] = {}
 
     async def fake_aagentic(

@@ -1159,7 +1159,7 @@ class CascadeWorker:
         """
         # First sweep: catch up from any prior session before honouring the
         # interval. Rebuild is cheap (~0.3s per 50k rows × indexed columns
-        # in local benchmarks); deferring it 12h after startup risks long
+        # under sustained local load); deferring it 12h after startup risks long
         # accumulation if the daemon restarts often.
         for kind in self._handlers:
             if self._stop.is_set():

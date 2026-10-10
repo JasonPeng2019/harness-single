@@ -7,23 +7,14 @@ Cache invalidation:
     function — clear both caches around every test to keep results
     deterministic regardless of declaration order.
 
-Cross-suite fixtures:
-    ``long_conversation`` lives here (not under ``tests/e2e/conftest.py``)
-    because both ``tests/e2e/`` and ``tests/integration/search/`` depend
-    on it — pytest conftest cascades down the directory tree, so a
-    fixture defined under ``tests/e2e/`` is invisible to siblings.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-
-_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
-_LONG_CONV_PATH = _FIXTURE_DIR / "long_conversation_locomo_caroline_melanie.json"
 
 
 @pytest.fixture(autouse=True)
@@ -133,5 +124,7 @@ def _reset_multimodal_capability_singleton() -> Iterator[None]:
 
 @pytest.fixture(scope="session")
 def long_conversation() -> dict:
-    """LoCoMo conv_0 fixture (419 messages, 19 batches, one session)."""
-    return json.loads(_LONG_CONV_PATH.read_text())
+    """Original multi-topic project conversation for persistence coverage."""
+    from tests.fixtures.project_data import project_conversation
+
+    return project_conversation()

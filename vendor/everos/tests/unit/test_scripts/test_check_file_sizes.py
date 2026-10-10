@@ -191,21 +191,31 @@ def test_unresolvable_base_is_a_hard_failure(repo: Path) -> None:
 
 def test_exempt_directory_may_exceed_the_ceiling(tmp_path: Path) -> None:
     checker = _load_checker()
-    exempt = _write(tmp_path, "tests/fixtures/search_seed/episode.json", 9 * 1024)
-    nearby = _write(tmp_path, "tests/fixtures/other_seed.json", 9 * 1024)
+    exempt = _write(tmp_path, "generated/assets/sample.bin", 9 * 1024)
+    nearby = _write(tmp_path, "generated/other.bin", 9 * 1024)
 
-    violations = checker.find_violations([exempt, nearby], root=tmp_path, max_kb=8)
+    default_violations = checker.find_violations(
+        [exempt, nearby], root=tmp_path, max_kb=8
+    )
+    assert [violation.path for violation in default_violations] == [exempt, nearby]
 
-    assert [violation.path for violation in violations] == [
-        "tests/fixtures/other_seed.json"
-    ], "the exemption must cover exactly its directory, not siblings"
+    violations = checker.find_violations(
+        [exempt, nearby],
+        root=tmp_path,
+        max_kb=8,
+        exempt_prefixes=("generated/assets/",),
+    )
+
+    assert [violation.path for violation in violations] == ["generated/other.bin"], (
+        "the exemption must cover exactly its directory, not siblings"
+    )
 
 
 def test_exemption_list_is_pinned() -> None:
     """Every entry is a place the ceiling stops protecting — keep it visible."""
     checker = _load_checker()
 
-    assert checker.EXEMPT_PREFIXES == ("tests/fixtures/search_seed/",)
+    assert checker.EXEMPT_PREFIXES == ()
 
 
 def test_exempt_prefixes_point_at_real_directories() -> None:
