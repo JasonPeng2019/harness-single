@@ -241,6 +241,7 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
@@ -262,7 +263,7 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(launch.LAUNCH_PROVIDER_START_FAILED, result["code"])
         self.assertEqual(
-            {"pid": 41, "creation_time": "created-1"}, updates[0]["process"]
+            {"pid": 41, "creation_time": "created-1"}, updates[1]["process"]
         )
         self.assertEqual({}, updates[-1]["process"])
 

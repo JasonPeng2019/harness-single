@@ -22,8 +22,10 @@ from .bootstrap import (
 )
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
-from .epochs import lane_record_dir
-from .lanes import find_active_lane, read_lane, update_lane
+from .epochs import lane_record_dir, read_current_epoch
+from .setup import read_runtime_state
+from .lanes import find_active_lane, lane_operation_lock, read_lane, update_lane
+from .lane_cleanup import controller_not_created, never_launched, observe_controller_status
 from .records import atomic_write_json, remove_record
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
 from .task_cards import validate_task_card
@@ -48,26 +50,33 @@ _RESUMABLE_LIFECYCLES = frozenset(
 
 def _live_controller(lane: dict[str, Any]) -> bool:
     """Check both the lane process and the controller's exact attestation."""
-    identities = [lane.get("process") or {}]
     status_value = lane.get("controller_status_path")
     if not isinstance(status_value, str) or not status_value:
         raise ValueError("controller status path is missing; resume cannot prove prior ownership")
-    status_path = Path(status_value)
-    if status_path.is_file():
-        try:
-            status = read_json(status_path)
-            require_schema(status, "controller-status/v1", status_path)
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                "controller status is unreadable; resume cannot prove prior ownership"
-            ) from exc
-        if status.get("lane_id") == lane["lane_id"] and status.get("run_id") == lane["run_id"]:
-            identities.append(status.get("controller_identity") or {})
-    return any(
-        isinstance(identity, dict)
-        and processes.identity_matches(identity.get("pid"), identity.get("creation_time"))
-        for identity in identities
-    )
+    observation = observe_controller_status(lane)
+    if observation.kind in ("invalid", "unreadable"):
+        raise ValueError("controller status is invalid or unreadable; resume cannot prove prior ownership")
+    identities = [lane.get("process")]
+    status = observation.status
+    if status is not None:
+        identities.append(status.get("controller_identity", {}))
+    for identity in identities:
+        if not isinstance(identity, dict) or (identity and (
+            type(identity.get("pid")) is not int or not identity.get("creation_time")
+        )):
+            raise ValueError("controller identity is unknown; resume cannot replace its run")
+        if identity:
+            pid, creation = identity["pid"], identity["creation_time"]
+            if processes.identity_matches(pid, creation):
+                return True
+            if processes.process_alive(pid) and processes.process_identity(pid) is None:
+                raise ValueError("controller identity is unobservable; resume cannot replace its run")
+    if (
+        status is None and lane.get("lifecycle") == "running"
+        and not never_launched(lane, observation) and not controller_not_created(lane, observation)
+    ):
+        raise ValueError("started invocation cleanup is unknown; resume cannot discard its evidence")
+    return False
 
 
 def _consume_resume_signal(rt: Path, lane_id: str, prior_run_id: str) -> None:
@@ -279,6 +288,10 @@ def run_resume(
                 raise ValueError("lane run or status changed before resume mutation")
             if _live_controller(current):
                 raise ValueError("an exact controller is still live; resume cannot replace its run")
+            marker = read_current_epoch(rt)
+            runtime = read_runtime_state(rt)
+            if not marker or marker.get("epoch_id") != epoch_id or not runtime or runtime.get("state") != "OPEN":
+                raise ValueError("runtime or epoch changed before resume")
             return {
                 **current,
                 "lifecycle": "resuming",
@@ -286,68 +299,74 @@ def run_resume(
                 "resume_from_run_id": prior_run_id,
             }
 
-        update_lane(rt, epoch_id, lane_id, mark_resuming)
-        current = read_lane(rt, epoch_id, lane_id)
-        if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
-            raise ValueError("lane run or status changed before prior run cleanup")
-        _clear_prior_run(rt, epoch_id, lane)
-        if managed:
-            _reset_worker_inbox(worktree, lane_id, run_id)
-        _write_worker_prompt(
-            worktree, task_card, managed=managed, rationale=rationale
-        )
-        _write_result_template(worktree, lane_id, run_id)
-        invocation_path = worktree / ".agent-workspace" / "invocation.json"
-        try:
-            prior_invocation = read_json(invocation_path)
-            require_schema(prior_invocation, INVOCATION_SCHEMA, invocation_path)
-            exclusive_resources = [
-                str(item) for item in prior_invocation.get("exclusive_resources", [])
-            ]
-        except (OSError, ValueError):
-            exclusive_resources = []
-        invocation = _write_invocation(
-            worktree,
-            lane_id=lane_id,
-            run_id=run_id,
-            provider_id=lane["provider"]["id"],
-            model=lane["provider"]["model"],
-            launch_config=lane["provider"]["launch_config"],
-            exclusive_resources=exclusive_resources,
-        )
-        invocation_path = worktree / ".agent-workspace" / "invocation.json"
-        written_invocation = read_json(invocation_path)
-        require_schema(written_invocation, INVOCATION_SCHEMA, invocation_path)
-        if (
-            written_invocation.get("lane_id") != lane_id
-            or written_invocation.get("run_id") != run_id
-            or written_invocation.get("provider", {}).get("id") != lane["provider"]["id"]
-            or written_invocation.get("content_hash") != content_hash(written_invocation)
-        ):
-            raise ValueError("fresh resume invocation failed identity or hash validation")
-        _rewrite_overlay_receipt(worktree, lane, run_id, managed=managed)
-        if managed:
-            _write_worker_binding(worktree, rt, lane_id, run_id)
-        # The resume task card is a per-lane input; keep the current copy.
-        atomic_write_json(worktree / ".agent-workspace" / "task-card.json", task_card)
-
-        def replace_run(current: dict[str, Any]) -> dict[str, Any]:
+        with lane_operation_lock(rt, epoch_id, lane_id):
+            update_lane(rt, epoch_id, lane_id, mark_resuming)
+            current = read_lane(rt, epoch_id, lane_id)
             if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
-                raise ValueError("lane run or status changed before fresh run ownership")
-            return {
-                **current,
-                "run_id": run_id,
-                "lifecycle": "running",
-                "process": {},
-                "launch_pending": True,
-                "acceptance_advancement": None,
-                "last_reported_actionable_status": None,
-                "resume_from_run_id": prior_run_id,
-            }
+                raise ValueError("lane run or status changed before prior run cleanup")
+            _clear_prior_run(rt, epoch_id, lane)
+            if managed:
+                _reset_worker_inbox(worktree, lane_id, run_id)
+            _write_worker_prompt(
+                worktree, task_card, managed=managed, rationale=rationale
+            )
+            _write_result_template(worktree, lane_id, run_id)
+            invocation_path = worktree / ".agent-workspace" / "invocation.json"
+            try:
+                prior_invocation = read_json(invocation_path)
+                require_schema(prior_invocation, INVOCATION_SCHEMA, invocation_path)
+                exclusive_resources = [
+                    str(item) for item in prior_invocation.get("exclusive_resources", [])
+                ]
+            except (OSError, ValueError):
+                exclusive_resources = []
+            invocation = _write_invocation(
+                worktree,
+                lane_id=lane_id,
+                run_id=run_id,
+                provider_id=lane["provider"]["id"],
+                model=lane["provider"]["model"],
+                launch_config=lane["provider"]["launch_config"],
+                exclusive_resources=exclusive_resources,
+            )
+            invocation_path = worktree / ".agent-workspace" / "invocation.json"
+            written_invocation = read_json(invocation_path)
+            require_schema(written_invocation, INVOCATION_SCHEMA, invocation_path)
+            if (
+                written_invocation.get("lane_id") != lane_id
+                or written_invocation.get("run_id") != run_id
+                or written_invocation.get("provider", {}).get("id") != lane["provider"]["id"]
+                or written_invocation.get("content_hash") != content_hash(written_invocation)
+            ):
+                raise ValueError("fresh resume invocation failed identity or hash validation")
+            _rewrite_overlay_receipt(worktree, lane, run_id, managed=managed)
+            if managed:
+                _write_worker_binding(worktree, rt, lane_id, run_id)
+            # The resume task card is a per-lane input; keep the current copy.
+            atomic_write_json(worktree / ".agent-workspace" / "task-card.json", task_card)
 
-        update_lane(rt, epoch_id, lane_id, replace_run)
-        if managed:
-            _consume_resume_signal(rt, lane_id, prior_run_id)
+            def replace_run(current: dict[str, Any]) -> dict[str, Any]:
+                if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
+                    raise ValueError("lane run or status changed before fresh run ownership")
+                marker = read_current_epoch(rt)
+                runtime = read_runtime_state(rt)
+                if not marker or marker.get("epoch_id") != epoch_id or not runtime or runtime.get("state") != "OPEN":
+                    raise ValueError("runtime or epoch changed before fresh run ownership")
+                return {
+                    **current,
+                    "run_id": run_id,
+                    "lifecycle": "running",
+                    "process": {},
+                    "launch_pending": True,
+                    "launch_failure": None,
+                    "acceptance_advancement": None,
+                    "last_reported_actionable_status": None,
+                    "resume_from_run_id": prior_run_id,
+                }
+
+            update_lane(rt, epoch_id, lane_id, replace_run)
+            if managed:
+                _consume_resume_signal(rt, lane_id, prior_run_id)
     except Exception as exc:
         return {
             "ok": False,

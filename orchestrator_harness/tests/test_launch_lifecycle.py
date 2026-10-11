@@ -46,6 +46,7 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=invocation),
             patch.object(
@@ -76,6 +77,7 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
@@ -95,12 +97,13 @@ class LaunchHandshakeTests(unittest.TestCase):
         self.assertIn("result_invalid", result["summary"])
         self.assertEqual(2, update.call_count)
 
-    def test_unrecordable_controller_identity_stops_exact_child(self) -> None:
+    def test_unrecordable_controller_identity_is_not_targeted_by_pid(self) -> None:
         child = MagicMock(pid=41)
         with (
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
@@ -114,8 +117,8 @@ class LaunchHandshakeTests(unittest.TestCase):
         ):
             result = launch.run_launch("lane-1")
         self.assertFalse(result["ok"])
-        child.terminate.assert_called_once_with()
-        child.wait.assert_called_once_with(timeout=10.0)
+        child.terminate.assert_not_called()
+        child.wait.assert_not_called()
 
     def test_lane_persistence_failure_stops_exact_child(self) -> None:
         child = MagicMock(pid=41)
@@ -123,6 +126,7 @@ class LaunchHandshakeTests(unittest.TestCase):
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
             patch.object(launch, "read_record", return_value=self.invocation),
             patch.object(
@@ -132,11 +136,13 @@ class LaunchHandshakeTests(unittest.TestCase):
             ),
             patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch.processes, "process_identity", return_value={"pid": 41, "creation_time": "created-1"}),
+            patch.object(launch.processes, "terminate_process", return_value=True) as terminate,
+            patch.object(launch.processes, "identity_matches", return_value=False),
             patch.object(launch, "update_lane", side_effect=[self.lane, OSError("write failed")]),
         ):
             result = launch.run_launch("lane-1")
         self.assertFalse(result["ok"])
-        child.terminate.assert_called_once_with()
+        terminate.assert_called_once_with(41, "created-1", force=True)
         child.wait.assert_called_once_with(timeout=10.0)
 
     def test_failed_registration_and_cleanup_cannot_look_unlaunched(self) -> None:
@@ -145,10 +151,16 @@ class LaunchHandshakeTests(unittest.TestCase):
                 with self.subTest(lifecycle=lifecycle, failure=failure):
                     lane = {**self.lane, "lifecycle": lifecycle, "launch_pending": True}
                     child = MagicMock(pid=41)
-                    getattr(child, failure).side_effect = OSError("cleanup unproven")
+                    if failure == "wait":
+                        child.wait.side_effect = OSError("cleanup unproven")
                     events = []
+                    writes = 0
 
                     def persist(_runtime, _epoch, _lane, mutate):
+                        nonlocal writes
+                        writes += 1
+                        if writes == 2:
+                            raise OSError("identity registration failed")
                         lane.update(mutate(dict(lane)))
                         events.append("persist")
                         return dict(lane)
@@ -161,18 +173,21 @@ class LaunchHandshakeTests(unittest.TestCase):
                         patch.object(launch, "find_harness_root", return_value=self.root),
                         patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
                         patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+                        patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
                         patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
                         patch.object(launch, "read_record", return_value=self.invocation),
                         patch.object(launch, "_validate_provider_launch_config", return_value=self.invocation["provider"]["launch_config"]),
                         patch.object(launch, "_spawn_controller_logged", side_effect=spawn),
-                        patch.object(launch.processes, "process_identity", return_value=None),
+                        patch.object(launch.processes, "process_identity", return_value={"pid": 41, "creation_time": "created-1"}),
+                        patch.object(launch.processes, "identity_matches", return_value=False),
+                        patch.object(launch.processes, "terminate_process", return_value=True, side_effect=OSError("cleanup unproven") if failure == "terminate" else None),
                         patch.object(launch, "update_lane", side_effect=persist),
                     ):
                         result = launch.run_launch("lane-1")
                     self.assertFalse(result["ok"])
                     with patch.object(shutdown.processes, "identity_matches", return_value=False):
                         self.assertFalse(shutdown._lane_clean(self.runtime, lane))
-                    self.assertEqual(["persist", "spawn"], events)
+                    self.assertEqual(["persist", "spawn", "persist"], events)
                     self.assertEqual("running", lane["lifecycle"])
                     self.assertIs(False, lane["launch_pending"])
 

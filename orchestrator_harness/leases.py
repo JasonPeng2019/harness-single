@@ -109,7 +109,7 @@ def acquire_leases(
             raise
 
 
-def release_leases(rt: Path, lane_id: str, run_id: str) -> None:
+def release_leases(rt: Path, lane_id: str, run_id: str, *, strict: bool = False) -> None:
     """Remove every lease held by this lane's current run."""
     with _leases_lock(rt):
         for path in sorted(lease_dir(rt).glob("*.lease")):
@@ -121,22 +121,20 @@ def release_leases(rt: Path, lane_id: str, run_id: str) -> None:
                 try:
                     path.unlink()
                 except OSError:
-                    pass
+                    if strict:
+                        raise
 
 
-def force_release_leases(rt: Path, lane_id: str) -> None:
-    """Force-release every lease held by one lane (force-stop / orphan clear)."""
+def force_release_leases(rt: Path, lane_id: str, run_id: str) -> None:
+    """Force-release only leases owned by the proven-clean invocation."""
     with _leases_lock(rt):
         for path in sorted(lease_dir(rt).glob("*.lease")):
             try:
                 record = read_record(path, LEASE_SCHEMA)
             except (OSError, ValueError):
                 continue
-            if record.get("lane_id") == lane_id:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            if record.get("lane_id") == lane_id and record.get("run_id") == run_id:
+                path.unlink()
 
 
 def force_release_lease(

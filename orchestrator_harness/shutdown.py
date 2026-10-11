@@ -1,4 +1,4 @@
-﻿"""``harness shutdown``: end the whole runtime with exact process ownership.
+"""``harness shutdown``: end the whole runtime with exact process ownership.
 
 Shutdown flips the runtime state OPEN -> SHUTTING_DOWN, lets each lane's own
 controller clean its provider/helper processes (cleanup-proof-first), stops
@@ -24,7 +24,8 @@ from .epochs import (
     read_epoch_state,
     write_active_lanes,
 )
-from .lanes import read_lane, update_lane
+from .lanes import lane_operation_lock, read_lane, require_same_run, update_lane
+from .lane_cleanup import cleanup_is_proven, observe_controller_status
 from .leases import release_leases
 from .manager_queue import ManagerQueueError, read_manager_queue
 from .records import RecordLock, atomic_write_json, read_record
@@ -82,13 +83,7 @@ def _unresolved_manager_obligations(rt: Path) -> list[dict[str, Any]]:
 
 
 def _read_controller_status(lane: dict[str, Any]) -> dict[str, Any] | None:
-    path = Path(lane["controller_status_path"])
-    if not path.is_file():
-        return None
-    try:
-        return read_record(path, CONTROLLER_STATUS_SCHEMA)
-    except (OSError, ValueError):
-        return None
+    return observe_controller_status(lane).status
 
 
 def _provider_identity(lane: dict[str, Any]) -> tuple[int | None, str | None]:
@@ -117,43 +112,21 @@ def _wait_for_controller_exit(lane: dict[str, Any], timeout_seconds: float) -> b
 
 
 def _lane_clean(rt: Path, lane: dict[str, Any]) -> bool:
-    """Return whether controller and provider boundary are proven gone."""
-    process = lane.get("process") or {}
-    if processes.identity_matches(
-        process.get("pid"), process.get("creation_time")
-    ):
-        return False
-    status = _read_controller_status(lane)
-    if status is None:
-        # Resume marks an unlaunched invocation running with launch_pending.
-        # No recorded process and no status file distinguish it from unknown
-        # cleanup of an invocation that actually started.
-        never_launched = lane.get("lifecycle") == "prepared" or (
-            lane.get("lifecycle") == "running" and lane.get("launch_pending") is True
-        )
-        return (
-            never_launched
-            and lane.get("process") == {}
-            and not Path(lane["controller_status_path"]).exists()
-        )
-    if status.get("cleanup_proven") is not True:
-        return False
-    boundary = status.get("process_boundary")
-    if not isinstance(boundary, dict) or not processes.process_boundary_is_gone(boundary):
-        return False
-    provider_state = status.get("provider_state") or {}
-    provider_pid = provider_state.get("pid")
-    provider_creation = provider_state.get("creation_time")
-    if isinstance(provider_pid, int):
-        if processes.identity_matches(provider_pid, provider_creation):
-            return False
-        if processes.process_alive(provider_pid) and processes.process_identity(provider_pid) is None:
-            return False
-    return True
+    return cleanup_is_proven(lane)
 
 
-def _retire_lane(rt: Path, epoch_id: str, lane_id: str) -> None:
-    update_lane(rt, epoch_id, lane_id, lambda current: {**current, "lifecycle": "retired"})
+def _retire_lane(rt: Path, epoch_id: str, lane_id: str, lane: dict[str, Any]) -> None:
+    def retire(current: dict[str, Any]) -> dict[str, Any]:
+        require_same_run(current, lane)
+        marker = read_current_epoch(rt)
+        if not marker or marker.get("epoch_id") != epoch_id or current.get("lifecycle") == "resuming":
+            raise ShutdownError(SHUTDOWN_LANE_CLEANUP_UNPROVEN, "lane or epoch changed before retirement")
+        if not _lane_clean(rt, current):
+            raise ShutdownError(SHUTDOWN_LANE_CLEANUP_UNPROVEN, "lane cleanup changed before retirement")
+        release_leases(rt, lane_id, current["run_id"], strict=True)
+        return {**current, "lifecycle": "retired", "launch_pending": False}
+
+    update_lane(rt, epoch_id, lane_id, retire)
     entries = [e for e in read_active_lanes(rt, epoch_id) if e.get("lane_id") != lane_id]
     write_active_lanes(rt, epoch_id, entries)
 
@@ -283,24 +256,24 @@ def run_shutdown() -> dict[str, Any]:
             if state_record.get("lifecycle") == "active":
                 for entry in read_active_lanes(rt, epoch_id):
                     lane_id = entry["lane_id"]
-                    try:
-                        lane = read_lane(rt, epoch_id, lane_id)
-                    except Exception:
-                        continue
-                    if lane.get("lifecycle") in ("retired", "abandoned"):
-                        continue
-                    if not _wait_for_controller_exit(lane, SHUTDOWN_WAIT_SECONDS):
-                        raise ShutdownError(
-                            SHUTDOWN_LANE_CLEANUP_UNPROVEN,
-                            f"lane {lane_id} controller did not exit; force-stop the lane",
-                        )
-                    if not _lane_clean(rt, lane):
-                        raise ShutdownError(
-                            SHUTDOWN_LANE_CLEANUP_UNPROVEN,
-                            f"lane {lane_id} processes could not be proven gone; force-stop the lane",
-                        )
-                    release_leases(rt, lane_id, lane["run_id"])
-                    _retire_lane(rt, epoch_id, lane_id)
+                    with lane_operation_lock(rt, epoch_id, lane_id):
+                        try:
+                            lane = read_lane(rt, epoch_id, lane_id)
+                        except Exception as exc:
+                            raise ShutdownError(SHUTDOWN_LANE_CLEANUP_UNPROVEN, f"cannot read lane {lane_id}: {exc}") from exc
+                        if lane.get("lifecycle") in ("retired", "abandoned"):
+                            continue
+                        if not _wait_for_controller_exit(lane, SHUTDOWN_WAIT_SECONDS):
+                            raise ShutdownError(
+                                SHUTDOWN_LANE_CLEANUP_UNPROVEN,
+                                f"lane {lane_id} controller did not exit; force-stop the lane",
+                            )
+                        if not _lane_clean(rt, lane):
+                            raise ShutdownError(
+                                SHUTDOWN_LANE_CLEANUP_UNPROVEN,
+                                f"lane {lane_id} processes could not be proven gone; force-stop the lane",
+                            )
+                        _retire_lane(rt, epoch_id, lane_id, lane)
                 close_epoch(rt, epoch_id)
 
         _stop_monitor(rt)

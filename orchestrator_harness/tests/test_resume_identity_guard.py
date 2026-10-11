@@ -12,6 +12,25 @@ from orchestrator_harness import resume
 
 
 class ResumeIdentityGuardTests(unittest.TestCase):
+    def test_unknown_failed_start_cannot_be_replaced_by_pending_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lane = {
+                "lane_id": "lane-1", "run_id": "run-1", "process": {},
+                "lifecycle": "running", "launch_pending": False,
+                "controller_status_path": str(Path(temporary) / "status.json"),
+                "launch_failure": {"run_id": "run-1", "controller_not_created": False},
+            }
+            with self.assertRaisesRegex(ValueError, "cleanup is unknown"):
+                resume._live_controller(lane)
+            lane["launch_pending"] = True
+            self.assertFalse(resume._live_controller(lane))
+            lane["launch_pending"] = False
+            lane["launch_failure"]["controller_not_created"] = True
+            self.assertFalse(resume._live_controller(lane))
+            lane["launch_failure"]["run_id"] = "old-run"
+            with self.assertRaisesRegex(ValueError, "cleanup is unknown"):
+                resume._live_controller(lane)
+
     def test_missing_controller_status_path_fails_closed(self) -> None:
         lane = {"lane_id": "lane-1", "run_id": "run-1", "process": {}}
         with self.assertRaisesRegex(ValueError, "controller status path is missing"):

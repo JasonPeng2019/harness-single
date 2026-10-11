@@ -59,6 +59,7 @@ PUBLIC_ROUTE_DEPENDENCIES = (
     "orchestrator_harness/lanes.py",
     "orchestrator_harness/leases.py",
     "orchestrator_harness/launch.py",
+    "orchestrator_harness/lane_cleanup.py",
     "orchestrator_harness/manager_queue.py",
     "orchestrator_harness/models.py",
     "orchestrator_harness/monitor.py",

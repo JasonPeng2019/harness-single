@@ -1450,6 +1450,8 @@ class Addendum3ProductTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime, profile="plain"),
             ),
             patch.object(resume, "find_active_lane", return_value=("epoch-1", lane)),
+            patch.object(resume, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(resume, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(resume, "_read_task_card", return_value=task_card),
             patch.object(resume, "_clear_prior_run"),
             patch.object(resume, "_write_worker_prompt"),
@@ -1510,6 +1512,7 @@ class Addendum3ProductTests(unittest.TestCase):
         ) -> dict[str, object]:
             value = mutate(dict(lane))
             updates.append(value)
+            lane.update(value)
             return {**lane, **value}
 
         with (
@@ -1520,6 +1523,7 @@ class Addendum3ProductTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
             patch.object(launch, "read_record", return_value=invocation),
             patch.object(

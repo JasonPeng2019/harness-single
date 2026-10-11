@@ -79,6 +79,19 @@ def update_lane(
     return record
 
 
+def lane_operation_lock(rt: Path, epoch_id: str, lane_id: str) -> RecordLock:
+    """Serialize native launch/resume/cancellation effects, outside controller writes."""
+    return RecordLock(lane_record_dir(rt, epoch_id, lane_id) / "lifecycle-operation")
+
+
+def require_same_run(current: dict[str, Any], captured: dict[str, Any]) -> None:
+    if not captured.get("run_id") or any(
+        current.get(field) != captured.get(field)
+        for field in ("lane_id", "run_id", "worktree_path", "provider")
+    ):
+        raise LaneError("LANE_OWNERSHIP_CHANGED", "lane invocation changed before the operation's effect")
+
+
 def find_active_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
     """Locate one lane in the active epoch by its operator-chosen id."""
     marker = read_current_epoch(rt)

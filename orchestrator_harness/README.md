@@ -55,7 +55,12 @@ results, operates hardware, or replaces the root orchestrator.
   decision as the linked `COMPLETION_REVIEW.json` / `ORCHESTRATOR_ACCEPTANCE.json` pair outside
   the worktree, and close the managed review event.
 - `lane force-stop --lane-id <id>` — hard-stop one stuck lane by exact recorded identity and
-  retire it.
+  retire it. An initial prepared lane or an explicitly pending resumed invocation can be
+  cancelled without a process only when its process record is exactly empty and controller
+  status is genuinely absent. Missing or uncertain cleanup proof returns
+  `FORCE_STOP_CLEANUP_UNPROVEN`; `FORCE_STOP_PROCESS_SURVIVED` means an exact recorded process
+  remains live after cleanup. Cancellation releases only the captured lane/run's leases and
+  refuses changed invocation ownership.
 - `lane retire --acceptance-ref <path>` — gracefully retire one accepted lane (the reference is
   the `orchestrator-acceptance/v1` record with `approval: ACCEPTED`), cleanup-proof-first and
   archive-first.
@@ -64,7 +69,9 @@ results, operates hardware, or replaces the root orchestrator.
 
 - `resume-lane --lane-id <id> --resume-task-card <path> [--rationale <text>]` — re-run a
   stopped, unaccepted lane in its same worktree and provider session with a fresh `run_id`. It
-  never reconstructs a session, PID, or worktree.
+  never reconstructs a session, PID, or worktree. Resume prepares the invocation; it starts no
+  controller or provider until `lane launch`. Shutdown or force-stop can retire that pending
+  invocation using the same strict never-launched proof.
 
 ### `manager` — manager-queue commands (managed only)
 

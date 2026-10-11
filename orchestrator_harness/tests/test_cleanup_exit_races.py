@@ -151,6 +151,7 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(
                 launch, "find_active_lane", return_value=("epoch-1", self.lane)
             ),
@@ -177,7 +178,7 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
             "pid": identity["pid"],
             "creation_time": identity["creation_time"],
         }
-        self.assertEqual(recorded, updates[0]["process"])
+        self.assertEqual(recorded, updates[1]["process"])
         self.assertEqual(
             {},
             updates[-1]["process"],
@@ -202,6 +203,7 @@ class ProviderStartFailureExitRaceTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
             patch.object(
                 launch, "find_active_lane", return_value=("epoch-1", self.lane)
             ),
