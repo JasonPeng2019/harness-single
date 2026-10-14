@@ -1,0 +1,27 @@
+{
+  "poll_interval_seconds": 300,
+  "observed_sources": [
+    {
+      "path": "runtime/orchestrator-harness/example-epoch/MANAGER_LOG.jsonl",
+      "role": "orchestrator",
+      "source_id": "main-orchestrator"
+    },
+    {
+      "path": "runtime/orchestrator-harness/example-epoch/events.jsonl",
+      "role": "harness",
+      "source_id": "managed-harness"
+    },
+    {
+      "path": "runtime/orchestrator-harness/example-epoch/LANE_EVENTS.jsonl",
+      "role": "subagent",
+      "source_id": "lane-events"
+    }
+  ],
+  "runtime_root": "runtime/harness-watcher/example-epoch",
+  "no_progress_seconds": 900,
+  "max_tail_bytes": 65536,
+  "attention_logging_enabled": false,
+  "attention_producers": [],
+  "attention_lock_timeout_seconds": 5.0,
+  "evaluator_enabled": false
+}

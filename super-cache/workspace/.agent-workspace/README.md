@@ -1,0 +1,39 @@
+# Super-cache workspace base
+
+This directory is the provider-neutral workspace base staged into every
+managed worktree by `lane bootstrap`.  It carries the shared
+`.agent-workspace/` skeleton and the four provider-neutral helpers that the
+worker skills call.
+
+## Contents
+
+- `result-stop-check.py` — validates the worktree `RESULT.json` against
+  `result/v1` using the canonical validator staged at bootstrap/resume: current
+  invocation/task/branch/full tip, checks, diagnostics, time, hash and clean PASS
+  source. It exits 0/1 and uses a separate import namespace when called by a provider.
+- `lane-queue.py` — advances one ROOT assignment in the worker inbox
+  (`lane-inbox/v1`) through PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
+- `manager-notify.py` — writes one escalation notice into
+  `manager-notifications/` for the monitor to promote into the manager queue.
+- `hook-dispatch.py` — decides the worker PostToolUse/Stop hook boundary from
+  the worker binding and inbox (`harness-hook-binding/v1`, `lane-inbox/v1`);
+  it never reads the manager queue and never advances assignment state.
+
+`RESULT.json` is always at the worktree root. The result checker requires a nonblank summary,
+evidence list, complete current assignment/revision/checks, completed timestamp
+with timezone and valid content hash. `.agent-workspace` contains the template,
+assignment mirror and validator modules. ROOT independently uses protected
+operator authority; this worker-editable mirror cannot authorize acceptance.
+
+## Rules
+
+- Helpers are provider-neutral and portable on Windows and Linux.
+- Queue/notice helpers prefer the current runtime record primitives
+  (`orchestrator_harness.records`, `orchestrator_harness.core`) when the
+  package is importable and fall back to portable stdlib equivalents. The RESULT
+  checker requires its staged canonical validator; missing staging is a diagnostic.
+- Helpers never write the manager queue; the worker only touches its own
+  inbox and outbox.
+- Bootstrap writes the authoritative worker binding with runtime paths into
+  `.agent-workspace/harness-hook-binding.json`; the payload binding is the
+  static template the helpers read.

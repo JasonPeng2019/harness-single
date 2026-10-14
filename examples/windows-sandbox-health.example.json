@@ -1,0 +1,12 @@
+{
+  "schema": "windows-sandbox-health/v1",
+  "status": "UNVERIFIED",
+  "probe_exit_code": 1,
+  "codex_home": "<absolute tested Codex home>",
+  "local_appdata": "<absolute tested run cache>",
+  "native_codex_executable": "<absolute tested native codex.exe>",
+  "native_codex_sha256": "<sha256 of tested executable>",
+  "setup_marker_sha256": "<sha256 of native setup marker>",
+  "probe_evidence_path": "<absolute retained real probe inside the run repository area>",
+  "probe_evidence_sha256": "<sha256 of retained probe evidence>"
+}

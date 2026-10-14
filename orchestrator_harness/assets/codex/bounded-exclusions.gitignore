@@ -1,0 +1,8 @@
+# Paths are relative to the repository/worktree root. Git-ignore syntax applies.
+# The provider bounded supervisor must be directly callable so it can enforce
+# the nested command's bound.  The approved Codex stable-runner script launches
+# a lane-managed agent session, not a bounded test, and receives no test
+# deadline.  Only these approved orchestration paths are excluded; an excluded
+# supervisor segment never exempts an appended covered command.
+.codex/scripts/Invoke-BoundedTest.ps1
+.codex/scripts/stable_runner.py

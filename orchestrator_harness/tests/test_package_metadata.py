@@ -1,0 +1,326 @@
+"""Focused package metadata tests for the out-of-tree wheel surface.
+
+Statically proves the pyproject ``packages``/``package-data`` declarations
+cover every registered provider binding and every required package-owned
+asset, and (when setuptools/wheel are importable) builds and inspects a wheel
+in a temporary directory.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import shutil
+import tempfile
+import tomllib
+import unittest
+import zipfile
+from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = REPOSITORY_ROOT / "orchestrator_harness"
+PYPROJECT_PATH = PACKAGE_ROOT / "pyproject.toml"
+
+# Every package that must be declared so all runtime modules ship in the wheel.
+REQUIRED_PACKAGES = (
+    "orchestrator_harness",
+    "orchestrator_harness.assets",
+    "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.rules",
+    "orchestrator_harness.provider_adapters",
+    "orchestrator_harness.provider_adapters.claude-code",
+    "orchestrator_harness.provider_adapters.codex",
+    "orchestrator_harness.provider_adapters.qwen-code",
+    "harness_common",
+)
+
+# Package-owned assets that must be declared as package data.
+REQUIRED_PACKAGE_DATA = (
+    "assets/codex/bounded-exclusions.gitignore",
+    "config.example.json",
+    "install_wsl_codex.ps1",
+    "provider_adapters/claude-code/launcher_binding.py",
+    "provider_adapters/codex/launcher_binding.py",
+    "provider_adapters/qwen-code/launcher_binding.py",
+)
+
+# Harness-root single-source trees that must never be duplicated in the wheel.
+FORBIDDEN_PACKAGE_DATA_PREFIXES = ("adapters/", "super-cache/")
+FORBIDDEN_PACKAGE_DATA_NAMES = ("harness-config.json", "resource-manifest.json")
+
+
+def _load_pyproject() -> dict:
+    with PYPROJECT_PATH.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def _glob_matches(pattern: str, relative_path: str) -> bool:
+    regex = re.escape(pattern).replace(r"\*", "[^/]*")
+    return re.fullmatch(regex, relative_path) is not None
+
+
+def _package_data_patterns(pyproject: dict) -> list[str]:
+    return list(
+        pyproject["tool"]["setuptools"]["package-data"]["orchestrator_harness"]
+    )
+
+
+def _on_disk_required_files() -> list[str]:
+    """Every non-module package-owned file that must ship in the wheel."""
+    required: list[str] = []
+    for binding in sorted(
+        (PACKAGE_ROOT / "provider_adapters").rglob("launcher_binding.py")
+    ):
+        required.append(binding.relative_to(PACKAGE_ROOT).as_posix())
+    for relative in (
+        "install_wsl_codex.ps1",
+        "config.example.json",
+        "assets/codex/bounded-exclusions.gitignore",
+    ):
+        required.append(relative)
+    for sub in ("codex",):
+        for path in sorted((PACKAGE_ROOT / "assets" / sub).iterdir()):
+            if path.is_file() and path.name != "__init__.py":
+                required.append(path.relative_to(PACKAGE_ROOT).as_posix())
+    for path in sorted((PACKAGE_ROOT / "assets" / "rules").iterdir()):
+        if path.is_file() and path.name != "__init__.py":
+            required.append(path.relative_to(PACKAGE_ROOT).as_posix())
+    for path in sorted((PACKAGE_ROOT / "assets" / "release").rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts:
+            required.append(path.relative_to(PACKAGE_ROOT).as_posix())
+    return sorted(set(required))
+
+
+class PackageMetadataStaticTests(unittest.TestCase):
+    def test_packaged_scripts_invalidate_owning_release_unit_credit(self) -> None:
+        import subprocess
+        from orchestrator_harness import release_checks
+        spec = release_checks.get_check("S6.RELEASE.ORCHESTRATOR-UNIT")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scope in spec.input_scopes:
+                if scope.kind == "tree":
+                    (root / scope.path).mkdir(parents=True, exist_ok=True)
+                    (root / scope.path / "fixture.py").write_text("fixture")
+                elif scope.kind == "file" and scope.required:
+                    (root / scope.path).parent.mkdir(parents=True, exist_ok=True)
+                    (root / scope.path).write_text("fixture")
+            for relative in spec.dependency_paths:
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_text("fixture")
+            scripts = ["scripts/" + name for name in (
+                "prepare_root_launch.py", "check_windows_sandbox.py", "collect_codex_usage.py", "token_ledger.py")]
+            for relative in scripts:
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_text("baseline")
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            for relative in scripts:
+                with self.subTest(script=relative):
+                    before = release_checks.dependency_fingerprint(spec, root)
+                    (root / relative).write_text("changed")
+                    self.assertNotEqual(before, release_checks.dependency_fingerprint(spec, root))
+
+    def test_integrated_registry_executes_contract_suites_and_invalidates_credit_inputs(self) -> None:
+        from orchestrator_harness import release_checks
+        spec = release_checks.get_check("S6.AFFECTED.INTEGRATED-CONTRACTS")
+        for module in ("orchestrator_harness.tests.test_protected_retry_history",
+                       "orchestrator_harness.tests.test_public_checks",
+                       "orchestrator_harness.tests.test_worker_isolation_boundaries",
+                       "orchestrator_harness.tests.test_path_portability", "scripts.tests.test_root_prelaunch"):
+            self.assertIn(module, spec.command)
+        self.assertIn("orchestrator_harness/lane_cleanup.py", spec.dependency_paths)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in spec.dependency_paths:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"baseline fixture")
+            before = release_checks.dependency_fingerprint(spec, root)
+            (root / "orchestrator_harness/retry_policy.py").write_bytes(b"changed launch authority")
+            self.assertNotEqual(before, release_checks.dependency_fingerprint(spec, root))
+
+    def test_runtime_and_build_versions_are_coherent(self) -> None:
+        pyproject = _load_pyproject()
+        self.assertEqual("2.0.0", pyproject["project"]["version"])
+        package_init = (PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('__version__ = "2.0.0"', package_init)
+        metadata = (PACKAGE_ROOT / "portable_orchestrator_harness.egg-info" / "PKG-INFO").read_text(encoding="utf-8")
+        self.assertIn("Version: 2.0.0", metadata)
+
+    def test_removed_candidate_modules_are_not_packaged(self) -> None:
+        removed = (
+            "provider.py",
+            "invocation.py",
+            "prompt_bundle.py",
+            "host_adapters.py",
+            "lane_controller.py",
+            "public_launch.py",
+            "cli.py",
+            "resume_admission.py",
+        )
+        for name in removed:
+            self.assertFalse((PACKAGE_ROOT / name).exists(), name)
+
+    def test_packages_cover_every_runtime_module(self) -> None:
+        pyproject = _load_pyproject()
+        declared = set(pyproject["tool"]["setuptools"]["packages"])
+        for package in REQUIRED_PACKAGES:
+            self.assertIn(package, declared, package)
+        for marker in sorted(PACKAGE_ROOT.rglob("__init__.py")):
+            package_dir = marker.parent
+            relative = package_dir.relative_to(PACKAGE_ROOT)
+            if (
+                "__pycache__" in relative.parts
+                or "tests" in relative.parts
+                or "egg-info" in relative.parts
+            ):
+                continue
+            dotted = (
+                "orchestrator_harness"
+                if relative.parts == ()
+                else "orchestrator_harness." + ".".join(relative.parts)
+            )
+            self.assertIn(dotted, declared, dotted)
+        self.assertEqual(
+            "../harness_common",
+            pyproject["tool"]["setuptools"]["package-dir"]["harness_common"],
+        )
+
+    def test_package_data_covers_registered_bindings_and_required_assets(
+        self,
+    ) -> None:
+        pyproject = _load_pyproject()
+        patterns = _package_data_patterns(pyproject)
+        self.assertTrue(patterns)
+        for relative in _on_disk_required_files():
+            self.assertTrue(
+                any(_glob_matches(pattern, relative) for pattern in patterns),
+                f"no package-data pattern covers {relative}",
+            )
+        for relative in REQUIRED_PACKAGE_DATA:
+            self.assertTrue(
+                any(_glob_matches(pattern, relative) for pattern in patterns),
+                f"no package-data pattern covers {relative}",
+            )
+        for pattern in patterns:
+            for prefix in FORBIDDEN_PACKAGE_DATA_PREFIXES:
+                self.assertFalse(pattern.startswith(prefix), pattern)
+            for name in FORBIDDEN_PACKAGE_DATA_NAMES:
+                self.assertNotIn(name, pattern, pattern)
+
+    def test_data_files_preserve_release_destinations(self) -> None:
+        pyproject = _load_pyproject()
+        data_files = pyproject["tool"]["setuptools"]["data-files"]
+        self.assertIn("examples", data_files)
+        self.assertIn("release_evidence_templates", data_files)
+        for destination, required in {
+            "scripts": "../scripts/prepare_root_launch.py",
+            "tools": "../tools/worker_public_check.py",
+            "docs": "../docs/PATH_PORTABILITY.md",
+        }.items():
+            self.assertIn(required, data_files[destination])
+        self.assertIn(
+            "assets/release/templates/*.md",
+            data_files["release_evidence_templates"],
+        )
+
+
+class PackageWheelBuildTests(unittest.TestCase):
+    def test_wheel_includes_registered_bindings_and_required_assets(self) -> None:
+        if (
+            importlib.util.find_spec("setuptools") is None
+            or importlib.util.find_spec("wheel") is None
+        ):
+            self.skipTest(
+                "setuptools/wheel are not importable in this environment"
+            )
+        with tempfile.TemporaryDirectory(prefix="orchestrator-package-wheel-") as raw:
+            temporary = Path(raw)
+            source = temporary / "source"
+            wheel_dir = temporary / "wheel"
+            wheel_dir.mkdir()
+            ignored = shutil.ignore_patterns(
+                "__pycache__", "*.pyc", "*.egg-info", "build", "dist"
+            )
+            shutil.copytree(
+                PACKAGE_ROOT, source / "orchestrator_harness", ignore=ignored
+            )
+            shutil.copytree(
+                REPOSITORY_ROOT / "harness_common",
+                source / "harness_common",
+                ignore=ignored,
+            )
+            shutil.copytree(
+                REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
+            )
+            for directory in ("scripts", "tools", "docs"):
+                shutil.copytree(REPOSITORY_ROOT / directory, source / directory, ignore=ignored)
+            previous = os.getcwd()
+            try:
+                os.chdir(source / "orchestrator_harness")
+                from setuptools.build_meta import build_wheel
+
+                wheel_name = build_wheel(str(wheel_dir))
+            finally:
+                os.chdir(previous)
+            wheel = wheel_dir / wheel_name
+            self.assertTrue(wheel.is_file(), wheel)
+            with zipfile.ZipFile(wheel) as archive:
+                names = set(archive.namelist())
+            required_entries = (
+                "orchestrator_harness/__init__.py",
+                "orchestrator_harness/release_checks.py",
+                "orchestrator_harness/operator_launch.py",
+                "orchestrator_harness/public_checks.py",
+                "orchestrator_harness/git_source.py",
+                "orchestrator_harness/lane_authority.py",
+                "orchestrator_harness/result_validation.py",
+                "orchestrator_harness/retry_policy.py",
+                "orchestrator_harness/windows_sandbox_preflight.py",
+                "orchestrator_harness/provider_adapters/__init__.py",
+                "orchestrator_harness/provider_adapters/codex/__init__.py",
+                "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
+                "orchestrator_harness/provider_adapters/claude-code/__init__.py",
+                "orchestrator_harness/provider_adapters/claude-code/launcher_binding.py",
+                "orchestrator_harness/provider_adapters/qwen-code/__init__.py",
+                "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
+                "orchestrator_harness/assets/codex/bounded-exclusions.gitignore",
+                "orchestrator_harness/config.example.json",
+                "orchestrator_harness/install_wsl_codex.ps1",
+                "orchestrator_harness/assets/release/manifest.json",
+                "orchestrator_harness/assets/release/examples/public-coding-launch.example.md",
+                "orchestrator_harness/assets/release/examples/release-selection.example.json",
+                "orchestrator_harness/assets/release/templates/COMPLETION.md",
+                "harness_common/__init__.py",
+                "harness_common/process_identity.py",
+                "harness_common/platform_paths.py",
+            )
+            for entry in required_entries:
+                self.assertIn(entry, names, entry)
+            for entry in ("scripts/prepare_root_launch.py", "scripts/check_windows_sandbox.py",
+                          "scripts/collect_codex_usage.py", "scripts/token_ledger.py",
+                          "tools/worker_public_check.py", "docs/BUILD_TEST_INTERFACE.md",
+                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md", "docs/ROOT_TASK_POLICY.md"):
+                self.assertTrue(any(name.endswith(".data/data/" + entry) for name in names), entry)
+            self.assertTrue(any(".data/data/examples/" in name for name in names))
+            self.assertTrue(
+                any(
+                    name.endswith(".data/data/examples/project-task-card.example.json")
+                    for name in names
+                )
+            )
+            self.assertTrue(
+                any(".data/data/release_evidence_templates/" in name for name in names)
+            )
+            for name in names:
+                lowered = name.lower()
+                self.assertFalse(lowered.startswith("adapters/"), name)
+                self.assertFalse(lowered.startswith("super-cache/"), name)
+                self.assertNotIn("harness-config.json", lowered, name)
+                self.assertNotIn("resource-manifest.json", lowered, name)
+
+
+if __name__ == "__main__":
+    unittest.main()

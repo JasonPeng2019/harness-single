@@ -1,0 +1,21 @@
+{
+  "schema": "result/v1",
+  "lane_id": "parser",
+  "run_id": "parser-001",
+  "worker_invocation_id": "parser-001",
+  "task_card_hash": "<copy-from-staged-result-template>",
+  "branch": "lane/example/parser/work",
+  "commit": "fedcba9876543210fedcba9876543210fedcba98",
+  "outcome": "PASS",
+  "summary": "Implemented the parser and focused tests.",
+  "checks": [
+    {
+      "name": "parser unit tests",
+      "command": "python -m unittest tests.test_parser -v",
+      "outcome": "PASS"
+    }
+  ],
+  "evidence": ["Parser unit tests completed successfully."],
+  "completed_at": "2026-10-11T00:00:00Z",
+  "content_hash": "<compute-canonical-hash-excluding-this-field>"
+}

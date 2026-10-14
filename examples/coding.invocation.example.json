@@ -1,0 +1,39 @@
+{
+  "schema": "controller-invocation/v1",
+  "lane_id": "parser",
+  "run_id": "parser-001",
+  "provider": {
+    "id": "codex",
+    "model": "configured-model",
+    "launch_config": {
+      "reasoning_effort": "configured-effort",
+      "service_tier": "configured-tier"
+    }
+  },
+  "exclusive_resources": [
+    "service:integration-database"
+  ],
+  "launcher": {
+    "entry": "python -m orchestrator_harness.controller",
+    "argv": [
+      "python",
+      "-m",
+      "orchestrator_harness.controller",
+      "parser"
+    ]
+  },
+  "env": {},
+  "cwd": "<absolute-worktree>",
+  "paths": {
+    "worktree": "<absolute-worktree>",
+    "result": "<absolute-result>",
+    "controller_status": "<absolute-controller-status>",
+    "controller_events": "<absolute-controller-events>",
+    "transcript": "<absolute-transcript>",
+    "stderr": "<absolute-stderr>",
+    "last_message": "<absolute-last-message>",
+    "prompt": "<absolute-prompt>"
+  },
+  "created_at": "2026-08-03T10:00:00Z",
+  "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}

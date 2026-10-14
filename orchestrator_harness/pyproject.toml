@@ -1,0 +1,65 @@
+[project]
+name = "portable-orchestrator-harness"
+version = "2.0.0"
+description = "Durable event observation and lane control for parallel coding work"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+package-dir = { orchestrator_harness = ".", harness_common = "../harness_common" }
+packages = [
+    "orchestrator_harness",
+    "orchestrator_harness.assets",
+    "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.rules",
+    "orchestrator_harness.provider_adapters",
+    "orchestrator_harness.provider_adapters.claude-code",
+    "orchestrator_harness.provider_adapters.codex",
+    "orchestrator_harness.provider_adapters.qwen-code",
+    "harness_common",
+]
+
+[tool.setuptools.package-data]
+orchestrator_harness = [
+    "assets/codex/bounded-exclusions.gitignore",
+    "assets/codex/*.json",
+    "assets/codex/*.py",
+    "assets/rules/*.md",
+    "assets/release/*.json",
+    "assets/release/examples/*.json",
+    "assets/release/examples/*.md",
+    "assets/release/templates/*.md",
+    "config.example.json",
+    "install_wsl_codex.ps1",
+    "provider_adapters/*/launcher_binding.py",
+]
+
+[tool.setuptools.data-files]
+"examples" = [
+    "../examples/coding.invocation.example.json",
+    "../examples/coding.named-lock.example.json",
+    "../examples/coding.result.example.json",
+    "../examples/harness.example.json",
+    "../examples/project-task-card.example.json",
+    "../examples/watcher.diagnostic.example.json",
+    "../examples/public-check-policy.example.json",
+    "../examples/windows-sandbox-health.example.json",
+    "assets/release/examples/*.json",
+    "assets/release/examples/*.md",
+]
+"release_evidence_templates" = ["assets/release/templates/*.md"]
+"scripts" = ["../scripts/prepare_root_launch.py", "../scripts/check_windows_sandbox.py",
+             "../scripts/collect_codex_usage.py", "../scripts/token_ledger.py"]
+"tools" = ["../tools/worker_public_check.py"]
+"docs" = ["../docs/BUILD_TEST_INTERFACE.md", "../docs/INTEGRATED_RUN_FIXES.md",
+          "../docs/PATH_PORTABILITY.md", "../docs/ROOT_TASK_POLICY.md"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+extraPaths = [".."]
+reportImplicitRelativeImport = "none"

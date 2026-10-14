@@ -1,0 +1,428 @@
+﻿"""The manager queue (managed) and the worker inbox.
+
+Three components write the manager queue, each under the same short queue
+lock: the monitor (sole producer of events), ROOT (advances event state via
+the manager commands), and the managed PostToolUse hook (appends a
+delivery-history receipt only).  The controller and worker never write it.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+import json
+from pathlib import Path
+from typing import Any
+
+from .activity_log import append_detail
+from .core import iso_utc, new_id, read_json, require_schema
+from .epochs import (
+    MANAGER_QUEUE_SCHEMA,
+    current_epoch_path,
+    lane_record_dir,
+    manager_queue_path,
+    read_current_epoch,
+)
+from .records import RecordLock, atomic_write_json, read_record, runtime_admission_lock
+from .mutation import capture_target, read_bytes as anchored_read
+from .stable_io import PreparedOutputTransaction
+
+LANE_INBOX_SCHEMA = "lane-inbox/v1"
+
+EVENT_TYPES = frozenset(
+    {
+        "COMPLETION_REVIEW_REQUIRED",
+        "LANE_RESULT_INVALID",
+        "LANE_RESUME_REQUIRED",
+        "LANE_STATUS_CHANGED",
+    }
+)
+EVENT_STATES = frozenset({"PENDING", "ACKNOWLEDGED", "COMPLETE", "BLOCKED"})
+ASSIGNMENT_STATES = frozenset({"PENDING", "ACKNOWLEDGED", "COMPLETE", "BLOCKED"})
+
+MANAGER_ACK_EVENT_NOT_FOUND = "MANAGER_ACK_EVENT_NOT_FOUND"
+MANAGER_ACK_ALREADY_ACKNOWLEDGED = "MANAGER_ACK_ALREADY_ACKNOWLEDGED"
+MANAGER_ACK_NOT_ROOT_EVENT = "MANAGER_ACK_NOT_ROOT_EVENT"
+MANAGER_CLOSE_NOT_ACKNOWLEDGED = "MANAGER_CLOSE_NOT_ACKNOWLEDGED"
+MANAGER_CLOSE_ALREADY_CLOSED = "MANAGER_CLOSE_ALREADY_CLOSED"
+MANAGER_CLOSE_NOT_ROOT_EVENT = "MANAGER_CLOSE_NOT_ROOT_EVENT"
+MANAGER_CLOSE_INVALID_OUTCOME = "MANAGER_CLOSE_INVALID_OUTCOME"
+MANAGER_CLOSE_SUMMARY_REQUIRED = "MANAGER_CLOSE_SUMMARY_REQUIRED"
+SEND_LANE_NOT_FOUND = "SEND_LANE_NOT_FOUND"
+SEND_LANE_NOT_MANAGED = "SEND_LANE_NOT_MANAGED"
+SEND_LANE_NOT_RUNNING = "SEND_LANE_NOT_RUNNING"
+SEND_LANE_WRITE_FAILED = "SEND_LANE_WRITE_FAILED"
+
+SEVERITIES = frozenset({"info", "warning", "error", "blocking"})
+
+
+class ManagerQueueError(RuntimeError):
+    """A manager-queue or worker-inbox operation failed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _queue_header(rt: Path) -> dict[str, Any]:
+    marker = read_current_epoch(rt)
+    if marker is None:
+        raise ManagerQueueError("MANAGER_QUEUE_NO_EPOCH", "no active epoch")
+    return {
+        "epoch_id": str(marker["epoch_id"]),
+        "queue_id": str(marker.get("queue_id") or ""),
+    }
+
+
+def read_manager_queue(rt: Path) -> dict[str, Any]:
+    """Read the manager queue, confirming its header matches the epoch marker."""
+    path = manager_queue_path(rt)
+    if not path.is_file():
+        raise ManagerQueueError("MANAGER_QUEUE_MISSING", f"manager queue missing: {path}")
+    try:
+        record = read_record(path, MANAGER_QUEUE_SCHEMA)
+    except (OSError, ValueError) as exc:
+        raise ManagerQueueError("MANAGER_QUEUE_INVALID", str(exc)) from exc
+    header = _queue_header(rt)
+    if record.get("epoch_id") != header["epoch_id"] or record.get("queue_id") != header["queue_id"]:
+        raise ManagerQueueError("QUEUE_REPLACED", "manager queue header does not match the active epoch")
+    validate_queue_record(record)
+    return record
+
+
+def validate_queue_record(record: dict[str, Any]) -> None:
+    """Unknown or malformed event state is not a resolved ROOT obligation."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        raise ManagerQueueError("MANAGER_QUEUE_INVALID", "manager events must be a list")
+    identities = set()
+    for event in events:
+        if (not isinstance(event, dict) or not isinstance(event.get("event_id"), str)
+                or not event["event_id"] or event["event_id"] in identities
+                or event.get("type") not in EVENT_TYPES or event.get("state") not in EVENT_STATES
+                or not isinstance(event.get("lane_id"), str) or not isinstance(event.get("run_id"), str)):
+            raise ManagerQueueError("MANAGER_QUEUE_INVALID", "manager event identity, type or state is invalid")
+        identities.add(event["event_id"])
+        history = event.get("history")
+        delivery = event.get("delivery_history")
+        if (not isinstance(history, list) or not history or not isinstance(delivery, list)
+                or any(not isinstance(item, dict) or item.get("state") not in EVENT_STATES for item in history)
+                or history[-1]["state"] != event["state"]
+                or any(not isinstance(item, dict) for item in delivery)):
+            raise ManagerQueueError("MANAGER_QUEUE_INVALID", "manager event history is invalid")
+
+
+def _write_manager_queue(rt: Path, record: dict[str, Any]) -> None:
+    """Replace the queue while the caller owns its queue lock."""
+    path = manager_queue_path(rt)
+    atomic_write_json(path, record)
+
+
+def _update_manager_queue(
+    rt: Path,
+    mutate: Callable[[dict[str, Any]], tuple[Any, bool]],
+) -> Any:
+    """Validate, mutate, and replace the manager queue in one transaction."""
+    path = manager_queue_path(rt)
+    with runtime_admission_lock(rt), RecordLock(path):
+        record = read_manager_queue(rt)
+        result, changed = mutate(record)
+        if changed:
+            _write_manager_queue(rt, record)
+        return result
+
+
+def promote_event(
+    rt: Path,
+    *,
+    event_type: str,
+    lane_id: str,
+    run_id: str,
+    summary: str,
+    actionable_status: str | None = None,
+    event_class: str | None = None,
+    severity: str | None = None,
+    data: dict[str, Any] | None = None,
+    dedup_key: str | None = None,
+) -> dict[str, Any]:
+    """The monitor's sole-producer admission of one PENDING event."""
+    if event_type not in EVENT_TYPES:
+        raise ManagerQueueError("MANAGER_QUEUE_INVALID_EVENT_TYPE", event_type)
+    admitted = False
+
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        nonlocal admitted
+        if dedup_key:
+            for existing in record.get("events", []):
+                if existing.get("dedup_key") == dedup_key:
+                    return existing, False
+        event = {
+            "event_id": new_id(),
+            "type": event_type,
+            "lane_id": lane_id,
+            "run_id": run_id,
+            "summary": summary,
+            "state": "PENDING",
+            "history": [{"state": "PENDING", "at": iso_utc()}],
+            "delivery_history": [],
+        }
+        if actionable_status is not None:
+            event["actionable_status"] = actionable_status
+        if event_class:
+            event["event_class"] = event_class
+        if severity:
+            if severity not in SEVERITIES:
+                raise ManagerQueueError(
+                    "MANAGER_QUEUE_INVALID_SEVERITY", severity
+                )
+            event["severity"] = severity
+        if data:
+            event["data"] = dict(data)
+        if dedup_key:
+            event["dedup_key"] = dedup_key
+        record["events"].append(event)
+        admitted = True
+        return event, True
+
+    event = _update_manager_queue(rt, mutate)
+    if admitted:
+        append_detail(
+            rt,
+            "queue.manager.added",
+            component="queue",
+            added_event=event,
+            queue_snapshot=read_manager_queue(rt),
+        )
+    return event
+
+
+def acknowledge_event(rt: Path, event_id: str) -> dict[str, Any]:
+    """ROOT advances one event PENDING -> ACKNOWLEDGED."""
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            raise ManagerQueueError(
+                MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
+            )
+        if event["state"] != "PENDING":
+            raise ManagerQueueError(
+                MANAGER_ACK_ALREADY_ACKNOWLEDGED,
+                f"event {event_id} is already {event['state']}",
+            )
+        event["state"] = "ACKNOWLEDGED"
+        event["history"].append({"state": "ACKNOWLEDGED", "at": iso_utc()})
+        return event, True
+
+    return _update_manager_queue(rt, mutate)
+
+
+def close_event(
+    rt: Path, event_id: str, outcome: str, summary: str | None = None
+) -> dict[str, Any]:
+    """ROOT closes an acknowledged event with COMPLETE or BLOCKED."""
+    if outcome not in ("COMPLETE", "BLOCKED"):
+        raise ManagerQueueError(MANAGER_CLOSE_INVALID_OUTCOME, f"invalid outcome: {outcome}")
+    normalized_summary = summary.strip() if isinstance(summary, str) else ""
+    if not normalized_summary:
+        raise ManagerQueueError(
+            MANAGER_CLOSE_SUMMARY_REQUIRED, "close summary must be nonblank"
+        )
+    def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            raise ManagerQueueError(
+                MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
+            )
+        if event["state"] == "PENDING":
+            raise ManagerQueueError(
+                MANAGER_CLOSE_NOT_ACKNOWLEDGED,
+                f"event {event_id} is not acknowledged",
+            )
+        if event["state"] in ("COMPLETE", "BLOCKED"):
+            raise ManagerQueueError(
+                MANAGER_CLOSE_ALREADY_CLOSED,
+                f"event {event_id} is already {event['state']}",
+            )
+        event["state"] = outcome
+        event["history"].append(
+            {"state": outcome, "at": iso_utc(), "summary": normalized_summary}
+        )
+        event["summary"] = normalized_summary
+        return event, True
+
+    return _update_manager_queue(rt, mutate)
+
+
+def append_delivery_history(
+    rt: Path,
+    event_id: str,
+    *,
+    source: str = "hook",
+    queue_id: str | None = None,
+    session_id: str | None = None,
+    binding_id: str | None = None,
+) -> None:
+    """The managed PostToolUse hook appends a DELIVERED receipt only."""
+    def mutate(record: dict[str, Any]) -> tuple[None, bool]:
+        event = _find_event(record, event_id)
+        if event is None:
+            return None, False
+        receipt: dict[str, Any] = {
+            "outcome": "DELIVERED",
+            "source": source,
+            "event_id": event_id,
+            "at": iso_utc(),
+        }
+        if queue_id:
+            receipt["queue_id"] = queue_id
+        if session_id:
+            receipt["session_id"] = session_id
+        if binding_id:
+            receipt["binding_id"] = binding_id
+        receipt_queue_id = queue_id or record.get("queue_id")
+        if receipt_queue_id:
+            receipt["queue_id"] = receipt_queue_id
+        event.setdefault("delivery_history", []).append(receipt)
+        return None, True
+
+    _update_manager_queue(rt, mutate)
+
+
+def append_watch_delivery(
+    rt: Path,
+    event_id: str,
+    *,
+    root_session_id: str,
+    binding_id: str,
+) -> bool:
+    """Record one idle-watch delivery unless this ROOT session already saw it."""
+
+    def mutate(record: dict[str, Any]) -> tuple[bool, bool]:
+        event = _find_event(record, event_id)
+        if event is None or event.get("state") not in {"PENDING", "ACKNOWLEDGED"}:
+            return False, False
+        queue_id = record.get("queue_id")
+        history = event.setdefault("delivery_history", [])
+        for receipt in history:
+            if (
+                receipt.get("source") == "watch"
+                and receipt.get("queue_id") == queue_id
+                and receipt.get("event_id") == event_id
+                and receipt.get("session_id") == root_session_id
+                and receipt.get("binding_id") == binding_id
+            ):
+                return False, False
+        history.append(
+            {
+                "outcome": "DELIVERED",
+                "source": "watch",
+                "event_id": event_id,
+                "queue_id": queue_id,
+                "session_id": root_session_id,
+                "binding_id": binding_id,
+                "at": iso_utc(),
+            }
+        )
+        return True, True
+
+    return bool(_update_manager_queue(rt, mutate))
+
+
+def _find_event(record: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+    for event in record.get("events", []):
+        if event.get("event_id") == event_id:
+            return event
+    return None
+
+
+def read_lane_inbox(worktree: Path) -> dict[str, Any]:
+    path = worktree / ".agent-workspace" / "QUEUE.json"
+    try:
+        record = json.loads(anchored_read(worktree, path.relative_to(worktree)))
+        if not isinstance(record, dict):
+            raise ValueError("lane inbox is not an object")
+        require_schema(record, LANE_INBOX_SCHEMA, path)
+        if (not isinstance(record.get("lane_id"), str) or not record["lane_id"]
+                or not isinstance(record.get("run_id"), str) or not record["run_id"]
+                or not isinstance(record.get("assignments"), list)
+                or any(not isinstance(item, dict) or item.get("lane_id") != record["lane_id"]
+                       or item.get("run_id") != record["run_id"]
+                       or item.get("state") not in ASSIGNMENT_STATES
+                       for item in record["assignments"])):
+            raise ValueError("lane inbox identity or assignments are invalid")
+        return record
+    except FileNotFoundError as exc:
+        raise ManagerQueueError("LANE_INBOX_MISSING", f"lane inbox missing: {path}") from exc
+    except (OSError, ValueError) as exc:
+        raise ManagerQueueError("LANE_INBOX_INVALID", str(exc)) from exc
+
+
+def write_lane_inbox(worktree: Path, record: dict[str, Any]) -> None:
+    path = worktree / ".agent-workspace" / "QUEUE.json"
+    output = PreparedOutputTransaction(worktree)
+    output.prepare()
+    output.admit(path)
+    output.ensure_parent(path)
+    with RecordLock(path, root=worktree):
+        output.atomic_json(path, record)
+
+
+def append_assignment(
+    rt: Path, lane: dict[str, Any], prompt: str
+) -> dict[str, Any]:
+    """ROOT appends one PENDING assignment to a running managed lane's inbox."""
+    from .lanes import lane_operation_lock, read_lane, require_same_run
+    from .setup import read_runtime_state
+    from .processes import identity_matches
+    try:
+        with runtime_admission_lock(rt):
+            state = read_runtime_state(rt)
+            marker = read_current_epoch(rt)
+            if not state or state["state"] != "OPEN" or not marker:
+                raise ValueError("lane assignments require the current OPEN runtime")
+            epoch_id = marker["epoch_id"]
+            with lane_operation_lock(rt, epoch_id, lane["lane_id"]):
+                current = read_lane(rt, epoch_id, lane["lane_id"])
+                require_same_run(current, lane)
+                process = current.get("process") or {}
+                if (current.get("lifecycle") != "running" or not current.get("incoming_queue_path")
+                        or not identity_matches(process.get("pid"), process.get("creation_time"))):
+                    raise ValueError("managed lane owner is no longer running")
+                worktree = Path(current["worktree_path"]).absolute()
+                path = worktree / ".agent-workspace" / "QUEUE.json"
+                if Path(current["incoming_queue_path"]).absolute() != path:
+                    raise ValueError("lane inbox path differs from its assigned worktree")
+                output = PreparedOutputTransaction(worktree)
+                output.prepare()
+                if tuple(current.get("worktree_identity", ())) != output.root_identity:
+                    raise ValueError("lane worktree identity changed or is missing")
+                output.admit(path)
+                with RecordLock(path, root=worktree):
+                    expected = capture_target(worktree, path.relative_to(worktree))
+                    inbox = read_lane_inbox(worktree)
+                    if not expected.present or json.loads(expected.content) != inbox:
+                        raise ValueError("lane inbox changed during the assignment read")
+                    if (inbox["lane_id"], inbox["run_id"]) != (lane["lane_id"], lane["run_id"]):
+                        raise ValueError("lane inbox identity is stale or foreign")
+                    assignment = {
+                        "event_id": new_id(), "lane_id": lane["lane_id"], "run_id": lane["run_id"],
+                        "prompt": prompt, "created_at": iso_utc(), "state": "PENDING",
+                        "history": [{"state": "PENDING", "at": iso_utc()}],
+                    }
+                    inbox["assignments"].append(assignment)
+                    require_same_run(read_lane(rt, epoch_id, lane["lane_id"]), lane)
+                    output.atomic_json(path, inbox, expected=expected)
+    except ManagerQueueError:
+        raise
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        raise ManagerQueueError(SEND_LANE_WRITE_FAILED, str(exc)) from exc
+    append_detail(
+        rt,
+        "queue.worker.added",
+        component="queue",
+        lane_id=lane["lane_id"],
+        run_id=lane["run_id"],
+        prompt=prompt,
+        added_assignment=assignment,
+        queue_snapshot=inbox,
+    )
+    return assignment

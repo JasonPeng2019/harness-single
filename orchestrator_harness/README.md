@@ -1,0 +1,235 @@
+# Orchestrator Harness v2: Command and Contract Reference
+
+The package exposes one public launcher:
+
+```powershell
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
+```
+
+Every public command returns the structured result `{ ok, code, summary, evidence_paths,
+next_action }`; `--json` emits the machine-readable result object. Success prints a short status
+line and exits 0; failure prints one stable failure code and a message on stderr and exits
+non-zero. The harness never schedules work, chooses providers, decides outcomes, accepts
+results, operates hardware, or replaces the root orchestrator.
+
+## Command reference
+
+### `harness` — runtime lifecycle
+
+- `harness setup [--overwrite]` — one-time idempotent integration. Validates
+  `harness-config.json` and `resource-manifest.json`, preflights the entire catalog before
+  writing anything, stages and byte-verifies the active super-cache, installs the ROOT payloads,
+  writes the active resource manifest and lease directory, and starts the persistent monitor.
+  It starts no lane or provider and never creates an epoch or worktree. Existing Codex and Claude
+  configuration is preserved while harness hook groups are merged idempotently. An existing Codex
+  config must already enable hooks. `--overwrite` re-integrates only harness-owned payload files.
+- `harness shutdown` — end the whole runtime: OPEN -> SHUTTING_DOWN, each lane's controller cleans
+  its own processes, the monitor stops, the active-epoch marker clears, and the runtime closes.
+  It never kills by broad process name.
+
+### `lane` — lane lifecycle
+
+- `lane bootstrap --lane-id <id> --provider <id> --model <model>
+  [--provider-option <name>=<value>] [--exclusive-resource <id>]
+  --task-card <path>` — prepare one lane: create the worktree, stage the super-cache base and the
+  selected provider payload, write the worker binding and inbox/outbox, and open the epoch on
+  first use. `--exclusive-resource` may repeat; every name must be declared in
+  `resource-manifest.json`.
+
+  The `project-task-card/v1` object requires a non-empty `task`, non-empty string arrays named
+  `acceptance_criteria` and `deliverables`, and a non-empty
+  `reason_for_acceptance_and_deliverables` string. These fields are rendered into the worker
+  prompt, preserved in `.agent-workspace/task-card.json`, and covered by its review hash. Cards
+  missing them are invalid; add valid values and retry. See
+  `examples/project-task-card.example.json` for the complete template.
+
+  All provider model preferences must be supplied before bootstrap. Codex requires
+  `reasoning_effort` and `service_tier`; Claude Code requires `effort`; Qwen Code currently has no
+  provider option beyond its model. `--provider-option` may repeat. The selected adapter rejects
+  missing, duplicate, or unknown preferences before lane mutation, and the signed invocation
+  preserves the exact configuration for launch and resume. No launcher binding chooses defaults.
+- `lane launch --lane-id <id>` — start one prepared lane's controller and provider.
+- `lane completion-review (--event-id <id> | --lane-id <id>) --review-outcome {PASS,FAIL,BLOCKED}
+  --approval {ACCEPTED,REJECTED} --review-summary <text> [--evidence <path>] [--force-accept]
+  [--force-reason <text>]` — record ROOT's factual finding and the separate accept/reject
+  decision as the linked `COMPLETION_REVIEW.json` / `ORCHESTRATOR_ACCEPTANCE.json` pair outside
+  the worktree, and close the managed review event.
+- `lane force-stop --lane-id <id>` — hard-stop one stuck lane by exact recorded identity and
+  retire it. An initial prepared lane or an explicitly pending resumed invocation can be
+  cancelled without a process only when its process record is exactly empty and controller
+  status is genuinely absent. Missing or uncertain cleanup proof returns
+  `FORCE_STOP_CLEANUP_UNPROVEN`; `FORCE_STOP_PROCESS_SURVIVED` means an exact recorded process
+  remains live after cleanup. Cancellation releases only the captured lane/run's leases and
+  refuses changed invocation ownership.
+- `lane retire --acceptance-ref <path>` — gracefully retire one accepted lane (the reference is
+  the `orchestrator-acceptance/v1` record with `approval: ACCEPTED`), cleanup-proof-first and
+  archive-first.
+
+### `resume-lane`
+
+- `resume-lane --lane-id <id> --resume-task-card <path> [--rationale <text>]` — re-run a
+  stopped, unaccepted lane in its same worktree and provider session with a fresh `run_id`. It
+  never reconstructs a session, PID, or worktree. Resume prepares the invocation; it starts no
+  controller or provider until `lane launch`. Shutdown or force-stop can retire that pending
+  invocation using the same strict never-launched proof.
+
+### `manager` — manager-queue commands (managed only)
+
+- `manager acknowledge --event-id <id>` — move one event PENDING -> ACKNOWLEDGED. Acknowledge
+  only the envelope's top-level `event_id` after handling the event; `data.signal_id` is not an
+  acknowledgement ID.
+- `manager close --event-id <id> --outcome {COMPLETE,BLOCKED} --summary <text>` — close an
+  acknowledged event.
+
+### `lease` — orphaned lease recovery
+
+- `lease force-release --resource-id <id>` — release one declared resource only after the exact
+  holder's exit and its provider/helper boundary cleanup are proven. A resumed or missing current
+  lane requires the matching protected prior invocation, status and launch journal; a lifecycle
+  label or controller exit alone cannot free the resource. Malformed/non-file lease evidence
+  blocks acquisition and strict cleanup without being overwritten. The command fails
+  closed with a stable `code` and actionable `next_action`; never hand-edit lease records.
+
+### `send-lane-notification`
+
+- `send-lane-notification --lane-id <id> --prompt <text>` — append one assignment to a running
+  managed lane's inbox.
+
+The command requires the current OPEN runtime and the same live lane invocation.
+A resumed run, foreign inbox, replaced worktree, or changed inbox publication
+refuses the assignment and preserves the existing evidence. Worker acknowledgements
+and ROOT additions share the inbox lock, so an addition preserves earlier updates.
+
+### `scan`, `watch`, `health`
+
+- `scan [--no-write]` — read-only lane-status snapshot.
+- `watch [--until-actionable] [--timeout <duration>] [--until-event <id>]` — block until an
+  actionable condition exists (or the named manager event appears). Durations accept `30s`, `5m`,
+  `1h`.
+- `health reconcile` — rebuild active-lanes and re-derive status (manual entry point to the
+  monitor's automatic reconciliation).
+- `health monitor-recover` — recover the persistent monitor. Managed coordination only and the
+  runtime must be OPEN: starts a missing monitor, restarts a dead one, and force-stops a hung one
+  before replacement. A deliberately stopped monitor (stop mark) is never restarted.
+
+## Configuration and one-time integration
+
+`harness-config.json` at the harness root is the closed two-key `harness-config/v1` shape: a
+required absolute `root_workspace` and optional `managed_coordination` (`enabled` or `disabled`;
+default `enabled`). No other keys are legal. `resource-manifest.json` is the closed
+`resource-manifest/v1` shape: a literal `schema` field plus a `resources` list; every nonempty
+entry declares a nonempty `id` and `exclusive: true`, and duplicate IDs or unknown fields are
+invalid. ROOT never passes paths, feature flags, or a profile again on any later command; the
+stored config selects everything.
+
+`managed_coordination: enabled` (managed) stages a manager queue for the epoch: ROOT uses
+`manager acknowledge`/`manager close` and `send-lane-notification`, and the monitor promotes
+worker notices into the queue. Managed watch wakes from an unresolved queue event or an
+actionable lane/resource state and returns the top-level event ID after a durable
+per-queue/current-ROOT-session delivery receipt; plain watch has no queue.
+`disabled` (plain) omits the manager queue.
+
+## Providers and the adapter catalog
+
+Three provider IDs ship: `codex`, `claude-code`, and `qwen-code`. Each has one tree under
+`adapters/<provider-id>/`:
+
+- `root/` — the provider's ROOT payload (config, hooks, binding, eight ROOT skills).
+- `super-cache/` — the managed worker payload (worker hooks, config, binding, two worker skills).
+- `harness/launcher_binding.py` — the launcher binding, registered under
+  `orchestrator_harness/provider_adapters/<provider-id>/` by setup.
+- `shipped-machinery/` — adapter-author notes.
+
+`super-cache/custom/` is the custom file-only adapter tree: reserved for local, non-shipped
+payload files. The shipped tree keeps only a marker README, and runtime staging never reads it
+unless an operator explicitly places payloads there.
+
+## Super-cache and bootstrap
+
+`super-cache/workspace/` is the provider-neutral base staged into every managed worktree by
+`lane bootstrap`: the shared `.agent-workspace/` skeleton plus three provider-neutral helpers:
+
+- `result-stop-check.py` — validates the worktree `RESULT.json` against `result/v1` (schema,
+  current invocation/task/branch/tip, checks, diagnostics, timestamp, content hash
+  and clean PASS source) using the canonical validator staged at bootstrap/resume, and exits 0/1.
+- `lane-queue.py` — advances one ROOT assignment in the worker inbox (`lane-inbox/v1`) through
+  PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
+- `manager-notify.py` — writes one escalation notice into `manager-notifications/` for the
+  monitor to promote into the manager queue.
+
+Bootstrap writes the authoritative worker binding with runtime paths into
+`.agent-workspace/harness-hook-binding.json`; payload bindings are the static templates the
+helpers read. Helpers never write the manager queue; the worker only touches its own inbox and
+outbox. Notices must use `manager-notice/v1` with the exact current lane/run,
+nonempty notice/signal IDs, summary, event class and creation timestamp, and a
+supported severity. Each notice is limited to 64 KiB. Malformed or stale notices
+remain in place with diagnostics; the monitor never relabels them for a resumed
+run. After promotion, it retains original bytes in the protected lane's
+`notice-archive/<run>/` before safely archiving the worker copy. A reused signal
+with changed bytes or an unsafe archive path is reported without overwriting
+other state or deleting a replacement notice.
+
+## Lane lifecycle and evidence
+
+Lifecycle: task card -> worktree-root `RESULT.json` -> `COMPLETION_REVIEW.json` ->
+`ORCHESTRATOR_ACCEPTANCE.json`. The worker writes the result; ROOT records the factual finding
+and the separate accept/reject decision with `lane completion-review`. A result is merge-ready
+only after current invocation/task/assignment, branch and exact full tip, outcome,
+summary, checks, evidence, timezone-bearing completion timestamp and content hash
+validate. Fill the lane's `.agent-workspace/result-template.json`; the static
+coding example contains placeholders and is not a usable completion record.
+ROOT validates against protected operator authority, independently of the worker's
+local assignment mirror. Acceptance, decision replay and retirement require clean
+project source at the assigned current tip; FAIL/BLOCKED may retain dirty failure
+diagnostics. Reported checks are evidence; the harness does not execute them.
+
+Clean-source validation checks index entries and actual file bytes, including
+files marked assume-unchanged or skip-worktree, and verifies Git object contents.
+`RESULT.json`, `.agent-workspace/` and the exact generated provider files recorded
+in the protected assignment are bookkeeping exclusions. Other tracked, staged or
+untracked project changes prevent acceptance. Normal Git-ignored build output is
+not an untracked-source error. Built-in Git text/encoding normalization is supported;
+external filter commands are disabled. Real source links, submodule contents and
+source requiring an external clean filter are not currently proven by this validator
+and produce a diagnostic rather than a clean-source claim. Resolve those cases
+explicitly before acceptance; changing the worker mirror cannot waive ROOT validation.
+
+Stop and cleanup use exact recorded identity (PID plus creation time) only; unknown identity is
+never safe absence, and no process is ever killed by broad name or command matching. Static
+examples and fixtures are never live provider proof: only a real recorded live run with exact
+identity evidence (provider, session, command provenance, delivery receipts) can claim provider
+proof.
+
+The monitor records a heartbeat on every pass, including zero watched lanes and promotion or
+inspection diagnostics. ROOT PostToolUse records `DELIVERED` receipts without advancing queue
+state; hooks only report an unhealthy monitor and direct ROOT to the public
+`health monitor-recover` command. Each launcher invokes its provider once; invalid results never
+trigger automatic corrective launches. The lane/session budget is initial assignment plus one
+explicit manual retry across run IDs. An invalid RESULT or a provider startup/auth/process
+failure ends as `provider_exited_no_result` without a fresh context.
+
+## Read-only shipped source
+
+The shipped source (`adapters/`, `super-cache/`, `orchestrator_harness/`) is read-only product
+material. Launcher bindings are shipped/read-only: setup validates catalog binding bytes against
+the registered binding and never copies a binding into product source. Local configuration
+belongs under `local-config/`; runtime state lives under the configured root workspace's
+`.harness-runtime` with a fresh epoch per live run. Keep source directories free of runtime
+output.
+
+## Release checks
+
+`orchestrator_harness.release_checks` is the one stable-ID registry/selector owning fast,
+affected, full, and release checks. Credit requires declared-input fingerprints plus exact source
+root, Git common directory, and branch identity, with the recorded origin tip still an ancestor
+of the current tip; unknown, divergent, mixed, or stale credit is not green evidence.
+
+## Integrated run guards
+
+Managed ROOT Stop requires runtime CLOSED, including empty-queue/live-worker and no-epoch
+cases. CLOSED establishes cleanup, not task completion. Before a fresh Codex ROOT launch, the
+operator must prepare native hooks/monitor and a matching setup receipt with
+`scripts/prepare_root_launch.py`. Windows Codex always requires the read-only environment-bound
+sandbox gate; it never initializes or repairs the sandbox. The optional project-configured build/test service
+stages a lane-local client and is stopped during shutdown. See
+[the integration guide](../docs/INTEGRATED_RUN_FIXES.md) for setup, limits and remaining work.

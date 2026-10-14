@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from orchestrator_harness import root_hook_dispatch as hooks
+from orchestrator_harness.config import HarnessConfig
+
+
+class RootHookDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.config = HarnessConfig(self.root, self.workspace, "enabled")
+        self.open_state = {"schema": "runtime-state/v1", "state": "OPEN"}
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def call(
+        self,
+        boundary: str,
+        *,
+        recovery: dict[str, object] | None = None,
+        marker: dict[str, object] | None = None,
+        queue: dict[str, object] | None = None,
+        runtime: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        recovery = recovery or {"ok": True, "code": "MONITOR_HEALTHY"}
+        marker = marker if marker is not None else {"epoch_id": "epoch-1"}
+        queue = queue or {"events": []}
+        runtime = runtime if runtime is not None else self.open_state
+        health = (None, None) if recovery.get("ok") else (
+            str(recovery.get("code") or "MONITOR_UNHEALTHY"),
+            str(recovery.get("next_action") or "monitor requires recovery"),
+        )
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value=runtime),
+            patch.object(hooks, "read_current_epoch", return_value=marker),
+            patch.object(hooks, "read_manager_queue", return_value=queue),
+            patch.object(hooks, "_monitor_health", return_value=health),
+        ):
+            result = hooks.dispatch(self.root, boundary, "codex")
+        return result
+
+    def test_post_tool_use_notice_is_content_free(self) -> None:
+        queue = {
+            "events": [
+                {"event_id": "secret-id", "type": "LANE_RESULT_INVALID", "state": "PENDING", "summary": "secret summary"},
+                {"event_id": "done", "type": "LANE_STATUS_CHANGED", "state": "COMPLETE"},
+            ]
+        }
+        result = self.call("post-tool-use", queue=queue)
+        self.assertEqual(result["decision"], "NOTICE")
+        notice = result["notice"]
+        self.assertEqual(notice["unresolved_count"], 1)
+        self.assertEqual(notice["event_classes"], ["LANE_RESULT_INVALID"])
+        self.assertEqual(notice["provider_id"], "codex")
+        self.assertNotIn("secret-id", str(notice))
+        self.assertNotIn("secret summary", str(notice))
+
+    def test_stop_rejects_pending_or_acknowledged_obligations(self) -> None:
+        for state in ("PENDING", "ACKNOWLEDGED"):
+            with self.subTest(state=state):
+                result = self.call(
+                    "stop",
+                    queue={"events": [{"type": "LANE_STATUS_CHANGED", "state": state}]},
+                )
+                self.assertEqual(result["decision"], "REJECT")
+                self.assertTrue(result["reason"])
+
+    def test_terminal_queue_does_not_allow_open_runtime_to_stop(self) -> None:
+        queue = {"events": [{"type": "LANE_STATUS_CHANGED", "state": "COMPLETE"}]}
+        self.assertEqual(self.call("post-tool-use", queue=queue), {"decision": "ALLOW"})
+        self.assertEqual(self.call("stop", queue=queue)["decision"], "REJECT")
+
+    def test_closed_runtime_allows_stop_even_without_monitor_or_queue(self) -> None:
+        from orchestrator_harness.records import atomic_write_json
+        atomic_write_json(self.config.runtime_root / "RUNTIME_STATE.json", {
+            "schema": "runtime-state/v1", "state": "CLOSED", "cleanup_owners": {"monitor": None, "service": None}})
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value={"state": "CLOSED"}),
+            patch.object(hooks, "_unresolved_events") as queue,
+            patch.object(hooks, "_monitor_health") as health,
+        ):
+            self.assertEqual({"decision": "ALLOW"}, hooks.dispatch(self.root, "stop", "codex"))
+        queue.assert_not_called()
+        health.assert_not_called()
+
+    def test_empty_queue_running_worker_cannot_allow_stop(self) -> None:
+        # OPEN is the lifecycle invariant; no delayed monitor event is required.
+        result = self.call("stop", queue={"events": []})
+        self.assertEqual("REJECT", result["decision"])
+        self.assertIn("worker work continues", result["reason"])
+        self.assertIn("shutdown", result["reason"])
+
+    def test_closed_label_without_receipt_does_not_allow_stop(self) -> None:
+        from orchestrator_harness.records import atomic_write_json
+        atomic_write_json(self.config.runtime_root / "RUNTIME_STATE.json", {
+            "schema": "runtime-state/v1", "state": "CLOSED"})
+        with patch.object(hooks, "load_config", return_value=self.config):
+            self.assertEqual("REJECT", hooks.dispatch(self.root, "stop", "codex")["decision"])
+
+    def test_corrupt_runtime_returns_stop_rejection_and_tool_notice(self) -> None:
+        path = self.config.runtime_root / "RUNTIME_STATE.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{invalid", encoding="utf-8")
+        with patch.object(hooks, "load_config", return_value=self.config):
+            self.assertEqual("REJECT", hooks.dispatch(self.root, "stop", "codex")["decision"])
+            self.assertEqual("NOTICE", hooks.dispatch(self.root, "post-tool-use", "codex")["decision"])
+
+    def test_monitor_recovery_failure_is_a_notice(self) -> None:
+        result = self.call(
+            "post-tool-use",
+            recovery={"ok": False, "code": "MONITOR_CLEANUP_UNPROVEN", "next_action": "verify exact process"},
+        )
+        self.assertEqual(result["decision"], "NOTICE")
+        self.assertEqual(result["notice"]["monitor_code"], "MONITOR_CLEANUP_UNPROVEN")
+        self.assertIn("verify exact process", result["notice"]["message"])
+
+    def test_live_degraded_monitor_directs_diagnostic_correction(self) -> None:
+        record = {
+            "pid": 41,
+            "creation_time": "created-1",
+            "last_heartbeat_at": hooks.iso_utc(),
+            "health": "degraded",
+            "diagnostics": [{"error": "secret-detail"}],
+        }
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value=self.open_state),
+            patch.object(hooks, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(hooks, "read_manager_queue", return_value={"events": []}),
+            patch.object(hooks, "read_monitor_record", return_value=record),
+            patch.object(hooks.processes, "identity_matches", return_value=True),
+        ):
+            result = hooks.dispatch(self.root, "post-tool-use", "codex")
+        self.assertEqual(result["decision"], "NOTICE")
+        notice = result["notice"]
+        self.assertEqual("MONITOR_DEGRADED", notice["monitor_code"])
+        self.assertIn("inspect and correct the recorded diagnostics", notice["message"])
+        self.assertNotIn("health monitor-recover", notice["message"])
+        self.assertNotIn("secret-detail", str(notice))
+
+    def test_queue_corruption_fails_closed(self) -> None:
+        self.assertEqual(self.call("post-tool-use", queue={"events": "bad"})["decision"], "NOTICE")
+        self.assertEqual(self.call("stop", queue={"events": "bad"})["decision"], "REJECT")
+
+    def test_no_epoch_still_requires_shutdown_before_stop(self) -> None:
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value=self.open_state),
+            patch.object(hooks, "read_current_epoch", return_value=None),
+            patch.object(hooks, "current_epoch_path", return_value=self.root / "missing"),
+            patch.object(hooks, "read_manager_queue") as queue,
+            patch.object(hooks, "_monitor_health") as health,
+        ):
+            self.assertEqual(hooks.dispatch(self.root, "stop", "codex")["decision"], "REJECT")
+        queue.assert_not_called()
+        health.assert_not_called()
+
+    def test_closed_or_plain_runtime_allows_without_recovery(self) -> None:
+        from orchestrator_harness.records import atomic_write_json
+        atomic_write_json(self.config.runtime_root / "RUNTIME_STATE.json", {
+            "schema": "runtime-state/v1", "state": "CLOSED", "cleanup_owners": {"monitor": None, "service": None}})
+        closed = {"schema": "runtime-state/v1", "state": "CLOSED"}
+        with (
+            patch.object(hooks, "load_config", return_value=self.config),
+            patch.object(hooks, "read_runtime_state", return_value=closed),
+            patch.object(hooks, "_monitor_health") as health,
+        ):
+            self.assertEqual(hooks.dispatch(self.root, "post-tool-use", "codex"), {"decision": "ALLOW"})
+        health.assert_not_called()
+        plain = HarnessConfig(self.root, self.workspace, "disabled")
+        with (
+            patch.object(hooks, "load_config", return_value=plain),
+            patch.object(hooks, "_monitor_health") as health,
+        ):
+            self.assertEqual(hooks.dispatch(self.root, "post-tool-use", "codex"), {"decision": "ALLOW"})
+        health.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
