@@ -49,7 +49,8 @@ class PlatformMutationTests(unittest.TestCase):
         mutation.ensure_directory_path(self.root / "b")
         mutation.publish_bytes(self.root, "a/nested/data", b"first")
         old = mutation.capture_target(self.root, "a/nested/data")
-        receipt = mutation.replace(self.root, "a/nested/data", b"second", expected=old)
+        receipt = mutation._publish(self.root, "a/nested/data", b"second", expected=None,
+                                    expected_root_identity=None)
         self.assertEqual(old, receipt.expected)
         self.assertEqual(b"second", receipt.resulting.content)
         self.assertNotEqual(old.identity, receipt.resulting.identity)
@@ -97,9 +98,319 @@ class PlatformMutationTests(unittest.TestCase):
         module = records if os.name == "nt" else mutation
         with patch.object(module, function, side_effect=OSError("controlled publication failure")):
             with self.assertRaises(OSError):
-                mutation.replace(self.root, "record", b"new bytes")
+                with records.RecordLock(self.root / "record", root=self.root):
+                    records.atomic_write_bytes(self.root / "record", b"new bytes")
+        (self.root / ".record.lock").unlink()
         self.assertEqual(b"old complete bytes", (self.root / "record").read_bytes())
         self.assertEqual(["record"], sorted(item.name for item in self.root.iterdir()))
+
+    def test_conditional_update_verifies_bytes_and_platform_identity_semantics(self):
+        target = self.root / "record"
+        target.write_bytes(b"long authorized original")
+        expected = mutation.capture_target(self.root, "record")
+        result = mutation.replace(self.root, "record", b"short", expected=expected)
+        self.assertEqual(expected, result.expected)
+        self.assertEqual(b"short", result.resulting.content)
+        self.assertEqual(b"short", mutation.read_bytes(self.root, "record"))
+        if os.name == "nt":
+            self.assertEqual(expected.identity, result.resulting.identity)
+        else:
+            self.assertNotEqual(expected.identity, result.resulting.identity)
+        mutation.replace(self.root, "record", b"", expected=result.resulting)
+        self.assertEqual(b"", target.read_bytes())
+
+    def test_record_lock_publication_commits_complete_staged_bytes_atomically(self):
+        target = self.root / "record"
+        target.write_bytes(b"old complete bytes")
+        expected = mutation.capture_target(self.root, "record")
+        data = b"complete new record\n" * 4096
+        original = records._replace_with_retry if os.name == "nt" else mutation._posix_rename
+        def inspect_stage(*args, **kwargs):
+            staged = Path(args[0]) if os.name == "nt" else target.parent / args[1]
+            self.assertEqual(data, staged.read_bytes())
+            self.assertEqual(b"old complete bytes", target.read_bytes())
+            return original(*args, **kwargs)
+        module, name = (records, "_replace_with_retry") if os.name == "nt" else (mutation, "_posix_rename")
+        with records.RecordLock(target, root=self.root), patch.object(module, name, side_effect=inspect_stage) as commit:
+            records.atomic_write_bytes(target, data)
+        commit.assert_called_once()
+        published = mutation.capture_target(self.root, "record")
+        self.assertNotEqual(expected.identity, published.identity)
+        self.assertEqual(data, published.content)
+        self.assertEqual([".record.lock", "record"], sorted(p.name for p in self.root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_conditional_update_rejects_substitution_at_native_acquisition(self):
+        target, foreign = self.root / "record", self.root / "foreign"
+        target.write_bytes(b"authorized original")
+        foreign.write_bytes(b"foreign publication")
+        expected = mutation.capture_target(self.root, "record")
+        original = mutation._windows_file_handle
+        acquisitions = []
+        def substitute(path, **kwargs):
+            if Path(path) == target and kwargs["access"] & mutation._GENERIC_WRITE:
+                acquisitions.append(path)
+                os.replace(foreign, target)
+            return original(path, **kwargs)
+        with patch.object(mutation, "_windows_file_handle", side_effect=substitute):
+            with self.assertRaises(mutation.MutationConflict):
+                mutation.replace(self.root, "record", b"forbidden", expected=expected)
+        self.assertEqual([target], acquisitions)
+        self.assertEqual(b"foreign publication", target.read_bytes())
+        self.assertEqual(["record"], sorted(p.name for p in self.root.iterdir()))
+        target.unlink()  # Failed acquisition must not retain a no-delete handle.
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_conditional_update_holds_target_through_actual_write(self):
+        target, foreign = self.root / "record", self.root / "foreign"
+        target.write_bytes(b"authorized original")
+        foreign.write_bytes(b"foreign publication")
+        expected = mutation.capture_target(self.root, "record")
+        original = mutation._windows_open_existing_for_update
+        attempts = []
+        fixture = self
+        class Writer:
+            def __init__(self, handle):
+                self.handle = handle
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.handle.close()
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+            def write(self, data):
+                attempts.append("actual write")
+                with fixture.assertRaises(OSError):
+                    os.replace(foreign, target)
+                with fixture.assertRaises(OSError):
+                    target.write_bytes(b"foreign in-place write")
+                return self.handle.write(data)
+        with patch.object(mutation, "_windows_open_existing_for_update",
+                          side_effect=lambda *args: Writer(original(*args))) as acquire:
+            result = mutation.replace(self.root, "record", b"new bytes", expected=expected)
+        acquire.assert_called_once_with(target, expected)
+        self.assertEqual(["actual write"], attempts)
+        self.assertEqual(expected.identity, result.resulting.identity)
+        self.assertEqual(b"new bytes", target.read_bytes())
+        self.assertEqual(b"foreign publication", foreign.read_bytes())
+        target.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_rename_validates_all_source_facts_at_final_acquisition(self):
+        source, target = self.root / "source", self.root / "target"
+        source.write_bytes(b"authorized source")
+        target.write_bytes(b"authorized destination")
+        source_state, target_state = mutation.capture_target(self.root, "source"), mutation.capture_target(self.root, "target")
+        original = mutation._windows_file_handle
+        acquisitions = []
+        def change_source(path, **kwargs):
+            if Path(path) == source and kwargs["access"] & mutation._DELETE:
+                acquisitions.append(path)
+                source.write_bytes(b"foreign source")
+            return original(path, **kwargs)
+        with patch.object(mutation, "_windows_file_handle", side_effect=change_source):
+            with self.assertRaises(mutation.MutationConflict):
+                mutation.rename(self.root, "source", "target", expected_source=source_state, expected_target=target_state)
+        self.assertEqual([source], acquisitions)
+        self.assertEqual(b"foreign source", source.read_bytes())
+        self.assertEqual(b"authorized destination", target.read_bytes())
+        self.assertEqual(source_state.identity, mutation.capture_target(self.root, "source").identity)
+        self.assertEqual(target_state, mutation.capture_target(self.root, "target"))
+        self.assertEqual(["source", "target"], sorted(p.name for p in self.root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_rename_rejects_destination_substitution_at_final_acquisition(self):
+        source, target, foreign = self.root / "source", self.root / "target", self.root / "foreign"
+        source.write_bytes(b"authorized source")
+        target.write_bytes(b"authorized destination")
+        foreign.write_bytes(b"foreign publication")
+        source_state, target_state = mutation.capture_target(self.root, "source"), mutation.capture_target(self.root, "target")
+        original = mutation._windows_file_handle
+        acquisitions = []
+        def substitute(path, **kwargs):
+            if Path(path) == target and kwargs["access"] & mutation._DELETE:
+                acquisitions.append(path)
+                os.replace(foreign, target)
+            return original(path, **kwargs)
+        with patch.object(mutation, "_windows_file_handle", side_effect=substitute):
+            with self.assertRaises(mutation.MutationConflict):
+                mutation.rename(self.root, "source", "target", expected_source=source_state, expected_target=target_state)
+        self.assertEqual([target], acquisitions)
+        self.assertEqual(source_state, mutation.capture_target(self.root, "source"))
+        self.assertEqual(b"foreign publication", target.read_bytes())
+        self.assertEqual(["source", "target"], sorted(p.name for p in self.root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_rename_holds_both_original_entries_through_native_displacement(self):
+        source, target, foreign = self.root / "source", self.root / "target", self.root / "foreign"
+        source.write_bytes(b"authorized source")
+        target.write_bytes(b"authorized destination")
+        foreign.write_bytes(b"foreign publication")
+        source_state, target_state = mutation.capture_target(self.root, "source"), mutation.capture_target(self.root, "target")
+        original = mutation._windows_rename_handle
+        attempts = []
+        def inspect_binding(handle, destination, name, **kwargs):
+            self.assertFalse(kwargs["replace_existing"])
+            if mutation._windows_identity(handle) == target_state.identity:
+                attempts.append("bound destination")
+                with self.assertRaises(OSError):
+                    os.replace(foreign, target)
+                with self.assertRaises(OSError):
+                    target.write_bytes(b"foreign in-place destination")
+                with self.assertRaises(OSError):
+                    os.replace(foreign, source)
+                with self.assertRaises(OSError):
+                    source.write_bytes(b"foreign in-place source")
+            return original(handle, destination, name, **kwargs)
+        with patch.object(mutation, "_windows_rename_handle", side_effect=inspect_binding):
+            result = mutation.rename(self.root, "source", "target", expected_source=source_state, expected_target=target_state)
+        self.assertEqual(["bound destination"], attempts)
+        self.assertEqual(source_state, result.resulting)
+        self.assertEqual(b"foreign publication", foreign.read_bytes())
+        self.assertEqual(["foreign", "target"], sorted(p.name for p in self.root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle rename")
+    def test_windows_rename_final_publication_preserves_foreign_target_and_retained_original(self):
+        source, target, foreign = self.root / "source", self.root / "target", self.root / "foreign"
+        source.write_bytes(b"authorized source")
+        target.write_bytes(b"authorized destination")
+        foreign.write_bytes(b"foreign publication")
+        source_state, target_state = mutation.capture_target(self.root, "source"), mutation.capture_target(self.root, "target")
+        original = mutation._windows_rename_handle
+        attempts = []
+        def substitute(handle, destination, name, **kwargs):
+            self.assertFalse(kwargs["replace_existing"])
+            if name == "target" and mutation._windows_identity(handle) == source_state.identity:
+                attempts.append("final source publication")
+                os.replace(foreign, target)
+            return original(handle, destination, name, **kwargs)
+        with patch.object(mutation, "_windows_rename_handle", side_effect=substitute):
+            with self.assertRaisesRegex(mutation.MutationConflict, "original destination .* retained at") as conflict:
+                mutation.rename(self.root, "source", "target", expected_source=source_state, expected_target=target_state)
+        self.assertEqual(["final source publication"], attempts)
+        self.assertEqual(source_state, mutation.capture_target(self.root, "source"))
+        self.assertEqual(b"foreign publication", target.read_bytes())
+        retained = list(self.root.glob(".rename.*.retained"))
+        self.assertEqual(1, len(retained))
+        self.assertEqual(target_state, mutation.capture_target(self.root, retained[0].name))
+        self.assertIn(str(retained[0]), str(conflict.exception))
+        self.assertEqual(3, len(list(self.root.iterdir())))
+        retained[0].unlink()  # Error exit released the target's native ownership.
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle rename")
+    def test_windows_rename_failure_restores_bound_destination_only_into_absent_name(self):
+        (self.root / "source").write_bytes(b"authorized source")
+        (self.root / "target").write_bytes(b"authorized destination")
+        source_state, target_state = mutation.capture_target(self.root, "source"), mutation.capture_target(self.root, "target")
+        original = mutation._windows_rename_handle
+        attempts = []
+        def fail_publication(handle, destination, name, **kwargs):
+            self.assertFalse(kwargs["replace_existing"])
+            if name == "target" and mutation._windows_identity(handle) == source_state.identity:
+                attempts.append("final source publication")
+                raise OSError("controlled native publication failure")
+            return original(handle, destination, name, **kwargs)
+        with patch.object(mutation, "_windows_rename_handle", side_effect=fail_publication):
+            with self.assertRaisesRegex(OSError, "controlled native publication failure"):
+                mutation.rename(self.root, "source", "target", expected_source=source_state, expected_target=target_state)
+        self.assertEqual(["final source publication"], attempts)
+        self.assertEqual(source_state, mutation.capture_target(self.root, "source"))
+        self.assertEqual(target_state, mutation.capture_target(self.root, "target"))
+        self.assertEqual(["source", "target"], sorted(p.name for p in self.root.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle rename")
+    def test_windows_rename_absent_destination_remains_no_replace_at_native_commit(self):
+        (self.root / "source").write_bytes(b"authorized source")
+        foreign = self.root / "foreign"
+        foreign.write_bytes(b"foreign publication")
+        source_state = mutation.capture_target(self.root, "source")
+        original = mutation._windows_rename_handle
+        def substitute(handle, destination, name, **kwargs):
+            self.assertFalse(kwargs["replace_existing"])
+            os.replace(foreign, destination.parent / name)
+            return original(handle, destination, name, **kwargs)
+        with patch.object(mutation, "_windows_rename_handle", side_effect=substitute) as commit:
+            with self.assertRaises(mutation.MutationConflict):
+                mutation.rename(self.root, "source", "target", expected_source=source_state,
+                                expected_target=mutation.TargetState.absent())
+        commit.assert_called_once()
+        self.assertEqual(source_state, mutation.capture_target(self.root, "source"))
+        self.assertEqual(b"foreign publication", (self.root / "target").read_bytes())
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_read_append_and_delete_reject_substitution_at_native_acquisition(self):
+        original = mutation._windows_file_handle
+        for operation_name in ("read", "append", "delete"):
+            with self.subTest(operation=operation_name):
+                parent = self.root / operation_name
+                parent.mkdir()
+                target, foreign = parent / "record", parent / "foreign"
+                target.write_bytes(b"authorized original")
+                foreign.write_bytes(b"foreign publication")
+                expected = mutation.capture_target(parent, "record")
+                acquisitions = []
+                access_bit = {"read": mutation._GENERIC_READ, "append": mutation._GENERIC_WRITE,
+                              "delete": mutation._DELETE}[operation_name]
+                def substitute(path, **kwargs):
+                    if Path(path) == target and kwargs["access"] & access_bit:
+                        acquisitions.append(path)
+                        os.replace(foreign, target)
+                    return original(path, **kwargs)
+                with patch.object(mutation, "_windows_file_handle", side_effect=substitute):
+                    with self.assertRaises(mutation.MutationConflict):
+                        if operation_name == "read":
+                            mutation.read_bytes(parent, "record")
+                        elif operation_name == "append":
+                            mutation.append_bytes(parent, "record", b"forbidden")
+                        else:
+                            mutation.delete(parent, "record", expected=expected)
+                self.assertEqual([target], acquisitions)
+                self.assertEqual(b"foreign publication", target.read_bytes())
+                target.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "native Windows handle sharing")
+    def test_windows_read_append_and_delete_keep_native_ownership_through_actual_io(self):
+        target, foreign = self.root / "record", self.root / "foreign"
+        target.write_bytes(b"authorized original")
+        foreign.write_bytes(b"foreign publication")
+        original_open = mutation.os.fdopen
+        attempts = []
+        fixture = self
+        class Stream:
+            def __init__(self, handle):
+                self.handle = handle
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.handle.close()
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+            def read(self, *args):
+                attempts.append("read")
+                with fixture.assertRaises(OSError):
+                    os.replace(foreign, target)
+                return self.handle.read(*args)
+            def write(self, data):
+                attempts.append("append")
+                with fixture.assertRaises(OSError):
+                    os.replace(foreign, target)
+                return self.handle.write(data)
+        with patch.object(mutation.os, "fdopen", side_effect=lambda *a, **kw: Stream(original_open(*a, **kw))):
+            self.assertEqual(b"authorized original", mutation.read_bytes(self.root, "record"))
+            self.assertEqual(b"authorized original suffix", mutation.append_bytes(self.root, "record", b" suffix").content)
+        self.assertEqual(["read", "append", "read"], attempts)
+        original_delete = mutation._windows_mark_handle_deleted
+        def inspect_delete(handle, path):
+            attempts.append("delete")
+            with self.assertRaises(OSError):
+                os.replace(foreign, target)
+            return original_delete(handle, path)
+        with patch.object(mutation, "_windows_mark_handle_deleted", side_effect=inspect_delete) as commit:
+            mutation.delete(self.root, "record")
+        commit.assert_called_once()
+        self.assertEqual("delete", attempts[-1])
+        self.assertFalse(target.exists())
+        self.assertEqual(b"foreign publication", foreign.read_bytes())
 
     def test_descriptor_conversion_failure_releases_owned_native_resources(self):
         target = self.root / "record"
@@ -407,10 +718,19 @@ assert Path(harness_common.__file__).is_relative_to(installed)
 mutation.ensure_directory_path(root / 'a')
 mutation.ensure_directory_path(root / 'b')
 mutation.publish_bytes(root, 'a/source', b'first')
-mutation.replace(root, 'a/source', b'second')
+authorized = mutation.capture_target(root, 'a/source')
+updated = mutation.replace(root, 'a/source', b'second', expected=authorized)
+assert updated.resulting.content == b'second'
+if mutation.os.name == 'nt': assert updated.resulting.identity == authorized.identity
 mutation.append_bytes(root, 'a/source', b' appended')
 receipt = mutation.rename(root, 'a/source', 'b/target')
 assert receipt.resulting.content == b'second appended'
+mutation.publish_bytes(root, 'a/next', b'next complete source')
+receipt = mutation.rename(root, 'a/next', 'b/target',
+    expected_source=mutation.capture_target(root, 'a/next'),
+    expected_target=mutation.capture_target(root, 'b/target'))
+assert receipt.resulting.content == b'next complete source'
+assert not list((root / 'b').glob('.rename.*.retained'))
 records.write_record(root / 'record', 'example/v1', {'value': 1})
 assert records.read_record(root / 'record', 'example/v1')['value'] == 1
 with records.RecordLock(root / 'record', root=root): pass

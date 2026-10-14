@@ -1204,14 +1204,64 @@ def replace(
     expected: TargetState | None = None,
     expected_root_identity: tuple[int, int] | None = None,
 ) -> MutationReceipt:
-    """Replace one authorized entry with complete bytes via an atomic rename.
+    """Write the authorized file, preserving Windows target handle protection.
 
-    Conditional expectations are rechecked under held ancestors immediately
-    before publication. Callers serialize cooperating writers with RecordLock;
-    the filesystem does not offer a portable inode compare-and-swap.
+    An existing Windows file is updated through a no-write/no-delete-sharing
+    handle, retaining its identity. This update is not atomic on write failure.
+    Complete atomic named record publication uses publish_bytes separately.
+    POSIX replacement is atomic but has no kernel expected-inode comparison;
+    cooperating writers must hold their resource lock.
     """
+    if os.name == "nt":
+        return _windows_replace_bound(root, relative, data, expected=expected,
+                                      expected_root_identity=expected_root_identity)
     return _publish(root, relative, data, expected=expected,
                     expected_root_identity=expected_root_identity)
+
+
+def _windows_replace_bound(root: str | Path, relative: str | Path, data: bytes, *,
+                           expected: TargetState | None,
+                           expected_root_identity: tuple[int, int] | None) -> MutationReceipt:
+    if not isinstance(data, bytes):
+        raise TypeError("replacement data must be bytes")
+    root_path = _lexical(root)
+    rel = _relative(root_path, relative)
+    parent, name = _validate_chain(root_path, rel)
+    anchor = _DirectoryAnchor(root_path, parent)
+    _before_commit()
+    with anchor:
+        _after_anchor()
+        anchor.assert_stable()
+        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+            raise MutationConflict("replacement root identity changed after preparation")
+        authorized = expected if expected is not None else _capture_anchored(anchor, name, include_content=True)
+        _require_anchored_expected(anchor, name, authorized)
+        _after_target_proof()
+        _require_anchored_expected(anchor, name, authorized)
+        if not authorized.present:
+            # The native publication is NO_REPLACE, even if another entry
+            # appears after this observation. The outer ancestors remain held.
+            return _publish(root_path, rel, data, expected=authorized,
+                            expected_root_identity=anchor.root_identity)
+        if authorized.kind != "file":
+            raise MutationConflict("replacement target is not a regular file")
+        target = parent / name
+        with _windows_open_existing_for_update(target, authorized) as handle:
+            # The acquisition validates every captured fact on this handle.
+            # Its share mode excludes both foreign writes and target renames
+            # throughout the actual write, truncate, flush and verification.
+            handle.seek(0)
+            if handle.write(data) != len(data):
+                raise MutationConflict("handle-bound replacement did not write all bytes")
+            handle.truncate(len(data))
+            handle.flush()
+            os.fsync(handle.fileno())
+            resulting = _capture_open_file(handle)
+            if (resulting.identity != authorized.identity or resulting.content != data
+                    or _identity(anchor.stat(name)) != resulting.identity):
+                raise MutationConflict("handle-bound replacement identity or bytes changed")
+            anchor.assert_stable()
+            return MutationReceipt("replace", str(root_path), str(parent), str(target), authorized, resulting)
 
 
 def delete(
@@ -1349,6 +1399,97 @@ def make_temporary_directory(root: str | Path, *, prefix: str) -> Path:
         return path
 
 
+def _windows_rename_entries(source_anchor: _DirectoryAnchor, source_name: str, source_state: TargetState,
+                            target_anchor: _DirectoryAnchor, target_name: str, target_state: TargetState) -> None:
+    """Bind both entries before moving; never overwrite an unbound destination.
+
+    Replacing an existing file needs two namespace moves. The bound old target
+    is retained under a unique sibling name, then the bound source is published
+    with native NO_REPLACE. A failed publication restores the original only
+    into an absent name; if a foreign entry won that name, both it and the
+    retained original survive and the error identifies the retained path.
+    This is deliberately not an atomic existing-target rename.
+    """
+    import msvcrt
+    retired = None
+    with ExitStack() as opened:
+        source_path = source_anchor.parent / source_name
+        source_file = None
+        if source_state.kind == "directory":
+            source_native = _windows_directory_handle(source_path, source_state)
+            opened.callback(_windows_close, source_native)
+            if _windows_identity(source_native) != source_state.identity:
+                raise MutationConflict("rename directory source changed while acquiring its handle")
+        else:
+            source_native, _ = _windows_file_handle(source_path, access=_GENERIC_READ | _DELETE,
+                                                    share=_FILE_SHARE_READ)
+            source_file = opened.enter_context(_windows_python_file(source_native, "rb", os.O_RDONLY))
+            source_native = msvcrt.get_osfhandle(source_file.fileno())
+            if not _same_state(_capture_open_file(source_file), source_state):
+                raise MutationConflict("rename source facts changed while acquiring its handle")
+        if _identity(source_anchor.stat(source_name)) != source_state.identity:
+            raise MutationConflict("rename opened source no longer occupies its authorized name")
+
+        target_file = None
+        target_native = None
+        retained = None
+        if target_state.present:
+            if target_state.kind != "file" or source_state.kind != "file":
+                raise MutationUnsupported("Windows existing-target rename requires two regular files")
+            target_path = target_anchor.parent / target_name
+            target_native, _ = _windows_file_handle(target_path, access=_GENERIC_READ | _DELETE,
+                                                    share=_FILE_SHARE_READ)
+            target_file = opened.enter_context(_windows_python_file(target_native, "rb", os.O_RDONLY))
+            target_native = msvcrt.get_osfhandle(target_file.fileno())
+            if (not _same_state(_capture_open_file(target_file), target_state)
+                    or _identity(target_anchor.stat(target_name)) != target_state.identity):
+                raise MutationConflict("rename destination facts changed while acquiring its handle")
+        source_anchor.assert_stable()
+        target_anchor.assert_stable()
+        try:
+            if target_native is not None:
+                retained_name = f".rename.{uuid.uuid4().hex}.retained"
+                _windows_rename_handle(target_native, target_anchor, retained_name, replace_existing=False)
+                retained = target_anchor.parent / retained_name
+            _windows_rename_handle(source_native, target_anchor, target_name, replace_existing=False)
+            # Verify on the still-held source before destroying any retained
+            # original. Neither source nor retained target permits new writers.
+            if source_file is not None and not _same_state(_capture_open_file(source_file), source_state):
+                raise MutationConflict("rename source facts changed during native publication")
+            if _identity(target_anchor.stat(target_name)) != source_state.identity:
+                raise MutationConflict("rename destination does not name the bound source")
+            try:
+                source_anchor.stat(source_name)
+            except FileNotFoundError:
+                pass
+            else:
+                raise MutationConflict("rename source name was repopulated during publication")
+            if retained is not None:
+                if (not _same_state(_capture_open_file(target_file), target_state)
+                        or _identity(target_anchor.stat(retained.name)) != target_state.identity):
+                    raise MutationConflict("retained rename destination changed")
+                _windows_mark_handle_deleted(target_native, retained)
+                retired = retained
+                retained = None
+        except BaseException as failure:
+            if retained is not None:
+                try:
+                    _windows_rename_handle(target_native, target_anchor, target_name, replace_existing=False)
+                except OSError as restore_error:
+                    raise MutationConflict(
+                        f"rename failed; original destination {target_state.identity} retained at {retained}; "
+                        f"no-replace restoration failed: {restore_error}"
+                    ) from failure
+            raise
+    if retired is not None:
+        try:
+            target_anchor.stat(retired.name)
+        except FileNotFoundError:
+            pass
+        else:
+            raise MutationConflict(f"rename published; retained destination cleanup is unproven: {retired}")
+
+
 def rename(
     root: str | Path,
     source: str | Path,
@@ -1357,7 +1498,13 @@ def rename(
     expected_source: TargetState | None = None,
     expected_target: TargetState | None = None,
 ) -> MutationReceipt:
-    """Move one exact entry between two anchored parents within one root."""
+    """Move an authorized entry between two anchored parents within one root.
+
+    Windows binds and validates source bytes before mutation. An existing
+    destination is retained through a bound handle before NO_REPLACE publication
+    and can be restored only if its name remains absent. POSIX lacks an atomic
+    expected-inode comparison; resource locks serialize cooperating writers.
+    """
     _require_supported_root_boundary()
     root_path = _lexical(root)
     source_rel, target_rel = _relative(root_path, source), _relative(root_path, target)
@@ -1382,22 +1529,8 @@ def rename(
         _require_anchored_expected(source_anchor, source_name, source_state)
         _require_anchored_expected(target_anchor, target_name, target_state)
         if os.name == "nt":
-            if source_state.kind == "directory":
-                native = _windows_directory_handle(source_parent / source_name, source_state)
-            else:
-                native, _ = _windows_file_handle(source_parent / source_name,
-                    access=_GENERIC_READ | _DELETE, share=_FILE_SHARE_READ)
-            try:
-                # Recheck exact opened-source identity before acting on its handle.
-                info = _ByHandleFileInformation()
-                if not _GetFileInformationByHandle(native, ctypes.byref(info)):
-                    raise MutationUnsupported("rename source handle identity unavailable")
-                identity = _windows_identity(native)
-                if identity != source_state.identity:
-                    raise MutationConflict("rename source changed while acquiring its handle")
-                _windows_rename_handle(native, target_anchor, target_name, replace_existing=target_state.present)
-            finally:
-                _windows_close(native)
+            _windows_rename_entries(source_anchor, source_name, source_state,
+                                    target_anchor, target_name, target_state)
         else:
             _posix_rename(source_anchor.parent_fd, source_name, target_anchor.parent_fd, target_name,
                           replace_existing=target_state.present)
