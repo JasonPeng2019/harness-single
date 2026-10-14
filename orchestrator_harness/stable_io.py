@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 import threading
@@ -24,6 +25,10 @@ from .mutation import (
     publish_bytes as mutation_publish,
     read_bytes as mutation_read,
     delete as mutation_delete,
+    _DirectoryAnchor,
+    _read_file_observation,
+    _validate_directory_input,
+    safe_relative_path,
 )
 
 
@@ -73,7 +78,14 @@ class _PathLockRegistry:
                 entry = _PathLockEntry()
                 self._entries[key] = entry
             entry.users += 1
-        entry.lock.acquire()
+        try:
+            entry.lock.acquire()
+        except BaseException:
+            with self._guard:
+                entry.users -= 1
+                if entry.users == 0 and self._entries.get(key) is entry:
+                    del self._entries[key]
+            raise
         return entry
 
     def release(self, key: str, entry: _PathLockEntry) -> None:
@@ -133,7 +145,7 @@ class PathKeyedAppendLock:
             self._handle = handle
             self._anchored = anchored
             return self
-        except Exception as exc:
+        except BaseException as exc:
             try:
                 if anchored is not None:
                     if os.name == "nt" and self._windows_locked and handle is not None:
@@ -150,8 +162,11 @@ class PathKeyedAppendLock:
             finally:
                 self._handle = None
                 self._anchored = None
+                self._windows_locked = False
                 self._local_entry = None
                 _PATH_LOCK_REGISTRY.release(self.key, entry)
+            if not isinstance(exc, Exception):
+                raise
             raise AppendLockError(
                 f"cannot acquire append lock for {self.path}: {exc}"
             ) from exc
@@ -182,6 +197,7 @@ class PathKeyedAppendLock:
                 else:
                     handle.close()
         finally:
+            self._windows_locked = False
             if entry is not None:
                 _PATH_LOCK_REGISTRY.release(self.key, entry)
 
@@ -238,6 +254,7 @@ class PreparedOutputTransaction:
         allowed_roots: tuple[Path, ...] = (),
         forbidden_roots: tuple[Path, ...] = (),
     ) -> None:
+        _validate_directory_input(root)
         self.root = Path(root).absolute()
         default_allowed = self.root.parent.resolve(strict=False)
         self.allowed_roots = tuple(
@@ -272,6 +289,10 @@ class PreparedOutputTransaction:
         self, target: Path, *, allow_prepared_parent: bool = False
     ) -> Path:
         lexical = Path(os.path.abspath(str(target)))
+        try:
+            _validate_directory_input(target)
+        except MutationConflict as exc:
+            raise PathSafetyError(str(exc)) from exc
         if self._has_ads(lexical):
             raise PathSafetyError(f"alternate data stream syntax rejected: {target}")
         resolved = lexical.resolve(strict=False)
@@ -293,7 +314,7 @@ class PreparedOutputTransaction:
             ):
                 raise PathSafetyError(f"output overlaps observed root: {forbidden}")
         current = allowed
-        if current.exists() and _is_reparse(current):
+        if os.path.lexists(current) and _is_reparse(current):
             raise PathSafetyError(f"output root is a reparse point: {current}")
         try:
             relative = lexical.relative_to(allowed)
@@ -303,7 +324,7 @@ class PreparedOutputTransaction:
             ) from exc
         for part in relative.parts:
             current = current / part
-            if current.exists() and _is_reparse(current):
+            if os.path.lexists(current) and _is_reparse(current):
                 raise PathSafetyError(f"reparse output component rejected: {current}")
         return lexical
 
@@ -354,7 +375,10 @@ class PreparedOutputTransaction:
     def admit(self, target: Path | str) -> Path:
         path = Path(target)
         if not path.is_absolute():
-            path = self.root / path
+            try:
+                path = self.root / safe_relative_path(target)
+            except MutationConflict as exc:
+                raise PathSafetyError(str(exc)) from exc
         lexical = self.revalidate(path)
         self._admitted.add(_path_key(lexical))
         return lexical
@@ -366,7 +390,10 @@ class PreparedOutputTransaction:
             or Path(relative).is_absolute()
         ):
             raise PathSafetyError("dynamic output child must be a relative path")
-        return self.admit(self.root / relative)
+        try:
+            return self.admit(self.root / safe_relative_path(relative))
+        except MutationConflict as exc:
+            raise PathSafetyError(str(exc)) from exc
 
     def _admit_for_write(self, path: Path) -> Path:
         candidate = Path(path)
@@ -395,7 +422,13 @@ class PreparedOutputTransaction:
     def ensure_parent(self, path: Path) -> None:
         target = self.revalidate(path)
         try:
-            ensure_directory_path(target.parent)
+            existing = target.parent
+            while not os.path.lexists(existing):
+                existing = existing.parent
+            with _DirectoryAnchor(self.root, existing):
+                self.revalidate(target)
+                ensure_directory_path(target.parent)
+                self.revalidate(target)
         except (MutationConflict, MutationUnsupported) as exc:
             raise PathSafetyError(str(exc)) from exc
         self.revalidate(target)
@@ -453,8 +486,10 @@ class PreparedOutputTransaction:
         data = _jsonl_bytes(records)
         with PathKeyedAppendLock(target):
             try:
+                self.revalidate(target)
                 relative = target.relative_to(self.root)
                 mutation_append(self.root, relative, data)
+                self.revalidate(target)
             except (MutationConflict, MutationUnsupported, ValueError) as exc:
                 raise PathSafetyError(str(exc)) from exc
 
@@ -493,6 +528,33 @@ def _signature(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)
 
 
+def _stable_observation(path: Path, *, max_bytes: int, retries: int, delay_seconds: float,
+                        sleep: Callable[[float], None], tail: bool) -> StableBytes:
+    if (type(max_bytes) is not int or max_bytes < 0 or type(retries) is not int or retries < 1
+            or not isinstance(delay_seconds, (int, float)) or not math.isfinite(delay_seconds)
+            or delay_seconds < 0):
+        raise ValueError("stable read requires a nonnegative bound/delay and positive retries")
+    target = Path(path).absolute()
+    reason = "file disappeared"
+    for attempt in range(retries):
+        try:
+            data, info = _read_file_observation(target.parent, target.name, max_bytes=max_bytes, tail=tail)
+        except FileNotFoundError:
+            reason = "file disappeared"
+        except MutationConflict as exc:
+            reason = str(exc)
+        except MutationUnsupported as exc:
+            raise PathSafetyError(str(exc)) from exc
+        except ValueError as exc:
+            raise UnstableReadError(str(exc)) from exc
+        else:
+            return StableBytes(path=path, data=data, sha256=sha256_bytes(data), size=info.st_size,
+                               mtime_ns=info.st_mtime_ns, file_id=(info.st_dev, info.st_ino))
+        if attempt + 1 < retries and delay_seconds:
+            sleep(delay_seconds)
+    raise UnstableReadError(f"unstable read for {path}: {reason}")
+
+
 def read_stable(
     path: Path,
     *,
@@ -501,35 +563,8 @@ def read_stable(
     delay_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> StableBytes:
-    last_reason = "unknown"
-    for attempt in range(retries):
-        try:
-            before = path.stat()
-            if before.st_size > max_bytes:
-                raise UnstableReadError(
-                    f"{path} is {before.st_size} bytes; limit is {max_bytes}"
-                )
-            with path.open("rb") as handle:
-                data = handle.read(max_bytes + 1)
-            after = path.stat()
-        except FileNotFoundError:
-            last_reason = "file disappeared"
-        else:
-            if len(data) > max_bytes:
-                raise UnstableReadError(f"{path} exceeds {max_bytes} bytes")
-            if _signature(before) == _signature(after) and len(data) == after.st_size:
-                return StableBytes(
-                    path=path,
-                    data=data,
-                    sha256=sha256_bytes(data),
-                    size=len(data),
-                    mtime_ns=after.st_mtime_ns,
-                    file_id=(after.st_dev, after.st_ino),
-                )
-            last_reason = "stat/read/stat identity changed"
-        if attempt + 1 < retries and delay_seconds:
-            sleep(delay_seconds)
-    raise UnstableReadError(f"unstable read for {path}: {last_reason}")
+    return _stable_observation(path, max_bytes=max_bytes, retries=retries,
+                               delay_seconds=delay_seconds, sleep=sleep, tail=False)
 
 
 def read_tail_stable(
@@ -540,33 +575,8 @@ def read_tail_stable(
     delay_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> StableBytes:
-    last_reason = "unknown"
-    for attempt in range(retries):
-        try:
-            before = path.stat()
-            offset = max(0, before.st_size - max_bytes)
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                data = handle.read(max_bytes + 1)
-            after = path.stat()
-        except FileNotFoundError:
-            last_reason = "file disappeared"
-        else:
-            if len(data) > max_bytes:
-                data = data[-max_bytes:]
-            if _signature(before) == _signature(after):
-                return StableBytes(
-                    path=path,
-                    data=data,
-                    sha256=sha256_bytes(data),
-                    size=after.st_size,
-                    mtime_ns=after.st_mtime_ns,
-                    file_id=(after.st_dev, after.st_ino),
-                )
-            last_reason = "stat/read/stat identity changed"
-        if attempt + 1 < retries and delay_seconds:
-            sleep(delay_seconds)
-    raise UnstableReadError(f"unstable tail read for {path}: {last_reason}")
+    return _stable_observation(path, max_bytes=max_bytes, retries=retries,
+                               delay_seconds=delay_seconds, sleep=sleep, tail=True)
 
 
 def _has_ads_syntax(path: Path) -> bool:

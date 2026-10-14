@@ -17,7 +17,7 @@ from orchestrator_harness.stable_io import PreparedOutputTransaction
 
 class WorkerFileBoundaryTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
+        temporary = tempfile.TemporaryDirectory(prefix="w")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
@@ -28,7 +28,6 @@ class WorkerFileBoundaryTests(unittest.TestCase):
         else:
             link.symlink_to(destination, target_is_directory=True)
 
-    @unittest.skipUnless(os.name == "nt", "native Windows append capability")
     def test_append_verifies_bytes_through_its_held_writer_handle(self):
         path = self.root / "events.jsonl"
         first = mutation.append_bytes(self.root, path.name, b'{"first":true}\n')
@@ -38,7 +37,6 @@ class WorkerFileBoundaryTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), second.content)
         self.assertEqual(hashlib.sha256(second.content).hexdigest(), second.content_sha256)
 
-    @unittest.skipUnless(os.name == "nt", "native Windows append capability")
     def test_append_refuses_a_hardlink_before_modifying_protected_bytes(self):
         protected = self.root / "protected.jsonl"
         protected.write_bytes(b"protected original\n")
@@ -110,7 +108,6 @@ class WorkerFileBoundaryTests(unittest.TestCase):
             output.publish_bytes(output.admit("response.json"), b"old owner's response")
         self.assertFalse((worker / "response.json").exists())
 
-    @unittest.skipUnless(os.name == "nt", "existing mutation backend requires native Windows containment")
     def test_atomic_publication_refuses_hardlinked_destination(self):
         protected = self.root / "authority.json"
         protected.write_bytes(b"operator authority")
@@ -386,7 +383,6 @@ class WorkerFileBoundaryTests(unittest.TestCase):
                         producer.write_notice(agent, **fields)
                 self.assertFalse((agent / "manager-notifications").exists())
 
-    @unittest.skipUnless(os.name == "nt", "existing mutation backend requires native Windows containment")
     def test_notice_bytes_are_retained_and_retries_cannot_change_identity(self):
         rt, worker, lane, notice, path = self.notice_fixture()
         atomic_write_json(path, notice)

@@ -23,17 +23,25 @@ def _mount_candidates(filesystem: str, configured: str | None) -> tuple[Path, ..
         if not Path(configured).is_absolute():
             raise RuntimeError("configured kernel mount must be absolute")
         argv.extend(("--mountpoint", configured))
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot discover {filesystem} mount") from exc
     if completed.returncode != 0:
         raise RuntimeError(f"cannot discover {filesystem} mount: {completed.stderr.strip()}")
     try:
         records = json.loads(completed.stdout)["filesystems"]
+        if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+            raise ValueError("mount records must be a list of objects")
         roots = tuple(
             Path(record["target"])
             for record in records
-            if record["fstype"] == filesystem and Path(record["target"]).is_absolute()
+            if record["fstype"] == filesystem and isinstance(record["target"], str)
+            and Path(record["target"]).is_absolute()
+            and (not configured or Path(record["target"]) == Path(configured))
         )
-    except (KeyError, TypeError, ValueError) as exc:
+        roots = tuple(dict.fromkeys(roots))
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
         raise RuntimeError("invalid kernel mount discovery output") from exc
     if not roots:
         raise RuntimeError(f"no {filesystem} mount is available")

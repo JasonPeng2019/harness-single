@@ -20,7 +20,7 @@ from .platform_paths import procfs_root
 
 def _valid_pid(pid: object) -> bool:
     return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-            and (os.name != "nt" or pid <= 0xFFFFFFFF))
+            and pid <= (0xFFFFFFFF if os.name == "nt" else 0x7FFFFFFF))
 
 
 def _windows_process_identity(pid: int) -> dict[str, Any] | None:
@@ -121,6 +121,8 @@ def _darwin_proc_bsd_info(pid: int) -> _DarwinProcBsdInfo | None:
 def darwin_process_info(pid: int) -> dict[str, Any] | None:
     """Return native macOS process details, or ``None`` when unavailable."""
 
+    if not _valid_pid(pid):
+        return None
     info = _darwin_proc_bsd_info(pid)
     if info is None or info.pid != pid or info.start_tvsec <= 0:
         return None
@@ -166,27 +168,37 @@ def darwin_process_ids() -> tuple[int, ...] | None:
         required = libproc.proc_listpids(1, 0, None, 0)  # PROC_ALL_PIDS
         if required < 0:
             return None
-        count = max(1, (required + ctypes.sizeof(ctypes.c_uint32) - 1) // 4)
-        pids = (ctypes.c_uint32 * count)()
-        received = libproc.proc_listpids(1, 0, ctypes.byref(pids), ctypes.sizeof(pids))
-        if received < 0 or received % ctypes.sizeof(ctypes.c_uint32):
-            return None
-        return tuple(sorted({int(pid) for pid in pids[: received // 4] if pid}))
+        count = max(32, (required + 3) // 4 + 32)
+        for _ in range(3):
+            pids = (ctypes.c_uint32 * count)()
+            received = libproc.proc_listpids(1, 0, ctypes.byref(pids), ctypes.sizeof(pids))
+            if received < 0 or received % 4:
+                return None
+            if received < ctypes.sizeof(pids):
+                return tuple(sorted({int(pid) for pid in pids[: received // 4] if pid}))
+            count *= 2
+        return None
     except (AttributeError, OSError):
         return None
 
 
 def _linux_process_identity(pid: int) -> dict[str, Any] | None:
+    if not _valid_pid(pid):
+        return None
     try:
-        with open(procfs_root() / str(pid) / "stat", encoding="utf-8") as handle:
-            stat = handle.read()
+        with open(procfs_root() / str(pid) / "stat", encoding="utf-8", errors="replace") as handle:
+            stat = handle.read(1_000_001)
+        if len(stat) > 1_000_000 or not stat.startswith(f"{pid} ("):
+            return None
         close = stat.rfind(")")
+        if close < len(str(pid)) + 2 or stat[close + 1:close + 2] != " ":
+            return None
         fields = stat[close + 2 :].split()
         start_ticks = fields[19]  # /proc/<pid>/stat field 22
         if not start_ticks.isdigit():
             return None
         return {"pid": pid, "created_utc": f"linux-start-ticks:{start_ticks}"}
-    except (OSError, IndexError, RuntimeError):
+    except (OSError, IndexError, RuntimeError, ValueError):
         return None
 
 

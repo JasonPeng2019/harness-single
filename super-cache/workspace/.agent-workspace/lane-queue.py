@@ -91,6 +91,7 @@ class _RecordLock:
             local = self._registry.setdefault(self.key, threading.Lock())
         local.acquire()
         self._local = local
+        handle = None
         try:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             handle = self.lock_path.open("a+b")
@@ -105,27 +106,34 @@ class _RecordLock:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             self._handle = handle
             return self
-        except Exception:
-            self._release_local()
+        except BaseException:
+            try:
+                if handle is not None:
+                    handle.close()
+            finally:
+                self._handle = None
+                self._release_local()
             raise
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         handle = self._handle
         self._handle = None
-        if handle is not None:
-            try:
-                if os.name == "nt":
-                    import msvcrt
+        try:
+            if handle is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
 
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
 
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            finally:
-                handle.close()
-        self._release_local()
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+        finally:
+            self._release_local()
 
     def _release_local(self) -> None:
         local = self._local

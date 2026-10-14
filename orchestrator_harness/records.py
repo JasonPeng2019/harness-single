@@ -10,14 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from .core import canonical_json, read_json, require_schema
+from .core import canonical_json, require_schema
 
 
 _WINDOWS_REPLACE_RETRY_ERRORS = frozenset({5, 32})
@@ -52,6 +51,20 @@ class RecordError(OSError):
     """A record could not be read, written, or locked."""
 
 
+def _read_plain_json(path: Path) -> dict[str, Any]:
+    from .mutation import _lexical, read_bytes
+    target = _lexical(path)
+    value = json.loads(read_bytes(target.parent, target.name).decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"record is not a JSON object: {path}")
+    return value
+
+
+def read_json(path: Any) -> dict[str, Any]:
+    """Preserve the record module's reader export with no-follow authority I/O."""
+    return _read_plain_json(path)
+
+
 class RecordLock:
     """One short advisory lock for one record path.
 
@@ -62,6 +75,7 @@ class RecordLock:
 
     _registry_guard = threading.Lock()
     _registry: dict[str, threading.Lock] = {}
+    _registry_users: dict[str, int] = {}
 
     def __init__(self, path: Path, *, root: Path | None = None) -> None:
         self.path = Path(path).absolute()
@@ -73,21 +87,25 @@ class RecordLock:
         self._local: threading.Lock | None = None
 
     def __enter__(self) -> "RecordLock":
+        if self._local is not None:
+            raise RecordError("a RecordLock instance cannot be entered twice")
         with self._registry_guard:
             local = self._registry.setdefault(self.key, threading.Lock())
-        local.acquire()
+            self._registry_users[self.key] = self._registry_users.get(self.key, 0) + 1
+        try:
+            local.acquire()
+        except BaseException:
+            self._drop_registry_user(local)
+            raise
         self._local = local
         handle = None
         try:
-            if self.root is not None:
-                # Use the same sibling lock as standalone workers, while a
-                # privileged writer holds no-follow ancestors through use.
-                from .mutation import open_append_file
-                self._anchor = open_append_file(self.root, self.lock_path.relative_to(self.root))
-                handle = self._anchor.handle
-            else:
-                self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = self.lock_path.open("a+b")
+            from .mutation import ensure_directory_path, open_append_file
+            if self.root is None:
+                ensure_directory_path(self.lock_path.parent)
+            root = self.root if self.root is not None else self.lock_path.parent
+            self._anchor = open_append_file(root, self.lock_path.relative_to(root))
+            handle = self._anchor.handle
             if os.name == "nt":
                 import msvcrt
 
@@ -139,6 +157,17 @@ class RecordLock:
         self._local = None
         if local is not None:
             local.release()
+            self._drop_registry_user(local)
+
+    def _drop_registry_user(self, local: threading.Lock) -> None:
+        with self._registry_guard:
+            remaining = self._registry_users[self.key] - 1
+            if remaining:
+                self._registry_users[self.key] = remaining
+            else:
+                self._registry_users.pop(self.key)
+                if self._registry.get(self.key) is local:
+                    self._registry.pop(self.key)
 
 
 _admission_local = threading.local()
@@ -169,25 +198,11 @@ def runtime_admission_lock(rt: Path):
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` via a temp sibling and same-volume rename."""
-    target = Path(path).absolute()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _replace_with_retry(temp_path, target)
-    except BaseException:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-        raise
+    """Publish complete bytes under held no-follow ancestors."""
+    from .mutation import _lexical, ensure_directory_path, publish_bytes
+    target = _lexical(path)
+    ensure_directory_path(target.parent)
+    publish_bytes(target.parent, target.name, data)
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -213,12 +228,10 @@ def write_record(path: Path, schema: str, fields: dict[str, Any]) -> dict[str, A
 
 def remove_record(path: Path) -> None:
     """Remove one record file under its short lock (missing is a no-op)."""
-    target = Path(path).absolute()
+    from .mutation import _lexical, delete
+    target = _lexical(path)
     with RecordLock(target):
-        try:
-            target.unlink()
-        except FileNotFoundError:
-            pass
+        delete(target.parent, target.name)
 
 
 def update_record(
@@ -250,33 +263,47 @@ def append_jsonl(path: Path, record: dict[str, Any], *, header: dict[str, Any] |
     When ``header`` is given and the file is absent or empty, the header object
     is written as the first line first.
     """
-    target = Path(path).absolute()
+    from .mutation import _lexical, open_append_file, MutationConflict
+    target = _lexical(path)
+    data = canonical_json(record) + b"\n"
+    header_data = canonical_json(header) + b"\n" if header is not None else b""
     with RecordLock(target):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if header is not None and (not target.exists() or target.stat().st_size == 0):
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(canonical_json(header).decode("utf-8") + "\n")
-        with target.open("a", encoding="utf-8") as handle:
-            handle.write(canonical_json(record).decode("utf-8") + "\n")
+        with open_append_file(target.parent, target.name) as anchored:
+            handle = anchored.handle
+            before = os.fstat(handle.fileno())
+            if before.st_nlink != 1:
+                raise MutationConflict("append target gained hard links")
+            payload = (header_data if before.st_size == 0 else b"") + data
+            anchored.anchor.assert_stable()
+            handle.seek(0, os.SEEK_END)
+            if handle.write(payload) != len(payload):
+                raise RecordError("record append did not write all bytes")
             handle.flush()
             os.fsync(handle.fileno())
+            after = os.fstat(handle.fileno())
+            named = anchored.anchor.stat(target.name)
+            if (after.st_nlink != 1 or after.st_size != before.st_size + len(payload)
+                    or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)):
+                raise MutationConflict("record append target changed during writing")
+            anchored.anchor.assert_stable()
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Read a JSONL audit log, skipping a malformed trailing line."""
-    target = Path(path).absolute()
-    if not target.exists():
+    from .mutation import _lexical, read_bytes
+    target = _lexical(path)
+    try:
+        raw = read_bytes(target.parent, target.name)
+    except FileNotFoundError:
         return []
     records: list[dict[str, Any]] = []
-    with target.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                records.append(value)
+    for line in raw.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
     return records
