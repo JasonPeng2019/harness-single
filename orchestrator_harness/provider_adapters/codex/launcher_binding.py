@@ -64,6 +64,31 @@ def _toml_inline(value: str | dict[str, Any]) -> str:
     raise ValueError("unsupported Codex worker permission value")
 
 
+def _ollama_catalog_path() -> Path:
+    return Path(__file__).resolve().parents[3] / "local-config" / "ollama-model-catalog.json"
+
+
+def _ollama_model_catalog(model: str, reasoning_effort: str) -> Path:
+    """Use explicitly prepared metadata, never an OpenAI/fallback catalog."""
+    path = _ollama_catalog_path()
+    try:
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        entries = catalog["models"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"prepare the operator-owned Ollama model catalog: {path}") from exc
+    if not isinstance(entries, list):
+        raise ValueError(f"invalid Ollama model catalog: {path}")
+    matching = [item for item in entries if isinstance(item, dict) and item.get("slug") == model]
+    if len(matching) != 1:
+        raise ValueError(f"Ollama model catalog must contain exactly one entry for {model}")
+    levels = matching[0].get("supported_reasoning_levels", [])
+    if not isinstance(levels, list) or reasoning_effort not in {
+        item.get("effort") for item in levels if isinstance(item, dict)
+    }:
+        raise ValueError(f"Ollama model {model} does not advertise reasoning effort {reasoning_effort}")
+    return path.resolve()
+
+
 def _isolation_overrides(worktree: str, isolation_config_path: str | None = None) -> list[str]:
     config_path = Path(isolation_config_path) if isolation_config_path else Path(worktree) / ".codex" / "config.toml"
     if not config_path.is_file():
@@ -168,11 +193,12 @@ def build_argv(
         argv.extend(["--cd", worktree])
     argv.append("-")
     if configured.get("launcher") == "ollama":
-        # Ollama owns the model/profile arguments and forwards stdin unchanged.
-        # Passing Codex's -m as an extra argument is rejected by ollama launch.
-        model_index = argv.index("-m")
-        del argv[model_index:model_index + 2]
-        return ["ollama", "launch", "codex", "--model", model, "--yes", "--", *argv[1:]]
+        # Select transport inside exec: outer `ollama launch` profile settings
+        # do not survive --ignore-user-config and can route requests to OpenAI.
+        catalog = _ollama_model_catalog(model, configured["reasoning_effort"])
+        # OSS selection belongs to exec; resume has no --oss option of its own.
+        argv[2:2] = ["--oss", "--local-provider", "ollama"]
+        argv[-1:-1] = ["-c", f"model_catalog_json={json.dumps(str(catalog))}"]
     argv[0] = _direct_codex_executable()
     return argv
 
@@ -186,14 +212,22 @@ def parse_line(line: str) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     raw_type = value.get("type")
-    if raw_type not in {"thread.started", "turn.completed", "turn.failed", "turn.cancelled"}:
+    if raw_type not in {"thread.started", "item.completed", "turn.completed", "turn.failed", "turn.cancelled"}:
         return None
     session_id = value.get("thread_id") or value.get("threadId")
     parsed: dict[str, Any] = {}
     if isinstance(session_id, str) and session_id:
         parsed["session_id"] = session_id
-    if raw_type != "thread.started":
-        parsed["message"] = raw_type
+    if raw_type == "item.completed":
+        item = value.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            return None
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            parsed["message"] = text
+    # Successful completion carries usage, not assistant text. Returning a
+    # terminal label here overwrites Codex's --output-last-message contents.
     if raw_type in {"turn.failed", "turn.cancelled"}:
+        parsed["message"] = raw_type
         parsed["non_retryable_failure"] = True
     return parsed
