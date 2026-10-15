@@ -6,10 +6,6 @@ exists in `scripts/collect_codex_usage.py`, `scripts/token_ledger.py` and the pu
 `operator_launch` commands. It adds no new flag and no new schema, never changes transcripts,
 never fabricates token counts, and never edits native runtime, cleanup, lease or queue records.
 
-Reported checks and fixtures are evidence, not live-provider proof. A cross-epoch accounting
-repair under way elsewhere does not change this receipt or CLI contract, and nothing here claims
-that a broad or live-model validation has already passed.
-
 ## Symptom
 
 `resume`, `snapshot`, `gate` or `finalize` refuses the run, for example:
@@ -90,10 +86,13 @@ be verified against the collector's own read.
   boundary, must be proven exited. A retired label is not cleanup proof, and the receipt does not
   create it; native shutdown or force-stop does.
 
-Wrong hash, wrong identity, open epoch, unretired lane, unproven cleanup, unknown or reused
-process identities and live processes are refused. The damaged bytes are never rewritten:
-`finalize` copies the exact transcript bytes, re-verifies the recorded digest, and reports the
-inexact total honestly.
+Wrong hash, wrong identity, open epoch, unretired lane and unproven cleanup are refused, and so
+is an unknown original identity or an exact original incarnation that is still live. Numeric PID
+reuse is not an owner match: an unrelated new process that happens to reuse a recorded PID is
+not the original incarnation, must survive (it is never terminated and it is not cleanup
+proof), and the original exact identity can still be proven gone by its recorded creation
+identity. The damaged bytes are never rewritten: `finalize` copies the exact transcript bytes,
+re-verifies the recorded digest, and reports the inexact total honestly.
 
 ## Honest unknown counts, caps and continuation
 
@@ -173,8 +172,13 @@ Follow the actual returned error; never delete records or invent state.
 `lane force-stop --lane-id <id>` is only for a genuinely stuck lane, for example one named by a
 `SHUTDOWN_LANE_CLEANUP_UNPROVEN` refusal:
 
-- It stops only the exact recorded PID-plus-creation identities and refuses when the identity is
-  unknown, unobservable or changed. A numeric PID alone, absence by process name, or a reused PID
+- It acts only on the exact recorded PID-plus-creation identity of the original incarnation. An
+  unrelated new process that happens to reuse a recorded numeric PID is not the original owner:
+  it must survive untouched, and its presence alone does not make the original owner live. The
+  original exact identities can still be proven gone by their recorded creation identities.
+  Force-stop refuses when the original identity is unknown or unobservable, when records
+  disagree or ownership changed, and when the exact original incarnation is still live
+  (`FORCE_STOP_PROCESS_SURVIVED`). A numeric PID alone, absence by process name or a reused PID
   is never proof; never kill by name, broad matching or a bare PID.
 - A genuinely never-launched lane (exactly empty process record and genuinely absent controller
   status) can be cancelled without a process; missing or uncertain cleanup proof returns
@@ -209,5 +213,4 @@ automatic retry, no model switch, and no session, PID or worktree reconstruction
 - `orchestrator_harness/resume.py` - `resume-lane` retained saved-session retry rules.
 - `orchestrator_harness/lane_cleanup.py` - `cleanup_is_proven` native identity checks.
 
-Focused regression coverage is `scripts/tests/test_collector_continuation.py` (fixture evidence,
-not live-provider proof).
+Focused regression coverage is `scripts/tests/test_collector_continuation.py`.
