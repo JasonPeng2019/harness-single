@@ -339,15 +339,15 @@ def main(argv: list[str] | None = None) -> int:
             watcher_identity = _identity(os.getpid())
             if watcher_identity is None:
                 raise RuntimeError("cannot establish watcher process identity")
-            watcher = watcher_identity
             with lock(runtime, service):
                 current = _read(service)
-                if current is None or current.get("startup_token") != args.startup_token or current.get("watcher") not in (None, watcher):
+                if current is None or current.get("startup_token") != args.startup_token or current.get("watcher") not in (None, watcher_identity):
                     raise RuntimeError("startup ownership changed before readiness publication")
-                current["watcher"] = watcher
+                initialize_service_cursor(cfg)
+                current["watcher"] = watcher_identity
                 current["startup_status"] = "READY"
                 _atomic(service, current)
-            initialize_service_cursor(cfg)
+                watcher = watcher_identity
             log(
                 runtime,
                 "watcher",

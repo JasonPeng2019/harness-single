@@ -1,4 +1,4 @@
-"""Board-free lifecycle proof for duplicate start, exact identity, stop, and owner loss."""
+"""Board-free proof for readiness, activity, fresh-epoch restart, stop, and owner loss."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ def config(runtime: str) -> Path:
         json.dumps(
             {
                 "runtime_root": str((DEST / runtime).relative_to(ROOT)),
-                "observed_log_roots": [
-                    str((DEST / "empty.log").relative_to(ROOT))
+                "observed_sources": [
+                    {"path": str(DEST / "empty.log"), "role": "harness", "source_id": "native"}
                 ],
                 "poll_interval_seconds": 2,
                 "evaluator_enabled": False,
@@ -67,15 +67,43 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
     raise RuntimeError("watcher did not stop cooperatively")
 
 
+def new_activity(runtime: str) -> dict[str, object]:
+    source = DEST / "empty.log"
+    cursor = json.loads((DEST / runtime / "watcher" / "cursor.json").read_text(encoding="utf-8"))
+    baseline = cursor["sources"][str(source)]["offset"]
+    if baseline != source.stat().st_size:
+        raise RuntimeError("READY did not establish the existing source baseline")
+    record = {"event": "after-ready", "epoch": runtime}
+    with source.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+    events = DEST / runtime / "harness" / "events.jsonl"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()] if events.exists() else []
+        if any(record in row["data"].get("records", []) for row in rows):
+            if len(rows) != 1:
+                raise RuntimeError("service replayed baseline history or duplicated new activity")
+            return {"baseline_offset": baseline, "record": record, "routed": rows}
+        time.sleep(0.1)
+    raise RuntimeError("post-READY activity was not recorded")
+
+
 def _run_canary() -> None:
     DEST.mkdir(parents=True)
     (DEST / "empty.log").write_text("", encoding="utf-8")
     ordinary = config("ordinary_runtime")
     start_code, start = call(ordinary, "start", "--owner-pid", str(os.getpid()))
+    activity = new_activity("ordinary_runtime")
     duplicate_code, duplicate = call(ordinary, "start", "--owner-pid", str(os.getpid()))
     status_code, status = call(ordinary, "status")
     stop_code, stop = call(ordinary, "stop")
     stopped = wait_not_running(ordinary, "stop-requested")
+
+    restart_config = config("restart_runtime")
+    restart_code, restart = call(restart_config, "start", "--owner-pid", str(os.getpid()))
+    restart_activity = new_activity("restart_runtime")
+    restart_stop_code, restart_stop = call(restart_config, "stop")
+    restarted_stopped = wait_not_running(restart_config, "stop-requested")
 
     # The wrapper is deliberately the service owner's parent and exits immediately after start.
     owner_loss = config("owner_loss_runtime")
@@ -89,10 +117,15 @@ def _run_canary() -> None:
     lost = wait_not_running(owner_loss, "owner-identity-lost")
     result = {
         "start": [start_code, start],
+        "new_activity": activity,
         "duplicate": [duplicate_code, duplicate],
         "live_status": [status_code, status],
         "stop": [stop_code, stop],
         "stopped_status": stopped,
+        "restart": [restart_code, restart],
+        "restart_activity": restart_activity,
+        "restart_stop": [restart_stop_code, restart_stop],
+        "restarted_stopped_status": restarted_stopped,
         "owner_loss_status": lost,
         "live_has_pid_and_creation": bool(
             status.get("state", {}).get("watcher", {}).get("pid")
@@ -110,7 +143,7 @@ def _run_canary() -> None:
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(result, indent=2))
-    if (any(code != 0 for code in (start_code, duplicate_code, status_code, stop_code))
+    if (any(code != 0 for code in (start_code, duplicate_code, status_code, stop_code, restart_code, restart_stop_code))
             or duplicate.get("result") != "already-started"
             or not all(result[key] for key in ("live_has_pid_and_creation", "cooperative_stop_reason", "owner_loss_reason"))):
         raise RuntimeError("native watcher lifecycle assertions failed; inspect retained result")
@@ -122,7 +155,7 @@ def main() -> None:
     finally:
         proof = []
         failures = []
-        for name in ("ordinary_runtime", "owner_loss_runtime"):
+        for name in ("ordinary_runtime", "restart_runtime", "owner_loss_runtime"):
             path = DEST / f"{name}.json"
             if not path.exists():
                 continue

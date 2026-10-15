@@ -65,6 +65,50 @@ class WatcherIntegrityTests(unittest.TestCase):
         self.assertIsNone(cli._read(self.runtime / "watcher" / "service.json"))
         self.assertFalse(self.runtime.exists())
 
+    def test_ready_baseline_precedes_activity_appended_at_publication(self):
+        service = self.runtime / "watcher" / "service.json"
+        owner = exact_process_identity(os.getpid())
+        self.assertIsNotNone(owner)
+        cli._atomic(service, {"startup_token": "test", "owner": owner,
+                              "watcher": None, "startup_status": "STARTING"})
+        baseline = self.source.stat().st_size
+        publish = cli._atomic
+        ready = []
+
+        def append_at_ready(path, state):
+            if state.get("startup_status") == "READY" and not state.get("exit_reason"):
+                cursor = json.loads((self.runtime / "watcher" / "cursor.json").read_bytes())
+                self.assertEqual(baseline, cursor["sources"][str(self.source)]["offset"])
+                with self.source.open("ab") as handle:
+                    handle.write(b'{"event":"after-ready"}\n')
+                ready.append(True)
+            publish(path, state)
+
+        with (patch.object(cli, "load_config", return_value=self.cfg),
+              patch.object(cli, "_atomic", side_effect=append_at_ready),
+              patch.object(cli, "_sleep_until", return_value="stop-requested"),
+              patch.object(cli, "CommandEvaluator") as evaluator):
+            self.assertEqual(0, cli.main(["serve", "--startup-token", "test"]))
+        evaluator.assert_not_called()
+        self.assertEqual([True], ready)
+        self.assertEqual([{"event": "after-ready"}], self.routed()[0]["data"]["records"])
+        self.assertEqual("stop-requested", cli._read(service)["exit_reason"])
+
+    def test_cursor_initialization_failure_never_publishes_ready(self):
+        service = self.runtime / "watcher" / "service.json"
+        owner = exact_process_identity(os.getpid())
+        self.assertIsNotNone(owner)
+        cli._atomic(service, {"startup_token": "test", "owner": owner,
+                              "watcher": None, "startup_status": "STARTING"})
+        with (patch.object(cli, "load_config", return_value=self.cfg),
+              patch.object(poller, "_save_cursor", side_effect=OSError("cursor write failed")),
+              patch.object(cli, "poll") as poll):
+            self.assertEqual(1, cli.main(["serve", "--startup-token", "test"]))
+        poll.assert_not_called()
+        state = cli._read(service)
+        self.assertEqual("STARTING", state["startup_status"])
+        self.assertEqual("service-error", state["exit_reason"])
+
     def test_service_baseline_keeps_an_unfinished_record_until_completion(self):
         self.source.write_bytes(b'{"old":true}\n{"new":')
         self.assertTrue(poller.initialize_service_cursor(self.cfg))
