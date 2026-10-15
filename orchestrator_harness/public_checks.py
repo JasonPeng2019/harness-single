@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
-import errno
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
@@ -41,6 +40,53 @@ def read(path: Path) -> dict:
 
 def home(root: Path) -> Path:
     return root / ".harness-runtime" / "operator-only" / "public-check-service"
+
+
+def initialize_service(root: Path, harness: Path) -> None:
+    """Native setup records that no service creation has been attempted."""
+    base = home(root)
+    path = base / "service.json"
+    if not (harness / POLICY).exists() or path.exists() or path.is_symlink():
+        return
+    if (base / "config.json").exists() or (base / "config.json").is_symlink():
+        raise ValueError("public check startup ownership is missing")
+    with RecordLock(path):
+        atomic_write_json(path, {"schema": "worker-public-check-service/v1",
+            "root": str(root.resolve()), "harness": str(harness.resolve()),
+            "pid": None, "creation_time": None, "startup_id": new_id(),
+            "status": "NOT_STARTED", "cleanup_proven": True, "policy_sha256": None})
+
+
+def service_cleanup(root: Path, harness: Path | None = None) -> dict | None:
+    """Prove retained service cleanup without consulting mutable policy inputs."""
+    base = home(root)
+    path = base / "service.json"
+    if not path.exists() and not path.is_symlink():
+        if ((base / "config.json").exists() or (base / "config.json").is_symlink()
+                or (harness is not None and (harness / POLICY).exists())):
+            raise ValueError("expected public check service record is missing or invalid")
+        return None
+    with RecordLock(path):
+        record = read(path)
+    if (record.get("status") == "NOT_STARTED" and record.get("pid") is None
+            and record.get("creation_time") is None and record.get("cleanup_proven") is True
+            and record.get("schema") == "worker-public-check-service/v1"
+            and isinstance(record.get("startup_id"), str)
+            and re.fullmatch(r"[a-f0-9]{32}", record["startup_id"])
+            and record.get("root") == str(root.resolve())
+            and (harness is None or record.get("harness") == str(harness.resolve()))
+            and not ((base / "config.json").exists() or (base / "config.json").is_symlink())):
+        return record
+    identity = _service_identity(record, root, harness)
+    if (record.get("status") != "STOPPED" or record.get("cleanup_proven") is not True
+            or not processes.identity_exit_proven(*identity)):
+        raise ValueError("public check service cleanup is not proven")
+    config = read(base / "config.json")
+    if (config.get("startup_id") != record.get("startup_id")
+            or record.get("policy_sha256") != hashlib.sha256(
+                json.dumps(config["policy"], sort_keys=True).encode()).hexdigest()):
+        raise ValueError("public check cleanup startup identity mismatch")
+    return record
 
 
 def policy(harness: Path) -> dict | None:
@@ -275,6 +321,12 @@ def _service_environment(harness: Path) -> dict[str, str]:
 
 def _require_service_owner(config: dict, owner: tuple[int, str, str]) -> dict:
     """An executing service can operate only its original startup incarnation."""
+    base = home(Path(config["root"]))
+    with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
+        return _owned_service_record(config, owner)
+
+
+def _owned_service_record(config: dict, owner: tuple[int, str, str]) -> dict:
     root, harness = Path(config["root"]), Path(config["harness"])
     current_config = read(home(root) / "config.json")
     record = read(home(root) / "service.json")
@@ -288,33 +340,20 @@ def _require_service_owner(config: dict, owner: tuple[int, str, str]) -> dict:
     return record
 
 
-@contextmanager
-def _publication_admission(root: Path):
-    """Wait for native admission across Windows' finite LK_LOCK window.
-
-    Bootstrap/resume may legitimately hold admission longer than ten seconds.
-    Retry only acquisition's native contention error, never the protected body.
-    No service or adapter invocation is repeated.
-    """
-    with ExitStack() as held:
-        while True:
-            try:
-                held.enter_context(runtime_admission_lock(root / ".harness-runtime"))
-                break
-            except OSError as exc:
-                if os.name != "nt" or exc.errno != errno.EDEADLK:
-                    raise
-        yield
-
-
 def start_service(harness: Path, root: Path) -> dict | None:
     with runtime_admission_lock(root / '.harness-runtime'):
         selected = policy(harness)
         if selected is None:
             return None
         base = home(root)
+        prior = None
         if (base / "service.json").exists() or (base / "service.json").is_symlink():
-            return validate_service(root, harness)
+            prior = read(base / "service.json")
+            if prior.get("status") not in {"STOPPED", "NOT_STARTED"}:
+                return validate_service(root, harness)
+            service_cleanup(root, harness)
+        elif (base / "config.json").exists():
+            raise ValueError("public check startup ownership is missing")
         if read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") != "OPEN":
             raise ValueError("public checks require an OPEN native runtime")
         revision = git(root, "rev-parse", "HEAD").decode().strip()
@@ -324,41 +363,72 @@ def start_service(harness: Path, root: Path) -> dict | None:
         if read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") != "OPEN":
             raise ValueError("runtime changed before public check service creation")
         startup_id = new_id()
-        with RecordLock(base / "config.json"):
+        with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
+            if prior is not None:
+                history = {"service": prior}
+                if (base / "config.json").exists():
+                    history["config"] = read(base / "config.json")
+                atomic_write_json(base / "history" / f"{new_id()}.json", history)
             atomic_write_json(base / "config.json", {
                 "root": str(root.resolve()), "harness": str(harness.resolve()), "policy": selected,
                 "baseline_revision": revision, "fixed_inputs": _file_digests(root, revision, selected["fixed_paths"]),
                 "startup_id": startup_id,
             })
+            # A crash between spawn and exact identity publication remains
+            # explicitly ambiguous, never a missing-record guess.
+            record = {"schema": "worker-public-check-service/v1", "root": str(root.resolve()),
+                "harness": str(harness.resolve()), "pid": None, "creation_time": None,
+                "startup_id": startup_id, "status": "SPAWNING", "cleanup_proven": False,
+                "stop_requested": False, "started_at": iso_utc(),
+                "policy_sha256": hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()}
+            atomic_write_json(base / "service.json", record)
         environment = _service_environment(harness)
         service_home = base / "service-home"
         service_home.mkdir(exist_ok=True)
         environment.update(HOME=str(service_home), USERPROFILE=str(service_home),
                            APPDATA=str(service_home), LOCALAPPDATA=str(service_home))
-        with (base / "service.stdout.log").open("ab") as stdout, (base / "service.stderr.log").open("ab") as stderr:
-            process = processes.spawn_detached(
-                [sys.executable, "-B", "-m", "orchestrator_harness.public_checks", "--root", str(root)],
-                cwd=harness, env=environment, stdout=stdout, stderr=stderr,
-            )
-        try:
+        with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
+            with (base / "service.stdout.log").open("ab") as stdout, (base / "service.stderr.log").open("ab") as stderr:
+                process = processes.spawn_detached(
+                    [sys.executable, "-B", "-m", "orchestrator_harness.public_checks", "--root", str(root)],
+                    cwd=harness, env=environment, stdout=stdout, stderr=stderr,
+                )
             created_identity = processes.process_identity(process.pid)
+            if created_identity and processes.valid_creation_identity(created_identity.get("creation_time")):
+                record.update(pid=process.pid, creation_time=created_identity["creation_time"], status="STARTING")
+                atomic_write_json(base / "service.json", record)
+        try:
             if not created_identity or not processes.valid_creation_identity(created_identity.get("creation_time")):
                 raise ValueError("new public check service identity is unproven")
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise ValueError(f"public check service exited during startup; inspect {base}")
                 if (base / "service.json").is_file():
-                    record = read(base / "service.json")
+                    with RecordLock(base / "service.json"):
+                        record = read(base / "service.json")
                     if (record.get("startup_id") != startup_id or record.get("pid") != process.pid
                             or record.get("creation_time") != created_identity["creation_time"]):
                         raise ValueError("public check readiness belongs to a different service incarnation")
-                    return validate_service(root, harness)
+                    if record.get("status") == "READY":
+                        return validate_service(root, harness)
+                    if record.get("status") == "STOPPED":
+                        raise ValueError(f"public check service startup failed: {record.get('error')}; inspect {base}")
                 time.sleep(0.1)
             raise ValueError("public check service did not become ready")
         except BaseException as exc:
             if not processes.reap_created_process(process):
                 raise ValueError(f"public check startup failed and exact child cleanup is unproven: {exc}") from exc
+            with RecordLock(base / "service.json"):
+                current = read(base / "service.json")
+                if (current.get("startup_id") == startup_id and current.get("status") == "STARTING"
+                        and current.get("pid") == process.pid and created_identity
+                        and current.get("creation_time") == created_identity["creation_time"]):
+                    # STARTING cannot dispatch checks. The original Popen
+                    # handle establishes exit even after delayed preflight.
+                    current.update(status="STOPPED", cleanup_proven=True, stopped_at=iso_utc(),
+                                   error=str(exc), startup_exit_code=process.returncode)
+                    atomic_write_json(base / "service.json", current)
             raise
 
 
@@ -503,7 +573,7 @@ def serve_request(config: dict, route: dict, path: Path, cancel: threading.Event
     # Release the job record lock before admission: all lifecycle transactions
     # take runtime, lane, then record locks. Slow adapter work holds neither.
     epoch = lane.parent.name
-    with _publication_admission(root), lane_operation_lock(root / ".harness-runtime", epoch, route["lane_id"]):
+    with runtime_admission_lock(root / ".harness-runtime"), lane_operation_lock(root / ".harness-runtime", epoch, route["lane_id"]):
         try:
             if service_owner is not None:
                 _require_service_owner(config, service_owner)
@@ -530,112 +600,157 @@ def serve_request(config: dict, route: dict, path: Path, cancel: threading.Event
 
 def run_service(root: Path) -> None:
     base = home(root)
-    config = read(base / "config.json")
-    initial_config = dict(config)
-    identity = processes.process_identity(os.getpid())
-    if identity is None or not processes.valid_creation_identity(identity.get("creation_time")):
-        raise ValueError("cannot bind public test service process identity")
-    startup_id = config.get("startup_id")
-    if not isinstance(startup_id, str) or not re.fullmatch(r"[a-f0-9]{32}", startup_id):
-        raise ValueError("public test service has no valid startup identity")
-    owner = (identity["pid"], identity["creation_time"], startup_id)
-    # Adapter code executes only in this credential-filtered service process.
-    backend = bridge(config["policy"], root).preflight()
-    if not isinstance(backend, dict):
-        raise ValueError("adapter preflight must return a JSON object or raise on failure")
-    config["backend"] = json.loads(json.dumps(backend, allow_nan=False))
-    record = {"schema": "worker-public-check-service/v1", "root": config["root"],
-              "harness": config["harness"], "pid": os.getpid(),
-              "creation_time": identity["creation_time"], "status": "READY",
-              "policy_sha256": hashlib.sha256(json.dumps(config["policy"], sort_keys=True).encode()).hexdigest(),
-              "startup_id": config["startup_id"],
-              "started_at": iso_utc(), "stop_requested": False, "cleanup_proven": False}
-    # Startup cannot acquire runtime admission here: its parent holds admission
-    # until READY. Serialize config/record publication and compare the original
-    # nonce instead, so delayed preflight cannot overwrite a later startup.
     with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
-        if read(base / "config.json") != initial_config:
-            raise ValueError("public check configuration changed during startup")
-        if (base / "service.json").exists() or (base / "service.json").is_symlink():
-            raise ValueError("public check service already has an ownership record")
-        atomic_write_json(base / "config.json", config)
-        atomic_write_json(base / "service.json", record)
+        config = read(base / "config.json")
+        initial_config = dict(config)
+        identity = processes.process_identity(os.getpid())
+        if identity is None or not processes.valid_creation_identity(identity.get("creation_time")):
+            raise ValueError("cannot bind public test service process identity")
+        startup_id = config.get("startup_id")
+        if not isinstance(startup_id, str) or not re.fullmatch(r"[a-f0-9]{32}", startup_id):
+            raise ValueError("public test service has no valid startup identity")
+        owner = (identity["pid"], identity["creation_time"], startup_id)
+        record = _owned_service_record(config, owner)
+        if record.get("status") != "STARTING":
+            raise ValueError("public test service has no owned STARTING record")
     cancel = threading.Event()
-    pending, seen = {}, set()
+    pending, seen, invalid_routes = {}, set(), set()
     clean = True
-    with ThreadPoolExecutor(max_workers=config["policy"]["max_parallel_checks"]) as executor:
+    failure = None
+    ready = False
+
+    def log_error(key, exc):
+        diagnostic = json.dumps({"request": key, "error": str(exc)})
         try:
-            while True:
-                # This scan only observes records; ownership effects and final
-                # feedback publication take admission below. Bootstrap can hold
-                # admission longer than Windows' blocking byte-range lock wait,
-                # so an idle READY service must not contend on every scan.
-                current = _require_service_owner(config, owner)
-                if (read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") != "OPEN"
-                        or current.get("stop_requested") or current.get("status") != "READY"):
-                    break
-                for future, key in list(pending.items()):
-                    if future.done():
+            with (base / "errors.jsonl").open("a", encoding="utf-8") as log:
+                log.write(diagnostic + "\n")
+        except OSError:
+            # Diagnostics cannot bypass cancellation/draining of owned tasks.
+            print(diagnostic, file=sys.stderr, flush=True)
+
+    def finish(future, key):
+        try:
+            return future.result().get("cleanup_proven") is True
+        except Exception as exc:
+            log_error(key, exc)
+            # A publication failure can follow fully cleaned adapter work.
+            # Credit only its retained authoritative result for this request.
+            try:
+                result = read(base / "jobs" / key[0] / Path(key[1]).parent.name / "result.json")
+                return (result.get("schema") == "worker-public-check-result/v1"
+                        and result.get("run_id") == key[0]
+                        and result.get("request_id") == Path(key[1]).parent.name
+                        and result.get("cleanup_proven") is True)
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
+
+    try:
+        # Ownership is durable before any trusted adapter code executes.
+        backend = bridge(config["policy"], root).preflight()
+        if not isinstance(backend, dict):
+            raise ValueError("adapter preflight must return a JSON object or raise on failure")
+        backend = json.loads(json.dumps(backend, allow_nan=False))
+        with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
+            current = _owned_service_record(initial_config, owner)
+            if current.get("status") != "STARTING":
+                raise ValueError("public check configuration changed during startup")
+            config["backend"] = backend
+            atomic_write_json(base / "config.json", config)
+            record.update(status="READY")
+            atomic_write_json(base / "service.json", record)
+            ready = True
+        with ThreadPoolExecutor(max_workers=config["policy"]["max_parallel_checks"]) as executor:
+            try:
+                while True:
+                    # Serialize native replacements with the same admission
+                    # boundary as their writers. Never retry a read conflict or
+                    # adapter operation under a guessed identity.
+                    with runtime_admission_lock(root / ".harness-runtime"):
+                        current = _require_service_owner(config, owner)
+                        opened = read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") == "OPEN"
+                    if not opened or current.get("stop_requested") or current.get("status") != "READY":
+                        break
+                    for future, key in list(pending.items()):
+                        if future.done():
+                            clean = finish(future, key) and clean
+                            del pending[future]
+                    for registration in (base / "routes").glob("*.json"):
                         try:
-                            clean = future.result().get("cleanup_proven") is True and clean
-                        except Exception as exc:
-                            clean = False
-                            with (base / "errors.jsonl").open("a", encoding="utf-8") as log:
-                                log.write(json.dumps({"request": key, "error": str(exc)}) + "\n")
-                        del pending[future]
-                for registration in (base / "routes").glob("*.json"):
-                    route = read(registration)
-                    lane = Path(route["worktree"])
-                    for request in (lane / ".agent-workspace/public-checks").glob("*/request.json"):
-                        key = (route["run_id"], str(request))
-                        if key in seen or len(pending) >= config["policy"]["max_parallel_checks"]:
+                            route = read(registration)
+                            lane = Path(route["worktree"])
+                            if (route.get("schema") != "worker-public-check-route/v1"
+                                    or not re.fullmatch(r"[a-f0-9]{32}", route["run_id"])
+                                    or lane.parent.parent != root.resolve() / ".harness-runtime/worktrees"
+                                    or lane.name != route["lane_id"]):
+                                raise ValueError("invalid public check route")
+                        except (OSError, ValueError, KeyError, TypeError) as exc:
+                            if str(registration) not in invalid_routes:
+                                invalid_routes.add(str(registration))
+                                log_error(str(registration), exc)
                             continue
-                        try:
-                            _registered_request(route, request)
-                        except (OSError, ValueError, KeyError, TypeError):
-                            # Old run registrations remain as evidence, but cannot
-                            # publish into a resumed invocation's request directory.
-                            continue
-                        seen.add(key)
-                        pending[executor.submit(serve_request, config, route, request, cancel,
-                                                service_owner=owner)] = key
-                time.sleep(0.2)
-        finally:
-            cancel.set()
-            for future in pending:
-                try:
-                    clean = future.result().get("cleanup_proven") is True and clean
-                except Exception:
-                    clean = False
-    record.update(status="STOPPED", cleanup_proven=clean, stopped_at=iso_utc())
-    with _publication_admission(root), RecordLock(base / "service.json"):
-        current = _require_service_owner(config, owner)
-        record["stop_requested"] = current.get("stop_requested", False)
-        atomic_write_json(base / "service.json", record)
+                        for request in (lane / ".agent-workspace/public-checks").glob("*/request.json"):
+                            key = (route["run_id"], str(request))
+                            if key in seen or len(pending) >= config["policy"]["max_parallel_checks"]:
+                                continue
+                            try:
+                                _registered_request(route, request)
+                            except (OSError, ValueError, KeyError, TypeError):
+                                continue
+                            seen.add(key)
+                            pending[executor.submit(serve_request, config, route, request, cancel,
+                                                    service_owner=owner)] = key
+                    time.sleep(0.2)
+            finally:
+                cancel.set()
+                for future, key in pending.items():
+                    clean = finish(future, key) and clean
+    except BaseException as exc:
+        failure = exc
+    finally:
+        cancel.set()
+        # Even a scan/read failure must drain owned work before STOPPED. If
+        # ownership changed, retain the replacement record and refuse cleanup.
+        # The startup parent holds admission until READY or failure. A service
+        # that has never admitted work needs only its original startup locks.
+        with (runtime_admission_lock(root / ".harness-runtime") if ready else nullcontext()), RecordLock(base / "config.json"), RecordLock(base / "service.json"):
+            current = _owned_service_record(config, owner)
+            current.update(status="STOPPED" if clean else "CLEANUP_UNPROVEN",
+                           cleanup_proven=clean, stopped_at=iso_utc())
+            if failure is not None:
+                current["error"] = str(failure)
+            atomic_write_json(base / "service.json", current)
+    if failure is not None:
+        raise failure
 
 
 def stop_service(root: Path, harness: Path | None = None) -> dict | None:
     path = home(root) / "service.json"
-    if not path.is_file():
-        if path.exists() or (home(root) / "config.json").exists() or (harness is not None and policy(harness) is not None):
-            raise ValueError("expected public check service record is missing or invalid")
-        return
     with runtime_admission_lock(root / ".harness-runtime"), RecordLock(path):
+        if not path.is_file():
+            # No creation record is absence only when service was never enabled.
+            if (path.exists() or path.is_symlink() or (home(root) / "config.json").exists()
+                    or (harness is not None and (harness / POLICY).exists())):
+                raise ValueError("expected public check service record is missing or invalid")
+            return None
         record = read(path)
-        identity = _service_identity(record, root, harness)
-        startup_id = record.get("startup_id")
-        record["stop_requested"] = True
-        atomic_write_json(path, record)
+        if record.get("status") == "NOT_STARTED":
+            identity = None
+        else:
+            identity = _service_identity(record, root, harness)
+            startup_id = record.get("startup_id")
+            record["stop_requested"] = True
+            atomic_write_json(path, record)
+    if identity is None:
+        return service_cleanup(root, harness)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        current = read(path)
+        with RecordLock(path):
+            current = read(path)
         if (_service_identity(current, root, harness) != identity
                 or current.get("startup_id") != startup_id):
             raise ValueError("public check service identity changed during shutdown")
         if processes.identity_exit_proven(*identity):
-            if current.get("status") != "STOPPED" or current.get("cleanup_proven") is not True:
-                raise ValueError("public check service cleanup is not proven")
-            return current
+            return service_cleanup(root, harness)
         time.sleep(0.1)
     raise ValueError("public check service failed to stop within its cleanup window")
 

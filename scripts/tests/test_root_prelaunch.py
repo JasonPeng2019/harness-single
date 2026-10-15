@@ -191,6 +191,65 @@ class RootPrelaunchTests(unittest.TestCase):
         self.assertNotEqual(old_owner["startup_id"], receipt["monitor"]["startup_id"])
         self.assertEqual(old_receipt, Path(receipt["prior_receipt"]["path"]).read_bytes())
 
+    def test_enabled_service_manual_setup_closes_without_starting(self):
+        from orchestrator_harness.public_checks import home
+        self.enable_service()
+        self.installed()
+        self.close_runtime()
+        record = preparation.read(home(self.workspace) / "service.json")
+        self.assertEqual("NOT_STARTED", record["status"])
+        self.assertIsNone(record["pid"])
+        self.assertFalse((home(self.workspace) / "config.json").exists())
+
+    def test_failed_service_preparation_closes_and_recovers_exact_attempt(self):
+        from orchestrator_harness.public_checks import home
+        self.enable_service()
+        adapter = self.harness / "fixture-adapter.py"
+        adapter.write_text(adapter.read_text().replace(
+            'return {"backend": "temporary-project-checks"}',
+            'raise RuntimeError("configured preflight failure")'), encoding="utf-8")
+        import hashlib
+        selected = preparation.read(self.harness / "local-config/public-check-policy.json")
+        selected["adapter"]["sha256"] = hashlib.sha256(adapter.read_bytes()).hexdigest()
+        self.write(self.harness / "local-config/public-check-policy.json", selected)
+        with self.assertRaisesRegex(ValueError, "startup failed|exited during startup"):
+            preparation.prepare(self.harness, self.workspace, "fixture")
+        before = preparation.read(home(self.workspace) / "service.json")
+        self.assertEqual("STOPPED", before["status"])
+        self.assertTrue(before["cleanup_proven"])
+        self.assertIn("configured preflight failure", before["error"])
+        self.assertTrue(processes.identity_exit_proven(before["pid"], before["creation_time"]))
+        self.close_runtime()
+        self.enable_service()
+        refreshed = preparation.prepare(self.harness, self.workspace, "fixture")
+        after = preparation.read(home(self.workspace) / "service.json")
+        self.assertNotEqual(before["startup_id"], after["startup_id"])
+        self.assertEqual("READY", after["status"])
+        self.assertTrue(refreshed["root_session_id"])
+        histories = [preparation.read(path) for path in (home(self.workspace) / "history").glob("*.json")]
+        self.assertTrue(any(item["service"].get("error") == before["error"] for item in histories))
+
+    def test_enabled_closed_reopen_same_run_restarts_only_on_explicit_prepare(self):
+        from orchestrator_harness import public_checks
+        self.enable_service()
+        self.prepared()
+        old_receipt = (self.workspace / preparation.RECEIPT).read_bytes()
+        before = preparation.read(public_checks.home(self.workspace) / "service.json")
+        session = self.preparation["root_session_id"]
+        self.close_runtime()
+        self.installed()
+        with patch.object(public_checks, "start_service", wraps=public_checks.start_service) as start:
+            with self.assertRaisesRegex(ValueError, "not healthy"):
+                preparation.validate_prepared_root(self.harness, self.workspace, "fixture", resuming=True)
+            start.assert_not_called()
+            refreshed = preparation.prepare(self.harness, self.workspace, "fixture")
+            start.assert_called_once()
+        self.assertEqual(session, refreshed["root_session_id"])
+        after = preparation.read(public_checks.home(self.workspace) / "service.json")
+        self.assertNotEqual(before["startup_id"], after["startup_id"])
+        receipt = preparation.read(self.workspace / preparation.RECEIPT)
+        self.assertEqual(old_receipt, Path(receipt["prior_receipt"]["path"]).read_bytes())
+
     def collector_args(self) -> argparse.Namespace:
         args = self.resume_args()
         args.resume_task_file = None
@@ -455,11 +514,11 @@ class RootPrelaunchTests(unittest.TestCase):
         self.prepared()
         receipt = preparation.read(self.workspace / preparation.RECEIPT)
         self.close_runtime()
-        with patch.object(public_checks, "validate_service", wraps=public_checks.validate_service) as validate:
+        with (patch.object(public_checks, "validate_service", wraps=public_checks.validate_service) as validate,
+              patch.object(public_checks, "service_cleanup", wraps=public_checks.service_cleanup) as cleanup):
             preparation.validate_prepared_root(self.harness, self.workspace, "fixture", resuming=True)
-            self.assertGreaterEqual(validate.call_count, 2)
-            self.assertTrue(all(call.args == (self.workspace, self.harness)
-                                and call.kwargs == {"runtime_closed": True} for call in validate.call_args_list))
+            validate.assert_called_once_with(self.workspace, self.harness, runtime_closed=True)
+            self.assertGreaterEqual(cleanup.call_count, 1)
         self.write(self.workspace / preparation.RECEIPT, {**receipt,
                    "public_check_service": {**receipt["public_check_service"], "pid": 456}})
         with self.assertRaisesRegex(ValueError, "service changed after"):

@@ -1,6 +1,5 @@
 """Public test feedback must preserve revision, lane and sandbox boundaries."""
 import importlib.util
-import errno
 import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
@@ -13,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from orchestrator_harness import public_checks as service
 from orchestrator_harness.records import atomic_write_json
@@ -437,28 +436,6 @@ class PublicCheckTests(unittest.TestCase):
         self.assertEqual("finite complete\n", feedback["stdout"])
         self.assertTrue(feedback["cleanup_proven"])
 
-    def test_publication_retries_only_windows_lock_acquisition_contention(self):
-        busy = MagicMock()
-        busy.__enter__ = Mock(side_effect=OSError(errno.EDEADLK, "busy"))
-        acquired = MagicMock()
-        acquired.__enter__ = Mock(return_value=acquired)
-        acquired.__exit__ = Mock(return_value=False)
-        with (patch.object(service.os, "name", "nt"),
-              patch.object(service, "runtime_admission_lock", side_effect=[busy, acquired]) as lock):
-            with self.assertRaisesRegex(OSError, "body failed"):
-                with service._publication_admission(self.root):
-                    raise OSError(errno.EDEADLK, "body failed")
-        self.assertEqual(2, lock.call_count)
-        acquired.__exit__.assert_called_once()
-        denied = MagicMock()
-        denied.__enter__ = Mock(side_effect=PermissionError(errno.EACCES, "denied"))
-        with (patch.object(service.os, "name", "nt"),
-              patch.object(service, "runtime_admission_lock", return_value=denied) as lock):
-            with self.assertRaises(PermissionError):
-                with service._publication_admission(self.root):
-                    self.fail("denied lock admitted publication")
-        lock.assert_called_once()
-
     def test_service_dispatches_each_request_only_to_its_registered_run(self):
         old_route, old_path = dict(self.route), self.submit()
         self.resume_route()
@@ -469,6 +446,7 @@ class PublicCheckTests(unittest.TestCase):
         self.config["policy"]["max_parallel_checks"] = 2
         self.config["startup_id"] = "3" * 32
         atomic_write_json(base / "config.json", self.config)
+        self.bind_service_owner(starting=True)
         dispatched = []
 
         def submit_inline(function, config, route, path, cancel, **kwargs):
@@ -508,14 +486,14 @@ class PublicCheckTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     service.validate_service(self.root, self.harness, runtime_closed=True)
 
-    def bind_service_owner(self):
+    def bind_service_owner(self, *, starting=False):
         identity = service.processes.process_identity(os.getpid())
         self.config["startup_id"] = "3" * 32
         base = service.home(self.root)
         atomic_write_json(base / "config.json", self.config)
         record = {"schema": "worker-public-check-service/v1", **identity,
                   "root": str(self.root), "harness": str(self.harness),
-                  "startup_id": self.config["startup_id"], "status": "READY", "stop_requested": False,
+                  "startup_id": self.config["startup_id"], "status": "STARTING" if starting else "READY", "stop_requested": False,
                   "policy_sha256": hashlib.sha256(json.dumps(self.policy, sort_keys=True).encode()).hexdigest()}
         atomic_write_json(base / "service.json", record)
         return identity["pid"], identity["creation_time"], self.config["startup_id"]
@@ -539,6 +517,7 @@ class PublicCheckTests(unittest.TestCase):
         self.config["startup_id"] = "3" * 32
         base = service.home(self.root)
         atomic_write_json(base / "config.json", self.config)
+        self.bind_service_owner(starting=True)
         replacement = {**self.config, "startup_id": "4" * 32}
         backend = Mock()
         def preflight():
@@ -546,15 +525,16 @@ class PublicCheckTests(unittest.TestCase):
             return {"backend": "old preflight"}
         backend.preflight.side_effect = preflight
         with patch.object(service, "bridge", return_value=backend):
-            with self.assertRaisesRegex(ValueError, "configuration changed during startup"):
+            with self.assertRaisesRegex(ValueError, "ownership changed"):
                 service.run_service(self.root)
         self.assertEqual(replacement, service.read(base / "config.json"))
-        self.assertFalse((base / "service.json").exists())
+        self.assertEqual("STARTING", service.read(base / "service.json")["status"])
 
     def test_old_service_cannot_publish_stopped_over_new_owner(self):
         self.config["startup_id"] = "3" * 32
         base = service.home(self.root)
         atomic_write_json(base / "config.json", self.config)
+        self.bind_service_owner(starting=True)
         def replace(_delay):
             record = service.read(base / "service.json")
             atomic_write_json(base / "service.json", {**record, "startup_id": "4" * 32})
@@ -569,6 +549,7 @@ class PublicCheckTests(unittest.TestCase):
         self.config["startup_id"] = "3" * 32
         base = service.home(self.root)
         atomic_write_json(base / "config.json", self.config)
+        self.bind_service_owner(starting=True)
         backend = Mock()
         backend.preflight.return_value = {"devices": ("first", "second")}
         def stop(_delay):
@@ -579,6 +560,90 @@ class PublicCheckTests(unittest.TestCase):
             service.run_service(self.root)
         self.assertEqual(["first", "second"], service.read(base / "config.json")["backend"]["devices"])
         self.assertEqual("STOPPED", service.read(base / "service.json")["status"])
+
+    def test_delayed_startup_timeout_retains_original_child_exit_proof(self):
+        atomic_write_json(self.harness / service.POLICY, self.policy)
+        environment = service._service_environment(self.harness)
+        environment["PYTHONPATH"] = str(SOURCE)
+        with (patch.object(service, "_service_environment", return_value=environment),
+              patch.object(service.time, "monotonic", side_effect=[0, 181])):
+            with self.assertRaisesRegex(ValueError, "did not become ready"):
+                service.start_service(self.harness, self.root)
+        record = service.service_cleanup(self.root, self.harness)
+        self.assertEqual("STOPPED", record["status"])
+        self.assertIn("did not become ready", record["error"])
+        self.assertTrue(service.processes.identity_exit_proven(record["pid"], record["creation_time"]))
+
+    def test_scan_failure_drains_active_check_before_stopped(self):
+        from orchestrator_harness.mutation import MutationConflict
+        self.bind_service_owner(starting=True)
+        base = service.home(self.root)
+        atomic_write_json(base / "routes" / f"{self.run_id}.json", self.route)
+        self.submit()
+        active, canceled = threading.Event(), threading.Event()
+        def runner(snapshot, command, *, timeout, cancel):
+            active.set()
+            self.assertTrue(cancel.wait(10), "service did not cancel its active adapter")
+            canceled.set()
+            return {"stdout": "canceled", "stderr": "", "exit_code": 125, "cleanup_proven": True}
+        original = service.serve_request
+        def serve(*args, **kwargs):
+            return original(*args, runner=runner, **kwargs)
+        def interrupted_scan(delay):
+            self.assertTrue(active.wait(10), "check did not become active")
+            raise MutationConflict("controlled scan read replacement")
+        with (patch.object(service, "serve_request", side_effect=serve),
+              patch.object(service.time, "sleep", side_effect=interrupted_scan)):
+            with self.assertRaisesRegex(MutationConflict, "controlled scan"):
+                service.run_service(self.root)
+        record = service.read(base / "service.json")
+        self.assertTrue(canceled.is_set())
+        self.assertEqual("STOPPED", record["status"])
+        self.assertTrue(record["cleanup_proven"])
+        self.assertIn("controlled scan", record["error"])
+
+    def test_native_atomic_replacement_between_observation_and_open_is_a_conflict(self):
+        from orchestrator_harness import mutation
+        path = service.home(self.root) / "replacement.json"
+        atomic_write_json(path, {"generation": 1})
+        original = mutation._DirectoryAnchor.stat
+        replaced = False
+        def stat(anchor, name):
+            nonlocal replaced
+            observed = original(anchor, name)
+            if anchor.parent / name == path and not replaced:
+                replaced = True
+                atomic_write_json(path, {"generation": 2})
+            return observed
+        with patch.object(mutation._DirectoryAnchor, "stat", stat):
+            with self.assertRaises(mutation.MutationConflict):
+                service.read(path)
+        self.assertTrue(replaced)
+        self.assertEqual({"generation": 2}, service.read(path))
+
+    def test_scan_failure_cannot_claim_unproven_adapter_cleanup(self):
+        self.bind_service_owner(starting=True)
+        base = service.home(self.root)
+        atomic_write_json(base / "routes" / f"{self.run_id}.json", self.route)
+        self.submit()
+        active = threading.Event()
+        def runner(snapshot, command, *, timeout, cancel):
+            active.set()
+            cancel.wait(10)
+            return {"stdout": "", "stderr": "uncertain cleanup", "exit_code": 2, "cleanup_proven": False}
+        original = service.serve_request
+        def serve(*args, **kwargs):
+            return original(*args, runner=runner, **kwargs)
+        def interrupted(delay):
+            self.assertTrue(active.wait(10))
+            raise ValueError("controlled observation failure")
+        with (patch.object(service, "serve_request", side_effect=serve),
+              patch.object(service.time, "sleep", side_effect=interrupted)):
+            with self.assertRaisesRegex(ValueError, "controlled observation"):
+                service.run_service(self.root)
+        record = service.read(base / "service.json")
+        self.assertFalse(record["cleanup_proven"])
+        self.assertEqual("CLEANUP_UNPROVEN", record["status"])
 
     def test_closed_resume_rejects_still_live_service_identity(self):
         record = {"schema": "worker-public-check-service/v1", "root": str(self.root),

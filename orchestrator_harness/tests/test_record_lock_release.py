@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import json
 import unittest
 from unittest.mock import patch
 
@@ -274,6 +277,52 @@ class RecordLockReleaseTests(unittest.TestCase):
         self.assertEqual(0, child.returncode, stderr)
         self.assertEqual([], errors)
         self.assertTrue(entered.is_set())
+
+    @unittest.skipUnless(os.name == "nt", "Windows LK_LOCK finite wait")
+    def test_windows_retries_acquisition_only_and_preserves_body_error(self):
+        import msvcrt
+        native = msvcrt.locking
+        calls = []
+        def locking(fd, mode, size):
+            calls.append(mode)
+            if mode == msvcrt.LK_LOCK and calls.count(mode) == 1:
+                raise OSError(errno.EDEADLK, "native contention")
+            return native(fd, mode, size)
+        bodies = []
+        with patch.object(msvcrt, "locking", side_effect=locking):
+            with self.assertRaisesRegex(OSError, "body failure"):
+                with records.RecordLock(self.root / "retry"):
+                    bodies.append(True)
+                    raise OSError(errno.EDEADLK, "body failure")
+        self.assertEqual([True], bodies)
+        self.assertEqual([msvcrt.LK_LOCK, msvcrt.LK_LOCK, msvcrt.LK_UNLCK], calls)
+        with patch.object(msvcrt, "locking", side_effect=PermissionError(errno.EACCES, "denied")) as lock:
+            with self.assertRaises(PermissionError):
+                with records.RecordLock(self.root / "retry"):
+                    self.fail("denied acquisition entered body")
+        lock.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows LK_LOCK native contention")
+    def test_windows_admission_waits_past_native_window_for_exact_child(self):
+        from orchestrator_harness import processes
+        code = ("import json,os,sys,time; from pathlib import Path; "
+                "from orchestrator_harness import processes; "
+                "from orchestrator_harness.records import runtime_admission_lock; "
+                "lock=runtime_admission_lock(Path(sys.argv[1])); lock.__enter__(); "
+                "print(json.dumps(processes.process_identity(os.getpid())),flush=True); "
+                "time.sleep(12); lock.__exit__(None,None,None)")
+        child = subprocess.Popen([sys.executable, "-B", "-c", code, str(self.root)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        identity = json.loads(child.stdout.readline())
+        self.assertTrue(processes.identity_matches(identity["pid"], identity["creation_time"]))
+        start = time.monotonic()
+        try:
+            with records.runtime_admission_lock(self.root):
+                self.assertGreater(time.monotonic() - start, 10)
+        finally:
+            stdout, stderr = child.communicate(timeout=30)
+        self.assertEqual(0, child.returncode, stdout + stderr)
+        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
 
 
 if __name__ == "__main__":
