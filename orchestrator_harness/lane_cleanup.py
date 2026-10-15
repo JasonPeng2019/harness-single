@@ -17,7 +17,29 @@ from .records import read_record
 FORCED_CLEANUP_SCHEMA = "lane-cleanup/v1"
 
 
-def _history_proof(lane: dict[str, Any]) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+def _bound_history_hash(raw: bytes, recorded: object, run_id: str) -> str:
+    """Keep a receipt's history binding when only other runs appended rows.
+
+    The shared lane journal grows when a later saved-session retry runs. The
+    recorded journal must remain a byte-identical row prefix; any later row for
+    the receipt's own run, or any rewritten byte, still breaks the binding.
+    """
+    digest = hashlib.sha256(raw).hexdigest()
+    if not isinstance(recorded, str) or digest == recorded:
+        return digest
+    rows = raw.splitlines(keepends=True)
+    prefix = hashlib.sha256()
+    for index, row in enumerate(rows):
+        prefix.update(row)
+        if prefix.hexdigest() == recorded:
+            later = [json.loads(line) for line in rows[index + 1:]]
+            if all(isinstance(line, dict) and line.get("run_id") != run_id for line in later):
+                return recorded
+            break
+    return digest
+
+
+def _history_proof(lane: dict[str, Any], recorded: object = None) -> tuple[str | None, str | None, list[dict[str, Any]]]:
     if not lane.get("provider_history_path"):
         return None, None, []
     from .retry_policy import _path, current_invocation_facts
@@ -29,7 +51,7 @@ def _history_proof(lane: dict[str, Any]) -> tuple[str | None, str | None, list[d
     native = mutation.durable_identity(path.parent, path.name, expected=original)
     facts = current_invocation_facts(lane)
     mutation.durable_identity(path.parent, path.name, expected=original)
-    return hashlib.sha256(raw).hexdigest(), native, facts
+    return _bound_history_hash(raw, recorded, lane["run_id"]), native, facts
 
 
 def _native_cleanup_proof(lane: dict[str, Any]) -> dict[str, Any]:
@@ -134,7 +156,7 @@ def _forced_cleanup_is_proven(lane: dict[str, Any]) -> bool:
         if mutation.durable_identity(path.parent.parent, path.parent.name,
                 expected=folder) != observations["directory_identity"]:
             return False
-        history_hash, history_identity, facts = _history_proof(lane)
+        history_hash, history_identity, facts = _history_proof(lane, record["invocation_ref"])
         if history_hash != record["invocation_ref"] or history_identity != observations["history_identity"]:
             return False
         if any(fact["kind"] == "RESERVED" for fact in facts):
@@ -145,7 +167,7 @@ def _forced_cleanup_is_proven(lane: dict[str, Any]) -> bool:
             mutation.durable_identity(path.parent, path.name, expected=original,
                                       expected_root_identity=folder.identity)
             mutation.durable_identity(path.parent.parent, path.parent.name, expected=folder)
-            return _history_proof(lane) == (history_hash, history_identity, facts)
+            return _history_proof(lane, record["invocation_ref"]) == (history_hash, history_identity, facts)
         if observations["kind"] in {"never_launched", "controller_not_created"}:
             proof = _native_cleanup_proof(lane)
             return revalidated(proof["kind"] == observations["kind"] and record["controller"] is None
