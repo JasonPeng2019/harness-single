@@ -84,7 +84,16 @@ class BackgroundOwnerProofTests(unittest.TestCase):
               patch.object(monitor, "load_resource_manifest", return_value=config.ResourceManifest()),
               patch.object(monitor, "compute_config_identity", return_value="fixture"),
               patch.object(monitor, "_require_monitor_owner", side_effect=observe)):
-            self.assertEqual(1, monitor.main())
+            # Setup hands the reserved nonce to the exact monitor it starts.
+            with patch.dict(os.environ, {"HARNESS_MONITOR_STARTUP_ID": old["startup_id"]}):
+                self.assertEqual(1, monitor.main())
+            self.assertEqual(2, len(calls))
+            self.assertEqual(new, setup.read_monitor_record(self.rt))
+            # A process without the reserved nonce never adopts the record.
+            calls.clear()
+            with patch.dict(os.environ, {"HARNESS_MONITOR_STARTUP_ID": ""}):
+                self.assertEqual(1, monitor.main())
+            self.assertEqual([], calls)
         self.assertEqual(new, setup.read_monitor_record(self.rt))
 
     def test_closed_receipt_rejects_a_new_live_monitor(self):

@@ -286,16 +286,37 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
 
     def test_removed_boundary_inventory_symbols_have_no_tracked_references(self) -> None:
         repository = Path(__file__).resolve().parents[2]
-        for symbol in ("process_group_" + "inventory", "ProcessBoundary" + "Inventory"):
-            with self.subTest(symbol=symbol):
-                result = subprocess.run(
-                    ["git", "-C", str(repository), "grep", "-n", "-e", symbol, "--"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                self.assertEqual(1, result.returncode, result.stdout)
+        symbols = ("process_group_" + "inventory", "ProcessBoundary" + "Inventory")
+        top = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if top.returncode == 0 and Path(top.stdout.strip()).resolve() == repository:
+            for symbol in symbols:
+                with self.subTest(symbol=symbol):
+                    result = subprocess.run(
+                        ["git", "-C", str(repository), "grep", "-n", "-e", symbol, "--"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    self.assertEqual(1, result.returncode, result.stdout)
+            return
+        # A shipped archive copy has no Git metadata; its files are the shipped
+        # source, apart from runtime output that tests and tools may create.
+        generated = {".git", ".agent-workspace", ".harness-runtime", "__pycache__", "runtime"}
+        matches = []
+        for directory, names, files in os.walk(repository):
+            names[:] = [name for name in names if name not in generated and not name.endswith(".egg-info")]
+            for name in files:
+                data = (Path(directory) / name).read_bytes()
+                matches.extend(f"{Path(directory, name).relative_to(repository)}: {symbol}"
+                               for symbol in symbols if symbol.encode() in data)
+        self.assertEqual([], matches)
 
     def test_cleanup_status_transition_retains_boundary_evidence(self) -> None:
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -331,6 +352,7 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
             "result_id": "result-1",
             "result_hash": "result-hash",
             "commit": "commit-1",
+            "source_assignment_hash": "assignment-hash",
             "reviewed_at": "2026-09-02T00:00:00Z",
         }
         review["content_hash"] = content_hash(review)
@@ -346,6 +368,7 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
             "result_id": "result-1",
             "result_hash": "result-hash",
             "commit": "commit-1",
+            "source_assignment_hash": "assignment-hash",
             "decided_at": "2026-09-02T00:00:00Z",
         }
         acceptance["content_hash"] = content_hash(acceptance)
@@ -373,7 +396,8 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
 
     def test_monitor_rejects_mismatched_task_result_or_commit_identity(self) -> None:
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        for field in ("task_card_id", "task_card_hash", "result_id", "result_hash", "commit"):
+        for field in ("task_card_id", "task_card_hash", "result_id", "result_hash", "commit",
+                      "source_assignment_hash"):
             with self.subTest(field=field), tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as raw:
                 root = Path(raw) / "runtime" / "epochs" / "epoch-1" / "lanes" / "lane-1"
                 root.mkdir(parents=True)

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from orchestrator_harness import launch, mutation, records, setup
-from orchestrator_harness.tests.support import seed_acceptance_chain
+from orchestrator_harness import controller, git_source, lanes, launch, mutation, processes, records, review, setup
+from orchestrator_harness.core import content_hash, iso_utc
+from orchestrator_harness.epochs import lane_record_dir
+from orchestrator_harness.tests.support import prepare_lane_fixture, seed_provider_history
 
 
 def _windows_error(code: int) -> OSError:
@@ -207,40 +211,82 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         binding_path.parent.mkdir(parents=True)
         binding_path.write_text(binding, encoding="utf-8")
 
+    def _controller(self) -> subprocess.Popen[bytes]:
+        """A real controller stand-in that runs until the test releases its handle."""
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+
+        def stop() -> None:
+            # Exact cleanup through the owned handle only.
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=10)
+            child.stdin.close()
+
+        self.addCleanup(stop)
+        return child
+
+    @staticmethod
+    def _release(child: subprocess.Popen[bytes]) -> None:
+        child.stdin.write(b"x")
+        child.stdin.close()
+
+    def _exited_identity(self) -> dict[str, object]:
+        child = self._controller()
+        identity = processes.process_identity(child.pid)
+        self.assertIsNotNone(identity)
+        self._release(child)
+        child.wait(timeout=10)
+        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
+        return identity
+
     def test_provider_start_failure_clears_exact_controller_identity_after_handle_exit(
         self,
     ) -> None:
-        from orchestrator_harness.tests.support import seed_provider_history
-        self.lane["provider"] = self.invocation["provider"]
-        seed_provider_history(self.runtime, self.lane)
-        records.atomic_write_json(self.runtime / "epochs/epoch-1/lanes/lane-1/lane.json", self.lane)
-        Path(self.lane["controller_events_path"]).write_text(
-            '{"event_type":"provider_start_failed"}\n', encoding="utf-8"
+        lane = prepare_lane_fixture(
+            self.runtime, "epoch-1", {**self.lane, "provider": self.invocation["provider"]}
         )
-        status = {
-            "schema": "controller-status/v1",
-            "lane_id": "lane-1",
-            "run_id": "run-1",
-            "controller_state": "exited",
-            "provider_state": {"state": "not_started"},
-            "cleanup_proven": True,
-            "recorded_status": "provider_start_failed",
-        }
-        child = MagicMock(pid=41)
-        child.poll.return_value = 0
-        current = dict(self.lane)
+        seed_provider_history(self.runtime, lane)
+        lane = lanes.write_lane(self.runtime, "epoch-1", "lane-1", lane)
+        spawned: list[subprocess.Popen[bytes]] = []
         updates: list[dict[str, object]] = []
+        real_update = launch.update_lane
+
+        def spawn(_argv: object, **_options: object) -> subprocess.Popen[bytes]:
+            spawned.append(self._controller())
+            return spawned[-1]
 
         def update(
-            _rt: object,
-            _epoch: object,
-            _lane_id: object,
+            rt: Path,
+            epoch: str,
+            lane_id: str,
             mutate: object,
         ) -> dict[str, object]:
-            value = mutate(dict(current))
+            value = real_update(rt, epoch, lane_id, mutate)
             updates.append(value)
-            current.update(value)
-            return dict(current)
+            if len(updates) == 2:
+                # Registered: the controller cannot start its provider, publishes
+                # its terminal status and event, then exits on its own.
+                controller._write_status(value, {
+                    "controller_identity": value["process"],
+                    "controller_state": "exited",
+                    "provider_state": {"state": "not_started"},
+                    "cleanup_proven": True,
+                    "recorded_status": "provider_start_failed",
+                    "provider_start_error": "provider executable is missing",
+                    "process_boundary": None,
+                    "cleanup_error": None,
+                })
+                records.append_jsonl(
+                    Path(value["controller_events_path"]),
+                    {"ts": iso_utc(), "run_id": value["run_id"], "event_type": "provider_start_failed",
+                     "detail": "provider executable is missing"},
+                    header={"schema": controller.CONTROLLER_EVENTS_SCHEMA},
+                )
+                self._release(spawned[0])
+            return value
 
         with (
             patch.object(launch, "find_harness_root", return_value=self.root),
@@ -249,55 +295,72 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
                 "load_config",
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
-            patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
-            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
-            patch.object(launch, "find_active_lane", return_value=("epoch-1", self.lane)),
-            patch.object(launch, "read_record", return_value=self.invocation),
+            patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
             patch.object(
                 launch,
                 "_validate_provider_launch_config",
                 return_value=self.invocation["provider"]["launch_config"],
             ),
-            patch.object(launch.processes, "spawn_detached", return_value=child),
-            patch.object(
-                launch.processes,
-                "process_identity",
-                return_value={"pid": 41, "creation_time": "created-1"},
-            ),
+            patch.object(launch.processes, "spawn_detached", side_effect=spawn),
             patch.object(launch, "update_lane", side_effect=update),
-            patch.object(launch, "_read_controller_status", return_value=status),
-            patch.object(launch.processes, "identity_exit_proven", return_value=True),
         ):
             result = launch.run_launch("lane-1")
 
-        self.assertFalse(result["ok"])
+        self.assertFalse(result["ok"], result)
         self.assertEqual(launch.LAUNCH_PROVIDER_START_FAILED, result["code"])
-        self.assertEqual(
-            {"pid": 41, "creation_time": "created-1"}, updates[1]["process"]
-        )
+        self.assertEqual(1, len(spawned))
+        identity = updates[1]["process"]
+        self.assertEqual(spawned[0].pid, identity["pid"])
+        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
         self.assertEqual({}, updates[-1]["process"])
+        self.assertEqual({}, lanes.read_lane(self.runtime, "epoch-1", "lane-1")["process"])
 
     def test_retire_waits_for_controller_handle_after_exited_status(self) -> None:
-        lane = {
-            **self.lane,
-            "lifecycle": "accepted",
-            "process": {"pid": 41, "creation_time": "2026-10-11T06:00:00Z"},
+        lane = prepare_lane_fixture(self.runtime, "epoch-1", {
+            **self.lane, "lifecycle": "review_pending", "provider": self.invocation["provider"],
+        })
+        result = {
+            "schema": "result/v1", "lane_id": "lane-1", "run_id": "run-1",
+            "worker_invocation_id": "run-1", "task_card_hash": lane["task_card_hash"],
+            "branch": lane["git_source"]["branch_ref"].removeprefix("refs/heads/"),
+            "commit": git_source.current_tip(lane), "outcome": "PASS", "summary": "completed",
+            "checks": [{"name": "fixture", "command": ["python", "-m", "unittest"], "outcome": "PASS"}],
+            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}], "completed_at": iso_utc(),
         }
-        status = {
-            "schema": "controller-status/v1",
-            "lane_id": "lane-1",
-            "run_id": "run-1",
+        result["content_hash"] = content_hash(result)
+        records.atomic_write_json(Path(lane["result_path"]), result)
+        review._write_pair(
+            self.runtime, "epoch-1", lane, review_outcome="PASS", review_summary="reviewed",
+            evidence=[], approval="ACCEPTED", force_accept_reason=None,
+        )
+        acceptance_path = lane_record_dir(self.runtime, "epoch-1", "lane-1") / "ORCHESTRATOR_ACCEPTANCE.json"
+        provider = self._exited_identity()
+        handle = self._controller()
+        identity = processes.process_identity(handle.pid)
+        self.assertIsNotNone(identity)
+        lane = lanes.write_lane(self.runtime, "epoch-1", "lane-1", {
+            **lane, "lifecycle": "accepted", "process": identity,
+        })
+        # The controller has published exited/cleanup-proven status, but its
+        # process handle has not exited yet.
+        controller._write_status(lane, {
+            "controller_identity": identity,
             "controller_state": "exited",
-            "provider_state": {
-                "state": "exited",
-                "pid": 42,
-                "creation_time": "2026-10-11T06:00:00Z",
-            },
-            "process_boundary": {"root": {"pid": 42, "creation_time": "provider-created"}},
+            "provider_state": {"state": "exited", **provider, "exit_code": 0},
+            "process_boundary": {"root": provider, "processes": [provider]},
             "cleanup_proven": True,
-        }
-        acceptance = seed_acceptance_chain(self.runtime, "epoch-1", lane)
-        records.atomic_write_json(Path(lane["controller_status_path"]), status)
+            "recorded_status": "review_pending",
+        })
+        real_wait = launch._wait_for_controller_exit
+        waited: list[bool] = []
+
+        def wait_for_exit(current: dict[str, object], timeout_seconds: float) -> bool:
+            self.assertTrue(processes.identity_matches(identity["pid"], identity["creation_time"]))
+            self._release(handle)
+            handle.wait(timeout=10)
+            waited.append(real_wait(current, timeout_seconds))
+            return waited[-1]
+
         with (
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(
@@ -307,29 +370,22 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
                     runtime_root=self.runtime, root_workspace=self.root
                 ),
             ),
-            patch.object(launch, "_validate_acceptance_ref", return_value=acceptance),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
-            patch.object(launch, "_read_controller_status", return_value=status),
-            patch.object(
-                launch.processes,
-                "identity_exit_proven",
-                side_effect=[False, *([True] * 20)],
-            ),
-            patch.object(launch.processes, "identity_matches", return_value=True),
-            patch.object(launch.processes, "process_alive", return_value=False),
+            patch.object(launch, "_wait_for_controller_exit", side_effect=wait_for_exit),
+            # Provider boundary proof is covered elsewhere; the controller handle is the subject.
             patch.object(launch.processes, "process_boundary_is_gone", return_value=True),
             patch.object(launch, "release_leases"),
-            patch.object(launch, "update_lane"),
             patch.object(launch, "read_active_lanes", return_value=[]),
             patch.object(launch, "write_active_lanes"),
             patch.object(launch, "_prune_worktrees"),
             patch.object(launch, "_maybe_close_epoch"),
         ):
-            result = launch.run_retire("acceptance.json")
+            outcome = launch.run_retire(str(acceptance_path))
 
-        self.assertTrue(result["ok"], result)
-        self.assertEqual("RETIRE_OK", result["code"])
-
+        self.assertTrue(outcome["ok"], outcome)
+        self.assertEqual("RETIRE_OK", outcome["code"])
+        self.assertEqual([True], waited)
+        self.assertEqual("retired", lanes.read_lane(self.runtime, "epoch-1", "lane-1")["lifecycle"])
 
 if __name__ == "__main__":
     unittest.main()
