@@ -2,8 +2,10 @@
 
 The distribution contains no selected operator workspace. Set the empty
 `root_workspace` in the harness-root `harness-config.json` to the absolute path
-of your chosen Git workspace before running setup. An unconfigured distribution
-fails with a configuration error and cannot silently write into another project.
+of your chosen Git product workspace before running setup; the optional
+`manager_workspace` selects where ROOT hooks, skills and `.agent-workspace` are
+installed and defaults to `root_workspace`. An unconfigured distribution fails
+with a configuration error and cannot silently write into another project.
 Configured paths remain operator data; the harness never guesses a developer's
 workspace. Legacy observation examples also require an explicit `suite_root`.
 

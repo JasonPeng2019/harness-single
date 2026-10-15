@@ -97,10 +97,16 @@ the new revision. Repeated checks are separate from process-launch retries.
 
 The service binds request/lane/run/revision identities, deduplicates delivery,
 rejects stale/resumed or changed-tip requests, and publishes feedback directly
-to the worker. Historical registrations cannot overwrite another invocation's
-feedback. Shutdown cancels checks, proves adapter/service cleanup, then stops the
-native monitor. ROOT resume revalidates the original service/prelaunch proof
-without setup or an automatic service restart.
+to the worker. The staged client reads the lane's committed `HEAD` and refuses to
+request a check while configured inputs are uncommitted; checks therefore run
+against an exact committed revision, and a new commit needs a new request.
+Historical registrations cannot overwrite another invocation's feedback. Native
+bootstrap and resume stage a lane-local client and route bound to the current
+run, so a resumed session receives a fresh route; a request naming a stale run or
+route is refused and the lane must be refreshed through native preparation.
+Shutdown cancels checks, proves adapter/service cleanup, then stops the native
+monitor. ROOT resume revalidates the original service/prelaunch proof without
+setup or an automatic service restart.
 Routes retain the prepared worktree's filesystem identity. Requests are limited
 to 64 KiB and read through one file handle with held, nonlinked ancestors; growth
 after an initial size check cannot evade that bound. An old route without its

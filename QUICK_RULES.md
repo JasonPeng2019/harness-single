@@ -34,7 +34,8 @@
 - Delivery is at-least-once. Deduplicate with the top-level `event_id`.
 - Acknowledge only after handling and verifying the event.
 - Acknowledge the top-level `event_id`, never `data.signal_id`.
-- Leave an unhandled event pending.
+- Leave an unhandled event pending; an acknowledged event is not redelivered, so watch again for
+  new work after handling it.
 
 ## Resources and processes
 
@@ -43,10 +44,15 @@
 - Unknown identity is never safe absence. Reclaim only when exact PID-plus-creation evidence proves
   the prior owner absent.
 - A controller releases only claims owned by its exact invocation.
-- Stop cooperatively and never kill by broad process name or command matching.
+- Cancel a prepared or running lane only through `lane force-stop` and its exact recorded
+  PID-plus-creation identity; never kill by broad process name or command matching, and treat an
+  unobservable identity as a refusal rather than absence.
 - Each launcher gets one provider attempt; never automatically retry, refresh sandbox setup,
   switch modes or bypass a health gate. Preserve and diagnose failures before a separate launch.
 - A lane/session permits initial assignment plus at most one explicit manual retry across run IDs.
+  Retry explicitly with `resume-lane --lane-id <id> --resume-task-card <fresh-card.json>
+  --rationale <reason>` in the same worktree/session, then `lane launch`; there is no automatic
+  loop, and a retired lane refuses resume with a preserved error.
 - Prepare Codex ROOT hooks/monitor before the ROOT process starts. Windows Codex requires the
   read-only CLI/home/cache/marker/probe gate; missing local policy cannot disable it.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,

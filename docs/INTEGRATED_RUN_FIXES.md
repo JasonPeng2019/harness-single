@@ -3,7 +3,11 @@
 This portable harness integrates launcher safety, ROOT lifecycle enforcement,
 worker permissions and a project-configured build/test interface. It retains the
 strict task-card contract, watch acknowledgement behavior and review/resume
-recovery guards.
+recovery guards. `harness-config.json` splits the Git product workspace
+(`root_workspace`) from the optional ROOT workspace (`manager_workspace`, default
+`root_workspace`), which selects where ROOT hooks, skills and `.agent-workspace`
+are installed; existing provider configuration fields, hook groups and unrelated
+files are preserved.
 
 ## Implemented behavior
 
@@ -11,6 +15,11 @@ recovery guards.
   running worker or no current epoch. Unreadable managed state fails closed.
   Handle events, settle lanes, shut down and verify CLOSED before exit. Plain
   mode and an already CLOSED runtime retain their existing behavior.
+- Lane cancellation owns the exact recorded PID-plus-creation boundary and the
+  lane's declared resource leases: `lane force-stop` stops prepared and
+  busy-running lanes, proves cleanup before retiring the lane, and refuses when
+  the identity is unknown or records disagree. Public `harness shutdown` reports
+  CLOSED only for proven cleanup; CLOSED is not task-completion proof.
 - Each worker launcher invokes its provider once. An invalid RESULT or startup
   failure preserves transcript, stderr, usage and cleanup evidence. It never
   triggers an automatic correction, resume, provider switch or repair.
@@ -18,7 +27,11 @@ recovery guards.
   manual retry. Protected operator launch history spans run IDs; worker-local
   attempt logs are diagnostic mirrors. Missing/corrupt trusted saved-session
   history cannot reset the budget. Diagnose failures before a
-  separate launch and use a fresh lane/session after the budget is spent.
+  separate launch and use a fresh lane/session after the budget is spent. The
+  retry is `resume-lane --lane-id <id> --resume-task-card <fresh-card.json>
+  --rationale <reason>` followed by `lane launch`; it reuses the retained
+  worktree/session/history and never becomes an automatic loop. A retired lane in
+  the current epoch refuses resume with a preserved error.
 - ROOT hooks and the native monitor are installed before the ROOT process starts.
   Fresh launches and resumes validate the run/workspace/config/hook-bound setup
   receipt. Installing hooks inside ROOT is too late for that session's discovery.
@@ -48,13 +61,26 @@ recovery guards.
   flags unable to hide changes. FAIL/BLOCKED preserve dirty-source diagnostics.
   See the package README for explicit bookkeeping exclusions and unproven
   link/submodule/external-filter cases.
+- Codex lanes can run the native OSS transport with `--provider-option
+  launcher=ollama`: the launcher passes `--oss --local-provider ollama`, requires
+  the operator-owned `local-config/ollama-model-catalog.json` to match the exact
+  model slug and reasoning effort, and disables the provider's built-in web
+  search because the Ollama 0.40.2 stream path can corrupt the replayed
+  conversation. Hooks, worker isolation, approval policy and authentication
+  handling are unchanged; built-in web search is unavailable in this launcher,
+  nothing falls back to another provider automatically, and provider staffing
+  fallbacks remain ROOT planning rather than harness behavior.
 
 ## Operator preparation
 
-Configure a fresh harness copy and ROOT workspace. For Windows Codex, choose a
-process-local LOCALAPPDATA cache and keep it unchanged for setup, ROOT,
-controllers and workers. Obtain a real isolated-command/protected-path probe for
-the exact CLI/home/cache before issuing `local-config/windows-sandbox-health.json`.
+Configure a fresh harness copy and ROOT workspace, and optionally a separate
+manager workspace. A wheel installation is module-only; a runnable harness root
+also needs the sibling `adapters/`, `super-cache/`, `scripts/`, `tools/`,
+`harness_watcher_implementation/`, `docs/` and `examples/` trees plus operator
+configuration. For Windows Codex, choose a process-local LOCALAPPDATA cache and
+keep it unchanged for setup, ROOT, controllers and workers. Obtain a real
+isolated-command/protected-path probe for the exact CLI/home/cache before
+issuing `local-config/windows-sandbox-health.json`.
 `examples/windows-sandbox-health.example.json` is an UNVERIFIED schema template;
 a copied PASS receipt is not a new probe.
 
@@ -68,17 +94,18 @@ before emitting a diagnostic. Never run speculative `codex sandbox ...
 --help`, retry setup, switch implementations or broaden permissions to bypass
 the gate. Machine ACL repair is an operator responsibility.
 
-Before starting Codex ROOT:
+Before starting Codex ROOT, the sandbox gate reads the product workspace while
+preparation selects the configured manager workspace:
 
 ```powershell
-python -B scripts/check_windows_sandbox.py --harness-dir . --workspace <absolute-root>
-python -B scripts/prepare_root_launch.py --harness-dir . --workspace <absolute-root> --run-id <id>
+python -B scripts/check_windows_sandbox.py --harness-dir . --workspace <absolute-root-workspace>
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>
 ```
 
-Preparation invokes native setup once, validates hooks and writes
-`<root>/.agent-workspace/ROOT_PRELAUNCH_SETUP.json`. Repeating preparation for an
-identical prepared run only revalidates that receipt; it never repeats setup.
-Existing runtime without the matching receipt is refused. Use the same run ID
+Preparation invokes native setup once, validates hooks and writes the receipt
+under the manager workspace's `.agent-workspace/ROOT_PRELAUNCH_SETUP.json`. Repeating
+preparation for an identical prepared run only revalidates that receipt; it never repeats
+setup. Existing runtime without the matching receipt is refused. Use the same run ID
 and paths with `scripts/collect_codex_usage.py`. Supply `--results-dir` explicitly
 for a fresh run; the collector does not choose an evidence folder from its caller's cwd.
 

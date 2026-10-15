@@ -11,13 +11,13 @@ Every public command returns the small structured result `{ ok, code, summary, e
 next_action }`; `--json` emits it as the machine-readable result object. Success prints a short
 status line and exits 0; failure prints one stable failure code on stderr and exits non-zero.
 
-This generic edition starts from commit `5134f6c` and includes later core fixes for
-worker payload composition, setup recovery, process identity, Codex worker isolation,
-manager queue shutdown, provider usage receipts, and monitor logging. Configure
-`harness-config.json` with the ROOT workspace before use. The shipped configuration
-has an empty `root_workspace`; commands refuse it until the operator supplies an
-absolute workspace path. It never selects a developer's workspace. The harness does not
-install or query an experience memory store.
+Configure `harness-config.json` before use. The closed `harness-config/v1` shape has a
+required absolute `root_workspace` (the Git product and runtime workspace) and two optional
+keys: `manager_workspace` (an absolute workspace for ROOT hooks, skills and `.agent-workspace`;
+defaults to `root_workspace`) and `managed_coordination` (`enabled` or `disabled`; default
+`enabled`). The shipped configuration has an empty `root_workspace`; commands refuse it until
+the operator supplies an absolute workspace path. The harness never selects a developer's
+workspace and does not install or query an experience memory store.
 
 See [portable path configuration](docs/PATH_PORTABILITY.md) for tool discovery,
 unconfigured examples and the explicit WSL isolation mount inputs.
@@ -26,6 +26,17 @@ See [the integrated run fixes](docs/INTEGRATED_RUN_FIXES.md) for Codex ROOT prel
 preparation, the mandatory Windows sandbox health gate, the optional direct worker public
 build/test service, and remaining task-completion work. Reusable coding-task requirements
 are in [ROOT task policy](docs/ROOT_TASK_POLICY.md).
+
+## Installation layout
+
+A wheel installation provides the module-only distribution: the `orchestrator_harness` and
+`harness_common` modules plus their packaged data files. A runnable harness root also needs the
+sibling product trees from this checkout: `adapters/`, `super-cache/`, `scripts/`, `tools/`,
+`harness_watcher_implementation/`, `docs/`, `examples/`, the top-level operating files and
+explicit operator configuration, as produced by the staged installation procedure (build the
+wheel from a fixed source copy, install it into a fresh target, then add the sibling trees).
+Packaging validation fixtures used during development are private developer tooling, not product
+examples, and installing the product does not by itself prove a live provider run.
 
 ## What the harness does and does not do
 
@@ -48,10 +59,16 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
   lane; `lane launch --lane-id` — start one prepared lane.
 - `lane completion-review (--event-id|--lane-id) --review-outcome {PASS,FAIL,BLOCKED} --approval
   {ACCEPTED,REJECTED} --review-summary [--evidence] [--force-accept] [--force-reason]` — record
-  ROOT's review and acceptance.
-- `lane force-stop --lane-id` — hard-stop one stuck lane; `lane retire --acceptance-ref` —
-  gracefully retire one accepted lane.
-- `resume-lane --lane-id --resume-task-card [--rationale]` — re-run a stopped, unaccepted lane.
+  ROOT's review and acceptance; the managed `--event-id` selector requires the acknowledged
+  review event and closes it. ACCEPTED requires a PASS finding.
+- `lane force-stop --lane-id` — hard-stop one stuck lane (prepared or running) by exact
+  recorded PID-plus-creation identity and release its leases; an unobservable or conflicting
+  identity refuses instead of guessing. `lane retire --acceptance-ref` — gracefully retire one
+  accepted lane.
+- `resume-lane --lane-id --resume-task-card [--rationale]` — re-run a stopped or otherwise
+  resumable unaccepted lane in its retained worktree/session with a fresh complete task card and an
+  explicit rationale; a retired lane in the current epoch refuses resume, and there is no automatic
+  retry loop.
 - `manager acknowledge --event-id <top-level-event-id>` — move one event PENDING -> ACKNOWLEDGED; `manager close
   --event-id --outcome {COMPLETE,BLOCKED} --summary <text>` — close an acknowledged event (managed only).
 - `lease force-release --resource-id <id>` — recover one declared orphaned resource lease. The
@@ -59,14 +76,17 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
   proves release is safe; follow its returned `next_action` instead of hand-editing lease records.
 - `send-lane-notification --lane-id --prompt` — append one assignment to a running managed lane.
 - `scan --no-write` — read-only lane-status snapshot; `watch --until-actionable [--timeout]
-  [--until-event]` — block until an actionable condition exists.
+  [--until-event]` — block until an actionable condition exists. An event already delivered and
+  acknowledged for this ROOT session is not redelivered; after handling it, watch again for new
+  work.
 - `health reconcile` — rebuild active-lanes and re-derive status.
 
 ## One-time ROOT sequence
 
-1. Write `harness-config.json` at the harness root: the closed two-key `harness-config/v1` shape
-   with a required absolute `root_workspace` and optional `managed_coordination` (`enabled` or
-   `disabled`; default `enabled`). No other keys are legal.
+1. Write `harness-config.json` at the harness root: the closed `harness-config/v1` shape with a
+   required absolute `root_workspace`, optional absolute `manager_workspace` (ROOT hooks, skills
+   and `.agent-workspace`; defaults to `root_workspace`), and optional `managed_coordination`
+   (`enabled` or `disabled`; default `enabled`). No other keys are legal.
 2. Write `resource-manifest.json`: the closed `resource-manifest/v1` shape with a literal `schema`
    field and a `resources` list. Every nonempty entry declares a nonempty `id` and
    `exclusive: true`; duplicate IDs and unknown fields are invalid.
@@ -76,12 +96,14 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
    directory, and starts the persistent monitor. It starts no lane or provider and never creates
    an epoch or worktree.
 
-Setup preserves existing `.codex/` and `.claude/` directories. It adds the harness-owned skills,
-hook scripts, and binding files, while structurally merging harness hook registrations into an
-existing `.codex/hooks.json` or `.claude/settings.json`. Existing fields, permissions, and hook
-groups remain in place. An existing `.codex/config.toml` is preserved byte-for-byte and must already
-set `[features] hooks = true`. `--overwrite` replaces only harness-owned payload files; it does not
-replace these shared provider configuration files.
+ROOT payloads (skills, hook scripts, binding files and the `.agent-workspace` helpers) are
+installed into the configured `manager_workspace`. Setup preserves existing `.codex/` and `.claude/`
+directories. It adds the harness-owned skills, hook scripts, and binding files, while structurally
+merging harness hook registrations into an existing `.codex/hooks.json` or `.claude/settings.json`.
+Existing fields, permissions, hook groups and unrelated files remain in place. An existing
+`.codex/config.toml` is preserved byte-for-byte and must already set `[features] hooks = true`.
+`--overwrite` replaces only harness-owned payload files; it does not replace these shared provider
+configuration files.
 
 ### Managed vs plain
 
@@ -108,11 +130,22 @@ requires `effort`; Qwen Code currently has no provider option beyond its require
 unknown, or duplicate options fail before an epoch, worktree, controller, or provider is created.
 Launcher bindings never select a model, effort, service tier, or fallback.
 
+Codex lanes can select the native OSS transport with `--provider-option launcher=ollama` (the
+default is the ordinary Codex launcher). That launcher passes `--oss --local-provider ollama`,
+requires the operator-owned `local-config/ollama-model-catalog.json` to contain exactly one entry
+for the lane's exact model slug advertising the configured `reasoning_effort`, and passes that
+catalog to the provider. Ollama 0.40.2's built-in web-search path can corrupt the replayed
+conversation, so the Ollama launcher sets `web_search="disabled"`; built-in web search is
+unavailable in this launcher. Hooks, worker isolation, approval policy and authentication handling
+are unchanged: the launcher never bypasses the configured permissions and never falls back to
+another provider. Provider staffing fallbacks are a ROOT planning decision, not harness behavior.
+
 ## Super-cache and bootstrap
 
 `super-cache/workspace/` is the provider-neutral base staged into every managed worktree by
-`lane bootstrap`: the shared `.agent-workspace/` skeleton plus the three provider-neutral helpers
-(`result-stop-check.py`, `lane-queue.py`, `manager-notify.py`). Bootstrap also materializes the
+`lane bootstrap`: the shared `.agent-workspace/` skeleton plus the four provider-neutral helpers
+(`result-stop-check.py`, `lane-queue.py`, `manager-notify.py`, `hook-dispatch.py`); plain mode
+omits the manager-queue and notice helpers. Bootstrap also materializes the
 selected provider's worker payload, writes the authoritative worker binding with runtime paths,
 and creates the lane's inbox/outbox. Bootstrap opens the epoch on first use and reuses it while
 the immutable configuration is unchanged.

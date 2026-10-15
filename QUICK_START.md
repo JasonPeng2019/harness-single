@@ -9,14 +9,18 @@ python -m orchestrator_harness.operator_launch <group> <command> [options]
 
 ## 1. Configure the harness root
 
-Write `harness-config.json` at the harness root (closed two-key `harness-config/v1` shape):
+Write `harness-config.json` at the harness root (closed `harness-config/v1` shape):
 
 ```json
 {
-  "root_workspace": "<absolute-path-to-root-workspace>",
+  "root_workspace": "<absolute-path-to-product-workspace>",
+  "manager_workspace": "<absolute-path-for-ROOT-hooks-and-skills>",
   "managed_coordination": "enabled"
 }
 ```
+
+`root_workspace` selects the Git product workspace; `manager_workspace` is optional and selects
+where ROOT hooks, skills and `.agent-workspace` are installed (defaults to `root_workspace`).
 
 Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
 
@@ -38,10 +42,11 @@ for the exact CLI/home/process-local LOCALAPPDATA cache. Follow
 [the integration guide](docs/INTEGRATED_RUN_FIXES.md); no PASS receipt ships with the harness.
 
 ```powershell
-python -B scripts/prepare_root_launch.py --harness-dir . --workspace <absolute-root> --run-id <id>
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>
 ```
 
-This calls native setup once, verifies hooks/monitor and records a matching receipt. The usage
+`--workspace` must equal the configured `manager_workspace`. This calls native setup once, verifies
+hooks/monitor and records a matching receipt under that workspace's `.agent-workspace/`. The usage
 collector requires it before a fresh harness ROOT launch. ROOT continues that prepared runtime.
 An existing runtime without the matching receipt is refused; setup after ROOT starts cannot
 install hooks into that already-running session. Optional public-check policy must be installed
@@ -103,11 +108,24 @@ remains in use; `permission_mode=worker-isolated` selects it explicitly. Claude 
 uses `--permission-mode bypassPermissions`, equivalent to its permission-bypass CLI
 flag. Permission bypass does not change the assigned repository or task ownership.
 
+For the native Codex OSS transport, add `--provider-option launcher=ollama` and provide the
+operator-owned `local-config/ollama-model-catalog.json` with exactly one entry for the exact
+`--model` slug advertising the configured `reasoning_effort`. The Ollama launcher passes
+`--oss --local-provider ollama` and disables the provider's built-in web search, whose 0.40.2 path
+can corrupt the replayed conversation; built-in web search is unavailable in this mode. The
+configured model/effort, hooks, isolation and approval policy are unchanged, and nothing switches
+providers automatically.
+
 ## 4. Launch
 
 ```powershell
 python -m orchestrator_harness.operator_launch lane launch --lane-id lane-01
 ```
+
+Inside the lane the worker edits only its own isolated worktree, commits the configured project
+inputs, requests a configured check when public-check policy is installed, and writes `RESULT.json`
+for the current committed tip. A stale, non-tip or dirty result is not completion, and launches or
+checks are never retried automatically.
 
 ## 5. Wait and acknowledge (managed)
 
@@ -117,7 +135,9 @@ python -m orchestrator_harness.operator_launch manager acknowledge --event-id <t
 ```
 
 Acknowledge only the envelope's top-level `event_id` after handling the event; `data.signal_id`
-is not an acknowledgement ID. Close handled events with:
+is not an acknowledgement ID. An event already delivered and acknowledged for this ROOT session is
+not redelivered: after handling it, run `watch` again to block for new work. Close handled events
+with:
 
 ```powershell
 python -m orchestrator_harness.operator_launch manager close --event-id <id> --outcome COMPLETE --summary <text>
@@ -125,13 +145,17 @@ python -m orchestrator_harness.operator_launch manager close --event-id <id> --o
 
 ## 6. Review and accept
 
-The worker writes `RESULT.json` at the worktree root (`result/v1`). ROOT records the factual finding
-and the separate accept/reject decision:
+The worker writes `RESULT.json` for the current committed tip at the worktree root (`result/v1`).
+ROOT records the factual finding and the separate accept/reject decision. Select the acknowledged
+review event with `--event-id` in managed mode (plain mode uses `--lane-id`):
 
 ```powershell
 python -m orchestrator_harness.operator_launch lane completion-review `
-  --lane-id lane-01 --review-outcome PASS --approval ACCEPTED --review-summary <summary>
+  --event-id <review-event-id> --review-outcome PASS --approval ACCEPTED --review-summary <summary>
 ```
+
+`ACCEPTED` requires a `PASS` finding; `--force-accept` cannot override that. Review returns the
+acceptance reference used to retire the lane.
 
 ## 7. Retire
 
@@ -141,12 +165,16 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
 
 ## Resume, force-stop, shutdown
 
-- Resume a stopped, unaccepted lane: `resume-lane --lane-id lane-01 --resume-task-card <card>`,
-  then `lane launch --lane-id lane-01`. Initial assignment plus at most one explicit manual
-  retry is allowed per lane/session, including launches under new run IDs.
-- Hard-stop a stuck lane: `lane force-stop --lane-id lane-01`.
+- Resume a stopped, unaccepted lane with a fresh complete task card and an explicit rationale:
+  `resume-lane --lane-id lane-01 --resume-task-card <fresh-card.json> --rationale <reason>`,
+  then `lane launch --lane-id lane-01`. It reuses the retained worktree, session and history. The
+  allowance is the initial assignment plus at most one explicit manual retry per lane/session,
+  across run IDs; there is no automatic retry or model switch. A retired lane in the current epoch
+  refuses resume and keeps its records; follow the returned next action.
+- Cancel a prepared or running stuck lane: `lane force-stop --lane-id lane-01`. It stops only the
+  exact recorded PID-plus-creation identities and refuses an unknown identity.
 - End the whole runtime: `harness shutdown`. Managed ROOT Stop rejects OPEN, including an empty
-  queue with a live worker. Verify CLOSED before exiting; cleanup is separate from task success.
+  queue with a live worker. CLOSED is published only for proven cleanup, not for task success.
 
 ## Follow the run
 
@@ -168,6 +196,8 @@ values are redacted in the views; task and prompt text remains visible.
 
 ## Notes
 
+- Run the harness from a full installed layout (module wheel plus the sibling product trees and
+  operator configuration), not from a bare wheel install; see `README.md`.
 - Run `scan --no-write` before launch for a read-only lane-status snapshot.
 - `send-lane-notification --lane-id <id> --prompt <assignment>` appends one assignment to a
   running managed lane.

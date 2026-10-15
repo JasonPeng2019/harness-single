@@ -130,6 +130,9 @@ python -m harness_watcher_implementation --config <epoch-config> status
 python -m harness_watcher_implementation --config <epoch-config> stop
 ```
 
+READY is published after startup initialization completes and before the first poll, so it marks
+the service-ready boundary rather than useful activity; the first poll and its evidence follow.
+
 Proof is the service JSON's `evaluator_enabled:false` through READY and terminal state plus
 `SERVICE_STARTED`, `POLL` (`evaluator_enabled:false`), and `EVALUATOR_SKIPPED` records under the
 watcher runtime. If READY is not published, confirm the owner PID/creation identity and config
@@ -210,7 +213,7 @@ processes by broad command-line matching.
 
 ## Validation
 
-Historical run evidence was intentionally not copied. The portable snapshot itself passed 208
-harness tests (one environment-gated skip), 99 watcher tests, compilation, configuration loading,
-and the host-only attention practical. Re-run the commands in the portable root `README.md` after
-changing code.
+Historical run evidence was intentionally not copied and no stored test counts are shipped.
+Re-run the focused commands named in the portable root `README.md` after changing watcher or
+harness code. Fixture and example configurations are validation scaffolding, not product examples,
+and static checks never prove live provider or OS-enforcement behavior.
