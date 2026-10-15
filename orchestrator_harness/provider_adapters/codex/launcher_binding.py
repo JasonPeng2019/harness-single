@@ -198,7 +198,13 @@ def build_argv(
         catalog = _ollama_model_catalog(model, configured["reasoning_effort"])
         # OSS selection belongs to exec; resume has no --oss option of its own.
         argv[2:2] = ["--oss", "--local-provider", "ollama"]
-        argv[-1:-1] = ["-c", f"model_catalog_json={json.dumps(str(catalog))}"]
+        # Ollama 0.40.2's built-in web-search path emits client function calls
+        # before closing reasoning, corrupting the history replayed by Codex.
+        # Omit that tool even when the task never intends to search the web.
+        argv[-1:-1] = [
+            "-c", 'web_search="disabled"',
+            "-c", f"model_catalog_json={json.dumps(str(catalog))}",
+        ]
     argv[0] = _direct_codex_executable()
     return argv
 
