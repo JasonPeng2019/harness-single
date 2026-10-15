@@ -122,6 +122,21 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
     return int(info.st_dev), int(info.st_ino)
 
 
+def same_identity(actual: tuple[int, int] | list[int], expected: tuple[int, int] | list[int]) -> bool:
+    """Compare a current identity with one recorded, possibly by another Python.
+
+    Worker helpers can run under a different interpreter than the operator. On
+    Windows, Python >=3.12 reports the 64-bit volume serial where earlier
+    versions report its low 32 bits. Only a legacy 32-bit serial is compared
+    with the low half of the other; two full serials and the file ID must
+    still match exactly.
+    """
+    (actual_device, actual_file), (expected_device, expected_file) = actual, expected
+    if os.name == "nt" and min(actual_device, expected_device) <= 0xFFFFFFFF:
+        actual_device, expected_device = actual_device & 0xFFFFFFFF, expected_device & 0xFFFFFFFF
+    return (actual_device, actual_file) == (expected_device, expected_file)
+
+
 def _windows_close(handle: object) -> None:
     if not _CloseHandle(handle):
         raise MutationError(f"native handle close failed ({ctypes.get_last_error()})")
@@ -887,7 +902,7 @@ def _read_file_observation(
             _after_anchor()
         anchor.assert_stable()
         if (expected_root_identity is not None
-                and _identity(root_path.lstat()) != expected_root_identity):
+                and not same_identity(_identity(root_path.lstat()), expected_root_identity)):
             raise MutationConflict("read root identity changed after preparation")
         before = anchor.stat(name)
         if _is_reparse(target) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -982,7 +997,7 @@ def durable_identity(
         rel = _relative(root_path, relative)
         parent, name = _validate_chain(root_path, rel)
     with _DirectoryAnchor(root_path, parent) as anchor:
-        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(anchor.root_identity, expected_root_identity):
             raise MutationConflict("durable identity authority changed")
         if name is None:
             if expected.identity != anchor.root_identity:
@@ -1037,7 +1052,7 @@ def read_link_value(
     with _DirectoryAnchor(root_path, parent) as anchor:
         _after_anchor()
         anchor.assert_stable()
-        if expected_root_identity is not None and _identity(root_path.lstat()) != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(_identity(root_path.lstat()), expected_root_identity):
             raise MutationConflict("link read root identity changed after preparation")
         before = anchor.stat(name)
         if not stat.S_ISLNK(before.st_mode) or before.st_nlink != 1:
@@ -1105,7 +1120,7 @@ def open_append_file(root: str | Path, relative: str | Path, *,
         anchor.__enter__()
         _after_anchor()
         anchor.assert_stable()
-        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(anchor.root_identity, expected_root_identity):
             raise MutationConflict("append authority changed after preparation")
         _require_anchored_directories(anchor, expected_directories)
         before = expected if expected is not None else _capture_anchored(anchor, name, include_content=False)
@@ -1250,7 +1265,7 @@ def _publish(root: str | Path, relative: str | Path, data: bytes, *,
         try:
             _after_anchor()
             anchor.assert_stable()
-            if expected_root_identity is not None and _identity(root_path.lstat()) != expected_root_identity:
+            if expected_root_identity is not None and not same_identity(_identity(root_path.lstat()), expected_root_identity):
                 raise MutationConflict("publication root identity changed after preparation")
             _require_anchored_directories(anchor, expected_directories)
             authorized = expected if expected is not None else _capture_anchored(anchor, name, include_content=True)
@@ -1350,7 +1365,7 @@ def _windows_replace_bound(root: str | Path, relative: str | Path, data: bytes, 
     with anchor:
         _after_anchor()
         anchor.assert_stable()
-        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(anchor.root_identity, expected_root_identity):
             raise MutationConflict("replacement root identity changed after preparation")
         _require_anchored_directories(anchor, expected_directories)
         authorized = expected if expected is not None else _capture_anchored(anchor, name, include_content=True)
@@ -1404,7 +1419,7 @@ def delete(
     with anchor:
         _after_anchor()
         anchor.assert_stable()
-        if expected_root_identity is not None and _identity(root_path.lstat()) != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(_identity(root_path.lstat()), expected_root_identity):
             raise MutationConflict("deletion root identity changed after preparation")
         _require_anchored_expected(anchor, name, authorized)
         _after_target_proof()
@@ -1510,7 +1525,7 @@ def create_directory(root: str | Path, relative: str | Path, *,
     _before_commit()
     with anchor:
         _after_anchor()
-        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+        if expected_root_identity is not None and not same_identity(anchor.root_identity, expected_root_identity):
             raise MutationConflict("directory creation authority changed after preflight")
         _require_anchored_directories(anchor, expected_directories)
         _require_anchored_expected(anchor, name, TargetState.absent())
@@ -1763,8 +1778,8 @@ def rename(
         _after_anchor()
         source_anchor.assert_stable(); target_anchor.assert_stable()
         if expected_root_identity is not None and (
-                source_anchor.root_identity != expected_root_identity
-                or target_anchor.root_identity != expected_root_identity):
+                not same_identity(source_anchor.root_identity, expected_root_identity)
+                or not same_identity(target_anchor.root_identity, expected_root_identity)):
             raise MutationConflict("rename root identity changed after preparation")
         _require_anchored_expected(source_anchor, source_name, source_state)
         _require_anchored_expected(target_anchor, target_name, target_state)

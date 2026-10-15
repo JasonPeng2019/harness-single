@@ -15,7 +15,7 @@ import subprocess
 from typing import Any
 
 from .core import content_hash
-from .mutation import read_bytes as anchored_read
+from .mutation import read_bytes as anchored_read, same_identity
 from .portable_paths import repository_parts
 
 SCHEMA = "linked-git-source/v1"
@@ -198,12 +198,12 @@ def validate(source: dict[str, Any]) -> None:
             raise ValueError("protected Git assignment path must be absolute")
         identity_name = {"root_workspace": "root_identity", "worktree": "worktree_identity",
                          "common_dir": "common_identity", "private_dir": "private_identity"}[name]
-        if _identity(selected) != source[identity_name]:
+        if not same_identity(_identity(selected), source[identity_name]):
             raise ValueError(f"assigned Git source directory changed: {name}")
     private, common, worktree = (Path(source[name]) for name in ("private_dir", "common_dir", "worktree"))
     if private.parent != common / "worktrees":
         raise ValueError("assigned private Git directory is outside ROOT metadata")
-    if (_identity(common / "objects") != source["objects_identity"]
+    if (not same_identity(_identity(common / "objects"), source["objects_identity"])
             or _alternates(common) != source["alternates_sha256"]):
         raise ValueError("assigned Git object store or alternates changed")
     if _attributes(common) != source["attributes_sha256"]:

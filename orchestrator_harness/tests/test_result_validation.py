@@ -224,6 +224,32 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         with self.assertRaises(review.ReviewError):
             self.pair()
 
+    @unittest.skipUnless(os.name == "nt", "only Windows volume serial width differs between Python versions")
+    def test_staged_checker_accepts_identities_recorded_by_another_windows_python(self):
+        # A worker may run its Stop check under PATH Python: >=3.12 reports the
+        # 64-bit volume serial where the operator's earlier Python reported its low 32 bits.
+        def other_python(identity):
+            device, file_id = identity
+            return [device & 0xFFFFFFFF if device > 0xFFFFFFFF else device | (0x5A5A << 32), file_id]
+
+        mirror_path = self.worker / ".agent-workspace/result-assignment.json"
+        original = json.loads(mirror_path.read_text())
+        for changed_file_id in (False, True):
+            mirror = copy.deepcopy(original)
+            source = mirror["git_source"]
+            for name in ("root_identity", "worktree_identity", "common_identity", "objects_identity", "private_identity"):
+                source[name] = other_python(source[name])
+            source["content_hash"] = content_hash(source)
+            mirror["worktree_identity"] = other_python(mirror["worktree_identity"])
+            mirror["worktree_identity"][1] += changed_file_id
+            mirror["content_hash"] = content_hash(mirror)
+            atomic_write_json(mirror_path, mirror)
+            with self.subTest(changed_file_id=changed_file_id):
+                report = self.worker_check()
+                self.assertEqual(not changed_file_id, report["valid"], report)
+                if changed_file_id:
+                    self.assertEqual("read root identity changed after preparation", report["reason"])
+
     def test_source_changed_while_waiting_for_review_lock_is_not_published(self):
         actual_lock = review.RecordLock
         class SourceChangesAtLock:

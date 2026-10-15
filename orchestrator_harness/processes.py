@@ -239,7 +239,16 @@ def identity_exit_proven(pid: int, creation_time: str) -> bool:
         # parent's Popen handle remains open. Require an independent absence
         # query rather than interpreting that retained identity as live.
     query = targeted_process_query(pid)
-    return query.complete and query.process is None
+    if not query.complete:
+        return False
+    if query.process is None:
+        return True
+    # The PID may now name a process this account cannot open, such as a
+    # system service. A complete query creation clearly after this incarnation
+    # proves reuse. CIM truncates native 100 ns times to microseconds, as does
+    # _identity_time; one more microsecond covers a rounding provider.
+    observed, recorded = query.process.created_utc, _identity_time(creation_time)
+    return observed is not None and recorded is not None and observed - recorded > timedelta(microseconds=1)
 
 
 def terminate_process(

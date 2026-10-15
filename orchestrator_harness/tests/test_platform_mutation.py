@@ -793,6 +793,17 @@ class PlatformIdentityTests(unittest.TestCase):
             self.assertIsNone(process_identity.darwin_process_ids())
         self.assertEqual(4, native.proc_listpids.call_count)
 
+    def test_identity_comparison_maps_only_legacy_windows_volume_serials(self):
+        full, other_full, legacy = 0x4442909842908FF2, 0x5A5A909842908FF2, 0x42908FF2
+        windows = os.name == "nt"
+        for actual, expected, same in (
+                ((full, 7), (full, 7), True), ((legacy, 7), (legacy, 7), True),
+                ((legacy, 7), (full, 7), windows), ((full, 7), (legacy, 7), windows),
+                ((full, 7), (other_full, 7), False), ((legacy, 7), (full, 8), False),
+                ((0x52908FF2, 7), (full, 7), False)):
+            with self.subTest(actual=actual, expected=expected):
+                self.assertEqual(same, mutation.same_identity(actual, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

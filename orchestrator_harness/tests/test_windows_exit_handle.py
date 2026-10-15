@@ -6,11 +6,12 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 from harness_common import process_identity as common
 from orchestrator_harness import processes
-from orchestrator_harness.models import ProcessQuery
+from orchestrator_harness.models import ProcessInfo, ProcessQuery
 
 
 @unittest.skipUnless(os.name == "nt", "Windows native process handles")
@@ -72,3 +73,18 @@ class WindowsExitHandleTests(unittest.TestCase):
               patch.object(ctypes, "get_last_error", return_value=87)):
             self.assertTrue(processes._windows_identity_exit_proven(123, "windows-filetime:134361000000000000"))
         library.CloseHandle.assert_not_called()
+
+    def test_denied_pid_reused_by_a_later_process_proves_exit(self):
+        # The recorded worker exited and a system service this account cannot
+        # open now holds its PID; CIM reports its creation in microseconds.
+        recorded = "windows-filetime:134365070009392287"
+        recorded_time = processes._identity_time(recorded)
+        for created, complete, proven in (
+                (recorded_time + timedelta(minutes=3), True, True), (recorded_time + timedelta(minutes=3), False, False),
+                (recorded_time, True, False), (recorded_time + timedelta(microseconds=1), True, False), (None, True, False)):
+            occupant = ProcessInfo(53556, 1860, "WmiPrvSE.exe", "", created)
+            with (self.subTest(created=created, complete=complete),
+                  patch.object(processes, "_windows_identity_exit_proven", return_value=None),
+                  patch.object(processes, "process_identity", return_value=None),
+                  patch.object(processes, "targeted_process_query", return_value=ProcessQuery(complete, occupant))):
+                self.assertEqual(proven, processes.identity_exit_proven(53556, recorded))
