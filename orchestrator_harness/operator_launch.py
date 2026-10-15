@@ -15,7 +15,10 @@ import sys
 from typing import Any
 
 from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown
-from .config import find_harness_root, load_config, load_resource_manifest
+from .config import ConfigError, find_harness_root, load_config, load_resource_manifest
+from .root_session import resolve_root_session
+from .epochs import manager_queue_path
+from .records import RecordLock, runtime_admission_lock
 from .lanes import LaneError, find_active_lane
 from .leases import (
     FORCE_RELEASE_CONFIG_INVALID,
@@ -96,7 +99,12 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
         }
     rt = config.runtime_root
     try:
-        queue = read_manager_queue(rt)
+        scope = {}
+        if config.profile == "managed":
+            session_id, binding_id = resolve_root_session(config)
+            scope = {"root_session_id": session_id, "binding_id": binding_id}
+        with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
+            queue = read_manager_queue(rt)
         event = next(
             (item for item in queue.get("events", []) if item.get("event_id") == event_id),
             None,
@@ -110,7 +118,12 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
                 MANAGER_ACK_NOT_ROOT_EVENT,
                 f"event {event_id} is not a valid ROOT event",
             )
-        acknowledge_event(rt, event_id)
+        acknowledge_event(rt, event_id, **scope)
+    except ConfigError as exc:
+        code = str(exc).partition(":")[0]
+        return {"ok": False, "code": code if code.startswith("ROOT_SESSION_") else MANAGER_ACK_EVENT_NOT_FOUND,
+                "summary": str(exc), "evidence_paths": [],
+                "next_action": "explicitly prepare ROOT for the current configuration and session"}
     except ManagerQueueError as exc:
         return {
             "ok": False,

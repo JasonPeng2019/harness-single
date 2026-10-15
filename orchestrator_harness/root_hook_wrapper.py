@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .core import iso_utc
-from .config import load_config
+from .config import compute_config_identity, load_config, load_resource_manifest, path_identity
+from .mutation import ensure_directory_path, open_append_file, read_bytes, safe_relative_path
 from .manager_queue import append_delivery_history
 from .root_hook_dispatch import dispatch, unresolved_event_ids
+from .root_session import resolve_root_session
 
 BINDING_SCHEMA = "harness-hook-binding/v1"
 DECISIONS = frozenset({"ALLOW", "NOTICE", "REJECT"})
@@ -26,7 +28,8 @@ def _read_binding(path: Path, provider_id: str) -> dict[str, Any]:
             f"installed {provider_id} hook has no harness binding"
         )
     try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        target = path.absolute()
+        value = json.loads(read_bytes(target.parent, target.name).decode("utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RootHookBindingError(
             f"installed {provider_id} hook has invalid harness binding: {exc}"
@@ -45,31 +48,37 @@ def _read_binding(path: Path, provider_id: str) -> dict[str, Any]:
             raise RootHookBindingError(
                 f"installed {provider_id} hook has invalid binding {field}"
             )
-    for field in ("harness_root", "runtime_root"):
+    for field in ("harness_root", "runtime_root", "manager_workspace", "root_workspace"):
         raw = value.get(field)
         if not isinstance(raw, str) or not raw or not Path(raw).is_absolute():
             raise RootHookBindingError(
                 f"installed {provider_id} hook has no bound {field}"
             )
+    config = load_config(Path(value["harness_root"]))
+    expected_identity = compute_config_identity(config, load_resource_manifest(config.harness_root))
+    expected_paths = {"runtime_root": config.runtime_root,
+                      "manager_workspace": config.manager_workspace,
+                      "root_workspace": config.root_workspace}
+    if (value.get("config_identity") != expected_identity
+            or any(path_identity(value[field]) != path_identity(wanted)
+                   for field, wanted in expected_paths.items())
+            or path_identity(path.absolute().parent.parent) != path_identity(config.manager_workspace)):
+        raise RootHookBindingError("ROOT_BINDING_STALE: explicitly prepare hooks for the current manager/product configuration")
     return value
 
 
 def _workspace_path(binding_path: Path, relative: object, field: str) -> Path:
     if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
         raise RootHookBindingError(f"ROOT hook binding has invalid {field}")
-    workspace = binding_path.resolve().parent.parent
-    target = (workspace / relative).resolve(strict=False)
-    try:
-        target.relative_to(workspace)
-    except ValueError as exc:
-        raise RootHookBindingError(f"ROOT hook binding {field} escapes workspace") from exc
-    return target
+    workspace = binding_path.absolute().parent.parent
+    return workspace / safe_relative_path(relative)
 
 
 def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    path = path.absolute()
+    ensure_directory_path(path.parent)
+    with open_append_file(path.parent, path.name) as handle:
+        handle.write((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -103,6 +112,12 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
     """Run one ROOT hook and return its native JSON output object."""
     try:
         binding = _read_binding(binding_path, provider_id)
+        config = load_config(Path(binding["harness_root"]))
+        managed = config.profile == "managed"
+        scope = {}
+        if managed:
+            session_id, binding_id = resolve_root_session(config, provider_id=provider_id)
+            scope = {"session_id": session_id, "binding_id": binding_id}
         liveness = _workspace_path(
             binding_path, binding.get("liveness_path"), "liveness_path"
         )
@@ -114,6 +129,7 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
                 "provider_id": provider_id,
                 "boundary": boundary,
                 "at": iso_utc(),
+                **scope,
             },
         )
         decision = dispatch(Path(binding["harness_root"]), boundary, provider_id)
@@ -124,10 +140,6 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
             }
         # Plain mode must remain queue-free, including when a provider leaves
         # an old event-id environment variable behind.
-        try:
-            managed = load_config(Path(binding["harness_root"])).profile == "managed"
-        except Exception:
-            managed = False
         event_id = os.environ.get("HARNESS_EVENT_ID") if managed else None
         event_ids = (
             [event_id]
@@ -147,12 +159,11 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
                     "event_id": selected_event_id,
                     "provider_id": provider_id,
                     "at": iso_utc(),
+                    **scope,
                 }
                 try:
-                    # Keep the two-argument call compatible with the shipped
-                    # queue API; its default source is the ROOT hook.
                     append_delivery_history(
-                        Path(binding["runtime_root"]), selected_event_id
+                        Path(binding["runtime_root"]), selected_event_id, **scope
                     )
                 except Exception as exc:
                     receipt.update({"outcome": "DELIVERY_FAILED", "error": str(exc)})

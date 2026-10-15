@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -701,7 +702,7 @@ def _heartbeat(
     *, monitor_owner: tuple[Any, ...] | None = None,
 ) -> None:
     record_path = monitor_record_path(rt)
-    with RecordLock(record_path):
+    with runtime_admission_lock(rt), RecordLock(record_path):
         try:
             record = read_monitor_record(rt)
         except (OSError, ValueError):
@@ -721,10 +722,16 @@ def _heartbeat(
         elif _monitor_owner(record) != monitor_owner:
             append_activity(rt, "heartbeat.skipped", reason="owner_mismatch")
             return
+        state = read_runtime_state(rt)
+        if not state or state.get("state") != "OPEN" or record.get("stop_requested"):
+            return
         record["health"] = "degraded" if diagnostics else "healthy"
         record["last_heartbeat_at"] = iso_utc()
         record["watched_lane_count"] = watched_lane_count
         record["diagnostics"] = list(diagnostics or [])
+        if not diagnostics and record.get("initialized") is not True:
+            record["initialized"] = True
+            record["ready_at"] = record["last_heartbeat_at"]
         atomic_write_json(record_path, record)
     append_activity(
         rt, "heartbeat.written", health=record["health"],
@@ -755,6 +762,7 @@ def main() -> int:
         manifest = load_resource_manifest(harness_root)
         config_identity = compute_config_identity(config, manifest)
     except Exception as exc:
+        print(f"monitor configuration initialization failed: {exc}", file=sys.stderr, flush=True)
         return 1
     rt = config.runtime_root
     identity = processes.process_identity(os.getpid())
@@ -762,7 +770,9 @@ def main() -> int:
         return 1
     with runtime_admission_lock(rt):
         record = read_monitor_record(rt)
-        if (record is None or record.get("config_identity") != config_identity
+        if (record is None or not os.environ.get("HARNESS_MONITOR_STARTUP_ID")
+                or record.get("startup_id") != os.environ["HARNESS_MONITOR_STARTUP_ID"]
+                or record.get("config_identity") != config_identity
                 or (record.get("pid"), record.get("creation_time")) != (
                     identity["pid"], identity["creation_time"])):
             return 1

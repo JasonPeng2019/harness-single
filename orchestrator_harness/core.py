@@ -45,14 +45,12 @@ def content_hash(record: dict[str, Any]) -> str:
 
 
 def read_json(path: Any) -> dict[str, Any]:
-    """Read and parse one JSON record file."""
-    import os
-
+    """Read a plain JSON authority file without following redirected ancestry."""
     from pathlib import Path
+    from .mutation import read_bytes
 
-    target = Path(path)
-    with target.open("r", encoding="utf-8") as handle:
-        value = json.load(handle)
+    target = Path(path).absolute()
+    value = json.loads(read_bytes(target.parent, target.name).decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"record is not a JSON object: {target}")
     return value

@@ -15,6 +15,83 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+class PreparedRootFixture:
+    """A disposable split ROOT with an actual initialized, owned monitor.
+
+    Logical/native-session strings in unit tests exercise record contracts;
+    they are not evidence of a native model invocation or sandbox enforcement.
+    Every monitor is a real child, retained and reaped through its original
+    handle before the disposable directory is released.
+    """
+
+    def __init__(self, case, *, profile: str = "managed", provider_id: str = "codex",
+                 same_workspace: bool = False) -> None:
+        from unittest.mock import patch
+        from orchestrator_harness import processes, setup
+        from orchestrator_harness.config import compute_config_identity, load_config, load_resource_manifest
+        from orchestrator_harness.epochs import open_epoch
+        from orchestrator_harness.root_session import publish_root_session
+
+        self.case = case
+        self.temporary = tempfile.TemporaryDirectory(prefix="prepared-root-")
+        case.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.harness = self.home / "harness"
+        self.product = self.home / "product"
+        self.manager = self.product if same_workspace else self.home / "manager"
+        for path in {self.harness, self.product, self.manager}:
+            path.mkdir()
+        write_json(self.harness / "harness-config.json", {
+            "root_workspace": str(self.product), "manager_workspace": str(self.manager),
+            "managed_coordination": "enabled" if profile == "managed" else "disabled",
+        })
+        write_json(self.harness / "resource-manifest.json", {
+            "schema": "resource-manifest/v1", "resources": [],
+        })
+        self.config = load_config(self.harness)
+        self.rt = self.config.runtime_root
+        self.identity = compute_config_identity(self.config, load_resource_manifest(self.harness))
+        self.children = []
+        case.addCleanup(self.close)
+        setup.set_runtime_state(self.rt, "OPEN")
+        real_spawn = processes.spawn_detached
+
+        def spawn(*args, **kwargs):
+            child = real_spawn(*args, **kwargs)
+            self.children.append(child)
+            return child
+
+        self.environment = dict(os.environ)
+        self.environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        for key in ("HARNESS_ROOT_SESSION_ID", "HARNESS_SESSION_ID", "HARNESS_BINDING_ID",
+                    "CODEX_THREAD_ID", "CLAUDE_SESSION_ID", "QWEN_SESSION_ID"):
+            self.environment.pop(key, None)
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(processes, "spawn_detached", side_effect=spawn):
+            startup = setup._start_monitor(self.harness, self.rt, self.config, self.identity)
+        self.monitor = setup._wait_monitor_ready(self.rt, self.identity, startup)
+        self.epoch = open_epoch(self.rt, self.config, load_resource_manifest(self.harness))
+        self.session = publish_root_session(self.config, run_id="unit-prepared-run", provider_id=provider_id)
+
+    def close(self) -> None:
+        from orchestrator_harness import processes, setup
+
+        setup.set_runtime_state(self.rt, "SHUTTING_DOWN")
+        for child in self.children:
+            if child.poll() is None:
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.case.assertTrue(processes.reap_created_process(child))
+            self.case.assertIsNotNone(child.poll(), "owned monitor must be reaped before fixture removal")
+        setup.set_runtime_state(self.rt, "CLOSED")
+
+    def command(self, *argv: str, environment: dict[str, str] | None = None):
+        return subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch",
+                               "--json", *argv], cwd=self.harness,
+                              env={**self.environment, **(environment or {})},
+                              capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+
 FIXTURE_TASK_CARD = {
     "schema": "project-task-card/v1", "task": "Exercise the native lane contract",
     "acceptance_criteria": ["Preserve exact assignment and cleanup authority"],

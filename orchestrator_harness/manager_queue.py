@@ -195,21 +195,37 @@ def promote_event(
     return event
 
 
-def acknowledge_event(rt: Path, event_id: str) -> dict[str, Any]:
-    """ROOT advances one event PENDING -> ACKNOWLEDGED."""
+def acknowledge_event(rt: Path, event_id: str, *, root_session_id: str | None = None,
+                      binding_id: str | None = None) -> dict[str, Any]:
+    """ACK an unresolved event, retaining each prepared ROOT's exact scope."""
+    scoped = root_session_id is not None or binding_id is not None
+    if scoped and any(not isinstance(value, str) or not value.strip()
+                      for value in (root_session_id, binding_id)):
+        raise ManagerQueueError("MANAGER_ACK_SCOPE_INVALID", "ACK requires both ROOT session and binding")
+
     def mutate(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         event = _find_event(record, event_id)
         if event is None:
             raise ManagerQueueError(
                 MANAGER_ACK_EVENT_NOT_FOUND, f"event not found: {event_id}"
             )
-        if event["state"] != "PENDING":
+        scope = {"queue_id": record["queue_id"], "event_id": event_id,
+                 "session_id": root_session_id, "binding_id": binding_id,
+                 "lane_id": event["lane_id"], "run_id": event["run_id"]}
+        already_scoped = any(item.get("state") == "ACKNOWLEDGED"
+                             and all(item.get(key) == value for key, value in scope.items())
+                             for item in event["history"])
+        if event["state"] != "PENDING" and (
+                event["state"] != "ACKNOWLEDGED" or not scoped or already_scoped):
             raise ManagerQueueError(
                 MANAGER_ACK_ALREADY_ACKNOWLEDGED,
                 f"event {event_id} is already {event['state']}",
             )
         event["state"] = "ACKNOWLEDGED"
-        event["history"].append({"state": "ACKNOWLEDGED", "at": iso_utc()})
+        receipt = {"state": "ACKNOWLEDGED", "at": iso_utc()}
+        if scoped:
+            receipt.update(scope)
+        event["history"].append(receipt)
         return event, True
 
     return _update_manager_queue(rt, mutate)

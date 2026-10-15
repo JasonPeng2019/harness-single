@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -27,13 +28,81 @@ class ProvenNoProvider(RuntimeError):
     no_provider_created = True
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "native Linux terminal-child observation")
+class NativeLinuxTerminalChildTests(unittest.TestCase):
+    def child(self):
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import sys;sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(self.reap, child)
+        identity = processes.process_identity(child.pid)
+        self.assertIsNotNone(identity)
+        return child, identity
+
+    def reap(self, child):
+        self.assertTrue(processes.reap_created_process(child), "original child cleanup is unproven")
+        if child.stdin is not None and not child.stdin.closed:
+            child.stdin.close()
+
+    def exit_without_reaping(self, child, identity):
+        child.stdin.write(b"x")
+        child.stdin.close()
+        path = processes.procfs_root() / str(child.pid) / "stat"
+        deadline = time.monotonic() + 5
+        while True:
+            record = path.read_text(encoding="ascii")
+            fields = record.rsplit(")", 1)[1].split()
+            if fields[0] == "Z":
+                self.assertEqual(identity["creation_time"], f"linux-start-ticks:{fields[19]}")
+                return
+            self.assertLess(time.monotonic(), deadline, "original child did not reach native terminal state")
+            time.sleep(.01)
+
+    def test_original_live_then_unreaped_child_has_exact_terminal_proof_without_signal(self):
+        child, identity = self.child()
+        self.assertTrue(processes.process_alive(child.pid))
+        self.assertTrue(processes.identity_matches(child.pid, identity["creation_time"]))
+        self.assertFalse(processes.identity_exit_proven(child.pid, identity["creation_time"]))
+        legacy = processes._identity_time(identity["creation_time"]).isoformat()
+        self.exit_without_reaping(child, identity)
+        with patch.object(processes.os, "kill", side_effect=AssertionError("terminal child must not be signaled")):
+            self.assertFalse(processes.process_alive(child.pid))
+            self.assertFalse(processes.identity_matches(child.pid, identity["creation_time"]))
+            self.assertTrue(processes.identity_exit_proven(child.pid, identity["creation_time"]))
+            self.assertTrue(processes.identity_exit_proven(child.pid, legacy))
+            self.assertTrue(processes.terminate_process(child.pid, identity["creation_time"], force=True))
+        self.assertEqual(0, child.wait(timeout=5))
+        self.assertTrue(processes.identity_exit_proven(child.pid, identity["creation_time"]))
+
+    def test_original_process_group_is_gone_with_unreaped_terminal_root(self):
+        child, identity = self.child()
+        boundary = processes.ProcessBoundary.for_process(child.pid)
+        self.assertTrue(boundary.observe())
+        self.assertFalse(boundary.is_gone())
+        self.exit_without_reaping(child, identity)
+        self.assertTrue(boundary.is_gone())
+        self.assertTrue(boundary.cleanup(force=True, timeout_seconds=1))
+        self.assertEqual(0, child.wait(timeout=5))
+
+    def test_unreadable_or_malformed_terminal_observation_cannot_prove_live_child_exit(self):
+        child, identity = self.child()
+        for error in (PermissionError("native state unreadable"), ValueError("malformed state"),
+                      RuntimeError("proc mount unknown")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(processes, "_linux_process_stat", side_effect=error):
+                    self.assertTrue(processes.process_alive(child.pid))
+                    self.assertTrue(processes.identity_matches(child.pid, identity["creation_time"]))
+                    self.assertFalse(processes.identity_exit_proven(child.pid, identity["creation_time"]))
+
+
 class LifecycleAdversarialTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name) / self._testMethodName
         self.base.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.base)
         self.harness = self.base / "harness"
         self.root = self.base / "workspace"
         self.harness.mkdir()

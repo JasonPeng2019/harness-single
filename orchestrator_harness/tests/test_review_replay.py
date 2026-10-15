@@ -7,6 +7,8 @@ from threading import Barrier
 from unittest.mock import patch
 
 from orchestrator_harness import review
+from orchestrator_harness import launch, monitor, resume
+from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import lane_record_dir
 from orchestrator_harness.records import atomic_write_json
 from orchestrator_harness.tests.result_fixture import LinkedResultFixture
@@ -18,7 +20,7 @@ class ReviewReplayTests(LinkedResultFixture, unittest.TestCase):
                                   review_summary=summary, evidence=[], approval="ACCEPTED",
                                   force_accept_reason=None)
 
-    def command(self, *, event=None):
+    def command(self, *, event=None, outcome="PASS", approval="ACCEPTED", force=False):
         patches = [patch.object(review, "find_harness_root", return_value=self.base),
                    patch.object(review, "load_config", return_value=self.config)]
         if event is None:
@@ -31,9 +33,57 @@ class ReviewReplayTests(LinkedResultFixture, unittest.TestCase):
                 stack.enter_context(context)
             return review.run_completion_review(event_id=event["event_id"] if event else None,
                                                 lane_id=None if event else self.lane["lane_id"],
-                                                review_outcome="PASS", approval="ACCEPTED",
+                                                review_outcome=outcome, approval=approval,
                                                 review_summary="verified", evidence=[],
-                                                force_accept=False, force_reason=None)
+                                                force_accept=force, force_reason="explicit override" if force else None)
+
+    def test_force_accept_cannot_publish_failed_or_blocked_finding(self):
+        folder = lane_record_dir(self.rt, self.epoch, self.lane["lane_id"])
+        for outcome in ("FAIL", "BLOCKED"):
+            with self.subTest(outcome=outcome):
+                result = self.command(outcome=outcome, force=True)
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(review.COMPLETION_REVIEW_FORCE_REASON_INVALID, result["code"])
+                self.assertFalse((folder / "COMPLETION_REVIEW.json").exists())
+                self.assertFalse((folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+                with self.assertRaises(review.ReviewError):
+                    review._write_pair(self.rt, self.epoch, self.lane, review_outcome=outcome,
+                                       review_summary="failed finding", evidence=[], approval="ACCEPTED",
+                                       force_accept_reason="explicit override")
+                self.assertFalse((folder / "COMPLETION_REVIEW.json").exists())
+                self.assertFalse((folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+
+    def test_integrity_valid_forced_acceptance_is_rejected_by_consumers(self):
+        # A former writer could publish this fully linked pair. Rehashing both
+        # records must not turn a failed finding into current acceptance.
+        self.publish_pair()
+        folder = lane_record_dir(self.rt, self.epoch, self.lane["lane_id"])
+        review_path = folder / "COMPLETION_REVIEW.json"
+        acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+        finding = review.read_json(review_path)
+        finding["review_outcome"] = "FAIL"
+        finding["content_hash"] = content_hash(finding)
+        acceptance = review.read_json(acceptance_path)
+        acceptance["review_ref"] = finding["content_hash"]
+        acceptance["force_accept_reason"] = "former explicit override"
+        acceptance["content_hash"] = content_hash(acceptance)
+        atomic_write_json(review_path, finding)
+        atomic_write_json(acceptance_path, acceptance)
+        before = (review_path.read_bytes(), acceptance_path.read_bytes())
+        self.assertFalse(review.validate_acceptance_chain(finding, acceptance,
+                         lane_id=self.lane["lane_id"], run_id=self.lane["run_id"]))
+        self.assertFalse(monitor._review_pair_is_valid(self.rt, self.epoch, self.lane))
+        with self.assertRaisesRegex(ValueError, "invalid or stale"):
+            resume._has_valid_acceptance_chain(self.rt, self.epoch, self.lane)
+        with self.assertRaises(launch.LaunchError):
+            launch._validate_current_acceptance(self.rt, self.epoch, self.lane, acceptance)
+        self.assertEqual(before, (review_path.read_bytes(), acceptance_path.read_bytes()))
+
+    def test_failed_finding_can_still_record_root_rejection(self):
+        finding, rejection = self.pair(approval="REJECTED", outcome="FAIL")
+        self.assertTrue(review.validate_acceptance_chain(finding, rejection,
+                        lane_id=self.lane["lane_id"], run_id=self.lane["run_id"]))
+        self.assertFalse(resume._has_valid_acceptance_chain(self.rt, self.epoch, self.lane))
 
     def test_orphan_acceptance_rebuilds_only_matching_review(self):
         folder = lane_record_dir(self.rt, self.epoch, self.lane["lane_id"])

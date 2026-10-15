@@ -1,6 +1,6 @@
 ﻿"""Configuration: harness-config/v1, resource-manifest/v1, and config identity.
 
-The configuration is a closed two-key set in ``<harness-root>/harness-config.json``
+The configuration is a closed set in ``<harness-root>/harness-config.json``
 plus the ROOT-authored resource manifest.  ROOT never passes paths, feature
 flags, or a profile again on any later command; the stored config selects
 everything.
@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,11 @@ class HarnessConfig:
     record_paths: tuple[str, ...] = ()
     record_manifests: tuple[str, ...] = ()
     legacy_config_diagnostics: tuple[str, ...] = ()
+    manager_workspace: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.manager_workspace is None:
+            object.__setattr__(self, "manager_workspace", self.root_workspace)
 
     @property
     def profile(self) -> str:
@@ -150,10 +156,10 @@ def _load_legacy_config(
     harness_root: Path | None = None,
 ) -> HarnessConfig:
     """Read a legacy config.json and derive the legacy settings."""
-    config_path = Path(path).resolve()
+    config_path = Path(path).absolute()
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = read_json(config_path)
+    except (OSError, ValueError) as exc:
         raise ConfigError(f"cannot load config {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a JSON object")
@@ -250,12 +256,36 @@ def _load_legacy_config(
     )
 
 
+def _workspace_path(value: object, field: str, config_path: Path) -> Path:
+    """Keep configured authority paths lexical and reject existing redirects."""
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"harness config {field} missing: configure an absolute operator workspace in {config_path}")
+    workspace = Path(value).expanduser()
+    if not workspace.is_absolute():
+        raise ConfigError(f"harness config {field} must be absolute: {config_path}")
+    from .mutation import _validate_directory_input
+    try:
+        _validate_directory_input(workspace)
+        for component in (*reversed(workspace.parents), workspace):
+            try:
+                info = component.lstat()
+            except FileNotFoundError:
+                break
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & 0x400):
+                raise ConfigError(f"harness config {field} must have plain directory ancestry: {component}")
+    except OSError as exc:
+        raise ConfigError(f"harness config {field} cannot be inspected: {exc}") from exc
+    return workspace
+
+
 def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
     """Read and validate the stored harness-config.json.
 
-    The stored record is the closed two-key ``harness-config/v1`` shape:
+    The stored record is the closed ``harness-config/v1`` shape:
     required absolute ``root_workspace`` and optional ``managed_coordination``
-    (``enabled`` or ``disabled``, default ``enabled``).  The record carries no
+    (``enabled`` or ``disabled``, default ``enabled``) and ``manager_workspace``
+    (defaults to root_workspace). The record carries no
     literal ``schema`` field and no other keys are legal.
     """
     root = Path(harness_root).absolute()
@@ -266,24 +296,15 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"harness config unreadable: {path}: {exc}") from exc
-    unknown = sorted(set(record) - {"root_workspace", "managed_coordination"})
+    unknown = sorted(set(record) - {"root_workspace", "manager_workspace", "managed_coordination"})
     if unknown:
         raise ConfigError(
             f"harness config unknown key {unknown[0]!r} "
-            f"(closed keys: root_workspace, managed_coordination): {path}"
+            f"(closed keys: root_workspace, manager_workspace, managed_coordination): {path}"
         )
-    root_workspace = record.get("root_workspace")
-    if not isinstance(root_workspace, str) or not root_workspace:
-        raise ConfigError(
-            f"harness config root_workspace missing: configure an absolute operator workspace in {path}"
-        )
-    workspace = Path(root_workspace).expanduser()
-    if not workspace.is_absolute():
-        raise ConfigError(f"harness config root_workspace must be absolute: {path}")
-    if workspace.is_symlink():
-        raise ConfigError(
-            f"harness config root_workspace must not be a symbolic link: {path}"
-        )
+    workspace = _workspace_path(record.get("root_workspace"), "root_workspace", path)
+    manager = _workspace_path(record.get("manager_workspace", record.get("root_workspace")),
+                              "manager_workspace", path)
     managed = record.get("managed_coordination", "enabled")
     if managed not in ("enabled", "disabled"):
         raise ConfigError(
@@ -293,6 +314,7 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         harness_root=root,
         root_workspace=workspace,
         managed_coordination=managed,
+        manager_workspace=manager,
     )
 
 
@@ -386,4 +408,6 @@ def compute_config_identity(
         "resource_manifest": [dict(item) for item in manifest.resources],
         "runtime_record_schema_version": 1,
     }
+    if config.manager_workspace is not None and not same_path(config.manager_workspace, config.root_workspace):
+        payload["manager_workspace"] = path_identity(config.manager_workspace)
     return sha256_hex(payload)

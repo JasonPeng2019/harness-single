@@ -92,6 +92,8 @@ def validate_acceptance_chain(
         return False
     if acceptance.get("approval") not in APPROVALS:
         return False
+    if acceptance.get("approval") == "ACCEPTED" and review.get("review_outcome") != "PASS":
+        return False
     if not isinstance(acceptance.get("accepted_by"), str) or not acceptance["accepted_by"]:
         return False
     return review.get("review_outcome") in REVIEW_OUTCOMES
@@ -179,6 +181,10 @@ def _write_pair(
     approval: str,
     force_accept_reason: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if review_outcome not in REVIEW_OUTCOMES or approval not in APPROVALS:
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "invalid review finding or approval")
+    if approval == "ACCEPTED" and review_outcome != "PASS":
+        raise ReviewError(COMPLETION_REVIEW_FORCE_REASON_INVALID, "ACCEPTED requires a PASS finding")
     with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane['lane_id']):
         require_same_run(read_lane(rt, epoch_id, lane["lane_id"]), lane)
         folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
@@ -380,16 +386,10 @@ def run_completion_review(
                 COMPLETION_REVIEW_WRITE_FAILED, f"invalid approval: {approval}"
             )
         if approval == "ACCEPTED" and review_outcome != "PASS":
-            if not force_accept:
-                raise ReviewError(
-                    COMPLETION_REVIEW_FORCE_REASON_INVALID,
-                    "ACCEPTED requires a PASS finding unless --force-accept is used",
-                )
-            if not force_reason or not force_reason.strip():
-                raise ReviewError(
-                    COMPLETION_REVIEW_FORCE_REASON_INVALID,
-                    "--force-accept requires a non-empty --force-reason",
-                )
+            raise ReviewError(
+                COMPLETION_REVIEW_FORCE_REASON_INVALID,
+                "ACCEPTED requires a PASS finding; --force-accept cannot override it",
+            )
         if event_id is not None:
             epoch_id, lane, event = _resolve_lane_managed(rt, event_id)
         elif lane_id is not None:
@@ -401,9 +401,7 @@ def run_completion_review(
                 "select the lane with --event-id (managed) or --lane-id (plain)",
             )
         folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
-        exact_reason = (
-            force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
-        )
+        exact_reason = None
         if event is not None and event.get("state") == "COMPLETE" and not (
             (folder / "COMPLETION_REVIEW.json").is_file()
             and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()

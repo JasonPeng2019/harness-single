@@ -31,7 +31,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
     def _setup(self, *, overwrite: bool = False) -> dict:
         with (
             patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
-            patch.object(setup, "_start_monitor"),
+            self.fixture.native_setup(),
         ):
             return setup.run_setup(overwrite=overwrite)
 
@@ -63,14 +63,25 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         }
 
     def _record_transaction(self, stage: Path, *, previous: dict | None = None, target: dict | None = None) -> None:
-        self.journal.write_text(json.dumps({
-            "schema": "super-cache-transaction/v1",
+        # These fixture trees were genuinely created by this test. Capture
+        # their original native births before any interrupted-copy/rename fault.
+        root_state = setup.TargetState(True, "directory", (self.runtime.stat().st_dev, self.runtime.stat().st_ino), None, None)
+        objects = []
+        for path, purpose in ((self.destination, "target" if self.backup.exists() else "previous"),
+                              (stage, "target"), (self.backup, "previous")):
+            if path.exists():
+                objects.append(setup._cache_tree_proof(setup.capture_tree(self.runtime, path.name), purpose))
+        self.journal.write_bytes(setup._journal_snapshot_bytes({
+            "schema": setup.CACHE_TRANSACTION_SCHEMA,
             "runtime_root": str(self.runtime.absolute()),
+            "runtime_identity": setup.durable_identity(self.runtime, ".", expected=root_state),
+            "config_identity": setup._cache_config_identity(setup._capture_cache_catalog(self.fixture.harness)),
             "transaction_id": "a" * 32,
             "stage_name": stage.name,
             "previous": previous,
             "target": target or self._manifest(self.destination),
-        }), encoding="utf-8")
+            "objects": objects, "state": "promoting", "error": None,
+        }))
 
     def _blocked_payload(self) -> None:
         with self.assertRaises(setup.SetupError):
@@ -107,24 +118,25 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 before = self._bytes(destination)
                 source = fixture.harness / "super-cache" / "custom" / "README.md"
                 source.write_bytes(b"updated catalog\n")
-                real_copy = shutil.copy2
-                real_replace = setup._replace_with_retry
+                real_copy = setup.replace
+                real_replace = setup.rename
 
-                def copy(source_path: Path, target: Path) -> Path:
-                    if source_path == source:
+                def copy(root, relative, data, **kwargs):
+                    if data == b"updated catalog\n":
                         raise OSError("injected staging failure")
-                    return real_copy(source_path, target)
+                    return real_copy(root, relative, data, **kwargs)
 
-                def replace(source_path: Path, target: Path) -> None:
+                def replace(root, source_relative, target_relative, **kwargs):
+                    source_path, target = Path(root) / source_relative, Path(root) / target_relative
                     if source_path == destination:
                         if failure.endswith("-after"):
-                            real_replace(source_path, target)
+                            real_replace(root, source_relative, target_relative, **kwargs)
                         raise OSError("injected first rename failure")
-                    real_replace(source_path, target)
+                    return real_replace(root, source_relative, target_relative, **kwargs)
 
                 with patch.object(
-                    setup.shutil if failure == "copy" else setup,
-                    "copy2" if failure == "copy" else "_replace_with_retry",
+                    setup,
+                    "replace" if failure == "copy" else "rename",
                     side_effect=copy if failure == "copy" else replace,
                 ):
                     with self.assertRaises(setup.SetupError) as raised:
@@ -140,7 +152,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertEqual([], list(runtime.glob(".super-cache.*")))
                 with (
                     patch.object(setup, "find_harness_root", return_value=fixture.harness),
-                    patch.object(setup, "_start_monitor"),
+                    fixture.native_setup(),
                 ):
                     recovered = setup.run_setup(overwrite=True)
                 self.assertTrue(recovered["ok"], recovered)
@@ -160,24 +172,25 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 before = self._bytes(destination)
                 source = fixture.harness / "super-cache" / "custom" / "README.md"
                 source.write_bytes(b"updated catalog\n")
-                real_replace = setup._replace_with_retry
+                real_replace = setup.rename
                 real_validate = setup._validate_active_cache
 
-                def replace(source_path: Path, target: Path) -> None:
+                def replace(root, source_relative, target_relative, **kwargs):
+                    source_path, target = Path(root) / source_relative, Path(root) / target_relative
                     if target == destination and source_path.name.startswith(".super-cache."):
                         if failure.endswith("-after"):
-                            real_replace(source_path, target)
+                            real_replace(root, source_relative, target_relative, **kwargs)
                         raise OSError("injected promotion failure")
-                    real_replace(source_path, target)
+                    return real_replace(root, source_relative, target_relative, **kwargs)
 
-                def validate(plan: list[tuple[Path, Path]], target: Path) -> None:
+                def validate(plan: list[tuple[Path, Path]], target: Path, **kwargs) -> None:
                     if target == destination and (target / "custom" / "README.md").read_bytes() == b"updated catalog\n":
                         raise setup.SetupError(setup.SETUP_CACHE_INVALID, "injected post-promotion validation failure")
-                    real_validate(plan, target)
+                    real_validate(plan, target, **kwargs)
 
                 with patch.object(
                     setup,
-                    "_replace_with_retry" if failure.startswith("staged-to-destination") else "_validate_active_cache",
+                    "rename" if failure.startswith("staged-to-destination") else "_validate_active_cache",
                     side_effect=replace if failure.startswith("staged-to-destination") else validate,
                 ):
                     with self.assertRaises(setup.SetupError):
@@ -192,7 +205,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertEqual([], list(runtime.glob(".super-cache.*")))
                 with (
                     patch.object(setup, "find_harness_root", return_value=fixture.harness),
-                    patch.object(setup, "_start_monitor"),
+                    fixture.native_setup(),
                 ):
                     recovered = setup.run_setup(overwrite=True)
                 self.assertTrue(recovered["ok"], recovered)
@@ -229,7 +242,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 before = self._bytes(destination)
                 with (
                     patch.object(setup, "find_harness_root", return_value=fixture.harness),
-                    patch.object(setup, "_start_monitor") as monitor,
+                    fixture.native_setup() as monitor,
                 ):
                     result = setup.run_setup(overwrite=True)
                 self.assertFalse(result["ok"], result)
@@ -257,7 +270,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 )
                 with (
                     patch.object(setup, "find_harness_root", return_value=fixture.harness),
-                    patch.object(setup, "_start_monitor") as monitor,
+                    fixture.native_setup() as monitor,
                 ):
                     result = setup.run_setup(overwrite=True)
                 self.assertFalse(result["ok"], result)
@@ -300,6 +313,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
 
     def test_unknown_live_cache_paths_block_overwrite_without_mutation(self) -> None:
         self.assertTrue(self._setup()["ok"])
+        self.fixture.stop_owned_monitors()
         for relative in (
             Path("operator-notes.txt"),
             Path("operator-notes") / "note.txt",
@@ -463,18 +477,18 @@ class SetupCacheRecoveryTests(unittest.TestCase):
 
     def test_owned_backup_cleanup_failure_and_partial_cleanup_converge(self) -> None:
         self.assertTrue(self._setup()["ok"])
-        real_remove = shutil.rmtree
+        real_remove = setup.remove_tree
 
-        def fail_backup(path: Path, *args: object, **kwargs: object) -> None:
-            if Path(path) == self.backup:
+        def fail_backup(root: Path, relative: Path, **kwargs: object) -> None:
+            if Path(root) / relative == self.backup:
                 raise OSError("injected backup cleanup failure")
-            real_remove(path, *args, **kwargs)
+            real_remove(root, relative, **kwargs)
 
         for partial in (False, True):
             with self.subTest(partial=partial):
                 expected = f"updated catalog {partial}\n".encode()
                 self.source.write_bytes(expected)
-                with patch.object(setup.shutil, "rmtree", side_effect=fail_backup):
+                with patch.object(setup, "remove_tree", side_effect=fail_backup):
                     failed = self._setup(overwrite=True)
                 self.assertFalse(failed["ok"], failed)
                 self.assertTrue(self.journal.is_file())
@@ -563,14 +577,15 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self.assertTrue(self._setup()["ok"])
         previous = self._bytes(self.destination)
         self.source.write_bytes(b"updated catalog\n")
-        real_replace = setup._replace_with_retry
+        real_replace = setup.rename
 
-        def fail_renames(source: Path, target: Path) -> None:
+        def fail_renames(root, source_relative, target_relative, **kwargs):
+            source, target = Path(root) / source_relative, Path(root) / target_relative
             if target == self.destination and source != self.destination:
                 raise OSError("injected promotion and rollback rename failure")
-            real_replace(source, target)
+            return real_replace(root, source_relative, target_relative, **kwargs)
 
-        with patch.object(setup, "_replace_with_retry", side_effect=fail_renames):
+        with patch.object(setup, "rename", side_effect=fail_renames):
             failed = self._setup(overwrite=True)
         self.assertFalse(failed["ok"], failed)
         self.assertTrue(self.backup.is_dir())
@@ -586,8 +601,8 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         prior_bytes = (self.destination / "custom" / "README.md").read_bytes()
         previous = self._manifest(self.destination)
         stage = self.runtime / (".super-cache." + "a" * 32)
-        self._record_transaction(stage, previous=previous)
         shutil.copytree(self.destination, self.backup)
+        self._record_transaction(stage, previous=previous)
         (self.destination / "custom" / "README.md").write_bytes(b"corrupt promoted bytes\n")
         self._blocked_payload()
         repaired = self._setup()
@@ -644,7 +659,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                     before = self._bytes(target)
                     with (
                         patch.object(setup, "find_harness_root", return_value=fixture.harness),
-                        patch.object(setup, "_start_monitor") as monitor,
+                        fixture.native_setup() as monitor,
                     ):
                         rejected = setup.run_setup(overwrite=True)
                     self.assertFalse(rejected["ok"], rejected)
@@ -660,6 +675,11 @@ class SetupCacheRecoveryTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows junction contract")
     def test_workspace_and_runtime_junctions_block_setup_and_both_bootstrap_profiles(self) -> None:
         self.assertTrue(self._setup()["ok"])
+        # The first setup used a genuine monitor. Release its held runtime
+        # handles before this test deliberately redirects the owned fixture.
+        from orchestrator_harness.shutdown import _stop_monitor
+        owner = _stop_monitor(self.runtime)
+        self.assertTrue(setup.processes.identity_exit_proven(owner["pid"], owner["creation_time"]))
         for boundary in ("workspace", "runtime"):
             with self.subTest(boundary=boundary):
                 link = self.fixture.root_workspace if boundary == "workspace" else self.runtime
@@ -682,7 +702,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                             })
                             result = self._bootstrap_preflight()
                             self.assertFalse(result["ok"], result)
-                            self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"])
+                            expected = (bootstrap.BOOTSTRAP_REQUEST_INVALID if boundary == "workspace"
+                                        else bootstrap.BOOTSTRAP_CACHE_COLLISION)
+                            self.assertEqual(expected, result["code"])
                             self.assertEqual(before, self._bytes(target))
                 finally:
                     if link.exists():

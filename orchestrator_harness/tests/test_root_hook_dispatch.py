@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator_harness import root_hook_dispatch as hooks
 from orchestrator_harness.config import HarnessConfig
+from orchestrator_harness.tests.support import PreparedRootFixture, write_json
 
 
 class RootHookDispatchTests(unittest.TestCase):
@@ -16,6 +18,7 @@ class RootHookDispatchTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         self.config = HarnessConfig(self.root, self.workspace, "enabled")
+        write_json(self.root / "resource-manifest.json", {"schema": "resource-manifest/v1", "resources": []})
         self.open_state = {"schema": "runtime-state/v1", "state": "OPEN"}
 
     def tearDown(self) -> None:
@@ -125,28 +128,48 @@ class RootHookDispatchTests(unittest.TestCase):
         self.assertIn("verify exact process", result["notice"]["message"])
 
     def test_live_degraded_monitor_directs_diagnostic_correction(self) -> None:
-        record = {
-            "pid": 41,
-            "creation_time": "created-1",
-            "last_heartbeat_at": hooks.iso_utc(),
-            "health": "degraded",
-            "diagnostics": [{"error": "secret-detail"}],
-        }
-        with (
-            patch.object(hooks, "load_config", return_value=self.config),
-            patch.object(hooks, "read_runtime_state", return_value=self.open_state),
-            patch.object(hooks, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
-            patch.object(hooks, "read_manager_queue", return_value={"events": []}),
-            patch.object(hooks, "read_monitor_record", return_value=record),
-            patch.object(hooks.processes, "identity_matches", return_value=True),
-        ):
-            result = hooks.dispatch(self.root, "post-tool-use", "codex")
+        from orchestrator_harness.records import atomic_write_json, runtime_admission_lock
+        from orchestrator_harness.setup import monitor_record_path
+        fixture = PreparedRootFixture(self)
+        with runtime_admission_lock(fixture.rt):
+            atomic_write_json(monitor_record_path(fixture.rt), {
+                **fixture.monitor, "health": "degraded", "diagnostics": [{"error": "secret-detail"}]})
+            result = hooks.dispatch(fixture.harness, "post-tool-use", "codex")
         self.assertEqual(result["decision"], "NOTICE")
         notice = result["notice"]
         self.assertEqual("MONITOR_DEGRADED", notice["monitor_code"])
         self.assertIn("inspect and correct the recorded diagnostics", notice["message"])
         self.assertNotIn("health monitor-recover", notice["message"])
         self.assertNotIn("secret-detail", str(notice))
+
+    def test_actual_initialized_monitor_allows_tool_boundary(self) -> None:
+        fixture = PreparedRootFixture(self)
+        self.assertEqual({"decision": "ALLOW"}, hooks.dispatch(fixture.harness, "post-tool-use", "codex"))
+
+    def test_future_uninitialized_and_stale_actual_owner_are_not_healthy(self) -> None:
+        from orchestrator_harness.records import atomic_write_json, runtime_admission_lock
+        from orchestrator_harness.setup import monitor_record_path
+        fixture = PreparedRootFixture(self)
+        changed = [{"initialized": False}, {"health": "starting"},
+                   {"last_heartbeat_at": hooks.iso_utc(datetime.now(timezone.utc) + timedelta(days=1))},
+                   {"last_heartbeat_at": hooks.iso_utc(datetime.now(timezone.utc) - timedelta(days=1))}]
+        with runtime_admission_lock(fixture.rt):
+            for value in changed:
+                with self.subTest(value=value):
+                    atomic_write_json(monitor_record_path(fixture.rt), {**fixture.monitor, **value})
+                    result = hooks.dispatch(fixture.harness, "post-tool-use", "codex")
+                    self.assertEqual("NOTICE", result["decision"])
+                    self.assertEqual("MONITOR_UNHEALTHY", result["notice"]["monitor_code"])
+            atomic_write_json(monitor_record_path(fixture.rt), fixture.monitor)
+
+    def test_stopped_dead_monitor_does_not_prove_an_open_runtime_healthy(self) -> None:
+        from orchestrator_harness import setup
+        fixture = PreparedRootFixture(self)
+        fixture.close()
+        setup.set_runtime_state(fixture.rt, "OPEN")
+        result = hooks.dispatch(fixture.harness, "post-tool-use", "codex")
+        self.assertEqual("NOTICE", result["decision"])
+        self.assertEqual("MONITOR_UNHEALTHY", result["notice"]["monitor_code"])
 
     def test_queue_corruption_fails_closed(self) -> None:
         self.assertEqual(self.call("post-tool-use", queue={"events": "bad"})["decision"], "NOTICE")

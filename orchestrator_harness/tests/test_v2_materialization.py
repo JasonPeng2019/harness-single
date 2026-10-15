@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import bootstrap, setup
@@ -32,9 +35,20 @@ class CodexWorkerIsolationLayoutTests(unittest.TestCase):
             self.assertEqual("deny", filesystem[str(workspace / ".secrets")])
             self.assertNotIn(str(host.resolve()), filesystem)
             self.assertNotIn(str(unrelated.resolve()), filesystem)
+            for leaf in (".codex", ".claude", ".qwen", ".agent-workspace"):
+                self.assertEqual("deny", filesystem[str(workspace / leaf)])
 
 
 class GitWorktreeFailureCleanupTests(unittest.TestCase):
+    def _commands(self, run, root: Path):
+        commands = []
+        for entry in run.call_args_list:
+            argv = entry.args[0]
+            self.assertEqual(["git", "--no-replace-objects", "--no-lazy-fetch", "-C", str(root),
+                              "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false"], argv[:9])
+            commands.append([argv[0], *argv[3:5], *argv[9:]])
+        return commands
+
     @staticmethod
     def _completed(returncode: int, *, stderr: str = "") -> MagicMock:
         return MagicMock(returncode=returncode, stderr=stderr, stdout="")
@@ -55,7 +69,7 @@ class GitWorktreeFailureCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "checkout failed"):
                 bootstrap._git_worktree_add(root, branch, target, "base")
 
-        commands = [entry.args[0] for entry in run.call_args_list]
+        commands = self._commands(run, root)
         branch_ref = f"refs/heads/{branch}"
         self.assertEqual(
             ["git", "-C", str(root), "show-ref", "--verify", "--quiet", branch_ref],
@@ -97,7 +111,7 @@ class GitWorktreeFailureCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(bootstrap.BootstrapError, "branch already exists"):
                 bootstrap._git_worktree_add(root, branch, target, "base")
 
-        commands = [entry.args[0] for entry in run.call_args_list]
+        commands = self._commands(run, root)
         self.assertNotIn(
             ["git", "-C", str(root), "branch", "-D", "--", branch], commands
         )
@@ -111,6 +125,8 @@ class MaterializationFixture:
         self.root_workspace = self.root / "root-workspace"
         self.harness.mkdir()
         self.root_workspace.mkdir()
+        self.monitor_children = []
+        self.bootstrap_runtime = False
         self._write_json(
             self.harness / "harness-config.json",
             {
@@ -141,7 +157,51 @@ class MaterializationFixture:
         )
 
     def close(self) -> None:
+        if self.bootstrap_runtime:
+            from orchestrator_harness import shutdown
+            runtime = self.root_workspace / ".harness-runtime"
+            if setup.read_runtime_state(runtime) is not None:
+                with patch.object(shutdown, "find_harness_root", return_value=self.harness):
+                    result = shutdown.run_shutdown()
+                if not result["ok"]:
+                    raise AssertionError(f"native fixture shutdown failed; fixture preserved: {result}")
+                shutdown.prove_runtime_closed(runtime, self.root_workspace, self.harness)
+        self.stop_owned_monitors()
         self.temporary.cleanup()
+
+    def stop_owned_monitors(self) -> None:
+        """Quiesce original native writers while retaining the fixture bytes."""
+        for child, birth in self.monitor_children:
+            if child.poll() is None:
+                rt = self.root_workspace / ".harness-runtime"
+                from orchestrator_harness.records import RecordLock, atomic_write_json, runtime_admission_lock
+                try:
+                    with runtime_admission_lock(rt), RecordLock(setup.monitor_record_path(rt)):
+                        record = setup.read_monitor_record(rt)
+                        if (birth is not None and record is not None
+                                and (record.get("pid"), record.get("creation_time")) ==
+                                (birth["pid"], birth["creation_time"])):
+                            record["stop_requested"] = True
+                            atomic_write_json(setup.monitor_record_path(rt), record)
+                    child.wait(timeout=3)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    if not setup.processes.reap_created_process(child):
+                        raise AssertionError("exact owned monitor child cleanup is unproven; fixture preserved")
+            if child.poll() is None:
+                raise AssertionError("owned monitor child remains live; fixture preserved")
+
+    @contextmanager
+    def native_setup(self):
+        """Observe actual native spawns; never synthesize monitor ownership."""
+        real_spawn = setup.processes.spawn_detached
+        def spawn(*args, **kwargs):
+            child = real_spawn(*args, **kwargs)
+            self.monitor_children.append((child, setup.processes.process_identity(child.pid)))
+            return child
+        with (patch.object(setup, "find_harness_root", return_value=self.harness),
+              patch.dict(os.environ, {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}),
+              patch.object(setup.processes, "spawn_detached", side_effect=spawn) as observed):
+            yield observed
 
     def _write_text(self, path: Path, contents: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +323,41 @@ class MaterializationFixture:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         return destination
+
+    def git(self, *args: str) -> str:
+        result = bootstrap._run_git(self.root_workspace, *args)
+        if result.returncode:
+            raise AssertionError(f"owned fixture Git failed: {args}: {result.stderr}")
+        return result.stdout.strip()
+
+    def initialize_git(self) -> str:
+        if not (self.root_workspace / ".git").exists():
+            self._write_text(self.root_workspace / ".gitignore",
+                             ".harness-runtime/\n.agent-workspace/\n.codex/\n.custom/\n.claude/\n.qwen/\nRESULT.json\n")
+            self._write_text(self.root_workspace / "application.txt", "fixture product\n")
+            self.git("init", "-q")
+            self.git("add", ".gitignore", "application.txt")
+            self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture base")
+        return self.git("rev-parse", "HEAD")
+
+    def prepare_runtime(self, *, managed: bool, manager: Path | None = None) -> str:
+        """Actual setup/READY and Git; no epoch, ownership or source mocks."""
+        self._write_json(self.harness / "harness-config.json", {
+            "root_workspace": str(self.root_workspace),
+            "managed_coordination": "enabled" if managed else "disabled",
+            **({"manager_workspace": str(manager)} if manager is not None else {}),
+        })
+        base = self.initialize_git()
+        self.bootstrap_runtime = True
+        with self.native_setup():
+            result = setup.run_setup()
+        if not result["ok"]:
+            raise AssertionError(f"native fixture setup failed: {result}")
+        from orchestrator_harness.config import compute_config_identity, load_config, load_resource_manifest
+        config = load_config(self.harness)
+        identity = compute_config_identity(config, load_resource_manifest(self.harness))
+        setup.require_monitor_ready(config.runtime_root, identity)
+        return base
 
     def source_snapshot(self) -> dict[str, bytes]:
         return {
@@ -698,17 +793,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_setup_installs_shared_and_provider_files_in_one_worker_tree(self) -> None:
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
-            patch.object(setup.processes, "python_argv", return_value=["python", "-m", "monitor"]),
-            patch.object(setup.processes, "spawn_detached", return_value=child),
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             result = setup.run_setup()
         self.assertTrue(result["ok"], result)
         composed = (
@@ -732,25 +817,7 @@ class V2MaterializationTests(unittest.TestCase):
 
     def test_setup_materialization_keeps_shipped_sources_immutable(self) -> None:
         before = self.fixture.source_snapshot()
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ) as spawn_detached,
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             result = setup.run_setup()
         self.assertTrue(result["ok"], result)
         self.assertEqual(before, self.fixture.source_snapshot())
@@ -794,28 +861,7 @@ class V2MaterializationTests(unittest.TestCase):
         }
 
     def test_setup_second_unchanged_run_is_idempotent(self) -> None:
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ) as spawn_detached,
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-            patch.object(
-                setup.processes, "identity_matches", return_value=True
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             first = setup.run_setup()
             runtime = self.fixture.root_workspace / ".harness-runtime"
             root_after_first = self._snapshot(self.fixture.root_workspace)
@@ -862,32 +908,17 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertEqual(provider_id, binding["provider_id"])
 
     def test_setup_manifest_change_ignores_persistent_lease_lock_file(self) -> None:
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ) as spawn_detached,
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-            patch.object(
-                setup.processes, "identity_matches", return_value=True
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             first = setup.run_setup()
             runtime = self.fixture.root_workspace / ".harness-runtime"
             lease_dir = runtime / "resources" / "leases"
-            (lease_dir / "..leases.lock.lock").write_bytes(b"")
+            from orchestrator_harness.records import RecordLock
+            from orchestrator_harness import shutdown
+            with RecordLock(lease_dir / ".leases.lock"):
+                pass
+            with patch.object(shutdown, "find_harness_root", return_value=self.fixture.harness):
+                closed = shutdown.run_shutdown()
+            self.assertTrue(closed["ok"], closed)
             self.fixture._write_json(
                 self.fixture.harness / "resource-manifest.json",
                 {
@@ -895,12 +926,12 @@ class V2MaterializationTests(unittest.TestCase):
                     "resources": [{"id": "ollama-provider-home", "exclusive": True}],
                 },
             )
-            second = setup.run_setup()
+            second = setup.run_setup(overwrite=True)
 
         self.assertTrue(first["ok"], first)
         self.assertTrue(second["ok"], second)
-        self.assertEqual(setup.SETUP_MONITOR_ALREADY_RUNNING, second["code"])
-        spawn_detached.assert_called_once()
+        self.assertEqual("SETUP_OK", second["code"])
+        self.assertEqual(2, spawn_detached.call_count)
         self.assertEqual(
             [{"exclusive": True, "id": "ollama-provider-home"}],
             json.loads(
@@ -911,25 +942,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_setup_second_run_rejects_byte_changed_installed_payload(self) -> None:
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ),
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         changed = self.fixture.root_workspace / ".codex" / "root.txt"
@@ -945,33 +958,16 @@ class V2MaterializationTests(unittest.TestCase):
     def test_setup_second_run_unreadable_installed_payload_returns_collision(
         self,
     ) -> None:
-        child = MagicMock(pid=1701)
-        original_read_bytes = Path.read_bytes
+        from orchestrator_harness import mutation
+        original_read = mutation._read_file_observation
         target = self.fixture.root_workspace / ".codex" / "root.txt"
 
-        def read_bytes_guard(path: Path) -> bytes:
-            if str(path) == str(target):
+        def read_guard(root, relative, **kwargs):
+            if Path(root) / relative == target.absolute():
                 raise PermissionError("simulated unreadable installed payload")
-            return original_read_bytes(path)
+            return original_read(root, relative, **kwargs)
 
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ) as spawn_detached,
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         before = target.read_bytes()
@@ -979,7 +975,7 @@ class V2MaterializationTests(unittest.TestCase):
             patch.object(
                 setup, "find_harness_root", return_value=self.fixture.harness
             ),
-            patch.object(Path, "read_bytes", read_bytes_guard),
+            patch.object(mutation, "_read_file_observation", side_effect=read_guard),
         ):
             second = setup.run_setup()
         self.assertFalse(second["ok"])
@@ -989,25 +985,7 @@ class V2MaterializationTests(unittest.TestCase):
         spawn_detached.assert_called_once()
 
     def test_setup_second_run_rejects_binding_materialized_elsewhere(self) -> None:
-        child = MagicMock(pid=1701)
-        with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
-            patch.object(
-                setup.processes,
-                "python_argv",
-                return_value=["python", "-m", "monitor"],
-            ),
-            patch.object(
-                setup.processes, "spawn_detached", return_value=child
-            ),
-            patch.object(
-                setup.processes,
-                "process_identity",
-                return_value={"pid": 1701, "creation_time": "test-creation"},
-            ),
-        ):
+        with self.fixture.native_setup() as spawn_detached:
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         binding_path = (
@@ -1124,9 +1102,9 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(self) -> None:
+        self.fixture.prepare_runtime(managed=True)
         for failure in ("missing", "changed"):
             with self.subTest(failure=failure):
-                self.fixture.active_cache()
                 installed = (
                     self.fixture.root_workspace
                     / ".harness-runtime"
@@ -1136,6 +1114,7 @@ class V2MaterializationTests(unittest.TestCase):
                     / ".agent-workspace"
                     / "lane-queue.py"
                 )
+                original = installed.read_bytes()
                 if failure == "missing":
                     installed.unlink()
                 else:
@@ -1146,6 +1125,23 @@ class V2MaterializationTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
                 self.assertFalse(worktree.exists())
+                installed.write_bytes(original)
+
+    def test_managed_bootstrap_passes_split_manager_protection_destinations(self) -> None:
+        self._assert_split_manager_protection(managed=True)
+
+    def test_plain_bootstrap_passes_split_manager_protection_destinations(self) -> None:
+        self._assert_split_manager_protection(managed=False)
+
+    def _assert_split_manager_protection(self, *, managed: bool) -> None:
+        manager = self.fixture.root
+        result, worktree = self._bootstrap("split-manager", managed=managed, provider="codex", manager=manager)
+        self.assertTrue(result["ok"], result)
+        filesystem = tomllib.loads((worktree / ".codex/config.toml").read_text())["permissions"]["worker-isolated"]["filesystem"]
+        for leaf in (".codex", ".claude", ".qwen", ".agent-workspace"):
+            self.assertEqual("deny", filesystem[str(manager / leaf)])
+        self.assertNotIn(str(manager), filesystem)
+        self.assertEqual("write", filesystem[":workspace_roots"]["."])
 
     def test_managed_codex_payload_preserves_valid_existing_config(self) -> None:
         runtime = self.fixture.root_workspace / ".harness-runtime"
@@ -1262,83 +1258,46 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_bootstrap_overlay_failure_rolls_back_attempt_worktree(self) -> None:
-        self.fixture._write_json(
-            self.fixture.harness / "harness-config.json",
-            {
-                "root_workspace": str(self.fixture.root_workspace),
-                "managed_coordination": "enabled",
-            },
-        )
-        runtime = self.fixture.root_workspace / ".harness-runtime"
-        self.fixture.active_cache()
+        self.fixture.initialize_git()
+        collision = self.fixture.root_workspace / ".agent-workspace/README.md"
+        self.fixture._write_text(collision, "tracked product file\n")
+        self.fixture.git("add", "-f", ".agent-workspace/README.md")
+        self.fixture.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local",
+                         "commit", "-qm", "tracked overlay collision")
+        base = self.fixture.prepare_runtime(managed=True)
         lane_id = "overlay-failure"
         branch = f"lane/{lane_id}"
         task_card = self.fixture.root / f"{lane_id}.json"
-        self.fixture._write_json(
-            task_card,
-            {
-                "schema": "project-task-card/v1",
-                "task": "prove failed materialization rollback",
-                "acceptance_criteria": ["The failed worktree is rolled back"],
-                "deliverables": ["A rollback disposition"],
-                "reason_for_acceptance_and_deliverables": "These prove rollback.",
-                "branch": branch,
-                "base_commit": "test-base",
-            },
-        )
-        epoch = {"epoch_id": "epoch-1"}
-        worktree = runtime / "worktrees" / "epoch-1" / lane_id
-
-        def fake_git_add(
-            root: Path, selected_branch: str, target: Path, base_commit: str
-        ) -> None:
-            self.assertEqual(self.fixture.root_workspace, root)
-            self.assertEqual(branch, selected_branch)
-            self.assertEqual("test-base", base_commit)
-            collision = target / ".agent-workspace" / "README.md"
-            collision.parent.mkdir(parents=True, exist_ok=True)
-            collision.write_text("tracked product file\n", encoding="utf-8")
-
-        def fake_rollback(root: Path, selected_branch: str, target: Path) -> list[str]:
-            self.assertEqual(self.fixture.root_workspace, root)
-            self.assertEqual(branch, selected_branch)
-            self.assertEqual(worktree, target)
-            shutil.rmtree(target)
-            return []
-
+        self.fixture._write_json(task_card, {
+            "schema": "project-task-card/v1", "task": "prove failed materialization rollback",
+            "acceptance_criteria": ["The failed worktree is rolled back"],
+            "deliverables": ["A rollback disposition"],
+            "reason_for_acceptance_and_deliverables": "These prove rollback.",
+            "branch": branch, "base_commit": base,
+        })
         with (
-            patch(
-                "orchestrator_harness.config.find_harness_root",
-                return_value=self.fixture.harness,
-            ),
-            patch.object(bootstrap, "open_epoch", return_value=epoch),
-            patch.object(bootstrap, "read_active_lanes", return_value=[]),
-            patch.object(bootstrap, "_git_worktree_add", side_effect=fake_git_add),
-            patch.object(
-                bootstrap,
-                "_rollback_bootstrap_worktree",
-                side_effect=fake_rollback,
-                create=True,
-            ) as rollback,
+            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
+            patch.object(bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add) as git_add,
+            patch.object(bootstrap, "_rollback_bootstrap_worktree",
+                         wraps=bootstrap._rollback_bootstrap_worktree) as rollback,
         ):
             result = bootstrap.run_bootstrap(
-                lane_id=lane_id,
-                provider="codex",
-                model="test-model",
-                launch_config={
-                    "reasoning_effort": "high",
-                    "service_tier": "priority",
-                },
-                exclusive_resources=[],
-                task_card_path=str(task_card),
+                lane_id=lane_id, provider="codex", model="test-model",
+                launch_config={"reasoning_effort": "high", "service_tier": "priority"},
+                exclusive_resources=[], task_card_path=str(task_card),
             )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"])
-        rollback.assert_called_once_with(
-            self.fixture.root_workspace, branch, worktree
-        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"], result)
+        worktree = Path(result["attempt_effects"]["worktree_path"])
+        self.assertTrue(worktree.is_relative_to(self.fixture.root_workspace))
+        git_add.assert_called_once_with(self.fixture.root_workspace, branch, worktree, base)
+        rollback.assert_called_once_with(self.fixture.root_workspace, branch, worktree)
+        self.assertTrue(result["attempt_effects"]["rollback_proven"], result)
         self.assertFalse(worktree.exists())
+        self.assertEqual(base, self.fixture.git("rev-parse", "HEAD"))
+        self.assertEqual("tracked product file\n", collision.read_text(encoding="utf-8"))
+        self.assertEqual(1, bootstrap._run_git(self.fixture.root_workspace,
+                                             "show-ref", "--verify", "--quiet", "refs/heads/" + branch).returncode)
 
     def test_bootstrap_rejects_missing_provider_preferences_before_mutation(self) -> None:
         self.fixture._write_json(
@@ -1422,68 +1381,53 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def _bootstrap(
-        self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True
+        self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True,
+        manager: Path | None = None,
     ) -> tuple[dict[str, object], Path]:
-        self.fixture._write_json(
-            self.fixture.harness / "harness-config.json",
-            {
-                "root_workspace": str(self.fixture.root_workspace),
-                "managed_coordination": "enabled" if managed else "disabled",
-            },
-        )
+        from orchestrator_harness import processes
+        from orchestrator_harness.records import read_record
         runtime = self.fixture.root_workspace / ".harness-runtime"
         if prime_cache:
-            self.fixture.active_cache()
+            base = self.fixture.prepare_runtime(managed=managed, manager=manager)
+        else:
+            self.assertEqual("OPEN", setup.read_runtime_state(runtime)["state"])
+            base = self.fixture.git("rev-parse", "HEAD")
         task_card = self.fixture.root / f"{lane_id}.json"
-        self.fixture._write_json(
-            task_card,
-            {
-                "schema": "project-task-card/v1",
-                "task": f"materialize {lane_id}",
-                "acceptance_criteria": [f"The {lane_id} lane is materialized"],
-                "deliverables": ["A prepared worker worktree"],
-                "reason_for_acceptance_and_deliverables": "These prove materialization.",
-                "branch": f"lane/{lane_id}",
-                "base_commit": "test-base",
-            },
-        )
-        epoch = {"epoch_id": "epoch-1"}
-        worktree = runtime / "worktrees" / "epoch-1" / lane_id
-
-        def fake_git(root: Path, branch: str, target: Path, base_commit: str) -> None:
-            target.mkdir(parents=True, exist_ok=True)
-
+        self.fixture._write_json(task_card, {
+            "schema": "project-task-card/v1", "task": f"materialize {lane_id}",
+            "acceptance_criteria": [f"The {lane_id} lane is materialized"],
+            "deliverables": ["A prepared worker worktree"],
+            "reason_for_acceptance_and_deliverables": "These prove materialization.",
+            "branch": f"lane/{lane_id}", "base_commit": base,
+        })
         with (
-            patch(
-                "orchestrator_harness.config.find_harness_root",
-                return_value=self.fixture.harness,
-            ),
-            patch.object(bootstrap, "open_epoch", return_value=epoch),
-            patch.object(bootstrap, "read_active_lanes", return_value=[]),
-            patch.object(
-                bootstrap, "_git_worktree_add", side_effect=fake_git
-            ) as git_add,
-            patch.object(bootstrap.subprocess, "run") as provider_cli,
+            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
+            patch.object(bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add) as git_add,
+            patch.object(processes, "spawn_provider", side_effect=AssertionError("bootstrap started a provider")) as provider_spawn,
+            patch.object(processes, "spawn_detached", side_effect=AssertionError("bootstrap started a detached process")) as detached,
         ):
             result = bootstrap.run_bootstrap(
-                lane_id=lane_id,
-                provider=provider,
-                model="test-model",
-                launch_config=(
-                    {"reasoning_effort": "high", "service_tier": "priority"}
-                    if provider == "codex"
-                    else {"effort": "high"}
-                    if provider == "claude-code"
-                    else {}
-                ),
-                exclusive_resources=[],
-                task_card_path=str(task_card),
+                lane_id=lane_id, provider=provider, model="test-model",
+                launch_config=({"reasoning_effort": "high", "service_tier": "priority"}
+                               if provider == "codex" else {"effort": "high"}
+                               if provider == "claude-code" else {}),
+                exclusive_resources=[], task_card_path=str(task_card),
             )
+        provider_spawn.assert_not_called()
+        detached.assert_not_called()
         if result["ok"]:
             git_add.assert_called_once()
+            worktree = Path(result["evidence_paths"][0])
+            self.assertTrue((worktree / ".git").is_file())
+            lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+            self.assertEqual(base, lane["git_source"]["base_commit"])
+            self.assertEqual(self.fixture.root_workspace / ".git", Path(lane["git_source"]["common_dir"]))
         else:
+            if prime_cache:
+                self.fail(f"actual prepared bootstrap failed: {result}")
             git_add.assert_not_called()
-        provider_cli.assert_not_called()
+            self.assertFalse(list((runtime / "worktrees").glob(f"*/{lane_id}")))
+            worktree = runtime / "worktrees/not-admitted" / lane_id
         return result, worktree
 if __name__ == "__main__":
     unittest.main()

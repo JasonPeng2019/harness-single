@@ -60,6 +60,20 @@ def process_identity(pid: int) -> dict[str, Any] | None:
     return {"pid": int(identity["pid"]), "creation_time": str(identity["created_utc"])}
 
 
+def _linux_process_stat(pid: int) -> tuple[str, int]:
+    """Read state and start ticks from the same validated native object."""
+    text = (procfs_root() / str(pid) / "stat").read_text(encoding="ascii")
+    opening, closing = text.find("("), text.rfind(")")
+    fields = text[closing + 1:].split()
+    if (opening < 0 or closing <= opening or int(text[:opening].strip()) != pid
+            or len(fields) <= 19 or len(fields[0]) != 1):
+        raise ValueError("process stat record is incomplete or belongs to another PID")
+    ticks = int(fields[19])
+    if ticks < 0:
+        raise ValueError("process start ticks are invalid")
+    return fields[0], ticks
+
+
 def process_alive(pid: int) -> bool:
     """Return whether the operating system still reports a live PID.
 
@@ -90,6 +104,14 @@ def process_alive(pid: int) -> bool:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
             return False
+    if sys.platform.startswith("linux"):
+        try:
+            state, _ = _linux_process_stat(pid)
+        except (OSError, RuntimeError, ValueError):
+            pass  # The preliminary kill probe cannot grant ownership or exit proof.
+        else:
+            if state in {"Z", "X", "x"}:
+                return False
     try:
         os.kill(pid, 0)
         return True
@@ -170,11 +192,32 @@ def _windows_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
         return None
 
 
+def _linux_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
+    """Prove a matching exited object without reaping another caller's child."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        state, ticks = _linux_process_stat(pid)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if state not in {"Z", "X", "x"}:
+        return None
+    observed = f"linux-start-ticks:{ticks}"
+    if observed == creation_time:
+        return True
+    legacy = parse_utc(creation_time)
+    if legacy is not None and _identity_time(observed) == legacy:
+        return True
+    return None
+
+
 def identity_exit_proven(pid: int, creation_time: str) -> bool:
     """Prove this incarnation exited; an unreadable PID is not absence."""
     if not _valid_pid(pid) or not valid_creation_identity(creation_time):
         return False
     native = _windows_identity_exit_proven(pid, creation_time)
+    if native is None:
+        native = _linux_identity_exit_proven(pid, creation_time)
     if native is not None:
         return native
     current = process_identity(pid)

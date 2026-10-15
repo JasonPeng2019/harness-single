@@ -15,9 +15,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,10 @@ from .task_cards import validate_task_card
 from .records import RecordLock, atomic_write_bytes, atomic_write_json
 from .records import runtime_admission_lock
 from .stable_io import PreparedOutputTransaction
+from .mutation import (CapturedTree, DirectoryExpectations, FileMetadata, MutationConflict,
+                       TargetState, capture_target, capture_tree, create_directory,
+                       safe_relative_path, _DirectoryAnchor, _revalidate_tree, _same_state,
+                       _require_anchored_directories, _require_anchored_expected)
 from .git_source import environment as git_environment
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
@@ -223,45 +229,171 @@ def _git_worktree_add(
         )
 
 
+@dataclass(frozen=True)
+class _OverlayFile:
+    relative: Path
+    source: TargetState
+    metadata: FileMetadata
+    target: TargetState
+    write: bool
+    predecessor: tuple[Path, tuple[int, int], TargetState] | None = None
+
+
+@dataclass(frozen=True)
+class _OverlayPlan:
+    source: CapturedTree | None
+    destination: Path
+    authority: Path | None
+    authority_identity: tuple[int, int] | None
+    directories: tuple[tuple[Path, TargetState], ...]
+    files: tuple[_OverlayFile, ...]
+
+
+def _overlay_chain(relative: Path, directories: dict[Path, TargetState]) -> DirectoryExpectations:
+    chain = [Path(".")]
+    current = Path(".")
+    for part in relative.parts:
+        current /= part
+        chain.append(current)
+    return tuple((path, directories[path]) for path in chain)
+
+
+def _overlay_metadata(root: Path, relative: Path, state: TargetState,
+                      directories: DirectoryExpectations | None = None) -> FileMetadata:
+    with _DirectoryAnchor(root, (root / relative).parent) as anchor:
+        _require_anchored_directories(anchor, directories)
+        _require_anchored_expected(anchor, relative.name, state)
+        info = anchor.stat(relative.name)
+        metadata = FileMetadata(stat.S_IMODE(info.st_mode), info.st_atime_ns, info.st_mtime_ns)
+        _require_anchored_expected(anchor, relative.name, state)
+        return metadata
+
+
+def _overlay_source_directories(source: CapturedTree) -> dict[Path, TargetState]:
+    return {Path("."): TargetState(True, "directory", source.root_identity, None, None, None),
+            **{path: state for path, state in source.entries if state.kind == "directory"}}
+
+
+def _overlay_source_file(plan: _OverlayPlan, item: _OverlayFile) -> None:
+    source = plan.source
+    relative = source.relative / item.relative
+    directories = _overlay_source_directories(source)
+    actual = _overlay_metadata(source.root, relative, item.source,
+                               _overlay_chain(relative.parent, directories))
+    if (actual.mode, actual.mtime_ns) != (item.metadata.mode, item.metadata.mtime_ns):
+        raise MutationConflict("overlay source permissions or modification time changed")
+
+
+def _overlay_predecessor(item: _OverlayFile) -> None:
+    if item.predecessor is None:
+        return
+    path, identity, state = item.predecessor
+    with _DirectoryAnchor(path.parent, path.parent) as anchor:
+        if anchor.root_identity != identity:
+            raise MutationConflict("overlay predecessor authority changed")
+        _require_anchored_expected(anchor, path.name, state)
+
+
+def _overlay_check_destinations(plan: _OverlayPlan, directories: dict[Path, TargetState],
+                                *, files: bool) -> None:
+    with _DirectoryAnchor(plan.authority, plan.authority) as anchor:
+        if anchor.root_identity != plan.authority_identity:
+            raise MutationConflict("overlay destination authority changed")
+        for relative in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+            state = directories[relative]
+            if relative == Path("."):
+                continue
+            parent = directories[relative.parent]
+            if parent.present:
+                actual = capture_target(plan.authority, relative)
+                if not _same_state(actual, state):
+                    raise MutationConflict("overlay directory changed after planning")
+            elif state.present:
+                raise MutationConflict("overlay directory census is inconsistent")
+        if files:
+            for item in plan.files:
+                target = plan.destination / item.relative
+                relative = target.relative_to(plan.authority)
+                if directories[relative.parent].present:
+                    if not _same_state(capture_target(plan.authority, relative), item.target):
+                        raise MutationConflict("overlay destination file changed after planning")
+                elif item.target.present:
+                    raise MutationConflict("overlay file census is inconsistent")
+        anchor.assert_stable()
+
+
 def _overlay_plan(
     source: Path,
     destination: Path,
     *,
     exclude: tuple[str, ...] = (),
     replace_if_matches: dict[str, Path] | None = None,
-) -> list[tuple[Path, Path]]:
-    """Plan one overlay tree and reject collisions before any write.
-
-    ``exclude`` holds relative POSIX paths (e.g. ``.agent-workspace/lane-queue.py``)
-    that are skipped; plain bootstrap uses it to omit the managed queue helpers.
-    """
-    if not source.is_dir():
-        return []
-    excluded = {Path(relative).as_posix() for relative in exclude}
-    replaceable = replace_if_matches or {}
-    planned: list[tuple[Path, Path]] = []
-    for item in source.rglob("*"):
-        if not item.is_file():
-            continue
-        relative = item.relative_to(source)
-        if relative.as_posix() in excluded:
-            continue
-        target = destination / relative
-        if target.exists():
-            if target.is_file() and target.read_bytes() == item.read_bytes():
-                continue
-            expected = replaceable.get(relative.as_posix())
-            if (
-                expected is not None
-                and expected.is_file()
-                and target.is_file()
-                and target.read_bytes() == expected.read_bytes()
-            ):
-                planned.append((item, target))
-                continue
-            raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"collision at {target}")
-        planned.append((item, target))
-    return planned
+) -> _OverlayPlan:
+    """Capture all selected sources and original destinations before any write."""
+    source, destination = source.absolute(), destination.absolute()
+    if not os.path.lexists(source):
+        return _OverlayPlan(None, destination, None, None, (), ())
+    try:
+        snapshot = capture_tree(source.parent, source.name)
+        excluded = {safe_relative_path(relative).as_posix() for relative in exclude}
+        references = replace_if_matches or {}
+        source_directories = _overlay_source_directories(snapshot)
+        selected = [(path.relative_to(snapshot.relative), state) for path, state in snapshot.entries
+                    if state.kind == "file" and path.relative_to(snapshot.relative).as_posix() not in excluded]
+        if not selected:
+            return _OverlayPlan(snapshot, destination, None, None, (), ())
+        authority = destination
+        while not os.path.lexists(authority):
+            authority = authority.parent
+        with _DirectoryAnchor(authority, authority) as anchor:
+            identity = anchor.root_identity
+            directories = {Path("."): TargetState(True, "directory", identity, None, None, None)}
+            planned = []
+            for relative, state in selected:
+                target = destination / relative
+                target_relative = target.relative_to(authority)
+                current = Path(".")
+                for part in target_relative.parent.parts:
+                    parent = current
+                    current /= part
+                    if current not in directories:
+                        entry = (capture_target(authority, current) if directories[parent].present
+                                 else TargetState.absent())
+                        if entry.present and entry.kind != "directory":
+                            raise MutationConflict(f"overlay parent is not a directory: {authority / current}")
+                        directories[current] = entry
+                target_state = (capture_target(authority, target_relative)
+                                if directories[target_relative.parent].present else TargetState.absent())
+                metadata = _overlay_metadata(snapshot.root, snapshot.relative / relative, state,
+                                             _overlay_chain((snapshot.relative / relative).parent, source_directories))
+                predecessor = None
+                write = True
+                if target_state.present:
+                    if target_state.kind != "file":
+                        raise MutationConflict(f"overlay collision at {target}")
+                    if target_state.content == state.content:
+                        write = False
+                    else:
+                        expected_path = references.get(relative.as_posix())
+                        if expected_path is None:
+                            raise MutationConflict(f"overlay collision at {target}")
+                        expected_path = Path(expected_path).absolute()
+                        with _DirectoryAnchor(expected_path.parent, expected_path.parent) as reference_anchor:
+                            expected = capture_target(expected_path.parent, expected_path.name)
+                            if not expected.present or expected.kind != "file" or expected.content != target_state.content:
+                                raise MutationConflict(f"overlay predecessor differs at {target}")
+                            predecessor = (expected_path, reference_anchor.root_identity, expected)
+                planned.append(_OverlayFile(relative, state, metadata, target_state, write, predecessor))
+                if write and target.is_relative_to(source):
+                    raise MutationConflict("overlay publication would mutate its observed source")
+            anchor.assert_stable()
+        plan = _OverlayPlan(snapshot, destination, authority, identity,
+                            tuple(sorted(directories.items())), tuple(planned))
+        _revalidate_tree(snapshot)
+        _overlay_check_destinations(plan, directories, files=True)
+        return plan
+    except (OSError, ValueError, TypeError) as exc:
+        raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"overlay preflight rejected: {exc}") from exc
 
 
 def _copy_overlay(
@@ -271,15 +403,44 @@ def _copy_overlay(
     exclude: tuple[str, ...] = (),
     replace_if_matches: dict[str, Path] | None = None,
 ) -> None:
-    """Copy one overlay tree after preflighting all destination paths."""
-    for item, target in _overlay_plan(
-        source,
-        destination,
-        exclude=exclude,
-        replace_if_matches=replace_if_matches,
-    ):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item, target)
+    """Publish the original captured overlay without adopting later substitutions."""
+    plan = _overlay_plan(source, destination, exclude=exclude, replace_if_matches=replace_if_matches)
+    if not plan.files:
+        return
+    try:
+        _revalidate_tree(plan.source)
+        directories = dict(plan.directories)
+        _overlay_check_destinations(plan, directories, files=True)
+        for item in plan.files:
+            _overlay_source_file(plan, item)
+            _overlay_predecessor(item)
+        output = PreparedOutputTransaction(plan.authority, allowed_roots=(plan.authority.parent,))
+        output.prepare()
+        if output.root_identity != plan.authority_identity:
+            raise MutationConflict("overlay prepared authority changed")
+        for relative in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+            if not directories[relative].present:
+                directories[relative] = create_directory(
+                    plan.authority, relative, expected_root_identity=plan.authority_identity,
+                    expected_directories=_overlay_chain(relative.parent, directories))
+        for item in plan.files:
+            _overlay_source_file(plan, item)
+            _overlay_predecessor(item)
+            target = plan.destination / item.relative
+            relative = target.relative_to(plan.authority)
+            chain = _overlay_chain(relative.parent, directories)
+            if item.write:
+                output.admit(target)
+                output.write_bytes(target, item.source.content, expected=item.target,
+                                   expected_directories=chain, metadata=item.metadata)
+            else:
+                with _DirectoryAnchor(plan.authority, target.parent) as anchor:
+                    _require_anchored_directories(anchor, chain)
+                    _require_anchored_expected(anchor, target.name, item.target)
+            _overlay_source_file(plan, item)
+        _revalidate_tree(plan.source)
+    except (OSError, ValueError, TypeError) as exc:
+        raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"overlay publication rejected: {exc}") from exc
 
 
 
@@ -538,11 +699,30 @@ def _install_managed_material(
 
 
 def _install_codex_worker_isolation(
-    worktree: Path, harness_root: Path, root_workspace: Path, *, enforce_git_isolation: bool = True
+    worktree: Path, harness_root: Path, root_workspace: Path, *, enforce_git_isolation: bool = True,
+    manager_workspace: Path | None = None,
 ) -> None:
     """Keep a worker inside its task worktree and away from operator state."""
     import os
     import tomllib
+
+    from .mutation import _DirectoryAnchor, capture_target
+    manager = Path(os.path.abspath(manager_workspace if manager_workspace is not None else root_workspace))
+    protected_manager = {manager / leaf for leaf in (".codex", ".claude", ".qwen", ".agent-workspace")}
+    try:
+        with _DirectoryAnchor(manager, manager) as anchor:
+            anchor.assert_stable()
+            for path in protected_manager:
+                state = capture_target(manager, path.name)
+                if state.present and state.kind != "directory":
+                    raise ValueError(f"manager ROOT destination is not a plain directory: {path}")
+            anchor.assert_stable()
+    except (OSError, ValueError) as exc:
+        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"invalid manager authority: {exc}") from exc
+    for path in protected_manager:
+        if any(path == target or path in target.parents for target in (root_workspace.absolute(), worktree.absolute())):
+            raise BootstrapError(BOOTSTRAP_REQUEST_INVALID,
+                                 f"manager ROOT destination contains the product or worker: {path}")
 
     config_path = worktree / ".codex" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,6 +752,7 @@ def _install_codex_worker_isolation(
         harness_root.resolve(),
         root_workspace / ".harness-runtime" / "operator-only",
         root_workspace / ".secrets",
+        *protected_manager,
     }
     if workspaces_root.is_dir():
         denied.update(
@@ -984,6 +1165,7 @@ def run_bootstrap(
                 _install_codex_worker_isolation(
                     worktree_path, harness_root, config.root_workspace,
                     enforce_git_isolation=configured_launch.get("permission_mode") != "yolo",
+                    manager_workspace=config.manager_workspace,
                 )
             source_exclusions = [".codex/config.toml"] if provider == "codex" else []
             if managed:

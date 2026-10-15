@@ -15,6 +15,8 @@ from .mutation import (
     MutationConflict,
     MutationUnsupported,
     TargetState,
+    DirectoryExpectations,
+    FileMetadata,
     AnchoredAppendFile,
     append_bytes as mutation_append,
     capture_target,
@@ -453,13 +455,16 @@ class PreparedOutputTransaction:
         mutation_delete(self.root, relative, expected=capture_target(self.root, relative),
                         expected_root_identity=self.root_identity)
 
-    def write_bytes(self, path: Path, data: bytes) -> None:
+    def write_bytes(self, path: Path, data: bytes, *, expected: TargetState | None = None,
+                    expected_directories: DirectoryExpectations | None = None,
+                    metadata: FileMetadata | None = None) -> None:
         target = self._admit_for_write(path)
         try:
             relative = target.relative_to(self.root)
-            expected = capture_target(self.root, relative)
+            expected = expected if expected is not None else capture_target(self.root, relative)
             mutation_replace(self.root, relative, data, expected=expected,
-                             expected_root_identity=self.root_identity)
+                             expected_root_identity=self.root_identity,
+                             expected_directories=expected_directories, metadata=metadata)
         except (MutationConflict, MutationUnsupported, ValueError) as exc:
             raise PathSafetyError(str(exc)) from exc
 

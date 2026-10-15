@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import launch, processes, root_hook_dispatch, setup, shutdown
+from orchestrator_harness import lane_cleanup, launch, processes, root_hook_dispatch, setup, shutdown
 from orchestrator_harness.config import HarnessConfig, ResourceManifest
 from orchestrator_harness.epochs import open_epoch, read_current_epoch, read_epoch_state, write_active_lanes
 from orchestrator_harness.lane_cleanup import observe_controller_status
@@ -34,7 +34,7 @@ class CancellationFixture(unittest.TestCase):
         self.rt = self.config.runtime_root
         self.epoch = open_epoch(self.rt, self.config, ResourceManifest())['epoch_id']
         atomic_write_json(setup.runtime_state_path(self.rt), {"schema": "runtime-state/v1", "state": "OPEN"})
-        self.worktree = self.root / "worktree"
+        self.worktree = self.workspace / "worktree"
         (self.worktree / ".agent-workspace").mkdir(parents=True)
         self.status_path = self.worktree / ".agent-workspace" / "controller.status.json"
         self.lane = write_lane(self.rt, self.epoch, "lane", {
@@ -59,6 +59,66 @@ class CancellationFixture(unittest.TestCase):
 
 
 class PendingCancellationTests(CancellationFixture):
+    def test_cleanup_reference_is_durable_before_lease_release(self) -> None:
+        actual_release = launch.force_release_leases
+        records = []
+        def checked_release(rt, lane_id, run_id):
+            current = read_lane(rt, self.epoch, lane_id)
+            self.assertTrue(lane_cleanup.cleanup_is_proven(current))
+            ref = current["forced_cleanup_ref"]
+            record = json.loads(Path(ref["path"]).read_bytes())
+            self.assertEqual(run_id, record["run_id"])
+            self.assertEqual("forced_cancellation", record["kind"])
+            self.assertEqual("never_launched", record["observations"]["kind"])
+            self.assertIsNone(record["controller"])
+            self.assertIsNone(record["provider"])
+            self.assertIsNone(record["boundary"])
+            records.append(ref)
+            actual_release(rt, lane_id, run_id)
+        with patch.object(launch, "force_release_leases", side_effect=checked_release):
+            result = self.force_stop()
+        self.assertTrue(result["ok"], result)
+        retired = read_lane(self.rt, self.epoch, "lane")
+        self.assertEqual([retired["forced_cleanup_ref"]], records)
+        self.assertTrue(lane_cleanup.cleanup_is_proven(retired))
+        self.assertFalse(self.status_path.exists())
+
+    def test_failed_lease_release_retains_proof_for_exact_explicit_retry(self) -> None:
+        own = self.lease("own", self.lane["run_id"])
+        with patch.object(launch, "force_release_leases", side_effect=OSError("interrupted release")):
+            result = self.force_stop()
+        self.assertEqual(launch.FORCE_STOP_LEASE_RELEASE_FAILED, result["code"])
+        current = read_lane(self.rt, self.epoch, "lane")
+        self.assertEqual("running", current["lifecycle"])
+        self.assertTrue(own.exists())
+        self.assertTrue(lane_cleanup.cleanup_is_proven(current))
+        ref = current["forced_cleanup_ref"]
+        original = Path(ref["path"]).read_bytes()
+        self.assertTrue(self.force_stop()["ok"])
+        retired = read_lane(self.rt, self.epoch, "lane")
+        self.assertEqual(ref, retired["forced_cleanup_ref"])
+        self.assertEqual(original, Path(ref["path"]).read_bytes())
+        self.assertFalse(own.exists())
+        self.assertTrue(lane_cleanup.cleanup_is_proven(retired))
+
+    def test_byte_identical_foreign_cleanup_record_cannot_reuse_proof(self) -> None:
+        self.assertTrue(self.force_stop()["ok"])
+        retired = read_lane(self.rt, self.epoch, "lane")
+        path = Path(retired["forced_cleanup_ref"]["path"])
+        raw = path.read_bytes()
+        retained = path.with_name("original-cleanup-retained.json")
+        path.rename(retained)
+        path.write_bytes(raw)
+        self.assertFalse(lane_cleanup.cleanup_is_proven(retired))
+        self.assertEqual(raw, retained.read_bytes())
+        self.assertEqual(raw, path.read_bytes())
+
+    def test_unknown_cleanup_reference_cannot_fall_back_to_never_launched(self) -> None:
+        lane = {**self.lane, "forced_cleanup_ref": {"path": str(self.root / "unknown"),
+                                                   "content_hash": "unknown", "native_identity": "unknown"}}
+        self.assertFalse(lane_cleanup.cleanup_is_proven(lane))
+        self.assertEqual(launch.FORCE_STOP_CLEANUP_UNPROVEN, launch._cleanup_lane_processes(lane)[1])
+
     def test_force_stop_retires_resumed_pending_and_releases_exact_owner(self) -> None:
         own = self.lease("own", "resumed-run")
         other = self.lease("other", "newer-run")
@@ -258,7 +318,17 @@ class FailedStartRecoveryTests(CancellationFixture):
         for terminal in (False, True):
             with self.subTest(terminal=terminal):
                 write_lane(self.rt, self.epoch, "lane", self.lane)
-                child = MagicMock(pid=42)
+                child = processes.spawn_provider([sys.executable, "-B", "-c", "import time; time.sleep(60)"],
+                                                 cwd=self.workspace, stdin=subprocess.DEVNULL,
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                 env=dict(os.environ))
+                job = child.take_job_handle() if os.name == "nt" else None
+                boundary = processes.ProcessBoundary.for_process(child.pid, windows_job_handle=job)
+                self.assertTrue(boundary.observe())
+                self.assertIsNotNone(boundary.root_creation_time)
+                identity = {"pid": child.pid, "creation_time": boundary.root_creation_time}
+                if os.name == "nt":
+                    child.resume()
                 calls = 0
 
                 def fail_registration(*args):
@@ -266,26 +336,30 @@ class FailedStartRecoveryTests(CancellationFixture):
                     calls += 1
                     if calls == 2:
                         if terminal:
+                            self.assertTrue(boundary.cleanup(force=True))
                             atomic_write_json(self.status_path, {
                                 "schema": "controller-status/v1", "lane_id": "lane", "run_id": "resumed-run",
+                                "controller_identity": identity,
                                 "controller_state": "exited", "provider_state": {"state": "not_started"}, "cleanup_proven": True,
                             })
                         raise OSError("identity registration failed")
                     return update_lane(*args)
 
-                with (
-                    patch.object(launch, "update_lane", side_effect=fail_registration),
-                    patch.object(processes, "spawn_detached", return_value=child),
-                    patch.object(processes, "process_identity", return_value={"pid": 42, "creation_time": "created"}),
-                    patch.object(processes, "terminate_process", return_value=True),
-                    patch.object(processes, "identity_matches", return_value=False),
-                    patch.object(processes, "process_alive", return_value=False),
-                ):
-                    self.assertFalse(launch.run_launch("lane")["ok"])
-                    lane = read_lane(self.rt, self.epoch, "lane")
-                    self.assertTrue(lane["launch_failure"]["controller_reaped"])
-                    self.assertEqual(terminal, shutdown._lane_clean(self.rt, lane))
-                child.wait.assert_called_once_with(timeout=10.0)
+                try:
+                    with (patch.object(launch, "update_lane", side_effect=fail_registration),
+                          patch.object(processes, "spawn_detached", return_value=child),
+                          patch.object(child, "wait", wraps=child.wait) as original_wait):
+                        self.assertFalse(launch.run_launch("lane")["ok"])
+                        lane = read_lane(self.rt, self.epoch, "lane")
+                        self.assertTrue(lane["launch_failure"]["controller_reaped"])
+                        self.assertEqual(terminal, shutdown._lane_clean(self.rt, lane))
+                        original_wait.assert_called_once_with(timeout=10.0)
+                finally:
+                    self.assertTrue(boundary.cleanup(force=True))
+                    self.assertTrue(processes.reap_created_process(child))
+                    close = getattr(child, "close", None)
+                    if close is not None:
+                        close()
 
 
 class PublicPendingShutdownTests(unittest.TestCase):
@@ -294,11 +368,9 @@ class PublicPendingShutdownTests(unittest.TestCase):
     def test_public_resume_then_shutdown_and_force_stop_then_shutdown(self, *,
             modes: tuple[str, ...] = ("resume-shutdown", "resume-force-stop", "initial-prepared", "retry-limit")) -> None:
         source = Path(__file__).resolve().parents[2]
-        (source / "runtime").mkdir(exist_ok=True)
         for mode, enabled in ((mode, enabled) for mode in modes
                 for enabled in (False, True)):
-            # Keep native Git paths short on Windows while staying in version-b.
-            with self.subTest(mode=mode, service=enabled), tempfile.TemporaryDirectory(prefix="p", dir=source / "runtime") as raw:
+            with self.subTest(mode=mode, service=enabled), tempfile.TemporaryDirectory(prefix="p") as raw:
                 root = Path(raw)
                 harness = root / "local-config" / "harness"
                 workspace = root / "runtime" / "project"
@@ -335,9 +407,24 @@ class PublicPendingShutdownTests(unittest.TestCase):
                 env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
                 def public(*args: str, success: bool = True) -> dict:
-                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=45)
+                    # The original full-catalog Windows fixture exceeded45s in
+                    # every setup subcase. Keep a finite startup allowance while
+                    # retaining the shorter deadline for ordinary commands.
+                    setup_command = args == ("harness", "setup")
+                    started = time.monotonic()
+                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=120 if setup_command else 45)
+                    if setup_command:
+                        print("PUBLIC_PENDING_SETUP_TIMING " + json.dumps({"mode": mode, "service": enabled,
+                              "elapsed_seconds": round(time.monotonic() - started, 3), "exit_code": completed.returncode}), flush=True)
                     self.assertEqual(success, completed.returncode == 0, completed.stdout + completed.stderr)
                     return json.loads(completed.stdout)
+
+                def queue_snapshot() -> dict:
+                    from orchestrator_harness.epochs import manager_queue_path
+                    from orchestrator_harness.manager_queue import read_manager_queue
+                    from orchestrator_harness.records import RecordLock, runtime_admission_lock
+                    with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
+                        return read_manager_queue(rt)
 
                 def wait_for_exit(lane):
                     deadline = time.monotonic() + 35
@@ -365,6 +452,11 @@ class PublicPendingShutdownTests(unittest.TestCase):
                     public("harness", "setup")
                     monitor = setup.read_monitor_record(rt)
                     self.assertIsNotNone(monitor)
+                    from orchestrator_harness.config import load_config
+                    from orchestrator_harness.root_session import publish_root_session
+                    root_session = publish_root_session(load_config(harness), run_id="pending-public-fixture", provider_id="codex")
+                    env["HARNESS_ROOT_SESSION_ID"] = root_session["session_id"]
+                    env["HARNESS_BINDING_ID"] = root_session["provider_id"]
                     if enabled:
                         import hashlib
                         from orchestrator_harness.tests.test_public_checks import ADAPTER_SOURCE
@@ -435,12 +527,13 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         from orchestrator_harness.monitor import PASS_INTERVAL_SECONDS
                         deadline = time.monotonic() + 2 * PASS_INTERVAL_SECONDS
                         while True:
-                            observed = json.loads((rt / "manager/QUEUE.json").read_text(encoding="utf-8"))
+                            public("watch", "--until-actionable", "--timeout", str(int(2 * PASS_INTERVAL_SECONDS)) + "s")
+                            observed = queue_snapshot()
                             if any(event.get("dedup_key") == "orphan-lease:shared" for event in observed["events"]):
                                 break
                             self.assertLess(time.monotonic(), deadline, "native monitor did not report the retained dead lease")
                             time.sleep(0.1)
-                    queue = json.loads((rt / "manager/QUEUE.json").read_text(encoding="utf-8"))
+                    queue = queue_snapshot()
                     for event in queue["events"]:
                         if event["state"] == "PENDING":
                             public("manager", "acknowledge", "--event-id", event["event_id"])

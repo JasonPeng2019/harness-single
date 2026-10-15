@@ -28,7 +28,7 @@ from .epochs import (
     write_active_lanes,
 )
 from .lanes import LaneError, find_active_lane, lane_operation_lock, read_lane, require_same_run, update_lane
-from .lane_cleanup import cleanup_is_proven, controller_not_created, never_launched, observe_controller_status, retired_lane_record
+from .lane_cleanup import cleanup_is_proven, controller_not_created, never_launched, observe_controller_status, retired_lane_record, publish_forced_cleanup
 from .leases import force_release_leases, release_leases
 from .manager_queue import read_manager_queue
 from .records import read_record
@@ -459,6 +459,10 @@ def _terminate_lane_processes(lane: dict[str, Any]) -> bool:
 
 def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
     """Distinguish missing proof from an exact observed surviving identity."""
+    if "forced_cleanup_ref" in lane:
+        if cleanup_is_proven(lane):
+            return True, "", ""
+        return False, FORCE_STOP_CLEANUP_UNPROVEN, "retained forced cleanup is invalid or unproven"
     observation = observe_controller_status(lane)
     if never_launched(lane, observation) or controller_not_created(lane, observation):
         return True, "", ""
@@ -605,7 +609,7 @@ def run_force_stop(
         }
     try:
         with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane_id):
-            def cancel(current: dict[str, Any]) -> dict[str, Any]:
+            def prove_cleanup(current: dict[str, Any]) -> dict[str, Any]:
                 require_same_run(current, lane)
                 marker = read_current_epoch(rt)
                 if not marker or marker.get("epoch_id") != epoch_id or current.get("lifecycle") == "resuming":
@@ -615,6 +619,20 @@ def run_force_stop(
                 clean, code, reason = _cleanup_lane_processes(current)
                 if not clean:
                     raise LaunchError(code, reason, evidence_paths=[current["controller_status_path"]])
+                try:
+                    return publish_forced_cleanup(rt, epoch_id, current)
+                except (OSError, ValueError) as exc:
+                    raise LaunchError(FORCE_STOP_CLEANUP_UNPROVEN, str(exc)) from exc
+
+            update_lane(rt, epoch_id, lane_id, prove_cleanup)
+
+            def cancel(current: dict[str, Any]) -> dict[str, Any]:
+                require_same_run(current, lane)
+                marker = read_current_epoch(rt)
+                if not marker or marker.get("epoch_id") != epoch_id:
+                    raise LaneError(FORCE_STOP_OWNERSHIP_CHANGED, "epoch changed after cleanup proof")
+                if not cleanup_is_proven(current):
+                    raise LaunchError(FORCE_STOP_CLEANUP_UNPROVEN, "durable cancellation proof is unproven")
                 if force_stop_deadline is not None and time.monotonic() >= force_stop_deadline:
                     raise LaunchError(FORCE_STOP_ALLOWANCE_EXPIRED, "allowance expired before lease release and retirement")
                 # Still under the lane-record lock: no newer run can take ownership

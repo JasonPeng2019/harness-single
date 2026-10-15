@@ -24,6 +24,8 @@ from typing import Any
 
 from prepare_root_launch import validate_prepared_root
 from orchestrator_harness import processes
+from orchestrator_harness.config import load_config, path_identity
+from orchestrator_harness.root_session import bind_native_root_session
 from orchestrator_harness.records import atomic_write_json
 from orchestrator_harness.lane_cleanup import cleanup_is_proven, observe_controller_status
 from orchestrator_harness.lanes import retained_lanes, LaneError
@@ -92,10 +94,10 @@ def shutdown_harness_runtime(expected_runtime: Path, harness_dir: Path | None = 
     if not config_path.is_file():
         return f"harness configuration not found: {harness_dir}"
     try:
-        configured = Path(json.loads(config_path.read_text(encoding="utf-8"))["root_workspace"]).resolve()
+        configured = load_config(harness_dir).runtime_root
     except (OSError, KeyError, ValueError, TypeError) as exc:
         return f"could not validate harness configuration: {exc}"
-    if configured / ".harness-runtime" != expected_runtime.resolve():
+    if path_identity(configured) != path_identity(expected_runtime):
         return "harness configuration no longer selects this run's ROOT workspace"
     try:
         result = subprocess.run(
@@ -173,7 +175,10 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
         raise LedgerError("resume task and original launch differ")
     if task["arm"] == "harness":
         runtime = Path(task["harness_runtime"])
-        if Path(original.get("workspace", "")).resolve() != runtime.parent:
+        configured_harness = Path(original.get("harness_dir") or Path(__file__).resolve().parent.parent)
+        config = load_config(configured_harness)
+        if (path_identity(original.get("workspace", "")) != path_identity(config.manager_workspace)
+                or path_identity(runtime) != path_identity(config.runtime_root)):
             raise LedgerError("ROOT workspace differs from the selected harness runtime")
         state = read_object(runtime / "RUNTIME_STATE.json")
         if state.get("state") == "CLOSED":
@@ -243,7 +248,7 @@ def run_codex(args: argparse.Namespace) -> int:
     if resuming:
         segment_dir, segment_number, session_id, total_limit = prepare_resume(args)
     prompt = Path(args.prompt_file).resolve()
-    workspace = Path(args.cwd).resolve()
+    workspace = Path(os.path.abspath(args.cwd))
     if not prompt.is_file():
         raise LedgerError(f"prompt file does not exist: {prompt}")
     if not workspace.is_dir():
@@ -258,27 +263,37 @@ def run_codex(args: argparse.Namespace) -> int:
         raise LedgerError("harness runs require --harness-runtime")
     if args.arm == "harness" and not getattr(args, "trust_project_hooks", False):
         raise LedgerError("harness runs require --trust-project-hooks")
-    if args.arm == "harness" and Path(args.harness_runtime).resolve() != workspace / ".harness-runtime":
-        raise LedgerError("harness runtime must belong to the selected ROOT workspace")
     if args.arm == "raw" and args.harness_runtime:
         raise LedgerError("raw runs must not name a harness runtime")
-    harness_dir = (Path(args.harness_dir).resolve() if getattr(args, "harness_dir", None)
+    harness_dir = (Path(os.path.abspath(args.harness_dir)) if getattr(args, "harness_dir", None)
                    else Path(__file__).resolve().parent.parent)
     if args.arm == "harness":
         config_path = harness_dir / "harness-config.json"
         if not config_path.is_file():
             raise LedgerError(f"harness configuration not found: {config_path}")
         try:
-            configured = Path(json.loads(config_path.read_text(encoding="utf-8"))["root_workspace"]).resolve()
+            managed_config = load_config(harness_dir)
         except (OSError, KeyError, ValueError, TypeError) as exc:
             raise LedgerError(f"invalid harness configuration: {exc}") from exc
-        if configured != workspace:
+        if path_identity(managed_config.manager_workspace) != path_identity(workspace):
             raise LedgerError("harness configuration does not select this ROOT workspace")
+        if path_identity(managed_config.runtime_root) != path_identity(args.harness_runtime):
+            raise LedgerError("harness runtime must belong to the configured product workspace")
 
     root_prelaunch = None
     if args.arm == "harness":
         try:
             root_prelaunch = validate_prepared_root(harness_dir, workspace, args.run_id, resuming=resuming)
+            native = root_prelaunch["native_session_id"]
+            if resuming:
+                if native not in (None, session_id):
+                    raise LedgerError("saved native ROOT session differs from the prepared binding")
+                if native is None:
+                    bind_native_root_session(managed_config, run_id=args.run_id,
+                        session_id=root_prelaunch["root_session_id"], native_session_id=session_id)
+                    root_prelaunch["native_session_id"] = session_id
+            elif native is not None:
+                raise LedgerError("prepared ROOT already has a native thread; resume it or explicitly prepare a new run")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise LedgerError(str(exc)) from exc
 
@@ -341,7 +356,7 @@ def run_codex(args: argparse.Namespace) -> int:
         "watchdog_hours": args.watchdog_hours,
         "budget_tokens": args.budget_tokens,
         "harness_runtime": str(Path(args.harness_runtime).resolve()) if args.harness_runtime else None,
-        "harness_dir": str(harness_dir) if args.arm == "harness" and getattr(args, "harness_dir", None) else None,
+        "harness_dir": str(harness_dir) if args.arm == "harness" else None,
         "trust_project_hooks": bool(getattr(args, "trust_project_hooks", False)),
         "root_boundary_required": True,
     }
@@ -368,6 +383,14 @@ def run_codex(args: argparse.Namespace) -> int:
             task["harness_runtime"] = str(Path(args.harness_runtime).resolve())
         write_once(task_path, task)
     environment = os.environ.copy()
+    if root_prelaunch is not None:
+        environment["HARNESS_ROOT_SESSION_ID"] = root_prelaunch["root_session_id"]
+        environment["HARNESS_BINDING_ID"] = root_prelaunch["provider_id"]
+        environment.pop("CODEX_THREAD_ID", None)
+        environment.pop("CLAUDE_SESSION_ID", None)
+        environment.pop("QWEN_SESSION_ID", None)
+        if resuming:
+            environment["CODEX_THREAD_ID"] = session_id
     # ROOT invokes the host-side harness package outside its writable workspace.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # An uncapped run must not inherit an earlier diagnostic gate by accident.
@@ -380,6 +403,7 @@ def run_codex(args: argparse.Namespace) -> int:
     start_clock = time.monotonic()
     exit_code: int | None = None
     launch_error: str | None = None
+    native_session_seen = False
     process: subprocess.Popen[str] | None = None
     boundary: processes.ProcessBoundary | None = None
     boundary_lock = threading.RLock()
@@ -455,7 +479,21 @@ def run_codex(args: argparse.Namespace) -> int:
                     events_stream.write(line)
                     events_stream.flush()
                     write_stdout_safe(line)
+                    if root_prelaunch is not None:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue  # Raw malformed evidence remains in the archive.
+                        if isinstance(event, dict) and event.get("type") == "thread.started":
+                            native = event.get("thread_id")
+                            if not isinstance(native, str) or not native:
+                                raise LedgerError("native ROOT thread.started event has no thread identity")
+                            bind_native_root_session(managed_config, run_id=args.run_id,
+                                session_id=root_prelaunch["root_session_id"], native_session_id=native)
+                            native_session_seen = True
             exit_code = process.wait()
+            if root_prelaunch is not None and exit_code == 0 and not native_session_seen:
+                raise LedgerError("native ROOT exited successfully without a thread.started identity")
             if args.arm == "harness":
                 while not watchdog_expired.is_set() and active_harness_lanes(Path(args.harness_runtime)):
                     time.sleep(2)

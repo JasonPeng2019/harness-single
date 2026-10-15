@@ -8,16 +8,15 @@ an event or advances event state.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import processes
-from .config import ConfigError, load_config
+from .config import ConfigError, compute_config_identity, load_config, load_resource_manifest
 from .core import iso_utc
-from .epochs import EpochError, current_epoch_path, read_current_epoch
+from .epochs import EpochError, current_epoch_path, manager_queue_path, read_current_epoch
 from .manager_queue import ManagerQueueError, read_manager_queue
-from .setup import monitor_record_path, read_monitor_record, read_runtime_state
+from .setup import read_monitor_record, read_runtime_state, require_monitor_ready
+from .records import RecordLock, runtime_admission_lock
 
 BOUNDARIES = frozenset({"post-tool-use", "stop"})
 UNRESOLVED_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
@@ -102,7 +101,8 @@ def _unresolved_events(rt: Path) -> tuple[list[dict[str, Any]] | None, str | Non
             return None, f"active epoch marker is invalid: {marker_path}"
         return [], None
     try:
-        queue = read_manager_queue(rt)
+        with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
+            queue = read_manager_queue(rt)
     except (ManagerQueueError, OSError, ValueError) as exc:
         return None, f"manager queue is unreadable: {exc}"
     events = queue.get("events")
@@ -125,48 +125,17 @@ def unresolved_event_ids(rt: Path) -> list[str]:
     ]
 
 
-def _heartbeat_fresh(value: object) -> bool:
-    if not isinstance(value, str) or not value:
-        return False
+def _monitor_health(rt: Path, config_identity: str) -> tuple[str | None, str | None]:
+    """Require actual initialized readiness without recovering a monitor."""
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if parsed.tzinfo is None:
-        return False
-    from .monitor import HEARTBEAT_STALENESS_SECONDS
-
-    return (
-        datetime.now(timezone.utc) - parsed
-    ).total_seconds() <= HEARTBEAT_STALENESS_SECONDS
-
-
-def _monitor_health(rt: Path) -> tuple[str | None, str | None]:
-    """Inspect monitor liveness without starting, stopping, or replacing it."""
-    record = read_monitor_record(rt)
-    if record is None:
-        return "MONITOR_UNHEALTHY", f"monitor record is missing: {monitor_record_path(rt)}"
-    pid = record.get("pid")
-    creation = record.get("creation_time")
-    try:
-        alive = isinstance(pid, int) and processes.identity_matches(pid, creation)
-    except Exception as exc:
-        return "MONITOR_UNHEALTHY", f"monitor identity could not be checked: {exc}"
-    deliberately_stopped = bool(record.get("stop_requested")) or record.get("health") == "STOPPED"
-    if deliberately_stopped and not alive:
+        require_monitor_ready(rt, config_identity)
         return None, None
-    if not alive:
-        return "MONITOR_UNHEALTHY", "recorded monitor process is not alive"
-    if not _heartbeat_fresh(record.get("last_heartbeat_at")):
-        return "MONITOR_UNHEALTHY", "monitor heartbeat is stale; it may be hung"
-    if record.get("health") == "degraded":
-        return (
-            "MONITOR_DEGRADED",
-            "monitor reports degraded health; ROOT must inspect and correct the recorded diagnostics",
-        )
-    if deliberately_stopped:
-        return "MONITOR_STOP_INCOMPLETE", "monitor is marked stopped but its process is still alive"
-    return None, None
+    except (ConfigError, OSError, ValueError) as exc:
+        # This classification supplies an action, never readiness credit.
+        record = read_monitor_record(rt)
+        if record and record.get("health") == "degraded":
+            return "MONITOR_DEGRADED", "monitor reports degraded health; ROOT must inspect and correct the recorded diagnostics"
+        return "MONITOR_UNHEALTHY", str(exc)
 
 
 def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, Any]:
@@ -175,7 +144,7 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
         return _reject(f"unknown ROOT hook boundary: {boundary!r}")
     if not isinstance(provider_id, str) or not provider_id:
         return _reject("ROOT hook provider binding identity is missing")
-    root = Path(harness_root).resolve()
+    root = Path(harness_root).absolute()
     try:
         config = load_config(root)
     except (ConfigError, OSError, ValueError) as exc:
@@ -207,7 +176,11 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
     recovery_code: str | None = None
     recovery_message: str | None = None
     if boundary == "post-tool-use":
-        recovery_code, health_message = _monitor_health(config.runtime_root)
+        try:
+            identity = compute_config_identity(config, load_resource_manifest(root))
+            recovery_code, health_message = _monitor_health(config.runtime_root, identity)
+        except (ConfigError, OSError, ValueError) as exc:
+            recovery_code, health_message = "MONITOR_UNHEALTHY", str(exc)
         if recovery_code is not None:
             recovery_message = health_message
             if recovery_code != "MONITOR_DEGRADED":

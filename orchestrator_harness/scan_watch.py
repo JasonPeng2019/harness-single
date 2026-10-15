@@ -8,19 +8,21 @@ monitor's automatic reconciliation.
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Any
 
-from .config import find_harness_root, load_config
+from .config import ConfigError, find_harness_root, load_config
 from .epochs import (
+    manager_queue_path,
     read_active_lanes,
     read_current_epoch,
     read_epoch_state,
 )
 from .lanes import read_lane
 from .manager_queue import append_watch_delivery, read_manager_queue
+from .root_session import resolve_root_session
+from .records import RecordLock, runtime_admission_lock
 from .monitor import (
     ACTIONABLE_STATUSES,
     _discover_orphaned_leases,
@@ -172,24 +174,11 @@ def _find_actionable(
     return None
 
 
-def _root_session_id(explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    for name in (
-        "HARNESS_ROOT_SESSION_ID",
-        "HARNESS_SESSION_ID",
-        "CODEX_THREAD_ID",
-        "CLAUDE_SESSION_ID",
-        "QWEN_SESSION_ID",
-    ):
-        value = os.environ.get(name)
-        if value:
-            return value
-    return f"root-process-{os.getpid()}"
-
-
 def _watch_evidence_failure(rt: Path, exc: Exception) -> dict[str, Any]:
-    return {"ok": False, "code": WATCH_EVIDENCE_INVALID,
+    code = str(exc).partition(":")[0] if isinstance(exc, ConfigError) else WATCH_EVIDENCE_INVALID
+    if not code.startswith("ROOT_SESSION_"):
+        code = WATCH_EVIDENCE_INVALID
+    return {"ok": False, "code": code,
             "summary": f"watch cannot inspect or record native evidence: {exc}",
             "evidence_paths": [str(rt)],
             "next_action": "reconcile the named native record before waiting again"}
@@ -224,6 +213,14 @@ def _watch_event(
         if not isinstance(event_id, str) or not event_id:
             continue
         if requested_event_id is not None and event_id != requested_event_id:
+            continue
+        scope = {"queue_id": queue_id, "event_id": event_id,
+                 "session_id": root_session_id, "binding_id": binding_id,
+                 "lane_id": event.get("lane_id"), "run_id": event.get("run_id")}
+        if event.get("state") == "ACKNOWLEDGED" and any(
+                receipt.get("state") == "ACKNOWLEDGED"
+                and all(receipt.get(key) == value for key, value in scope.items())
+                for receipt in event.get("history", []) if isinstance(receipt, dict)):
             continue
         if not _watch_delivered(
             event, queue_id=queue_id, root_session_id=root_session_id, binding_id=binding_id,
@@ -273,43 +270,28 @@ def run_watch(
             "evidence_paths": [],
             "next_action": "run `harness setup` first",
         }
-    managed = _state.get("lane_mode") == "managed"
-    session_id = _root_session_id(root_session_id)
-    watch_binding_id = binding_id or os.environ.get("HARNESS_BINDING_ID") or "root"
-    while True:
-        evidence_errors = []
+    managed = config.profile == "managed"
+    if _state.get("lane_mode") != config.profile:
+        return _watch_evidence_failure(rt, ValueError("active epoch profile differs from configuration"))
+    if managed:
         try:
-            orphaned_leases = _discover_orphaned_leases(rt, epoch_id)
+            session_id, watch_binding_id = resolve_root_session(
+                config, session_id=root_session_id, binding_id=binding_id)
         except Exception as exc:
             return _watch_evidence_failure(rt, exc)
-        acknowledged_reviews: set[tuple[str, str]] = set()
+    while True:
         if managed:
             try:
-                queue = read_manager_queue(rt)
+                with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
+                    queue = read_manager_queue(rt)
                 event = _watch_event(
                     queue,
                     root_session_id=session_id,
                     binding_id=watch_binding_id,
                     requested_event_id=until_event,
                 )
-                # ROOT may need other lanes' evidence before deciding an already
-                # acknowledged review. Keep it open without repeatedly waking on
-                # the same status; new invocations/failures still use fallback.
-                acknowledged_reviews = {
-                    (item["lane_id"], item["run_id"])
-                    for item in queue.get("events", [])
-                    if item.get("state") == "ACKNOWLEDGED"
-                    and item.get("event_class") == "COMPLETION_REVIEW_REQUIRED"
-                    and isinstance(item.get("lane_id"), str) and item["lane_id"]
-                    and isinstance(item.get("run_id"), str) and item["run_id"]
-                    and _watch_delivered(
-                        item, queue_id=queue.get("queue_id"),
-                        root_session_id=session_id, binding_id=watch_binding_id,
-                    )
-                }
             except Exception as exc:
-                evidence_errors.append(str(exc))
-                event = None
+                return _watch_evidence_failure(rt, exc)
             if event is not None:
                 event_id = str(event["event_id"])
                 try:
@@ -320,8 +302,7 @@ def run_watch(
                         binding_id=watch_binding_id,
                     )
                 except Exception as exc:
-                    evidence_errors.append(str(exc))
-                    delivered = False
+                    return _watch_evidence_failure(rt, exc)
                 if delivered:
                     return {
                         "ok": True,
@@ -333,30 +314,24 @@ def run_watch(
                         "wake_reason": "manager_event",
                         "event_id": event_id,
                     }
-        try:
-            actionable = _find_actionable(
-                rt, epoch_id, orphaned_leases,
-                acknowledged_reviews=acknowledged_reviews,
-            )
-        except Exception as exc:
-            return _watch_evidence_failure(rt, exc)
-        if actionable is not None:
-            lane_id, status = actionable
-            result = {
-                "ok": True,
-                "code": "WATCH_ACTIONABLE",
-                "summary": f"{lane_id} is actionable: {status}",
-                "evidence_paths": [],
-                "next_action": "act on the condition per the operator-responses table",
-                "wake_reason": "lane_status",
-            }
-            if lane_id.startswith("resource:"):
-                result["resource_id"] = lane_id.split(":", 1)[1]
-            if evidence_errors:
-                result["diagnostics"] = [{"kind": "watch_evidence", "error": error} for error in evidence_errors]
-            return result
-        if evidence_errors:
-            return _watch_evidence_failure(rt, ValueError("; ".join(evidence_errors)))
+        else:
+            try:
+                orphaned_leases = _discover_orphaned_leases(rt, epoch_id)
+                actionable = _find_actionable(rt, epoch_id, orphaned_leases)
+            except Exception as exc:
+                return _watch_evidence_failure(rt, exc)
+            if actionable is not None:
+                lane_id, status = actionable
+                result = {
+                    "ok": True, "code": "WATCH_ACTIONABLE",
+                    "summary": f"{lane_id} is actionable: {status}",
+                    "evidence_paths": [],
+                    "next_action": "act on the condition per the operator-responses table",
+                    "wake_reason": "lane_status",
+                }
+                if lane_id.startswith("resource:"):
+                    result["resource_id"] = lane_id.split(":", 1)[1]
+                return result
         if deadline is not None and time.monotonic() >= deadline:
             return {
                 "ok": False,

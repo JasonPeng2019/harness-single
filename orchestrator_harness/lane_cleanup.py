@@ -3,12 +3,175 @@
 from __future__ import annotations
 
 import stat
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import processes
+from .core import content_hash, iso_utc
+from . import mutation
 from .records import read_record
+
+FORCED_CLEANUP_SCHEMA = "lane-cleanup/v1"
+
+
+def _history_proof(lane: dict[str, Any]) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    if not lane.get("provider_history_path"):
+        return None, None, []
+    from .retry_policy import _path, current_invocation_facts
+    path = _path(lane)
+    original = mutation.capture_target(path.parent, path.name)
+    raw = mutation.read_bytes(path.parent, path.name)
+    if original.kind != "file" or raw != original.content:
+        raise ValueError("protected cleanup history changed while reading")
+    native = mutation.durable_identity(path.parent, path.name, expected=original)
+    facts = current_invocation_facts(lane)
+    mutation.durable_identity(path.parent, path.name, expected=original)
+    return hashlib.sha256(raw).hexdigest(), native, facts
+
+
+def _native_cleanup_proof(lane: dict[str, Any]) -> dict[str, Any]:
+    observation = observe_controller_status(lane)
+    if never_launched(lane, observation):
+        return {"kind": "never_launched", "controller": None, "provider": None, "boundary": None}
+    if controller_not_created(lane, observation):
+        return {"kind": "controller_not_created", "controller": None, "provider": None, "boundary": None}
+    if observation.kind != "valid" or not isinstance(lane.get("process"), dict):
+        raise ValueError("forced cleanup requires an exact original controller observation")
+    status = observation.status
+    assert status is not None
+    controller = lane["process"] or status.get("controller_identity")
+    if (not isinstance(controller, dict) or not processes.identity_exit_proven(
+            controller.get("pid"), controller.get("creation_time"))):
+        raise ValueError("original controller exit is unproven")
+    if status.get("controller_identity") and status["controller_identity"] != controller:
+        raise ValueError("original controller registrations disagree")
+    provider = status.get("provider_state")
+    boundary = status.get("process_boundary")
+    if not isinstance(provider, dict):
+        raise ValueError("original provider creation is unknown")
+    if isinstance(boundary, dict):
+        if not processes.process_boundary_is_gone(boundary):
+            raise ValueError("original provider boundary exit is unproven")
+        provider_identity = boundary.get("root")
+        if not isinstance(provider_identity, dict):
+            raise ValueError("original provider root is missing")
+    elif provider == {"state": "not_started"} and status.get("cleanup_proven") is True:
+        provider_identity = None
+    else:
+        raise ValueError("original provider boundary is unknown")
+    return {"kind": "controller_created", "controller": controller,
+            "provider": provider_identity, "boundary": boundary}
+
+
+def publish_forced_cleanup(rt: Path, epoch_id: str, lane: dict[str, Any]) -> dict[str, Any]:
+    """Persist exact cancellation proof before releasing the original run."""
+    from .epochs import lane_record_dir
+    if "forced_cleanup_ref" in lane:
+        if not _forced_cleanup_is_proven(lane):
+            raise ValueError("retained forced cleanup is invalid; preserve it for reconciliation")
+        return lane
+    proof = _native_cleanup_proof(lane)
+    history_hash, history_identity, facts = _history_proof(lane)
+    if history_hash is None and proof["kind"] == "controller_created":
+        raise ValueError("created controller cleanup requires protected invocation history")
+    for fact in facts:
+        if fact["kind"] == "RESERVED":
+            raise ValueError("provider reservation has no native cleanup proof")
+        if fact["kind"] in {"STARTED", "COMPLETED"} and (
+                not isinstance(proof["boundary"], dict)
+                or not isinstance(fact.get("process_boundary"), dict)
+                or fact.get("process_boundary", {}).get("root") != proof["provider"]):
+            raise ValueError("forced boundary differs from protected provider creation")
+    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    original_folder = mutation.capture_target(folder.parent, folder.name)
+    folder_identity = mutation.durable_identity(folder.parent, folder.name, expected=original_folder)
+    record = {"schema": FORCED_CLEANUP_SCHEMA, "lane_id": lane["lane_id"], "run_id": lane["run_id"],
+              "kind": "forced_cancellation", "controller": proof["controller"], "provider": proof["provider"],
+              "boundary": proof["boundary"], "invocation_ref": history_hash,
+              "observations": {"kind": proof["kind"], "directory_identity": folder_identity,
+                               "history_identity": history_identity},
+              "cleanup_proven": True, "recorded_at": iso_utc()}
+    record["content_hash"] = content_hash(record)
+    raw = (json.dumps(record, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    receipt = mutation.replace(folder, "CLEANUP.json", raw, expected=mutation.TargetState.absent(),
+                               expected_root_identity=original_folder.identity)
+    native = mutation.durable_identity(folder, "CLEANUP.json", expected=receipt.resulting,
+                                       expected_root_identity=original_folder.identity)
+    return {**lane, "forced_cleanup_ref": {"path": str(folder / "CLEANUP.json"),
+                                           "content_hash": record["content_hash"], "native_identity": native}}
+
+
+def _forced_cleanup_is_proven(lane: dict[str, Any]) -> bool:
+    try:
+        ref = lane["forced_cleanup_ref"]
+        if not isinstance(ref, dict) or set(ref) != {"path", "content_hash", "native_identity"}:
+            return False
+        path = Path(ref["path"])
+        if (not path.is_absolute() or path.resolve() != path or path.name != "CLEANUP.json"
+                or path.is_relative_to(Path(lane["worktree_path"]).absolute())):
+            return False
+        folder = mutation.capture_target(path.parent.parent, path.parent.name)
+        original = mutation.capture_target(path.parent, path.name)
+        raw = mutation.read_bytes(path.parent, path.name, expected_root_identity=folder.identity)
+        if original.kind != "file" or original.content != raw:
+            return False
+        if mutation.durable_identity(path.parent, path.name, expected=original,
+                expected_root_identity=folder.identity) != ref["native_identity"]:
+            return False
+        record = json.loads(raw)
+        if (not isinstance(record, dict) or set(record) != {"schema", "lane_id", "run_id", "kind",
+                "controller", "provider", "boundary", "invocation_ref", "observations", "cleanup_proven",
+                "recorded_at", "content_hash"} or record.get("schema") != FORCED_CLEANUP_SCHEMA
+                or record.get("lane_id") != lane["lane_id"] or record.get("run_id") != lane["run_id"]
+                or record.get("kind") != "forced_cancellation" or record.get("cleanup_proven") is not True
+                or record.get("content_hash") != content_hash(record)
+                or record["content_hash"] != ref["content_hash"]):
+            return False
+        observations = record["observations"]
+        if mutation.durable_identity(path.parent.parent, path.parent.name,
+                expected=folder) != observations["directory_identity"]:
+            return False
+        history_hash, history_identity, facts = _history_proof(lane)
+        if history_hash != record["invocation_ref"] or history_identity != observations["history_identity"]:
+            return False
+        if any(fact["kind"] == "RESERVED" for fact in facts):
+            return False
+        def revalidated(result: bool) -> bool:
+            if not result:
+                return False
+            mutation.durable_identity(path.parent, path.name, expected=original,
+                                      expected_root_identity=folder.identity)
+            mutation.durable_identity(path.parent.parent, path.parent.name, expected=folder)
+            return _history_proof(lane) == (history_hash, history_identity, facts)
+        if observations["kind"] in {"never_launched", "controller_not_created"}:
+            proof = _native_cleanup_proof(lane)
+            return revalidated(proof["kind"] == observations["kind"] and record["controller"] is None
+                    and record["provider"] is None and record["boundary"] is None
+                    and not any(fact["kind"] in {"STARTED", "COMPLETED"} for fact in facts))
+        if observations["kind"] != "controller_created" or history_hash is None:
+            return False
+        controller = record["controller"]
+        current = lane.get("process")
+        if not isinstance(current, dict) or (current and current != controller):
+            return False
+        if not current:
+            status = observe_controller_status(lane)
+            if status.kind != "valid" or status.status.get("controller_identity") != controller:
+                return False
+        if not processes.identity_exit_proven(controller.get("pid"), controller.get("creation_time")):
+            return False
+        boundary = record["boundary"]
+        if boundary is None:
+            return revalidated(record["provider"] is None and not any(fact["kind"] in {"STARTED", "COMPLETED"} for fact in facts))
+        return revalidated(isinstance(boundary, dict) and boundary.get("root") == record["provider"]
+                and all(fact.get("process_boundary", {}).get("root") == record["provider"]
+                        for fact in facts if fact["kind"] in {"STARTED", "COMPLETED"})
+                and processes.process_boundary_is_gone(boundary))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -86,6 +249,8 @@ def retired_lane_record(lane: dict[str, Any]) -> dict[str, Any]:
 
 def cleanup_is_proven(lane: dict[str, Any]) -> bool:
     """Return whether controller and provider boundary are proven gone."""
+    if "forced_cleanup_ref" in lane:
+        return _forced_cleanup_is_proven(lane)
     facts = []
     if lane.get("provider_history_path"):
         try:

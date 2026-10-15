@@ -24,6 +24,7 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from typing import BinaryIO
 
 from .portable_paths import component as portable_component
 
@@ -54,6 +55,26 @@ class TargetState:
     @classmethod
     def absent(cls) -> "TargetState":
         return cls(False, "absent", None, None, None, None)
+
+
+@dataclass(frozen=True)
+class CapturedTree:
+    """A complete plain-entry census carried from validation into removal."""
+
+    root: Path
+    relative: Path
+    root_identity: tuple[int, int]
+    entries: tuple[tuple[Path, TargetState], ...]
+
+
+DirectoryExpectations = tuple[tuple[Path, TargetState], ...]
+
+
+@dataclass(frozen=True)
+class FileMetadata:
+    mode: int
+    atime_ns: int
+    mtime_ns: int
 
 
 @dataclass(frozen=True)
@@ -621,7 +642,8 @@ if os.name == "nt":
     _NtSetInformationFile.restype = ctypes.c_long
 
 
-def _windows_open_directory(path: Path, *, parent: object = None) -> tuple[object, tuple[int, int]]:
+def _windows_open_directory(path: Path, *, parent: object = None,
+                            create: bool = False) -> tuple[object, tuple[int, int]]:
     """NtCreateFile refuses reparse traversal, including above an absolute root.
 
     Outside ancestors need no extra access grants or enumeration. Below the
@@ -649,8 +671,10 @@ def _windows_open_directory(path: Path, *, parent: object = None) -> tuple[objec
     status = _IoStatusBlock()
     result = _NtCreateFile(ctypes.byref(handle), 0x00100000 | _FILE_READ_ATTRIBUTES, ctypes.byref(attributes),
         ctypes.byref(status), None, 0, _FILE_SHARE_READ | _FILE_SHARE_WRITE,
-        1, 0x00000001 | 0x00000020 | 0x00200000, None, 0)  # OPEN, DIRECTORY, SYNC, NOFOLLOW
+        2 if create else 1, 0x00000001 | 0x00000020 | 0x00200000, None, 0)  # CREATE/OPEN, DIRECTORY, SYNC, NOFOLLOW
     if result < 0:
+        if create and result & 0xffffffff == 0xc0000035:
+            raise MutationConflict(f"directory appeared before native creation: {path}")
         if result & 0xffffffff == 0xc000050b:
             raise MutationConflict(f"native directory ancestry contains a reparse point: {path}")
         raise MutationUnsupported(f"native no-reparse directory open failed (0x{result & 0xffffffff:08x}): {path}")
@@ -940,6 +964,68 @@ def _require_anchored_expected(anchor: _DirectoryAnchor, name: str, expected: Ta
     return actual
 
 
+def durable_identity(
+    root: str | Path, relative: str | Path, *, expected: TargetState,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> str:
+    """Observe a version-independent native identity against the original proof.
+
+    This identifies an object; it does not establish who created or owns it.
+    Windows FILE_ID_INFO is used even when Python stat exposes a legacy ID.
+    """
+    root_path = _lexical(root)
+    if os.fspath(relative) == ".":
+        if not expected.present or expected.kind != "directory":
+            raise MutationConflict("authority identity requires a captured plain directory")
+        parent, name = root_path, None
+    else:
+        rel = _relative(root_path, relative)
+        parent, name = _validate_chain(root_path, rel)
+    with _DirectoryAnchor(root_path, parent) as anchor:
+        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+            raise MutationConflict("durable identity authority changed")
+        if name is None:
+            if expected.identity != anchor.root_identity:
+                raise MutationConflict("durable authority identity changed")
+            handle = anchor._handles[0] if os.name == "nt" else anchor.parent_fd
+            actual = expected
+        else:
+            actual = _require_anchored_expected(anchor, name, expected)
+            if not actual.present:
+                raise MutationConflict("durable identity target is absent")
+        if os.name == "nt":
+            close = False
+            if name is not None:
+                if actual.kind == "directory":
+                    handle, identity = _windows_open_directory(Path(name), parent=anchor._handles[-1])
+                else:
+                    handle, _ = _windows_file_handle(parent / name, access=_GENERIC_READ, share=_FILE_SHARE_READ)
+                    identity = _windows_identity(handle)
+                close = True
+            try:
+                if name is not None and identity != actual.identity:
+                    raise MutationConflict("durable identity target changed while opening")
+                info = _FileIdInfo()
+                if not _GetFileInformationByHandleEx(handle, 18, ctypes.byref(info), ctypes.sizeof(info)):
+                    raise MutationUnsupported("stable native FILE_ID_INFO is unavailable")
+                value = f"windows-file-id/v1:{int(info.VolumeSerialNumber):016x}:{bytes(info.FileId).hex()}"
+            finally:
+                if close:
+                    _windows_close(handle)
+        else:
+            if name is None:
+                info = os.fstat(handle)
+            else:
+                info = anchor.stat(name)
+                if _identity(info) != actual.identity:
+                    raise MutationConflict("durable identity target changed while observing")
+            value = f"posix-inode/v1:{int(info.st_dev):x}:{int(info.st_ino):x}"
+        if name is not None:
+            _require_anchored_expected(anchor, name, expected)
+        anchor.assert_stable()
+        return value
+
+
 def read_link_value(
     root: str | Path, relative: str | Path, *,
     expected_root_identity: tuple[int, int] | None = None,
@@ -1003,7 +1089,10 @@ def publish_bytes(
     _publish(root, relative, data, expected=None, expected_root_identity=expected_root_identity)
 
 
-def open_append_file(root: str | Path, relative: str | Path) -> AnchoredAppendFile:
+def open_append_file(root: str | Path, relative: str | Path, *,
+                     expected: TargetState | None = None,
+                     expected_root_identity: tuple[int, int] | None = None,
+                     expected_directories: DirectoryExpectations | None = None) -> AnchoredAppendFile:
     """Open/create one plain append file and retain all its ancestor handles."""
     _require_supported_root_boundary()
     root_path = _lexical(root)
@@ -1016,10 +1105,15 @@ def open_append_file(root: str | Path, relative: str | Path) -> AnchoredAppendFi
         anchor.__enter__()
         _after_anchor()
         anchor.assert_stable()
-        before = _capture_anchored(anchor, name, include_content=False)
+        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+            raise MutationConflict("append authority changed after preparation")
+        _require_anchored_directories(anchor, expected_directories)
+        before = expected if expected is not None else _capture_anchored(anchor, name, include_content=False)
+        _require_anchored_expected(anchor, name, before)
         if before.present and before.kind != "file":
             raise MutationConflict("append target is not a regular file")
         _after_target_proof()
+        _require_anchored_directories(anchor, expected_directories)
         _require_anchored_expected(anchor, name, before)
         if os.name == "nt":
             native, _ = _windows_file_handle(parent / name,
@@ -1047,6 +1141,8 @@ def open_append_file(root: str | Path, relative: str | Path) -> AnchoredAppendFi
                 or (before.present and _identity(opened) != before.identity)
                 or _identity(anchor.stat(name)) != _identity(opened)):
             raise MutationConflict("append target changed while opening")
+        if expected is not None and expected.present and not _same_state(_capture_open_file(file_handle), expected):
+            raise MutationConflict("opened append bytes differ from authorization")
         anchor.assert_stable()
         return AnchoredAppendFile(file_handle, anchor)
     except BaseException:
@@ -1125,14 +1221,23 @@ def _windows_rename_handle(handle: object, destination: _DirectoryAnchor, name: 
                     ("FileNameLength", ctypes.wintypes.DWORD), ("FileName", ctypes.c_wchar * (length // 2 + 1))]
     info = RenameInfo(bool(replace_existing), destination._handles[-1], length, name)
     status = _IoStatusBlock()
-    result = _NtSetInformationFile(handle, ctypes.byref(status), ctypes.byref(info), ctypes.sizeof(info), 10)
-    if result < 0:
-        raise MutationConflict(f"native handle-bound rename failed (0x{result & 0xffffffff:08x}): {name}")
+    from . import records
+    for attempt in range(records._WINDOWS_REPLACE_MAX_ATTEMPTS):
+        result = _NtSetInformationFile(handle, ctypes.byref(status), ctypes.byref(info), ctypes.sizeof(info), 10)
+        if result >= 0:
+            return
+        error = result & 0xffffffff
+        if error not in {0xc0000022, 0xc0000043} or attempt + 1 >= records._WINDOWS_REPLACE_MAX_ATTEMPTS:
+            raise MutationConflict(f"native handle-bound rename failed (0x{error:08x}): {name}")
+        records.time.sleep(records._WINDOWS_REPLACE_RETRY_DELAY_SECONDS * (attempt + 1))
 
 
 def _publish(root: str | Path, relative: str | Path, data: bytes, *,
-             expected: TargetState | None, expected_root_identity: tuple[int, int] | None) -> MutationReceipt:
+             expected: TargetState | None, expected_root_identity: tuple[int, int] | None,
+             expected_directories: DirectoryExpectations | None = None,
+             metadata: FileMetadata | None = None) -> MutationReceipt:
     _require_supported_root_boundary()
+    _validate_metadata(metadata)
     if not isinstance(data, bytes):
         raise TypeError("publication data must be bytes")
     root_path = _lexical(root)
@@ -1147,6 +1252,7 @@ def _publish(root: str | Path, relative: str | Path, data: bytes, *,
             anchor.assert_stable()
             if expected_root_identity is not None and _identity(root_path.lstat()) != expected_root_identity:
                 raise MutationConflict("publication root identity changed after preparation")
+            _require_anchored_directories(anchor, expected_directories)
             authorized = expected if expected is not None else _capture_anchored(anchor, name, include_content=True)
             _require_anchored_expected(anchor, name, authorized)
             if authorized.present and authorized.kind != "file":
@@ -1163,8 +1269,11 @@ def _publish(root: str | Path, relative: str | Path, data: bytes, *,
                     raise MutationConflict("publication did not write all bytes")
                 handle.flush()
                 os.fsync(handle.fileno())
+                if metadata is not None and os.name != "nt":
+                    _apply_file_metadata(handle, metadata)
             _after_target_proof()
             anchor.assert_stable()
+            _require_anchored_directories(anchor, expected_directories)
             _require_anchored_expected(anchor, name, authorized)
             staged = _capture_anchored(anchor, temporary.name, include_content=True)
             if staged.identity != anchor._temporaries[temporary.name] or staged.content != data:
@@ -1175,10 +1284,12 @@ def _publish(root: str | Path, relative: str | Path, data: bytes, *,
                     from .records import _replace_with_retry
                     _replace_with_retry(temporary, parent / name)
                 else:
-                    native, _ = _windows_file_handle(temporary, access=_GENERIC_READ | _DELETE,
+                    native, _ = _windows_file_handle(temporary, access=_GENERIC_READ | _DELETE | (0x0100 if metadata is not None else 0),
                                                      share=_FILE_SHARE_READ)
                     try:
                         _windows_rename_handle(native, anchor, name, replace_existing=False)
+                        if metadata is not None:
+                            _apply_windows_metadata(native, metadata)
                     finally:
                         _windows_close(native)
             else:
@@ -1203,6 +1314,8 @@ def replace(
     *,
     expected: TargetState | None = None,
     expected_root_identity: tuple[int, int] | None = None,
+    expected_directories: DirectoryExpectations | None = None,
+    metadata: FileMetadata | None = None,
 ) -> MutationReceipt:
     """Write the authorized file, preserving Windows target handle protection.
 
@@ -1214,14 +1327,19 @@ def replace(
     """
     if os.name == "nt":
         return _windows_replace_bound(root, relative, data, expected=expected,
-                                      expected_root_identity=expected_root_identity)
+                                      expected_root_identity=expected_root_identity,
+                                      expected_directories=expected_directories, metadata=metadata)
     return _publish(root, relative, data, expected=expected,
-                    expected_root_identity=expected_root_identity)
+                    expected_root_identity=expected_root_identity,
+                    expected_directories=expected_directories, metadata=metadata)
 
 
 def _windows_replace_bound(root: str | Path, relative: str | Path, data: bytes, *,
                            expected: TargetState | None,
-                           expected_root_identity: tuple[int, int] | None) -> MutationReceipt:
+                           expected_root_identity: tuple[int, int] | None,
+                           expected_directories: DirectoryExpectations | None = None,
+                           metadata: FileMetadata | None = None) -> MutationReceipt:
+    _validate_metadata(metadata)
     if not isinstance(data, bytes):
         raise TypeError("replacement data must be bytes")
     root_path = _lexical(root)
@@ -1234,15 +1352,18 @@ def _windows_replace_bound(root: str | Path, relative: str | Path, data: bytes, 
         anchor.assert_stable()
         if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
             raise MutationConflict("replacement root identity changed after preparation")
+        _require_anchored_directories(anchor, expected_directories)
         authorized = expected if expected is not None else _capture_anchored(anchor, name, include_content=True)
         _require_anchored_expected(anchor, name, authorized)
         _after_target_proof()
+        _require_anchored_directories(anchor, expected_directories)
         _require_anchored_expected(anchor, name, authorized)
         if not authorized.present:
             # The native publication is NO_REPLACE, even if another entry
             # appears after this observation. The outer ancestors remain held.
             return _publish(root_path, rel, data, expected=authorized,
-                            expected_root_identity=anchor.root_identity)
+                            expected_root_identity=anchor.root_identity,
+                            expected_directories=expected_directories, metadata=metadata)
         if authorized.kind != "file":
             raise MutationConflict("replacement target is not a regular file")
         target = parent / name
@@ -1260,6 +1381,8 @@ def _windows_replace_bound(root: str | Path, relative: str | Path, data: bytes, 
             if (resulting.identity != authorized.identity or resulting.content != data
                     or _identity(anchor.stat(name)) != resulting.identity):
                 raise MutationConflict("handle-bound replacement identity or bytes changed")
+            if metadata is not None:
+                _apply_file_metadata(handle, metadata)
             anchor.assert_stable()
             return MutationReceipt("replace", str(root_path), str(parent), str(target), authorized, resulting)
 
@@ -1298,6 +1421,122 @@ def delete(
         if resulting.present:
             raise MutationConflict("deletion could not prove target absence")
         return MutationReceipt("delete", str(root_path), str(parent), str(parent / name), authorized, resulting)
+
+
+def _require_anchored_directories(anchor: _DirectoryAnchor,
+                                  expected: DirectoryExpectations | None) -> None:
+    if expected is None:
+        return
+    chain = [Path(".")]
+    current = Path(".")
+    for part in anchor.parent.relative_to(anchor.root).parts:
+        current /= part
+        chain.append(current)
+    states = dict(expected)
+    if len(states) != len(expected) or set(states) != set(chain):
+        raise MutationConflict("captured directory chain is incomplete or belongs to another parent")
+    anchor.assert_stable()
+    for relative in chain:
+        state = states[relative]
+        if (not isinstance(relative, Path) or not isinstance(state, TargetState)
+                or not state.present or state.kind != "directory" or state.identity is None):
+            raise MutationConflict("captured parent state is not a plain directory")
+        path = anchor.root / relative
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or _is_reparse(path)
+                or _identity(info) != state.identity):
+            raise MutationConflict("publication directory changed after preflight")
+    anchor.assert_stable()
+
+
+def _validate_metadata(metadata: FileMetadata | None) -> None:
+    if metadata is not None and (not isinstance(metadata, FileMetadata)
+            or type(metadata.mode) is not int or not 0 <= metadata.mode <= 0o7777
+            or type(metadata.atime_ns) is not int or type(metadata.mtime_ns) is not int):
+        raise MutationConflict("file metadata is invalid")
+    if metadata is not None and os.name == "nt" and any(
+            not 0 < value // 100 + 116444736000000000 < 2**63
+            for value in (metadata.atime_ns, metadata.mtime_ns)):
+        raise MutationConflict("file time is outside the native Windows range")
+
+
+def _apply_windows_metadata(native: object, metadata: FileMetadata) -> None:
+    class BasicInformation(ctypes.Structure):
+        _fields_ = [("CreationTime", ctypes.c_longlong), ("LastAccessTime", ctypes.c_longlong),
+                    ("LastWriteTime", ctypes.c_longlong), ("ChangeTime", ctypes.c_longlong),
+                    ("FileAttributes", ctypes.c_ulong)]
+    before = _ByHandleFileInformation()
+    if not _GetFileInformationByHandle(native, ctypes.byref(before)):
+        raise MutationUnsupported("bound file metadata is unavailable")
+    access = metadata.atime_ns // 100 + 116444736000000000
+    modified = metadata.mtime_ns // 100 + 116444736000000000
+    if not 0 < access < 2**63 or not 0 < modified < 2**63:
+        raise MutationConflict("file time is outside the native Windows range")
+    attributes = before.dwFileAttributes & ~1
+    if not metadata.mode & stat.S_IWRITE:
+        attributes |= 1
+    basic = BasicInformation(0, access, modified, 0, attributes or 0x80)
+    if not _SetFileInformationByHandle(native, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+        raise MutationError(f"bound file metadata update failed ({ctypes.get_last_error()})")
+    after = _ByHandleFileInformation()
+    if not _GetFileInformationByHandle(native, ctypes.byref(after)):
+        raise MutationUnsupported("updated bound file metadata is unavailable")
+    actual_modified = (int(after.ftLastWriteTime.dwHighDateTime) << 32) | int(after.ftLastWriteTime.dwLowDateTime)
+    if actual_modified != modified or bool(after.dwFileAttributes & 1) != (not bool(metadata.mode & stat.S_IWRITE)):
+        raise MutationConflict("bound file metadata update could not be verified")
+
+
+def _apply_file_metadata(handle: BinaryIO, metadata: FileMetadata) -> None:
+    if os.name == "nt":
+        import msvcrt
+        _apply_windows_metadata(msvcrt.get_osfhandle(handle.fileno()), metadata)
+    else:
+        os.fchmod(handle.fileno(), metadata.mode)
+        os.utime(handle.fileno(), ns=(metadata.atime_ns, metadata.mtime_ns))
+        after = os.fstat(handle.fileno())
+        if stat.S_IMODE(after.st_mode) != metadata.mode or after.st_mtime_ns != metadata.mtime_ns:
+            raise MutationConflict("bound file metadata update could not be verified")
+
+
+def create_directory(root: str | Path, relative: str | Path, *,
+                     expected_root_identity: tuple[int, int] | None = None,
+                     expected_directories: DirectoryExpectations | None = None) -> TargetState:
+    """Create one absent child without adopting a late existing directory."""
+    _require_supported_root_boundary()
+    root_path = _lexical(root)
+    rel = _relative(root_path, relative)
+    parent, name = _validate_chain(root_path, rel)
+    anchor = _DirectoryAnchor(root_path, parent)
+    _before_commit()
+    with anchor:
+        _after_anchor()
+        if expected_root_identity is not None and anchor.root_identity != expected_root_identity:
+            raise MutationConflict("directory creation authority changed after preflight")
+        _require_anchored_directories(anchor, expected_directories)
+        _require_anchored_expected(anchor, name, TargetState.absent())
+        _after_target_proof()
+        _require_anchored_directories(anchor, expected_directories)
+        _require_anchored_expected(anchor, name, TargetState.absent())
+        if os.name == "nt":
+            native, identity = _windows_open_directory(Path(name), parent=anchor._handles[-1], create=True)
+            try:
+                result = _capture_anchored(anchor, name, include_content=False)
+                if result.kind != "directory" or result.identity != identity:
+                    raise MutationConflict("created directory identity changed")
+                anchor.assert_stable()
+                return result
+            finally:
+                _windows_close(native)
+        try:
+            os.mkdir(name, dir_fd=anchor.parent_fd)
+        except FileExistsError as exc:
+            raise MutationConflict("directory appeared before native creation") from exc
+        os.fsync(anchor.parent_fd)
+        result = _capture_anchored(anchor, name, include_content=False)
+        if result.kind != "directory":
+            raise MutationConflict("created directory is not plain")
+        anchor.assert_stable()
+        return result
 
 
 def ensure_directory_path(path: str | Path) -> Path:
@@ -1497,6 +1736,7 @@ def rename(
     *,
     expected_source: TargetState | None = None,
     expected_target: TargetState | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> MutationReceipt:
     """Move an authorized entry between two anchored parents within one root.
 
@@ -1522,6 +1762,10 @@ def rename(
     with source_anchor, target_anchor:
         _after_anchor()
         source_anchor.assert_stable(); target_anchor.assert_stable()
+        if expected_root_identity is not None and (
+                source_anchor.root_identity != expected_root_identity
+                or target_anchor.root_identity != expected_root_identity):
+            raise MutationConflict("rename root identity changed after preparation")
         _require_anchored_expected(source_anchor, source_name, source_state)
         _require_anchored_expected(target_anchor, target_name, target_state)
         _after_target_proof()
@@ -1544,73 +1788,145 @@ def rename(
         return MutationReceipt("rename", str(root_path), str(target_parent), str(target_parent / target_name), source_state, resulting)
 
 
+def _tree_plan(captured: CapturedTree) -> tuple[dict[Path, TargetState], dict[Path, list[str]]]:
+    if any(not isinstance(entry, Path) or not isinstance(state, TargetState)
+           for entry, state in captured.entries):
+        raise MutationConflict("captured tree entries have invalid types")
+    plan = dict(captured.entries)
+    if len(plan) != len(captured.entries) or captured.relative not in plan:
+        raise MutationConflict("captured tree has duplicate entries or no selected root")
+    if not plan[captured.relative].present:
+        if len(plan) != 1 or plan[captured.relative] != TargetState.absent():
+            raise MutationConflict("absent captured tree contains entries")
+        return plan, {}
+    if plan[captured.relative].kind != "directory":
+        raise MutationConflict("captured tree root is not a plain directory")
+    names = {entry: [] for entry, state in plan.items() if state.kind == "directory"}
+    for entry, state in plan.items():
+        if (not isinstance(entry, Path) or entry.is_absolute()
+                or entry != safe_relative_path(entry) or not entry.is_relative_to(captured.relative)
+                or not isinstance(state, TargetState) or not state.present
+                or state.kind not in ("file", "directory")):
+            raise MutationConflict("captured tree entry is outside its plain selected tree")
+        if state.kind == "file" and (not isinstance(state.content, bytes)
+                or state.size != len(state.content)
+                or state.content_sha256 != hashlib.sha256(state.content).hexdigest()):
+            raise MutationConflict("captured tree file lacks its complete validated bytes")
+        if entry != captured.relative:
+            if entry.parent not in names:
+                raise MutationConflict("captured tree entry has no captured directory parent")
+            names[entry.parent].append(entry.name)
+    for children in names.values():
+        if len({name.casefold() for name in children}) != len(children):
+            raise MutationConflict("captured tree contains aliased portable names")
+        children.sort()
+    return plan, names
+
+
+def _revalidate_tree(captured: CapturedTree) -> None:
+    plan, names = _tree_plan(captured)
+    root = captured.root
+    with _DirectoryAnchor(root, root) as root_anchor:
+        if root_anchor.root_identity != captured.root_identity:
+            raise MutationConflict("captured tree authority root changed")
+        for entry, state in plan.items():
+            if not _same_state(capture_target(root, entry), state):
+                raise MutationConflict("captured tree entry identity or bytes changed")
+            if entry in names:
+                with _DirectoryAnchor(root, root / entry) as directory:
+                    if directory.parent_identity != state.identity:
+                        raise MutationConflict("captured tree directory changed")
+                    actual = sorted(os.listdir(directory.parent_fd if os.name != "nt" else root / entry))
+                    if actual != names[entry]:
+                        raise MutationConflict("captured tree membership changed")
+                    directory.assert_stable()
+            root_anchor.assert_stable()
+
+
+def capture_tree(root: str | Path, relative: str | Path) -> CapturedTree:
+    """Capture and revalidate every plain entry without authorizing later substitutions."""
+    _require_supported_root_boundary()
+    root_path = _lexical(root)
+    rel = _relative(root_path, relative)
+    parent, name = _validate_chain(root_path, rel)
+    plan: dict[Path, TargetState] = {}
+
+    def inventory(entry: Path) -> None:
+        state = capture_target(root_path, entry)
+        if not state.present:
+            raise MutationConflict("tree entry disappeared during capture")
+        plan[entry] = state
+        if state.kind == "directory":
+            with _DirectoryAnchor(root_path, root_path / entry) as directory:
+                if directory.parent_identity != state.identity:
+                    raise MutationConflict("tree directory changed during capture")
+                children = sorted(os.listdir(directory.parent_fd if os.name != "nt" else root_path / entry))
+                seen = set()
+                for child in children:
+                    try:
+                        portable_component(child)
+                    except ValueError as exc:
+                        raise MutationConflict("tree contains an unsafe portable name") from exc
+                    if child.casefold() in seen:
+                        raise MutationConflict("tree contains aliased portable names")
+                    seen.add(child.casefold())
+                    inventory(entry / child)
+                directory.assert_stable()
+
+    with _DirectoryAnchor(root_path, parent) as outer:
+        selected = _capture_anchored(outer, name, include_content=True)
+        if not selected.present:
+            plan[rel] = selected
+        elif selected.kind != "directory":
+            raise MutationConflict("tree capture requires one plain directory")
+        else:
+            inventory(rel)
+            if not _same_state(plan[rel], selected):
+                raise MutationConflict("tree root changed during capture")
+        captured = CapturedTree(root_path, rel, outer.root_identity, tuple(sorted(plan.items())))
+        _revalidate_tree(captured)
+        outer.assert_stable()
+        return captured
+
+
 def remove_tree(
     root: str | Path,
     relative: str | Path,
     *,
     expected: TargetState | None = None,
+    captured: CapturedTree | None = None,
 ) -> None:
-    """Preflight the entire tree, then remove only its captured plain entries."""
+    """Remove captured entries only; changed identity/bytes/membership is a conflict."""
     _require_supported_root_boundary()
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
-    parent, name = _validate_chain(root_path, rel)
-    authorized = expected if expected is not None else capture_target(root_path, rel)
+    snapshot = captured if captured is not None else capture_tree(root_path, rel)
+    if not isinstance(snapshot, CapturedTree) or snapshot.root != root_path or snapshot.relative != rel:
+        raise MutationConflict("captured tree belongs to another authority root or target")
+    plan, _ = _tree_plan(snapshot)
+    authorized = plan[rel]
+    if expected is not None and not _same_state(authorized, expected):
+        raise MutationConflict("captured tree root differs from the expected target")
     if not authorized.present:
-        with _DirectoryAnchor(root_path, parent) as anchor:
-            _require_anchored_expected(anchor, name, authorized)
+        _revalidate_tree(snapshot)
         return
-    if authorized.kind != "directory":
-        raise MutationConflict("recursive removal requires one plain directory")
-    _remove_anchored_tree(root_path, rel, authorized)
+    _remove_anchored_tree(snapshot)
 
 
-def _remove_anchored_tree(root: Path, relative: Path, expected: TargetState) -> None:
-    plan: dict[Path, TargetState] = {}
-    names: dict[Path, list[str]] = {}
-
-    def inventory(entry: Path) -> None:
-        state = capture_target(root, entry)
-        if not state.present:
-            raise MutationConflict("tree entry disappeared during preflight")
-        plan[entry] = state
-        if state.kind == "directory":
-            with _DirectoryAnchor(root, root / entry) as directory:
-                directory.assert_stable()
-                if _identity((root / entry).lstat()) != state.identity:
-                    raise MutationConflict("tree directory changed during preflight")
-                children = sorted(os.listdir(directory.parent_fd if os.name != "nt" else root / entry))
-                seen = set()
-                for name in children:
-                    try:
-                        portable_component(name)
-                    except ValueError as exc:
-                        raise MutationConflict("tree contains an unsafe portable name") from exc
-                    if name.casefold() in seen:
-                        raise MutationConflict("tree contains aliased portable names")
-                    seen.add(name.casefold())
-                names[entry] = children
-                for name in children:
-                    inventory(entry / name)
-                directory.assert_stable()
-
+def _remove_anchored_tree(captured: CapturedTree) -> None:
+    root, relative = captured.root, captured.relative
+    plan, _ = _tree_plan(captured)
     parent, name = _validate_chain(root, relative)
     outer = _DirectoryAnchor(root, parent)
     _before_commit()
     with outer:
         _after_anchor()
-        _require_anchored_expected(outer, name, expected)
-        inventory(relative)
-        if not _same_state(plan[relative], expected):
-            raise MutationConflict("tree root changed during preflight")
+        if outer.root_identity != captured.root_identity:
+            raise MutationConflict("captured tree authority root changed before removal")
+        _require_anchored_expected(outer, name, plan[relative])
         _after_target_proof()
-        outer.assert_stable()
-        # Nothing is removed until every entry, including later siblings, passes.
-        for entry, state in plan.items():
-            if not _same_state(capture_target(root, entry), state):
-                raise MutationConflict("tree changed after preflight")
-            if entry in names and sorted(os.listdir(root / entry)) != names[entry]:
-                raise MutationConflict("tree inventory changed after preflight")
+        # Validate the caller's entire original census before the first deletion.
+        _revalidate_tree(captured)
         for entry in sorted(plan, key=lambda item: len(item.parts), reverse=True):
             state = plan[entry]
             with _DirectoryAnchor(root, (root / entry).parent) as anchor:
@@ -1641,11 +1957,16 @@ def _remove_anchored_tree(root: Path, relative: Path, expected: TargetState) -> 
             raise MutationConflict("tree removal could not prove root absence")
 
 
-def append_bytes(root: str | Path, relative: str | Path, data: bytes) -> TargetState:
+def append_bytes(root: str | Path, relative: str | Path, data: bytes, *,
+                 expected: TargetState | None = None,
+                 expected_root_identity: tuple[int, int] | None = None,
+                 expected_directories: DirectoryExpectations | None = None) -> TargetState:
     root_path = _lexical(root)
     rel = _relative(root_path, relative)
     target = root_path / rel
-    anchored = open_append_file(root_path, rel)
+    anchored = open_append_file(root_path, rel, expected=expected,
+                               expected_root_identity=expected_root_identity,
+                               expected_directories=expected_directories)
     try:
         handle = anchored.handle
         before = os.fstat(handle.fileno())
@@ -1684,10 +2005,16 @@ __all__ = [
     "MutationReceipt",
     "MutationUnsupported",
     "AnchoredAppendFile",
+    "CapturedTree",
+    "DirectoryExpectations",
+    "FileMetadata",
     "TargetState",
     "append_bytes",
     "capture_target",
+    "capture_tree",
+    "create_directory",
     "delete",
+    "durable_identity",
     "ensure_directory_path",
     "make_temporary_directory",
     "open_append_file",

@@ -1,53 +1,36 @@
+"""Recovery exercises live, exited and unobservable native monitor ownership."""
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
-from orchestrator_harness import operator_launch, setup
-from orchestrator_harness.config import HarnessConfig, ResourceManifest
-from orchestrator_harness.core import iso_utc
+from orchestrator_harness import operator_launch, processes, setup
+from orchestrator_harness.config import compute_config_identity, load_config, load_resource_manifest
 from orchestrator_harness.records import atomic_write_json
+from orchestrator_harness.tests.test_v2_materialization import MaterializationFixture
 
 
 class MonitorRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.workspace = self.root / "workspace"
-        self.workspace.mkdir()
-        self.config = HarnessConfig(self.root, self.workspace, "enabled")
-        self.manifest = ResourceManifest(())
-        setup.set_runtime_state(self.config.runtime_root, "OPEN")
+        self.fixture = MaterializationFixture()
+        self.addCleanup(self.fixture.close)
+        self.root = self.fixture.harness
+        self.config = load_config(self.root)
+        self.identity = compute_config_identity(self.config, load_resource_manifest(self.root))
+        self.rt = self.config.runtime_root
+        setup.set_runtime_state(self.rt, "OPEN")
 
-    def tearDown(self) -> None:
-        self.temp.cleanup()
+    def record(self, **overrides):
+        with self.fixture.native_setup():
+            startup = setup._start_monitor(self.root, self.rt, self.config, self.identity)
+        ready = dict(setup._wait_monitor_ready(self.rt, self.identity, startup))
+        ready.update(overrides)
+        atomic_write_json(setup.monitor_record_path(self.rt), ready)
+        return ready
 
-    def record(self, **overrides: object) -> dict[str, object]:
-        value: dict[str, object] = {
-            "schema": setup.MONITOR_SCHEMA,
-            "config_identity": "cfg-current",
-            "pid": 41,
-            "creation_time": "windows-filetime:134361000000000000",
-            "started_at": iso_utc(),
-            "health": "healthy",
-            "last_heartbeat_at": iso_utc(),
-            "stop_requested": False,
-        }
-        value.update(overrides)
-        atomic_write_json(setup.monitor_record_path(self.config.runtime_root), value)
-        return value
-
-    def call(self) -> dict[str, object]:
-        with (
-            patch.object(setup, "find_harness_root", return_value=self.root),
-            patch.object(setup, "load_config", return_value=self.config),
-            patch.object(setup, "load_resource_manifest", return_value=self.manifest),
-            patch.object(setup, "compute_config_identity", return_value="cfg-current"),
-        ):
-            return setup.run_monitor_recover()
+    def call(self):
+        with self.fixture.native_setup():
+            return setup.run_monitor_recover(self.root)
 
     def test_public_cli_exposes_monitor_recover(self) -> None:
         args = operator_launch._build_parser().parse_args(["health", "monitor-recover"])
@@ -57,102 +40,91 @@ class MonitorRecoveryTests(unittest.TestCase):
         recover.assert_called_once_with()
 
     def test_missing_monitor_starts_one_exact_record(self) -> None:
-        with (
-            patch.object(setup.processes, "spawn_detached", return_value=SimpleNamespace(pid=77)) as spawn,
-            patch.object(setup.processes, "process_identity", return_value={"pid": 77, "creation_time": "windows-filetime:134361000000000001"}),
-        ):
-            result = self.call()
-        self.assertEqual(result["code"], "MONITOR_RECOVERED")
-        spawn.assert_called_once()
-        self.assertEqual(setup.read_monitor_record(self.config.runtime_root)["creation_time"], "windows-filetime:134361000000000001")
+        result = self.call()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(setup.MONITOR_RECOVERED, result["code"])
+        self.assertEqual(1, len(self.fixture.monitor_children))
+        ready = setup.require_monitor_ready(self.rt, self.identity)
+        self.assertIs(ready["initialized"], True)
+        self.assertEqual(self.fixture.monitor_children[0][0].pid, ready["pid"])
 
     def test_fresh_live_monitor_is_unchanged(self) -> None:
         before = self.record()
-        with (
-            patch.object(setup.processes, "identity_matches", return_value=True),
-            patch.object(setup.processes, "identity_exit_proven", return_value=False),
-            patch.object(setup.processes, "spawn_detached") as spawn,
-        ):
-            result = self.call()
-        self.assertEqual(result["code"], "MONITOR_HEALTHY")
-        spawn.assert_not_called()
-        self.assertEqual(setup.read_monitor_record(self.config.runtime_root), before)
+        result = self.call()
+        self.assertEqual(setup.MONITOR_HEALTHY, result["code"])
+        self.assertEqual(1, len(self.fixture.monitor_children))
+        self.assertEqual(before, setup.read_monitor_record(self.rt))
 
     def test_dead_unstopped_monitor_restarts(self) -> None:
-        self.record()
-        with (
-            patch.object(setup.processes, "identity_matches", return_value=False),
-            patch.object(setup.processes, "identity_exit_proven", return_value=True),
-            patch.object(setup.processes, "spawn_detached", return_value=SimpleNamespace(pid=78)),
-            patch.object(setup.processes, "process_identity", return_value={"pid": 78, "creation_time": "windows-filetime:134361000000000002"}),
-        ):
-            result = self.call()
-        self.assertEqual(result["code"], "MONITOR_RECOVERED")
-        self.assertEqual(setup.read_monitor_record(self.config.runtime_root)["pid"], 78)
+        before = self.record()
+        self.assertTrue(processes.terminate_process(before["pid"], before["creation_time"], force=True))
+        self.fixture.monitor_children[0][0].wait(timeout=3)
+        result = self.call()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(setup.MONITOR_RECOVERED, result["code"])
+        ready = setup.require_monitor_ready(self.rt, self.identity)
+        self.assertNotEqual(before["startup_id"], ready["startup_id"])
+        self.assertTrue(processes.identity_exit_proven(before["pid"], before["creation_time"]))
 
     def test_dead_deliberately_stopped_monitor_is_not_restarted(self) -> None:
-        self.record(stop_requested=True, health="STOPPED")
-        with (
-            patch.object(setup.processes, "identity_matches", return_value=False),
-            patch.object(setup.processes, "identity_exit_proven", return_value=True),
-            patch.object(setup.processes, "spawn_detached") as spawn,
-        ):
-            result = self.call()
-        self.assertEqual(result["code"], "MONITOR_DELIBERATELY_STOPPED")
-        spawn.assert_not_called()
+        self.record(stop_requested=True)
+        self.fixture.monitor_children[0][0].wait(timeout=3)
+        result = self.call()
+        self.assertEqual(setup.MONITOR_DELIBERATELY_STOPPED, result["code"])
+        self.assertEqual(1, len(self.fixture.monitor_children))
 
     def test_marked_stopped_but_alive_does_not_double_start(self) -> None:
-        self.record(stop_requested=True)
-        with (
-            patch.object(setup.processes, "identity_matches", return_value=True),
-            patch.object(setup.processes, "identity_exit_proven", return_value=False),
-            patch.object(setup.processes, "spawn_detached") as spawn,
-        ):
+        before = self.record()
+        # Own admission prevents the actual child from consuming the stop flag
+        # until recovery has observed the exact still-live owner.
+        from orchestrator_harness.records import runtime_admission_lock
+        with runtime_admission_lock(self.rt):
+            atomic_write_json(setup.monitor_record_path(self.rt), {**before, "stop_requested": True})
             result = self.call()
-        self.assertEqual(result["code"], "MONITOR_STOP_INCOMPLETE")
+        self.assertEqual(setup.MONITOR_STOP_INCOMPLETE, result["code"])
         self.assertFalse(result["ok"])
-        spawn.assert_not_called()
+        self.assertEqual(1, len(self.fixture.monitor_children))
 
     def test_stale_live_monitor_is_exactly_stopped_before_replacement(self) -> None:
-        self.record(last_heartbeat_at="2020-01-01T00:00:00Z")
-        matches = iter([True, False])
-        with (
-            patch.object(setup.processes, "identity_matches", side_effect=lambda *_: next(matches)),
-            patch.object(setup.processes, "identity_exit_proven", side_effect=[False, True]),
-            patch.object(setup.processes, "terminate_process", return_value=True) as terminate,
-            patch.object(setup.processes, "spawn_detached", return_value=SimpleNamespace(pid=79)),
-            patch.object(setup.processes, "process_identity", return_value={"pid": 79, "creation_time": "windows-filetime:134361000000000003"}),
-        ):
+        before = self.record(last_heartbeat_at="2020-01-01T00:00:00Z")
+        real_terminate = processes.terminate_process
+        with patch.object(processes, "terminate_process", wraps=real_terminate) as terminate:
             result = self.call()
-        self.assertEqual(result["code"], "MONITOR_RECOVERED")
-        terminate.assert_called_once_with(41, "windows-filetime:134361000000000000", force=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(setup.MONITOR_RECOVERED, result["code"])
+        terminate.assert_called_once_with(before["pid"], before["creation_time"], force=True)
+        self.assertTrue(processes.identity_exit_proven(before["pid"], before["creation_time"]))
+        setup.require_monitor_ready(self.rt, self.identity)
 
     def test_unproven_hung_cleanup_never_starts_replacement(self) -> None:
-        self.record(last_heartbeat_at="not-a-time")
-        with (
-            patch.object(setup.processes, "identity_matches", return_value=True),
-            patch.object(setup.processes, "identity_exit_proven", return_value=False),
-            patch.object(setup.processes, "terminate_process", return_value=False) as terminate,
-            patch.object(setup.processes, "spawn_detached") as spawn,
-        ):
+        before = self.record(last_heartbeat_at="not-a-time")
+        with patch.object(processes, "terminate_process", return_value=False) as terminate:
             result = self.call()
-        self.assertEqual(result["code"], "MONITOR_CLEANUP_UNPROVEN")
-        terminate.assert_called_once_with(41, "windows-filetime:134361000000000000", force=True)
-        spawn.assert_not_called()
+        self.assertEqual(setup.MONITOR_CLEANUP_UNPROVEN, result["code"])
+        terminate.assert_called_once_with(before["pid"], before["creation_time"], force=True)
+        self.assertEqual(1, len(self.fixture.monitor_children))
+        self.assertTrue(processes.identity_matches(before["pid"], before["creation_time"]))
 
     def test_plain_profile_refuses_automatic_recovery(self) -> None:
-        self.config = HarnessConfig(self.root, self.workspace, "disabled")
-        with patch.object(setup.processes, "spawn_detached") as spawn:
-            result = self.call()
-        self.assertEqual(result["code"], "MONITOR_RECOVERY_DISABLED")
-        spawn.assert_not_called()
+        self.fixture._write_json(self.root / "harness-config.json", {
+            "root_workspace": str(self.fixture.root_workspace), "managed_coordination": "disabled"})
+        result = self.call()
+        self.assertEqual(setup.MONITOR_RECOVERY_DISABLED, result["code"])
+        self.assertEqual([], self.fixture.monitor_children)
 
     def test_closed_runtime_refuses_recovery(self) -> None:
-        setup.set_runtime_state(self.config.runtime_root, "CLOSED")
-        with patch.object(setup.processes, "spawn_detached") as spawn:
+        setup.set_runtime_state(self.rt, "CLOSED")
+        result = self.call()
+        self.assertEqual(setup.MONITOR_RUNTIME_NOT_OPEN, result["code"])
+        self.assertEqual([], self.fixture.monitor_children)
+
+    def test_unknown_owner_is_preserved_without_replacement(self) -> None:
+        before = self.record()
+        with patch.object(processes, "identity_matches", return_value=False), patch.object(processes, "identity_exit_proven", return_value=False):
             result = self.call()
-        self.assertEqual(result["code"], "MONITOR_RUNTIME_NOT_OPEN")
-        spawn.assert_not_called()
+        self.assertEqual(setup.MONITOR_IDENTITY_UNPROVEN, result["code"])
+        self.assertEqual(before, setup.read_monitor_record(self.rt))
+        self.assertEqual(1, len(self.fixture.monitor_children))
 
 
 if __name__ == "__main__":

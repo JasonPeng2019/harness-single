@@ -1,5 +1,6 @@
 """Regression checks for run-local harness/ROOT permission boundaries."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import tomllib
@@ -9,6 +10,77 @@ from orchestrator_harness.bootstrap import BootstrapError, _install_codex_worker
 
 
 class WorkerIsolationBoundaryTests(unittest.TestCase):
+    def test_manager_ancestor_protects_hooks_without_denying_product_or_git_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Path(directory) / "manager"
+            root = manager / "development/product"
+            harness = manager / "harness"
+            lane = root / ".harness-runtime/worktrees/epoch/worker"
+            root.mkdir(parents=True)
+            harness.mkdir()
+            protected = []
+            for leaf in (".codex", ".claude", ".qwen", ".agent-workspace"):
+                target = manager / leaf
+                target.mkdir()
+                sentinel = target / "sentinel.txt"
+                sentinel.write_text("protected ROOT\n", encoding="utf-8")
+                protected.append(sentinel)
+            def git(tree, *args):
+                return subprocess.check_output(["git", "-C", str(tree), *args], text=True).strip()
+            git(root, "init", "-q")
+            git(root, "-c", "user.name=Fixture", "-c", "user.email=fixture@local",
+                "commit", "--allow-empty", "-qm", "base")
+            git(root, "worktree", "add", "-qb", "lane/worker/work", str(lane))
+            _install_codex_worker_isolation(lane, harness, root, manager_workspace=manager)
+            filesystem = tomllib.loads((lane / ".codex/config.toml").read_text())["permissions"]["worker-isolated"]["filesystem"]
+            for sentinel in protected:
+                self.assertEqual("deny", filesystem[str(sentinel.parent)])
+                self.assertEqual("protected ROOT\n", sentinel.read_text(encoding="utf-8"))
+            for name, mode in filesystem.items():
+                if not name.startswith(":") and mode == "deny":
+                    self.assertNotIn(Path(name), root.parents)
+                    self.assertNotIn(Path(name), lane.parents)
+            self.assertNotIn(str(manager), filesystem)
+            (lane / "change.txt").write_text("worker change\n", encoding="utf-8")
+            git(lane, "add", "change.txt")
+            git(lane, "-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "worker")
+            self.assertEqual("worker", git(lane, "show", "--format=%s", "--no-patch"))
+
+    def test_redirected_manager_is_refused_before_worker_config_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real = base / "real-manager"
+            real.mkdir()
+            sentinel = real / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            manager = base / "redirected-manager"
+            if os.name == "nt":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(manager), str(real)],
+                               check=True, capture_output=True)
+            else:
+                manager.symlink_to(real, target_is_directory=True)
+            try:
+                root = base / "product"
+                root.mkdir()
+                lane = root / ".harness-runtime/worktrees/epoch/worker"
+                with self.assertRaisesRegex(BootstrapError, "invalid manager authority"):
+                    _install_codex_worker_isolation(lane, base / "harness", root, manager_workspace=manager)
+                self.assertFalse((lane / ".codex/config.toml").exists())
+                self.assertEqual("unchanged\n", sentinel.read_text(encoding="utf-8"))
+            finally:
+                if os.name == "nt": manager.rmdir()
+                else: manager.unlink()
+
+    def test_manager_provider_directory_containing_product_is_a_named_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = Path(directory) / "manager"
+            root = manager / ".codex/product"
+            root.mkdir(parents=True)
+            lane = root / ".harness-runtime/worktrees/epoch/worker"
+            with self.assertRaisesRegex(BootstrapError, "manager ROOT destination contains"):
+                _install_codex_worker_isolation(lane, manager / "harness", root, manager_workspace=manager)
+            self.assertFalse((lane / ".codex/config.toml").exists())
+
     def test_linked_worker_can_commit_without_root_index_or_config_grants(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

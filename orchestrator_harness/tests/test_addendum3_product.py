@@ -21,7 +21,7 @@ from orchestrator_harness.manager_queue import (
     read_manager_queue,
 )
 from orchestrator_harness.records import atomic_write_json, read_jsonl, read_record
-from orchestrator_harness.tests.support import prepare_lane_fixture, seed_provider_history
+from orchestrator_harness.tests.support import PreparedRootFixture, prepare_lane_fixture, seed_provider_history
 from orchestrator_harness.lanes import write_lane
 from orchestrator_harness.stable_io import PreparedOutputTransaction
 
@@ -1033,29 +1033,25 @@ class Addendum3ProductTests(unittest.TestCase):
                 ),
             )
 
-    def test_managed_watch_wakes_on_lane_status_with_empty_queue(self) -> None:
+    def test_managed_watch_waits_for_queue_publication_despite_local_lane_status(self) -> None:
+        fixture = PreparedRootFixture(self)
         with (
-            patch.object(scan_watch, "find_harness_root", return_value=Path("root")),
-            patch.object(scan_watch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
-            patch.object(scan_watch, "_active_epoch", return_value=("epoch-1", {"lane_mode": "managed"})),
-            patch.object(scan_watch, "_discover_orphaned_leases", return_value=[]),
-            patch.object(scan_watch, "read_manager_queue", return_value={"queue_id": "queue-1", "events": []}),
-            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")),
+            patch.dict(os.environ, fixture.environment, clear=True),
+            patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
+            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")) as local_status,
         ):
-            result = scan_watch.run_watch(timeout="0s", root_session_id="root-1")
-        self.assertTrue(result["ok"], result)
-        self.assertEqual("WATCH_ACTIONABLE", result["code"])
-        self.assertEqual("lane_status", result["wake_reason"])
-        self.assertEqual("lane-1", result["summary"].split(" ")[0])
+            result = scan_watch.run_watch(timeout="0s")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual("WATCH_TIMEOUT", result["code"])
+        local_status.assert_not_called()
 
     def test_plain_watch_skips_queue_reads_and_wakes_on_lane_status(self) -> None:
         def fail_queue(*_args: object, **_kwargs: object) -> object:
             raise AssertionError("plain watch must not read the manager queue")
 
+        fixture = PreparedRootFixture(self, profile="plain")
         with (
-            patch.object(scan_watch, "find_harness_root", return_value=Path("root")),
-            patch.object(scan_watch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
-            patch.object(scan_watch, "_active_epoch", return_value=("epoch-1", {"lane_mode": "plain"})),
+            patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
             patch.object(scan_watch, "_discover_orphaned_leases", return_value=[]),
             patch.object(scan_watch, "read_manager_queue", side_effect=fail_queue),
             patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")),
@@ -1065,8 +1061,9 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("WATCH_ACTIONABLE", result["code"])
 
     def test_managed_watch_prefers_delivered_manager_event_over_lane_status(self) -> None:
+        fixture = PreparedRootFixture(self)
         event = promote_event(
-            self.runtime,
+            fixture.rt,
             event_type="LANE_RESULT_INVALID",
             lane_id="lane-1",
             run_id="run-1",
@@ -1076,13 +1073,11 @@ class Addendum3ProductTests(unittest.TestCase):
             data={"signal_id": "signal-2"},
         )
         with (
-            patch.object(scan_watch, "find_harness_root", return_value=Path("root")),
-            patch.object(scan_watch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
-            patch.object(scan_watch, "_active_epoch", return_value=("epoch-1", {"lane_mode": "managed"})),
-            patch.object(scan_watch, "_discover_orphaned_leases", return_value=[]),
-            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")),
+            patch.dict(os.environ, fixture.environment, clear=True),
+            patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
+            patch.object(scan_watch, "_find_actionable", side_effect=AssertionError("managed watch is queue only")),
         ):
-            result = scan_watch.run_watch(timeout="0s", root_session_id="root-1")
+            result = scan_watch.run_watch(timeout="0s")
         self.assertTrue(result["ok"], result)
         self.assertEqual("WATCH_EVENT", result["code"])
         self.assertEqual(event["event_id"], result["event_id"])

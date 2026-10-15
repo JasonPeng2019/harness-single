@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import launch, records, setup
+from orchestrator_harness import launch, mutation, records, setup
 from orchestrator_harness.tests.support import seed_acceptance_chain
 
 
@@ -22,6 +23,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
+    @unittest.skipUnless(os.name == "nt", "native Windows record replacement retry")
     def test_record_replacement_retries_access_and_sharing_errors(self) -> None:
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
@@ -49,6 +51,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual(2, sleep.call_count)
         self.assertEqual([], list(self.root.glob(".record.json.*.tmp")))
 
+    @unittest.skipUnless(os.name == "nt", "native Windows record replacement retry")
     def test_record_permanent_replacement_error_is_immediate_and_preserves_old(self) -> None:
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
@@ -65,6 +68,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual(b"old\n", target.read_bytes())
         self.assertEqual([], list(self.root.glob(".record.json.*.tmp")))
 
+    @unittest.skipUnless(os.name == "nt", "native Windows record replacement retry")
     def test_record_nontransient_replacement_error_is_not_retried(self) -> None:
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
@@ -81,6 +85,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual(b"old\n", target.read_bytes())
         self.assertEqual([], list(self.root.glob(".record.json.*.tmp")))
 
+    @unittest.skipUnless(os.name == "nt", "native Windows cache rename retry")
     def test_super_cache_directory_replacement_retries_transient_errors(self) -> None:
         destination = self.root / "super-cache"
         destination.mkdir()
@@ -88,19 +93,18 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         staging = self.root / ".super-cache.staging"
         staging.mkdir()
         (staging / "new.txt").write_text("new\n", encoding="utf-8")
-        real_replace = setup.os.replace
+        real_replace = mutation._NtSetInformationFile
         calls = 0
 
-        def replace(source: object, target: object) -> None:
+        def replace(*args: object) -> int:
             nonlocal calls
             calls += 1
             if calls == 1:
-                raise _windows_error(32)
-            real_replace(source, target)
+                return 0xc0000043 - 2**32
+            return real_replace(*args)
 
         with (
-            patch.object(setup.os, "name", "nt"),
-            patch.object(setup.os, "replace", side_effect=replace),
+            patch.object(mutation, "_NtSetInformationFile", side_effect=replace),
             patch.object(records.time, "sleep") as sleep,
         ):
             setup._replace_tree(staging, destination)
@@ -111,6 +115,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual(3, calls)
         self.assertEqual(1, sleep.call_count)
 
+    @unittest.skipUnless(os.name == "nt", "native Windows cache rename retry")
     def test_super_cache_staging_destination_retry_preserves_atomic_swap(self) -> None:
         destination = self.root / "super-cache"
         destination.mkdir()
@@ -118,19 +123,18 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         staging = self.root / ".super-cache.staging"
         staging.mkdir()
         (staging / "new.txt").write_text("new\n", encoding="utf-8")
-        real_replace = setup.os.replace
+        real_replace = mutation._NtSetInformationFile
         calls = 0
 
-        def replace(source: object, target: object) -> None:
+        def replace(*args: object) -> int:
             nonlocal calls
             calls += 1
             if calls == 2:
-                raise _windows_error(5)
-            real_replace(source, target)
+                return 0xc0000022 - 2**32
+            return real_replace(*args)
 
         with (
-            patch.object(setup.os, "name", "nt"),
-            patch.object(setup.os, "replace", side_effect=replace),
+            patch.object(mutation, "_NtSetInformationFile", side_effect=replace),
             patch.object(records.time, "sleep") as sleep,
         ):
             setup._replace_tree(staging, destination)
@@ -140,14 +144,14 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual(3, calls)
         self.assertEqual(1, sleep.call_count)
 
+    @unittest.skipUnless(os.name == "nt", "native Windows cache rename retry")
     def test_super_cache_permanent_replacement_error_surfaces(self) -> None:
         destination = self.root / "super-cache"
         destination.mkdir()
         staging = self.root / ".super-cache.staging"
         staging.mkdir()
         with (
-            patch.object(setup.os, "name", "nt"),
-            patch.object(setup.os, "replace", side_effect=_windows_error(5)) as replace,
+            patch.object(mutation, "_NtSetInformationFile", return_value=0xc0000022 - 2**32) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
         ):
