@@ -314,14 +314,35 @@ class FailedStartRecoveryTests(CancellationFixture):
         self.assertEqual(launch.FORCE_STOP_CLEANUP_UNPROVEN, self.force_stop()["code"])
         child.terminate.assert_not_called()
 
+    def test_fast_provider_exit_is_a_successful_launch_only_with_cleanup_proof(self) -> None:
+        for cleanup in (True, False):
+            with self.subTest(cleanup=cleanup):
+                write_lane(self.rt, self.epoch, "lane", self.lane)
+                child = MagicMock(pid=os.getpid())
+                child.poll.return_value = 0
+                status = {
+                    "controller_state": "exited", "provider_state": {"state": "exited"},
+                    "cleanup_proven": cleanup, "recorded_status": "provider_exited_no_result",
+                }
+                with (patch.object(processes, "spawn_detached", return_value=child),
+                      patch.object(launch, "_read_controller_status", return_value=status)):
+                    result = launch.run_launch("lane")
+                self.assertEqual(cleanup, result["ok"], result)
+                if cleanup:
+                    self.assertEqual("LAUNCH_OK", result["code"])
+                    self.assertIn("provider_exited_no_result", result["summary"])
+                child.terminate.assert_not_called()
+
     def test_failed_registration_records_exact_reap_without_inventing_provider_cleanup(self) -> None:
         for terminal in (False, True):
             with self.subTest(terminal=terminal):
                 write_lane(self.rt, self.epoch, "lane", self.lane)
-                child = processes.spawn_provider([sys.executable, "-B", "-c", "import time; time.sleep(60)"],
-                                                 cwd=self.workspace, stdin=subprocess.DEVNULL,
-                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                                 env=dict(os.environ))
+                with (open(os.devnull, "r") as stdin, open(os.devnull, "w") as stdout,
+                      open(os.devnull, "w") as stderr):
+                    child = processes.spawn_provider([sys.executable, "-B", "-c", "import time; time.sleep(60)"],
+                                                     cwd=self.workspace, stdin=stdin,
+                                                     stdout=stdout, stderr=stderr,
+                                                     env=dict(os.environ))
                 job = child.take_job_handle() if os.name == "nt" else None
                 boundary = processes.ProcessBoundary.for_process(child.pid, windows_job_handle=job)
                 self.assertTrue(boundary.observe())
@@ -330,13 +351,15 @@ class FailedStartRecoveryTests(CancellationFixture):
                 if os.name == "nt":
                     child.resume()
                 calls = 0
+                boundary_cleaned = False
 
                 def fail_registration(*args):
-                    nonlocal calls
+                    nonlocal calls, boundary_cleaned
                     calls += 1
                     if calls == 2:
                         if terminal:
                             self.assertTrue(boundary.cleanup(force=True))
+                            boundary_cleaned = True
                             atomic_write_json(self.status_path, {
                                 "schema": "controller-status/v1", "lane_id": "lane", "run_id": "resumed-run",
                                 "controller_identity": identity,
@@ -355,11 +378,41 @@ class FailedStartRecoveryTests(CancellationFixture):
                         self.assertEqual(terminal, shutdown._lane_clean(self.rt, lane))
                         original_wait.assert_called_once_with(timeout=10.0)
                 finally:
-                    self.assertTrue(boundary.cleanup(force=True))
+                    # The terminal branch already consumed/closed the Job.
+                    # Do not repeat its cleanup through global process discovery.
+                    if not boundary_cleaned:
+                        self.assertTrue(boundary.cleanup(force=True), boundary.errors)
+                    self.assertTrue(processes.process_boundary_is_gone(boundary.record()))
                     self.assertTrue(processes.reap_created_process(child))
                     close = getattr(child, "close", None)
                     if close is not None:
                         close()
+
+    def test_early_controller_failure_retains_stderr_for_public_diagnosis(self) -> None:
+        children = []
+        original_spawn = processes.spawn_detached
+
+        def spawn(*args, **kwargs):
+            child = original_spawn(*args, **kwargs)
+            children.append(child)
+            return child
+
+        try:
+            with (patch.object(processes, "spawn_detached", side_effect=spawn),
+                  patch.object(processes, "python_argv", return_value=[sys.executable, "-B", "-c",
+                      "import sys,time; time.sleep(0.3); sys.stderr.write('fixture controller import failed\\n'); sys.exit(1)"])):
+                result = launch.run_launch("lane")
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(launch.LAUNCH_CONTROLLER_START_FAILED, result["code"])
+            stderr = self.status_path.with_name("controller-stderr.txt")
+            self.assertIn(str(stderr), result["evidence_paths"])
+            self.assertIn("fixture controller import failed", stderr.read_text(encoding="utf-8"))
+        finally:
+            for child in children:
+                # Original handles remain authoritative even if registration failed.
+                if child.poll() is None:
+                    child.terminate()
+                self.assertTrue(processes.reap_created_process(child))
 
 
 class PublicPendingShutdownTests(unittest.TestCase):
@@ -406,17 +459,38 @@ class PublicPendingShutdownTests(unittest.TestCase):
                 rt = workspace / ".harness-runtime"
                 env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
+                def startup_diagnostics() -> str:
+                    diagnostics = []
+                    for path in (rt / "epochs").glob("*/lanes/pending/lane.json"):
+                        try:
+                            current = json.loads(path.read_text(encoding="utf-8"))
+                            diagnostics.append({"lane": str(path), "launch_failure": current.get("launch_failure")})
+                            status = Path(current["controller_status_path"])
+                            paths = {status, Path(current["controller_events_path"]),
+                                     status.with_name("controller-stderr.txt")}
+                            paths.update(status.parent.rglob("provider-stderr.txt"))
+                            for evidence in sorted(paths):
+                                if evidence.is_file():
+                                    diagnostics.append({"path": str(evidence),
+                                                        "tail": evidence.read_text(encoding="utf-8", errors="replace")[-8000:]})
+                        except (OSError, ValueError, KeyError) as error:
+                            diagnostics.append({"path": str(path), "diagnostic_error": str(error)})
+                    return "PUBLIC_PENDING_STARTUP_DIAGNOSTICS " + json.dumps(diagnostics)
+
                 def public(*args: str, success: bool = True) -> dict:
-                    # The original full-catalog Windows fixture exceeded45s in
-                    # every setup subcase. Keep a finite startup allowance while
-                    # retaining the shorter deadline for ordinary commands.
+                    # A full-catalog Windows setup took 68.609s and bootstrap
+                    # took 61.297s in a disposable Git project. Allow both
+                    # startup commands 120s; ordinary commands retain 45s.
                     setup_command = args == ("harness", "setup")
+                    bootstrap_command = args[:2] == ("lane", "bootstrap")
                     started = time.monotonic()
-                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=120 if setup_command else 45)
-                    if setup_command:
-                        print("PUBLIC_PENDING_SETUP_TIMING " + json.dumps({"mode": mode, "service": enabled,
+                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=120 if setup_command or bootstrap_command else 45)
+                    if setup_command or bootstrap_command:
+                        print(("PUBLIC_PENDING_SETUP_TIMING " if setup_command else "PUBLIC_PENDING_BOOTSTRAP_TIMING ") + json.dumps({"mode": mode, "service": enabled,
                               "elapsed_seconds": round(time.monotonic() - started, 3), "exit_code": completed.returncode}), flush=True)
-                    self.assertEqual(success, completed.returncode == 0, completed.stdout + completed.stderr)
+                    self.assertEqual(success, completed.returncode == 0,
+                                     completed.stdout + completed.stderr + "\n" +
+                                     (startup_diagnostics() if success != (completed.returncode == 0) else ""))
                     return json.loads(completed.stdout)
 
                 def queue_snapshot() -> dict:
@@ -445,7 +519,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                             self.assertFalse(lease_path(rt, "shared").exists())
                             return current
                         time.sleep(0.1)
-                    self.fail("owned controller/provider did not complete with proven cleanup")
+                    self.fail("owned controller/provider did not complete with proven cleanup\n" + startup_diagnostics())
 
                 monitor = None
                 try:
@@ -557,6 +631,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         self.assertEqual("STOPPED", stopped["status"])
                         self.assertTrue(json.loads((home(workspace) / "service.json").read_text())["cleanup_proven"])
                 except BaseException:
+                    print(startup_diagnostics(), flush=True)
                     # Optional owned validation output preserves the authority
                     # behind a failure before temporary-fixture cleanup removes
                     # it. This is test evidence, never a product recovery path.

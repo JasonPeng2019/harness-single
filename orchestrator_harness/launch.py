@@ -90,7 +90,10 @@ def _spawn_controller_logged(
             argv=list(argv), cwd=spawn_options.get("cwd"),
             environment_mode="scrubbed" if "env" in spawn_options else "inherited",
         )
-        return processes.spawn_detached(argv, **dict(spawn_options))
+        # Keep early controller/import failures, which occur before status exists.
+        stderr_path = Path(lane["controller_status_path"]).with_name("controller-stderr.txt")
+        with stderr_path.open("a", encoding="utf-8") as stderr:
+            return processes.spawn_detached(argv, **{**spawn_options, "stderr": stderr})
     except (OSError, ValueError) as exc:
         raise ControllerNotCreated(LAUNCH_CONTROLLER_START_FAILED, str(exc)) from exc
 
@@ -370,6 +373,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         )
         deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
+            # Observe exit first so the status read also sees the final write
+            # when a short provider finishes between handshake polls.
+            controller_exited = child.poll() is not None
             status = _read_controller_status(lane)
             provider_state = (status or {}).get("provider_state") or {}
             running = (
@@ -381,7 +387,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 status is not None
                 and provider_state.get("state") == "exited"
                 and status.get("cleanup_proven") is True
-                and status.get("recorded_status") in ("review_pending", "result_invalid")
+                and status.get("recorded_status") in (
+                    "review_pending", "result_invalid", "provider_exited_no_result",
+                )
             )
             if running or terminal:
                 lane = read_lane(rt, epoch_id, lane_id)
@@ -393,7 +401,7 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     "evidence_paths": [lane["controller_status_path"]],
                     "next_action": "wait for the worker result; the monitor reports actionable status",
                 }
-            if child.poll() is not None:
+            if controller_exited:
                 break
             time.sleep(0.2)
         # The controller exited before the handshake: map its last event to a code.
@@ -413,6 +421,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     summary = "the provider process could not be started"
         status = _read_controller_status(lane)
         evidence = [str(Path(lane["controller_status_path"]))] if status else []
+        for path in (events_path, Path(lane["controller_status_path"]).with_name("controller-stderr.txt")):
+            if path.is_file():
+                evidence.append(str(path))
         if (
             code == LAUNCH_PROVIDER_START_FAILED
             and status is not None
