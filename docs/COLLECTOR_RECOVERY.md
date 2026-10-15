@@ -99,7 +99,12 @@ re-verifies the recorded digest, and reports the inexact total honestly.
 An accepted receipt marks that worker `terminated_usage_unknown`:
 
 - `charged_tokens` and every per-field charge stay null; no token count is invented.
-- `unknown_usage_invocations` counts the acknowledged gaps and `token_total_is_exact` is false.
+- `unknown_usage_invocations` counts invocations whose usage is unknown, not receipt entries,
+  and `token_total_is_exact` is false. A later invocation that continues the same native
+  session also stays unknown when the earlier acknowledged attempt's baseline is missing: its
+  cumulative total is readable, but turning it into an attributable delta would invent that
+  baseline. It is linked to the original receipt and native session identity, so the counter
+  can read 2 while only one original receipt exists.
 - With a `budget_tokens` cap, `remaining_tokens` and `overshoot_tokens` are null,
   `gate_allows_new_work` is false, `gate` exits 3 and `resume` refuses ("token budget cannot
   authorize resume"). Capped unknown work stays refused; the receipt never unlocks a cap.
