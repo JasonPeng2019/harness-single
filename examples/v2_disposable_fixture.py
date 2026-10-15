@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from orchestrator_harness.tests.v2_acceptance.contract import (  # noqa: E402
     content_hash,
 )
 from orchestrator_harness.tests.v2_acceptance.reference_runtime import ReferenceRuntime  # noqa: E402
+from orchestrator_harness import processes  # noqa: E402
 
 
 def _timestamp() -> str:
@@ -134,6 +136,11 @@ def _launch_local_fake_child(
         str(target_root),
         json.dumps(authorization, sort_keys=True),
     ]
+    environment = None
+    if os.name == "nt" and sys.prefix != sys.base_prefix:
+        # Match spawn_detached: the venv redirector's PID is not the Python child.
+        command[0] = sys._base_executable
+        environment = {**os.environ, "__PYVENV_LAUNCHER__": sys.executable}
     started_at = _timestamp()
     process = subprocess.Popen(
         command,
@@ -142,23 +149,31 @@ def _launch_local_fake_child(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=environment,
     )
     assert process.stdin and process.stdout and process.stderr
-    ready_line = process.stdout.readline()
-    observer_ready_at = _timestamp()
-    ready = json.loads(ready_line)
-    requested_identity = {"pid": process.pid, "identity_token": identity_token}
-    observed_identity = {
-        "pid": ready.get("pid"),
-        "creation_time_utc": ready.get("creation_time_utc"),
-        "identity_token": ready.get("identity_token"),
-    }
-    if ready["event"] != "observer-ready" or observed_identity["pid"] != process.pid:
-        raise RuntimeError("local fake observer did not report its spawned process")
-    if observed_identity["identity_token"] != identity_token or not observed_identity["creation_time_utc"]:
-        raise RuntimeError("local fake observer identity token mismatch")
-    if process.poll() is not None:
-        raise RuntimeError("local fake child was not still running when observed")
+    try:
+        ready_line = process.stdout.readline()
+        observer_ready_at = _timestamp()
+        ready = json.loads(ready_line)
+        requested_identity = {"pid": process.pid, "identity_token": identity_token}
+        observed_identity = {
+            "pid": ready.get("pid"),
+            "creation_time_utc": ready.get("creation_time_utc"),
+            "identity_token": ready.get("identity_token"),
+        }
+        if ready["event"] != "observer-ready" or observed_identity["pid"] != process.pid:
+            raise RuntimeError("local fake observer did not report its spawned process")
+        if observed_identity["identity_token"] != identity_token or not observed_identity["creation_time_utc"]:
+            raise RuntimeError("local fake observer identity token mismatch")
+        if process.poll() is not None:
+            raise RuntimeError("local fake child was not still running when observed")
+    except BaseException:
+        if not processes.reap_created_process(process):
+            raise RuntimeError("local fake child cleanup could not be proven")
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+        raise
     return process, {
         "attempt": attempt,
         "unit": unit,

@@ -1,6 +1,7 @@
 """Failure gates without executing Codex, requesting elevation, or repairing ACLs."""
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +33,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {"CODEX_HOME": str(self.home), "LOCALAPPDATA": str(self.cache)})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.real_popen = subprocess.Popen
         self.spawn = patch("subprocess.Popen", side_effect=AssertionError("no process may launch"))
         self.process = self.spawn.start()
         self.addCleanup(self.spawn.stop)
@@ -204,7 +206,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self._assert_controller_sandbox_failure(already_exited=True)
 
     def _assert_controller_sandbox_failure(self, *, already_exited):
-        from orchestrator_harness import controller
+        from orchestrator_harness import controller, git_source
         runtime = self.workspace / ".harness-runtime"
         worktree = runtime / "worktrees/epoch/worker"
         agent = worktree / ".agent-workspace"
@@ -216,8 +218,10 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
                 "last_message_path": str(agent / "last.txt"), "controller_status_path": str(agent / "status.json")}
         from orchestrator_harness.tests.support import prepare_lane_fixture, seed_provider_history
         lane["provider"] = {"id": "codex", "model": "fixture", "launch_config": {}}
-        lane = prepare_lane_fixture(runtime, "epoch", lane)
-        seed_provider_history(runtime, lane, epoch_id="epoch")
+        # Git prepares the owned fixture before the controller's no-process boundary.
+        with patch("subprocess.Popen", self.real_popen):
+            lane = prepare_lane_fixture(runtime, "epoch", lane)
+            seed_provider_history(runtime, lane, epoch_id="epoch")
         child = MagicMock(pid=123, returncode=17)
         child.poll.return_value = 17 if already_exited else None
         child.take_job_handle.return_value = object()
@@ -226,7 +230,16 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         boundary.cleanup.return_value = True
         health = {"harness_dir": str(self.harness)}
         binding = SimpleNamespace(build_argv=lambda **_kw: [str(self.native), "exec", "-"], parse_line=lambda _line: None)
+        git_read = git_source._run
+
+        def read_fixture_git(source, *args, **kwargs):
+            # Keep the controller's real assignment validation; only its owned Git reads may spawn.
+            self.assertEqual(lane["git_source"], source)
+            with patch("subprocess.Popen", self.real_popen):
+                return git_read(source, *args, **kwargs)
+
         with (patch.object(controller, "require_ready", return_value=health),
+              patch.object(git_source, "_run", side_effect=read_fixture_git),
               patch.object(controller, "startup_failure", return_value="first sandbox setup error"),
               patch.object(controller.processes, "spawn_provider", return_value=child) as spawn,
               patch.object(controller.processes.ProcessBoundary, "for_process", return_value=boundary),

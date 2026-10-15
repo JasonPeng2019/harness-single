@@ -22,8 +22,8 @@ class CheckU5Tests(unittest.TestCase):
             cwd=ROOT,
             text=True,
             capture_output=True,
-            check=True,
         )
+        self.assertEqual(0, completed.returncode, completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual("synthetic/readiness-only", result["evidence_class"])
         self.assertEqual("RESERVED_FOR_M09", result["live_claims"])
