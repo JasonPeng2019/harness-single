@@ -36,33 +36,36 @@ Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `res
 
 ## 2. Prepare before ROOT starts
 
-For a fresh Codex ROOT, the operator prepares the configured run copy before opening ROOT's
-Codex session. On Windows, the read-only sandbox gate requires real operator health evidence
-for the exact CLI/home/process-local LOCALAPPDATA cache. Follow
+For a fresh managed ROOT, run pre-launch preparation FIRST: it performs the one native setup
+internally and records the run-bound receipt. On Windows Codex the read-only sandbox gate must be
+valid for the exact CLI/home/process-local LOCALAPPDATA cache before preparation. Follow
 [the integration guide](docs/INTEGRATED_RUN_FIXES.md); no PASS receipt ships with the harness.
 
 ```powershell
 python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>
 ```
 
-`--workspace` must equal the configured `manager_workspace`. This calls native setup once, verifies
-hooks/monitor and records a matching receipt under that workspace's `.agent-workspace/`. The usage
-collector requires it before a fresh harness ROOT launch. ROOT continues that prepared runtime.
-An existing runtime without the matching receipt is refused; setup after ROOT starts cannot
+`--workspace` must equal the configured `manager_workspace`. Select the ROOT provider explicitly:
+the default is `--provider codex`, and `--provider claude-code` or `--provider qwen-code` are
+equally valid selections; the Codex health gate applies only to Codex and is never bypassed. The
+usage collector and a fresh ROOT launch expect the matching receipt under that workspace's
+`.agent-workspace/`. An existing runtime without it is refused, and setup after ROOT starts cannot
 install hooks into that already-running session. Optional public-check policy must be installed
 before preparation so the operator-owned service is ready before any worker starts.
 
-For other providers or explicit manual integration, the native setup command remains:
+Manual native integration remains available:
 
 ```powershell
 python -m orchestrator_harness.operator_launch harness setup
 ```
 
-Setup is idempotent; use `--overwrite` only for a separately diagnosed integration change.
-Each invocation gets one attempt; never retry a failed setup or refresh a live session. Existing Codex
-and Claude configuration is preserved, with harness hooks merged into the provider hook files. An
-existing `.codex/config.toml` must already set `[features] hooks = true`. Setup starts no lane or
-provider.
+It is for plain/manual integration and for reopening an already prepared ROOT. Reopening the SAME
+run ID through pre-launch preparation revalidates the existing receipt instead of repeating setup.
+Use `--overwrite` only for a separately diagnosed integration change, give each invocation one
+attempt, and never retry a failed setup or refresh a live session. Existing Codex and Claude
+configuration is preserved, with harness hooks merged into the provider hook files. An existing
+`.codex/config.toml` must already set `[features] hooks = true`. Setup starts no lane or provider,
+and runtime records or receipts are never deleted or fabricated.
 
 ## 3. Bootstrap one lane
 

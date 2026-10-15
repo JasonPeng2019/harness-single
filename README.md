@@ -29,14 +29,24 @@ are in [ROOT task policy](docs/ROOT_TASK_POLICY.md).
 
 ## Installation layout
 
-A wheel installation provides the module-only distribution: the `orchestrator_harness` and
-`harness_common` modules plus their packaged data files. A runnable harness root also needs the
-sibling product trees from this checkout: `adapters/`, `super-cache/`, `scripts/`, `tools/`,
-`harness_watcher_implementation/`, `docs/`, `examples/`, the top-level operating files and
-explicit operator configuration, as produced by the staged installation procedure (build the
-wheel from a fixed source copy, install it into a fresh target, then add the sibling trees).
-Packaging validation fixtures used during development are private developer tooling, not product
-examples, and installing the product does not by itself prove a live provider run.
+A full source checkout already is the full layout: configure `harness-config.json` and
+`resource-manifest.json` there and run pre-launch preparation. A wheel installation is
+module-only, so a `--target` install needs the sibling trees copied in from the same source:
+
+1. Use a fixed full source checkout/copy and a Python >=3.11 installation that already provides
+   pip, setuptools >= 68 and wheel.
+2. Build the module wheel from that source:
+   `python -B -m pip wheel --no-deps --no-build-isolation --wheel-dir <wheel-dir> <source>/orchestrator_harness`
+3. Install it into a new harness root target:
+   `python -B -m pip install --no-deps --no-index --no-compile --target <new-harness-root> <actual-wheel>`
+4. From the same source, copy `adapters/`, `super-cache/`, `scripts/`, `tools/`,
+   `harness_watcher_implementation/`, `docs/`, `examples/`, the top-level operating files and
+   `.gitignore` into the target, preserving the pip-installed modules. Test material is
+   validation-only and is not part of the module wheel.
+5. Create explicit operator `harness-config.json` and `resource-manifest.json` in the target and
+   run pre-launch preparation first.
+
+Installing the product does not by itself prove a live provider or sandbox run.
 
 ## What the harness does and does not do
 
@@ -65,10 +75,10 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
   recorded PID-plus-creation identity and release its leases; an unobservable or conflicting
   identity refuses instead of guessing. `lane retire --acceptance-ref` — gracefully retire one
   accepted lane.
-- `resume-lane --lane-id --resume-task-card [--rationale]` — re-run a stopped or otherwise
+- `resume-lane --lane-id --resume-task-card --rationale` — re-run a stopped or otherwise
   resumable unaccepted lane in its retained worktree/session with a fresh complete task card and an
-  explicit rationale; a retired lane in the current epoch refuses resume, and there is no automatic
-  retry loop.
+  explicit rationale; a lane retired in the current epoch refuses resume while supported retained
+  stopped lanes across closed epochs remain resumable, and there is no automatic retry loop.
 - `manager acknowledge --event-id <top-level-event-id>` — move one event PENDING -> ACKNOWLEDGED; `manager close
   --event-id --outcome {COMPLETE,BLOCKED} --summary <text>` — close an acknowledged event (managed only).
 - `lease force-release --resource-id <id>` — recover one declared orphaned resource lease. The
@@ -90,11 +100,22 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 2. Write `resource-manifest.json`: the closed `resource-manifest/v1` shape with a literal `schema`
    field and a `resources` list. Every nonempty entry declares a nonempty `id` and
    `exclusive: true`; duplicate IDs and unknown fields are invalid.
-3. Run `harness setup` (repeat with `--overwrite` to re-integrate). Setup validates the config and
-   manifest, preflights the entire catalog before writing anything, stages and byte-verifies the
-   active super-cache, installs the ROOT payloads, writes the active resource manifest and lease
-   directory, and starts the persistent monitor. It starts no lane or provider and never creates
-   an epoch or worktree.
+3. For a fresh managed ROOT, run pre-launch preparation FIRST; it performs the one native
+   integration internally:
+   `python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>`.
+   Windows Codex needs the read-only sandbox health receipt before preparation; other ROOT
+   providers are selected explicitly (`--provider claude-code` or `--provider qwen-code`) and the
+   Codex health gate is never bypassed. Preparation validates the config and manifest, preflights
+   the entire catalog before writing anything, stages and byte-verifies the active super-cache,
+   installs the ROOT payloads, writes the active resource manifest and lease directory, starts the
+   persistent monitor, and records the run-bound receipt. It starts no lane or provider and never
+   creates an epoch or worktree.
+4. Manual native integration remains available with
+   `python -m orchestrator_harness.operator_launch harness setup` for plain/manual integration and
+   for reopening an already prepared ROOT (`--overwrite` only for a separately diagnosed
+   integration change). Reopening an already prepared ROOT goes through pre-launch preparation
+   with the same run ID, which revalidates the existing receipt instead of repeating setup. Never
+   delete or fabricate runtime records or receipts.
 
 ROOT payloads (skills, hook scripts, binding files and the `.agent-workspace` helpers) are
 installed into the configured `manager_workspace`. Setup preserves existing `.codex/` and `.claude/`

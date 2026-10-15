@@ -52,9 +52,14 @@
 - A lane/session permits initial assignment plus at most one explicit manual retry across run IDs.
   Retry explicitly with `resume-lane --lane-id <id> --resume-task-card <fresh-card.json>
   --rationale <reason>` in the same worktree/session, then `lane launch`; there is no automatic
-  loop, and a retired lane refuses resume with a preserved error.
-- Prepare Codex ROOT hooks/monitor before the ROOT process starts. Windows Codex requires the
-  read-only CLI/home/cache/marker/probe gate; missing local policy cannot disable it.
+  loop, and a lane retired in the current epoch refuses resume with a preserved error while
+  supported retained stopped lanes across closed epochs remain resumable.
+- For a fresh managed ROOT, run `scripts/prepare_root_launch.py` first; it performs the native
+  setup internally. Windows Codex requires the read-only CLI/home/cache/marker/probe gate before
+  preparation and it cannot be disabled by missing local policy; other ROOT providers are selected
+  explicitly and the Codex gate is never bypassed. Manual `harness setup` is for plain/manual
+  integration and for reopening an already prepared ROOT, where preparation revalidates the same
+  run-id receipt instead of repeating setup. Never delete or fabricate runtime records or receipts.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,
   not task success. Carry fresh-validator/public-evidence requirements in the actual run prompt.
 
