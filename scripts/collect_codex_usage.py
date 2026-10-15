@@ -191,6 +191,8 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
     snapshot = build_snapshot(task_path)
     if snapshot["errors"] or snapshot["in_flight_invocations"]:
         raise LedgerError("prior task evidence is not sealed and countable: " + "; ".join(snapshot["errors"]))
+    if not snapshot["gate_allows_new_work"]:
+        raise LedgerError("token budget cannot authorize resume: usage is unknown or the budget is exhausted")
     segment_root = run_dir / "segments"
     children = sorted(item for item in segment_root.iterdir() if item.is_dir()) if segment_root.is_dir() else []
     for number, child in enumerate(children, 2):

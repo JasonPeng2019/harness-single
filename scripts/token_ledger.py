@@ -36,6 +36,10 @@ class LedgerError(ValueError):
     """Evidence is missing, inconsistent, or unsafe to count."""
 
 
+class TranscriptError(LedgerError):
+    """Transcript bytes cannot be decoded as JSON objects."""
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -185,9 +189,9 @@ def extract_usage(
             except (UnicodeError, json.JSONDecodeError) as exc:
                 if not completed and not raw_line.endswith(b"\n"):
                     break
-                raise LedgerError(f"malformed transcript at {path}:{line_number}: {exc}") from exc
+                raise TranscriptError(f"malformed transcript at {path}:{line_number}: {exc}") from exc
             if not isinstance(event, dict):
-                raise LedgerError(f"transcript record must be an object at {path}:{line_number}")
+                raise TranscriptError(f"transcript record must be an object at {path}:{line_number}")
             record_count += 1
             kind = event.get("type")
             if kind == "thread.started":
@@ -576,7 +580,10 @@ def validate_usage_gap(
     task: dict[str, Any], row: dict[str, Any], evidence: dict[str, Any], gap: dict[str, Any]
 ) -> None:
     """A receipt seals lifecycle, never fabricates a token amount."""
-    if row["role"] != "worker" or row["completed"] or evidence["status"] != "in_flight":
+    if row["role"] != "worker" or not (
+        evidence["status"] == "malformed_transcript"
+        or (not row["completed"] and evidence["status"] == "in_flight")
+    ):
         raise LedgerError("usage-gap receipt is not for an unmetered worker")
     if evidence.get("terminal_records") or evidence.get("comparison_total_tokens") is not None:
         raise LedgerError("usage-gap worker has terminal usage; count it normally")
@@ -593,6 +600,9 @@ def validate_usage_gap(
             lane.get("lifecycle") != "retired" or
             lane.get("run_id") != row["lane_run_id"]):
         raise LedgerError("usage-gap worker lacks closed epoch and retired lane proof")
+    from orchestrator_harness.lane_cleanup import cleanup_is_proven
+    if not cleanup_is_proven(lane):
+        raise LedgerError("usage-gap worker native cleanup is unproven")
 
 
 def build_snapshot(task_path: Path) -> dict[str, Any]:
@@ -665,12 +675,28 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                         attempt_provider.get("launch_config") or {}).get("reasoning_effort") != row.get("reasoning_effort") or (
                         attempt_provider.get("launch_config") or {}).get("service_tier") != row.get("service_tier"):
                         errors.append(f"{row['invocation_id']}: attempt provider record differs from invocation")
-        evidence = extract_usage(
-            Path(row["transcript_path"]), completed=row["completed"],
-            segment_index=row.get("transcript_segment_index"),
-        )
-        row.update(evidence)
         gap = gaps.get(row["invocation_id"])
+        transcript = Path(row["transcript_path"])
+        try:
+            evidence = extract_usage(
+                transcript, completed=row["completed"],
+                segment_index=row.get("transcript_segment_index"),
+            )
+        except TranscriptError as exc:
+            # Strict by default, including every ROOT transcript. The existing
+            # operator receipt may acknowledge damaged worker bytes, never a
+            # guessed token count or a replacement native session identity.
+            if gap is None or row["role"] != "worker":
+                raise
+            digest = hashlib.sha256()
+            with transcript.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            evidence = {"status": "malformed_transcript", "transcript_sha256": digest.hexdigest(),
+                        "accounting_error": str(exc)}
+        row.update(evidence)
+        row["charged_tokens"] = None
+        row["charge_source"] = None
         if gap is not None:
             validate_usage_gap(task, row, evidence, gap)
             used_gaps.add(row["invocation_id"])
@@ -678,6 +704,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
             row["usage_gap"] = gap
             row["source_manifest_paths"].append(str(gap_path))
             unknown_usage += 1
+            continue
         if row["role"] != "worker" and row["resume"] and evidence.get("thread_id") != row.get("resume_session_id"):
             errors.append(f"{row['invocation_id']}: resumed ROOT transcript changed native session")
         if not row["completed"] and gap is None:
@@ -685,8 +712,6 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
         if evidence["status"] not in ("ok", "in_flight"):
             errors.append(f"{row['invocation_id']}: {evidence['status']}")
         total = evidence.get("comparison_total_tokens")
-        row["charged_tokens"] = None
-        row["charge_source"] = None
         if total is None:
             if row["completed"]:
                 errors.append(f"{row['invocation_id']}: no countable terminal usage")
@@ -753,13 +778,13 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
         "budget_tokens": budget,
         "known_total_tokens": known_total,
         "aggregate_components": aggregate_components,
-        "remaining_tokens": max(0, budget - known_total) if budget is not None else None,
-        "overshoot_tokens": max(0, known_total - budget) if budget is not None else None,
+        "remaining_tokens": max(0, budget - known_total) if budget is not None and not unknown_usage else None,
+        "overshoot_tokens": max(0, known_total - budget) if budget is not None and not unknown_usage else None,
         "in_flight_invocations": in_flight,
         "unknown_usage_invocations": unknown_usage,
         "token_total_is_exact": unknown_usage == 0 and in_flight == 0 and not errors,
         "errors": sorted(set(errors)),
-        "gate_allows_new_work": not errors and (budget is None or known_total < budget),
+        "gate_allows_new_work": not errors and (budget is None or (not unknown_usage and known_total < budget)),
         "rows": rows,
     }
 
