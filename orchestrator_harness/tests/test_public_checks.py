@@ -1,5 +1,6 @@
 """Public test feedback must preserve revision, lane and sandbox boundaries."""
 import importlib.util
+import errno
 import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from orchestrator_harness import public_checks as service
 from orchestrator_harness.records import atomic_write_json
@@ -418,6 +419,45 @@ class PublicCheckTests(unittest.TestCase):
                 except Exception:
                     print((service.home(self.root) / "service.stderr.log").read_text(), flush=True)
                     raise
+
+    def test_completed_check_waits_through_long_native_admission_transaction(self):
+        from orchestrator_harness.records import runtime_admission_lock
+        atomic_write_json(self.harness / service.POLICY, self.policy)
+        atomic_write_json(service.home(self.root) / "routes" / f"{self.run_id}.json", self.route)
+        environment = service._service_environment(self.harness)
+        environment["PYTHONPATH"] = str(SOURCE)
+        with patch.object(service, "_service_environment", return_value=environment):
+            service.start_service(self.harness, self.root)
+        self.addCleanup(service.stop_service, self.root, self.harness)
+        with runtime_admission_lock(self.root / ".harness-runtime"):
+            path = self.submit("focused", [sys.executable, "-B", "-c", "print('finite complete')"])
+            time.sleep(20 if os.name == "nt" else 1)
+        feedback, code = client.wait(self.agent, path.parent.name, 15)
+        self.assertEqual(0, code, feedback)
+        self.assertEqual("finite complete\n", feedback["stdout"])
+        self.assertTrue(feedback["cleanup_proven"])
+
+    def test_publication_retries_only_windows_lock_acquisition_contention(self):
+        busy = MagicMock()
+        busy.__enter__ = Mock(side_effect=OSError(errno.EDEADLK, "busy"))
+        acquired = MagicMock()
+        acquired.__enter__ = Mock(return_value=acquired)
+        acquired.__exit__ = Mock(return_value=False)
+        with (patch.object(service.os, "name", "nt"),
+              patch.object(service, "runtime_admission_lock", side_effect=[busy, acquired]) as lock):
+            with self.assertRaisesRegex(OSError, "body failed"):
+                with service._publication_admission(self.root):
+                    raise OSError(errno.EDEADLK, "body failed")
+        self.assertEqual(2, lock.call_count)
+        acquired.__exit__.assert_called_once()
+        denied = MagicMock()
+        denied.__enter__ = Mock(side_effect=PermissionError(errno.EACCES, "denied"))
+        with (patch.object(service.os, "name", "nt"),
+              patch.object(service, "runtime_admission_lock", return_value=denied) as lock):
+            with self.assertRaises(PermissionError):
+                with service._publication_admission(self.root):
+                    self.fail("denied lock admitted publication")
+        lock.assert_called_once()
 
     def test_service_dispatches_each_request_only_to_its_registered_run(self):
         old_route, old_path = dict(self.route), self.submit()

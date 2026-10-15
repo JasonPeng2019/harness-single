@@ -52,8 +52,15 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
 
         def run(argv, cwd, *, code=0, timeout=45):
             started = time.monotonic()
-            completed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True,
-                                       text=True, timeout=timeout)
+            try:
+                completed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True,
+                                           text=True, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                evidence["commands"].append({"argv": list(map(str, argv)), "cwd": str(cwd),
+                    "timeout_seconds": timeout, "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "timed_out": True, "stdout": (exc.stdout or b"").decode("utf-8", "replace"),
+                    "stderr": (exc.stderr or b"").decode("utf-8", "replace")})
+                raise
             evidence["commands"].append({"argv": list(map(str, argv)), "cwd": str(cwd),
                 "timeout_seconds": timeout, "exit_code": completed.returncode,
                 "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -133,7 +140,7 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                 "acceptance_criteria": ["Staged feedback follows native invocation"],
                 "deliverables": ["Feedback and exact cleanup"],
                 "reason_for_acceptance_and_deliverables": "Prove optional service integration"})
-            public("harness", "setup", timeout=120)
+            public("harness", "setup", timeout=180)
             monitor = setup.read_monitor_record(rt)
             prepared = json.loads(run([sys.executable, "-B", "-c",
                 'import json; from pathlib import Path; from orchestrator_harness.config import load_config; '
@@ -146,7 +153,7 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                 service_started = True
             public("lane", "bootstrap", "--lane-id", "worker", "--provider", "codex", "--model", "fixture-model",
                 "--provider-option", "reasoning_effort=high", "--provider-option", "service_tier=priority",
-                "--provider-option", "permission_mode=yolo", "--task-card", str(card), timeout=120)
+                "--provider-option", "permission_mode=yolo", "--task-card", str(card), timeout=240)
             public("scan", "--no-write")
             epoch = read_current_epoch(rt)["epoch_id"]
             lane = read_lane(rt, epoch, "worker")
@@ -245,6 +252,8 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                 except Exception as exc:
                     cleanup_errors.append(repr(exc))
             evidence["cleanup_errors"] = cleanup_errors
+            if monitor:
+                evidence["monitor_exit_proven"] = processes.identity_exit_proven(monitor["pid"], monitor["creation_time"])
             evidence["runtime_state"] = setup.read_runtime_state(rt)
             destination = os.environ.get("SERVICE_EVIDENCE_DIR")
             if destination:

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
+import errno
 import hashlib
 import importlib.util
 import json
@@ -286,6 +288,25 @@ def _require_service_owner(config: dict, owner: tuple[int, str, str]) -> dict:
     return record
 
 
+@contextmanager
+def _publication_admission(root: Path):
+    """Wait for native admission across Windows' finite LK_LOCK window.
+
+    Bootstrap/resume may legitimately hold admission longer than ten seconds.
+    Retry only acquisition's native contention error, never the protected body.
+    No service or adapter invocation is repeated.
+    """
+    with ExitStack() as held:
+        while True:
+            try:
+                held.enter_context(runtime_admission_lock(root / ".harness-runtime"))
+                break
+            except OSError as exc:
+                if os.name != "nt" or exc.errno != errno.EDEADLK:
+                    raise
+        yield
+
+
 def start_service(harness: Path, root: Path) -> dict | None:
     with runtime_admission_lock(root / '.harness-runtime'):
         selected = policy(harness)
@@ -482,7 +503,7 @@ def serve_request(config: dict, route: dict, path: Path, cancel: threading.Event
     # Release the job record lock before admission: all lifecycle transactions
     # take runtime, lane, then record locks. Slow adapter work holds neither.
     epoch = lane.parent.name
-    with runtime_admission_lock(root / ".harness-runtime"), lane_operation_lock(root / ".harness-runtime", epoch, route["lane_id"]):
+    with _publication_admission(root), lane_operation_lock(root / ".harness-runtime", epoch, route["lane_id"]):
         try:
             if service_owner is not None:
                 _require_service_owner(config, service_owner)
@@ -587,7 +608,7 @@ def run_service(root: Path) -> None:
                 except Exception:
                     clean = False
     record.update(status="STOPPED", cleanup_proven=clean, stopped_at=iso_utc())
-    with runtime_admission_lock(root / ".harness-runtime"), RecordLock(base / "service.json"):
+    with _publication_admission(root), RecordLock(base / "service.json"):
         current = _require_service_owner(config, owner)
         record["stop_requested"] = current.get("stop_requested", False)
         atomic_write_json(base / "service.json", record)
