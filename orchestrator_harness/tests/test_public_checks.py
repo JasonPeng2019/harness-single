@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,14 +19,39 @@ from orchestrator_harness.records import atomic_write_json
 
 SOURCE = Path(__file__).resolve().parents[2]
 ADAPTER_SOURCE = '''import subprocess
+import time
+from orchestrator_harness import processes
 def preflight():
     return {"backend": "temporary-project-checks"}
 def run_public_command(snapshot, command, *, timeout, cancel):
     if cancel.is_set():
         return {"exit_code": 125, "stdout": "", "stderr": "canceled", "cleanup_proven": True}
-    checked = subprocess.run(command, cwd=snapshot, capture_output=True, text=True, timeout=timeout)
-    return {"exit_code": checked.returncode, "stdout": checked.stdout,
-            "stderr": checked.stderr, "cleanup_proven": True}
+    child = subprocess.Popen(command, cwd=snapshot, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    identity = processes.process_identity(child.pid)
+    deadline = time.monotonic() + timeout
+    canceled = timed_out = False
+    try:
+        while True:
+            try:
+                stdout, stderr = child.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                canceled, timed_out = cancel.is_set(), time.monotonic() >= deadline
+                if canceled or timed_out:
+                    # These finite fixture commands have no descendants. The
+                    # original Popen handle owns this exact child.
+                    child.terminate()
+                    stdout, stderr = child.communicate(timeout=5)
+                    break
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+    clean = bool(identity and processes.identity_exit_proven(child.pid, identity["creation_time"]))
+    return {"exit_code": 125 if canceled else 124 if timed_out else child.returncode,
+            "stdout": stdout, "stderr": stderr, "cleanup_proven": clean,
+            "process": identity, "canceled": canceled, "timed_out": timed_out}
 '''
 DATACLASS_ADAPTER_SOURCE = '''from __future__ import annotations
 from dataclasses import dataclass
@@ -373,6 +399,25 @@ class PublicCheckTests(unittest.TestCase):
         self.assertEqual("STOPPED", record["status"])
         self.assertTrue(record["cleanup_proven"])
         self.assertFalse(service.processes.identity_matches(record["pid"], record["creation_time"]))
+
+    def test_idle_service_survives_long_native_admission_transaction(self):
+        from orchestrator_harness.records import runtime_admission_lock
+        atomic_write_json(self.harness / service.POLICY, self.policy)
+        environment = service._service_environment(self.harness)
+        environment["PYTHONPATH"] = str(SOURCE)
+        with patch.object(service, "_service_environment", return_value=environment):
+            # Bootstrap legitimately holds admission longer than Windows'
+            # ten-second LK_LOCK contention window. Idle observation must not
+            # require that lock or kill the already READY service.
+            with runtime_admission_lock(self.root / ".harness-runtime"):
+                started = service.start_service(self.harness, self.root)
+                self.addCleanup(service.stop_service, self.root, self.harness)
+                time.sleep(12 if os.name == "nt" else 0.5)
+                try:
+                    self.assertEqual(started, service.validate_service(self.root, self.harness))
+                except Exception:
+                    print((service.home(self.root) / "service.stderr.log").read_text(), flush=True)
+                    raise
 
     def test_service_dispatches_each_request_only_to_its_registered_run(self):
         old_route, old_path = dict(self.route), self.submit()

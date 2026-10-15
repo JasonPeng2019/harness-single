@@ -545,11 +545,14 @@ def run_service(root: Path) -> None:
     with ThreadPoolExecutor(max_workers=config["policy"]["max_parallel_checks"]) as executor:
         try:
             while True:
-                with runtime_admission_lock(root / ".harness-runtime"):
-                    current = _require_service_owner(config, owner)
-                    if (read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") != "OPEN"
-                            or current.get("stop_requested") or current.get("status") != "READY"):
-                        break
+                # This scan only observes records; ownership effects and final
+                # feedback publication take admission below. Bootstrap can hold
+                # admission longer than Windows' blocking byte-range lock wait,
+                # so an idle READY service must not contend on every scan.
+                current = _require_service_owner(config, owner)
+                if (read(root / ".harness-runtime/RUNTIME_STATE.json").get("state") != "OPEN"
+                        or current.get("stop_requested") or current.get("status") != "READY"):
+                    break
                 for future, key in list(pending.items()):
                     if future.done():
                         try:
