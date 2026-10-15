@@ -239,4 +239,5 @@ rendered command as shell text.
 - `orchestrator_harness/README.md` — command and contract reference.
 - `orchestrator_harness/SPEC.md` — harness contracts.
 - `docs/HARNESS_WATCHER_GUIDE.md` — optional diagnostic watcher.
+- `docs/COLLECTOR_RECOVERY.md` — supported recovery for a sealed malformed or unmetered worker transcript blocking ROOT collector continuation, with safe shutdown, force-stop and retry steps.
 - `adapters/README.md` — provider adapter catalog and binding contract.
