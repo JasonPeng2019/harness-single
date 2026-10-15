@@ -16,6 +16,7 @@ import os
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -397,21 +398,33 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
     ) -> None:
         config = self.root / "watcher.json"
         product = Path(__file__).resolve().parents[2]
-        base = {"runtime_root": str((self.root / "configured-watcher").relative_to(product)),
+        runtime = product / "runtime" / "harness-watcher" / ("config-" + uuid.uuid4().hex)
+        base = {"runtime_root": str(runtime.relative_to(product)),
                 "observed_sources": [{"path": str(self.log_file), "role": "harness", "source_id": "native"}]}
         config.write_text(json.dumps(base), encoding="utf-8")
         self.assertFalse(load_config(config).evaluator_enabled)
+        self.assertFalse(runtime.exists())
         config.write_text(
             json.dumps({**base, "evaluator_enabled": False}),
             encoding="utf-8",
         )
         self.assertFalse(load_config(config).evaluator_enabled)
+        self.assertFalse(runtime.exists())
         config.write_text(
             json.dumps({**base, "evaluator_enabled": True}),
             encoding="utf-8",
         )
         with self.assertRaisesRegex(ValueError, "evaluator_command is required"):
             load_config(config)
+        self.assertFalse(runtime.exists())
+        config.write_text(
+            json.dumps({**base, "evaluator_enabled": True,
+                        "evaluator_command": ["configured-provider", "--configured"]}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "evaluator_identity is required"):
+            load_config(config)
+        self.assertFalse(runtime.exists())
         config.write_text(
             json.dumps(
                 {
@@ -429,6 +442,12 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         )
         loaded = load_config(config)
         self.assertTrue(loaded.evaluator_enabled)
+        self.assertEqual(runtime, loaded.runtime_root)
+        self.assertEqual((self.log_file,), loaded.observed_log_roots)
+        self.assertEqual(("configured-provider", "--configured"), loaded.evaluator_command)
+        self.assertFalse(runtime.exists())
+        self.assertEqual('{"event":"progress"}\n', self.log_file.read_text(encoding="utf-8"))
+        self.assertEqual(True, json.loads(config.read_text(encoding="utf-8"))["evaluator_enabled"])
         self.assertEqual(
             {
                 "provider": "configured-provider",
@@ -443,6 +462,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "evaluator_enabled must be boolean"):
             load_config(config)
+        self.assertFalse(runtime.exists())
 
     def test_enabled_healthy_poll_is_passive_and_logs_only_watcher_activity(
         self,

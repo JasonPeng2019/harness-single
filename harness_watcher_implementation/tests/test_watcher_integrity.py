@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -45,15 +46,23 @@ class WatcherIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit configuration"):
             load_config()
         product = Path(__file__).resolve().parents[2]
+        self.runtime = product / "runtime" / "harness-watcher" / ("config-" + uuid.uuid4().hex)
         config = self.root / "watcher.json"
         valid = {"runtime_root": str(self.runtime.relative_to(product)),
                  "observed_sources": [{"path": str(self.source), "role": "harness", "source_id": "native"}]}
         config.write_text(json.dumps(valid), encoding="utf-8")
         selected = load_config(config)
         self.assertEqual(self.runtime, selected.runtime_root)
+        self.assertEqual((self.source,), selected.observed_log_roots)
+        self.assertFalse(selected.evaluator_enabled)
+        self.assertEqual(valid, json.loads(config.read_text(encoding="utf-8")))
+        self.assertEqual(b'{"event":"first"}\n', self.source.read_bytes())
         self.assertFalse(self.runtime.exists())
-        for change in ({"runtime_root": "harness_watcher"}, {"runtime_root": "runtime"},
-                       {"runtime_root": str(self.root.relative_to(product))},
+        for change in ({"runtime_root": ""}, {"runtime_root": "harness_watcher"},
+                       {"runtime_root": "runtime"}, {"runtime_root": "runtime/harness-watcher"},
+                       {"runtime_root": str(self.root)}, {"observed_sources": []},
+                       {"observed_sources": [{"path": str(self.runtime), "role": "harness", "source_id": "native"}]},
+                       {"observed_sources": [{"path": str(self.runtime.parent), "role": "harness", "source_id": "native"}]},
                        {"observed_sources": [{"path": str(self.runtime / "input.jsonl"), "role": "harness", "source_id": "native"}]},
                        {"poll_interval_seconds": True}, {"attention_lock_timeout_seconds": float("nan")}):
             with self.subTest(change=change):
