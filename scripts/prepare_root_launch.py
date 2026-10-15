@@ -27,6 +27,7 @@ from orchestrator_harness.setup import read_monitor_record, read_runtime_state, 
 SCHEMA = "root-prelaunch-setup/v2"
 LEGACY_SCHEMA = "root-prelaunch-setup/v1"
 RECEIPT = ".agent-workspace/ROOT_PRELAUNCH_SETUP.json"
+ATTEMPT = ".agent-workspace/ROOT_PRELAUNCH_ATTEMPT.json"
 PROVIDERS = {"codex": ".codex", "claude-code": ".claude", "qwen-code": ".qwen"}
 MONITOR_FIELDS = ("startup_id", "pid", "creation_time", "config_identity", "ready_at")
 HOOK_FILES = (
@@ -170,7 +171,8 @@ def check_installed(harness: Path, workspace: Path, *, allow_closed: bool = Fals
 
 
 def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
-                       resuming: bool, provider_id: str, compare_monitor: bool = True):
+                       resuming: bool, provider_id: str, compare_monitor: bool = True,
+                       explicit_prepare: bool = False):
     config = _configured(harness, workspace, provider_id)
     receipt_path = workspace / RECEIPT
     try:
@@ -206,12 +208,13 @@ def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
     health = require_ready(harness, workspace=config.root_workspace) if provider_id == "codex" else None
     if receipt.get("windows_sandbox_health") != health:
         raise ValueError("Windows sandbox health changed after pre-launch setup")
-    from orchestrator_harness.public_checks import policy, validate_service
+    from orchestrator_harness.public_checks import home, policy, validate_service
     configured_policy = policy(harness)
     if (configured_policy is not None) != (receipt.get("public_check_service") is not None):
         raise ValueError("public check service changed after pre-launch setup (enabled/disabled policy)")
     if configured_policy is not None:
-        closed = resuming and read_runtime_state(config.runtime_root).get("state") == "CLOSED"
+        closed = ((resuming and read_runtime_state(config.runtime_root).get("state") == "CLOSED")
+                  or (explicit_prepare and read(home(config.root_workspace) / "service.json").get("status") == "STOPPED"))
         service = validate_service(config.root_workspace, harness, runtime_closed=closed)
         expected_service = receipt.get("public_check_service")
         if closed and isinstance(expected_service, dict):
@@ -257,6 +260,7 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
     receipt_path = workspace / RECEIPT
     prior = capture_target(workspace, RECEIPT) if receipt_path.parent.is_dir() else None
     previous = None
+    needs_setup = True
     if prior is not None and prior.present:
         previous = json.loads(prior.content.decode("utf-8-sig"))
         if not isinstance(previous, dict) or any(previous.get(key) != value for key, value in
@@ -265,19 +269,48 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
         if previous.get("schema") == SCHEMA:
             with runtime_admission_lock(config.runtime_root):
                 _receipt, _session, owner, _state = _validated_receipt(harness, workspace, run_id,
-                                            resuming=False, provider_id=provider_id, compare_monitor=False)
-            if previous.get("monitor") == owner:
+                                            resuming=False, provider_id=provider_id, compare_monitor=False,
+                                            explicit_prepare=True)
+            from orchestrator_harness.public_checks import home, policy
+            service_ready = (policy(harness) is None or
+                             read(home(config.root_workspace) / "service.json").get("status") == "READY")
+            if previous.get("monitor") == owner and service_ready:
                 return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
         elif previous.get("schema") != LEGACY_SCHEMA:
             raise ValueError("unknown pre-launch setup receipt; preserve it before preparation")
-    elif config.runtime_root.exists():
-        # K04 will admit matching interrupted birth intents; unrelated runtime
-        # directories are never adopted merely because their configuration fits.
-        return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
+    else:
+        attempt_path = workspace / ATTEMPT
+        expected_attempt = {"schema": "root-prelaunch-attempt/v1", "run_id": run_id,
+            "harness_dir": str(harness), "workspace": str(workspace), "provider_id": provider_id,
+            "config_identity": original_identity, "harness_config_sha256": digest(harness / "harness-config.json"),
+            "workspace_identity": workspace_identity(workspace),
+            "product_workspace_identity": workspace_identity(config.root_workspace)}
+        if config.runtime_root.exists():
+            # Only an exact pre-setup birth intent authorizes interrupted
+            # preparation recovery. An unrelated manual runtime is not adopted.
+            if not attempt_path.is_file() or read(attempt_path) != expected_attempt:
+                return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
+            state = read_runtime_state(config.runtime_root)
+            if not state or state.get("state") not in {"OPEN", "CLOSED"}:
+                raise ValueError("interrupted preparation requires proven OPEN or CLOSED runtime; run harness shutdown")
+            needs_setup = state["state"] == "CLOSED"
+            if not needs_setup:
+                check_installed(harness, workspace, provider_id=provider_id)
+        else:
+            ensure_directory_path(attempt_path.parent)
+            with RecordLock(attempt_path):
+                captured = capture_target(workspace, ATTEMPT)
+                if captured.present:
+                    if read(attempt_path) != expected_attempt:
+                        raise ValueError("pre-launch attempt belongs to a different ROOT run")
+                else:
+                    _publish(workspace, ATTEMPT, canonical_json(expected_attempt) + b"\n", expected=captured,
+                             expected_root_identity=(expected_attempt["workspace_identity"]["device"],
+                                                     expected_attempt["workspace_identity"]["inode"]))
 
     command = [sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", "harness", "setup"]
-    if previous is None:
-        completed = subprocess.run(command, cwd=harness, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    if previous is None and needs_setup:
+        completed = subprocess.run(command, cwd=harness, capture_output=True, text=True, encoding="utf-8", timeout=240)
         try:
             result = json.loads(completed.stdout)
         except ValueError as exc:

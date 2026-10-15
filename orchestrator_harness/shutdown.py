@@ -256,15 +256,8 @@ def _background_cleanup_snapshot(rt: Path, root: Path, harness: Path) -> dict[st
     if monitor is not None and not processes.identity_exit_proven(
             monitor.get("pid"), monitor.get("creation_time")):
         raise ShutdownError(SHUTDOWN_MONITOR_UNPROVEN, "current monitor owner exit is unproven")
-    from .public_checks import home, policy, read, validate_service
-    path = home(root) / "service.json"
-    if path.exists() or path.is_symlink():
-        validate_service(root, harness, runtime_closed=True)
-        service = read(path)
-    else:
-        if (home(root) / "config.json").exists() or policy(harness) is not None:
-            raise ShutdownError(SHUTDOWN_RUNTIME_AMBIGUOUS, "expected service cleanup ownership is missing")
-        service = None
+    from .public_checks import service_cleanup
+    service = service_cleanup(root, harness)
     return {"monitor": _monitor_receipt(monitor), "service": _service_receipt(service)}
 
 

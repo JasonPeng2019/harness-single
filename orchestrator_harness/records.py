@@ -8,6 +8,7 @@ directory, validated, then atomically renamed under that record's short lock.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
@@ -110,7 +111,16 @@ class RecordLock:
                 import msvcrt
 
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError as exc:
+                        # LK_LOCK gives up after ten native attempts. Admission
+                        # can legitimately cover a longer worktree preparation.
+                        # Repeat acquisition only, never the protected operation.
+                        if exc.errno != errno.EDEADLK:
+                            raise
             else:
                 import fcntl
 

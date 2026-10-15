@@ -2414,6 +2414,8 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                 (rt / "manager").mkdir(parents=True, exist_ok=True)
 
             if state is None or state.get("state") == "CLOSED":
+                from .public_checks import initialize_service
+                initialize_service(config.root_workspace, harness_root)
                 set_runtime_state(rt, "OPEN")
             elif state.get("state") != "OPEN":
                 raise SetupError(
