@@ -10,9 +10,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator_harness.provider_adapters.codex import launcher_binding as binding
+from orchestrator_harness.provider_adapters import usage_observation
 
 
 class CodexOllamaLaunchTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.catalog = Path(temporary.name) / "ollama-model-catalog.json"
+        self.catalog.write_text(json.dumps({"models": [{
+            "slug": "requested-model:cloud",
+            "supported_reasoning_levels": [{"effort": "max"}, {"effort": "high"}],
+        }]}), encoding="utf-8")
+        catalog_path = patch.object(binding, "_ollama_catalog_path", return_value=self.catalog)
+        catalog_path.start()
+        self.addCleanup(catalog_path.stop)
+
     def argv(self, **overrides):
         options = dict(
             model="requested-model:cloud",
@@ -23,28 +36,81 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         options.update(overrides)
         return binding.build_argv(**options)
 
-    def test_ollama_owns_model_and_preserves_codex_flags(self):
+    def test_ollama_uses_native_oss_transport_and_preserves_codex_flags(self):
         argv = self.argv()
-        self.assertEqual(["ollama", "launch", "codex", "--model", "requested-model:cloud", "--yes", "--"], argv[:7])
-        forwarded = argv[7:]
-        self.assertEqual(["exec", "--ignore-user-config"], forwarded[:2])
-        self.assertNotIn("-m", forwarded)
-        self.assertNotIn("--model", forwarded)
-        self.assertIn('model_reasoning_effort="max"', forwarded)
-        self.assertIn('service_tier="normal"', forwarded)
-        self.assertIn("features.hooks=true", forwarded)
-        self.assertIn("--json", forwarded)
-        self.assertEqual("-", forwarded[-1])
+        self.assertEqual([
+            binding._direct_codex_executable(), "exec", "--oss", "--local-provider", "ollama",
+            "--ignore-user-config",
+        ], argv[:6])
+        self.assertEqual("requested-model:cloud", argv[argv.index("-m") + 1])
+        self.assertIn('model_reasoning_effort="max"', argv)
+        self.assertIn('service_tier="normal"', argv)
+        self.assertIn('default_permissions="worker-isolated"', argv)
+        self.assertIn("features.hooks=true", argv)
+        self.assertIn("--json", argv)
+        self.assertIn("model_catalog_json=" + json.dumps(str(self.catalog.resolve())), argv)
+        self.assertEqual("-", argv[-1])
 
     def test_resume_keeps_exact_session_and_transport(self):
         argv = self.argv(resume=True, session_id="native-session")
         self.assertEqual(
-            ["exec", "--ignore-user-config", "resume", "native-session"],
-            argv[7:11],
+            ["exec", "--oss", "--local-provider", "ollama", "--ignore-user-config", "resume", "native-session"],
+            argv[1:8],
         )
         self.assertNotIn("--cd", argv)
         with self.assertRaisesRegex(ValueError, "session ID"):
             self.argv(resume=True)
+
+    def test_ollama_requires_explicit_matching_model_and_effort_catalog(self):
+        self.catalog.unlink()
+        with self.assertRaisesRegex(ValueError, "operator-owned Ollama model catalog"):
+            self.argv()
+        self.catalog.write_text('{"models": []}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "exactly one entry"):
+            self.argv()
+        self.catalog.write_text(json.dumps({"models": [{
+            "slug": "requested-model:cloud",
+            "supported_reasoning_levels": [{"effort": "low"}],
+        }]}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "does not advertise reasoning effort max"):
+            self.argv()
+
+    def test_direct_codex_does_not_read_ollama_catalog(self):
+        self.catalog.unlink()
+        argv = self.argv(launch_config={"reasoning_effort": "high", "service_tier": "default"})
+        self.assertNotIn("--oss", argv)
+        self.assertFalse(any(value.startswith("model_catalog_json=") for value in argv))
+
+    def test_ollama_preserves_protected_isolation_config_on_launch_and_resume(self):
+        config = self.catalog.parent / "protected-isolation.toml"
+        codex_home = str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve())
+        filesystem = {codex_home: "deny", str(self.catalog.parent / "worker"): "write"}
+        config.write_text(
+            '[permissions.worker-isolated]\nextends=":workspace"\nfilesystem='
+            + binding._toml_inline(filesystem), encoding="utf-8",
+        )
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                argv = self.argv(
+                    resume=resume, session_id="saved-session" if resume else None,
+                    isolation_config_path=str(config),
+                    launch_config={"launcher": "ollama", "reasoning_effort": "high", "service_tier": "default"},
+                )
+                self.assertIn("--oss", argv)
+                self.assertIn('service_tier="default"', argv)
+                self.assertIn("permissions.worker-isolated.filesystem=" + binding._toml_inline(filesystem), argv)
+                self.assertNotIn("--yolo", argv)
+                self.assertEqual(resume, "resume" in argv)
+
+    def test_ollama_preserves_explicit_yolo_and_preferences_on_resume(self):
+        argv = self.argv(resume=True, session_id="saved-session", launch_config={
+            "launcher": "ollama", "permission_mode": "yolo",
+            "reasoning_effort": "high", "service_tier": "default",
+        })
+        self.assertIn("--oss", argv)
+        self.assertIn("--yolo", argv)
+        self.assertIn('service_tier="default"', argv)
+        self.assertFalse(any("worker-isolated" in value or "windows.sandbox" in value for value in argv))
 
     def test_direct_codex_uses_workspace_sandbox(self):
         argv = self.argv(launch_config={"reasoning_effort": "high", "service_tier": "normal"})
@@ -130,6 +196,39 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         self.assertEqual({"session_id": "native-session"}, binding.parse_line(json.dumps({"type": "thread.started", "thread_id": "native-session"})))
         self.assertTrue(binding.parse_line('{"type":"turn.failed"}')["non_retryable_failure"])
         self.assertIsNone(binding.parse_line("Launching Codex with Ollama"))
+
+    def test_native_final_text_survives_terminal_usage_event(self):
+        final = "Committed the change.\n\nChecks passed. \U0001f600\n"
+        usage = {"input_tokens": 181363, "cached_input_tokens": 166144, "output_tokens": 2882}
+        events = [
+            {"type": "thread.started", "thread_id": "native-session"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Working."}},
+            {"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": "tool text"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": final}},
+            {"type": "turn.completed", "usage": usage},
+        ]
+        last_message, session = None, None
+        for event in events:
+            parsed = binding.parse_line(json.dumps(event))
+            if isinstance(parsed, dict):
+                last_message = parsed.get("message") or last_message
+                session = parsed.get("session_id") or session
+        self.assertEqual(final, last_message)
+        self.assertEqual("native-session", session)
+        self.assertEqual({"event_type": "turn.completed", "usage": usage}, usage_observation(events[-1], "codex"))
+
+    def test_terminal_success_preserves_native_file_without_agent_message(self):
+        parsed = binding.parse_line('{"type":"turn.completed","threadId":"saved-session","usage":{}}')
+        self.assertEqual({"session_id": "saved-session"}, parsed)
+        self.assertNotIn("message", parsed)
+        for event in (
+            {"type": "item.started", "item": {"type": "agent_message", "text": "partial"}},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "private reasoning"}},
+        ):
+            self.assertIsNone(binding.parse_line(json.dumps(event)))
+        for event_type in ("turn.failed", "turn.cancelled"):
+            self.assertEqual({"message": event_type, "non_retryable_failure": True},
+                             binding.parse_line(json.dumps({"type": event_type})))
 
 
 if __name__ == "__main__":
