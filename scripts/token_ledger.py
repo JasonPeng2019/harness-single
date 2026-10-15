@@ -56,6 +56,34 @@ def nonempty_string(value: Any, name: str) -> str:
     return value
 
 
+def _worker_resume_index(argv: Any) -> int:
+    """Locate exec's resume subcommand, skipping option values, never prompts.
+
+    Native Codex and Ollama workers both invoke ``exec``; transport and other
+    exec options may precede its subcommand. Stop at the first positional or
+    ``--`` so a prompt or an option value named ``resume`` is not a retry.
+    """
+    if (not isinstance(argv, list) or any(not isinstance(word, str) for word in argv)
+            or argv[1:2] != ["exec"]):
+        return -1
+    value_options = {"-c", "--config", "-m", "--model", "--local-provider",
+                     "-o", "--output-last-message", "--output-schema", "-C", "--cd"}
+    flags = {"--ignore-user-config", "--oss", "--skip-git-repo-check",
+             "--dangerously-bypass-hook-trust", "--json", "--yolo"}
+    index = 2
+    while index < len(argv):
+        word = argv[index]
+        if word in value_options:
+            index += 2
+        elif word.partition("=")[0] in value_options and "=" in word:
+            index += 1
+        elif word in flags:
+            index += 1
+        else:
+            return index if word == "resume" else -1
+    return -1
+
+
 def launch_preferences(argv: Any) -> dict[str, str]:
     """Read the model, effort, and tier actually passed to a Codex launch."""
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv):
@@ -538,7 +566,7 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                             raise LedgerError(f"worker activity occurred during paused interval: {events_path}")
                         continue
                     argv = row.get("argv") if row else None
-                    resume = isinstance(argv, list) and "resume" in argv[:5]
+                    resume = _worker_resume_index(argv) >= 0
                     controller_run_id = valid_id(
                         start_event.get("run_id") or lane_run_id, "controller run_id"
                     )
@@ -806,7 +834,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
             session_key = _protected_worker_session(task, row)
             unknown_prior = unknown_sessions.get(session_key) if session_key is not None else None
             argv = row.get("launch_argv") or []
-            resume_index = argv.index("resume") if "resume" in argv else -1
+            resume_index = _worker_resume_index(argv)
             if (unknown_prior is not None and row["completed"] and evidence["status"] == "ok"
                     and session_key[2] == thread_id and resume_index >= 0
                     and argv[resume_index + 1:resume_index + 2] == [thread_id]):

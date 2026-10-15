@@ -14,15 +14,19 @@ import shutil
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collect_codex_usage as collector
 import token_ledger as ledger
 from scripts.tests import test_collector_continuation as continuation
 from orchestrator_harness import bootstrap, git_source, lane_authority, retry_policy
+from orchestrator_harness.provider_adapters.codex import launcher_binding as binding
 
 
 class CrossEpochUsageTests(unittest.TestCase):
+    launcher = "codex"
+
     def setUp(self):
         self.f = f = continuation.CollectorContinuationTests()
         f.id = self.id  # Evidence belongs to this case, not the helper's runTest.
@@ -41,7 +45,13 @@ class CrossEpochUsageTests(unittest.TestCase):
                  "commit", "-qm", "base")
         self.git(f.product, "worktree", "add", "-qb", "lane/w/work", str(f.worktree))
         (f.worktree / ".codex").mkdir()
-        (f.worktree / ".codex/config.toml").write_text("[features]\nhooks = true\n", encoding="utf-8")
+        codex_home = str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve())
+        (f.worktree / ".codex/config.toml").write_text(
+            '[features]\nhooks = true\n[permissions.worker-isolated]\nextends=":workspace"\nfilesystem='
+            + binding._toml_inline({codex_home: "deny", str(f.worktree): "write"}), encoding="utf-8")
+        f.lane["provider"]["launch_config"]["launcher"] = self.launcher
+        self.catalog = f.base / "ollama-model-catalog.json"
+        f.write(self.catalog, {"models": [{"slug": "fixture", "supported_reasoning_levels": [{"effort": "high"}]}]})
         self.card = {"schema": "project-task-card/v1", "task": "Account for retained retry",
                      "acceptance_criteria": ["All actual invocations counted"], "deliverables": ["Evidence"],
                      "reason_for_acceptance_and_deliverables": "Verify actual saved-session accounting"}
@@ -92,9 +102,18 @@ class CrossEpochUsageTests(unittest.TestCase):
         token = retry_policy.reserve_invocation(f.runtime, lane)
         retry_policy.record_started(f.runtime, lane, token, process_boundary=worker_boundary)
         lane["_history_token"], lane["_history_runtime"] = token, str(f.runtime)
-        command = f.argv()
+        # Offline fixtures substitute catalog/executable discovery only; argv,
+        # grammar and isolation still use the actual shipped provider binding.
+        with patch.object(binding, "_ollama_catalog_path", return_value=self.catalog), \
+                patch.object(binding, "_direct_codex_executable", return_value="codex"):
+            command = binding.build_argv(model=lane["provider"]["model"],
+                launch_config=lane["provider"]["launch_config"], worktree=lane["worktree_path"],
+                prompt_path=lane["prompt_path"], session_id="worker-session" if resumed else None,
+                resume=resumed, isolation_config_path=lane["isolation_config_path"])
+        self.assertEqual("codex", command[0])
+        self.assertEqual(resumed, "resume" in command)
         if resumed:
-            command[2:2] = ["--ignore-user-config", "resume", "worker-session"]
+            self.assertEqual(6 if self.launcher == "ollama" else 3, command.index("resume"))
         control = Path(lane["control_dir"])
         (control / "controller.events.jsonl").write_text(json.dumps({"event_type": "provider_started",
             "run_id": lane["run_id"], "ts": ledger.utc_now()}) + "\n", encoding="utf-8")
@@ -122,7 +141,7 @@ class CrossEpochUsageTests(unittest.TestCase):
     def retain_evidence(self):
         destination = os.environ.get("CROSS_EPOCH_USAGE_EVIDENCE")
         if destination:
-            shutil.copytree(self.f.base, Path(destination) / self.id().rsplit(".", 1)[-1])
+            shutil.copytree(self.f.base, Path(destination) / type(self).__name__ / self.id().rsplit(".", 1)[-1])
 
     def snapshot(self):
         result = ledger.build_snapshot(self.f.task_path)
@@ -167,8 +186,9 @@ class CrossEpochUsageTests(unittest.TestCase):
 
     def test_receipted_malformed_first_run_and_retry_prepare_uncapped_honestly(self):
         self.f.recover()
-        prepared = collector.prepare_resume(self.f.args())
         snapshot = self.snapshot()
+        self.assertEqual(0, self.command("snapshot").returncode)
+        self.assertEqual(0, self.command("gate").returncode)
         self.assertEqual(3, len(snapshot["rows"]), snapshot)
         self.assertEqual([], snapshot["errors"], snapshot)
         self.assertEqual(2, snapshot["unknown_usage_invocations"], snapshot)
@@ -177,11 +197,11 @@ class CrossEpochUsageTests(unittest.TestCase):
         workers = [r for r in snapshot["rows"] if r["role"] == "worker"]
         self.assertTrue(all(r["charged_tokens"] is None for r in workers), workers)
         self.assertEqual(self.f.gap, workers[1]["usage_gap"])
+        self.assertIn("baseline is unknown", workers[1]["accounting_error"])
+        prepared = collector.prepare_resume(self.f.args())
         self.assertEqual((2, "saved-root", 1), prepared[1:])
         self.f.write(self.f.base / "prepared.json", {"segment": str(prepared[0]), "number": prepared[1],
                                                     "session": prepared[2], "watchdog": prepared[3]})
-        self.assertEqual(0, self.command("snapshot").returncode)
-        self.assertEqual(0, self.command("gate").returncode)
         archive = self.f.base / "archive"
         self.assertFalse(ledger.finalize(self.f.task_path, archive)["token_total_is_exact"])
         self.assertEqual(self.f.damaged_bytes, self.f.transcript.read_bytes())
@@ -284,13 +304,56 @@ class CrossEpochUsageTests(unittest.TestCase):
         records[-1].update(changes)
         path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
 
+    def test_discovery_distinguishes_resume_subcommand_from_values_and_prompt(self):
+        attempt = Path(self.second["attempts_path"])
+        original = attempt.read_bytes()
+        resumed = ledger.read_lines(attempt)[-1]["argv"]
+        initial = ledger.read_lines(Path(self.f.lane["attempts_path"]))[-1]["argv"]
+        # These values can occur before or after exec options. Only the actual
+        # first positional subcommand selects saved-session accounting.
+        cases = [(resumed, True), (initial, False),
+                 ([initial[0], "review", "resume"], False),
+                 ([*initial, "resume"], False),
+                 ([*initial[:-1], "--", "resume", "worker-session"], False)]
+        for option in ("-m", "--model", "-c", "--config", "--local-provider",
+                       "--output-last-message", "--output-schema", "--cd"):
+            cases.extend([([*initial[:2], option, "resume", *initial[2:]], False),
+                          ([*resumed[:2], option, "resume", *resumed[2:]], True)])
+            if option.startswith("--"):
+                cases.append(([*resumed[:2], option + "=resume", *resumed[2:]], True))
+        try:
+            for argv, expected in cases:
+                with self.subTest(argv=argv):
+                    self.mutate_attempt(self.second, argv=argv)
+                    rows = ledger._worker_invocations(ledger.load_task(self.f.task_path))
+                    retry = next(r for r in rows if r["lane_run_id"] == "retry-run")
+                    self.assertIs(expected, retry["resume"])
+        finally:
+            attempt.write_bytes(original)
+
+    def test_receipted_retry_skips_option_value_named_resume_for_session_target(self):
+        self.f.recover()
+        attempt = Path(self.second["attempts_path"])
+        original = attempt.read_bytes()
+        argv = ledger.read_lines(attempt)[-1]["argv"]
+        self.mutate_attempt(self.second, argv=[*argv[:2], "--output-last-message", "resume", *argv[2:]])
+        try:
+            snapshot = self.snapshot()
+            self.assertEqual([], snapshot["errors"], snapshot)
+            self.assertEqual(2, snapshot["unknown_usage_invocations"], snapshot)
+            self.assertEqual("saved-root", collector.prepare_resume(self.f.args())[2])
+        finally:
+            attempt.write_bytes(original)
+
     def test_recovery_cannot_cross_native_session_or_resume_target(self):
         self.f.recover()
         attempt_path = Path(self.second["attempts_path"])
         original = attempt_path.read_bytes()
         transcript = self.second_transcript.read_bytes()
+        wrong_target = ledger.read_lines(attempt_path)[-1]["argv"]
+        wrong_target[wrong_target.index("resume") + 1] = "different"
         for change in ({"session_id": "different"}, {"session_id": None},
-                       {"argv": ["codex", "exec", "resume", "different", *self.f.argv()[2:]]}):
+                       {"argv": wrong_target}):
             with self.subTest(change=change):
                 try:
                     self.mutate_attempt(self.second, **change)
@@ -400,6 +463,10 @@ class CrossEpochUsageTests(unittest.TestCase):
         retry = next(r for r in snapshot["rows"] if r["lane_run_id"] == "retry-run")
         self.assertEqual("task.root.segment-2", retry["parent_id"])
         self.assertEqual(25, retry["charged_tokens"])
+
+
+class OllamaCrossEpochUsageTests(CrossEpochUsageTests):
+    launcher = "ollama"
 
 
 if __name__ == "__main__":
