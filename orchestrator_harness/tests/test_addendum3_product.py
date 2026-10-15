@@ -1294,6 +1294,7 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_resume_marks_launch_pending_for_fresh_running_lane(self) -> None:
         from orchestrator_harness import resume
+        from orchestrator_harness.epochs import write_active_lanes
 
         worktree = self.runtime / "resume-worktree"
         workspace = worktree / ".agent-workspace"
@@ -1327,6 +1328,7 @@ class Addendum3ProductTests(unittest.TestCase):
             ),
         }
         lane = prepare_lane_fixture(self.runtime, "epoch-1", lane, task_card=task_card)
+        write_active_lanes(self.runtime, "epoch-1", [])
         updates: list[dict[str, object]] = []
         current = dict(lane)
 
