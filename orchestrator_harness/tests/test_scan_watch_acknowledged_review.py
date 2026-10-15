@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import unittest
 from unittest.mock import patch
@@ -60,6 +62,32 @@ class AcknowledgedReviewWatchTests(unittest.TestCase):
         before = manager_queue_path(self.rt).read_bytes()
         self.assertEqual("WATCH_TIMEOUT", self.watch()["code"])
         self.assertEqual(before, manager_queue_path(self.rt).read_bytes())
+
+    def test_public_watch_stays_blocked_after_separate_ack_and_fresh_event_wakes_it(self):
+        first = self.event()
+        ack = self.fixture.command("manager", "acknowledge", "--event-id", first["event_id"])
+        self.assertEqual(0, ack.returncode, ack.stderr + ack.stdout)
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json",
+             "watch", "--until-actionable", "--timeout", "10s"],
+            cwd=self.fixture.harness, env=self.fixture.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.communicate(timeout=1)
+            fresh = self.event(run_id="fresh-run", event_type="LANE_STATUS_CHANGED")
+            stdout, stderr = child.communicate(timeout=10)
+            self.assertEqual(0, child.returncode, stderr + stdout)
+            self.assertEqual(fresh["event_id"], json.loads(stdout)["event_id"])
+            queue = manager_queue.read_manager_queue(self.rt)
+            self.assertEqual("ACKNOWLEDGED", queue["events"][0]["state"])
+            self.assertEqual("PENDING", queue["events"][1]["state"])
+        finally:
+            if child.poll() is None:
+                from orchestrator_harness import processes
+                self.assertTrue(processes.reap_created_process(child))
+                child.communicate(timeout=10)
 
     def test_delivery_is_deduplicated_in_the_same_scope(self):
         event = self.event()

@@ -22,12 +22,13 @@ from .bootstrap import (
     _write_worker_prompt,
 )
 from .config import find_harness_root, load_config
+from .config import compute_config_identity, load_resource_manifest, same_path
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
-from .epochs import lane_record_dir, read_current_epoch
+from .epochs import lane_record_dir, open_epoch, read_active_lanes, read_current_epoch, read_epoch_state
 from .setup import read_runtime_state
-from .lanes import find_active_lane, lane_operation_lock, read_lane, update_lane
-from .lane_cleanup import controller_not_created, never_launched, observe_controller_status
-from .records import atomic_write_json, remove_record
+from .lanes import LaneError, find_active_lane, find_retained_lane, lane_operation_lock, read_lane, update_lane, write_lane
+from .lane_cleanup import cleanup_is_proven, controller_not_created, never_launched, observe_controller_status
+from .records import atomic_write_bytes, atomic_write_json, remove_record
 from .records import runtime_admission_lock
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
 from .task_cards import validate_task_card
@@ -160,11 +161,22 @@ def _has_valid_acceptance_chain(
 
 
 def _clear_prior_run(rt: Path, epoch_id: str, lane: dict[str, Any], *, output=None) -> None:
-    """Remove the prior run's obsolete current state (best-effort, honest)."""
+    """Retain prior decisions/result before replacing their current projections."""
     worktree = Path(lane["worktree_path"])
     output = _worker_output(worktree, output)
-    output.delete(worktree / "RESULT.json")
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    archive = Path(lane["control_dir"])
+    for name in ("RESULT.json", "COMPLETION_REVIEW.json", "ORCHESTRATOR_ACCEPTANCE.json"):
+        try:
+            value = (output.read_bytes(worktree / name) if name == "RESULT.json"
+                     else (folder / name).read_bytes())
+        except FileNotFoundError:
+            continue
+        target = archive / name
+        if target.exists() and target.read_bytes() != value:
+            raise ValueError(f"prior run archive already contains different {name}; reconcile before resume")
+        atomic_write_bytes(target, value)
+    output.delete(worktree / "RESULT.json")
     remove_record(folder / "COMPLETION_REVIEW.json")
     remove_record(folder / "ORCHESTRATOR_ACCEPTANCE.json")
     output.delete(worktree / ".agent-workspace" / "controller.status.json")
@@ -199,6 +211,52 @@ def _rewrite_overlay_receipt(
     output.publish_json(output.admit(worktree / ".agent-workspace" / "overlay-receipt.json"), receipt)
 
 
+def _validate_retained_resume(config, epoch_id: str, lane: dict[str, Any], task_card: dict[str, Any]) -> None:
+    """Validate protected native inputs without reconstructing worker authority."""
+    from .git_source import current_tip, git
+    from .lane_authority import read_invocation
+
+    rt = config.runtime_root
+    state = read_epoch_state(rt, epoch_id)
+    manifest = load_resource_manifest(config.harness_root)
+    if (read_runtime_state(rt) or {}).get("state") != "OPEN":
+        raise ValueError("runtime is not OPEN; run native harness setup before resume")
+    if state["lifecycle"] != "closed":
+        raise ValueError("retained lane must belong to a closed epoch")
+    if state.get("config_identity") != compute_config_identity(config, manifest):
+        raise ValueError("retained epoch configuration is incompatible with this runtime")
+    read_invocation(lane)
+    source = lane["git_source"]
+    if not same_path(source["root_workspace"], config.root_workspace):
+        raise ValueError("retained Git source differs from the configured product")
+    branch = source["branch_ref"].removeprefix("refs/heads/")
+    if task_card.get("branch") is not None and task_card["branch"] != branch:
+        raise ValueError("resume task card cannot change the retained branch")
+    tip = current_tip(lane)
+    if task_card.get("base_commit") is not None:
+        git(source, "merge-base", "--is-ancestor", task_card["base_commit"], tip)
+    if not cleanup_is_proven(lane):
+        raise ValueError("retained controller/provider/helper cleanup is live or unproven")
+
+
+def _adopt_retained_lane(config, epoch_id: str, lane: dict[str, Any]) -> str:
+    """Publish a current owner and preserve the closed epoch and all run inputs."""
+    rt = config.runtime_root
+    if find_retained_lane(rt, lane["lane_id"]) != (epoch_id, lane):
+        raise ValueError("retained lane identity changed before adoption")
+    state = open_epoch(rt, config, load_resource_manifest(config.harness_root))
+    destination = state["epoch_id"]
+    read_active_lanes(rt, destination)
+    if config.profile == "managed":
+        read_manager_queue(rt)
+    write_lane(rt, destination, lane["lane_id"], {
+        **lane, "lifecycle": "resuming", "resume_from_epoch_id": epoch_id,
+    }, create_only=True)
+    from .lanes import reconcile_active_lanes
+    reconcile_active_lanes(rt, destination)
+    return destination
+
+
 def run_resume(
     *,
     lane_id: str,
@@ -217,9 +275,28 @@ def run_resume(
             "evidence_paths": [],
             "next_action": "fix the configuration and re-run setup",
         }
+    try:
+        with runtime_admission_lock(config.runtime_root):
+            return _run_resume(config, harness_root, lane_id, resume_task_card, rationale)
+    except Exception as exc:
+        return {
+            "ok": False, "code": RESUME_LANE_WRITE_FAILED, "summary": str(exc),
+            "evidence_paths": [str(config.runtime_root)],
+            "next_action": "preserve the retained records and reconcile the named failure",
+        }
+
+
+def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
+                rationale: str | None) -> dict[str, Any]:
     rt = config.runtime_root
+    retained = False
     try:
         epoch_id, lane = find_active_lane(rt, lane_id)
+    except LaneError as exc:
+        if exc.code != "LANE_NOT_FOUND":
+            raise
+        epoch_id, lane = find_retained_lane(rt, lane_id)
+        retained = True
     except Exception as exc:
         return {
             "ok": False,
@@ -230,7 +307,7 @@ def run_resume(
         }
 
     try:
-        if _has_valid_acceptance_chain(rt, epoch_id, lane):
+        if _has_valid_acceptance_chain(rt, epoch_id, lane) or lane.get("acceptance_advancement"):
             return {
                 "ok": False,
                 "code": ALREADY_ACCEPTED,
@@ -249,7 +326,7 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "preserve evidence and reconcile the ROOT decision",
             }
-        if lifecycle == "retired":
+        if lifecycle == "retired" and not retained:
             return {
                 "ok": False,
                 "code": RESUME_LANE_WRITE_FAILED,
@@ -280,7 +357,7 @@ def run_resume(
                 "evidence_paths": [str(lane.get("provider_history_path") or "")],
                 "next_action": "settle the previous lane and bootstrap a fresh lane and native session",
             }
-        if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle != "running":
+        if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle != "running" and not (retained and lifecycle == "retired"):
             return {
                 "ok": False,
                 "code": RESUME_LANE_WRITE_FAILED,
@@ -323,6 +400,12 @@ def run_resume(
         prior_run_id = str(lane.get("run_id") or "")
         run_id = new_id()
         managed = config.profile == "managed"
+        if retained:
+            _validate_retained_resume(config, epoch_id, lane, task_card)
+            with lane_operation_lock(rt, epoch_id, lane_id):
+                epoch_id = _adopt_retained_lane(config, epoch_id, lane)
+            lane = read_lane(rt, epoch_id, lane_id)
+            lifecycle = "resuming"
         def mark_resuming(current: dict[str, Any]) -> dict[str, Any]:
             if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != lifecycle:
                 raise ValueError("lane run or status changed before resume mutation")
@@ -408,7 +491,8 @@ def run_resume(
                 if not marker or marker.get("epoch_id") != epoch_id or not runtime or runtime.get("state") != "OPEN":
                     raise ValueError("runtime or epoch changed before fresh run ownership")
                 return {
-                    **current,
+                    **{key: value for key, value in current.items()
+                       if key not in {"forced_cleanup_ref", "retirement_proof"}},
                     **{key: value for key, value in replacement.items() if key in {
                         "control_dir", "worktree_identity", "result_assignment_hash", "invocation_path", "invocation_hash", "prompt_path", "prompt_sha256",
                         "task_card_path", "task_card_hash", "controller_status_path", "controller_events_path",
