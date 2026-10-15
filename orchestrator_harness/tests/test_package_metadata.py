@@ -8,10 +8,13 @@ in a temporary directory.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -92,6 +95,26 @@ def _on_disk_required_files() -> list[str]:
     return sorted(set(required))
 
 
+def _copy_build_source(source: Path) -> None:
+    """Copy declared build inputs without borrowing local generated metadata."""
+    ignored = shutil.ignore_patterns(
+        "__pycache__", "*.pyc", "*.egg-info", "build", "dist"
+    )
+    shutil.copytree(
+        PACKAGE_ROOT, source / "orchestrator_harness", ignore=ignored
+    )
+    shutil.copytree(
+        REPOSITORY_ROOT / "harness_common",
+        source / "harness_common",
+        ignore=ignored,
+    )
+    shutil.copytree(
+        REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
+    )
+    for directory in ("scripts", "tools", "docs"):
+        shutil.copytree(REPOSITORY_ROOT / directory, source / directory, ignore=ignored)
+
+
 class PackageMetadataStaticTests(unittest.TestCase):
     def test_packaged_scripts_invalidate_owning_release_unit_credit(self) -> None:
         import subprocess
@@ -144,10 +167,33 @@ class PackageMetadataStaticTests(unittest.TestCase):
     def test_runtime_and_build_versions_are_coherent(self) -> None:
         pyproject = _load_pyproject()
         self.assertEqual("2.0.0", pyproject["project"]["version"])
-        package_init = (PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "2.0.0"', package_init)
-        metadata = (PACKAGE_ROOT / "portable_orchestrator_harness.egg-info" / "PKG-INFO").read_text(encoding="utf-8")
-        self.assertIn("Version: 2.0.0", metadata)
+        from orchestrator_harness import __version__
+        self.assertEqual(pyproject["project"]["version"], __version__)
+        # A clean checkout has no egg-info. Ask the declared build backend for
+        # real distribution metadata in a private copy, just as a wheel build
+        # does; never manufacture PKG-INFO or rely on ignored source output.
+        with tempfile.TemporaryDirectory(prefix="oh-meta-") as raw:
+            temporary = Path(raw)
+            source = temporary / "source"
+            _copy_build_source(source)
+            metadata_root = temporary / "metadata"
+            metadata_root.mkdir()
+            command = [sys.executable, "-B", "-c",
+                       "from setuptools.build_meta import prepare_metadata_for_build_wheel; "
+                       "prepare_metadata_for_build_wheel(" + repr(str(metadata_root)) + ")"]
+            completed = subprocess.run(command, cwd=source / "orchestrator_harness",
+                                       capture_output=True, text=True)
+            self.assertEqual(0, completed.returncode,
+                             f"{command!r}\n{completed.stdout}\n{completed.stderr}")
+            # Setuptools also stages egg-info beside the wheel's dist-info.
+            # Validate the wheel metadata specifically, not both representations.
+            distributions = [importlib.metadata.Distribution.at(path)
+                             for path in metadata_root.glob("*.dist-info")]
+            self.assertEqual(1, len(distributions))
+            metadata = distributions[0]
+            self.assertEqual(pyproject["project"]["name"], metadata.metadata["Name"])
+            self.assertEqual(__version__, metadata.version)
+            self.assertEqual(pyproject["project"]["requires-python"], metadata.metadata["Requires-Python"])
 
     def test_removed_candidate_modules_are_not_packaged(self) -> None:
         removed = (
@@ -241,22 +287,7 @@ class PackageWheelBuildTests(unittest.TestCase):
             source = temporary / "source"
             wheel_dir = temporary / "wheel"
             wheel_dir.mkdir()
-            ignored = shutil.ignore_patterns(
-                "__pycache__", "*.pyc", "*.egg-info", "build", "dist"
-            )
-            shutil.copytree(
-                PACKAGE_ROOT, source / "orchestrator_harness", ignore=ignored
-            )
-            shutil.copytree(
-                REPOSITORY_ROOT / "harness_common",
-                source / "harness_common",
-                ignore=ignored,
-            )
-            shutil.copytree(
-                REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
-            )
-            for directory in ("scripts", "tools", "docs"):
-                shutil.copytree(REPOSITORY_ROOT / directory, source / directory, ignore=ignored)
+            _copy_build_source(source)
             previous = os.getcwd()
             try:
                 os.chdir(source / "orchestrator_harness")

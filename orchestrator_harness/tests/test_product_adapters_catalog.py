@@ -12,6 +12,7 @@ import importlib.util
 import json
 import py_compile
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -157,10 +158,26 @@ class WorkerPayloadTests(unittest.TestCase):
     def test_installed_composition_is_the_worker_overlay_for_each_provider(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            runtime = root / "runtime"
-            runtime.mkdir()
-            plan = setup._plan_active_cache(REPOSITORY_ROOT)
-            setup._install_active_cache(REPOSITORY_ROOT, runtime, plan=plan, overwrite=False)
+            harness = root / "harness"
+            workspace = root / "product"
+            workspace.mkdir()
+            # Cache publication binds to real operator configuration. Keep the
+            # shipped catalog intact and never depend on this checkout's local
+            # configuration (or write test configuration into the source tree).
+            for directory in ("super-cache", "adapters"):
+                shutil.copytree(
+                    REPOSITORY_ROOT / directory, harness / directory,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                )
+            (harness / "harness-config.json").write_text(json.dumps({
+                "root_workspace": str(workspace), "managed_coordination": "enabled",
+            }), encoding="utf-8")
+            (harness / "resource-manifest.json").write_text(json.dumps({
+                "schema": "resource-manifest/v1", "resources": [],
+            }), encoding="utf-8")
+            runtime = workspace / ".harness-runtime"
+            plan = setup._plan_active_cache(harness)
+            setup._install_active_cache(harness, runtime, plan=plan, overwrite=False)
             for provider_id, dotdir in PROVIDERS.items():
                 worktree = root / provider_id
                 worktree.mkdir()
@@ -177,13 +194,13 @@ class WorkerPayloadTests(unittest.TestCase):
                     config["custom"] = {"product": True}
                     qwen_settings.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
                     qwen_settings_before = qwen_settings.read_bytes()
-                installed = bootstrap._managed_payload(REPOSITORY_ROOT, runtime, provider_id)
+                installed = bootstrap._managed_payload(harness, runtime, provider_id)
                 self.assertEqual(
                     runtime / "super-cache" / "composed-payloads" / provider_id,
                     installed,
                 )
                 bootstrap._install_managed_material(
-                    REPOSITORY_ROOT, runtime, worktree,
+                    harness, runtime, worktree,
                     provider_id=provider_id, lane_id=f"lane-{provider_id}", run_id="run-1",
                 )
                 for name in HELPERS:
@@ -194,6 +211,17 @@ class WorkerPayloadTests(unittest.TestCase):
                 for name in WORKER_SKILLS:
                     relative = Path(dotdir) / "skills" / name / "SKILL.md"
                     self.assertEqual((installed / relative).read_bytes(), (worktree / relative).read_bytes())
+                for source in installed.rglob("*"):
+                    if source.is_file():
+                        relative = source.relative_to(installed)
+                        if worktree / relative != qwen_settings:
+                            self.assertEqual(source.read_bytes(), (worktree / relative).read_bytes(),
+                                             f"{provider_id}: {relative}")
+                binding = json.loads((worktree / ".agent-workspace" / "harness-hook-binding.json").read_text())
+                self.assertEqual(f"lane-{provider_id}", binding["lane_id"])
+                self.assertEqual("run-1", binding["run_id"])
+                self.assertEqual(str(worktree / "RESULT.json"), binding["result_path"])
+                self.assertEqual(str(runtime / "manager" / "QUEUE.json"), binding["manager_queue_path"])
                 self.assertEqual(b"checked-out product instructions\n", instructions.read_bytes())
                 if qwen_settings is not None:
                     self.assertEqual(qwen_settings_before, qwen_settings.read_bytes())
