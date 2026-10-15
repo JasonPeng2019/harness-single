@@ -1357,6 +1357,50 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual("worker-isolated", config["default_permissions"])
         self.assertFalse((worktree / ".custom").exists())
 
+    def _commit_product(self, files: dict[str, str]) -> None:
+        for name, text in files.items():
+            self.fixture._write_text(self.fixture.root_workspace / name, text)
+        self.fixture.git("init", "-q")
+        self.fixture.git("add", *files)
+        self.fixture.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture base")
+
+    def test_generated_lane_material_is_ignored_without_hiding_project_source(self) -> None:
+        from orchestrator_harness.records import read_record
+        # The product ignores neither the runtime nor .codex, and ships .codex/dev source.
+        self._commit_product({".gitignore": "*.log\n", ".codex/dev/shipped.json": "{}\n"})
+        result, worktree = self._bootstrap("ignored-lane", managed=True, provider="codex")
+        self.assertTrue(result["ok"], result)
+        product_status = self.fixture.git("status", "--porcelain=v1", "--untracked-files=all")
+        self.assertNotIn(".harness-runtime", product_status)
+        lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+        def status() -> set[str]:
+            return set(bootstrap._run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines())
+        self.assertEqual(set(), status())
+        def entries(path: Path) -> list[str]:
+            return [line for line in path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")]
+        generated = {"/" + name.partition("/")[2] for name in lane["source_exclusions"] if name.startswith(".codex/")}
+        self.assertIn("/config.toml", generated)
+        self.assertIn("/.gitignore", generated)
+        self.assertEqual(sorted(generated | {"/.gitignore"}), entries(worktree / ".codex/.gitignore"))
+        self.assertEqual(["*"], entries(worktree / ".agent-workspace/.gitignore"))
+        (worktree / ".codex/dev/new.json").write_text("{}\n", encoding="utf-8")
+        (worktree / ".codex/dev/shipped.json").write_text("{\"changed\": true}\n", encoding="utf-8")
+        self.assertEqual({"?? .codex/dev/new.json", " M .codex/dev/shipped.json"}, status())
+
+    def test_product_owned_generated_directory_gitignore_is_preserved(self) -> None:
+        self._commit_product({".gitignore": ".harness-runtime/\n", ".codex/.gitignore": "local/\n"})
+        from orchestrator_harness.records import read_record
+        result, worktree = self._bootstrap("owned-ignore-lane", managed=True, provider="codex")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("", bootstrap._run_git(worktree, "status", "--porcelain=v1", "--", ".codex/.gitignore").stdout)
+        self.assertEqual("local/\n", (worktree / ".codex/.gitignore").read_text(encoding="utf-8").replace("\r\n", "\n"))
+        # Generated files stay visible here; RESULT validation refuses committing them.
+        status = bootstrap._run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").stdout
+        self.assertIn("?? .codex/config.toml", status.splitlines())
+        lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+        self.assertIn(".codex/config.toml", lane["source_exclusions"])
+        self.assertNotIn(".codex/.gitignore", lane["source_exclusions"])
+
     def test_managed_bootstrap_preserves_validated_task_card_copy(self) -> None:
         self._assert_bootstrap_preserves_validated_task_card_copy(managed=True)
 

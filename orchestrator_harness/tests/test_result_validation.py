@@ -93,6 +93,34 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         (self.worker / "project-diagnostic.txt").write_text("project change\n")
         self.assert_consumers(False)
 
+    def test_committed_generated_lane_file_is_rejected_until_restored(self):
+        # A product-owned .codex/.gitignore leaves generated files visible to
+        # 'git add -A'; the shared contract still refuses to accept them.
+        self.lane = self.prepare({**self.lane, "run_id": "second-run", "source_exclusions": [".codex/config.toml"]})
+        generated = self.worker / ".codex/config.toml"
+        generated.parent.mkdir()
+        generated.write_text("generated\n")
+        self.publish()
+        self.assert_consumers(True)
+        (self.worker / "source.txt").write_text("worker change\n")
+        self.git(self.worker, "add", "-A")
+        self.commit(self.worker, "ordinary worker habit")
+        self.publish()
+        self.assert_consumers(False)
+        self.assertIn(".codex/config.toml", self.worker_check()["reason"])
+        base = self.lane["git_source"]["base_commit"]
+        self.git(self.worker, "reset", "-q", base, "--", ".codex/config.toml")
+        self.commit(self.worker, "restore generated file")
+        self.publish()
+        # The tip is clean, but lane history would still carry the file.
+        self.assert_consumers(False)
+        self.assertIn("in its history", self.worker_check()["reason"])
+        self.git(self.worker, "reset", "-q", "--soft", base)
+        self.commit(self.worker, "rebuilt without generated files")
+        self.publish()
+        self.assert_consumers(True)
+        self.assertTrue(generated.is_file())
+
     def test_dirty_failure_and_blocked_diagnostics_remain_valid(self):
         (self.worker / "source.txt").write_bytes(b"incomplete\n")
         for outcome in ("FAIL", "BLOCKED"):
@@ -275,6 +303,20 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         self.publish()
         self.assert_consumers(True)
         (self.worker / ".gitattributes").write_bytes(b"source.txt -text\n")
+        self.assert_consumers(False)
+
+    def test_windows_autocrlf_checkout_of_committed_lf_text_is_clean(self):
+        # Git for Windows enables core.autocrlf in system config, which operator
+        # Git ignores: an ordinary worker commit stores LF while CRLF stays on disk.
+        (self.worker / "source.txt").write_bytes(b"original source\r\n")
+        self.assert_consumers(True)
+        (self.worker / "source.txt").write_bytes(b"changed source\r\n")
+        self.assert_consumers(False)
+        (self.worker / ".gitattributes").write_bytes(b"source.txt -text\n")
+        self.git(self.worker, "add", ".gitattributes")
+        self.commit(self.worker, "literal attributes")
+        (self.worker / "source.txt").write_bytes(b"original source\r\n")
+        self.publish()
         self.assert_consumers(False)
 
     def test_external_filter_is_never_executed_even_when_named_set(self):

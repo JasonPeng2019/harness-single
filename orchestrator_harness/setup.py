@@ -61,6 +61,7 @@ from .epochs import MANAGER_QUEUE_SCHEMA, manager_queue_path, read_current_epoch
 from .records import (
     RecordLock,
     _replace_with_retry,
+    atomic_write_bytes,
     atomic_write_json,
     read_record,
 )
@@ -2405,6 +2406,10 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                     raise SetupError(SETUP_CONFIG_INVALID, f"cannot reopen unproven CLOSED runtime: {exc}") from exc
             for parent in ("worktrees", "monitor", "epochs", "resources"):
                 (rt / parent).mkdir(parents=True, exist_ok=True)
+            # The runtime and its lane worktrees live inside the product
+            # checkout; keep them out of ROOT's ordinary product Git view.
+            if not os.path.lexists(rt / ".gitignore"):
+                atomic_write_bytes(rt / ".gitignore", b"*\n")
             if config.profile == "managed":
                 (rt / "manager").mkdir(parents=True, exist_ok=True)
 

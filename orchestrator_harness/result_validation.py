@@ -59,7 +59,8 @@ def _index_entries(source: dict[str, Any]) -> dict[str, tuple[str, str]]:
     return result
 
 
-def _canonical_working_digest(source: dict[str, Any], tip: str, path: str, value: bytes) -> str:
+def _canonical_working_digest(source: dict[str, Any], tip: str, path: str, value: bytes, *,
+                              normalize_crlf: bool = False) -> str:
     # Read attributes from the verified commit, never a dirty .gitattributes.
     attributes = git_source.git(source, "-c", "core.attributesFile=" + os.devnull,
                                 "check-attr", "--source=" + tip, "-z", "filter", "--", path).split(b"\0")
@@ -69,6 +70,12 @@ def _canonical_working_digest(source: dict[str, Any], tip: str, path: str, value
     # selected name even for 'set'/'unset'/'unspecified', avoiding that ambiguity.
     overrides = {f"filter.{driver}.clean": "", f"filter.{driver}.process": "",
                  f"filter.{driver}.required": "false"}
+    if normalize_crlf:
+        # Operator Git ignores system config, but Git for Windows enables
+        # core.autocrlf there, so an ordinary worker commit stores LF text
+        # while CRLF stays on disk. Apply only that text CRLF->LF input rule;
+        # committed attributes (-text, eol) still decide as for the worker.
+        overrides["core.autocrlf"] = "true"
     digest = git_source.git(source, "--attr-source=" + tip, *options,
                             "hash-object", "--stdin", "--path=" + path, input_bytes=value,
                             config_overrides=overrides).decode().strip()
@@ -78,6 +85,19 @@ def _canonical_working_digest(source: dict[str, Any], tip: str, path: str, value
 def require_clean(lane: dict[str, Any], tip: str) -> None:
     source, worktree = lane["git_source"], Path(lane["worktree_path"])
     tree = git_source.tree_entries(source, tip)
+    # A product-owned ignore file can leave generated lane files visible to
+    # 'git add -A'; never accept a branch whose history commits harness material
+    # (generated config holds machine paths and would reach integration).
+    base_commit = source["base_commit"]
+    base = git_source.tree_entries(source, base_commit)
+    changed = [name for name in sorted(set(tree) | set(base)) if _excluded(name, lane) and tree.get(name) != base.get(name)]
+    generated = ["RESULT.json", ".agent-workspace", *lane.get("source_exclusions", [])]
+    if changed or git_source.git(source, "--literal-pathspecs", "rev-list", "--full-history",
+                                 base_commit + ".." + tip, "--", *generated).strip():
+        restore = f"'git reset -q -- {' '.join(changed)}', " if changed else ""
+        raise ValueError(f"reported branch commits generated lane files ({', '.join(changed) or 'in its history'}); "
+                         f"rebuild it with 'git reset --soft {base_commit}', {restore}then commit again "
+                         "(working files stay)")
     index = _index_entries(source)
     expected = {name: entry for name, entry in tree.items() if not _excluded(name, lane)}
     actual = {name: entry for name, entry in index.items() if not _excluded(name, lane)}
@@ -93,6 +113,8 @@ def require_clean(lane: dict[str, Any], tip: str) -> None:
         digest = git_source.object_digest("blob", value, len(oid))
         if digest != oid and mode in {"100644", "100755"}:
             digest = _canonical_working_digest(source, tip, name, value)
+        if digest != oid and mode in {"100644", "100755"} and b"\r\n" in value:
+            digest = _canonical_working_digest(source, tip, name, value, normalize_crlf=True)
         if digest != oid:
             raise ValueError(f"working source differs from committed bytes (or needs an external filter validator): {name}")
         if mode == "100755" and os.name != "nt" and not (worktree / name).stat().st_mode & stat.S_IXUSR:

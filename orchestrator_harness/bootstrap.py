@@ -481,7 +481,8 @@ def _write_worker_prompt(
         "Keep the assigned lane/run/worker_invocation_id/task_card_hash/branch fields. Set commit "
         "to the full current assigned branch tip, report checks with name/command/outcome and "
         "evidence, and supply an ISO timestamp with timezone. Commit project changes and remove "
-        "untracked project inputs before a PASS result. Generated harness bookkeeping is excluded. "
+        "untracked project inputs before a PASS result. Generated harness bookkeeping is excluded; "
+        "never commit RESULT.json or harness files. "
         "Hash the complete record, excluding content_hash, as sorted compact UTF-8 JSON with "
         "ensure_ascii=False. FAIL/BLOCKED preserve diagnostics without claiming clean completion; "
         "they still need the current assignment and tip. Report unsupported source validation "
@@ -551,6 +552,35 @@ def _write_result_template(worktree: Path, lane_id: str, run_id: str, *,
     output.ensure_parent(path)
     output.publish_json(output.admit(path), template)
     return path
+
+
+def _ignore_generated_material(worktree: Path, generated: list[str], *,
+                               output: PreparedOutputTransaction | None = None) -> list[str]:
+    """Keep generated lane material out of the worker's ordinary Git view.
+
+    Each generated directory receives an untracked, self-ignoring .gitignore
+    naming only harness-written files, so ``git add -A`` cannot commit lane
+    bookkeeping while project source beside it (for example ``.codex/dev``)
+    stays visible. A product-owned .gitignore is never replaced; RESULT
+    validation still refuses generated files committed past one. Returns the
+    written ignore files, which are generated material as well.
+    """
+    patterns: dict[str, set[str]] = {".agent-workspace": {"*"}}
+    for name in generated:
+        top, _, rest = name.partition("/")
+        if rest and top != ".agent-workspace":
+            patterns.setdefault(top, {"/.gitignore"}).add("/" + rest)
+    output = _worker_output(worktree, output)
+    written = []
+    for top, entries in sorted(patterns.items()):
+        path = worktree / top / ".gitignore"
+        if os.path.lexists(path):
+            continue
+        text = "# Generated lane material only; other files here remain project source.\n"
+        output.ensure_parent(path)
+        output.publish_bytes(output.admit(path), (text + "\n".join(sorted(entries)) + "\n").encode("utf-8"))
+        written.append(top + "/.gitignore")
+    return written
 
 
 def _write_invocation(
@@ -1172,6 +1202,7 @@ def run_bootstrap(
                 payload = _managed_payload(harness_root, rt, provider)
                 source_exclusions.extend(path.relative_to(payload).as_posix()
                                          for path in payload.rglob("*") if path.is_file())
+            source_exclusions.extend(_ignore_generated_material(worktree_path, source_exclusions))
             receipt = {
                 "schema": OVERLAY_RECEIPT_SCHEMA,
                 "lane_id": lane_id,
