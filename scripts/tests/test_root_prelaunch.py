@@ -514,11 +514,11 @@ class RootPrelaunchTests(unittest.TestCase):
         self.prepared()
         receipt = preparation.read(self.workspace / preparation.RECEIPT)
         self.close_runtime()
-        with patch.object(public_checks, "validate_service", wraps=public_checks.validate_service) as validate:
+        with (patch.object(public_checks, "validate_service", wraps=public_checks.validate_service) as validate,
+              patch.object(public_checks, "service_cleanup", wraps=public_checks.service_cleanup) as cleanup):
             preparation.validate_prepared_root(self.harness, self.workspace, "fixture", resuming=True)
-            self.assertGreaterEqual(validate.call_count, 2)
-            self.assertTrue(all(call.args == (self.workspace, self.harness)
-                                and call.kwargs == {"runtime_closed": True} for call in validate.call_args_list))
+            validate.assert_called_once_with(self.workspace, self.harness, runtime_closed=True)
+            self.assertGreaterEqual(cleanup.call_count, 1)
         self.write(self.workspace / preparation.RECEIPT, {**receipt,
                    "public_check_service": {**receipt["public_check_service"], "pid": 456}})
         with self.assertRaisesRegex(ValueError, "service changed after"):
