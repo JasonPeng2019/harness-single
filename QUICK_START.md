@@ -59,8 +59,13 @@ Manual native integration remains available:
 python -m orchestrator_harness.operator_launch harness setup
 ```
 
-It is for plain/manual integration and for reopening an already prepared ROOT. Reopening the SAME
-run ID through pre-launch preparation revalidates the existing receipt instead of repeating setup.
+It is for plain/manual integration and for reopening an already prepared ROOT. Reopening an
+already prepared ROOT revalidates the existing receipt instead of repeating setup. For a
+prepared CLOSED runtime, run native `harness setup` first, then pre-launch preparation with the
+SAME run ID: preparation revalidates the prior receipt/session/config/hooks and the exact stopped
+service owner, explicitly starts the enabled service with a fresh startup identity, and archives
+the old owner/config/receipt. A lane resume or launch never starts the service, and nothing
+retries automatically.
 Use `--overwrite` only for a separately diagnosed integration change, give each invocation one
 attempt, and never retry a failed setup or refresh a live session. Existing Codex and Claude
 configuration is preserved, with harness hooks merged into the provider hook files. An existing

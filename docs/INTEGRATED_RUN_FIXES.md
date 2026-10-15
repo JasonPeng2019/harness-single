@@ -103,9 +103,15 @@ python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured
 ```
 
 Preparation invokes native setup once, validates hooks and writes the receipt
-under the manager workspace's `.agent-workspace/ROOT_PRELAUNCH_SETUP.json`. Repeating
-preparation for an identical prepared run only revalidates that receipt; it never repeats
-setup. Existing runtime without the matching receipt is refused. Use the same run ID
+under the manager workspace's `.agent-workspace/ROOT_PRELAUNCH_SETUP.json`. Before
+setup it writes a run/workspace/config-bound attempt record
+(`.agent-workspace/ROOT_PRELAUNCH_ATTEMPT.json`); only that exact attempt authorizes
+recovery of an interrupted preparation. If initial preparation fails before a receipt,
+preserve every record, use native `harness shutdown`, correct the actual failure, and
+explicitly prepare again with the SAME run ID and paths. An unrelated manual runtime
+with no matching attempt or receipt still refuses; never delete or fabricate records
+or broaden permissions. Repeating preparation for an identical prepared run only
+revalidates that receipt; it never repeats setup. Use the same run ID
 and paths with `scripts/collect_codex_usage.py`. Supply `--results-dir` explicitly
 for a fresh run; the collector does not choose an evidence folder from its caller's cwd.
 
@@ -122,9 +128,13 @@ native cleanup proof for resume.
 Configure the optional [build/test interface](BUILD_TEST_INTERFACE.md) before
 preparation. No service, backend, sandbox or provider startup is automatically
 retried. ROOT resumes revalidate the original hooks, config, sandbox health,
-run-wide block and service. Quiescent OPEN review needs the live service; CLOSED
-resume requires the original service STOPPED with cleanup proved. Resume does
-not restart it or reopen lanes.
+run-wide block and service. Quiescent OPEN review needs the live service;
+reopening a prepared CLOSED runtime requires the original service STOPPED with
+cleanup proved; native `harness setup` and preparation with the SAME run ID then
+revalidate the prior receipt/session/config/hooks and the exact stopped service
+owner, explicitly start the enabled service with a fresh startup identity, and
+archive the old owner, config and receipt. A lane resume or launch never starts
+the service or reopens lanes, and nothing retries automatically.
 
 ## Remaining work
 
