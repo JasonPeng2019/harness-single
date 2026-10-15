@@ -12,11 +12,11 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import bootstrap, controller, lane_authority, processes, public_checks, shutdown
 from orchestrator_harness.config import HarnessConfig, ResourceManifest
-from orchestrator_harness.models import ProcessQuery
+from orchestrator_harness.models import ProcessInfo, ProcessQuery, ProcessSnapshot
 from orchestrator_harness.lanes import lane_operation_lock, write_lane, read_lane
 from orchestrator_harness.epochs import write_active_lanes, open_epoch
 from orchestrator_harness.records import atomic_write_json
@@ -55,7 +55,7 @@ class NativeLinuxTerminalChildTests(unittest.TestCase):
             record = path.read_text(encoding="ascii")
             fields = record.rsplit(")", 1)[1].split()
             if fields[0] == "Z":
-                self.assertEqual(identity["creation_time"], f"linux-start-ticks:{fields[19]}")
+                self.assertEqual(identity["creation_time"], f"linux-boot:{processes._linux_boot_id()}:{fields[19]}")
                 return
             self.assertLess(time.monotonic(), deadline, "original child did not reach native terminal state")
             time.sleep(.01)
@@ -97,6 +97,77 @@ class NativeLinuxTerminalChildTests(unittest.TestCase):
                     self.assertFalse(processes.identity_exit_proven(child.pid, identity["creation_time"]))
 
 
+class LinuxBootIdentityTests(unittest.TestCase):
+    old_boot = "11111111-1111-1111-1111-111111111111"
+    new_boot = "22222222-2222-2222-2222-222222222222"
+
+    def test_new_identity_distinguishes_equal_pid_and_ticks_after_reboot(self):
+        with (patch.object(processes.sys, "platform", "linux"),
+              patch.object(processes, "exact_process_identity", return_value={"pid": 123, "created_utc": "linux-start-ticks:500"}),
+              patch.object(processes, "_linux_boot_id", side_effect=[self.old_boot, self.new_boot])):
+            old, new = processes.process_identity(123), processes.process_identity(123)
+        self.assertNotEqual(old, new)
+        self.assertTrue(processes.valid_creation_identity(old["creation_time"]))
+        self.assertTrue(processes.valid_creation_identity(new["creation_time"]))
+
+    def test_unknown_boot_cannot_publish_signal_identity(self):
+        with (patch.object(processes.sys, "platform", "linux"),
+              patch.object(processes, "exact_process_identity", return_value={"pid": 123, "created_utc": "linux-start-ticks:500"}),
+              patch.object(processes, "_linux_boot_id", side_effect=OSError("boot ID unreadable"))):
+            self.assertIsNone(processes.process_identity(123))
+
+    def test_old_boot_proves_exit_without_adopting_reused_group_or_signaling(self):
+        old = {"pid": 123, "creation_time": f"linux-boot:{self.old_boot}:500"}
+        record = {"kind": "posix-process-group", "root": old, "processes": [old],
+                  "process_group_id": 123, "session_id": 123}
+        with (patch.object(processes.sys, "platform", "linux"),
+              patch.object(processes, "_linux_boot_id", return_value=self.new_boot),
+              patch.object(processes, "process_snapshot", side_effect=AssertionError("old group cannot grant membership")),
+              patch.object(processes.os, "kill", side_effect=AssertionError("reused PID cannot be signaled"))):
+            self.assertTrue(processes.identity_exit_proven(**old))
+            self.assertTrue(processes.terminate_process(**old, force=True))
+            self.assertTrue(processes.process_boundary_is_gone(record))
+            self.assertTrue(processes.cleanup_recorded_process_boundary(record))
+
+    def test_legacy_ticks_cannot_signal_live_alias_but_can_prove_old_pid_exit(self):
+        current = {"pid": 123, "creation_time": f"linux-boot:{self.new_boot}:500"}
+        with (patch.object(processes.sys, "platform", "linux"),
+              patch.object(processes, "_linux_boot_id", return_value=self.new_boot),
+              patch.object(processes, "_linux_process_stat", return_value=("S", 500)),
+              patch.object(processes, "process_identity", return_value=current),
+              patch.object(processes, "process_alive", return_value=True),
+              patch.object(processes.os, "kill", side_effect=AssertionError("unscoped PID cannot be signaled"))):
+            self.assertTrue(processes.identity_matches(**current))
+            self.assertFalse(processes.identity_matches(123, "linux-start-ticks:500"))
+            self.assertFalse(processes.terminate_process(123, "linux-start-ticks:500", force=True))
+            self.assertFalse(processes.identity_exit_proven(123, "linux-start-ticks:500"))
+            self.assertTrue(processes.identity_exit_proven(123, "linux-start-ticks:499"))
+            self.assertTrue(processes.terminate_process(123, "linux-start-ticks:499", force=True))
+            record = {"kind": "posix-process-group", "root": {"pid": 123, "creation_time": "linux-start-ticks:500"},
+                      "processes": [], "process_group_id": 123, "session_id": 123}
+            self.assertFalse(processes.cleanup_recorded_process_boundary(record))
+
+    def test_reused_group_without_original_root_cannot_grant_signal_authority(self):
+        from datetime import datetime, timezone
+        original = {"pid": 123, "creation_time": f"linux-boot:{self.new_boot}:100"}
+        record = {"kind": "posix-process-group", "root": original, "processes": [original],
+                  "process_group_id": 123, "session_id": 123}
+        created = datetime(2026, 10, 15, tzinfo=timezone.utc)
+        snapshot = ProcessSnapshot(True, (ProcessInfo(456, 1, "unrelated", "unrelated", created,
+                                                     process_group_id=123, session_id=123),))
+        with (patch.object(processes.sys, "platform", "linux"),
+              patch.object(processes, "_linux_boot_id", return_value=self.new_boot),
+              patch.object(processes, "_identity_time", return_value=created),
+              patch.object(processes, "process_identity", side_effect=lambda pid: None if pid == 123 else
+                           {"pid": 456, "creation_time": f"linux-boot:{self.new_boot}:500"}),
+              patch.object(processes, "process_alive", side_effect=lambda pid: pid == 456),
+              patch.object(processes, "terminate_process") as terminate):
+            boundary = processes.ProcessBoundary.from_record(record, snapshot_provider=lambda: snapshot)
+            self.assertFalse(boundary.cleanup(force=True, timeout_seconds=.01))
+            self.assertEqual({(123, original["creation_time"])}, set(boundary._owned))
+        terminate.assert_not_called()
+
+
 class LifecycleAdversarialTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -117,6 +188,69 @@ class LifecycleAdversarialTests(unittest.TestCase):
               patch.object(shutdown, "_prune_worktrees"),
               patch.object(shutdown, "MONITOR_WAIT_SECONDS", 0.05)):
             return shutdown.run_shutdown()
+
+    @unittest.skipUnless(os.name == "nt", "native Windows repeated owned Job cleanup")
+    def test_owned_job_cleanup_is_reusable_without_global_inventory(self):
+        with open(os.devnull, "rb") as stdin, open(os.devnull, "wb") as stdout, open(os.devnull, "wb") as stderr:
+            child = processes.spawn_provider([sys.executable, "-B", "-c", "import time; time.sleep(30)"],
+                                             cwd=self.root, stdin=stdin, stdout=stdout, stderr=stderr)
+        boundary = None
+        try:
+            boundary = processes.ProcessBoundary.for_process(child.pid, windows_job_handle=child.take_job_handle())
+            child.resume()
+            self.assertTrue(boundary.cleanup(force=True))
+            with patch.object(processes, "process_snapshot", side_effect=AssertionError("already-clean Job needs no inventory")):
+                self.assertTrue(boundary.cleanup(force=True))
+            self.assertTrue(processes.identity_exit_proven(child.pid, boundary.root_creation_time))
+        finally:
+            if boundary is not None:
+                boundary._close_job()
+            self.assertTrue(processes.reap_created_process(child))
+            child.close()
+
+    def test_shutdown_checks_run_with_a_nonempty_transcript_backlog(self):
+        worktree = self.root / "worker"
+        agent = worktree / ".agent-workspace"
+        agent.mkdir(parents=True)
+        prompt = agent / "prompt.md"
+        prompt.write_text("fixture", encoding="utf-8")
+        lane = {"lane_id": "worker", "run_id": "run", "worktree_path": str(worktree),
+                "provider": {"id": "fixture"}, "lifecycle": "running", "process": {},
+                "last_message_path": str(agent / "last.txt"),
+                "controller_status_path": str(agent / "status.json"),
+                "controller_events_path": str(agent / "events.jsonl")}
+        child = MagicMock(pid=123, returncode=-1)
+        child.poll.side_effect = [None, None, None, 0]
+        boundary = MagicMock(root_creation_time="2026-10-15T00:00:00Z", process_group_id=None, session_id=None)
+        boundary.record.return_value = {"kind": "fixture"}
+        state = {"state": "OPEN"}
+        parsed, stopped_at = [], []
+
+        def spawn(*args, **kwargs):
+            # The reader always has another line while the fake child is live.
+            (agent / "provider-transcript.jsonl").write_text("{}\n" * 20, encoding="utf-8")
+            return child
+
+        def parse(line):
+            parsed.append(line)
+            state["state"] = "SHUTTING_DOWN"
+            return {}
+
+        boundary.cleanup.side_effect = lambda **_: stopped_at.append(len(parsed)) or True
+        clock = iter(range(100))
+        with (patch.object(controller, "read_lane", return_value=lane),
+              patch.object(lane_authority, "read_invocation"),
+              patch.object(controller, "read_current_epoch", return_value={"epoch_id": "epoch"}),
+              patch.object(controller, "read_runtime_state", side_effect=lambda _: dict(state)),
+              patch.object(controller, "reserve_invocation", return_value="token"),
+              patch.object(controller, "record_started"),
+              patch.object(controller.time, "monotonic", side_effect=lambda: next(clock)),
+              patch.object(processes, "spawn_provider", side_effect=spawn),
+              patch.object(processes.ProcessBoundary, "for_process", return_value=boundary)):
+            controller._run_provider(self.rt, "epoch", lane, {"provider": {"model": "fixture", "launch_config": {}}},
+                                     SimpleNamespace(build_argv=lambda **_: ["fixture"], parse_line=parse), prompt)
+        self.assertEqual([1], stopped_at, "cancellation must occur before draining the live transcript")
+        child.wait.assert_called_once_with(timeout=10.0)
 
     def test_shutdown_does_not_close_with_exact_live_stopped_monitor(self):
         identity = processes.process_identity(os.getpid())

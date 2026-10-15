@@ -57,7 +57,29 @@ def process_identity(pid: int) -> dict[str, Any] | None:
     identity = exact_process_identity(pid)
     if identity is None:
         return None
-    return {"pid": int(identity["pid"]), "creation_time": str(identity["created_utc"])}
+    creation = str(identity["created_utc"])
+    if sys.platform.startswith("linux") and creation.startswith("linux-start-ticks:"):
+        try:
+            creation = f"linux-boot:{_linux_boot_id()}:{creation.split(':')[1]}"
+        except (OSError, RuntimeError, ValueError):
+            return None  # Tick counts alone repeat after reboot.
+    return {"pid": int(identity["pid"]), "creation_time": creation}
+
+
+def _linux_boot_id() -> str:
+    value = (procfs_root() / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) is None:
+        raise ValueError("Linux boot identity is unavailable")
+    return value
+
+
+def _linux_scoped_identity(value: str) -> tuple[str, int] | None:
+    match = re.fullmatch(
+        r"linux-boot:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}):(0|[1-9][0-9]{0,19})", value
+    )
+    if match is None or int(match[2]) >= 2**64:
+        return None
+    return match[1], int(match[2])
 
 
 def _linux_process_stat(pid: int) -> tuple[str, int]:
@@ -128,6 +150,8 @@ def identity_matches(pid: int, creation_time: str | None) -> bool:
 
     if not _valid_pid(pid) or not creation_time:
         return False
+    if sys.platform.startswith("linux") and creation_time.startswith("linux-start-ticks:"):
+        return False  # Legacy saved ticks carry no boot identity or signal authority.
     if not process_alive(pid):
         return False
     current = process_identity(pid)
@@ -138,6 +162,8 @@ def valid_creation_identity(value: object) -> bool:
     """Recognize native start identities and the supported legacy UTC form."""
     if not isinstance(value, str) or not value:
         return False
+    if _linux_scoped_identity(value) is not None:
+        return True
     if re.fullmatch(r"windows-filetime:[1-9][0-9]{0,19}", value):
         return int(value.split(":")[1]) < 2**64 and _identity_time(value) is not None
     if re.fullmatch(r"linux-start-ticks:(0|[1-9][0-9]{0,19})", value):
@@ -196,14 +222,17 @@ def _linux_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
     """Prove a matching exited object without reaping another caller's child."""
     if not sys.platform.startswith("linux"):
         return None
+    scoped = _linux_scoped_identity(creation_time)
     try:
+        if scoped is not None and scoped[0] != _linux_boot_id():
+            return True  # A different boot proves the saved incarnation exited.
         state, ticks = _linux_process_stat(pid)
     except (OSError, RuntimeError, ValueError):
         return None
     if state not in {"Z", "X", "x"}:
         return None
     observed = f"linux-start-ticks:{ticks}"
-    if observed == creation_time:
+    if observed == creation_time or (scoped is not None and scoped[1] == ticks):
         return True
     legacy = parse_utc(creation_time)
     if legacy is not None and _identity_time(observed) == legacy:
@@ -226,6 +255,11 @@ def identity_exit_proven(pid: int, creation_time: str) -> bool:
         if not valid_creation_identity(observed):
             return False
         same = observed == creation_time
+        if sys.platform.startswith("linux") and creation_time.startswith("linux-start-ticks:"):
+            scoped = _linux_scoped_identity(observed)
+            if scoped is None:
+                return False
+            same = scoped[1] == int(creation_time.split(":")[1])
         if parse_utc(creation_time) is not None:
             expected_time, observed_time = _identity_time(creation_time), _identity_time(observed)
             if observed_time is None:
@@ -1220,6 +1254,14 @@ def _identity_time(value: str) -> datetime | None:
             )
         except (OverflowError, OSError, ValueError):
             return None
+    scoped = _linux_scoped_identity(value)
+    if scoped is not None:
+        try:
+            if scoped[0] != _linux_boot_id():
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        value = f"linux-start-ticks:{scoped[1]}"
     if value.startswith("linux-start-ticks:"):
         try:
             start_ticks = int(value.split(":", 1)[1])
@@ -1293,6 +1335,7 @@ class ProcessBoundary:
         if _valid_pid(root_pid) and isinstance(root_creation_time, str) and root_creation_time:
             self._owned[_identity_key(root_pid, root_creation_time)] = root_process
         self._job_handle: Any = windows_job_handle
+        self._job_cleanup_proven = False
         if windows_job_handle is not None:
             self.boundary_kind = "windows-job"
         self._last_observation_complete = not self.errors
@@ -1480,6 +1523,19 @@ class ProcessBoundary:
 
         if self._job_handle is not None:
             return self._observe_job()
+        if sys.platform.startswith("linux") and self.root_creation_time:
+            scoped = _linux_scoped_identity(self.root_creation_time)
+            try:
+                old_boot = scoped is not None and scoped[0] != _linux_boot_id()
+            except (OSError, RuntimeError, ValueError):
+                self._last_observation_complete = False
+                return False
+            if old_boot or self.root_creation_time.startswith("linux-start-ticks:"):
+                # Saved group/session numbers can also be reused after reboot.
+                # Check only the retained members; never adopt or signal from
+                # an old or unscoped containment record.
+                self._last_observation_complete = self._remaining() == []
+                return self._last_observation_complete
         snapshot = self.snapshot_provider()
         if not isinstance(snapshot, ProcessSnapshot) or not snapshot.complete:
             self._last_observation_complete = False
@@ -1517,6 +1573,12 @@ class ProcessBoundary:
                 continue
             if (item.pid, creation) not in recorded_identities:
                 if not in_boundary:
+                    continue
+                if root is None:
+                    # A saved group/session number can be reused after its
+                    # original members exit. Without the original root, retain
+                    # exact known members and refuse new containment-only claims.
+                    self.errors.append(f"PID {item.pid} containment owner is no longer observable")
                     continue
                 # Membership would rest on a snapshot containment fact alone;
                 # the snapshot incarnation must be the live incarnation.
@@ -1598,6 +1660,11 @@ class ProcessBoundary:
     def cleanup(self, *, force: bool = False, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
         """Terminate every recorded/contained member and prove the boundary gone."""
 
+        if self._job_cleanup_proven:
+            # A cooperative stop and the controller's terminal path clean the
+            # same owned Job. Its kernel emptiness was already proven before
+            # close; recheck exact exits without a new global inventory.
+            return self._wait_exact_members(timeout_seconds)
         if self._job_handle is not None:
             cleanup_proven = False
             try:
@@ -1630,6 +1697,7 @@ class ProcessBoundary:
             exact = self._wait_exact_members(timeout_seconds)
             if not exact:
                 self.errors.append("Windows Job recorded-member exit proof is unavailable")
+            self._job_cleanup_proven = exact
             return exact
 
         if not self.root_creation_time:
@@ -1706,7 +1774,7 @@ def cleanup_recorded_process_boundary(
     )
 
 
-def process_boundary_is_gone(record: dict[str, Any]) -> bool:
+def process_boundary_is_gone(record: dict[str, Any], *, timeout_seconds: float = 0.0) -> bool:
     """Prove a serialized boundary is absent without terminating anything."""
 
     boundary = ProcessBoundary.from_record(record)
@@ -1715,8 +1783,9 @@ def process_boundary_is_gone(record: dict[str, Any]) -> bool:
     # A closed Windows Job cannot acquire descendants of a reused numeric PID.
     # Fresh absence of every recorded incarnation needs no global PID snapshot.
     # Unknown or surviving members still require the ordinary strict observation.
-    if os.name == "nt" and boundary.boundary_kind == "windows-job" and boundary._remaining() == []:
-        return True
+    if os.name == "nt" and boundary.boundary_kind == "windows-job":
+        if boundary._wait_exact_members(timeout_seconds):
+            return True
     if not boundary.observe():
         return False
     return boundary._remaining() == []

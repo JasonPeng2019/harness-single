@@ -603,6 +603,18 @@ def _run_provider(
                         child.wait(timeout=10.0)
                     break
             if time.monotonic() >= next_observation:
+                # Cancellation is independent of transcript EOF: a busy provider
+                # can keep this file readable throughout its lifetime.
+                state = read_runtime_state(rt)
+                if state is not None and state.get("state") == "SHUTTING_DOWN":
+                    _append_event(
+                        lane,
+                        "shutdown_stop",
+                        "runtime shutting down; terminating provider boundary",
+                    )
+                    boundary.cleanup(force=True, timeout_seconds=10.0)
+                    child.wait(timeout=10.0)
+                    break
                 boundary.observe()
                 next_observation = time.monotonic() + 0.5
             line = handle.readline()
@@ -626,23 +638,6 @@ def _run_provider(
                     if parsed.get("non_retryable_failure") is True:
                         non_retryable_failure = True
             else:
-                # The runtime is shutting down: this controller cleans its own
-                # provider by exact identity (its direct child handle), then
-                # the normal cleanup-proof path below runs.
-                state = read_runtime_state(rt)
-                if state is not None and state.get("state") == "SHUTTING_DOWN":
-                    _append_event(
-                        lane,
-                        "shutdown_stop",
-                        "runtime shutting down; terminating provider boundary",
-                    )
-                    boundary.cleanup(force=True, timeout_seconds=10.0)
-                    try:
-                        child.wait(timeout=10.0)
-                    except subprocess.TimeoutExpired:
-                        child.kill()  # Popen handle for this exact child
-                        child.wait(timeout=10.0)
-                    break
                 time.sleep(0.2)
         for line in handle:
             try:
