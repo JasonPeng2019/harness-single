@@ -134,7 +134,7 @@ cleanup proved; native `harness setup` and preparation with the SAME run ID then
 revalidate the prior receipt/session/config/hooks and the exact stopped service
 owner, explicitly start the enabled service with a fresh startup identity, and
 archive the old owner, config and receipt. A lane resume or launch never starts
-the service or reopens lanes, and nothing retries automatically.
+the service, and nothing retries automatically.
 
 ## Remaining work
 
