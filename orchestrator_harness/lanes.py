@@ -53,13 +53,22 @@ def read_lane(rt: Path, epoch_id: str, lane_id: str) -> dict[str, Any]:
         raise LaneError("LANE_RECORD_INVALID", str(exc)) from exc
 
 
-def write_lane(rt: Path, epoch_id: str, lane_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+def write_lane(
+    rt: Path, epoch_id: str, lane_id: str, fields: dict[str, Any], *, create_only: bool = False,
+) -> dict[str, Any]:
     record = dict(fields)
     record["schema"] = LANE_SCHEMA
     record["lane_id"] = lane_id
     path = lane_record_path(rt, epoch_id, lane_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with RecordLock(path):
+        if create_only:
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise LaneError("LANE_ID_IN_USE", f"lane record already exists: {path}")
         atomic_write_json(path, record)
     return record
 
@@ -145,9 +154,67 @@ def find_active_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
     epoch_id = str(marker["epoch_id"])
     try:
         lane = read_lane(rt, epoch_id, lane_id)
-    except LaneError:
+    except LaneError as exc:
+        if exc.code != "LANE_NOT_FOUND":
+            raise
         raise LaneError("LANE_NOT_FOUND", f"lane not found: {lane_id}")
     return epoch_id, lane
+
+
+def find_retained_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
+    """Find a unique retained owner for explicit resume only.
+
+    Ordinary launch/review/discovery must continue to use the current epoch.
+    Reused IDs and unreadable inventories require explicit reconciliation.
+    """
+    from .portable_paths import component
+
+    component(lane_id)
+    directory = rt / "epochs"
+    if not directory.exists():
+        raise LaneError("LANE_NOT_FOUND", f"retained lane not found: {lane_id}")
+    matches = []
+    for folder in sorted(directory.iterdir()):
+        metadata = folder.lstat()
+        if not folder.is_dir() or folder.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+            raise LaneError("LANE_RECORD_INVALID", f"unexpected epoch entry: {folder}")
+        lane = retained_lanes(rt, folder.name).get(lane_id)
+        if lane is not None:
+            matches.append((folder.name, lane))
+    if len(matches) > 1:
+        # A pause after resume preparation retains both the closed original
+        # and its replacement. Select only a complete, unbranched native chain;
+        # timestamps or directory order never establish ownership.
+        owners = dict(matches)
+        parents = {lane.get("resume_from_epoch_id") for _, lane in matches}
+        leaves = set(owners) - parents
+        if len(leaves) == 1:
+            selected = next(iter(leaves))
+            visited = set()
+            cursor = selected
+            while cursor in owners and cursor not in visited:
+                visited.add(cursor)
+                child = owners[cursor]
+                parent_id = child.get("resume_from_epoch_id")
+                if parent_id is None:
+                    break
+                parent = owners.get(parent_id)
+                if parent is None or child.get("resume_from_run_id") != parent["run_id"] or any(
+                    child.get(field) != parent.get(field) for field in (
+                        "worktree_path", "worktree_identity", "provider", "session", "git_source",
+                        "provider_history_path", "exclusive_resources", "git_write_namespace",
+                    )
+                ):
+                    break
+                cursor = parent_id
+            if len(visited) == len(owners) and owners[cursor].get("resume_from_epoch_id") is None:
+                return selected, owners[selected]
+    if len(matches) != 1:
+        raise LaneError(
+            "LANE_ID_AMBIGUOUS" if matches else "LANE_NOT_FOUND",
+            f"retained lane {lane_id} has {len(matches)} matching epoch records; resume requires a unique owner",
+        )
+    return matches[0]
 
 
 def active_lane_entries(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
