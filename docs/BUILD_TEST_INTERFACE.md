@@ -78,8 +78,12 @@ settings are omitted; its home/cache directories are owned runtime directories.
 
 ## Worker and lifecycle behavior
 
-Operator preparation starts the service once before ROOT and records its policy
-and exact process identity. Bootstrap/resume stage a lane-local client and route.
+Operator preparation starts the service before ROOT and records its policy
+and exact process identity. With an enabled policy, native setup first records a
+never-started state before any service attempt, and each startup records exact
+process ownership before the trusted adapter's preflight runs; a failed startup
+keeps its evidence, and readiness is permitted up to 180 seconds. Bootstrap/resume
+stage a lane-local client and route.
 Workers commit the configured inputs, then request and consume feedback:
 
 ```powershell
@@ -105,8 +109,10 @@ bootstrap and resume stage a lane-local client and route bound to the current
 run, so a resumed session receives a fresh route; a request naming a stale run or
 route is refused and the lane must be refreshed through native preparation.
 Shutdown cancels checks, proves adapter/service cleanup, then stops the native
-monitor. ROOT resume revalidates the original service/prelaunch proof without
-setup or an automatic service restart.
+monitor. Retained cleanup is proved independently of any later policy edit;
+unproven adapter cleanup stays `CLEANUP_UNPROVEN` and refuses CLOSED. ROOT resume
+revalidates the original service/prelaunch proof without setup or an automatic
+service restart.
 Routes retain the prepared worktree's filesystem identity. Requests are limited
 to 64 KiB and read through one file handle with held, nonlinked ancestors; growth
 after an initial size check cannot evade that bound. An old route without its

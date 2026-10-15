@@ -113,9 +113,13 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 4. Manual native integration remains available with
    `python -m orchestrator_harness.operator_launch harness setup` for plain/manual integration and
    for reopening an already prepared ROOT (`--overwrite` only for a separately diagnosed
-   integration change). Reopening an already prepared ROOT goes through pre-launch preparation
-   with the same run ID, which revalidates the existing receipt instead of repeating setup. Never
-   delete or fabricate runtime records or receipts.
+   integration change). Reopening an already prepared ROOT revalidates the existing receipt
+   instead of repeating setup. For a prepared CLOSED runtime, run native `harness setup` first,
+   then pre-launch preparation with the SAME run ID: preparation revalidates the prior
+   receipt/session/config/hooks and the exact stopped service owner, explicitly starts the enabled
+   service with a fresh startup identity, and archives the old owner, config and receipt. A lane
+   resume or launch never starts the service, and nothing retries automatically. Never delete or
+   fabricate runtime records or receipts.
 
 ROOT payloads (skills, hook scripts, binding files and the `.agent-workspace` helpers) are
 installed into the configured `manager_workspace`. Setup preserves existing `.codex/` and `.claude/`
