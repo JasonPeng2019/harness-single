@@ -9,10 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from orchestrator_harness import controller, leases, manager_queue, monitor, review, scan_watch
+from orchestrator_harness import controller, git_source, leases, manager_queue, monitor, review, scan_watch, setup
 from orchestrator_harness.controller import ProviderExecution
-from orchestrator_harness.core import content_hash
-from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA
+from orchestrator_harness.core import content_hash, iso_utc
+from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA, lane_record_dir
 from orchestrator_harness.manager_queue import (
     append_assignment,
     append_watch_delivery,
@@ -68,6 +68,26 @@ class Addendum3ProductTests(unittest.TestCase):
             "attempts_path": str(worktree / ".agent-workspace" / "attempts.jsonl"),
         }
         return write_lane(self.runtime, "epoch-1", "lane-1", lane)
+
+    def _reviewable_lane(self) -> dict[str, object]:
+        """A real linked lane whose current committed PASS RESULT awaits ROOT review."""
+        lane = prepare_lane_fixture(self.runtime, "epoch-1", {
+            "lane_id": "lane-1", "run_id": "run-1", "lifecycle": "review_pending",
+            "worktree_path": str(Path(self.temp.name) / "review-worktree"),
+            "provider": {"id": "claude-code"}, "last_reported_actionable_status": None,
+        })
+        result = {
+            "schema": "result/v1", "lane_id": "lane-1", "run_id": "run-1",
+            "worker_invocation_id": "run-1", "task_card_hash": lane["task_card_hash"],
+            "branch": lane["git_source"]["branch_ref"].removeprefix("refs/heads/"),
+            "commit": git_source.current_tip(lane), "outcome": "PASS", "summary": "completed",
+            "checks": [{"name": "fixture", "command": ["python", "-m", "unittest"], "outcome": "PASS"}],
+            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}], "completed_at": iso_utc(),
+        }
+        result["content_hash"] = content_hash(result)
+        atomic_write_json(Path(str(lane["result_path"])), result)
+        self.assertTrue(monitor._valid_current_result(lane))
+        return lane
 
     def test_outbox_promotes_before_archive_and_retries_to_one_event(self) -> None:
         lane = self._lane()
@@ -187,12 +207,13 @@ class Addendum3ProductTests(unittest.TestCase):
                 **identity,
             },
         )
-        monitor._heartbeat(
-            self.runtime,
-            "config-1",
-            0,
-            [{"kind": "outbox_promotion", "error": "queue unavailable"}],
-        )
+        diagnostics = [{"kind": "outbox_promotion", "error": "queue unavailable"}]
+        # Without an OPEN runtime the monitor must not report itself alive.
+        before = monitor_path.read_bytes()
+        monitor._heartbeat(self.runtime, "config-1", 0, diagnostics)
+        self.assertEqual(before, monitor_path.read_bytes())
+        setup.set_runtime_state(self.runtime, "OPEN")
+        monitor._heartbeat(self.runtime, "config-1", 0, diagnostics)
         record = monitor.read_monitor_record(self.runtime)
         self.assertEqual(0, record["watched_lane_count"])
         self.assertEqual("degraded", record["health"])
@@ -216,92 +237,40 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertTrue(queue["events"][0]["history"][-1]["summary"])
 
     def test_monitor_recovers_malformed_pair_and_one_lost_review_event(self) -> None:
-        from orchestrator_harness.lanes import LANE_SCHEMA
-
-        lane_dir = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1"
-        worktree = self.runtime / "review-worktree"
-        (worktree / ".agent-workspace").mkdir(parents=True)
-        lane_dir.mkdir(parents=True)
-        lane = {
-            "schema": LANE_SCHEMA,
-            "lane_id": "lane-1",
-            "run_id": "run-1",
-            "worktree_path": str(worktree),
-            "result_path": str(worktree / "RESULT.json"),
-            "lifecycle": "review_pending",
-            "last_reported_actionable_status": None,
-        }
-        atomic_write_json(lane_dir / "lane.json", lane)
-        result = {
-            "schema": "result/v1",
-            "lane_id": "lane-1",
-            "run_id": "run-1",
-            "outcome": "PASS",
-            "summary": "completed",
-            "evidence": [],
-            "completed_at": "2026-09-09T00:00:00Z",
-        }
-        result["content_hash"] = content_hash(result)
-        atomic_write_json(worktree / "RESULT.json", result)
-        atomic_write_json(lane_dir / "COMPLETION_REVIEW.json", {"broken": True})
-        self.assertTrue(monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane))
-        self.assertFalse((lane_dir / "COMPLETION_REVIEW.json").exists())
-        recovered_lane = monitor.read_lane(self.runtime, "epoch-1", "lane-1")
-        monitor._recover_lost_review_event(self.runtime, "epoch-1", recovered_lane)
+        lane = self._reviewable_lane()
+        lane_dir = lane_record_dir(self.runtime, "epoch-1", "lane-1")
+        # Valid current work with no ROOT pair and no open request regains one request.
+        self.assertFalse(monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane))
+        monitor._recover_lost_review_event(self.runtime, "epoch-1", lane)
         monitor._recover_lost_review_event(
             self.runtime, "epoch-1", monitor.read_lane(self.runtime, "epoch-1", "lane-1")
         )
         events = read_manager_queue(self.runtime)["events"]
         self.assertEqual(1, len(events))
         self.assertEqual("COMPLETION_REVIEW_REQUIRED", events[0]["type"])
+        recovered = monitor.read_lane(self.runtime, "epoch-1", "lane-1")["review_recovery"]
+        self.assertEqual(events[0]["event_id"], recovered["event_id"])
+        # A malformed ROOT decision is preserved for explicit reconciliation, never deleted.
+        review_path = lane_dir / "COMPLETION_REVIEW.json"
+        atomic_write_json(review_path, {"broken": True})
+        before = review_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "preserve it for explicit ROOT reconciliation"):
+            monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane)
+        self.assertEqual(before, review_path.read_bytes())
+        self.assertFalse((lane_dir / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        self.assertEqual(1, len(read_manager_queue(self.runtime)["events"]))
 
     def test_review_recovery_waits_for_pair_publication(self) -> None:
-        lane_dir = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1"
-        worktree = self.runtime / "review-publication-worktree"
-        workspace = worktree / ".agent-workspace"
-        workspace.mkdir(parents=True)
-        lane_dir.mkdir(parents=True)
-        lane = {
-            "schema": "lane/v1",
-            "lane_id": "lane-1",
-            "run_id": "run-1",
-            "worktree_path": str(worktree),
-            "result_path": str(worktree / "RESULT.json"),
-            "lifecycle": "review_pending",
-        }
-        atomic_write_json(lane_dir / "lane.json", lane)
-        atomic_write_json(
-            workspace / "task-card.json",
-            {
-                "schema": "project-task-card/v1",
-                "card_id": "card-1",
-                "task": "review the completed lane",
-                "acceptance_criteria": ["The review pair is published atomically"],
-                "deliverables": ["Completion review and acceptance records"],
-                "reason_for_acceptance_and_deliverables": (
-                    "Recovery must observe only a complete review pair."
-                ),
-                "base_commit": "commit-1",
-            },
-        )
-        result = {
-            "schema": "result/v1",
-            "lane_id": "lane-1",
-            "run_id": "run-1",
-            "outcome": "PASS",
-            "summary": "completed",
-            "evidence": [],
-            "completed_at": "2026-09-09T00:00:00Z",
-        }
-        result["content_hash"] = content_hash(result)
-        atomic_write_json(worktree / "RESULT.json", result)
-        review_path = lane_dir / "COMPLETION_REVIEW.json"
+        lane = self._reviewable_lane()
+        review_path = lane_record_dir(self.runtime, "epoch-1", "lane-1") / "COMPLETION_REVIEW.json"
         first_write = threading.Event()
         allow_second_write = threading.Event()
         recovery_lock_requested = threading.Event()
         writer_errors: list[BaseException] = []
         recovery_errors: list[BaseException] = []
         recovery_result: list[bool] = []
+        # Authentic Git source validation takes seconds on Windows.
+        timeout = 60
 
         from orchestrator_harness.records import RecordLock
 
@@ -311,7 +280,7 @@ class Addendum3ProductTests(unittest.TestCase):
             real_atomic_write_json(path, value)
             if path == review_path:
                 first_write.set()
-                if not allow_second_write.wait(5):
+                if not allow_second_write.wait(timeout):
                     raise AssertionError("timed out waiting to complete review publication")
 
         def tracked_lock(path: Path) -> RecordLock:
@@ -344,20 +313,22 @@ class Addendum3ProductTests(unittest.TestCase):
 
         with (
             patch.object(review, "atomic_write_json", side_effect=write_pair),
-            patch.object(review, "_worktree_commit", return_value="commit-1"),
             patch.object(monitor, "RecordLock", side_effect=tracked_lock),
         ):
             writer = threading.Thread(target=publish_pair)
             writer.start()
-            self.assertTrue(first_write.wait(5))
+            self.assertTrue(first_write.wait(timeout))
             recovery = threading.Thread(target=recover_pair)
             recovery.start()
-            lock_observed = recovery_lock_requested.wait(2)
+            lock_observed = recovery_lock_requested.wait(timeout)
+            recovery.join(0.5)
+            waited_for_writer = recovery.is_alive()
             allow_second_write.set()
-            writer.join(5)
-            recovery.join(5)
+            writer.join(timeout)
+            recovery.join(timeout)
 
         self.assertTrue(lock_observed, "recovery must acquire the writer's review lock")
+        self.assertTrue(waited_for_writer, "recovery must not inspect a half-published pair")
         self.assertFalse(writer.is_alive())
         self.assertFalse(recovery.is_alive())
         self.assertEqual([], writer_errors)
