@@ -72,6 +72,25 @@ class CleanupEvidenceIntegrityTests(unittest.TestCase):
               patch.object(processes.ProcessBoundary, "observe", return_value=False)):
             self.assertFalse(processes.process_boundary_is_gone(record))
 
+    def test_force_stop_uses_exact_gone_job_proof_before_inventory_cleanup(self):
+        boundary = {"kind": "windows-job", "root": self.identity, "processes": [self.identity]}
+        self.status.update(process_boundary=boundary, cleanup_proven=False)
+        atomic_write_json(self.status_path, self.status)
+        with (patch.object(processes, "terminate_process", return_value=True),
+              patch.object(processes, "identity_exit_proven", return_value=True),
+              patch.object(processes, "process_boundary_is_gone", return_value=True),
+              patch.object(processes, "cleanup_recorded_process_boundary", return_value=False) as cleanup):
+            self.assertTrue(launch._cleanup_lane_processes(self.lane)[0])
+        cleanup.assert_not_called()
+
+    def test_job_exit_proof_waits_for_asynchronous_members_without_inventory(self):
+        record = {"kind": "windows-job", "root": self.identity, "processes": [self.identity]}
+        with (patch.object(processes.os, "name", "nt"),
+              patch.object(processes, "identity_exit_proven", side_effect=[False, True]),
+              patch.object(processes, "identity_matches", return_value=True),
+              patch.object(processes, "process_snapshot", side_effect=AssertionError("exact exit needs no inventory"))):
+            self.assertTrue(processes.process_boundary_is_gone(record, timeout_seconds=1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -534,7 +534,10 @@ def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
         provider_creation = provider_state.get("creation_time")
         boundary = status.get("process_boundary")
         if isinstance(boundary, dict):
-            boundary_ok = processes.cleanup_recorded_process_boundary(boundary)
+            # Closing the killed controller's Job is asynchronous. Give its
+            # exact recorded members time to exit before an inventory fallback.
+            boundary_ok = (processes.process_boundary_is_gone(boundary, timeout_seconds=processes.BOUNDARY_WAIT_SECONDS)
+                           or processes.cleanup_recorded_process_boundary(boundary))
         elif status.get("cleanup_proven") is True and status.get("controller_state") == "exited" and provider_state == {"state": "not_started"}:
             boundary_ok = True
     if ok and boundary_ok and processes.identity_exit_proven(controller_pid, controller_creation):

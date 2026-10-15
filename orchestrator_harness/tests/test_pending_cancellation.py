@@ -419,12 +419,15 @@ class PublicPendingShutdownTests(unittest.TestCase):
     """Public CLIs, controller/provider processes and optional service in owned fixtures."""
 
     def test_public_resume_then_shutdown_and_force_stop_then_shutdown(self, *,
-            modes: tuple[str, ...] = ("resume-shutdown", "resume-force-stop", "initial-prepared", "retry-limit")) -> None:
+            modes: tuple[str, ...] = ("resume-shutdown", "resume-force-stop", "initial-prepared", "retry-limit"),
+            services: tuple[bool, ...] = (False, True)) -> None:
         source = Path(__file__).resolve().parents[2]
         for mode, enabled in ((mode, enabled) for mode in modes
-                for enabled in (False, True)):
-            with self.subTest(mode=mode, service=enabled), tempfile.TemporaryDirectory(prefix="p") as raw:
-                root = Path(raw)
+                for enabled in services):
+            with self.subTest(mode=mode, service=enabled):
+                root = Path(tempfile.mkdtemp(prefix="p")).resolve()
+                fixture_success = False
+                fixture_commands = []
                 harness = root / "local-config" / "harness"
                 workspace = root / "runtime" / "project"
                 harness.mkdir(parents=True)
@@ -479,12 +482,16 @@ class PublicPendingShutdownTests(unittest.TestCase):
 
                 def public(*args: str, success: bool = True) -> dict:
                     # A full-catalog Windows setup took 68.609s and bootstrap
-                    # took 61.297s in a disposable Git project. Allow both
-                    # startup commands 120s; ordinary commands retain 45s.
+                    # took 61.297s in a disposable Git project. A later run
+                    # exceeded 120s under concurrent fixture I/O; allow startup
+                    # 180s. Ordinary commands retain 45s.
                     setup_command = args == ("harness", "setup")
                     bootstrap_command = args[:2] == ("lane", "bootstrap")
                     started = time.monotonic()
-                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=120 if setup_command or bootstrap_command else 45)
+                    completed = subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json", *args], cwd=harness, env=env, capture_output=True, text=True, timeout=180 if setup_command or bootstrap_command else 45)
+                    fixture_commands.append({"argv": list(completed.args), "cwd": str(harness),
+                                             "returncode": completed.returncode, "stdout": completed.stdout,
+                                             "stderr": completed.stderr, "seconds": round(time.monotonic() - started, 3)})
                     if setup_command or bootstrap_command:
                         print(("PUBLIC_PENDING_SETUP_TIMING " if setup_command else "PUBLIC_PENDING_BOOTSTRAP_TIMING ") + json.dumps({"mode": mode, "service": enabled,
                               "elapsed_seconds": round(time.monotonic() - started, 3), "exit_code": completed.returncode}), flush=True)
@@ -630,6 +637,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         stopped = validate_service(workspace, harness, runtime_closed=True)
                         self.assertEqual("STOPPED", stopped["status"])
                         self.assertTrue(json.loads((home(workspace) / "service.json").read_text())["cleanup_proven"])
+                    fixture_success = True
                 except BaseException:
                     print(startup_diagnostics(), flush=True)
                     # Optional owned validation output preserves the authority
@@ -683,6 +691,21 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         # Test failure cleanup still targets only this fixture's
                         # recorded PID plus creation identity.
                         shutdown._stop_monitor(rt)
+                    if fixture_success:
+                        current = read_lane(rt, epoch, "pending")
+                        self.assertTrue(lane_cleanup.cleanup_is_proven(current))
+                        self.assertTrue(processes.identity_exit_proven(monitor["pid"], monitor["creation_time"]))
+                        receipt = {"fixture_root": str(root), "mode": mode, "service": enabled,
+                                   "cleanup_proven": True, "lane": current, "monitor": setup.read_monitor_record(rt),
+                                   "runtime_state": setup.read_runtime_state(rt), "commands": fixture_commands}
+                        record_name = os.environ.get("MERGE_VALIDATION_RECORD")
+                        if record_name:
+                            destination = Path(record_name).absolute().with_suffix(".cases")
+                            destination.mkdir(parents=True, exist_ok=True)
+                            atomic_write_json(destination / (root.name + ".json"), receipt)
+                        print("PUBLIC_PENDING_CLEANUP_PROVEN " + json.dumps(receipt), flush=True)
+                    else:
+                        print("PUBLIC_PENDING_RETAINED_FIXTURE " + str(root), flush=True)
 
 
 if __name__ == "__main__":
