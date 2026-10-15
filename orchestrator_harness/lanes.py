@@ -181,6 +181,34 @@ def find_retained_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
         lane = retained_lanes(rt, folder.name).get(lane_id)
         if lane is not None:
             matches.append((folder.name, lane))
+    if len(matches) > 1:
+        # A pause after resume preparation retains both the closed original
+        # and its replacement. Select only a complete, unbranched native chain;
+        # timestamps or directory order never establish ownership.
+        owners = dict(matches)
+        parents = {lane.get("resume_from_epoch_id") for _, lane in matches}
+        leaves = set(owners) - parents
+        if len(leaves) == 1:
+            selected = next(iter(leaves))
+            visited = set()
+            cursor = selected
+            while cursor in owners and cursor not in visited:
+                visited.add(cursor)
+                child = owners[cursor]
+                parent_id = child.get("resume_from_epoch_id")
+                if parent_id is None:
+                    break
+                parent = owners.get(parent_id)
+                if parent is None or child.get("resume_from_run_id") != parent["run_id"] or any(
+                    child.get(field) != parent.get(field) for field in (
+                        "worktree_path", "worktree_identity", "provider", "session", "git_source",
+                        "provider_history_path", "exclusive_resources", "git_write_namespace",
+                    )
+                ):
+                    break
+                cursor = parent_id
+            if len(visited) == len(owners) and owners[cursor].get("resume_from_epoch_id") is None:
+                return selected, owners[selected]
     if len(matches) != 1:
         raise LaneError(
             "LANE_ID_AMBIGUOUS" if matches else "LANE_NOT_FOUND",

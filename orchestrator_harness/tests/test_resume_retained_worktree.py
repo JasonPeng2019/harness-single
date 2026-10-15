@@ -17,7 +17,7 @@ from orchestrator_harness import processes, resume, retry_policy, setup
 from orchestrator_harness.config import ResourceManifest
 from orchestrator_harness.epochs import close_epoch, lane_record_dir, open_epoch, read_active_lanes, read_current_epoch
 from orchestrator_harness.lane_authority import read_invocation
-from orchestrator_harness.lane_cleanup import cleanup_is_proven
+from orchestrator_harness.lane_cleanup import cleanup_is_proven, retired_lane_record
 from orchestrator_harness.lanes import read_lane, reconcile_active_lanes, write_lane
 from orchestrator_harness.records import atomic_write_json
 from orchestrator_harness.tests.result_fixture import LinkedResultFixture
@@ -142,6 +142,25 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
         self.assertTrue(self.run_resume()["ok"])
         self.assertEqual(state["epoch_id"], self.current()[0])
         self.assertEqual({"peer", "worker"}, {e["lane_id"] for e in read_active_lanes(self.rt, state["epoch_id"])})
+
+    def test_pause_after_resume_before_launch_preserves_unspent_retry(self):
+        self.assertTrue(self.run_resume()["ok"])
+        epoch, pending = self.current()
+        history = Path(pending["provider_history_path"]).read_bytes()
+        (self.worker / "source.txt").write_bytes(b"user work preserved across another pause\n")
+        self.assertTrue(cleanup_is_proven(pending))
+        write_lane(self.rt, epoch, "worker", retired_lane_record(pending))
+        close_epoch(self.rt, epoch)
+        self.assertTrue(self.run_resume()["ok"])
+        latest_epoch, fresh = self.current()
+        self.assertNotEqual(epoch, latest_epoch)
+        self.assertNotEqual(pending["run_id"], fresh["run_id"])
+        self.assertEqual(pending["session"], fresh["session"])
+        self.assertEqual(pending["worktree_path"], fresh["worktree_path"])
+        self.assertEqual(history, Path(fresh["provider_history_path"]).read_bytes())
+        self.assertEqual(1, retry_policy.completed_provider_invocations(fresh, self.rt))
+        self.assertTrue(cleanup_is_proven(fresh))
+        self.assertEqual(b"user work preserved across another pause\n", (self.worker / "source.txt").read_bytes())
 
     def test_same_worktree_retry_spends_second_invocation_and_third_is_refused(self):
         self.assertTrue(self.run_resume()["ok"])
