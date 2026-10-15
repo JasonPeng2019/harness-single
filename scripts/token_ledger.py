@@ -360,20 +360,25 @@ def _worker_evidence(runtime: Path, epoch_id: str, worktree: Path) -> list[tuple
         workspace = worktree / ".agent-workspace"
         return [(workspace, workspace / "invocation.json")]
     lane = read_object(lane_path)
-    if (lane.get("schema") != "lane/v1" or lane.get("lane_id") != worktree.name
+    if (lane_path.resolve() != lane_path.absolute()
+            or lane.get("schema") != "lane/v1" or lane.get("lane_id") != worktree.name
             or Path(lane.get("worktree_path", "")).resolve() != worktree.resolve()):
         raise LedgerError(f"native worker evidence owner differs: {lane_path}")
     if not lane.get("control_dir"):
         workspace = worktree / ".agent-workspace"
         return [(workspace, workspace / "invocation.json")]
     directory = native / "runs"
-    if directory.resolve() != directory.absolute() or not directory.is_dir():
+    if Path(lane["control_dir"]).absolute() != directory / valid_id(lane.get("run_id"), "native worker run_id"):
+        raise LedgerError(f"protected worker control owner differs: {lane_path}")
+    if (directory.resolve() != directory.absolute() or not directory.is_dir()
+            or not Path(lane["control_dir"]).is_dir()):
         raise LedgerError(f"protected worker evidence directory is redirected or missing: {directory}")
     evidence = []
     for workspace in sorted(directory.iterdir()):
         valid_id(workspace.name, "native worker run_id")
         invocation_path = workspace / "invocation.json"
-        if workspace.resolve() != workspace.absolute() or not workspace.is_dir() or not invocation_path.is_file():
+        if (workspace.resolve() != workspace.absolute() or not workspace.is_dir()
+                or not invocation_path.is_file() or invocation_path.resolve() != invocation_path.absolute()):
             raise LedgerError(f"protected worker invocation is missing or redirected: {workspace}")
         invocation = read_object(invocation_path)
         if (invocation.get("run_id") != workspace.name or invocation.get("lane_id") != worktree.name
@@ -383,6 +388,36 @@ def _worker_evidence(runtime: Path, epoch_id: str, worktree: Path) -> list[tuple
     if not evidence:
         raise LedgerError(f"protected worker invocation evidence is missing: {directory}")
     return evidence
+
+
+def _worker_owners(runtime: Path, epoch_id: str | None) -> dict[str, list[Path]]:
+    """Inventory authority epochs independently of worktree creation epochs.
+
+    A retained lane has a new protected owner while its worktree stays put.
+    Worktree mirrors are a legacy fallback only, never a second invocation.
+    """
+    owners: dict[str, list[Path]] = {}
+    native_worktrees: set[Path] = set()
+    for native in sorted((runtime / "epochs").glob("*/lanes/*")):
+        epoch = native.parent.parent.name
+        valid_id(epoch, "native worker epoch_id")
+        valid_id(native.name, "native worker lane_id")
+        lane_path = native / "lane.json"
+        if native.resolve() != native.absolute() or not lane_path.is_file():
+            raise LedgerError(f"native worker owner is missing or redirected: {native}")
+        lane = read_object(lane_path)
+        worktree = Path(nonempty_string(lane.get("worktree_path"), "worker worktree_path"))
+        if (worktree.name != native.name or worktree.resolve() != worktree.absolute()
+                or worktree.parent.parent != runtime / "worktrees"):
+            raise LedgerError(f"native worker worktree owner differs: {lane_path}")
+        native_worktrees.add(worktree)
+        if epoch_id is None or epoch == epoch_id:
+            owners.setdefault(epoch, []).append(worktree)
+    for worktree in sorted((runtime / "worktrees").glob("*/*")):
+        epoch = worktree.parent.name
+        if worktree.is_dir() and worktree not in native_worktrees and (epoch_id is None or epoch == epoch_id):
+            owners.setdefault(epoch, []).append(worktree)
+    return owners
 
 
 def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
@@ -405,16 +440,10 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
     runtime = Path(task["harness_runtime"])
     if not runtime.is_dir():
         return []
-    root = runtime / "worktrees"
-    if not root.is_dir():
-        return []
-    epochs = sorted(item for item in root.iterdir() if item.is_dir())
-    if task.get("epoch_id"):
-        epochs = [item for item in epochs if item.name == task["epoch_id"]]
     results: list[dict[str, Any]] = []
-    for epoch in epochs:
-        for lane_dir in sorted(item for item in epoch.iterdir() if item.is_dir()):
-            for workspace, invocation_path in _worker_evidence(runtime, epoch.name, lane_dir):
+    for epoch_id, lane_dirs in _worker_owners(runtime, task.get("epoch_id")).items():
+        for lane_dir in lane_dirs:
+            for workspace, invocation_path in _worker_evidence(runtime, epoch_id, lane_dir):
                 if not invocation_path.is_file():
                     continue
                 invocation = read_object(invocation_path)
@@ -471,6 +500,11 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                     for row in read_lines(events_path, allow_partial_tail=True)
                     if row.get("event_type") == "provider_started"
                 ]
+                if workspace != lane_dir / ".agent-workspace" and (
+                        any(start.get("run_id") != lane_run_id for start in starts)
+                        or any(row.get("run_id") != lane_run_id or row.get("lane_id") != lane_id
+                               for row in attempt_rows + no_provider_rows)):
+                    raise LedgerError(f"protected worker start/attempt identity differs: {workspace}")
                 if any(row["run_id"] == start.get("run_id") for row in no_provider_rows for start in starts):
                     raise LedgerError(f"no-provider receipt contradicts a start event in {events_path}")
                 if len(attempt_rows) > len(starts):
@@ -509,10 +543,10 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                         start_event.get("run_id") or lane_run_id, "controller run_id"
                     )
                     results.append({
-                        "invocation_id": f"{task['run_id']}.{epoch.name}.{lane_id}.{controller_run_id}.attempt-{number}",
+                        "invocation_id": f"{task['run_id']}.{epoch_id}.{lane_id}.{controller_run_id}.attempt-{number}",
                         "role": "worker",
                         "parent_id": owner,
-                        "epoch_id": epoch.name,
+                        "epoch_id": epoch_id,
                         "lane_id": lane_id,
                         "lane_run_id": controller_run_id,
                         "attempt": number,
@@ -526,6 +560,7 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                         "resume": resume or number > 1,
                         "launch_argv": argv,
                         "attempt_provider": row.get("provider") if row else None,
+                        "session_id": row.get("session_id") if row else None,
                         "transcript_path": str(transcript),
                         "transcript_segment_index": shared_segments[resolved_transcript],
                         "source_manifest_paths": [
@@ -605,6 +640,42 @@ def validate_usage_gap(
         raise LedgerError("usage-gap worker native cleanup is unproven")
 
 
+def _protected_worker_session(task: dict[str, Any], row: dict[str, Any]) -> tuple[Path, str, str] | None:
+    """Use the native attempt's session identity, never damaged JSON guesses."""
+    session = row.get("session_id")
+    if row["role"] != "worker":
+        return None
+    path = (Path(task["harness_runtime"]) / "epochs" / row["epoch_id"] / "lanes"
+            / row["lane_id"] / "runs" / row["lane_run_id"] / "invocation.json")
+    if str(path) not in row["source_manifest_paths"]:
+        return None  # Legacy worker mirrors cannot establish this recovery link.
+    invocation = read_object(path)
+    lane = read_object(path.parent.parent.parent / "lane.json")
+    if lane.get("run_id") != row["lane_run_id"]:
+        return None
+    if lane.get("provider_history_path"):
+        # A cancelled controller may never have published an attempt receipt.
+        # Its original native history can still prove the saved session.
+        from orchestrator_harness.retry_policy import current_invocation_facts
+        try:
+            facts = [fact for fact in current_invocation_facts(lane)
+                     if fact["attempt"] == row["attempt"] and fact["kind"] == "COMPLETED"
+                     and fact.get("cleanup_proven") is True and fact.get("provider_started") is True]
+        except (OSError, ValueError) as exc:
+            raise LedgerError(f"worker native session history is unproven: {exc}") from exc
+        if len(facts) != 1:
+            return None
+        native_session = facts[0].get("session_id")
+        if session and session != native_session:
+            raise LedgerError("worker attempt differs from protected native session")
+        session = native_session
+        row["source_manifest_paths"].append(lane["provider_history_path"])
+    if not isinstance(session, str) or not session:
+        return None
+    row["session_id"] = session
+    return Path(invocation["cwd"]).resolve(), row["lane_id"], session
+
+
 def build_snapshot(task_path: Path) -> dict[str, Any]:
     task = load_task(task_path)
     rows = discover_invocations(task)
@@ -614,6 +685,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
     # Attempts within a Codex thread must be processed in chronological order.
     rows.sort(key=lambda row: (str(row.get("started_at_utc") or ""), row["invocation_id"]))
     previous: dict[str, dict[str, Any]] = {}
+    unknown_sessions: dict[tuple[Path, str, str], dict[str, Any]] = {}
     fingerprints: dict[tuple[str | None, str], str] = {}
     errors: list[str] = []
     pause_seconds = 0.0
@@ -697,12 +769,18 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
         row.update(evidence)
         row["charged_tokens"] = None
         row["charge_source"] = None
+        if (row["role"] == "worker" and row.get("session_id") and evidence.get("thread_id")
+                and row["session_id"] != evidence["thread_id"]):
+            errors.append(f"{row['invocation_id']}: worker transcript changed native session")
         if gap is not None:
             validate_usage_gap(task, row, evidence, gap)
             used_gaps.add(row["invocation_id"])
             row["status"] = "terminated_usage_unknown"
             row["usage_gap"] = gap
             row["source_manifest_paths"].append(str(gap_path))
+            session_key = _protected_worker_session(task, row)
+            if session_key is not None:
+                unknown_sessions[session_key] = row
             unknown_usage += 1
             continue
         if row["role"] != "worker" and row["resume"] and evidence.get("thread_id") != row.get("resume_session_id"):
@@ -725,6 +803,29 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
             continue
         fingerprints[fingerprint] = row["invocation_id"]
         if row["resume"] and (not thread_id or thread_id not in previous):
+            session_key = _protected_worker_session(task, row)
+            unknown_prior = unknown_sessions.get(session_key) if session_key is not None else None
+            argv = row.get("launch_argv") or []
+            resume_index = argv.index("resume") if "resume" in argv else -1
+            if (unknown_prior is not None and row["completed"] and evidence["status"] == "ok"
+                    and session_key[2] == thread_id and resume_index >= 0
+                    and argv[resume_index + 1:resume_index + 2] == [thread_id]):
+                # R2's cumulative usage is readable but its R1 delta is not.
+                # Keep both charges unknown under the original validated receipt.
+                lane = read_object(Path(task["harness_runtime"]) / "epochs" / row["epoch_id"]
+                                   / "lanes" / row["lane_id"] / "lane.json")
+                from orchestrator_harness.lane_cleanup import cleanup_is_proven
+                if lane.get("run_id") != row["lane_run_id"] or not cleanup_is_proven(lane):
+                    errors.append(f"{row['invocation_id']}: resumed worker native cleanup is unproven")
+                    continue
+                row["status"] = "terminated_usage_unknown"
+                row["accounting_error"] = f"resumed thread baseline is unknown after {unknown_prior['invocation_id']}"
+                row["usage_gap"] = unknown_prior["usage_gap"]
+                row["source_manifest_paths"].extend(
+                    path for path in unknown_prior["source_manifest_paths"] if path not in row["source_manifest_paths"]
+                )
+                unknown_usage += 1
+                continue
             errors.append(f"{row['invocation_id']}: resumed thread has no prior baseline")
             continue
         prior = previous.get(thread_id) if thread_id else None
