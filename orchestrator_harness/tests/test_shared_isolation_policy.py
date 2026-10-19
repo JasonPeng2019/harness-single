@@ -49,9 +49,10 @@ class SharedPolicyTests(unittest.TestCase):
         self.git("-C", self.product, "worktree", "add", "-b", "lane/shared-policy/work", worker)
         return worker
 
-    def install(self, worker):
+    def install(self, worker, *, enforce_git_isolation=True):
         with patch.object(Path, "home", return_value=self.home), patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)}):
             bootstrap._install_codex_worker_isolation(worker, self.engine, self.product,
+                                                      enforce_git_isolation=enforce_git_isolation,
                                                       manager_workspace=self.manager)
 
     def test_shared_policy_denies_operator_and_existing_credential_locations(self):
@@ -103,6 +104,16 @@ class SharedPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.BootstrapError, "Git metadata.*inside denied path.*place the common Git directory"):
             self.install(worker)
         self.assertFalse((worker / ".codex/config.toml").exists())
+
+    def test_explicit_yolo_accepts_sibling_git_without_shared_write_grants(self):
+        common = self.product.parent / "repositories/common.git"
+        worker = self.linked_worker(common)
+        self.assertIn(common.parent, self.denials())
+        self.install(worker, enforce_git_isolation=False)
+        filesystem = tomllib.loads((worker / ".codex/config.toml").read_text())["permissions"]["worker-isolated"]["filesystem"]
+        self.assertEqual({str(path) for path in self.denials()},
+                         {name for name, mode in filesystem.items() if mode == "deny"})
+        self.assertFalse(any(mode == "write" for mode in filesystem.values()))
 
 
 if __name__ == "__main__":

@@ -786,8 +786,9 @@ def _install_codex_worker_isolation(
             from .git_source import capture, require_exclusive_namespace
             source = capture(root_workspace, worktree)
             common_dir, lane_git_dir = Path(source["common_dir"]), Path(source["private_dir"])
-            require_git_read_access(denied, common_dir, lane_git_dir)
             if enforce_git_isolation:
+                # Explicit yolo launches do not select the worker isolation profile.
+                require_git_read_access(denied, common_dir, lane_git_dir)
                 branch_namespace = require_exclusive_namespace(root_workspace, source["branch_ref"])
                 # Native filesystem policy needs directory grants for lock
                 # creation and rename. The branch parent must be exclusive;

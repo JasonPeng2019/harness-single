@@ -54,8 +54,8 @@ files are preserved.
   Public checks must not deny live source, worker worktrees or Git metadata that
   workers need. Execute an owned plain snapshot copy outside `operator-only`,
   granting writes only to that copy; see [the adapter contract](BUILD_TEST_INTERFACE.md).
-  Worker bootstrap refuses required Git metadata beneath a denied ancestor;
-  existing narrow private-Git/object/exclusive-ref write grants are unchanged.
+  Isolated Codex worker bootstrap refuses required Git metadata beneath a denied
+  ancestor; existing narrow private-Git/object/exclusive-ref write grants are unchanged.
 - The optional deterministic build/test service preserves committed snapshots,
   exact request/revision identities, stdout/stderr/exit status, direct worker
   feedback, bounded checks, resume rebinding and shutdown cleanup. Its commands,

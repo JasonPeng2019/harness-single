@@ -71,8 +71,8 @@ ACLs on a shared sandbox group, so a check must not deny live source, worker
 worktrees or Git administration that coding workers need. Keep service authority
 under `operator-only`; execute a plain snapshot copy outside that denied subtree,
 with writes limited to that copy. Preflight stays read-only; create temporary
-execution directories when running a check. A linked worker whose required Git
-metadata lies under any shared denied path is refused before its isolation
+execution directories when running a check. An isolated Codex linked worker whose
+required Git metadata lies under any shared denied path is refused before its isolation
 configuration is published; keep its common Git directory inside the product,
 outside `operator-only` and `.secrets`.
 
