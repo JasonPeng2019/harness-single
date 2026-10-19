@@ -49,6 +49,13 @@ files are preserved.
   the Git directory, pointer/backlink, branch and origin assignment before use;
   ROOT's index, config and hooks remain ungranted. Harness/operator state and
   protected sibling workspaces remain denied.
+- Native Windows public-check adapters and workers share the same read-denial
+  policy through `orchestrator_harness.isolation_policy.shared_read_denials`.
+  Public checks must not deny live source, worker worktrees or Git metadata that
+  workers need. Execute an owned plain snapshot copy outside `operator-only`,
+  granting writes only to that copy; see [the adapter contract](BUILD_TEST_INTERFACE.md).
+  Worker bootstrap refuses required Git metadata beneath a denied ancestor;
+  existing narrow private-Git/object/exclusive-ref write grants are unchanged.
 - The optional deterministic build/test service preserves committed snapshots,
   exact request/revision identities, stdout/stderr/exit status, direct worker
   feedback, bounded checks, resume rebinding and shutdown cleanup. Its commands,
@@ -93,6 +100,18 @@ and failure latch do not prove that a native CLI cannot attempt internal setup
 before emitting a diagnostic. Never run speculative `codex sandbox ...
 --help`, retry setup, switch implementations or broaden permissions to bypass
 the gate. Machine ACL repair is an operator responsibility.
+
+Native Codex Windows read denials may be applied to a persistent shared sandbox
+principal rather than isolated per command. Changing the configured profile does
+not itself prove that old denials were removed: SDK versions can leave stale
+explicit deny ACEs after their state stops tracking them. If access still fails
+with compatible profiles, preserve the exact failing command and compare the
+actual ACL/principal with the intended policy before retrying. Any repair belongs
+to an explicitly authorized operator procedure that backs up ACLs and removes only
+proven stale entries while preserving unrelated protection. This distribution
+ships no machine ACL cleanup, automatic permission reset or SDK-state edits.
+[Portable Git layout guidance](PATH_PORTABILITY.md#native-worker-git-storage)
+describes compatible storage before the first setup.
 
 Before starting Codex ROOT, the sandbox gate reads the product workspace while
 preparation selects the configured manager workspace:

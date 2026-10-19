@@ -48,3 +48,18 @@ adapter; example placeholders are intentionally unusable. Tests use temporary
 fixtures instead of fixed host or installation locations. Live WSL isolation and
 native sandbox enforcement require their configured environments; unit manifest
 checks alone do not prove those OS enforcement properties.
+
+## Native worker Git storage
+
+Keep linked-worker Git administration readable under the worker isolation policy.
+A normal product-owned `.git` directory works. If using a separate common Git
+directory, keep it inside the selected product workspace, outside
+`.harness-runtime/operator-only` and `.secrets`. A common store under a protected
+sibling directory is denied even when a worker has narrower write grants beneath
+it; bootstrap reports that conflict before publishing its isolation profile.
+Keep persistent Git administration outside disposable runtime directories.
+
+On Windows, keep the checkout, runtime and lane names reasonably short. Git can
+reject a long linked-worktree Git directory before loading `core.longpaths`, so
+that option alone does not make every deep temporary fixture usable. Choose a
+short operator-owned workspace or temporary root when Git reports this limit.

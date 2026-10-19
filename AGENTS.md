@@ -2,7 +2,6 @@
 
 Before any live use, read `QUICK_RULES.md` and follow `QUICK_START.md`. Consult `README.md`,
 `orchestrator_harness/SPEC.md`, and `docs/HARNESS_WATCHER_GUIDE.md` for the full contracts.
-For this merge, ROOT starts from [goal.md](../../../goal.md) in its manager workspace.
 Implementation workers follow the current scoped task card supplied by ROOT;
 archived plans and historical ownership records do not grant additional work.
 

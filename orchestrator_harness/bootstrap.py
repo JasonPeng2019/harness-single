@@ -773,32 +773,9 @@ def _install_codex_worker_isolation(
             "Codex worker config conflicts with the required isolation profile",
         )
 
+    from .isolation_policy import require_git_read_access, shared_read_denials
     root_workspace = root_workspace.resolve()
-    workspaces_root = root_workspace.parent
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
-    denied = {
-        codex_home,
-        (Path.home() / ".codex").resolve(),
-        harness_root.resolve(),
-        root_workspace / ".harness-runtime" / "operator-only",
-        root_workspace / ".secrets",
-        *protected_manager,
-    }
-    if workspaces_root.is_dir():
-        denied.update(
-            sibling.resolve()
-            for sibling in workspaces_root.iterdir()
-            if sibling.is_dir() and sibling.resolve() != root_workspace
-        )
-
-    # A run-local harness can be beside ROOT inside the same run directory.
-    # Denying that common parent denies ROOT and every lane beneath it on
-    # Windows, even when the lane is separately declared writable. Keep the
-    # specific harness/sibling restrictions, never an ancestor of ROOT.
-    denied = {
-        path for path in denied
-        if path != root_workspace and path not in root_workspace.parents
-    }
+    denied = shared_read_denials(harness_root, root_workspace, manager)
 
     git_writes: set[Path] = set()
     git_pointer = worktree / ".git"
@@ -809,6 +786,7 @@ def _install_codex_worker_isolation(
             from .git_source import capture, require_exclusive_namespace
             source = capture(root_workspace, worktree)
             common_dir, lane_git_dir = Path(source["common_dir"]), Path(source["private_dir"])
+            require_git_read_access(denied, common_dir, lane_git_dir)
             if enforce_git_isolation:
                 branch_namespace = require_exclusive_namespace(root_workspace, source["branch_ref"])
                 # Native filesystem policy needs directory grants for lock

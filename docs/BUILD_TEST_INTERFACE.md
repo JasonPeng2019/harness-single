@@ -63,6 +63,19 @@ the general service is routing and evidence infrastructure, not a host-command
 sandbox. Backend setup belongs to the operator, outside this interface. Preflight
 must not start workers, initialize sandboxes, pull dependencies or retry setup.
 
+Native Windows sandbox adapters must use the same read restrictions as workers:
+`orchestrator_harness.isolation_policy.shared_read_denials(harness_root,
+root_workspace, manager_workspace, home=..., codex_home=...)`. Bind the actual
+user/provider homes, not the service's private home. Windows persists deny-read
+ACLs on a shared sandbox group, so a check must not deny live source, worker
+worktrees or Git administration that coding workers need. Keep service authority
+under `operator-only`; execute a plain snapshot copy outside that denied subtree,
+with writes limited to that copy. Preflight stays read-only; create temporary
+execution directories when running a check. A linked worker whose required Git
+metadata lies under any shared denied path is refused before its isolation
+configuration is published; keep its common Git directory inside the product,
+outside `operator-only` and `.secrets`.
+
 Return a JSON object with string stdout/stderr, integer exit status, and an honest
 boolean cleanup proof, plus optional backend diagnostics. Cancellation/timeouts
 must stop only resources created by that invocation, using exact identities. A
