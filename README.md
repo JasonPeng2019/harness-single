@@ -24,8 +24,7 @@ unconfigured examples and the explicit WSL isolation mount inputs.
 
 See [the integrated run fixes](docs/INTEGRATED_RUN_FIXES.md) for Codex ROOT prelaunch
 preparation, the mandatory Windows sandbox health gate, the optional direct worker public
-build/test service, and remaining task-completion work. Reusable coding-task requirements
-are in [ROOT task policy](docs/ROOT_TASK_POLICY.md).
+build/test service, and remaining task-completion work.
 
 ## Installation layout
 

@@ -267,6 +267,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
             "docs": "../docs/PATH_PORTABILITY.md",
         }.items():
             self.assertIn(required, data_files[destination])
+        self.assertNotIn("../docs/ROOT_TASK_POLICY.md", data_files["docs"])
         self.assertIn(
             "assets/release/templates/*.md",
             data_files["release_evidence_templates"],
@@ -333,8 +334,9 @@ class PackageWheelBuildTests(unittest.TestCase):
             for entry in ("scripts/prepare_root_launch.py", "scripts/check_windows_sandbox.py",
                           "scripts/collect_codex_usage.py", "scripts/token_ledger.py",
                           "tools/worker_public_check.py", "docs/BUILD_TEST_INTERFACE.md",
-                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md", "docs/ROOT_TASK_POLICY.md"):
+                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md"):
                 self.assertTrue(any(name.endswith(".data/data/" + entry) for name in names), entry)
+            self.assertFalse(any(name.endswith("/ROOT_TASK_POLICY.md") for name in names))
             self.assertTrue(any(".data/data/examples/" in name for name in names))
             self.assertTrue(
                 any(

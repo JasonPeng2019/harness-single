@@ -57,7 +57,7 @@ orchestrator_harness = [
              "../scripts/collect_codex_usage.py", "../scripts/token_ledger.py"]
 "tools" = ["../tools/worker_public_check.py"]
 "docs" = ["../docs/BUILD_TEST_INTERFACE.md", "../docs/INTEGRATED_RUN_FIXES.md",
-          "../docs/PATH_PORTABILITY.md", "../docs/ROOT_TASK_POLICY.md"]
+          "../docs/PATH_PORTABILITY.md"]
 
 [tool.pyright]
 pythonVersion = "3.11"

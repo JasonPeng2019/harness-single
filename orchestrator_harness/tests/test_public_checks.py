@@ -146,7 +146,7 @@ class PublicCheckTests(unittest.TestCase):
         value.update(fields)
         atomic_write_json(path, value)
 
-    def test_enabled_route_installs_client_and_worker_feedback_guidance(self):
+    def test_enabled_route_installs_client_without_prescribing_worker_workflow(self):
         from orchestrator_harness import bootstrap
         public_policy = self.policy
         atomic_write_json(self.harness / service.POLICY, public_policy)
@@ -157,16 +157,32 @@ class PublicCheckTests(unittest.TestCase):
             service.install_route(self.harness, self.root, self.lane, self.lane_id, self.run_id)
         self.assertEqual(helper.read_bytes(), (self.agent / "public-check.py").read_bytes())
         self.assertEqual(self.route, service.read(service.home(self.root) / "routes" / f"{self.run_id}.json"))
-        bootstrap._write_worker_prompt(self.lane, {
-            "task": "Implement and test", "acceptance_criteria": ["Build and focused tests pass"],
-            "deliverables": ["Committed tested code"],
-            "reason_for_acceptance_and_deliverables": "Verify useful progress",
-        }, managed=True)
-        prompt = (self.agent / "worker-prompt.md").read_text(encoding="utf-8")
-        self.assertIn("public-check.py request --check build", prompt)
-        self.assertIn("public-check.py request --check public", prompt)
-        self.assertIn("Exit 75 means pending", prompt)
-        self.assertIn("Do not submit duplicates, finalize RESULT", prompt)
+        self.assertEqual(self.route, client.read(self.agent / "public-check-route.json"))
+        task_card = {
+            "task": "Implement the assigned change",
+            "acceptance_criteria": ["Caller-defined success criterion"],
+            "deliverables": ["Caller-defined artifact"],
+            "reason_for_acceptance_and_deliverables": "Caller-defined justification",
+        }
+        for rationale in (None, "Continue the supplied task"):
+            with self.subTest(rationale=rationale):
+                bootstrap._write_worker_prompt(
+                    self.lane, task_card, managed=True, rationale=rationale,
+                )
+                prompt = (self.agent / "worker-prompt.md").read_text(encoding="utf-8")
+                for supplied in (task_card["task"], task_card["acceptance_criteria"][0],
+                                 task_card["deliverables"][0],
+                                 task_card["reason_for_acceptance_and_deliverables"]):
+                    self.assertIn(supplied, prompt)
+                self.assertIn("## Completion record", prompt)
+                self.assertIn("## Escalation (managed coordination)", prompt)
+                if rationale:
+                    self.assertIn("## Resume rationale\n" + rationale, prompt)
+                else:
+                    self.assertNotIn("## Resume rationale", prompt)
+                self.assertNotIn("## Public build/test feedback", prompt)
+                self.assertNotIn("public-check.py request", prompt)
+                self.assertNotIn("repair and retest", prompt)
 
     def test_policy_accepts_windows_utf8_bom(self):
         path = self.harness / service.POLICY

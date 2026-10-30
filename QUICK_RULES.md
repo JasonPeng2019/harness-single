@@ -61,7 +61,7 @@
   integration and for reopening an already prepared ROOT, where preparation revalidates the same
   run-id receipt instead of repeating setup. Never delete or fabricate runtime records or receipts.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,
-  not task success. Carry fresh-validator/public-evidence requirements in the actual run prompt.
+  not task success.
 
 ## Runtime hygiene
 

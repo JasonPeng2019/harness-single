@@ -97,7 +97,7 @@ never-started state before any service attempt, and each startup records exact
 process ownership before the trusted adapter's preflight runs; a failed startup
 keeps its evidence, and readiness is permitted up to 180 seconds. Bootstrap/resume
 stage a lane-local client and route.
-Workers commit the configured inputs, then request and consume feedback:
+The client requests checks against committed inputs and retrieves feedback:
 
 ```powershell
 python .agent-workspace/public-check.py request --check build
@@ -106,11 +106,12 @@ python .agent-workspace/public-check.py wait --request-id <id> --timeout 30
 ```
 
 Focused checks, when enabled, use `request --check focused -- <command argv>`.
-Exit 75 means pending: wait on that same request within the active session.
+Exit 75 means pending: subsequent waits use that same request ID.
 Completed backend statuses remain intact in the feedback; the client maps a
 completed exit 75 (or a native status outside 0..255) to CLI exit 2.
-Build/test failures carry diagnostics; repair, commit and request a new check for
-the new revision. Repeated checks are separate from process-launch retries.
+Build/test failures carry diagnostics. Each request names one committed revision;
+checking a different revision requires a new request. Repeated checks are separate
+from process-launch retries.
 
 The service binds request/lane/run/revision identities, deduplicates delivery,
 rejects stale/resumed or changed-tip requests, and publishes feedback directly

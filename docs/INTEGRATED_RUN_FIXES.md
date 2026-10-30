@@ -159,8 +159,6 @@ the service, and nothing retries automatically.
 
 CLOSED proves operational cleanup, not task completion. Task IDs/overviews,
 registered task-card refresh and harness-owned final validation remain separate
-unimplemented features. [ROOT task policy](ROOT_TASK_POLICY.md) supplies fresh
-validator, initial test evidence and incremental integration/repair guidance;
-include it in the actual ROOT assignment. It is not a completion gate.
+unimplemented features.
 Cancellation terminal-state/token accounting remains a separate gap. Source
 changes alone do not prove a new live sandbox or agent run is healthy.

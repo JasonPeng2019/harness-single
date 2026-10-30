@@ -588,7 +588,6 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "examples/release-selection.example.json",
                 "orchestrator_harness/tests/test_general_coding_docs.py",
                 "docs/INTEGRATED_RUN_FIXES.md",
-                "docs/ROOT_TASK_POLICY.md",
                 "docs/BUILD_TEST_INTERFACE.md",
                 "docs/PATH_PORTABILITY.md",
                 "AGENTS.md",
