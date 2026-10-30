@@ -15,6 +15,15 @@ PRIMARY_DOCS = (
 
 
 class GeneralCodingDocumentationTests(unittest.TestCase):
+    def test_run_workflow_policy_is_not_bundled(self) -> None:
+        self.assertFalse((REPOSITORY_ROOT / "docs/ROOT_TASK_POLICY.md").exists())
+        for relative_path in (
+            "README.md", "QUICK_RULES.md", "docs/INTEGRATED_RUN_FIXES.md",
+        ):
+            document = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertNotIn("ROOT_TASK_POLICY.md", document, relative_path)
+            self.assertNotIn("fresh-validator/public-evidence", document, relative_path)
+
     def test_documented_harness_examples_parse(self) -> None:
         for relative_path in (
             "examples/harness.example.json",

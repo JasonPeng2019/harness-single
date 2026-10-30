@@ -50,7 +50,7 @@
 - Prepare Codex ROOT hooks/monitor before the ROOT process starts. Windows Codex requires the
   read-only CLI/home/cache/marker/probe gate; missing local policy cannot disable it.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,
-  not task success. Carry fresh-validator/public-evidence requirements in the actual run prompt.
+  not task success.
 
 ## Runtime hygiene
 

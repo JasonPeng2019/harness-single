@@ -76,8 +76,7 @@ not restart it or reopen lanes.
 
 CLOSED proves operational cleanup, not task completion. Task IDs/overviews,
 registered task-card refresh and harness-owned final validation remain separate
-unimplemented features. [ROOT task policy](ROOT_TASK_POLICY.md) supplies fresh
-validator, initial test evidence and incremental integration/repair guidance;
-include it in the actual ROOT assignment. It is not a completion gate.
+unimplemented features. Task-specific workflow and success criteria belong in
+the assignment; the harness does not supply a task-completion policy.
 Cancellation terminal-state/token accounting remains a separate gap. Source
 changes alone do not prove a new live sandbox or agent run is healthy.

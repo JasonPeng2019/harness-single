@@ -115,7 +115,7 @@ class PublicCheckTests(unittest.TestCase):
         value.update(fields)
         atomic_write_json(path, value)
 
-    def test_enabled_route_installs_client_and_worker_feedback_guidance(self):
+    def test_enabled_route_preserves_client_and_assignment_without_workflow_injection(self):
         from orchestrator_harness import bootstrap
         public_policy = self.policy
         atomic_write_json(self.harness / service.POLICY, public_policy)
@@ -126,16 +126,33 @@ class PublicCheckTests(unittest.TestCase):
             service.install_route(self.harness, self.root, self.lane, self.lane_id, self.run_id)
         self.assertEqual(helper.read_bytes(), (self.agent / "public-check.py").read_bytes())
         self.assertEqual(self.route, service.read(service.home(self.root) / "routes" / f"{self.run_id}.json"))
-        bootstrap._write_worker_prompt(self.lane, {
-            "task": "Implement and test", "acceptance_criteria": ["Build and focused tests pass"],
+        task = "Implement the requested change using the supplied project workflow."
+        task_card = {
+            "task": task, "acceptance_criteria": ["Build and focused tests pass"],
             "deliverables": ["Committed tested code"],
             "reason_for_acceptance_and_deliverables": "Verify useful progress",
-        }, managed=True)
-        prompt = (self.agent / "worker-prompt.md").read_text(encoding="utf-8")
-        self.assertIn("public-check.py request --check build", prompt)
-        self.assertIn("public-check.py request --check public", prompt)
-        self.assertIn("Exit 75 means pending", prompt)
-        self.assertIn("Do not submit duplicates, finalize RESULT", prompt)
+        }
+        for rationale in (None, "Continue the operator-assigned follow-up."):
+            with (
+                self.subTest(rationale=rationale),
+                patch.dict("os.environ", {"MEMORY_HARNESS_WORKER_RECALL": "0"}),
+                patch.object(bootstrap, "_render_always_on_memory_context", return_value=["Supplied recalled context"]),
+                patch.object(bootstrap, "_render_memory_context", return_value=["Supplied memory handoff"]),
+            ):
+                bootstrap._write_worker_prompt(self.lane, task_card, managed=True, rationale=rationale)
+                prompt = (self.agent / "worker-prompt.md").read_text(encoding="utf-8")
+                self.assertTrue(prompt.startswith(task + "\n"))
+                self.assertIn("Supplied recalled context", prompt)
+                self.assertIn("Supplied memory handoff", prompt)
+                self.assertIn("## Escalation (managed coordination)", prompt)
+                if rationale is not None:
+                    self.assertIn("## Resume rationale\n" + rationale, prompt)
+                self.assertNotIn("## Public build/test feedback", prompt)
+                self.assertNotIn("public-check.py request", prompt)
+                self.assertNotIn("repair and retest", prompt)
+                self.assertNotIn("Do not submit duplicates, finalize RESULT", prompt)
+                self.assertTrue((self.agent / "public-check.py").is_file())
+                self.assertEqual(self.route, client.read(self.agent / "public-check-route.json"))
 
     def test_policy_accepts_windows_utf8_bom(self):
         path = self.harness / service.POLICY

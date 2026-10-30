@@ -428,25 +428,6 @@ def _write_worker_prompt(
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
-        if (worktree / ".agent-workspace/public-check-route.json").is_file():
-            lines.append(
-                "\n## Public build/test feedback\n"
-                "An operator-owned public test service is already running. It needs no ROOT "
-                "model intervention and does not grant you harness or Docker access. Commit "
-                "the configured project inputs, then run:\n"
-                "  python .agent-workspace/public-check.py request --check build\n"
-                "  python .agent-workspace/public-check.py request --check public\n"
-                "If the configured route allows focused checks, use request --check focused -- <command argv>. "
-                "The service snapshots only the configured committed project inputs and uses "
-                "the operator-supplied build/test backend. It returns a request_id. Retrieve feedback:\n"
-                "  python .agent-workspace/public-check.py wait --request-id <id> --timeout 30\n"
-                "Exit 75 means pending: wait again for the same request, in this active worker "
-                "session. Do not submit duplicates, finalize RESULT, or stop while awaiting "
-                "feedback. Other nonzero exits are build/test failures or service errors; read "
-                "the returned revision, stdout, stderr and exit_code, repair and retest. "
-                "Public-check iterations are tool calls, not provider retries. Preserve exact "
-                "request/result paths as evidence. Keep any operator-designated immutable inputs unchanged."
-            )
         lines.append(
             "\n## Escalation (managed coordination)\n"
             "If this work needs a ROOT decision, authority, missing input, or help, run:\n"

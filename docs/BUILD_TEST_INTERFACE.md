@@ -82,11 +82,12 @@ python .agent-workspace/public-check.py wait --request-id <id> --timeout 30
 ```
 
 Focused checks, when enabled, use `request --check focused -- <command argv>`.
-Exit 75 means pending: wait on that same request within the active session.
+Exit 75 means pending: subsequent waits use that same request ID.
 Completed backend statuses remain intact in the feedback; the client maps a
 completed exit 75 (or a native status outside 0..255) to CLI exit 2.
-Build/test failures carry diagnostics; repair, commit and request a new check for
-the new revision. Repeated checks are separate from process-launch retries.
+Build/test failures carry diagnostics. Each request targets one committed
+revision; checking a new revision requires a new request. Repeated checks are
+separate from process-launch retries.
 
 The service binds request/lane/run/revision identities, deduplicates delivery,
 rejects stale/resumed or changed-tip requests, and publishes feedback directly

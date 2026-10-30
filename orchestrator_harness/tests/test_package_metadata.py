@@ -217,6 +217,8 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "orchestrator_harness/__init__.py",
                 "orchestrator_harness/release_checks.py",
                 "orchestrator_harness/operator_launch.py",
+                "orchestrator_harness/public_checks.py",
+                "orchestrator_harness/retry_policy.py",
                 "orchestrator_harness/provider_adapters/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
@@ -246,6 +248,7 @@ class PackageWheelBuildTests(unittest.TestCase):
                 self.assertFalse(lowered.startswith("super-cache/"), name)
                 self.assertNotIn("harness-config.json", lowered, name)
                 self.assertNotIn("resource-manifest.json", lowered, name)
+                self.assertNotIn("root_task_policy.md", lowered, name)
 
 
 if __name__ == "__main__":
