@@ -369,7 +369,7 @@ class RootPrelaunchTests(unittest.TestCase):
         self.prepared()
         result, manifest, _environment, _lines = self.fixture_collector(self.collector_args(), [])
         self.assertEqual(2, result, manifest)
-        self.assertIn("without a thread.started identity", manifest["launch_error"])
+        self.assertIn("without a codex session identity", manifest["launch_error"])
         self.assertIsNone(read_root_session(load_config(self.harness))["native_session_id"])
 
     def test_receipt_replaced_during_validation_cannot_supply_unvalidated_hash(self) -> None:
@@ -633,7 +633,8 @@ class RootPrelaunchTests(unittest.TestCase):
         prompt = self.workspace / "prompt.txt"
         prompt.write_text("fixture", encoding="utf-8")
         return argparse.Namespace(prompt_file=str(prompt), cwd=str(self.workspace), task="fixture", run_id="fixture",
-            budget_tokens=None, watchdog_hours=1, arm="harness", trust_project_hooks=True,
+            model="deterministic-fixture", reasoning_effort="fixture", service_tier="fixture",
+            sandbox="workspace-write", budget_tokens=None, watchdog_hours=1, arm="harness", trust_project_hooks=True,
             harness_runtime=str(self.workspace / ".harness-runtime"), harness_dir=str(self.harness),
             results_dir=str(self.workspace / "results"), resume_task_file=str(self.workspace / "task.json"))
 
@@ -680,7 +681,8 @@ class RootPrelaunchTests(unittest.TestCase):
         prompt = self.workspace / "prompt.txt"
         prompt.write_text("fixture", encoding="utf-8")
         args = argparse.Namespace(prompt_file=str(prompt), cwd=str(self.workspace), task="fixture", run_id="fixture",
-            budget_tokens=None, watchdog_hours=1, arm="harness", trust_project_hooks=True,
+            model="deterministic-fixture", reasoning_effort="fixture", service_tier="fixture",
+            sandbox="workspace-write", budget_tokens=None, watchdog_hours=1, arm="harness", trust_project_hooks=True,
             harness_runtime=str(self.workspace / ".harness-runtime"), harness_dir=str(self.harness), results_dir=str(self.workspace / "results"))
         with patch.object(collector.subprocess, "Popen") as process:
             with self.assertRaisesRegex(collector.LedgerError, "receipt is missing"):
