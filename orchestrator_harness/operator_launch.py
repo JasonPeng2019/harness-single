@@ -407,6 +407,18 @@ def _build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--lane-id", required=True)
     resume_parser.add_argument("--resume-task-card", required=True)
     resume_parser.add_argument("--rationale")
+    resume_parser.add_argument(
+        "--model",
+        help="explicit replacement model; with the complete provider options, starts a fresh session",
+    )
+    resume_parser.add_argument(
+        "--provider-option",
+        action="append",
+        default=[],
+        type=_provider_option,
+        metavar="NAME=VALUE",
+        help="complete explicit provider launch profile; repeat for each adapter-required option",
+    )
 
     manager = subparsers.add_parser("manager", help="manager-queue commands (managed)")
     manager_sub = manager.add_subparsers(dest="manager_command", required=True)
@@ -486,6 +498,12 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             lane_id=args.lane_id,
             resume_task_card=args.resume_task_card,
             rationale=args.rationale,
+            model=args.model,
+            launch_config=(
+                _provider_options(args.provider_option)
+                if args.model is not None or args.provider_option
+                else None
+            ),
         )
     if command == "manager":
         if args.manager_command == "acknowledge":

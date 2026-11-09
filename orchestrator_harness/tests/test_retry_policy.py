@@ -131,6 +131,39 @@ class RetryPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exhausted"):
             policy.reserve_invocation(self.root, self.lane)
 
+    def test_explicit_profile_transition_starts_fresh_session_without_refunding_retry(self):
+        old_provider = {
+            "id": "codex", "model": "old-model",
+            "launch_config": {"reasoning_effort": "high", "service_tier": "default"},
+        }
+        self.lane["provider"] = old_provider
+        self.lane["run_id"] = "first-run"
+        # Recreate history with the complete provider identity used by native lanes.
+        self.protected.unlink()
+        self.lane.pop("provider_history_path")
+        self.protected = policy.initialize_history(self.root, self.lane)
+        token = policy.reserve_invocation(self.root, self.lane)
+        policy.record_outcome(self.root, self.lane, token, provider_started=True,
+                              cleanup_proven=True, session_id="old-session")
+        self.lane["session"] = {"session_id": "old-session"}
+        new_provider = {
+            "id": "codex", "model": "new-model",
+            "launch_config": {"reasoning_effort": "xhigh", "service_tier": "priority"},
+        }
+        policy.record_profile_transition(
+            self.root, self.lane, new_run_id="fresh-run", new_provider=new_provider,
+            rationale="continue the retained dirty work with a replacement model",
+        )
+        migrated = {**self.lane, "run_id": "fresh-run", "provider": new_provider, "session": {}}
+        self.assertEqual(1, completed_provider_invocations(migrated))
+        token = policy.reserve_invocation(self.root, migrated)
+        policy.record_outcome(self.root, migrated, token, provider_started=True,
+                              cleanup_proven=True, session_id="new-session")
+        migrated["session"] = {"session_id": "new-session"}
+        self.assertEqual(2, completed_provider_invocations(migrated))
+        with self.assertRaisesRegex(ValueError, "exhausted"):
+            policy.reserve_invocation(self.root, {**migrated, "run_id": "third-run"})
+
     def test_duplicate_launch_same_run_and_changed_native_session_rejected(self):
         token = policy.reserve_invocation(self.root, self.lane)
         policy.record_outcome(self.root, self.lane, token, provider_started=True,

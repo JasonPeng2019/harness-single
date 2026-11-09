@@ -1030,6 +1030,18 @@ def _validate_provider_launch_config(
     return dict(configured)
 
 
+def normalize_fresh_launch_config(
+    provider_id: str, launch_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply defaults only to an explicitly selected new worker profile."""
+    if not isinstance(launch_config, dict):
+        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "launch configuration must be an object")
+    normalized = dict(launch_config)
+    if provider_id == "codex" and os.name == "nt" and "permission_mode" not in normalized:
+        normalized["permission_mode"] = "worker-workspace"
+    return normalized
+
+
 def run_bootstrap(
     *,
     lane_id: str,
@@ -1113,11 +1125,9 @@ def run_bootstrap(
             "evidence_paths": [],
             "next_action": "pass --provider and --model",
         }
-    # This is a fresh-input boundary. Persist the new Windows default in the
-    # invocation so later launch/resume never has to reinterpret an omission.
-    launch_config = dict(launch_config)
-    if provider == "codex" and os.name == "nt" and "permission_mode" not in launch_config:
-        launch_config["permission_mode"] = "worker-workspace"
+    # Persist fresh-profile defaults in the invocation; old saved profiles are
+    # never normalized during ordinary resume.
+    launch_config = normalize_fresh_launch_config(provider, launch_config)
     try:
         configured_launch = _validate_provider_launch_config(
             harness_root,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import unittest
@@ -76,11 +77,11 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
         })
         self.assertTrue(cleanup_is_proven(lane))
 
-    def command(self):
+    def command(self, *extra):
         env = dict(os.environ)
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         return subprocess.run([sys.executable, "-B", "-m", "orchestrator_harness.operator_launch", "--json",
-                               "resume-lane", "--lane-id", "worker", "--resume-task-card", str(self.card_path)],
+                               "resume-lane", "--lane-id", "worker", "--resume-task-card", str(self.card_path), *extra],
                               cwd=self.base, env=env, capture_output=True, text=True, timeout=30)
 
     def run_resume(self):
@@ -133,6 +134,33 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
         self.assertTrue(fresh["launch_pending"])
         self.assertTrue(cleanup_is_proven(fresh))
         self.assertEqual(fresh["run_id"], read_invocation(fresh)["run_id"])
+        self.assertEqual(1, retry_policy.completed_provider_invocations(fresh, self.rt))
+
+    def test_retained_cross_epoch_profile_change_keeps_old_authority_and_retry_count(self):
+        adapter_source = Path(__file__).resolve().parents[1] / "provider_adapters" / "claude-code"
+        adapter_target = self.base / "orchestrator_harness" / "provider_adapters" / "claude-code"
+        shutil.copytree(adapter_source, adapter_target)
+        (self.worker / "retained-edit.txt").write_bytes(b"kept across explicit model migration\n")
+        old_invocation = Path(self.lane["invocation_path"]).read_bytes()
+        completed = self.command(
+            "--model", "replacement-model", "--provider-option", "effort=high",
+            "--rationale", "continue retained dirty source with the selected model",
+        )
+        result = json.loads(completed.stdout)
+        self.assertEqual(0, completed.returncode, completed.stderr + completed.stdout)
+        self.assertTrue(result["ok"], result)
+        epoch, fresh = self.current()
+        self.assertNotEqual(self.epoch, epoch)
+        self.assertNotEqual(self.lane["run_id"], fresh["run_id"])
+        self.assertEqual("replacement-model", fresh["provider"]["model"])
+        self.assertEqual({}, fresh["session"])
+        self.assertEqual(str(self.epoch), fresh["resume_from_epoch_id"])
+        archive = lane_record_dir(self.rt, self.epoch, "worker") / "resume-history" / self.lane["run_id"]
+        self.assertEqual(old_invocation, (archive / "invocation.json").read_bytes())
+        transition = json.loads((archive / "transition.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.epoch, transition["from_epoch_id"])
+        self.assertEqual(fresh["run_id"], transition["to_run_id"])
+        self.assertEqual(b"kept across explicit model migration\n", (self.worker / "retained-edit.txt").read_bytes())
         self.assertEqual(1, retry_policy.completed_provider_invocations(fresh, self.rt))
 
     def test_reuses_compatible_epoch_and_preserves_its_inventory(self):

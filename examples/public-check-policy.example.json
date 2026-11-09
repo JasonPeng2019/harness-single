@@ -1,5 +1,6 @@
 {
-  "schema": "public-check-policy/v2",
+  "schema": "public-check-policy/v3",
+  "windows_permission_mode": "worker-workspace",
   "adapter": {
     "path": "<absolute-adapter-path>",
     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"

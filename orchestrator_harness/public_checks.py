@@ -94,8 +94,12 @@ def policy(harness: Path) -> dict | None:
     if not path.exists():
         return None
     value = read(path)
-    if value.get("schema") != "public-check-policy/v2":
+    if value.get("schema") not in {"public-check-policy/v2", "public-check-policy/v3"}:
         raise ValueError("unsupported public check policy")
+    if value.get("schema") == "public-check-policy/v3" and value.get("windows_permission_mode") not in {
+        "worker-workspace", "worker-isolated",
+    }:
+        raise ValueError("Windows public check policy must select worker-workspace or worker-isolated")
     if type(value.get("timeout_seconds")) is not int or not 1 <= value["timeout_seconds"] <= 600:
         raise ValueError("public check timeout must be 1..600 seconds")
     if type(value.get("max_parallel_checks")) is not int or not 1 <= value["max_parallel_checks"] <= 4:
@@ -158,6 +162,61 @@ def _adapter_path(selected: dict, root: Path | None = None) -> Path:
     if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
         raise ValueError("public check adapter changed or its SHA-256 does not match")
     return path
+
+
+def _is_native_windows_backend(backend: dict) -> bool:
+    if not isinstance(backend, dict):
+        return False
+    name = backend.get("backend_id", backend.get("backend", ""))
+    return isinstance(name, str) and "windows" in name.casefold() and "codex" in name.casefold()
+
+
+def validate_windows_backend_policy(selected: dict, backend: dict) -> None:
+    """Check the explicit R8 policy declaration for native Windows adapters."""
+    if selected.get("schema") != "public-check-policy/v3":
+        return
+    if not isinstance(backend, dict):
+        raise ValueError("native Windows public-check backend declaration must be an object")
+    expected = selected["windows_permission_mode"]
+    if backend.get("permission_mode") != expected:
+        raise ValueError("native Windows public-check backend permission mode differs from policy")
+    if backend.get("write_sandbox") is not True:
+        raise ValueError("native Windows public-check backend must retain its write sandbox")
+    strict = expected == "worker-isolated"
+    if backend.get("strict_read_isolation") is not strict:
+        raise ValueError("native Windows public-check backend read policy differs from policy")
+    read_denials = backend.get("read_denials")
+    if expected == "worker-workspace" and read_denials not in (None, []):
+        raise ValueError("worker-workspace public-check backend must not apply shared read denials")
+
+
+def _require_worker_mode_compatible(selected: dict, backend: dict, lane: Path) -> str | None:
+    """Reject a strict shared deny policy before routing a reduced worker."""
+    if not isinstance(backend, dict):
+        backend = {}
+    validate_windows_backend_policy(selected, backend)
+    config_path = lane / ".codex" / "config.toml"
+    if not config_path.is_file():
+        return None  # Non-Codex provider lanes use their own policy contract.
+    try:
+        import tomllib
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"worker Codex profile cannot be checked against public-check policy: {exc}") from exc
+    mode = config.get("default_permissions", "worker-isolated")
+    if selected.get("schema") == "public-check-policy/v2" and _is_native_windows_backend(backend):
+        strict_denials = True
+    elif selected.get("schema") == "public-check-policy/v3":
+        strict_denials = backend.get("strict_read_isolation") is True
+    elif _is_native_windows_backend(backend):
+        backend_policy = selected.get("windows_permission_mode", "worker-isolated")
+        strict_denials = backend.get("strict_read_isolation", backend_policy == "worker-isolated")
+    else:
+        strict_denials = False
+    if strict_denials:
+        if mode == "worker-workspace" and strict_denials is True:
+            raise ValueError("strict public-check read denials conflict with an active worker-workspace lane")
+    return mode
 
 
 def git(worktree: Path, *arguments: str) -> bytes:
@@ -283,6 +342,7 @@ def validate_service(root: Path, harness: Path, *, runtime_closed: bool = False)
     elif not processes.identity_matches(record["pid"], record["creation_time"]):
         raise ValueError("public check service is not healthy for this ROOT")
     config = read(home(root) / "config.json")
+    validate_windows_backend_policy(config["policy"], config.get("backend") or {})
     if (not isinstance(record.get("startup_id"), str)
             or not re.fullmatch(r"[a-f0-9]{32}", record["startup_id"])
             or config.get("startup_id") != record["startup_id"]):
@@ -293,7 +353,9 @@ def validate_service(root: Path, harness: Path, *, runtime_closed: bool = False)
     policy_hash = hashlib.sha256(json.dumps(config["policy"], sort_keys=True).encode()).hexdigest()
     if record.get("policy_sha256") != policy_hash:
         raise ValueError("public check service policy identity mismatch")
-    return {key: record[key] for key in ("schema", "pid", "creation_time", "root", "harness", "status", "policy_sha256", "startup_id")}
+    return {key: record[key] for key in ("schema", "pid", "creation_time", "root", "harness", "status", "policy_sha256", "startup_id")} | {
+        "backend": config.get("backend", {}),
+    }
 
 
 def _service_identity(record: dict, root: Path, harness: Path | None = None) -> tuple[int, str]:
@@ -438,11 +500,13 @@ def install_route(harness: Path, root: Path, lane: Path, lane_id: str, run_id: s
         if (home(root) / "service.json").exists() or (home(root) / "config.json").exists():
             raise ValueError("configured public check service policy is missing")
         return
-    validate_service(root, harness)
+    service_record = validate_service(root, harness)
     lane = lane.absolute()
     if (lane.parent.parent != root.resolve() / ".harness-runtime/worktrees"
             or lane.name != lane_id or not re.fullmatch(r"[a-f0-9]{32}", run_id)):
         raise ValueError("public check route must select one exact native lane")
+    selected = policy(harness)
+    worker_mode = _require_worker_mode_compatible(selected, service_record.get("backend", {}), lane)
     helper = harness / "tools/worker_public_check.py"
     agent = lane / ".agent-workspace"
     if output is None:
@@ -452,12 +516,12 @@ def install_route(harness: Path, root: Path, lane: Path, lane_id: str, run_id: s
         raise ValueError("public route output differs from the assigned worktree")
     helper_path = output.admit(agent / "public-check.py")
     output.publish_bytes(helper_path, helper.read_bytes())
-    selected = policy(harness)
     record = {"schema": "worker-public-check-route/v1", "lane_id": lane_id,
               "run_id": run_id, "worktree": str(lane),
               "worktree_identity": list(output.root_identity),
               "input_paths": selected["input_paths"] + selected["optional_input_paths"],
-              "allow_focused": selected["allow_focused"]}
+              "allow_focused": selected["allow_focused"],
+              **({"worker_permission_mode": worker_mode} if worker_mode else {})}
     atomic_write_json(home(root) / "routes" / f"{run_id}.json", record)
     output.publish_json(output.admit(agent / "public-check-route.json"), record)
 
@@ -650,6 +714,7 @@ def run_service(root: Path) -> None:
         if not isinstance(backend, dict):
             raise ValueError("adapter preflight must return a JSON object or raise on failure")
         backend = json.loads(json.dumps(backend, allow_nan=False))
+        validate_windows_backend_policy(config["policy"], backend)
         with RecordLock(base / "config.json"), RecordLock(base / "service.json"):
             current = _owned_service_record(initial_config, owner)
             if current.get("status") != "STARTING":

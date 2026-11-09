@@ -190,6 +190,37 @@ class PublicCheckTests(unittest.TestCase):
         path.write_text(json.dumps(self.policy), encoding="utf-8-sig")
         self.assertEqual(10, service.policy(self.harness)["timeout_seconds"])
 
+    def test_native_windows_public_policy_rejects_strict_denials_when_reduced(self):
+        selected = {"schema": "public-check-policy/v3", "windows_permission_mode": "worker-workspace"}
+        reduced = {"backend": "codex-windows-elevated", "permission_mode": "worker-workspace",
+                   "write_sandbox": True, "strict_read_isolation": False}
+        service.validate_windows_backend_policy(selected, reduced)
+        with self.assertRaisesRegex(ValueError, "permission mode differs"):
+            service.validate_windows_backend_policy(selected, {**reduced, "permission_mode": "worker-isolated"})
+        with self.assertRaisesRegex(ValueError, "read policy differs"):
+            service.validate_windows_backend_policy(selected, {**reduced, "strict_read_isolation": True})
+        with self.assertRaisesRegex(ValueError, "must not apply shared read denials"):
+            service.validate_windows_backend_policy(selected, {**reduced, "read_denials": ["broad-set"]})
+
+    def test_explicit_v3_policy_requires_mode_declaration_independent_of_backend_name(self):
+        selected = {"schema": "public-check-policy/v3", "windows_permission_mode": "worker-workspace"}
+        with self.assertRaisesRegex(ValueError, "permission mode differs"):
+            service.validate_windows_backend_policy(selected, {"backend": "codex-windows-elevated"})
+
+    def test_reduced_lane_refuses_historical_strict_native_public_adapter(self):
+        config = {
+            "policy": {"schema": "public-check-policy/v2"},
+            "backend": {"backend": "codex-windows-elevated", "strict_read_isolation": False},
+        }
+        atomic_write_json(service.home(self.root) / "config.json", config)
+        (self.lane / ".codex").mkdir(parents=True, exist_ok=True)
+        (self.lane / ".codex/config.toml").write_text(
+            'default_permissions = "worker-workspace"\n'
+            '[permissions.worker-workspace]\nextends = ":workspace"\n', encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "strict public-check read denials conflict"):
+            service._require_worker_mode_compatible(config["policy"], config["backend"], self.lane)
+
     def _configure_adapter(self, source):
         path = Path(self.policy["adapter"]["path"])
         path.write_text(source)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
 from pathlib import Path
 from typing import Any
@@ -66,12 +67,42 @@ def _read(path: Path, lane: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if not raw.endswith("\n"):
         raise ValueError("protected invocation history has an incomplete durable write")
     rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    if not rows or rows[0] != {"schema": SCHEMA, **_identity(lane)}:
+    if not rows or not isinstance(rows[0], dict) or rows[0].get("schema") != SCHEMA:
         raise ValueError("protected invocation history owner/schema changed")
+    header = rows[0]
+    original_identity = _identity(lane)
+    if any(header.get(key) != original_identity[key] for key in ("lane_id", "worktree")):
+        raise ValueError("protected invocation history owner/schema changed")
+    if not isinstance(header.get("provider"), dict) or header["provider"].get("id") != lane["provider"].get("id"):
+        raise ValueError("protected invocation history provider adapter changed")
     invocations: dict[str, dict[str, Any]] = {}
+    profile = header["provider"]
+    latest_profile_change: dict[str, Any] | None = None
     for row in rows[1:]:
         if not isinstance(row, dict):
             raise ValueError("invalid protected invocation fact")
+        if row.get("kind") == "PROFILE_CHANGED":
+            required = {
+                "kind", "change_id", "from_run_id", "to_run_id", "old_provider",
+                "new_provider", "previous_session_id", "rationale", "recorded_at",
+            }
+            if (set(row) != required or not isinstance(row.get("change_id"), str)
+                    or not row["change_id"] or not isinstance(row.get("from_run_id"), str)
+                    or not isinstance(row.get("to_run_id"), str) or not row["to_run_id"]
+                    or row.get("old_provider") != profile
+                    or not isinstance(row.get("new_provider"), dict)
+                    or row["new_provider"].get("id") != profile.get("id")
+                    or not isinstance(row.get("rationale"), str) or not row["rationale"].strip()
+                    or (row.get("previous_session_id") is not None
+                        and not isinstance(row.get("previous_session_id"), str))):
+                raise ValueError("invalid protected profile transition")
+            latest_profile_change = row
+            profile = row["new_provider"]
+            key = "PROFILE_CHANGED:" + row["change_id"]
+            if key in invocations:
+                raise ValueError("protected profile transition identity was reused")
+            invocations[key] = row
+            continue
         token, run, attempt = row.get("invocation_id"), row.get("run_id"), row.get("attempt")
         if (not isinstance(token, str) or len(token) != 32 or not isinstance(run, str)
                 or not run or type(attempt) is not int or attempt < 1):
@@ -95,6 +126,9 @@ def _read(path: Path, lane: dict[str, Any]) -> dict[str, dict[str, Any]]:
         elif kind == "COMPLETED" and (row.get("provider_started") is not True or type(row.get("cleanup_proven")) is not bool):
             raise ValueError("invalid protected provider outcome")
         invocations[token] = row
+    current_provider = lane.get("provider")
+    if current_provider not in (profile, (latest_profile_change or {}).get("old_provider")):
+        raise ValueError("protected invocation history profile does not match the lane")
     return invocations
 
 
@@ -116,14 +150,63 @@ def initialize_history(rt: Path, lane: dict[str, Any]) -> Path:
 
 def _count(invocations: dict[str, dict[str, Any]], lane: dict[str, Any]) -> int:
     rows = list(invocations.values())
+    active_sessions: set[str] = set()
+    for row in rows:
+        if row.get("kind") == "PROFILE_CHANGED":
+            if lane.get("provider") == row.get("new_provider"):
+                active_sessions.clear()
+        elif row.get("kind") == "COMPLETED" and isinstance(row.get("session_id"), str):
+            active_sessions.add(row["session_id"])
     if any(row["kind"] in ("RESERVED", "STARTED") or
-           (row["kind"] == "COMPLETED" and row.get("cleanup_proven") is not True) for row in rows):
+           (row.get("kind") == "COMPLETED" and row.get("cleanup_proven") is not True) for row in rows):
         raise ValueError("prior provider creation or cleanup remains unproven")
-    completed = [row for row in rows if row["kind"] == "COMPLETED"]
+    completed = [row for row in rows if row.get("kind") == "COMPLETED"]
     session = (lane.get("session") or {}).get("session_id")
-    if session and (not completed or any(row.get("session_id") != session for row in completed)):
+    if session and (not active_sessions or session not in active_sessions):
         raise ValueError("saved native session does not match protected invocation history")
     return len(completed)
+
+
+def record_profile_transition(
+    rt: Path,
+    lane: dict[str, Any],
+    *,
+    new_run_id: str,
+    new_provider: dict[str, Any],
+    rationale: str,
+) -> dict[str, Any]:
+    """Append the explicit fresh-session boundary before publishing its new run."""
+    path = _path(lane, rt)
+    with RecordLock(path):
+        rows = _read(path, lane)
+        old_provider = lane.get("provider")
+        if not isinstance(old_provider, dict) or not isinstance(new_provider, dict):
+            raise ValueError("profile transition provider identity is invalid")
+        if old_provider.get("id") != new_provider.get("id"):
+            raise ValueError("profile transition cannot change provider adapter")
+        if not isinstance(new_run_id, str) or not new_run_id or not rationale.strip():
+            raise ValueError("profile transition needs a fresh run id and nonblank rationale")
+        existing = [row for row in rows.values() if row.get("kind") == "PROFILE_CHANGED"]
+        latest = existing[-1] if existing else None
+        effective = (latest or {}).get("new_provider") or _identity(lane)["provider"]
+        if effective != old_provider:
+            # An interrupted transition is idempotent only for its exact new owner.
+            if latest and latest.get("to_run_id") == new_run_id and latest.get("new_provider") == new_provider:
+                return latest
+            raise ValueError("protected profile transition source changed")
+        transition = {
+            "kind": "PROFILE_CHANGED",
+            "change_id": secrets.token_hex(16),
+            "from_run_id": str(lane.get("run_id") or ""),
+            "to_run_id": new_run_id,
+            "old_provider": old_provider,
+            "new_provider": new_provider,
+            "previous_session_id": (lane.get("session") or {}).get("session_id"),
+            "rationale": rationale.strip(),
+            "recorded_at": iso_utc(),
+        }
+        _append(path, transition)
+        return transition
 
 
 def completed_provider_invocations(lane: dict[str, Any], rt: Path | None = None) -> int:
@@ -136,7 +219,8 @@ def current_invocation_facts(lane: dict[str, Any]) -> list[dict[str, Any]]:
     """Read protected creation/cleanup facts for this exact current run."""
     path = _path(lane)
     with RecordLock(path):
-        return [row for row in _read(path, lane).values() if row["run_id"] == lane["run_id"]]
+        return [row for row in _read(path, lane).values()
+                if row.get("kind") != "PROFILE_CHANGED" and row["run_id"] == lane["run_id"]]
 
 
 def reserve_invocation(rt: Path, lane: dict[str, Any], *, attempt_number: int = 1) -> str:
@@ -147,9 +231,13 @@ def reserve_invocation(rt: Path, lane: dict[str, Any], *, attempt_number: int = 
         spent = _count(invocations, lane)
         if spent >= MAX_LANE_PROVIDER_INVOCATIONS:
             raise ValueError("initial provider invocation plus one explicit retry exhausted")
-        if any(row["kind"] == "COMPLETED" and row["run_id"] == lane["run_id"] for row in invocations.values()):
+        if any(row.get("kind") == "COMPLETED" and row.get("run_id") == lane["run_id"]
+               for row in invocations.values()):
             raise ValueError("this explicit launch already invoked its provider")
-        if spent and not (lane.get("session") or {}).get("session_id"):
+        profile_changes = [row for row in invocations.values() if row.get("kind") == "PROFILE_CHANGED"]
+        fresh_profile_run = bool(profile_changes and profile_changes[-1].get("to_run_id") == lane.get("run_id")
+                                 and profile_changes[-1].get("new_provider") == lane.get("provider"))
+        if spent and not (lane.get("session") or {}).get("session_id") and not fresh_profile_run:
             raise ValueError("retry requires the saved native session; no fresh replacement launch")
         token = new_id()
         _append(path, {"invocation_id": token, "run_id": lane["run_id"],

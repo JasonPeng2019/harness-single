@@ -63,18 +63,23 @@ the general service is routing and evidence infrastructure, not a host-command
 sandbox. Backend setup belongs to the operator, outside this interface. Preflight
 must not start workers, initialize sandboxes, pull dependencies or retry setup.
 
-Native Windows sandbox adapters must use the same read restrictions as workers:
-`orchestrator_harness.isolation_policy.shared_read_denials(harness_root,
-root_workspace, manager_workspace, home=..., codex_home=...)`. Bind the actual
-user/provider homes, not the service's private home. Windows persists deny-read
-ACLs on a shared sandbox group, so a check must not deny live source, worker
-worktrees or Git administration that coding workers need. Keep service authority
-under `operator-only`; execute a plain snapshot copy outside that denied subtree,
-with writes limited to that copy. Preflight stays read-only; create temporary
-execution directories when running a check. An isolated Codex linked worker whose
-required Git metadata lies under any shared denied path is refused before its isolation
-configuration is published; keep its common Git directory inside the product,
-outside `operator-only` and `.secrets`.
+For a native Windows Codex adapter, use `public-check-policy/v3` and explicitly
+select `windows_permission_mode`. Fresh reduced-worker configurations select
+`worker-workspace`. The adapter's `preflight()` result must declare
+`permission_mode`, `write_sandbox: true`, and `strict_read_isolation: false` for
+that backend; a reduced configuration must not report or apply a shared read
+denial set. An explicitly strict adapter selects `worker-isolated` and declares
+`strict_read_isolation: true`. The service verifies this declaration at startup
+and refuses to route a reduced worker to an incompatible native Windows backend.
+Older `public-check-policy/v2` files keep their historical strict policy meaning.
+Use v2 for Docker/WSL and unrelated adapters; v3 is the explicit native Windows
+Codex contract and its declarations are checked regardless of backend display
+name.
+
+Keep service authority under `operator-only`; execute a plain snapshot copy
+outside that subtree, with writes limited to that copy. Preflight stays read-only;
+create temporary execution directories when running a check. Worker read policy
+is selected independently and retains only its corresponding write boundary.
 
 Return a JSON object with string stdout/stderr, integer exit status, and an honest
 boolean cleanup proof, plus optional backend diagnostics. Cancellation/timeouts

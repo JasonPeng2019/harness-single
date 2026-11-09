@@ -1,6 +1,7 @@
 """Failure gates without executing Codex, requesting elevation, or repairing ACLs."""
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,16 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self.cache = self.base / "cache"
         self.native = self.base / "codex.exe"
         self.native.write_bytes(b"fixture binary: never execute")
+        source_root = Path(__file__).resolve().parents[2]
+        for relative in (
+            "orchestrator_harness/bootstrap.py", "orchestrator_harness/isolation_policy.py",
+            "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
+            "adapters/codex/harness/launcher_binding.py",
+            "orchestrator_harness/windows_sandbox_preflight.py",
+        ):
+            target = self.harness / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_root / relative, target)
         self.marker = self.home / ".sandbox/setup_marker.json"
         self.evidence = self.base / "probe.json"
         self.write(self.harness / sandbox.POLICY, {
@@ -43,20 +54,47 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value), encoding="utf-8")
 
-    def ready(self):
+    def ready(self, permission_mode="worker-isolated"):
         self.write(self.marker, {"version": 1, "offline_username": "offline", "online_username": "online"})
-        self.write(self.evidence, {"exit_code": 0, "isolated_worker_command": "fixture"})
-        self.write(self.harness / sandbox.HEALTH, {
-            "schema": "windows-sandbox-health/v1", "status": "PASS", "probe_exit_code": 0,
+        profile = self.base / "probe-worker/.codex/config.toml"
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text(
+            f'default_permissions = "{permission_mode}"\n'
+            f'[permissions.{permission_mode}]\nextends = ":workspace"\n'
+            f'[permissions.{permission_mode}.filesystem]\n'
+            + (f'{json.dumps(str(self.home))} = "deny"\n' if permission_mode == "worker-isolated" else "")
+            + f'[permissions.{permission_mode}.filesystem.":workspace_roots"]\n"." = "write"\n',
+            encoding="utf-8",
+        )
+        protected = {"root/.git/index": "1" * 64, "peer/.git/index": "2" * 64,
+                     "unrelated/sentinel": "3" * 64}
+        self.write(self.evidence, {
+            "permission_mode": permission_mode, "exit_code": 0, "cleanup_proven": True,
+            "protected_unchanged": True, "local_appdata": str(self.cache),
+            "protected_before": protected, "protected_after": protected,
+            "protected_write_denials": list(protected), "unexpectedly_writable": [], "probe_errors": [],
+            "worker_base_tip": "a" * 40, "worker_tip": "b" * 40,
+            "profile_path": str(profile), "profile_sha256": sandbox.digest(profile),
+            "profile_contract_sha256": sandbox.profile_contract_digest(self.harness, permission_mode),
+            "profile_contract_sha256_after": sandbox.profile_contract_digest(self.harness, permission_mode),
+            "argv": [str(self.native), "-c", 'windows.sandbox="elevated"', "sandbox",
+                     "--include-managed-config", "--permission-profile", permission_mode],
+        })
+        self.write(sandbox.health_path(self.harness, permission_mode), {
+            "schema": "windows-sandbox-health/v2", "status": "PASS", "probe_exit_code": 0,
             "codex_home": str(self.home), "local_appdata": str(self.cache),
             "native_codex_executable": str(self.native), "native_codex_sha256": sandbox.digest(self.native),
             "setup_marker_sha256": sandbox.digest(self.marker),
             "probe_evidence_path": str(self.evidence), "probe_evidence_sha256": sandbox.digest(self.evidence),
+            "permission_mode": permission_mode,
+            "profile_contract_sha256": sandbox.profile_contract_digest(self.harness, permission_mode),
+            "backend_id": "codex-windows-elevated", "probe_profile_sha256": sandbox.digest(profile),
         })
 
-    def check(self):
+    def check(self, *, permission_mode="worker-isolated", **kwargs):
         with patch.object(sandbox.os, "name", "nt"):
-            return sandbox.require_ready(self.harness, workspace=self.workspace, executable=str(self.native))
+            return sandbox.require_ready(self.harness, workspace=self.workspace, executable=str(self.native),
+                                         permission_mode=permission_mode, **kwargs)
 
     def test_missing_local_policy_does_not_disable_windows_gate(self):
         (self.harness / sandbox.POLICY).unlink()
@@ -68,6 +106,21 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self.ready()
         (self.harness / sandbox.POLICY).unlink()
         self.assertIsNotNone(self.check())
+
+    def test_root_generic_gate_retains_historical_v1_receipt_contract(self):
+        self.ready()
+        worker_path = sandbox.health_path(self.harness, "worker-isolated")
+        value = json.loads(worker_path.read_text())
+        for key in ("permission_mode", "profile_contract_sha256", "backend_id", "probe_profile_sha256"):
+            value.pop(key)
+        value["schema"] = "windows-sandbox-health/v1"
+        path = sandbox.health_path(self.harness, None)
+        self.write(path, value)
+        self.write(self.evidence, {"exit_code": 0, "isolated_worker_command": "fixture"})
+        value["probe_evidence_sha256"] = sandbox.digest(self.evidence)
+        self.write(path, value)
+        health = self.check(permission_mode=None)
+        self.assertIsNone(health["permission_mode"])
 
     def test_non_windows_does_not_require_windows_setup(self):
         with patch.object(sandbox.os, "name", "posix"):
@@ -116,12 +169,63 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
     def test_other_cache_cannot_reuse_proof(self):
         self.ready()
         with patch.dict(os.environ, {"LOCALAPPDATA": str(self.base / "different-cache")}):
-            with self.assertRaisesRegex(sandbox.SandboxPreflightError, "different CLI/home/cache"):
+            with self.assertRaisesRegex(sandbox.SandboxPreflightError, "this profile, cache"):
                 self.check()
+
+    def test_receipt_is_bound_to_the_selected_permission_profile(self):
+        self.ready()
+        path = sandbox.health_path(self.harness, "worker-isolated")
+        value = json.loads(path.read_text())
+        value["permission_mode"] = "worker-workspace"
+        self.write(path, value)
+        with self.assertRaisesRegex(sandbox.SandboxPreflightError, "different worker permission mode"):
+            self.check()
+
+    def test_reduced_worker_profile_has_workspace_write_without_auth_deny(self):
+        self.ready(permission_mode="worker-workspace")
+        config = self.base / "worker-config.toml"
+        config.write_text(
+            'default_permissions = "worker-workspace"\n'
+            '[permissions.worker-workspace]\nextends = ":workspace"\n'
+            '[permissions.worker-workspace.filesystem]\n'
+            '":workspace_roots" = { "." = "write" }\n"C:/git/private" = "write"\n',
+            encoding="utf-8",
+        )
+        health = self.check(permission_mode="worker-workspace", isolation_config_path=config)
+        self.assertEqual("worker-workspace", health["permission_mode"])
+        self.assertEqual(sandbox.digest(config), health["worker_profile_sha256"])
+
+    def test_reduced_health_cannot_use_strict_mode_receipt(self):
+        self.ready()
+        strict_health = json.loads(sandbox.health_path(self.harness, "worker-isolated").read_text())
+        self.write(sandbox.health_path(self.harness, "worker-workspace"), strict_health)
+        config = self.base / "worker-config.toml"
+        config.write_text(
+            'default_permissions = "worker-workspace"\n'
+            '[permissions.worker-workspace]\nextends = ":workspace"\n'
+            '[permissions.worker-workspace.filesystem]\n'
+            '":workspace_roots" = { "." = "write" }\n', encoding="utf-8",
+        )
+        with self.assertRaisesRegex(sandbox.SandboxPreflightError, "different worker permission mode"):
+            self.check(permission_mode="worker-workspace", isolation_config_path=config)
+
+    def test_root_and_reduced_worker_receipts_coexist(self):
+        self.ready(permission_mode="worker-workspace")
+        root_path = sandbox.health_path(self.harness, None)
+        root_value = {
+            "schema": "windows-sandbox-health/v1", "status": "PASS", "probe_exit_code": 0,
+            "codex_home": str(self.home), "local_appdata": str(self.cache),
+            "native_codex_executable": str(self.native), "native_codex_sha256": sandbox.digest(self.native),
+            "setup_marker_sha256": sandbox.digest(self.marker),
+            "probe_evidence_path": str(self.evidence), "probe_evidence_sha256": sandbox.digest(self.evidence),
+        }
+        self.write(root_path, root_value)
+        self.assertEqual("worker-workspace", self.check(permission_mode="worker-workspace")["permission_mode"])
+        self.assertIsNone(self.check(permission_mode=None)["permission_mode"])
 
     def test_failed_probe_blocks(self):
         self.ready()
-        path = self.harness / sandbox.HEALTH
+        path = sandbox.health_path(self.harness, "worker-isolated")
         value = json.loads(path.read_text())
         value["probe_exit_code"] = 5
         self.write(path, value)
