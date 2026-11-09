@@ -51,16 +51,15 @@ checks alone do not prove those OS enforcement properties.
 
 ## Native worker Git storage
 
-For isolated Codex workers, keep linked-worker Git administration readable under
-the worker isolation policy. A normal product-owned `.git` directory works.
-If using a separate common Git
-directory, keep it inside the selected product workspace, outside
-`.harness-runtime/operator-only` and `.secrets`. A common store under a protected
-sibling directory is denied even when a worker has narrower write grants beneath
-it; bootstrap reports that conflict before publishing its isolation profile.
-Keep persistent Git administration outside disposable runtime directories.
-The explicit `permission_mode=yolo` launch does not select the worker isolation
-profile and is exempt from this profile's Git read-access guard.
+For Codex workers, keep linked-worker Git administration readable under the
+selected permission profile. A normal product-owned `.git` directory works.
+`worker-isolated` retains the prior strict read-denial behavior and refuses a
+common Git store beneath a denied path. Fresh Windows `worker-workspace` runs do
+not install or depend on those broad denials; they still receive only the lane's
+private Git directory, shared objects, and exclusive branch/ref/reflog write
+grants. This mode does not prevent reads elsewhere when OS/native permissions
+allow them. Keep persistent Git administration outside disposable runtime
+directories. Explicit `permission_mode=yolo` selects full access separately.
 
 On Windows, keep the checkout, runtime and lane names reasonably short. Git can
 reject a long linked-worktree Git directory before loading `core.longpaths`, so

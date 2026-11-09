@@ -35,12 +35,14 @@ files are preserved.
 - ROOT hooks and the native monitor are installed before the ROOT process starts.
   Fresh launches and resumes validate the run/workspace/config/hook-bound setup
   receipt. Installing hooks inside ROOT is too late for that session's discovery.
-- Windows Codex launches require a read-only sandbox health gate by default.
-  Missing local policy does not disable it. Marker, CLI binary, Codex home, local
-  cache and retained probe evidence must match an operator-issued receipt.
-  The gate never calls Codex, setup, elevation or fallback. A setup error or
-  changed marker records a run-wide block and stops only the exact owned process
-  boundary, including failures detected after fast exit.
+- Windows Codex launches use a read-only readiness gate for the selected worker
+  profile. A v2 health receipt binds the permission mode, generated-profile
+  policy digest, elevated Windows backend, CLI, Codex home, process-local cache,
+  marker, linked-worker probe profile and retained probe evidence. Fresh reduced
+  workers do not need the old broad read-denial set. The gate never calls Codex,
+  setup, elevation or fallback. A setup error or changed marker records a
+  run-wide block and stops only the exact owned process boundary, including
+  failures detected after fast exit.
 - Codex ROOT preparation and collector launch select the same explicit `--sandbox`:
   `workspace-write` (unchanged default), `read-only`, or `danger-full-access`.
   Preparation records the mode, and launch/resume refuses a mismatch. Explicit full
@@ -49,26 +51,35 @@ files are preserved.
   an operating compromise, not sandbox isolation. Worker `permission_mode=yolo`
   is selected independently and retains its existing behavior. Nothing falls back
   after startup failure or changes a running/prepared run's mode.
-- Worker isolation never denies an ancestor of ROOT/the lane. Linked workers
-  receive directory writes for their own private Git metadata, shared objects,
-  and an exclusive branch/ref/reflog parent. The default branch is
+- Fresh Windows Codex workers default to
+  `permission_mode=worker-workspace`, which retains the write sandbox but adds
+  no harness-generated broad read-denial entries and does not enumerate sibling
+  projects. It can read other locations where the remaining OS/native policy
+  permits reads. `worker-isolated` explicitly selects the stricter read-denial
+  profile; absent mode in historical saved invocations remains strict. `yolo`
+  remains a separate explicit full-access choice. Non-Windows defaults are
+  unchanged.
+- Both restricted Codex profiles grant the lane worktree plus only its private
+  Git metadata, shared objects, and exclusive branch/ref/reflog parent. The default branch is
   `lane/<epoch>/<lane>/work`; explicit isolated branches need a dedicated parent
   with no ROOT/peer branches or retained reservation. ROOT retains and checks
   the Git directory, pointer/backlink, branch and origin assignment before use;
-  ROOT's index, config and hooks remain ungranted. Harness/operator state and
-  protected sibling workspaces remain denied.
-- Windows worker-isolated Codex controllers receive a copied environment whose TEMP/TMP point
+  ROOT's index, config and hooks remain ungranted. Strict mode also denies the
+  recorded operator and sibling paths; the reduced mode makes no such read
+  confidentiality claim.
+- Windows restricted Codex controllers receive a copied environment whose TEMP/TMP point
   to `.agent-workspace/tmp/<run_id>` in the lane. Each invocation has its own directory; prior
   artifacts and the parent's environment are preserved. Yolo, other providers and non-Windows
   launches retain their existing environment. This mitigates shared-temp ACL traversal; it does
   not qualify the complete broad read-denial profile or concurrent shared-principal behavior.
-- Native Windows public-check adapters and workers share the same read-denial
-  policy through `orchestrator_harness.isolation_policy.shared_read_denials`.
-  Public checks must not deny live source, worker worktrees or Git metadata that
-  workers need. Execute an owned plain snapshot copy outside `operator-only`,
-  granting writes only to that copy; see [the adapter contract](BUILD_TEST_INTERFACE.md).
-  Isolated Codex worker bootstrap refuses required Git metadata beneath a denied
-  ancestor; existing narrow private-Git/object/exclusive-ref write grants are unchanged.
+- Native Windows public-check adapters execute an owned plain snapshot copy
+  outside `operator-only`, with writes limited to that copy; see
+  [the adapter contract](BUILD_TEST_INTERFACE.md). Fresh public-check policy v3
+  selects `worker-workspace`; a native Windows adapter must declare that mode,
+  retain its write sandbox and report no shared read-denial policy. A reduced
+  worker cannot be routed to a conflicting strict adapter. Historical policy v2
+  retains its strict meaning; strict adapters remain explicit and require
+  separate qualification.
 - The optional deterministic build/test service preserves committed snapshots,
   exact request/revision identities, stdout/stderr/exit status, direct worker
   feedback, bounded checks, resume rebinding and shutdown cleanup. Its commands,
@@ -117,12 +128,29 @@ Configure a fresh harness copy and ROOT workspace, and optionally a separate
 manager workspace. A wheel installation is module-only; a runnable harness root
 also needs the sibling `adapters/`, `super-cache/`, `scripts/`, `tools/`,
 `harness_watcher_implementation/`, `docs/` and `examples/` trees plus operator
-configuration. For isolated Windows Codex, choose a process-local LOCALAPPDATA cache and
-keep it unchanged for setup, ROOT, controllers and workers. Obtain a real
-isolated-command/protected-path probe for the exact CLI/home/cache before
-issuing `local-config/windows-sandbox-health.json`.
-`examples/windows-sandbox-health.example.json` is an UNVERIFIED schema template;
-a copied PASS receipt is not a new probe.
+configuration. For Windows Codex, choose a process-local LOCALAPPDATA cache and
+keep it unchanged for setup, ROOT, controllers and workers. Run the one-attempt
+linked-worker probe below; it creates an owned two-worktree fixture, tests lane
+and narrow Git writes, rejects protected writes, checks unchanged sentinels, and
+records exact cleanup. It publishes a v2 receipt only after those observed checks
+pass. The probe preserves prior evidence and never resets machine ACLs.
+The example health files are UNVERIFIED templates; a copied PASS receipt is not
+a new probe.
+
+```powershell
+python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
+  --output-dir runtime/windows-worker-probe/<run-id> `
+  --local-appdata runtime/windows-worker-probe-cache/<run-id>
+python -B scripts/check_windows_sandbox.py --harness-dir . `
+  --workspace <absolute-root-workspace> --permission-mode worker-workspace
+```
+
+The worker receipt is kept separately at
+`local-config/windows-sandbox-health-worker-workspace.json`. ROOT's historical
+generic receipt stays at `local-config/windows-sandbox-health.json`; neither
+replaces the other. To requalify an existing worker receipt, pass
+`--replace-existing-health`; the probe copies the prior receipt into its new
+evidence directory before updating the selected mode's health file.
 
 Preserve sandbox errors and exact ownership evidence, diagnose and repair before
 a separate launch. The harness makes zero sandbox setup requests and has no setup

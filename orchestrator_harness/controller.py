@@ -423,6 +423,9 @@ def _run_provider(
         try:
             sandbox_health = require_ready(
                 Path(sandbox_health["harness_dir"]), workspace=rt.parent, executable=argv[0],
+                permission_mode=sandbox_health.get("permission_mode", "worker-isolated"),
+                isolation_config_path=(Path(sandbox_health["isolation_config_path"])
+                                       if sandbox_health.get("isolation_config_path") else None),
             )
         except (OSError, ValueError) as exc:
             _record_sandbox_failure(rt, lane, None, None, str(exc))
@@ -803,7 +806,11 @@ def run_controller(lane_id: str) -> int:
             try:
                 require_not_blocked(rt.parent)
                 if provider_id == "codex" and invocation["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated") != "yolo":
-                    sandbox_health = require_ready(harness_root, workspace=rt.parent)
+                    permission_mode = invocation["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated")
+                    sandbox_health = require_ready(
+                        harness_root, workspace=rt.parent, permission_mode=permission_mode,
+                        isolation_config_path=Path(lane["isolation_config_path"]),
+                    )
             except (OSError, ValueError) as exc:
                 _record_sandbox_failure(rt, lane, None, None, str(exc))
                 raise ControllerError(

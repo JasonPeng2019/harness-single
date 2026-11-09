@@ -1,0 +1,16 @@
+{
+  "schema": "windows-sandbox-health/v2",
+  "status": "UNVERIFIED",
+  "permission_mode": "worker-workspace",
+  "profile_contract_sha256": "<sha256 of current profile policy sources and mode>",
+  "backend_id": "codex-windows-elevated",
+  "probe_exit_code": 1,
+  "codex_home": "<absolute tested Codex home>",
+  "local_appdata": "<absolute tested process-local cache>",
+  "native_codex_executable": "<absolute tested native codex.exe>",
+  "native_codex_sha256": "<sha256 of tested executable>",
+  "setup_marker_sha256": "<sha256 of native setup marker>",
+  "probe_evidence_path": "<absolute retained real probe inside harness runtime/>",
+  "probe_evidence_sha256": "<sha256 of retained probe result>",
+  "probe_profile_sha256": "<sha256 of generated linked-worker profile used by the probe>"
+}

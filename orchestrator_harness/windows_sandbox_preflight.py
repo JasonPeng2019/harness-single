@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tomllib
 from typing import Any
 
 POLICY = "local-config/windows-sandbox-policy.json"
@@ -19,6 +20,15 @@ DEFAULT_POLICY = {
 
 class SandboxPreflightError(ValueError):
     pass
+
+
+def health_path(harness: Path, permission_mode: str | None) -> Path:
+    """Keep ROOT's historical receipt separate from each worker profile proof."""
+    if permission_mode is None:
+        return harness / HEALTH
+    if permission_mode not in {"worker-isolated", "worker-workspace"}:
+        raise ValueError(f"unsupported isolated worker permission mode: {permission_mode}")
+    return harness / "local-config" / f"windows-sandbox-health-{permission_mode}.json"
 
 
 def _blocked(reason: str) -> SandboxPreflightError:
@@ -48,6 +58,51 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
+def profile_contract_digest(harness: Path, permission_mode: str) -> str:
+    """Fingerprint the exact installed profile generator and launcher policy."""
+    files = (
+        "orchestrator_harness/bootstrap.py",
+        "orchestrator_harness/isolation_policy.py",
+        "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
+        "adapters/codex/harness/launcher_binding.py",
+        "orchestrator_harness/windows_sandbox_preflight.py",
+    )
+    material = {"mode": permission_mode, "sources": {}}
+    for relative in files:
+        path = harness / relative
+        material["sources"][relative] = digest(path)
+    payload = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_worker_profile(config_path: Path, permission_mode: str) -> str:
+    """Validate the lane's actual generated profile before a native launch."""
+    try:
+        raw = config_path.read_bytes()
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"worker Codex profile is unreadable: {config_path}: {exc}") from exc
+    if config.get("default_permissions") != permission_mode:
+        raise ValueError("worker Codex profile mode differs from the recorded invocation")
+    permissions = config.get("permissions")
+    profile = permissions.get(permission_mode) if isinstance(permissions, dict) else None
+    filesystem = profile.get("filesystem") if isinstance(profile, dict) else None
+    if (not isinstance(profile, dict) or profile.get("extends") != ":workspace"
+            or not isinstance(filesystem, dict) or filesystem.get(":workspace_roots") != {".": "write"}):
+        raise ValueError("worker Codex filesystem profile is missing its workspace write boundary")
+    if permission_mode == "worker-workspace":
+        if any(value == "deny" for value in filesystem.values()):
+            raise ValueError("worker-workspace profile must not depend on read-denial entries")
+    else:
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
+        if filesystem.get(str(codex_home)) != "deny":
+            raise ValueError("worker-isolated profile does not deny the active Codex home")
+    if any(not isinstance(value, str) or value not in {"deny", "write"}
+           for key, value in filesystem.items() if key != ":workspace_roots"):
+        raise ValueError("worker Codex filesystem profile contains an unsupported permission")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _native_executable(executable: str | None) -> Path:
     if executable and Path(executable).is_absolute() and Path(executable).suffix.lower() == ".exe":
         return Path(executable).resolve()
@@ -70,6 +125,7 @@ def require_not_blocked(workspace: Path) -> None:
 
 def require_ready(
     harness: Path, *, workspace: Path | None = None, executable: str | None = None,
+    permission_mode: str | None = None, isolation_config_path: Path | None = None,
 ) -> dict[str, Any] | None:
     policy_path = harness / POLICY
     if workspace is not None:
@@ -82,21 +138,76 @@ def require_ready(
         raise _blocked("launch policy must require one attempt, no setup/fallback, and an operator health receipt")
     if os.name != "nt":
         return None
+    if permission_mode is not None and permission_mode not in {"worker-isolated", "worker-workspace"}:
+        raise _blocked(f"unsupported isolated worker permission mode: {permission_mode}")
+    if isolation_config_path is not None and permission_mode is None:
+        raise _blocked("a worker profile path requires an explicit worker permission mode")
+    profile_hash = None
+    if isolation_config_path is not None:
+        try:
+            profile_hash = validate_worker_profile(Path(isolation_config_path), permission_mode)
+        except (OSError, ValueError) as exc:
+            raise _blocked(str(exc)) from exc
+    expected_contract = profile_contract_digest(harness, permission_mode) if permission_mode else None
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
     marker = codex_home / ".sandbox/setup_marker.json"
     _object(marker)
     # A parseable marker alone does not establish version/config compatibility.
     # Only the operator may supply this after one successful isolated probe.
-    health_path = harness / HEALTH
-    health = _object(health_path)
+    selected_health_path = health_path(harness, permission_mode)
+    health = _object(selected_health_path)
     try:
         native = _native_executable(executable)
         local_appdata = Path(os.environ["LOCALAPPDATA"]).resolve()
         evidence = Path(health["probe_evidence_path"]).resolve()
         if not evidence.is_relative_to(harness.resolve().parent):
             raise ValueError("probe evidence must belong to this run's repository area")
-        if health.get("schema") != "windows-sandbox-health/v1" or health.get("status") != "PASS":
-            raise ValueError("operator health receipt is not PASS")
+        if permission_mode is None:
+            if health.get("schema") != "windows-sandbox-health/v1" or health.get("status") != "PASS":
+                raise ValueError("operator health receipt is not PASS")
+        else:
+            if health.get("schema") != "windows-sandbox-health/v2" or health.get("status") != "PASS":
+                raise ValueError("operator health receipt is not PASS")
+            if health.get("permission_mode") != permission_mode:
+                raise ValueError("operator health receipt qualifies a different worker permission mode")
+            if health.get("profile_contract_sha256") != expected_contract:
+                raise ValueError("operator health receipt qualifies a different profile generator or launcher policy")
+            if health.get("backend_id") != "codex-windows-elevated":
+                raise ValueError("operator health receipt names an unsupported Windows Codex sandbox backend")
+            probe_profile_hash = health.get("probe_profile_sha256")
+            if not isinstance(probe_profile_hash, str) or len(probe_profile_hash) != 64 or any(
+                char not in "0123456789abcdef" for char in probe_profile_hash
+            ):
+                raise ValueError("operator health receipt does not contain linked-profile probe evidence")
+            probe = _object(evidence)
+            protected_before = probe.get("protected_before")
+            protected_after = probe.get("protected_after")
+            denied_paths = probe.get("protected_write_denials")
+            if (probe.get("permission_mode") != permission_mode
+                    or probe.get("exit_code") != 0 or probe.get("cleanup_proven") is not True
+                    or probe.get("protected_unchanged") is not True
+                    or not isinstance(protected_before, dict) or protected_before != protected_after
+                    or not isinstance(denied_paths, list) or set(denied_paths) != set(protected_before)
+                    or probe.get("unexpectedly_writable") != [] or probe.get("probe_errors") != []
+                    or not isinstance(probe.get("worker_base_tip"), str)
+                    or not isinstance(probe.get("worker_tip"), str)
+                    or probe.get("worker_tip") == probe.get("worker_base_tip")
+                    or probe.get("profile_contract_sha256_after") != expected_contract
+                    or Path(probe.get("local_appdata", "")).resolve() != local_appdata
+                    or probe.get("profile_contract_sha256") != expected_contract
+                    or probe.get("profile_sha256") != probe_profile_hash):
+                raise ValueError("retained native probe does not prove this profile, cache, and exact cleanup")
+            probe_profile = Path(probe.get("profile_path", "")).resolve()
+            if not probe_profile.is_file() or digest(probe_profile) != probe_profile_hash:
+                raise ValueError("retained linked-worker profile is missing or changed after its probe")
+            validate_worker_profile(probe_profile, permission_mode)
+            argv = probe.get("argv")
+            if (not isinstance(argv, list) or not argv or Path(argv[0]).resolve() != native
+                    or '-c' not in argv or 'windows.sandbox="elevated"' not in argv
+                    or "--include-managed-config" not in argv
+                    or "--permission-profile" not in argv
+                    or argv[argv.index("--permission-profile") + 1] != permission_mode):
+                raise ValueError("retained probe did not launch the verified CLI with the selected profile")
         if type(health.get("probe_exit_code")) is not int or health["probe_exit_code"] != 0:
             raise ValueError("operator probe did not succeed")
         if (Path(health["codex_home"]).resolve() != codex_home
@@ -109,7 +220,10 @@ def require_ready(
             raise ValueError("sandbox marker, CLI binary, or probe evidence changed after verification")
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise _blocked(str(exc)) from exc
-    return {"harness_dir": str(harness.resolve()), "health_receipt_path": str(health_path), "health_receipt_sha256": digest(health_path),
+    return {"harness_dir": str(harness.resolve()), "health_receipt_path": str(selected_health_path), "health_receipt_sha256": digest(selected_health_path),
+            "permission_mode": permission_mode, "profile_contract_sha256": expected_contract,
+            "worker_profile_sha256": profile_hash, "backend_id": health.get("backend_id"),
+            "isolation_config_path": str(isolation_config_path.resolve()) if isolation_config_path else None,
             "marker_path": str(marker), "marker_sha256": health["setup_marker_sha256"]}
 
 
