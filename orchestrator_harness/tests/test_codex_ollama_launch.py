@@ -148,6 +148,29 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         self.assertEqual(argv, self.argv(launch_config={
             "reasoning_effort": "high", "service_tier": "normal", "launcher": "codex",
         }))
+
+    def test_worker_workspace_needs_no_auth_deny_and_binds_named_profile(self):
+        config = self.catalog.parent / "worker-workspace.toml"
+        filesystem = {":workspace_roots": {".": "write"},
+                      str(self.catalog.parent / "git-objects"): "write"}
+        config.write_text(
+            'default_permissions = "worker-workspace"\n'
+            '[permissions.worker-workspace]\nextends = ":workspace"\nfilesystem = '
+            + binding._toml_inline(filesystem),
+            encoding="utf-8",
+        )
+        argv = self.argv(
+            worktree=str(self.catalog.parent), isolation_config_path=str(config),
+            launch_config={"reasoning_effort": "high", "service_tier": "normal",
+                           "permission_mode": "worker-workspace"},
+        )
+        self.assertIn('default_permissions="worker-workspace"', argv)
+        self.assertTrue(any(value.startswith("permissions.worker-workspace.filesystem=") for value in argv))
+        self.assertFalse(any("permissions.worker-isolated" in value for value in argv))
+
+    def test_omitted_saved_mode_keeps_strict_profile_semantics(self):
+        argv = self.argv(launch_config={"reasoning_effort": "high", "service_tier": "normal"})
+        self.assertIn('default_permissions="worker-isolated"', argv)
         if os.name == "nt":
             self.assertEqual(Path(argv[0]).name.lower(), "codex.exe")
             self.assertTrue(Path(argv[0]).is_file())

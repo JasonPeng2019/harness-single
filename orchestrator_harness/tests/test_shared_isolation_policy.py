@@ -49,11 +49,12 @@ class SharedPolicyTests(unittest.TestCase):
         self.git("-C", self.product, "worktree", "add", "-b", "lane/shared-policy/work", worker)
         return worker
 
-    def install(self, worker, *, enforce_git_isolation=True):
+    def install(self, worker, *, enforce_git_isolation=True, permission_mode="worker-isolated"):
         with patch.object(Path, "home", return_value=self.home), patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)}):
             bootstrap._install_codex_worker_isolation(worker, self.engine, self.product,
                                                       enforce_git_isolation=enforce_git_isolation,
-                                                      manager_workspace=self.manager)
+                                                      manager_workspace=self.manager,
+                                                      permission_mode=permission_mode)
 
     def test_shared_policy_denies_operator_and_existing_credential_locations(self):
         denied = self.denials()
@@ -114,6 +115,23 @@ class SharedPolicyTests(unittest.TestCase):
         self.assertEqual({str(path) for path in self.denials()},
                          {name for name, mode in filesystem.items() if mode == "deny"})
         self.assertFalse(any(mode == "write" for mode in filesystem.values()))
+
+    def test_worker_workspace_skips_read_denials_and_keeps_narrow_git_writes(self):
+        common = self.product.parent / "repositories/common.git"
+        worker = self.linked_worker(common)
+        with patch.object(policy, "strict_read_denials", side_effect=AssertionError("strict scan used")):
+            self.install(worker, permission_mode="worker-workspace")
+        config = tomllib.loads((worker / ".codex/config.toml").read_text())
+        self.assertEqual("worker-workspace", config["default_permissions"])
+        filesystem = config["permissions"]["worker-workspace"]["filesystem"]
+        self.assertFalse(any(mode == "deny" for mode in filesystem.values()))
+        private = Path(self.git("-C", worker, "rev-parse", "--absolute-git-dir"))
+        writes = {Path(name) for name, mode in filesystem.items() if mode == "write"}
+        self.assertEqual({private, common / "objects",
+                          common / "refs/heads/lane/shared-policy",
+                          common / "logs/refs/heads/lane/shared-policy"}, writes)
+        self.assertNotIn(common, writes)
+        self.assertNotIn(common / "refs/heads", writes)
 
 
 if __name__ == "__main__":

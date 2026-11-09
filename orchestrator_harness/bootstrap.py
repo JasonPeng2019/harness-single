@@ -160,9 +160,34 @@ def _git_worktree_add(
     branch: str,
     worktree_path: Path,
     base_commit: str,
+    *,
+    checkout_paths: tuple[str, ...] | None = None,
 ) -> None:
     if worktree_path.exists():
         raise BootstrapError(BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}")
+
+    if checkout_paths is not None:
+        # Validate the exact assigned commit before creating a branch/worktree.
+        # Config parsing already restricts these to literal POSIX-relative
+        # directories, so pathspec interpretation cannot broaden the request.
+        directories = _run_git(
+            root_workspace,
+            "ls-tree",
+            "-d",
+            "--name-only",
+            "-z",
+            base_commit,
+            "--",
+            *checkout_paths,
+        )
+        found = set(directories.stdout.rstrip("\0").split("\0"))
+        missing = [directory for directory in checkout_paths if directory not in found]
+        if directories.returncode != 0 or missing:
+            detail = ", ".join(missing) if missing else directories.stderr.strip()
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID,
+                f"checkout_paths directories absent from the base commit: {detail}",
+            )
 
     branch_ref = f"refs/heads/{branch}"
     branch_before = _run_git(
@@ -179,11 +204,31 @@ def _git_worktree_add(
         root_workspace,
         "worktree",
         "add",
+        *(["--no-checkout"] if checkout_paths is not None else []),
         "-b",
         branch,
         str(worktree_path),
         base_commit,
     )
+    stage = "git worktree add"
+    if completed.returncode == 0 and checkout_paths is not None:
+        # Install worktree-local cone rules before the first checkout. This
+        # avoids ever materializing excluded trees, even transiently.
+        stage = "git sparse-checkout set"
+        completed = _run_git(
+            worktree_path,
+            "sparse-checkout",
+            "set",
+            "--cone",
+            "--no-sparse-index",
+            "--",
+            *checkout_paths,
+        )
+        if completed.returncode == 0:
+            stage = "git checkout"
+            completed = _run_git(
+                worktree_path, "checkout", "--no-recurse-submodules"
+            )
     if completed.returncode != 0:
         # ``git worktree add -b`` creates the branch before checkout.  A checkout
         # failure (for example a Windows long-path refusal) can therefore leave a
@@ -224,7 +269,7 @@ def _git_worktree_add(
             boundary_effects["rollback_notes"] = notes
         raise BootstrapError(
             BOOTSTRAP_REQUEST_INVALID,
-            f"git worktree add failed: {completed.stderr.strip()}{rollback_suffix}",
+            f"{stage} failed: {completed.stderr.strip()}{rollback_suffix}",
             attempt_effects=boundary_effects,
         )
 
@@ -746,11 +791,14 @@ def _install_managed_material(
 
 def _install_codex_worker_isolation(
     worktree: Path, harness_root: Path, root_workspace: Path, *, enforce_git_isolation: bool = True,
-    manager_workspace: Path | None = None,
+    manager_workspace: Path | None = None, permission_mode: str = "worker-isolated",
 ) -> None:
-    """Keep a worker inside its task worktree and away from operator state."""
+    """Install the selected write boundary and strict-mode read denials."""
     import os
     import tomllib
+
+    if permission_mode not in {"worker-isolated", "worker-workspace"}:
+        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "unsupported Codex worker isolation mode")
 
     from .mutation import _DirectoryAnchor, capture_target
     manager = Path(os.path.abspath(manager_workspace if manager_workspace is not None else root_workspace))
@@ -779,27 +827,32 @@ def _install_codex_worker_isolation(
         raise BootstrapError(
             BOOTSTRAP_CACHE_COLLISION, f"invalid Codex worker config: {exc}"
         ) from exc
-    marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
-    default_line = 'default_permissions = "worker-isolated"\n'
-    if existing.startswith(default_line) and existing.count(marker) == 1:
+    marker = "# Harness-owned worker isolation; regenerated for every lane.\n"
+    legacy_marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
+    candidates = (("worker-isolated", legacy_marker), ("worker-isolated", marker),
+                  ("worker-workspace", marker))
+    for candidate_mode, current_marker in candidates:
+        default_line = f'default_permissions = "{candidate_mode}"\n'
+        if not (existing.startswith(default_line) and existing.count(current_marker) == 1):
+            continue
         # A completed worker may commit this generated suffix before a child
         # branches from it. Discard only the complete owned shape; all grants
         # below are then derived again from the child's captured Git identity.
         from pathlib import PurePosixPath, PureWindowsPath
-        user_config, inherited_suffix = existing[len(default_line):].split(marker, 1)
+        user_config, inherited_suffix = existing[len(default_line):].split(current_marker, 1)
         try:
             inherited = tomllib.loads(inherited_suffix)
             permissions = inherited.get("permissions", {})
-            profile = permissions.get("worker-isolated", {}) if isinstance(permissions, dict) else {}
+            profile = permissions.get(candidate_mode, {}) if isinstance(permissions, dict) else {}
             filesystem = profile.get("filesystem", {}) if isinstance(profile, dict) else {}
             if (
                 isinstance(profile, dict)
-                and inherited == {"permissions": {"worker-isolated": profile}}
+                and inherited == {"permissions": {candidate_mode: profile}}
                 and set(profile) == {"extends", "filesystem"}
                 and profile["extends"] == ":workspace"
                 and isinstance(filesystem, dict)
                 and filesystem.get(":workspace_roots") == {".": "write"}
-                and any(value == "deny" for value in filesystem.values())
+                and (candidate_mode == "worker-workspace" or any(value == "deny" for value in filesystem.values()))
                 and all(
                     isinstance(value, str) and value in {"deny", "write"}
                     and (PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute())
@@ -816,16 +869,16 @@ def _install_codex_worker_isolation(
         "sandbox_mode" in parsed
         or "default_permissions" in parsed
         or not isinstance(permissions, dict)
-        or "worker-isolated" in permissions
+        or "worker-isolated" in permissions or "worker-workspace" in permissions
     ):
         raise BootstrapError(
             BOOTSTRAP_CACHE_COLLISION,
             "Codex worker config conflicts with the required isolation profile",
         )
 
-    from .isolation_policy import require_git_read_access, shared_read_denials
+    from .isolation_policy import require_git_read_access, strict_read_denials
     root_workspace = root_workspace.resolve()
-    denied = shared_read_denials(harness_root, root_workspace, manager)
+    denied = strict_read_denials(harness_root, root_workspace, manager) if permission_mode == "worker-isolated" else set()
 
     git_writes: set[Path] = set()
     git_pointer = worktree / ".git"
@@ -838,7 +891,8 @@ def _install_codex_worker_isolation(
             common_dir, lane_git_dir = Path(source["common_dir"]), Path(source["private_dir"])
             if enforce_git_isolation:
                 # Explicit yolo launches do not select the worker isolation profile.
-                require_git_read_access(denied, common_dir, lane_git_dir)
+                if denied:
+                    require_git_read_access(denied, common_dir, lane_git_dir)
                 branch_namespace = require_exclusive_namespace(root_workspace, source["branch_ref"])
                 # Native filesystem policy needs directory grants for lock
                 # creation and rename. The branch parent must be exclusive;
@@ -849,10 +903,10 @@ def _install_codex_worker_isolation(
             raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"invalid linked worktree metadata: {exc}") from exc
 
     lines = [
-        "# Harness-owned worker read isolation; regenerated for every lane.",
-        "[permissions.worker-isolated]",
+        marker.rstrip(),
+        f"[permissions.{permission_mode}]",
         'extends = ":workspace"',
-        "[permissions.worker-isolated.filesystem]",
+        f"[permissions.{permission_mode}.filesystem]",
     ]
     lines.extend(
         f'{json.dumps(str(path))} = "deny"'
@@ -864,18 +918,35 @@ def _install_codex_worker_isolation(
     )
     lines.extend(
         [
-            '[permissions.worker-isolated.filesystem.":workspace_roots"]',
+            f'[permissions.{permission_mode}.filesystem.":workspace_roots"]',
             '"." = "write"',
             "",
         ]
     )
     rendered = (
-        'default_permissions = "worker-isolated"\n'
+        f'default_permissions = "{permission_mode}"\n'
         + existing.rstrip()
         + "\n"
         + "\n".join(lines)
     )
     atomic_write_bytes(config_path, rendered.encode("utf-8"))
+
+
+def regenerate_codex_worker_profile(
+    worktree: Path, harness_root: Path, root_workspace: Path, *,
+    permission_mode: str, manager_workspace: Path | None = None,
+) -> Path:
+    """Regenerate only an exact harness-owned profile for an explicit transition.
+
+    The existing profile must be absent, an untouched user prefix, or an exact
+    recognized generated suffix. Callers must validate and persist the new
+    invocation identity under their own lane transaction before using it.
+    """
+    _install_codex_worker_isolation(
+        worktree, harness_root, root_workspace, manager_workspace=manager_workspace,
+        permission_mode=permission_mode,
+    )
+    return worktree / ".codex" / "config.toml"
 
 
 def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
@@ -1042,6 +1113,11 @@ def run_bootstrap(
             "evidence_paths": [],
             "next_action": "pass --provider and --model",
         }
+    # This is a fresh-input boundary. Persist the new Windows default in the
+    # invocation so later launch/resume never has to reinterpret an omission.
+    launch_config = dict(launch_config)
+    if provider == "codex" and os.name == "nt" and "permission_mode" not in launch_config:
+        launch_config["permission_mode"] = "worker-workspace"
     try:
         configured_launch = _validate_provider_launch_config(
             harness_root,
@@ -1193,7 +1269,17 @@ def run_bootstrap(
                 # effectful phase may not start now that the caller has stopped
                 # waiting, so no late lane appears.
                 raise refuse_expired_allowance("lane worktree was created")
-            _git_worktree_add(config.root_workspace, branch, worktree_path, base_commit)
+            _git_worktree_add(
+                config.root_workspace,
+                branch,
+                worktree_path,
+                base_commit,
+                **(
+                    {"checkout_paths": config.checkout_paths}
+                    if config.checkout_paths is not None
+                    else {}
+                ),
+            )
             worktree_created = True
             agent_workspace = worktree_path / ".agent-workspace"
             agent_workspace.mkdir(parents=True, exist_ok=True)
@@ -1225,6 +1311,9 @@ def run_bootstrap(
                     worktree_path, harness_root, config.root_workspace,
                     enforce_git_isolation=configured_launch.get("permission_mode") != "yolo",
                     manager_workspace=config.manager_workspace,
+                    permission_mode=(configured_launch.get("permission_mode")
+                                     if configured_launch.get("permission_mode") != "yolo"
+                                     else "worker-isolated"),
                 )
             source_exclusions = [".codex/config.toml"] if provider == "codex" else []
             if managed:

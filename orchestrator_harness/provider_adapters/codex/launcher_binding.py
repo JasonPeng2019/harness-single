@@ -89,25 +89,25 @@ def _ollama_model_catalog(model: str, reasoning_effort: str) -> Path:
     return path.resolve()
 
 
-def _isolation_overrides(worktree: str, isolation_config_path: str | None = None) -> list[str]:
+def _isolation_overrides(worktree: str, permission_mode: str, isolation_config_path: str | None = None) -> list[str]:
     config_path = Path(isolation_config_path) if isolation_config_path else Path(worktree) / ".codex" / "config.toml"
     if not config_path.is_file():
         if Path(worktree).exists():
             raise ValueError(f"Codex worker isolation profile missing: {config_path}")
         return []
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    profile = config.get("permissions", {}).get("worker-isolated")
+    profile = config.get("permissions", {}).get(permission_mode)
     if not isinstance(profile, dict) or profile.get("extends") != ":workspace":
-        raise ValueError(f"Codex worker isolation profile invalid: {config_path}")
+        raise ValueError(f"Codex {permission_mode} profile invalid: {config_path}")
     filesystem = profile.get("filesystem")
     if not isinstance(filesystem, dict) or not filesystem:
-        raise ValueError(f"Codex worker filesystem isolation missing: {config_path}")
+        raise ValueError(f"Codex worker filesystem profile missing: {config_path}")
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
-    if filesystem.get(str(codex_home)) != "deny":
+    if permission_mode == "worker-isolated" and filesystem.get(str(codex_home)) != "deny":
         raise ValueError(f"Codex worker auth directory is not denied: {config_path}")
     return [
-        'permissions.worker-isolated.extends=":workspace"',
-        "permissions.worker-isolated.filesystem=" + _toml_inline(filesystem),
+        f'permissions.{permission_mode}.extends=":workspace"',
+        f"permissions.{permission_mode}.filesystem=" + _toml_inline(filesystem),
     ]
 
 
@@ -134,8 +134,8 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
             raise ValueError("Codex launch_config launcher must be codex or ollama")
         normalized["launcher"] = launch_config["launcher"]
     if "permission_mode" in launch_config:
-        if launch_config["permission_mode"] not in ("worker-isolated", "yolo"):
-            raise ValueError("Codex launch_config permission_mode must be worker-isolated or yolo")
+        if launch_config["permission_mode"] not in ("worker-isolated", "worker-workspace", "yolo"):
+            raise ValueError("Codex launch_config permission_mode must be worker-workspace, worker-isolated, or yolo")
         normalized["permission_mode"] = launch_config["permission_mode"]
     return normalized
 
@@ -156,9 +156,11 @@ def build_argv(
     if configured.get("permission_mode") == "yolo":
         permission_args = ["--yolo"]
     else:
-        isolation_overrides = _isolation_overrides(worktree, isolation_config_path)
+        # Omission is the historical strict contract for saved invocations.
+        permission_mode = configured.get("permission_mode", "worker-isolated")
+        isolation_overrides = _isolation_overrides(worktree, permission_mode, isolation_config_path)
         permission_args = [
-            "-c", 'default_permissions="worker-isolated"',
+            "-c", f'default_permissions={json.dumps(permission_mode)}',
             *[part for override in isolation_overrides for part in ("-c", override)],
             *(["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []),
         ]

@@ -63,6 +63,7 @@ class HarnessConfig:
     record_manifests: tuple[str, ...] = ()
     legacy_config_diagnostics: tuple[str, ...] = ()
     manager_workspace: Path | None = None
+    checkout_paths: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.manager_workspace is None:
@@ -279,14 +280,44 @@ def _workspace_path(value: object, field: str, config_path: Path) -> Path:
     return workspace
 
 
+def _checkout_paths(value: object, config_path: Path) -> tuple[str, ...]:
+    """Validate literal POSIX-style repository directory names.
+
+    Existence is checked against the assigned commit by bootstrap, where the
+    repository and task card are both known. Here we reject syntax Git could
+    interpret as a pathspec, absolute path, or traversal before any setup.
+    """
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"harness config checkout_paths must be a non-empty list: {config_path}")
+    selected: list[str] = []
+    for directory in value:
+        if (
+            not isinstance(directory, str)
+            or not directory
+            or directory.startswith("/")
+            or any(part in ("", ".", "..") for part in directory.split("/"))
+            or any(char in directory for char in "\\:*?[]\r\n\0")
+            or any(ord(char) < 32 or ord(char) == 127 for char in directory)
+        ):
+            raise ConfigError(
+                "harness config checkout_paths requires literal repository-relative directories "
+                f"using '/' separators: {config_path}"
+            )
+        selected.append(directory)
+    if len(set(selected)) != len(selected):
+        raise ConfigError(f"harness config checkout_paths contains duplicate directories: {config_path}")
+    return tuple(selected)
+
+
 def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
     """Read and validate the stored harness-config.json.
 
     The stored record is the closed ``harness-config/v1`` shape:
     required absolute ``root_workspace`` and optional ``managed_coordination``
-    (``enabled`` or ``disabled``, default ``enabled``) and ``manager_workspace``
-    (defaults to root_workspace). The record carries no
-    literal ``schema`` field and no other keys are legal.
+    (``enabled`` or ``disabled``, default ``enabled``), ``manager_workspace``
+    (defaults to root_workspace), and ``checkout_paths`` (a nonempty list of
+    literal repository-relative directories; omission keeps full checkouts).
+    The record carries no literal ``schema`` field and no other keys are legal.
     """
     root = Path(harness_root).absolute()
     path = root / "harness-config.json"
@@ -296,11 +327,11 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"harness config unreadable: {path}: {exc}") from exc
-    unknown = sorted(set(record) - {"root_workspace", "manager_workspace", "managed_coordination"})
+    unknown = sorted(set(record) - {"root_workspace", "manager_workspace", "managed_coordination", "checkout_paths"})
     if unknown:
         raise ConfigError(
             f"harness config unknown key {unknown[0]!r} "
-            f"(closed keys: root_workspace, manager_workspace, managed_coordination): {path}"
+            f"(closed keys: root_workspace, manager_workspace, managed_coordination, checkout_paths): {path}"
         )
     workspace = _workspace_path(record.get("root_workspace"), "root_workspace", path)
     manager = _workspace_path(record.get("manager_workspace", record.get("root_workspace")),
@@ -310,11 +341,16 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         raise ConfigError(
             f"harness config managed_coordination must be enabled or disabled: {path}"
         )
+    checkout_paths = (
+        _checkout_paths(record["checkout_paths"], path)
+        if "checkout_paths" in record else None
+    )
     return HarnessConfig(
         harness_root=root,
         root_workspace=workspace,
         managed_coordination=managed,
         manager_workspace=manager,
+        checkout_paths=checkout_paths,
     )
 
 
@@ -410,4 +446,7 @@ def compute_config_identity(
     }
     if config.manager_workspace is not None and not same_path(config.manager_workspace, config.root_workspace):
         payload["manager_workspace"] = path_identity(config.manager_workspace)
+    if config.checkout_paths is not None:
+        # Preserve the historical identity for unscoped full checkouts.
+        payload["checkout_paths"] = list(config.checkout_paths)
     return sha256_hex(payload)
