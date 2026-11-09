@@ -11,6 +11,7 @@ import tomllib
 import unittest
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import bootstrap, setup
@@ -1526,7 +1527,7 @@ class V2MaterializationTests(unittest.TestCase):
         self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True,
         manager: Path | None = None, checkout_paths: list[str] | None = None,
         allow_refusal: bool = False, launch_config_override: dict[str, str] | None = None,
-    ) -> tuple[dict[str, object], Path]:
+    ) -> tuple[dict[str, Any], Path]:
         from orchestrator_harness import processes
         from orchestrator_harness.records import read_record
         runtime = self.fixture.root_workspace / ".harness-runtime"

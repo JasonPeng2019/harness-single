@@ -222,11 +222,15 @@ def _git_worktree_add(
                     return True
             return False
 
-        provider_inputs = {
-            "codex": (".codex/config.toml", ".codex/hooks.json"),
-            "claude-code": (".claude/settings.json",),
-            "qwen-code": (".qwen/settings.json",),
-        }.get(provider_id, ())
+        provider_inputs = (
+            {
+                "codex": (".codex/config.toml", ".codex/hooks.json"),
+                "claude-code": (".claude/settings.json",),
+                "qwen-code": (".qwen/settings.json",),
+            }.get(provider_id, ())
+            if provider_id is not None
+            else ()
+        )
         critical = {
             path for path in tracked_paths
             if path.startswith(".agent-workspace/") or path in provider_inputs
