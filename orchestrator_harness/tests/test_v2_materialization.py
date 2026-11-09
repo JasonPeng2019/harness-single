@@ -1311,7 +1311,13 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"], result)
         worktree = Path(result["attempt_effects"]["worktree_path"])
         self.assertTrue(worktree.is_relative_to(self.fixture.root_workspace))
-        git_add.assert_called_once_with(self.fixture.root_workspace, branch, worktree, base)
+        git_add.assert_called_once_with(
+            self.fixture.root_workspace,
+            branch,
+            worktree,
+            base,
+            provider_id="codex",
+        )
         rollback.assert_called_once_with(self.fixture.root_workspace, branch, worktree)
         self.assertTrue(result["attempt_effects"]["rollback_proven"], result)
         self.assertFalse(worktree.exists())
