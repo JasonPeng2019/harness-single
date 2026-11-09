@@ -23,6 +23,21 @@ from orchestrator_harness.tests.result_fixture import LinkedResultFixture
 
 
 class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
+    def _stage_recaptured_filter_source(self, run_id):
+        source = git_source.capture(self.root, self.worker, branch="lane/worker/work")
+        bootstrap._write_worker_prompt(self.worker, self.task, managed=False)
+        bootstrap._write_invocation(
+            self.worker, lane_id="worker", run_id=run_id,
+            provider_id=self.provider["id"], model=self.provider["model"],
+            launch_config=self.provider["launch_config"], exclusive_resources=[],
+        )
+        bootstrap._write_worker_binding(self.worker, self.rt, "worker", run_id)
+        self.lane = stage_authority(
+            self.rt, self.epoch,
+            {**self.lane, "run_id": run_id, "git_source": source},
+            self.task,
+        )
+
     def test_sparse_pass_uses_protected_scope_and_rejects_tampered_materialization(self):
         selected = "src café"
         selected_file = self.worker / selected / "chosen file.py"
@@ -494,10 +509,12 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         # Configure before capture: ROOT config is immutable after assignment.
         self.git(self.root, "config", "filter.set.clean", command)
         self.git(self.root, "config", "filter.set.required", "true")
-        self.lane["git_source"] = git_source.capture(self.root, self.worker, branch="lane/worker/work")
         (self.worker / ".gitattributes").write_bytes(b"source.txt filter=set text\n")
         self.git(self.worker, "-c", "filter.set.clean=", "-c", "filter.set.required=false", "add", ".gitattributes")
         self.commit(self.worker, "filter attributes")
+        # The test deliberately changes ROOT config and committed attributes;
+        # stage a fresh protected assignment for that exact source state.
+        self._stage_recaptured_filter_source("filter-validation-run")
         result = self.record()
         (self.worker / "source.txt").write_bytes(b"original source\r\n")
         validate_record(result, self.lane)
@@ -516,6 +533,9 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         # after setup, isolating execution attributable to the validator.
         if marker.exists():
             marker.unlink()
+        # The test deliberately changes ROOT config and committed attributes;
+        # stage a fresh protected assignment for that exact source state.
+        self._stage_recaptured_filter_source("filter-equals-validation-run")
         result = self.record()
         (self.worker / "source.txt").write_bytes(b"original source\r\n")
         validate_record(result, self.lane)
