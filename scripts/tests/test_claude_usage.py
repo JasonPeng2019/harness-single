@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -225,6 +226,95 @@ class ClaudeUsageTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ledger.LedgerError, "no top-level init session binding"
         ):
+            ledger.extract_usage(path, provider_id="claude-code")
+
+    def indexed_terminal_stream(self, path: Path, *, final_out=25) -> None:
+        """Portable regression shape captured from Claude CLI 2.1.319."""
+        sid = "portable-session"
+        base = {"inputTokens": 100, "outputTokens": 25}
+        final = {"inputTokens": 100, "outputTokens": final_out}
+        events = [
+            {"type": "system", "subtype": "init", "session_id": sid},
+            {"type": "system", "subtype": "task_notification", "session_id": sid},
+            {"type": "system", "subtype": "init", "session_id": sid},
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": sid,
+                "result_index": 0,
+                "modelUsage": {"claude-sonnet-5-5": base},
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": sid,
+                "result_index": 1,
+                "origin": {"kind": "task-notification"},
+                "model_usage_since_last_result": {},
+                "modelUsage": {"claude-sonnet-5-5": final},
+            },
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+
+    def test_real_cli_indexed_rollups_and_repeated_live_init_are_one_segment(self):
+        path = self.base / "claude-events.jsonl"
+        self.indexed_terminal_stream(path)
+        result = ledger.extract_usage(path, provider_id="claude-code")
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("portable-session", result["thread_id"])
+        self.assertEqual(
+            (2, 5, 125),
+            (
+                result["terminal_records"],
+                result["json_records"],
+                result["comparison_total_tokens"],
+            ),
+        )
+        self.assertEqual(25, result["model_usage"]["claude-sonnet-5-5"]["output_tokens"])
+
+    def test_provider_aware_summarize_reports_indexed_cli_rollup(self):
+        path = self.base / "claude-events.jsonl"
+        self.indexed_terminal_stream(path)
+        report = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS / "scripts" / "collect_usage.py"),
+                "summarize",
+                "--provider",
+                "claude-code",
+                "--events",
+                str(path),
+            ],
+            cwd=self.base,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, report.returncode, report.stderr)
+        self.assertEqual(125, json.loads(report.stdout)["comparison_total_tokens"])
+
+    def test_indexed_terminal_replay_and_decreasing_counters_are_rejected(self):
+        path = self.base / "claude-events.jsonl"
+        self.indexed_terminal_stream(path)
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        events[-1]["result_index"] = 0
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        with self.assertRaisesRegex(ledger.LedgerError, "ambiguous multiple"):
+            ledger.extract_usage(path, provider_id="claude-code")
+        events[-1]["result_index"] = 1
+        events[-1].pop("origin")
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        with self.assertRaisesRegex(ledger.LedgerError, "progression evidence"):
+            ledger.extract_usage(path, provider_id="claude-code")
+        events[-1]["origin"] = {"kind": "task-notification"}
+        events[-1]["modelUsage"]["claude-sonnet-5-5"]["outputTokens"] = 24
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+        with self.assertRaisesRegex(ledger.LedgerError, "counter decreased"):
             ledger.extract_usage(path, provider_id="claude-code")
 
     def test_appended_worker_resume_segments_select_their_own_terminal_rollups(self):

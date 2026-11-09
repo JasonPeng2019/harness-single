@@ -18,7 +18,11 @@ def extract_claude_usage(
         return {"status": "missing_transcript", "transcript_sha256": None}
     digest, segment_digest = hashlib.sha256(), hashlib.sha256()
     session: str | None = None
+    segment_session: str | None = None
     segment = terminals = records = 0
+    last_result_index: int | None = None
+    previous_counters: dict[str, dict[str, int | None]] | None = None
+    segment_has_terminal = False
     segment_bound = False
     selected: dict[str, Any] | None = None
     selected_line: int | None = None
@@ -48,19 +52,45 @@ def extract_claude_usage(
                 and event.get("subtype") == "init"
                 and not nested
             ):
-                segment += 1
+                init_session = event.get("session_id")
+                # Claude can repeat init after a builtin task notification before
+                # it emits the first terminal result. That is still one process
+                # segment. An init after a terminal retains the historical
+                # appended-resume boundary, even when the session ID is reused.
+                repeated_live_init = segment > 0 and not segment_has_terminal
+                if repeated_live_init:
+                    if not isinstance(init_session, str) or not init_session:
+                        raise LedgerError(
+                            f"repeated Claude init has no session binding: {path}:{number}"
+                        )
+                    if init_session != segment_session:
+                        raise LedgerError(
+                            f"multiple Claude session IDs in one segment: {path}"
+                        )
+                else:
+                    segment += 1
+                    segment_session = (
+                        init_session
+                        if isinstance(init_session, str) and init_session
+                        else None
+                    )
+                    segment_has_terminal = False
+                    last_result_index = None
+                    previous_counters = None
                 if segment_index is None or segment == segment_index:
-                    selected = None
-                    terminals = 0
-                    session = None
-                    selected_line = None
-                    final_error = False
-                    segment_bound = False
-                    init_session = event.get("session_id")
+                    if not repeated_live_init:
+                        selected = None
+                        terminals = 0
+                        session = None
+                        selected_line = None
+                        final_error = False
+                        segment_bound = False
                     if isinstance(init_session, str) and init_session:
                         session = init_session
                         segment_bound = True
             if segment_index is not None and segment != segment_index:
+                if event.get("type") == "result" and not nested:
+                    segment_has_terminal = True
                 continue
             segment_digest.update(raw)
             records += 1
@@ -73,17 +103,48 @@ def extract_claude_usage(
                 session = candidate
             if event.get("type") != "result" or nested:
                 continue
-            terminals += 1
-            if terminals > 1:
+            result_index = event.get("result_index")
+            if isinstance(result_index, bool) or (
+                result_index is not None
+                and (not isinstance(result_index, int) or result_index < 0)
+            ):
+                raise LedgerError(f"invalid Claude result_index at {path}:{number}")
+            if terminals:
+                if (
+                    result_index is None
+                    or last_result_index is None
+                    or result_index != last_result_index + 1
+                ):
+                    raise LedgerError(
+                        f"ambiguous multiple terminal Claude results in one provider segment: {path}"
+                    )
+                origin = event.get("origin")
+                delta = event.get("model_usage_since_last_result")
+                if (
+                    not isinstance(origin, dict)
+                    or origin.get("kind") != "task-notification"
+                    or not isinstance(delta, dict)
+                ):
+                    raise LedgerError(
+                        f"indexed Claude terminal lacks task-notification progression evidence: {path}:{number}"
+                    )
+                if selected is None:
+                    raise LedgerError(
+                        f"indexed Claude terminal progression follows a result without a usable rollup: {path}:{number}"
+                    )
+            elif result_index is not None and result_index != 0:
                 raise LedgerError(
-                    f"multiple terminal Claude results in one provider segment: {path}"
+                    f"Claude terminal result progression does not start at index 0: {path}:{number}"
                 )
+            terminals += 1
+            segment_has_terminal = True
+            last_result_index = result_index
             if not segment_bound:
                 raise LedgerError(
                     f"Claude terminal result has no top-level init session binding: {path}:{number}"
                 )
             selected_line = number
-            final_error = (
+            final_error = final_error or (
                 event.get("is_error") is True or event.get("subtype") != "success"
             )
             models = event.get("modelUsage")
@@ -129,6 +190,36 @@ def extract_claude_usage(
                         ).encode("utf-8")
                     ).hexdigest(),
                 }
+            current_counters = {
+                model: {
+                    "input_tokens": counters["input_tokens"],
+                    "output_tokens": counters["output_tokens"],
+                    "cached_input_tokens": counters["cached_input_tokens"],
+                    "cache_creation_input_tokens": counters[
+                        "cache_creation_input_tokens"
+                    ],
+                }
+                for model, counters in safe_models.items()
+            }
+            if previous_counters is not None:
+                for model, prior in previous_counters.items():
+                    current = current_counters.get(model)
+                    if current is None:
+                        raise LedgerError(
+                            f"Claude indexed terminal dropped model {model}: {path}:{number}"
+                        )
+                    for key, prior_value in prior.items():
+                        current_value = current[key]
+                        if prior_value is not None and current_value is not None:
+                            if current_value < prior_value:
+                                raise LedgerError(
+                                    f"Claude indexed terminal counter decreased for {model}.{key}: {path}:{number}"
+                                )
+                        elif prior_value != current_value:
+                            raise LedgerError(
+                                f"Claude indexed terminal counter availability changed for {model}.{key}: {path}:{number}"
+                            )
+            previous_counters = current_counters
             selected = {
                 "input_tokens": input_total,
                 "output_tokens": output_total,

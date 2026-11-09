@@ -34,10 +34,16 @@ cleanup checks.
 
 Claude ROOT transcripts are retained as `claude-events.jsonl`; native worker
 transcripts remain under the attempt path recorded by the protected invocation
-and attempt records. A resumed appended transcript is split at each top-level
-`system/init` segment. Protected attempt `session_id` and argv establish native
-resume identity. A fresh session starts a new cumulative chain; F2 profile
-migration history remains part of the immutable source evidence.
+and attempt records. A resumed appended transcript is split at top-level
+`system/init` boundaries after a terminal result. Claude can repeat
+`system/init` for the same session before its first result while publishing
+builtin-task progress; that repeated init remains in the current process
+segment. A process may publish multiple inclusive terminal snapshots using
+contiguous `result_index` values beginning at zero. The extractor validates
+the progression and nondecreasing model counters, then uses the last snapshot
+once. Protected attempt `session_id` and argv establish native resume identity.
+A fresh session starts a new cumulative chain; F2 profile migration history
+remains part of the immutable source evidence.
 
 ## Metric and evidence meaning
 
