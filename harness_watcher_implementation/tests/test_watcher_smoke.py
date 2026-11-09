@@ -7,34 +7,36 @@ turn a known defect into an expected failure.
 
 from __future__ import annotations
 
-import io
 import importlib
+import io
 import json
+import os
 import subprocess
 import sys
-import os
 import tempfile
 import time
 import unittest
 import uuid
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
 
+from harness_watcher_implementation import __main__ as watcher_cli
 from harness_watcher_implementation import settings
+from harness_watcher_implementation.attention import (
+    AttentionValidationError,
+    make_source_record,
+)
 from harness_watcher_implementation.config import (
     ObservedSource,
     WatcherConfig,
     load_config,
 )
-from harness_watcher_implementation.attention import (
-    AttentionValidationError,
-    make_source_record,
-)
 from harness_watcher_implementation.evaluator import (
-    FakeEvaluator,
     OWNERSHIP_PHASE_RULES,
     STALE_STATUS_QUARANTINE_RULE,
     CommandEvaluator,
+    FakeEvaluator,
     validate_verdict,
 )
 from harness_watcher_implementation.poller import initialize_service_cursor, poll
@@ -46,7 +48,6 @@ from harness_watcher_implementation.state import (
 )
 from orchestrator_harness.events import conditions_from_snapshot
 from orchestrator_harness.watcher_integration import merge_watcher_conditions
-from harness_watcher_implementation import __main__ as watcher_cli
 
 
 def defect_verdict(path: str = "observed.jsonl") -> dict[str, object]:
@@ -127,6 +128,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                     str(os.getpid()),
                 ],
                 cwd=root,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -160,6 +162,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                     "stop",
                 ],
                 cwd=root,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -176,18 +179,22 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                         "status",
                     ],
                     cwd=root,
+                    check=False,
                     capture_output=True,
                     text=True,
                 )
                 if not json.loads(status.stdout)["running"]:
                     break
                 time.sleep(0.1)
+            else:
+                self.fail("watcher did not stop after the cooperative stop request")
             self.assertFalse(json.loads(status.stdout)["running"])
             from orchestrator_harness.processes import identity_exit_proven
 
             self.assertTrue(identity_exit_proven(pid, state["watcher"]["created_utc"]))
         finally:
             import shutil
+
             from orchestrator_harness.processes import identity_exit_proven
 
             service_path = runtime / "watcher" / "service.json"
@@ -210,6 +217,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                             "stop",
                         ],
                         cwd=root,
+                        check=False,
                         capture_output=True,
                         text=True,
                         timeout=10,
@@ -263,6 +271,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
     def test_route_oversized_raw_byte_range_and_following_record(self) -> None:
         import hashlib
+
         from harness_watcher_implementation.poller import _route
 
         huge = {"payload": "x" * 70000}
@@ -562,6 +571,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.log_file.write_text(json.dumps(historical) + "\n", encoding="utf-8")
         evaluator = CapturingEvaluator()
         poll(self.config, evaluator)
+        assert evaluator.packet is not None
         self.assertIn(
             "sig-20260731-long-canary", evaluator.packet["observations"][0]["text"]
         )
@@ -675,9 +685,10 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
     def test_primary_identity_healthy_mismatch_and_incomplete_are_distinct(
         self,
     ) -> None:
-        from datetime import datetime, timezone
+        from datetime import datetime
+
+        from harness_watcher_implementation import poller
         from orchestrator_harness.models import ProcessInfo, ProcessSnapshot
-        import harness_watcher_implementation.poller as poller
 
         identity = self.root / "primary.json"
         stamp = "2026-01-01T00:00:00+00:00"
@@ -709,7 +720,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             identity,
         )
         processes = tuple(
-            ProcessInfo(pid, 0, "", "", datetime(2026, 1, 1, tzinfo=timezone.utc))
+            ProcessInfo(pid, 0, "", "", datetime(2026, 1, 1, tzinfo=UTC))
             for pid in (1, 2, 3)
         )
         with patch(
@@ -721,16 +732,18 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             "orchestrator_harness.processes.process_snapshot",
             return_value=ProcessSnapshot(True, processes[:2]),
         ):
-            self.assertEqual(
-                "identity-mismatch", poller._primary_loss(cfg, {})[0]["reason"]
-            )
+            loss, _ = poller._primary_loss(cfg, {})
+            self.assertIsNotNone(loss)
+            assert loss is not None
+            self.assertEqual("identity-mismatch", loss["reason"])
         with patch(
             "orchestrator_harness.processes.process_snapshot",
             return_value=ProcessSnapshot(False, ()),
         ):
-            self.assertEqual(
-                "process-coverage-unknown", poller._primary_loss(cfg, {})[0]["reason"]
-            )
+            loss, _ = poller._primary_loss(cfg, {})
+            self.assertIsNotNone(loss)
+            assert loss is not None
+            self.assertEqual("process-coverage-unknown", loss["reason"])
 
     def test_serve_preflight_failure_logs_diagnostic_before_terminal_state(
         self,
@@ -1182,6 +1195,9 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         second = save_alert(
             self.config.runtime_root, verdict, {"packet_id": "packet-2"}
         )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
         self.assertEqual(first["alert_id"], second["alert_id"])
         self.assertTrue(acknowledge(self.config.runtime_root, first["event_id"]))
         for state in (
@@ -1201,6 +1217,8 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             validate_verdict(defect_verdict(str(self.log_file))),
             {"packet_id": "packet"},
         )
+        self.assertIsNotNone(alert)
+        assert alert is not None
         with self.assertRaisesRegex(ValueError, "out of order"):
             transition(self.config.runtime_root, alert["alert_id"], "PAUSED")
 
@@ -1610,6 +1628,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
         capture = CapturingEvaluator()
         poll(self.config, capture)
+        assert capture.packet is not None
         self.assertEqual(
             [dict(rule) for rule in OWNERSHIP_PHASE_RULES],
             capture.packet["constraints"]["ownership_phase_rules"],
@@ -1678,6 +1697,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         )
         capture = CapturingEvaluator()
         poll(self.config, capture)
+        assert capture.packet is not None
         constraints = {
             rule["case"]: rule
             for rule in capture.packet["constraints"]["ownership_phase_rules"]
@@ -1741,5 +1761,6 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
         live = _identity(os.getpid())
         self.assertTrue(_same(live))
+        assert live is not None
         stale = {**live, "created_utc": str(live["created_utc"]) + "-different"}
         self.assertFalse(_same(stale))

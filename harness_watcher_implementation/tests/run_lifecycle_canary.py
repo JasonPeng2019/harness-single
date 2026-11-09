@@ -9,6 +9,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+
 from orchestrator_harness.processes import identity_exit_proven
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +50,7 @@ def call(path: Path, command: str, *extra: str) -> tuple[int, dict[str, object]]
             *extra,
         ],
         cwd=ROOT,
+        check=False,
         text=True,
         capture_output=True,
         timeout=20,
@@ -63,13 +65,13 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
         _, state = call(path, "status")
         state_record = state.get("state")
         if not isinstance(state_record, dict):
-            raise RuntimeError("watcher CLI status has no state record")
+            raise TypeError("watcher CLI status has no state record")
         watcher = state_record.get("watcher")
         gone = isinstance(watcher, dict) and identity_exit_proven(
             watcher.get("pid"), watcher.get("created_utc")
         )
         if (
-            not state["running"]
+            not state.get("running")
             and not state.get("identity_unproven")
             and gone
             and (reason is None or state_record.get("exit_reason") == reason)
@@ -119,8 +121,18 @@ def _run_canary() -> None:
     activity = new_activity("ordinary_runtime")
     duplicate_code, duplicate = call(ordinary, "start", "--owner-pid", str(os.getpid()))
     status_code, status = call(ordinary, "status")
+    live_state = status.get("state")
+    if not isinstance(live_state, dict):
+        raise TypeError("live watcher status has no state record")
+    live_watcher = live_state.get("watcher")
+    if not isinstance(live_watcher, dict):
+        raise TypeError("live watcher status has no watcher identity")
+    live_created = live_watcher.get("created_utc")
     stop_code, stop = call(ordinary, "stop")
     stopped = wait_not_running(ordinary, "stop-requested")
+    stopped_state = stopped.get("state")
+    if not isinstance(stopped_state, dict):
+        raise TypeError("stopped watcher status has no state record")
 
     restart_config = config("restart_runtime")
     restart_code, restart = call(
@@ -140,6 +152,9 @@ def _run_canary() -> None:
         timeout=20,
     )
     lost = wait_not_running(owner_loss, "owner-identity-lost")
+    lost_state = lost.get("state")
+    if not isinstance(lost_state, dict):
+        raise TypeError("owner-loss watcher status has no state record")
     result = {
         "start": [start_code, start],
         "new_activity": activity,
@@ -152,17 +167,12 @@ def _run_canary() -> None:
         "restart_stop": [restart_stop_code, restart_stop],
         "restarted_stopped_status": restarted_stopped,
         "owner_loss_status": lost,
-        "live_has_pid_and_creation": bool(
-            status.get("state", {}).get("watcher", {}).get("pid")
-        )
-        and isinstance(
-            status.get("state", {}).get("watcher", {}).get("created_utc"), str
-        )
-        and ":" in status.get("state", {}).get("watcher", {}).get("created_utc", ""),
-        "cooperative_stop_reason": status.get("state", {}).get("exit_reason") is None
-        and stopped.get("state", {}).get("exit_reason") == "stop-requested",
-        "owner_loss_reason": lost.get("state", {}).get("exit_reason")
-        == "owner-identity-lost",
+        "live_has_pid_and_creation": isinstance(live_watcher.get("pid"), int)
+        and isinstance(live_created, str)
+        and ":" in live_created,
+        "cooperative_stop_reason": live_state.get("exit_reason") is None
+        and stopped_state.get("exit_reason") == "stop-requested",
+        "owner_loss_reason": lost_state.get("exit_reason") == "owner-identity-lost",
     }
     (DEST / "result.json").write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
@@ -212,10 +222,10 @@ def main() -> None:
                     proof.append({"config": str(path), "never_published": True})
                     continue
                 if not isinstance(state, dict):
-                    raise RuntimeError("watcher CLI status state is not a record")
+                    raise TypeError("watcher CLI status state is not a record")
                 watcher = state.get("watcher")
                 if not isinstance(watcher, dict):
-                    raise RuntimeError(
+                    raise TypeError(
                         "published startup has no provable watcher identity"
                     )
                 if not identity_exit_proven(
@@ -238,7 +248,14 @@ def main() -> None:
                 )
                 if not gone:
                     raise RuntimeError("exact watcher exit remains unproven")
-            except Exception as exc:
+            except (
+                AssertionError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as exc:
                 failures.append({"config": str(path), "error": str(exc)})
         DEST.mkdir(parents=True, exist_ok=True)
         (DEST / "cleanup.json").write_text(
