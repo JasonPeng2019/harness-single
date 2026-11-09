@@ -160,9 +160,34 @@ def _git_worktree_add(
     branch: str,
     worktree_path: Path,
     base_commit: str,
+    *,
+    checkout_paths: tuple[str, ...] | None = None,
 ) -> None:
     if worktree_path.exists():
         raise BootstrapError(BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}")
+
+    if checkout_paths is not None:
+        # Validate the exact assigned commit before creating a branch/worktree.
+        # Config parsing already restricts these to literal POSIX-relative
+        # directories, so pathspec interpretation cannot broaden the request.
+        directories = _run_git(
+            root_workspace,
+            "ls-tree",
+            "-d",
+            "--name-only",
+            "-z",
+            base_commit,
+            "--",
+            *checkout_paths,
+        )
+        found = set(directories.stdout.rstrip("\0").split("\0"))
+        missing = [directory for directory in checkout_paths if directory not in found]
+        if directories.returncode != 0 or missing:
+            detail = ", ".join(missing) if missing else directories.stderr.strip()
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID,
+                f"checkout_paths directories absent from the base commit: {detail}",
+            )
 
     branch_ref = f"refs/heads/{branch}"
     branch_before = _run_git(
@@ -179,11 +204,31 @@ def _git_worktree_add(
         root_workspace,
         "worktree",
         "add",
+        *(["--no-checkout"] if checkout_paths is not None else []),
         "-b",
         branch,
         str(worktree_path),
         base_commit,
     )
+    stage = "git worktree add"
+    if completed.returncode == 0 and checkout_paths is not None:
+        # Install worktree-local cone rules before the first checkout. This
+        # avoids ever materializing excluded trees, even transiently.
+        stage = "git sparse-checkout set"
+        completed = _run_git(
+            worktree_path,
+            "sparse-checkout",
+            "set",
+            "--cone",
+            "--no-sparse-index",
+            "--",
+            *checkout_paths,
+        )
+        if completed.returncode == 0:
+            stage = "git checkout"
+            completed = _run_git(
+                worktree_path, "checkout", "--no-recurse-submodules"
+            )
     if completed.returncode != 0:
         # ``git worktree add -b`` creates the branch before checkout.  A checkout
         # failure (for example a Windows long-path refusal) can therefore leave a
@@ -224,7 +269,7 @@ def _git_worktree_add(
             boundary_effects["rollback_notes"] = notes
         raise BootstrapError(
             BOOTSTRAP_REQUEST_INVALID,
-            f"git worktree add failed: {completed.stderr.strip()}{rollback_suffix}",
+            f"{stage} failed: {completed.stderr.strip()}{rollback_suffix}",
             attempt_effects=boundary_effects,
         )
 
@@ -1224,7 +1269,17 @@ def run_bootstrap(
                 # effectful phase may not start now that the caller has stopped
                 # waiting, so no late lane appears.
                 raise refuse_expired_allowance("lane worktree was created")
-            _git_worktree_add(config.root_workspace, branch, worktree_path, base_commit)
+            _git_worktree_add(
+                config.root_workspace,
+                branch,
+                worktree_path,
+                base_commit,
+                **(
+                    {"checkout_paths": config.checkout_paths}
+                    if config.checkout_paths is not None
+                    else {}
+                ),
+            )
             worktree_created = True
             agent_workspace = worktree_path / ".agent-workspace"
             agent_workspace.mkdir(parents=True, exist_ok=True)

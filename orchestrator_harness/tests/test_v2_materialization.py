@@ -335,17 +335,23 @@ class MaterializationFixture:
             self._write_text(self.root_workspace / ".gitignore",
                              ".harness-runtime/\n.agent-workspace/\n.codex/\n.custom/\n.claude/\n.qwen/\nRESULT.json\n")
             self._write_text(self.root_workspace / "application.txt", "fixture product\n")
+            self._write_text(self.root_workspace / "src" / "selected.txt", "selected product input\n")
+            self._write_text(self.root_workspace / "unrelated" / "large.log", "excluded fixture data\n")
             self.git("init", "-q")
-            self.git("add", ".gitignore", "application.txt")
+            self.git("add", ".gitignore", "application.txt", "src/selected.txt", "unrelated/large.log")
             self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture base")
         return self.git("rev-parse", "HEAD")
 
-    def prepare_runtime(self, *, managed: bool, manager: Path | None = None) -> str:
+    def prepare_runtime(
+        self, *, managed: bool, manager: Path | None = None,
+        checkout_paths: list[str] | None = None,
+    ) -> str:
         """Actual setup/READY and Git; no epoch, ownership or source mocks."""
         self._write_json(self.harness / "harness-config.json", {
             "root_workspace": str(self.root_workspace),
             "managed_coordination": "enabled" if managed else "disabled",
             **({"manager_workspace": str(manager)} if manager is not None else {}),
+            **({"checkout_paths": checkout_paths} if checkout_paths is not None else {}),
         })
         base = self.initialize_git()
         self.bootstrap_runtime = True
@@ -1407,6 +1413,24 @@ class V2MaterializationTests(unittest.TestCase):
     def test_plain_bootstrap_preserves_validated_task_card_copy(self) -> None:
         self._assert_bootstrap_preserves_validated_task_card_copy(managed=False)
 
+    def test_configured_checkout_scope_reaches_managed_and_plain_bootstrap(self) -> None:
+        for managed in (True, False):
+            with self.subTest(managed=managed):
+                self.fixture = MaterializationFixture()
+                self.addCleanup(self.fixture.close)
+                result, worktree = self._bootstrap(
+                    f"scoped-{managed}", managed=managed, provider="codex",
+                    checkout_paths=["src"],
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual("selected product input\n",
+                                 (worktree / "src/selected.txt").read_text(encoding="utf-8"))
+                self.assertFalse((worktree / "unrelated").exists())
+                sparse = bootstrap._run_git(
+                    worktree, "config", "--worktree", "--get", "core.sparseCheckout"
+                )
+                self.assertEqual((0, "true"), (sparse.returncode, sparse.stdout.strip()))
+
     def _assert_bootstrap_preserves_validated_task_card_copy(
         self, *, managed: bool
     ) -> None:
@@ -1426,13 +1450,15 @@ class V2MaterializationTests(unittest.TestCase):
 
     def _bootstrap(
         self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True,
-        manager: Path | None = None,
+        manager: Path | None = None, checkout_paths: list[str] | None = None,
     ) -> tuple[dict[str, object], Path]:
         from orchestrator_harness import processes
         from orchestrator_harness.records import read_record
         runtime = self.fixture.root_workspace / ".harness-runtime"
         if prime_cache:
-            base = self.fixture.prepare_runtime(managed=managed, manager=manager)
+            base = self.fixture.prepare_runtime(
+                managed=managed, manager=manager, checkout_paths=checkout_paths
+            )
         else:
             self.assertEqual("OPEN", setup.read_runtime_state(runtime)["state"])
             base = self.fixture.git("rev-parse", "HEAD")

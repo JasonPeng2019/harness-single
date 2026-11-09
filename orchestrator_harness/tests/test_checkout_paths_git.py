@@ -17,13 +17,14 @@ class CheckoutPathsGitTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
         self.target = self.root / "worker"
+        self.sibling = self.root / "sibling"
         self.repo.mkdir()
         self.git(self.repo, "init", "-q", "-b", "main")
         self.git(self.repo, "config", "core.autocrlf", "false")
         self.git(self.repo, "config", "core.hooksPath", str(self.root / "no-hooks"))
         self.files = {
             "src/main.py": "selected source\n",
-            "docs/has spaces/Δelta.md": "selected unicode path\n",
+            "docs/has spaces/Δelta/readme.md": "selected unicode path\n",
             "AGENTS.md": "top level instructions\n",
             "unrelated/large.log": "excluded contents\n",
         }
@@ -35,6 +36,7 @@ class CheckoutPathsGitTests(unittest.TestCase):
         self.git(self.repo, "-c", "user.name=Scope Test", "-c", "user.email=scope@example.invalid",
                  "commit", "-qm", "fixture baseline")
         self.base = self.git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.git(self.repo, "worktree", "add", "--detach", str(self.sibling), self.base)
 
     @staticmethod
     def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -44,9 +46,23 @@ class CheckoutPathsGitTests(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8", check=True,
         )
 
+    @staticmethod
+    def worktree_setting(repo: Path, key: str) -> str | None:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "config", "--worktree", "--get", key],
+            capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+        if result.returncode in (1, 128) and not result.stdout:
+            return None
+        if result.returncode != 0:
+            raise AssertionError(f"could not inspect worktree setting {key}: {result.stderr}")
+        return result.stdout.strip()
+
     def test_scoped_materialization_never_checks_out_excluded_contents(self) -> None:
         original_run = bootstrap._run_git
         empty_before_sparse = False
+        source_sparse_before = self.worktree_setting(self.repo, "core.sparseCheckout")
+        sibling_sparse_before = self.worktree_setting(self.sibling, "core.sparseCheckout")
 
         def observe(root: Path, *args: str):
             nonlocal empty_before_sparse
@@ -63,8 +79,8 @@ class CheckoutPathsGitTests(unittest.TestCase):
             )
         self.assertTrue(empty_before_sparse)
         self.assertEqual(self.files["src/main.py"], (self.target / "src/main.py").read_text())
-        self.assertEqual(self.files["docs/has spaces/Δelta.md"],
-                         (self.target / "docs/has spaces/Δelta.md").read_text())
+        self.assertEqual(self.files["docs/has spaces/Δelta/readme.md"],
+                         (self.target / "docs/has spaces/Δelta/readme.md").read_text())
         self.assertEqual(self.files["AGENTS.md"], (self.target / "AGENTS.md").read_text())
         self.assertFalse((self.target / "unrelated").exists())
         self.assertEqual(self.base, self.git(self.target, "rev-parse", "HEAD").stdout.strip())
@@ -74,6 +90,10 @@ class CheckoutPathsGitTests(unittest.TestCase):
         self.assertEqual("true", self.git(self.target, "config", "--worktree", "--get",
                                            "core.sparseCheckoutCone").stdout.strip())
         self.assertEqual("", self.git(self.repo, "status", "--porcelain").stdout)
+        self.assertEqual("", self.git(self.sibling, "status", "--porcelain").stdout)
+        self.assertTrue((self.sibling / "unrelated/large.log").is_file())
+        self.assertEqual(source_sparse_before, self.worktree_setting(self.repo, "core.sparseCheckout"))
+        self.assertEqual(sibling_sparse_before, self.worktree_setting(self.sibling, "core.sparseCheckout"))
         self.assertEqual("", self.git(self.target, "status", "--porcelain").stdout)
         (self.target / "src/main.py").write_text("edited in sparse worktree\n", encoding="utf-8")
         self.git(self.target, "add", "src/main.py")
