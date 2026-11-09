@@ -1,107 +1,108 @@
-# General harness repairs and operational reproduction
+# General harness repairs and portable operation
 
-This note summarizes the R1–R7 repairs and gives a portable outline for an operator-run check
-with a small, unrelated code project. Commands use placeholders for local paths and provider
-settings. They are instructions, not evidence that a live provider demo has run.
+This guide describes the delivered R1–R7 protections and the F1–F3/R8 changes in this candidate.
+It is an operating guide, not evidence of a live provider run. Keep the prior R1–R7 completion
+report as historical evidence; its test and demo results do not qualify F1–F3 or R8.
 
 ## Repair summary
 
 - **R1/R2 — Claude hooks and upgrade migration.** ROOT and worker hook commands quote
-  `${CLAUDE_PROJECT_DIR}`, so nested working directories resolve scripts from the project root.
-  ROOT setup handles exact legacy-only and old-plus-current registrations, leaving one current
-  registration per event. Inherited worker bootstrap migrates only exact known legacy groups.
-  Other settings are preserved; altered or missing inherited owned registrations refuse without
-  mutation.
-- **R3 — inherited generated Codex profile.** Worker bootstrap regenerates only the recognized
-  harness-generated suffix for the current worktree and Git identity. It preserves the user's
-  profile prefix, current read denials, and narrow exclusive Git grants; custom or malformed owned
-  suffixes refuse. The repair and its focused controls do not establish acceptance of the complete
-  isolated profile.
-- **R4 — private Windows temporary files.** Windows worker-isolated Codex receives per-invocation
-  TEMP/TMP directories inside its lane. This mitigates shared-temp ACL traversal; it does not prove
-  the full broad-denial profile works in every environment.
-- **R5 — monitor finalization.** A provisional absent or invalid result stays nonterminal while the
-  exact controller remains alive and owns finalization. Explicit failures, dead or mismatched
-  controllers, orphaned leases, transcript contradictions, and unproven cleanup remain actionable.
-  The monitor adds no timer, retry, fallback, or second launch authority.
-- **R6 — usage evidence ambiguity.** Accounting rejects duplicate `controller_started` evidence
-  for one run before pairing provider events and transcripts. This is an evidence-integrity guard;
-  it does not replace native dispatch serialization or authorize a retry or second launch.
-- **R7 — explicit ROOT sandbox mode.** Codex preparation and collector launch bind the same
-  selected mode. Isolated modes keep their readiness gate; explicit `danger-full-access` skips
-  readiness for the unused OS sandbox while retaining the run-wide failure block and ownership
-  checks. Full access provides no OS sandbox enforcement. This compromise and the other fixes do
-  not establish full isolated-profile acceptance.
+  `${CLAUDE_PROJECT_DIR}`. Setup migrates only exact known legacy hook groups, deduplicates
+  old-plus-current registrations, and preserves unrelated provider settings.
+- **R3 — inherited Codex profiles.** Bootstrap regenerates recognized generated profile suffixes
+  for the current worktree and Git identity, while preserving user configuration and refusing
+  altered owned content.
+- **R4 — private Windows worker temporary files.** Restricted Codex workers receive private
+  per-invocation TEMP/TMP directories. This mitigates shared-temp traversal; it does not qualify
+  every Windows sandbox profile.
+- **R5/R6 — finalization and accounting integrity.** A live controller retains finalization
+  authority over provisional results; usage accounting rejects duplicate same-run controller-start
+  evidence. Neither behavior starts a retry or second provider.
+- **R7 — ROOT mode admission.** Codex preparation, launch and receipts bind the selected ROOT mode.
+  Explicit `danger-full-access` skips readiness for the unused OS sandbox but preserves existing
+  run-wide failure blocks and ownership checks. Full access has no OS sandbox enforcement.
+- **F1 — optional worker checkout scope.** Optional `checkout_paths` selects literal repository-
+  relative directories for new worktrees. Omission keeps a full checkout. Git cone-mode sparse
+  checkout preserves the assigned base commit and history, may include top-level/ancestor files,
+  and is not an access boundary. Bootstrap refuses when selected paths omit required tracked inputs;
+  it never silently expands the requested scope.
+- **F2 — explicit resume profile changes.** Ordinary resume keeps the saved session and effective
+  profile. A complete explicit changed profile validates before mutation and starts a fresh native
+  session in the same provider adapter and worktree. On Codex resume, omission of `permission_mode`
+  preserves the lane's effective mode, including legacy strict; a permission change must be explicit. Dirty files, commits, assignment, protected
+  history, retry counts and resource accounting remain. Conversation history is not transferred;
+  ROOT's model/provider is outside this feature. See [resume profiles](RESUME_PROFILES.md).
+- **F3 — provider-aware usage accounting.** `scripts/collect_usage.py` provides provider-aware
+  collection and reporting while preserving the existing Codex collector interface. Claude usage
+  uses the top-level terminal `modelUsage` rollup; comparison total is uncached input plus output,
+  cache read/create values remain separate, and missing values remain unknown. Resume deltas are
+  keyed by provider and native session. Reports keep per-provider totals and identify mixed metric
+  scope. Fixture behavior is documented; live Claude CLI/auth qualification is not claimed.
+- **R8 — normal Windows worker mode.** A fresh Windows Codex bootstrap with omitted worker mode
+  records `worker-workspace`, which keeps write restrictions and narrow Git grants without the
+  broad sibling/operator read-denial list. Explicit `worker-isolated` retains strict denials;
+  explicit `yolo` is full access. Non-Windows defaults are unchanged. Missing mode in a historical
+  saved invocation retains strict meaning. ROOT mode is independent. `worker-workspace` gives no
+  read-confidentiality guarantee and does not establish protection from files still readable by
+  native/OS permissions.
 
-## Portable reproduction outline
+## Portable operating outline
 
-Use a disposable harness copy and a tiny code project that is independent of this harness and its
-reference material. Set up a small task such as changing one function and adding a focused test.
-Keep source, local configuration, and runtime output in their documented locations. Select a
-provider and its model preferences explicitly for the environment; no shipped preference is
-implied here.
+Use a disposable harness copy and a small project unrelated to the harness or reference material.
+Configure only explicit, portable placeholders; shipped files do not select a model or developer
+workspace.
 
 1. Configure `harness-config.json` with the project's absolute `root_workspace`, optional
-   `manager_workspace` for ROOT hooks and skills (defaults to `root_workspace`), and
-   `managed_coordination: "enabled"`. Configure `resource-manifest.json` and a complete
-   `project-task-card/v1` task card. Review [Quick Start](../QUICK_START.md) for provider-specific
-   prerequisites and the chosen ROOT operating mode.
-2. For a fresh managed ROOT, prepare hooks and the monitor before starting ROOT:
+   `manager_workspace`, and `managed_coordination`. Optionally add
+   `"checkout_paths": ["src", "docs/operator guides"]` to materialize selected worker directories;
+   omit it for full checkout. Configure the resource manifest and a complete
+   `project-task-card/v1` card. Read [Quick Start](../QUICK_START.md) for full setup details.
+2. Select the ROOT provider and prepare before ROOT starts. The explicit full-access ROOT example
+   is:
 
    ```powershell
-   python -B scripts/prepare_root_launch.py --harness-dir . --workspace <manager-workspace> --run-id <run-id> --sandbox <selected-codex-mode>
+   python -B scripts/prepare_root_launch.py --harness-dir . --workspace <manager-workspace> --run-id <run-id> --sandbox danger-full-access
    ```
 
-   Select the same mode when launching the Codex collector. If using another ROOT provider, select
-   it explicitly as documented in [Quick Start](../QUICK_START.md). Native
-   `python -m orchestrator_harness.operator_launch harness setup` is for manual integration or
-   reopening an already prepared ROOT; follow the documented receipt and service checks.
-3. Bootstrap and launch one lane through the public launcher. Supply the provider, its configured
-   model, any required provider options, and the task card:
+   This is an operating compromise: ROOT commands have the current user's access, without OS
+   sandbox enforcement. Launch Codex ROOT through `scripts/collect_codex_usage.py run` with the
+   same `--sandbox danger-full-access`. `worker-workspace` and ROOT full access are independent
+   selections. Other ROOT providers use their provider-aware collection route and do not take
+   Codex `--sandbox`.
+3. On Windows, qualify `worker-workspace` against the installed harness with the one-attempt
+   native probe and check its mode-specific receipt before relying on that mode:
 
    ```powershell
-   python -m orchestrator_harness.operator_launch lane bootstrap --lane-id <lane-id> --provider <provider-id> --model <configured-model> --provider-option <name>=<configured-value> --task-card <task-card.json>
-   python -m orchestrator_harness.operator_launch lane launch --lane-id <lane-id>
+   python -B scripts/probe_windows_worker_isolation.py --harness-dir . --output-dir runtime/windows-worker-probe/<run-id> --local-appdata runtime/windows-worker-probe-cache/<run-id>
+   python -B scripts/check_windows_sandbox.py --harness-dir . --workspace <root-workspace> --permission-mode worker-workspace
    ```
 
-   Repeat `--provider-option` for provider-specific preferences and any explicitly selected
-   permission mode. Bootstrap and launch are explicit; a failed or invalid run does not trigger an
-   automatic retry or provider switch.
-4. Wait using native `watch` and acknowledge each event's top-level event ID. For an ordinary
-   notification, handle it and close it with `manager close`. For a completion-review event,
-   acknowledge it and then use `lane completion-review --event-id`; that command records the
-   finding and decision and closes its review event. Do not manually close the review event first.
+   The probe is mode-specific. It does not qualify strict read isolation. Final reduced-mode
+   concurrent-project and public-check acceptance remains pending in this candidate; do not claim a
+   probe result or live acceptance from these instructions.
+4. Bootstrap a lane with an explicit provider, model, and complete required provider options.
+   Fresh Windows Codex bootstrap omission selects and records `worker-workspace`. Select strict
+   `worker-isolated` or full-access `yolo` only when the operator intends that mode. Resume omission
+   preserves its existing effective mode; changing it requires an explicit `permission_mode` option. Non-Windows behavior is unchanged.
+   For a model/profile transition, use `resume-lane` with `--model` and the complete option set;
+   omitted overrides continue the saved session. Resume starts no provider until `lane launch`.
+5. In managed mode, wait through native `watch`, handle events and acknowledge the top-level event
+   ID only after handling. Review the current result, retire accepted lanes, then run native
+   `harness shutdown` and confirm CLOSED cleanup evidence.
 
-   ```powershell
-   python -m orchestrator_harness.operator_launch watch --until-actionable --timeout <duration>
-   python -m orchestrator_harness.operator_launch manager acknowledge --event-id <notification-event-id>
-   python -m orchestrator_harness.operator_launch manager close --event-id <notification-event-id> --outcome COMPLETE --summary <handling-summary>
-   python -m orchestrator_harness.operator_launch watch --until-actionable --timeout <duration>
-   python -m orchestrator_harness.operator_launch manager acknowledge --event-id <review-event-id>
-   python -m orchestrator_harness.operator_launch lane completion-review --event-id <review-event-id> --review-outcome PASS --approval ACCEPTED --review-summary <review-summary>
-   ```
-
-   Acceptance requires ROOT's PASS finding; worker output alone is not acceptance.
-5. Retire the accepted lane, then shut down and confirm the runtime reaches CLOSED:
-
-   ```powershell
-   python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acceptance-reference>
-   python -m orchestrator_harness.operator_launch harness shutdown
-   ```
-
-### Optional external public checks
-
-An operator may configure the build/test service before ROOT preparation. Pin the check adapter,
-its dependencies, and any external tool inputs to reviewed immutable revisions in operator-owned
-configuration. The public check should run against the service's committed snapshot and report its
-command, revision, output, and exit status. Keep the check implementation and dependencies outside
-the harness source and worker-editable project; grant writes only to its owned snapshot copy. The
-harness ships no fixed check, dataset, container image, or evaluation runner. See the
-[build/test interface](BUILD_TEST_INTERFACE.md) for its contract and limits.
+For provider-aware usage, use `scripts/collect_usage.py` for Claude `run`/`resume`, and its
+`snapshot`, `gate`, `finalize`, or `summarize` operations as needed. The provider identity comes
+from the ROOT launch and protected worker invocation records; collection reads native evidence and
+does not resume or modify a session. Claude collection requires the CLI/auth context configured by
+the operator. Live Claude qualification remains unavailable in this candidate.
 
 ## Evidence boundary
 
-Targeted implementation evidence and its limitations are recorded in the local repair results.
-Product documentation describes behavior and reproduction steps only. A live demonstration still
-requires the operator to run the complete native workflow and inspect its retained evidence; no
-provider, broad isolated-profile, or full live-run acceptance is claimed here.
+Native `watch --until-actionable` remains the manager work-discovery path. This extension does not
+claim a repair for the historical Stop-hook/compaction timeout; that cause remains unresolved.
+
+The probe script and usage collectors produce evidence only when actually run; this document does
+not claim those commands have passed. R8 still needs integrated concurrent-project acceptance in
+`worker-workspace`. Strict Windows read isolation remains separately unqualified. Historical R1–R7
+results remain valid for their recorded source revision only and are not evidence for these newer
+features.

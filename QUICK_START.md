@@ -15,12 +15,16 @@ Write `harness-config.json` at the harness root (closed `harness-config/v1` shap
 {
   "root_workspace": "<absolute-path-to-product-workspace>",
   "manager_workspace": "<absolute-path-for-ROOT-hooks-and-skills>",
-  "managed_coordination": "enabled"
+  "managed_coordination": "enabled",
+  "checkout_paths": ["src", "docs/operator guides"]
 }
 ```
 
 `root_workspace` selects the Git product workspace; `manager_workspace` is optional and selects
 where ROOT hooks, skills and `.agent-workspace` are installed (defaults to `root_workspace`).
+Optional `checkout_paths` selects literal repository-relative directories to materialize in new
+worker worktrees. Omit it for a full checkout. Sparse checkout is not an access-control boundary;
+bootstrap refuses if selected paths omit required tracked inputs.
 
 Write `resource-manifest.json` (closed `resource-manifest/v1` shape):
 
@@ -37,10 +41,10 @@ Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `res
 ## 2. Prepare before ROOT starts
 
 For a fresh managed ROOT, run pre-launch preparation FIRST: it performs the one native setup
-internally and records the run-bound receipt. The explicit working recipe below uses full-access
-Codex ROOT and, in step 3, an explicit yolo worker. This is an operating compromise for hosts where
-the broad worker-isolation profile is unusable: Codex commands have the current user's access,
-without OS sandbox enforcement. Native worktree ownership, hooks, review and cleanup still apply.
+internally and records the run-bound receipt. The explicit working recipe below uses full-access Codex ROOT. This is an operating compromise:
+Codex ROOT commands have the current user's access, without OS sandbox enforcement. Worker
+permissions are selected independently in step 3; the normal recipe does not select yolo. Native
+worktree ownership, hooks, review and cleanup still apply.
 
 ```powershell
 python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id> --sandbox danger-full-access
@@ -93,6 +97,22 @@ configuration is preserved, with harness hooks merged into the provider hook fil
 `.codex/config.toml` must already set `[features] hooks = true`. Setup starts no lane or provider,
 and runtime records or receipts are never deleted or fabricated.
 
+### Claude Code ROOT usage collection
+
+For a fresh Claude Code ROOT, prepare with `--provider claude-code` and collect through the
+provider-aware route:
+
+```powershell
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id> --provider claude-code
+python -B scripts/collect_usage.py run --provider claude-code --run-id <id> --task <task> --arm harness --cwd <configured-manager-workspace> --prompt-file <root-prompt.txt> --results-dir <owned-results-directory> --model <model> --effort <effort> --harness-runtime <configured-product-workspace>/.harness-runtime --harness-dir . --trust-project-hooks --watchdog-hours <hours>
+```
+
+Use `collect_usage.py resume --provider claude-code --task-file <root-run-dir>/task.json
+--prompt-file <prompt>` for an existing saved ROOT session. `snapshot`, `gate`, `finalize`, and
+`summarize` are report operations; finalization writes an owned output archive. Existing Codex
+`collect_codex_usage.py` run/resume commands remain compatible; `collect_usage.py run/resume`
+also accepts their legacy Codex options.
+
 ## 3. Bootstrap one lane
 
 Create a task card using `examples/project-task-card.example.json` as the template. Every
@@ -117,7 +137,6 @@ python -m orchestrator_harness.operator_launch lane bootstrap `
   --lane-id lane-01 --provider codex --model <model> `
   --provider-option reasoning_effort=<effort> `
   --provider-option service_tier=<tier> `
-  --provider-option permission_mode=yolo `
   --task-card <path-to-task-card.json>
 ```
 
@@ -129,16 +148,19 @@ payload, and writes the worker binding. Shipped provider IDs: `codex`, `claude-c
 Launch preferences have no harness defaults. Codex requires `reasoning_effort` and `service_tier`;
 Claude Code requires `effort`; Qwen Code currently requires only `--model`. Each option uses a
 repeated `--provider-option NAME=VALUE`. Bootstrap rejects missing, duplicate, or unsupported
-preferences before creating the lane, and resume reuses the recorded values unchanged.
+preferences before creating the lane. On resume, restate every required model option. An omitted
+Codex `permission_mode` preserves the effective existing mode; changing it requires the explicit
+option. An unchanged effective profile keeps the saved session.
 
-The example explicitly selects `--provider-option permission_mode=yolo` for
-approval/sandbox bypass. The adapter passes `--yolo` and omits worker-isolated and
-Windows sandbox overrides. To choose isolation on a qualified host, use
-`--provider-option permission_mode=worker-isolated`; omitting the option still selects that
-existing isolated default. ROOT and worker modes are independent: full-access ROOT may launch an
-isolated worker, whose Windows health gate still applies. Claude Code
-uses `--permission-mode bypassPermissions`, equivalent to its permission-bypass CLI
-flag. Permission bypass does not change the assigned repository or task ownership.
+For Codex workers, a fresh Windows bootstrap with no permission option records
+`permission_mode=worker-workspace`, which keeps the write sandbox and narrow Git grants without
+the broad sibling/operator read-denial list. This mode does not promise read confidentiality. Strict mode remains separately unqualified on this host.
+Fresh non-Windows workers keep the existing default. Select strict Windows read isolation
+explicitly with `--provider-option permission_mode=worker-isolated`; select full access explicitly
+with `--provider-option permission_mode=yolo`. Yolo passes `--yolo` without OS sandbox
+enforcement and is not the normal worker recipe. Historical invocations with no recorded mode
+retain strict meaning. ROOT and worker modes are independent. Claude Code uses
+`--permission-mode bypassPermissions`; permission bypass does not change repository/task ownership.
 
 For the native Codex OSS transport, add `--provider-option launcher=ollama` and provide the
 operator-owned `local-config/ollama-model-catalog.json` with exactly one entry for the exact
@@ -147,6 +169,28 @@ operator-owned `local-config/ollama-model-catalog.json` with exactly one entry f
 can corrupt the replayed conversation; built-in web search is unavailable in this mode. The
 configured model/effort, hooks, isolation and approval policy are unchanged, and nothing switches
 providers automatically.
+
+### One-attempt Windows worker qualification
+
+Before claiming Windows `worker-workspace` operation, run one owned native probe against the
+installed harness. It creates a temporary two-worktree fixture, checks lane writes and commits,
+attempts writes to protected sentinels, records profile/CLI/config hashes and exact cleanup, and
+publishes a `worker-workspace`-specific health receipt only when the observations pass. It does not
+configure or repair the sandbox. A successful probe is mode-specific evidence, not proof of strict
+read isolation; absent or stale receipts do not qualify the mode.
+
+```powershell
+python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
+  --output-dir runtime/windows-worker-probe/<run-id> `
+  --local-appdata runtime/windows-worker-probe-cache/<run-id>
+python -B scripts/check_windows_sandbox.py --harness-dir . `
+  --workspace <absolute-root-workspace> --permission-mode worker-workspace
+```
+
+This writes `local-config/windows-sandbox-health-worker-workspace.json`; the legacy ROOT receipt
+`local-config/windows-sandbox-health.json` is separate. A prior worker receipt is preserved; pass
+`--replace-existing-health` only when intentionally replacing it after retaining the prior evidence. The reduced-mode probe/receipt has not
+yet received final integrated concurrent-project acceptance in this candidate.
 
 ## 4. Launch
 
@@ -197,12 +241,13 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
 
 ## Resume, force-stop, shutdown
 
-- Resume a stopped, unaccepted lane with a fresh complete task card and an explicit rationale:
-  `resume-lane --lane-id lane-01 --resume-task-card <fresh-card.json> --rationale <reason>`,
-  then `lane launch --lane-id lane-01`. It reuses the retained worktree, session and history. The
-  allowance is the initial assignment plus at most one explicit manual retry per lane/session,
-  across run IDs; there is no automatic retry or model switch. A retired lane in the current epoch
-  refuses resume and keeps its records; follow the returned next action.
+- Resume a stopped, unaccepted lane with a fresh complete task card and rationale:
+  `resume-lane --lane-id lane-01 --resume-task-card <fresh-card.json> --rationale <reason>`, then
+  `lane launch --lane-id lane-01`. Without profile overrides this keeps the saved provider session.
+  To replace its model/profile, supply `--model <model>` and the complete provider option set; this
+  starts a fresh provider session in the same worktree and preserves dirty files, commits, protected
+  history, and retry/resource counts. The lane still permits only its initial attempt plus one explicit
+  manual retry across run IDs. A retired lane in the current epoch refuses resume and keeps its records.
 - Cancel a prepared or running stuck lane: `lane force-stop --lane-id lane-01`. It stops only the
   exact recorded PID-plus-creation identities and refuses an unknown identity.
 - End the whole runtime: `harness shutdown`. Managed ROOT Stop rejects OPEN, including an empty

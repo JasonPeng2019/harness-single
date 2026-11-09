@@ -48,21 +48,20 @@
   PID-plus-creation identity; never kill by broad process name or command matching, and treat an
   unobservable identity as a refusal rather than absence.
 - Each launcher gets one provider attempt; never automatically retry, refresh sandbox setup,
-  switch modes or bypass a health gate. Preserve and diagnose failures before a separate launch.
+  automatically switch modes or bypass a health gate. Fresh Windows Codex bootstrap defaults to write-restricted
+  `worker-workspace`; resume preserves the current effective mode unless explicitly changed. Strict
+  `worker-isolated` and full-access `yolo` are explicit choices. Strict remains the meaning of a
+  missing mode in historical invocations. Windows `worker-workspace` readiness uses the native
+  one-attempt probe and a mode-specific receipt. This mode does not claim read confidentiality and
+  the probe does not qualify strict mode. Preserve and diagnose failures before a separate launch.
 - A lane/session permits initial assignment plus at most one explicit manual retry across run IDs.
   Retry explicitly with `resume-lane --lane-id <id> --resume-task-card <fresh-card.json>
   --rationale <reason>` in the same worktree/session, then `lane launch`; there is no automatic
   loop, and a lane retired in the current epoch refuses resume with a preserved error while
-  supported retained stopped lanes across closed epochs remain resumable.
-- For a fresh managed ROOT, run `scripts/prepare_root_launch.py` first; it performs the native
-  setup internally. Isolated Windows Codex requires the read-only CLI/home/cache/marker/probe gate
-  before preparation and missing local policy cannot disable it. Explicit Codex ROOT
-  `--sandbox danger-full-access` and worker `permission_mode=yolo` use no OS sandbox; they skip
-  readiness for that unused sandbox but retain any existing run-wide failure block. ROOT mode
-  is bound into preparation and must match launch/resume. Other ROOT providers are selected
-  explicitly. Manual `harness setup` is for plain/manual
-  integration and for reopening an already prepared ROOT, where preparation revalidates the same
-  run-id receipt instead of repeating setup. Never delete or fabricate runtime records or receipts.
+  supported retained stopped lanes across closed epochs remain resumable. A complete explicit model
+  and provider-option replacement starts a fresh session in the same worktree; preserved history and
+  retry/resource counts are not reset. See `docs/RESUME_PROFILES.md`.
+- For a fresh managed ROOT, run `scripts/prepare_root_launch.py` first; it performs native setup internally. ROOT sandbox mode is selected and receipt-bound independently from worker permissions. Isolated ROOT requires matching readiness evidence; explicit `danger-full-access` has no OS sandbox and skips readiness for that unused sandbox while retaining any existing run-wide failure block. Fresh Windows Codex bootstrap defaults to `worker-workspace`; resume preserves the current mode. Its one-attempt native probe and mode-specific receipt are separate from ROOT's receipt. `worker-isolated` is an explicit strict choice; `yolo` is explicit full access and is not the normal worker recipe. Historical invocations with no worker mode retain strict meaning. Never delete or fabricate runtime records or receipts.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,
   not task success.
 

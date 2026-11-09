@@ -12,10 +12,12 @@ next_action }`; `--json` emits it as the machine-readable result object. Success
 status line and exits 0; failure prints one stable failure code on stderr and exits non-zero.
 
 Configure `harness-config.json` before use. The closed `harness-config/v1` shape has a
-required absolute `root_workspace` (the Git product and runtime workspace) and two optional
+required absolute `root_workspace` (the Git product and runtime workspace) and three optional
 keys: `manager_workspace` (an absolute workspace for ROOT hooks, skills and `.agent-workspace`;
-defaults to `root_workspace`) and `managed_coordination` (`enabled` or `disabled`; default
-`enabled`). The shipped configuration has an empty `root_workspace`; commands refuse it until
+defaults to `root_workspace`), `managed_coordination` (`enabled` or `disabled`; default
+`enabled`), and `checkout_paths` (a nonempty list of literal repository-relative directories for
+new worker worktrees; omission means full checkout). Sparse checkout limits materialized files,
+not Git history or file access permissions. The shipped configuration has an empty `root_workspace`; commands refuse it until
 the operator supplies an absolute workspace path. The harness never selects a developer's
 workspace and does not install or query an experience memory store.
 
@@ -26,7 +28,7 @@ See [the integrated run fixes](docs/INTEGRATED_RUN_FIXES.md) for Codex ROOT prel
 preparation, the Windows health gate for isolated Codex execution, the optional direct worker public
 build/test service, and remaining task-completion work.
 
-See [general harness repairs](docs/GENERAL_HARNESS_REPAIRS.md) for the R1–R7 repair summary
+See [general harness repairs](docs/GENERAL_HARNESS_REPAIRS.md) for the R1–R8 and F1–F3 implementation summary
 and a portable operational reproduction outline. The outline is guidance, not evidence that a
 live provider demo has been completed.
 
@@ -78,15 +80,15 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
   recorded PID-plus-creation identity and release its leases; an unobservable or conflicting
   identity refuses instead of guessing. `lane retire --acceptance-ref` — gracefully retire one
   accepted lane.
-- `resume-lane --lane-id --resume-task-card --rationale` — re-run a stopped or otherwise
-  resumable unaccepted lane in its retained worktree/session with a fresh complete task card and an
-  explicit rationale; a lane retired in the current epoch refuses resume while supported retained
-  stopped lanes across closed epochs remain resumable, and there is no automatic retry loop.
+- `resume-lane --lane-id --resume-task-card --rationale [--model --provider-option ...]` resumes a
+  stopped, unaccepted lane in its retained worktree. No profile override keeps the saved provider
+  session; a complete changed profile starts a fresh session. See [resume profiles](docs/RESUME_PROFILES.md).
 - `manager acknowledge --event-id <top-level-event-id>` — move one event PENDING -> ACKNOWLEDGED; `manager close
   --event-id --outcome {COMPLETE,BLOCKED} --summary <text>` — close an acknowledged event (managed only).
 - `lease force-release --resource-id <id>` — recover one declared orphaned resource lease. The
   command refuses an exact live holder and fails closed unless current process and lane/run evidence
-  proves release is safe; follow its returned `next_action` instead of hand-editing lease records.
+  proves release is safe; follow its returned `next_action` instead of hand-editing leases.
+ext_action` instead of hand-editing lease records.
 - `send-lane-notification --lane-id --prompt` — append one assignment to a running managed lane.
 - `scan --no-write` — read-only lane-status snapshot; `watch --until-actionable [--timeout]
   [--until-event]` — block until an actionable condition exists. An event already delivered and
@@ -99,7 +101,9 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 1. Write `harness-config.json` at the harness root: the closed `harness-config/v1` shape with a
    required absolute `root_workspace`, optional absolute `manager_workspace` (ROOT hooks, skills
    and `.agent-workspace`; defaults to `root_workspace`), and optional `managed_coordination`
-   (`enabled` or `disabled`; default `enabled`). No other keys are legal.
+   (`enabled` or `disabled`; default `enabled`), plus optional `checkout_paths`, a nonempty list of
+   literal repository-relative directories materialized in new worker worktrees. Omission keeps
+   full checkout. Sparse checkout is not an access-control boundary. No other keys are legal.
 2. Write `resource-manifest.json`: the closed `resource-manifest/v1` shape with a literal `schema`
    field and a `resources` list. Every nonempty entry declares a nonempty `id` and
    `exclusive: true`; duplicate IDs and unknown fields are invalid.
@@ -157,7 +161,8 @@ keeps only a marker README, and runtime staging never reads it unless an operato
 places payloads there.
 
 Every lane model and model preference is explicit bootstrap configuration and is preserved for
-native resume. Codex requires `reasoning_effort` and `service_tier` provider options; Claude Code
+ordinary same-session resume. An explicit complete replacement profile on resume starts a fresh
+provider session in the same worktree; protected prior history and retry limits remain intact. Codex requires `reasoning_effort` and `service_tier` provider options; Claude Code
 requires `effort`; Qwen Code currently has no provider option beyond its required model. Missing,
 unknown, or duplicate options fail before an epoch, worktree, controller, or provider is created.
 Launcher bindings never select a model, effort, service tier, or fallback.
@@ -204,8 +209,9 @@ CLOSED proves cleanup; it does not prove the user's task was completed or indepe
 
 ## Resume, force-stop, retire, shutdown
 
-- `resume-lane` re-runs a stopped, unaccepted lane in its same worktree and provider session with
-  a fresh `run_id`; it never reconstructs a session, PID, or worktree.
+- `resume-lane` re-runs a stopped, unaccepted lane in its same worktree with a fresh `run_id`.
+  With no overrides it resumes the saved session; a complete explicit changed profile starts a
+  fresh session without transferring conversation history. See [resume profiles](docs/RESUME_PROFILES.md).
 - `lane force-stop` hard-stops one stuck lane by exact recorded identity.
 - `lane retire` gracefully retires one accepted lane (by acceptance reference) with
   cleanup-proof-first and archive-first semantics.
@@ -221,6 +227,15 @@ the registered binding and never copies a binding into product source. Local con
 belongs under `local-config/`; runtime state lives under the configured root workspace's
 `.harness-runtime` with a fresh epoch per live run. Keep source directories free of runtime
 output.
+
+## Usage accounting
+
+`scripts/collect_usage.py` provides provider-aware `run`, `resume`, `snapshot`, `gate`, `finalize`,
+and `summarize`, while existing Codex collector commands remain compatible. Claude accounting uses
+the top-level terminal `modelUsage` rollup, including built-in subagents where recorded. The
+comparison metric is uncached input plus output; cache read/create fields are separate and absent
+values stay unknown. Reports preserve provider-specific totals and flag mixed metric scope. Claude
+usage is fixture-qualified; authenticated live CLI qualification is unavailable and not claimed.
 
 ## Evidence and provider proof
 
@@ -248,3 +263,4 @@ rendered command as shell text.
 - `docs/HARNESS_WATCHER_GUIDE.md` — optional diagnostic watcher.
 - `docs/COLLECTOR_RECOVERY.md` — supported recovery for a sealed malformed or unmetered worker transcript blocking ROOT collector continuation, with safe shutdown, force-stop and retry steps.
 - `adapters/README.md` — provider adapter catalog and binding contract.
+- `docs/RESUME_PROFILES.md` — same-session resume and explicit fresh-session profile changes.

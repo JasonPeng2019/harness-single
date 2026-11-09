@@ -88,6 +88,12 @@ explicitly unproven by the current clean-source validator, never silently accept
 
 ## Functional requirements
 
+### Sparse worker checkout, resume profile changes, and usage metrics
+
+- Optional `checkout_paths` is a nonempty list of literal repository-relative directories. Omission keeps a full checkout. Selected paths use worktree-specific Git cone-mode sparse checkout, keep the exact assigned base commit and complete history, and may include Git-required top-level/ancestor files. The selected scope is not an access boundary. Validate paths against traversal, absolute/drive/UNC names, Git patterns, duplicates, and directories absent from the base commit before creating a lane branch/worktree. If tracked bootstrap inputs are excluded, refuse with an actionable list; never broaden the selection implicitly. Resume retains the configured scope.
+- `resume-lane` without profile overrides keeps the saved provider session and effective settings. An explicit model plus all required adapter options validates before mutation. On Codex resume, omitted `permission_mode` preserves the current effective mode, including strict legacy mode; changing permission requires an explicit option. An unchanged effective profile keeps the session; a changed profile preserves the lane/worktree, branch, assignment, dirty project files, commits, protected prior evidence, retry/resource counts, and creates a fresh native provider session under the same adapter. Conversation history is not transferred. Qwen Code has a valid empty option set. Existing failure blocks remain in force across the transition. ROOT model and provider are out of scope.
+- Provider-aware `scripts/collect_usage.py` retains Codex run/resume compatibility and provides provider-aware snapshot, gate, finalize and summarize. Claude extraction uses only a top-level terminal `modelUsage` rollup; comparison total is uncached input plus output, cache read/create fields remain separate, and missing values stay unknown. Resume deltas are keyed by provider and native session. Per-provider totals and aggregate metric scope remain visible; mixed metrics are not presented as a common comparison measure.
+
 ### Integrated native launch, retry, service and termination contract
 
 - Managed ROOT Stop requires runtime CLOSED even with no epoch, no queued events,
@@ -98,26 +104,20 @@ explicitly unproven by the current clean-source validator, never silently accept
   waits for fresh events after acknowledgement while preserving explicit acceptance.
 - Each explicit controller launch creates at most one provider invocation. There
   is no automatic correction, resume, fallback or relaunch. Protected operator-only
-  history allows initial invocation plus one explicit manual same-session retry
-  across run IDs. Reservations are durable before creation; uncertain, lost or
-  corrupt history cannot replenish the allowance. Worker-local logs are diagnostic.
+  history allows the initial invocation plus one explicit manual retry across run IDs. An explicit changed profile preserves this accounting and does not reset retry/resource counts. Reservations are durable before creation; uncertain, lost or corrupt history cannot replenish the allowance. Worker-local logs are diagnostic.
 - ROOT creation/resume requires its original matching prelaunch receipt: exact
   workspace, native hooks/configuration, harness inputs, selected ROOT sandbox mode,
   applicable sandbox proof and optional
   service identity. OPEN quiescent review resume proves worker cleanup; CLOSED
   resume proves the original service STOPPED and does not reopen lanes.
-- Windows isolated Codex launch requires operator health proof for the selected
-  binary/home/cache. The harness never performs sandbox setup. A first failure,
-  including before polling or before provider creation, durably blocks the run;
-  later resume, provider switching or explicit bypass cannot clear it.
+- Windows restricted Codex launch requires operator health proof for the selected mode, binary/home/cache, and generated profile. The harness never performs sandbox setup. A first failure, including before polling or provider creation, durably blocks the run; later resume, provider switching or explicit bypass cannot clear it.
 - Codex ROOT preparation accepts an explicit `--sandbox` matching its collector
   launch: `read-only`, `workspace-write` (unchanged default), or `danger-full-access`.
   Full access skips readiness for the unused OS sandbox but preserves the run-wide
   failure block and all session/configuration/service/cleanup validation. The mode
   is bound into preparation and launch evidence and cannot change on resume.
-  Older v2 receipts without a mode retain only default workspace-write semantics
-  and the original readiness requirement. Explicit worker `yolo` is an independent
-  full-access selection, not OS isolation or a sandbox-failure fallback.
+  Older v2 receipts without a mode retain strict historical semantics and the original readiness requirement. Explicit worker `yolo` is an independent full-access selection, not OS isolation or a sandbox-failure fallback.
+- For fresh Windows Codex bootstrap, omitted permission mode selects and records `worker-workspace`, a write-restricted profile without the broad operator/sibling read-denial list. Explicit `worker-isolated` retains strict read denials; explicit `yolo` bypasses the OS sandbox. Non-Windows defaults do not change. `worker-workspace` is not a read-confidentiality boundary. Its mode-specific readiness receipt is separate from ROOT receipts; strict qualification remains separate.
 - Linked-worktree worker permissions resolve and validate Git common/per-worktree
   metadata and pointer/backlink ownership. Directory writes cover the assigned
   private Git directory, shared objects, and its exclusive branch/ref/reflog parent
@@ -128,8 +128,7 @@ explicitly unproven by the current clean-source validator, never silently accept
   files are writable within that directory: protected assignment hashes detect
   changes before ROOT trusts the source, and operator reads explicitly select
   the protected common repository rather than worker config or inherited Git
-  redirects. Effective OS enforcement requires a genuine isolated CLI probe
-  beyond host Git/static profile tests. Explicit `yolo` retains its bypass behavior.
+  redirects. Effective OS enforcement requires the one-attempt native Windows probe and a mode-specific receipt beyond host Git/static profile checks. R8 reduced-mode concurrent-project acceptance remains a separate qualification. Explicit `yolo` retains its bypass behavior.
 - The optional build/test interface selects exact committed inputs and fixed argv
   through an operator-owned hash-pinned adapter. It forwards no arbitrary credential
   environment, preserves native diagnostics/status, and maps completed exit 75 to

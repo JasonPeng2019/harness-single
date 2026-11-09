@@ -67,11 +67,7 @@ results, operates hardware, or replaces the root orchestrator.
 
 ### `resume-lane`
 
-- `resume-lane --lane-id <id> --resume-task-card <path> [--rationale <text>]` — re-run a
-  stopped, unaccepted lane in its same worktree and provider session with a fresh `run_id`. It
-  never reconstructs a session, PID, or worktree. Resume prepares the invocation; it starts no
-  controller or provider until `lane launch`. Shutdown or force-stop can retire that pending
-  invocation using the same strict never-launched proof.
+- `resume-lane --lane-id <id> --resume-task-card <path> [--rationale <text>] [--model <model>] [--provider-option <name>=<value>]` resumes a stopped, unaccepted lane in its same worktree. With no profile overrides it continues the saved provider session. A complete changed profile archives the prior protected invocation/session/profile and prepares a fresh session; omitted Codex `permission_mode` retains the lane's effective mode, including historical strict mode. Permission changes must be explicit. Provider launch remains a separate command. See [resume profiles](../docs/RESUME_PROFILES.md).
 
 ### `manager` — manager-queue commands (managed only)
 
@@ -117,7 +113,7 @@ and ROOT additions share the inbox lock, so an addition preserves earlier update
 `harness-config.json` at the harness root is the closed `harness-config/v1` shape: a required
 absolute `root_workspace`, optional absolute `manager_workspace` (ROOT hooks, skills and
 `.agent-workspace`; defaults to `root_workspace`), and optional `managed_coordination`
-(`enabled` or `disabled`; default `enabled`). These are the only allowed keys.
+(`enabled` or `disabled`; default `enabled`), plus optional `checkout_paths`, a nonempty list of literal repository-relative directories to materialize in new worker worktrees. Omission means full checkout. Sparse checkout uses Git cone mode and preserves the assigned commit and complete history; Git may also materialize top-level and ancestor files. It is not an access-control boundary. Bootstrap refuses if selected paths omit tracked bootstrap inputs. These are the only allowed keys.
 `resource-manifest.json` is the closed
 `resource-manifest/v1` shape: a literal `schema` field plus a `resources` list; every nonempty
 entry declares a nonempty `id` and `exclusive: true`, and duplicate IDs or unknown fields are
@@ -146,6 +142,10 @@ Three provider IDs ship: `codex`, `claude-code`, and `qwen-code`. Each has one t
 payload files. The shipped tree keeps only a marker README, and runtime staging never reads it
 unless an operator explicitly places payloads there.
 
+## Worker checkout selection
+
+Optional `checkout_paths` applies to newly created worker worktrees only. Each entry is a literal repository-relative directory present at the assigned base commit. Git cone mode may materialize top-level and ancestor files in addition to selected directories. Bootstrap inputs must be included or bootstrap refuses before creating a branch/worktree; it never silently broadens the selection. Excluded files remain in Git history and this feature is not an isolation boundary. The exact base commit and normal history/commit behavior are retained, and resume keeps the selected scope.
+
 ## Super-cache and bootstrap
 
 `super-cache/workspace/` is the provider-neutral base staged into every managed worktree by
@@ -170,6 +170,10 @@ run. After promotion, it retains original bytes in the protected lane's
 `notice-archive/<run>/` before safely archiving the worker copy. A reused signal
 with changed bytes or an unsafe archive path is reported without overwriting
 other state or deleting a replacement notice.
+
+## Resume profiles
+
+Unchanged effective settings keep the native session. An explicit model/profile change uses the same provider adapter and worktree but starts a new native session; provider conversation is not transferred. Fresh Windows bootstrap defaults to `worker-workspace`; resume omission preserves the effective recorded or legacy strict mode. Supply `permission_mode` explicitly to change it. The transition preserves dirty project files, commits, assignment, protected history, retry limits, and resource accounting. Qwen Code accepts an empty provider-option set. See [resume profiles](../docs/RESUME_PROFILES.md) for complete examples and boundaries.
 
 ## Lane lifecycle and evidence
 
@@ -210,6 +214,10 @@ trigger automatic corrective launches. The lane/session budget is initial assign
 explicit manual retry across run IDs. An invalid RESULT or a provider startup/auth/process
 failure ends as `provider_exited_no_result` without a fresh context.
 
+## Usage accounting
+
+`scripts/collect_usage.py` is the provider-aware public route: `run`, `resume`, `snapshot`, `gate`, `finalize`, and `summarize`. Existing Codex collector commands remain compatible. Claude accounting reads only a genuine top-level terminal `modelUsage` rollup, uses uncached input plus output for its comparison metric, preserves cache fields separately, and keeps absent data unknown. Reports show provider-specific totals and the aggregate metric scope; mixed metrics are not a shared comparison measure. Fixture qualification is present; authenticated live Claude usage is not claimed.
+
 ## Read-only shipped source
 
 The shipped source (`adapters/`, `super-cache/`, `orchestrator_harness/`) is read-only product
@@ -235,8 +243,9 @@ operator must prepare native hooks/monitor and a matching setup receipt with
 `--sandbox` selection: `workspace-write` (default), `read-only`, or `danger-full-access`.
 Windows isolated modes require the read-only environment-bound sandbox gate. Full access has no
 OS sandbox and does not require proof for that unused sandbox, but an existing run-wide failure
-block still refuses it. No mode switches or fallback occur on resume. The harness never initializes
-or repairs the sandbox. See `QUICK_START.md` for the explicit full-access ROOT/yolo-worker recipe
+block still refuses it. Ordinary resume does not change modes or fall back; a stopped worker profile
+change is an explicit F2 operation and cannot clear an existing failure block. The harness never
+initializes or repairs the sandbox. See `QUICK_START.md` for the explicit full-access ROOT recipe and worker permission choices
 and the isolated alternative. The optional project-configured build/test service
 stages a lane-local client and is stopped during shutdown. See
 [the integration guide](../docs/INTEGRATED_RUN_FIXES.md) for setup, limits and remaining work.

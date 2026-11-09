@@ -1,20 +1,21 @@
 # Collector recovery: sealed worker usage gaps, shutdown and retry
 
 This page is the supported recovery when a sealed ROOT Codex run cannot continue because a
-native worker transcript is malformed or otherwise unmetered. It documents behavior that already
-exists in `scripts/collect_codex_usage.py`, `scripts/token_ledger.py` and the public
-`operator_launch` commands. It adds no new flag and no new schema, never changes transcripts,
-never fabricates token counts, and never edits native runtime, cleanup, lease or queue records.
+native worker transcript is malformed or otherwise unmetered. It documents the existing Codex `usage-gaps.json` recovery contract implemented by
+`scripts/collect_usage.py` and `scripts/token_ledger.py`, together with the public
+`operator_launch` commands. This page does not define a Claude usage-gap receipt or Claude recovery
+qualification. It never changes transcripts, fabricates token counts, or edits native runtime,
+cleanup, lease or queue records.
 
 ## Symptom
 
-`resume`, `snapshot`, `gate` or `finalize` refuses the run, for example:
+`resume`, `snapshot`, `gate` or `finalize` on a Codex task refuses the run, for example:
 
 ```text
 error: malformed transcript at <worker transcript path>:<physical line>: <decode error>
 ```
 
-Exit code 2. Strict accounting counts only exact terminal `turn.completed` usage. A sealed run
+Exit code 2. Codex strict accounting counts only exact terminal `turn.completed` usage. A sealed run
 with an unmetered worker stays blocked until an operator supplies one explicit receipt for that
 exact worker invocation. The same receipt covers a sealed worker attempt that ended without
 terminal usage. A malformed ROOT transcript is always refused: there is no receipt for it, and no
@@ -22,8 +23,7 @@ automatic recovery flag exists.
 
 ## The receipt: `<root_run_dir>/usage-gaps.json`
 
-`root_run_dir` is the run directory named by `root_run_dir` in the run's `task.json` (created by
-`collect_codex_usage.py run` under `--results-dir/<run-id>`; it already holds `task.json`,
+`root_run_dir` is the run directory named by `root_run_dir` in the run's `task.json` (created by the Codex `run` command under `--results-dir/<run-id>`; it already holds `task.json`,
 `launch.json`, `manifest.json` and `codex-events.jsonl`). Write `usage-gaps.json` there in the
 existing `codex-usage-gaps/v1` schema:
 
@@ -91,7 +91,7 @@ is an unknown original identity or an exact original incarnation that is still l
 reuse is not an owner match: an unrelated new process that happens to reuse a recorded PID is
 not the original incarnation, must survive (it is never terminated and it is not cleanup
 proof), and the original exact identity can still be proven gone by its recorded creation
-identity. The damaged bytes are never rewritten: `finalize` copies the exact transcript bytes,
+identity. The damaged bytes are never rewritten: Codex `finalize` copies the exact transcript bytes,
 re-verifies the recorded digest, and reports the inexact total honestly.
 
 ## Honest unknown counts, caps and continuation
@@ -139,8 +139,8 @@ task declared as `planned_resume`.
 6. Verify with the read-only commands:
 
    ```powershell
-   python scripts/collect_codex_usage.py snapshot --task-file "<root_run_dir>/task.json"
-   python scripts/collect_codex_usage.py gate --task-file "<root_run_dir>/task.json"
+   python scripts/collect_usage.py snapshot --task-file "<root_run_dir>/task.json"
+   python scripts/collect_usage.py gate --task-file "<root_run_dir>/task.json"
    ```
 
 7. Confirm the ROOT pre-launch prerequisites for the same run id. The original run must have been
@@ -148,12 +148,16 @@ task declared as `planned_resume`.
    CLOSED runtime revalidates the existing pre-launch receipt; if the runtime was reopened with
    `harness setup`, run pre-launch preparation with the SAME run id first, as described in
    [Quick Start](../QUICK_START.md) and the [integration guide](INTEGRATED_RUN_FIXES.md).
-8. Resume the saved ROOT session. `resume` has exactly three options; model, effort, tier,
-   sandbox, workspace, harness runtime and the remaining watchdog are re-derived from the
-   original launch record, and the same native session is continued:
+8. Resume the saved ROOT session. The resume command accepts the task file and prompt, an optional
+   `--provider` assertion, and the optional `--continue-open-runtime` lifecycle flag. The provider
+   assertion must match the ROOT provider recorded at launch. Model, effort, tier, sandbox, workspace,
+   harness runtime and remaining watchdog are re-derived from the original launch record; ROOT
+   continues its same native session and profile. ROOT model replacement is not part of F2: F2
+   applies to stopped worker lanes only.
 
    ```powershell
-   python scripts/collect_codex_usage.py resume `
+   python scripts/collect_usage.py resume `
+     --provider codex `
      --task-file "<root_run_dir>/task.json" `
      --prompt-file "<continuation prompt>"
    ```
@@ -204,18 +208,25 @@ python -m orchestrator_harness.operator_launch lane launch --lane-id <id>
 `resume-lane` requires the OPEN runtime produced by setup, the retained worktree and the saved
 provider session; it prepares a fresh run id and starts nothing until `lane launch`. A lane
 retired in the current epoch refuses resume ("resume is not a cleanup tool"), as do an accepted
-lane and a lane that already used its initial assignment plus one explicit retry. There is no
-automatic retry, no model switch, and no session, PID or worktree reconstruction.
+lane and a lane that already used its initial assignment plus one explicit retry. There is no automatic retry or automatic profile switch, and no session, PID or worktree
+reconstruction. An operator may explicitly change a stopped, unaccepted worker lane's model/profile
+under F2 with `resume-lane`; it preserves the same worktree and starts a fresh worker session. That
+worker transition does not change ROOT's recorded model/session or change the Codex gap-recovery
+contract. See [resume profiles](RESUME_PROFILES.md).
 
 ## Where this contract lives
 
 - `scripts/token_ledger.py` - `usage_gap_receipts`, `validate_usage_gap`, `extract_usage`,
   `build_snapshot` and `finalize` accounting.
-- `scripts/collect_codex_usage.py` - `prepare_resume` guards and the `run`, `resume`, `snapshot`,
-  `gate` and `finalize` commands.
+- `scripts/collect_usage.py` - provider-aware public entrypoint; `run`/`resume` retain Codex command
+  compatibility, and provider identity assertions bind to recorded ROOT identity.
+- `scripts/collect_codex_usage.py` - the legacy Codex-compatible collector implementation and its
+  `prepare_resume` guards.
 - `orchestrator_harness/shutdown.py` - `run_shutdown` CLOSED/cleanup proof and refusal codes.
 - `orchestrator_harness/launch.py` - `run_force_stop` exact-identity cancellation.
 - `orchestrator_harness/resume.py` - `resume-lane` retained saved-session retry rules.
 - `orchestrator_harness/lane_cleanup.py` - `cleanup_is_proven` native identity checks.
 
-Focused regression coverage is `scripts/tests/test_collector_continuation.py`.
+Focused Codex recovery regression coverage is `scripts/tests/test_collector_continuation.py`.
+Claude transcript accounting has provider-specific fixtures and metrics, but this document does not
+claim live Claude CLI/authentication or gap-recovery qualification.

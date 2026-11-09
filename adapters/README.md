@@ -27,12 +27,24 @@ Each `harness/launcher_binding.py` must define the strict symbols:
 - `parse_line(line)` — read one provider output line into a dict with
   optional `message`, `session_id`, and `non_retryable_failure` keys, or `None`.
 
-Each binding implements native continuation in its own `build_argv`: a resume call uses the
+Each binding implements native continuation in its own `build_argv`: ordinary resume uses the
 saved provider session and `resume=True`; a missing session is an honest error, never a
 fresh-context fallback. The exact model and canonical launch configuration are recorded at
-bootstrap and reused on continuation. Bindings may hard-code transport and safety flags required
+bootstrap and reused on continuation. A stopped, unaccepted lane may explicitly replace its model
+and complete adapter-required options through `resume-lane`. A changed effective profile starts a
+fresh provider session under the same adapter and worktree; it does not transfer conversation
+history. Codex requires `reasoning_effort` and `service_tier`, Claude Code requires `effort`, and
+Qwen Code has a valid empty option set. Bindings may hard-code transport and safety flags required
 by the harness contract, but never a model, reasoning effort, service tier, fallback model, or
 other model preference. Provider startup/auth/process failures are marked non-retryable.
+
+For a fresh Windows Codex bootstrap, omitted `permission_mode` selects and records the write-
+restricted `worker-workspace` profile. On resume, omitted `permission_mode` preserves the lane's
+effective mode, including strict legacy mode; changing it requires the explicit provider option. Explicit `worker-isolated` retains the strict broad
+read-denial profile; explicit `yolo` disables OS sandbox enforcement. Non-Windows defaults stay as
+they were. Historical invocation records without a mode retain the strict interpretation. ROOT's
+sandbox mode is an independent setting. `worker-workspace` has no read-confidentiality guarantee
+and its mode-specific Windows receipt does not qualify strict mode.
 
 The controller loads the single registered binding and checks that its
 `PROVIDER_ID` matches before use.
