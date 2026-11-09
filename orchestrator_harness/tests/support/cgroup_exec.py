@@ -5,6 +5,12 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Protocol, cast
+
+
+class _LinuxOS(Protocol):
+    def geteuid(self) -> int: ...
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from harness_common.platform_paths import cgroup_root
@@ -18,7 +24,7 @@ def main() -> int:
     parser.add_argument("--network-namespace")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if os.geteuid() != 0:
+    if cast(_LinuxOS, os).geteuid() != 0:
         raise RuntimeError("cgroup launcher must run as root")
     command = args.command
     if command and command[0] == "--":

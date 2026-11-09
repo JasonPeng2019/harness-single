@@ -23,7 +23,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 # Support scripts can run directly from an unpacked harness distribution.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -45,6 +45,12 @@ FORBIDDEN_COMMAND_MARKERS = (
     "openocd",
     "st-util",
 )
+
+
+class _LinuxOS(Protocol):
+    def chown(self, path: Path, uid: int, gid: int) -> None: ...
+
+    def geteuid(self) -> int: ...
 
 
 def utc_now() -> str:
@@ -90,12 +96,12 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
 def chown_tree(root: Path, uid: int = NOBODY, gid: int = NOBODY) -> None:
     if not root.is_dir():
         raise RuntimeError(f"workspace ownership root is unavailable: {root}")
-    os.chown(root, uid, gid)
+    cast(_LinuxOS, os).chown(root, uid, gid)
     for directory, directories, files in os.walk(root):
         for name in directories:
-            os.chown(Path(directory) / name, uid, gid)
+            cast(_LinuxOS, os).chown(Path(directory) / name, uid, gid)
         for name in files:
-            os.chown(Path(directory) / name, uid, gid)
+            cast(_LinuxOS, os).chown(Path(directory) / name, uid, gid)
 
 
 def copy_harness_source(source_root: Path, destination: Path) -> Path:
@@ -143,7 +149,14 @@ def minimal_auth(source: Path, destination: Path) -> tuple[list[str], str, str]:
     account = tokens.get("account_id")
     id_token = tokens.get("id_token")
     refresh = tokens.get("refresh_token")
-    if not all(isinstance(item, str) and item for item in (access, account, id_token)):
+    if (
+        not isinstance(access, str)
+        or not access
+        or not isinstance(account, str)
+        or not account
+        or not isinstance(id_token, str)
+        or not id_token
+    ):
         raise RuntimeError("source Codex auth lacks token/account/ID fields")
     expiry = token_expiry(access)
     id_expiry = token_expiry(id_token)
@@ -792,7 +805,8 @@ def claim_prepared_state(
 
 
 def _prepare(args: argparse.Namespace) -> int:
-    if os.geteuid() != 0:
+    linux_os = cast(_LinuxOS, os)
+    if linux_os.geteuid() != 0:
         raise RuntimeError("Linux preparation requires root for cgroup/netns setup")
     _valid_hex(args.run_id, 32, "run-id")
     _valid_hex(args.nonce, 64, "nonce")
@@ -836,7 +850,7 @@ def _prepare(args: argparse.Namespace) -> int:
     # The sandbox uid must be able to traverse the whole disposable root to
     # reach the bound auth/codex-home; giving the root itself to the sandbox
     # owner keeps every later bind inside a nobody-owned subtree.
-    os.chown(temp_root, NOBODY, NOBODY)
+    linux_os.chown(temp_root, NOBODY, NOBODY)
     cgroup = cgroup_root() / f"orchestrator-harness-{args.run_id}"
     network: dict[str, Any] | None = None
     secrets: list[str] = []
@@ -849,8 +863,8 @@ def _prepare(args: argparse.Namespace) -> int:
             Path(args.auth_json).resolve(strict=True), codex_home / "auth.json"
         )
         chown_tree(workspace)
-        os.chown(codex_home, NOBODY, NOBODY)
-        os.chown(codex_home / "auth.json", NOBODY, NOBODY)
+        linux_os.chown(codex_home, NOBODY, NOBODY)
+        linux_os.chown(codex_home / "auth.json", NOBODY, NOBODY)
         cgroup.mkdir()
         metadata = cgroup.lstat()
         cgroup_identity = (metadata.st_dev, metadata.st_ino)

@@ -16,7 +16,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from harness_common.platform_paths import procfs_root
@@ -28,6 +28,10 @@ except ImportError:  # Direct support-script execution.
 
 
 BRIDGE_SCHEMA = "orchestrator-wsl-provider-bridge/v1"
+
+
+class _LinuxOS(Protocol):
+    def fork(self) -> int: ...
 
 
 def _sandbox_arguments(arguments: list[str], layout: dict[str, Any]) -> list[str]:
@@ -88,7 +92,7 @@ def _linux_creation_identity(pid: int) -> str:
 def _fork_provider(command: list[str]) -> int:
     """Run the containment launcher without an unowned Python Popen handle."""
 
-    pid = os.fork()
+    pid = cast(_LinuxOS, os).fork()
     if pid == 0:
         try:
             os.execv(command[0], command)
@@ -190,6 +194,8 @@ def main() -> int:
             timeout=30.0,
             expected_identity=tuple(state["cgroup_identity"]),
         )
+        if codex_pid is None:
+            raise RuntimeError("prepared Codex provider PID could not be discovered")
         codex_created = _linux_creation_identity(codex_pid)
         _ = proc_exe(codex_pid)
         _, wait_status = os.waitpid(linux_bridge_pid, 0)

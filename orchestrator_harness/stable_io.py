@@ -8,7 +8,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .models import StableBytes
 from .mutation import (
@@ -204,7 +204,7 @@ class PathKeyedAppendLock:
                 _PATH_LOCK_REGISTRY.release(self.key, entry)
 
 
-def _jsonl_bytes(records: list[Mapping[str, Any]]) -> bytes:
+def _jsonl_bytes(records: Sequence[Mapping[str, Any]]) -> bytes:
     return b"".join(
         (canonical_json(dict(record)) + "\n").encode("utf-8") for record in records
     )
@@ -523,7 +523,7 @@ class PreparedOutputTransaction:
         except (MutationConflict, MutationUnsupported, ValueError) as exc:
             raise PathSafetyError(str(exc)) from exc
 
-    def append_jsonl(self, path: Path, records: list[Mapping[str, Any]]) -> None:
+    def append_jsonl(self, path: Path, records: Sequence[Mapping[str, Any]]) -> None:
         if not records:
             return
         target = self._admit_for_write(path)
