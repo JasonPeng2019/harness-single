@@ -1,7 +1,8 @@
-"""Provider-aware read-only usage reports for protected task evidence.
+"""Provider-aware ROOT capture and usage accounting.
 
-Provider identity comes from the task's ROOT launch and each protected worker
-invocation. This command never launches, resumes, or modifies a native session.
+``run`` and ``resume`` delegate to the protected provider capture lifecycle.
+Reports and transcript summaries read provider identity from ROOT launch and
+protected worker evidence; reporting never modifies native session history.
 """
 from __future__ import annotations
 

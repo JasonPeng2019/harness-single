@@ -11,7 +11,7 @@ Use the provider-aware companion from the harness source or installed data tree:
 
 ```powershell
 python scripts/prepare_root_launch.py --harness-dir . --workspace <manager-workspace> --run-id <run-id> --provider claude-code
-python scripts/collect_usage.py run --provider claude-code --run-id <run-id> --task "<task>" --arm harness --cwd <manager-workspace> --prompt-file <prompt-file> --results-dir <results-dir> --model <claude-model> --effort <effort> --harness-runtime <manager-workspace>/.harness-runtime --harness-dir . --trust-project-hooks --watchdog-hours 4 --interrupted-run
+python scripts/collect_usage.py run --provider claude-code --run-id <run-id> --task "<task>" --arm harness --cwd <manager-workspace> --prompt-file <prompt-file> --results-dir <results-dir> --model <claude-model> --effort <effort> --harness-runtime <product-workspace>/.harness-runtime --harness-dir . --trust-project-hooks --watchdog-hours 4 --interrupted-run
 python scripts/collect_usage.py snapshot --task-file <root-run-dir>/task.json
 python scripts/collect_usage.py gate --task-file <root-run-dir>/task.json
 python scripts/collect_usage.py finalize --task-file <root-run-dir>/task.json --output <archive-dir>
