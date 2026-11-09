@@ -16,6 +16,7 @@ from . import processes
 from .setup import COMPOSED_PAYLOADS
 from .bootstrap import (
     _validate_provider_launch_config,
+    normalize_fresh_launch_config,
     _worker_output,
     _write_invocation,
     _write_result_template,
@@ -140,6 +141,25 @@ def _effective_provider_record(provider: dict[str, Any]) -> dict[str, Any]:
         # An omitted persisted Codex mode remains its historical strict profile.
         effective["launch_config"].setdefault("permission_mode", "worker-isolated")
     return effective
+
+
+def _regenerate_codex_profile_if_needed(
+    worktree: Path, harness_root: Path, config: Any,
+    old_provider: dict[str, Any], new_provider: dict[str, Any],
+) -> Path | None:
+    """Regenerate the owned file only when the replacement selects a worker profile."""
+    if old_provider.get("id") != "codex" or new_provider.get("id") != "codex":
+        return None
+    old_mode = old_provider.get("launch_config", {}).get("permission_mode", "worker-isolated")
+    new_mode = new_provider.get("launch_config", {}).get("permission_mode", "worker-isolated")
+    if old_mode == new_mode or new_mode == "yolo":
+        return None
+    from .bootstrap import regenerate_codex_worker_profile
+    return regenerate_codex_worker_profile(
+        worktree, harness_root, config.root_workspace,
+        permission_mode=new_mode,
+        manager_workspace=config.manager_workspace,
+    )
 
 
 def _has_valid_acceptance_chain(
@@ -419,16 +439,19 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
         }
 
     profile_requested = model is not None or launch_config is not None
-    if profile_requested and (model is None or launch_config is None):
+    if model is None and launch_config is not None:
         return {
             "ok": False, "code": PROFILE_CHANGE_INVALID,
-            "summary": "explicit profile change requires --model and the complete set of --provider-option values",
+            "summary": "provider options require an explicit --model on resume",
             "evidence_paths": [],
-            "next_action": "pass --model and every provider-required --provider-option, or omit both to keep the saved profile",
+            "next_action": "pass --model with the complete provider profile, or omit model and provider options to keep the saved profile",
         }
+    if model is not None and launch_config is None:
+        launch_config = {}
     replacement_provider = lane.get("provider")
     if profile_requested:
         try:
+            launch_config = normalize_fresh_launch_config(lane["provider"]["id"], launch_config)
             configured = _validate_provider_launch_config(
                 harness_root, provider_id=lane["provider"]["id"],
                 model=model, launch_config=launch_config,
@@ -618,16 +641,10 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             current = read_lane(rt, epoch_id, lane_id)
             if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
                 raise ValueError("lane run or status changed before prior run cleanup")
-            if profile_changed and lane["provider"]["id"] == "codex":
-                old_mode = lane["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated")
-                new_mode = replacement_provider["launch_config"].get("permission_mode", "worker-isolated")
-                if old_mode != new_mode and new_mode != "yolo":
-                    from .bootstrap import regenerate_codex_worker_profile
-                    regenerate_codex_worker_profile(
-                        worktree, harness_root, config.root_workspace,
-                        permission_mode=new_mode,
-                        manager_workspace=config.manager_workspace,
-                    )
+            if profile_changed:
+                _regenerate_codex_profile_if_needed(
+                    worktree, harness_root, config, lane["provider"], replacement_provider
+                )
             _clear_prior_run(rt, epoch_id, lane, output=output)
             if managed:
                 _reset_worker_inbox(worktree, lane_id, run_id, output=output)

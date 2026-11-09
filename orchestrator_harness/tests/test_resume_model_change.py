@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from orchestrator_harness import operator_launch, resume
+from orchestrator_harness.bootstrap import BootstrapError, normalize_fresh_launch_config
 from orchestrator_harness.config import HarnessConfig
 from orchestrator_harness.epochs import lane_record_dir
 from orchestrator_harness.lanes import read_lane, write_lane
@@ -35,7 +36,7 @@ class ResumeModelChangeTests(unittest.TestCase):
             "lane_id": "lane-1", "run_id": "old-run", "lifecycle": "review_pending",
             "worktree_path": "unused", "provider": {"id": "codex"}, "process": {},
         }
-        for model, options in ((None, {"reasoning_effort": "high"}), ("new-model", None)):
+        for model, options in ((None, {"reasoning_effort": "high"}),):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 with (
@@ -53,6 +54,26 @@ class ResumeModelChangeTests(unittest.TestCase):
             self.assertEqual(resume.PROFILE_CHANGE_INVALID, result["code"])
             mutation.assert_not_called()
             validate.assert_not_called()
+
+    def test_model_only_uses_adapter_catalog_defaults_and_required_options(self):
+        harness_root = Path(__file__).resolve().parents[2]
+        self.assertEqual({}, normalize_fresh_launch_config("qwen-code", {}))
+        from orchestrator_harness.bootstrap import _validate_provider_launch_config
+        self.assertEqual({}, _validate_provider_launch_config(
+            harness_root, provider_id="qwen-code", model="qwen-test-model", launch_config={}
+        ))
+        with self.assertRaisesRegex(BootstrapError, "missing"):
+            _validate_provider_launch_config(
+                harness_root, provider_id="codex", model="codex-test-model", launch_config={}
+            )
+
+    def test_fresh_windows_codex_default_is_worker_workspace(self):
+        import os
+        config = normalize_fresh_launch_config("codex", {"reasoning_effort": "high", "service_tier": "default"})
+        if os.name == "nt":
+            self.assertEqual("worker-workspace", config["permission_mode"])
+        else:
+            self.assertNotIn("permission_mode", config)
 
     def test_invalid_complete_profile_refuses_before_lane_or_worktree_mutation(self):
         lane = {
@@ -76,6 +97,39 @@ class ResumeModelChangeTests(unittest.TestCase):
         self.assertEqual(resume.PROFILE_CHANGE_INVALID, result["code"])
         self.assertIn("missing service_tier", result["summary"])
         mutation.assert_not_called()
+
+    def test_codex_permission_migration_regenerates_only_for_worker_profiles(self):
+        config = SimpleNamespace(root_workspace=Path("product"), manager_workspace=Path("manager"))
+        old = {"id": "codex", "model": "old", "launch_config": {"permission_mode": "worker-isolated"}}
+        for new_mode, should_regenerate in (("worker-workspace", True), ("worker-isolated", False), ("yolo", False)):
+            new = {"id": "codex", "model": "new", "launch_config": {"permission_mode": new_mode}}
+            with patch("orchestrator_harness.bootstrap.regenerate_codex_worker_profile",
+                       return_value=Path("worker/.codex/config.toml")) as regenerate:
+                result = resume._regenerate_codex_profile_if_needed(
+                    Path("worker"), Path("harness"), config, old, new
+                )
+            self.assertEqual(should_regenerate, regenerate.called)
+            if should_regenerate:
+                regenerate.assert_called_once_with(
+                    Path("worker"), Path("harness"), Path("product"),
+                    permission_mode="worker-workspace", manager_workspace=Path("manager"),
+                )
+                self.assertEqual(Path("worker/.codex/config.toml"), result)
+            else:
+                self.assertIsNone(result)
+
+        yolo = {"id": "codex", "model": "old", "launch_config": {"permission_mode": "yolo"}}
+        workspace = {"id": "codex", "model": "new", "launch_config": {"permission_mode": "worker-workspace"}}
+        with patch("orchestrator_harness.bootstrap.regenerate_codex_worker_profile") as regenerate:
+            resume._regenerate_codex_profile_if_needed(Path("worker"), Path("harness"), config, yolo, workspace)
+        regenerate.assert_called_once()
+
+    def test_historical_omitted_codex_mode_matches_explicit_strict_mode(self):
+        omitted = {"id": "codex", "model": "same", "launch_config": {"reasoning_effort": "high"}}
+        explicit = {"id": "codex", "model": "same", "launch_config": {
+            "reasoning_effort": "high", "permission_mode": "worker-isolated",
+        }}
+        self.assertEqual(resume._effective_profile(omitted), resume._effective_profile(explicit))
 
     def test_archive_keeps_exact_prior_identity_and_dirty_product_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
