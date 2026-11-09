@@ -131,6 +131,28 @@ class ResumeModelChangeTests(unittest.TestCase):
         }}
         self.assertEqual(resume._effective_profile(omitted), resume._effective_profile(explicit))
 
+    def test_windows_resume_keeps_saved_permission_mode_when_override_omits_it(self):
+        for saved, expected in (
+            ({"reasoning_effort": "high"}, "worker-isolated"),
+            ({"permission_mode": "worker-workspace"}, "worker-workspace"),
+            ({"permission_mode": "yolo"}, "yolo"),
+        ):
+            with self.subTest(saved=saved):
+                configured = resume._resume_launch_config(
+                    "codex", saved, {"reasoning_effort": "xhigh", "service_tier": "priority"}
+                )
+                self.assertEqual(expected, configured["permission_mode"])
+                self.assertEqual("xhigh", configured["reasoning_effort"])
+                self.assertEqual("priority", configured["service_tier"])
+                self.assertNotIn("launcher", configured)
+
+        explicit = resume._resume_launch_config(
+            "codex", {"permission_mode": "yolo"},
+            {"reasoning_effort": "xhigh", "service_tier": "priority", "permission_mode": "worker-workspace"},
+        )
+        self.assertEqual("worker-workspace", explicit["permission_mode"])
+        self.assertEqual({"reasoning_effort", "service_tier", "permission_mode"}, set(explicit))
+
     def test_archive_keeps_exact_prior_identity_and_dirty_product_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

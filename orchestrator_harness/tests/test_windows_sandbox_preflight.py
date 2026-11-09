@@ -54,7 +54,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value), encoding="utf-8")
 
-    def ready(self, permission_mode="worker-isolated"):
+    def ready(self, permission_mode: str = "worker-isolated") -> None:
         self.write(self.marker, {"version": 1, "offline_username": "offline", "online_username": "online"})
         profile = self.base / "probe-worker/.codex/config.toml"
         profile.parent.mkdir(parents=True, exist_ok=True)
@@ -91,10 +91,15 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
             "backend_id": "codex-windows-elevated", "probe_profile_sha256": sandbox.digest(profile),
         })
 
-    def check(self, *, permission_mode="worker-isolated", **kwargs):
+    def check(self, *, permission_mode: str | None = "worker-isolated", **kwargs) -> dict[str, object]:
         with patch.object(sandbox.os, "name", "nt"):
-            return sandbox.require_ready(self.harness, workspace=self.workspace, executable=str(self.native),
-                                         permission_mode=permission_mode, **kwargs)
+            health = sandbox.require_ready(
+                self.harness, workspace=self.workspace, executable=str(self.native),
+                permission_mode=permission_mode, **kwargs,
+            )
+        if health is None:
+            self.fail("Windows sandbox preflight returned no health receipt")
+        return health
 
     def test_missing_local_policy_does_not_disable_windows_gate(self):
         (self.harness / sandbox.POLICY).unlink()

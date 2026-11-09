@@ -496,7 +496,8 @@ def start_service(harness: Path, root: Path) -> dict | None:
 
 def install_route(harness: Path, root: Path, lane: Path, lane_id: str, run_id: str, *,
                   output: PreparedOutputTransaction | None = None) -> None:
-    if policy(harness) is None:
+    selected = policy(harness)
+    if selected is None:
         if (home(root) / "service.json").exists() or (home(root) / "config.json").exists():
             raise ValueError("configured public check service policy is missing")
         return
@@ -505,7 +506,6 @@ def install_route(harness: Path, root: Path, lane: Path, lane_id: str, run_id: s
     if (lane.parent.parent != root.resolve() / ".harness-runtime/worktrees"
             or lane.name != lane_id or not re.fullmatch(r"[a-f0-9]{32}", run_id)):
         raise ValueError("public check route must select one exact native lane")
-    selected = policy(harness)
     worker_mode = _require_worker_mode_compatible(selected, service_record.get("backend", {}), lane)
     helper = harness / "tools/worker_public_check.py"
     agent = lane / ".agent-workspace"

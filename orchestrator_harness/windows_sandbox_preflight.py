@@ -144,8 +144,11 @@ def require_ready(
         raise _blocked("a worker profile path requires an explicit worker permission mode")
     profile_hash = None
     if isolation_config_path is not None:
+        profile_mode = permission_mode
+        if profile_mode is None:
+            raise _blocked("a worker profile path requires an explicit worker permission mode")
         try:
-            profile_hash = validate_worker_profile(Path(isolation_config_path), permission_mode)
+            profile_hash = validate_worker_profile(Path(isolation_config_path), profile_mode)
         except (OSError, ValueError) as exc:
             raise _blocked(str(exc)) from exc
     expected_contract = profile_contract_digest(harness, permission_mode) if permission_mode else None

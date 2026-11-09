@@ -16,7 +16,6 @@ from . import processes
 from .setup import COMPOSED_PAYLOADS
 from .bootstrap import (
     _validate_provider_launch_config,
-    normalize_fresh_launch_config,
     _worker_output,
     _write_invocation,
     _write_result_template,
@@ -134,6 +133,17 @@ def _effective_profile(provider: dict[str, Any]) -> tuple[str, str, tuple[tuple[
     )
 
 
+def _resume_launch_config(
+    provider_id: str, saved_launch_config: Any, requested_launch_config: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep a saved Codex permission boundary when replacing only other options."""
+    configured = dict(requested_launch_config)
+    if provider_id == "codex" and "permission_mode" not in configured:
+        saved = saved_launch_config if isinstance(saved_launch_config, dict) else {}
+        configured["permission_mode"] = saved.get("permission_mode", "worker-isolated")
+    return configured
+
+
 def _effective_provider_record(provider: dict[str, Any]) -> dict[str, Any]:
     effective = {**provider, "launch_config": dict(provider.get("launch_config") or {})}
     if effective.get("id") == "codex":
@@ -232,11 +242,10 @@ PROFILE_HISTORY_SCHEMA = "provider-profile-transition/v1"
 
 
 def _profile_history_folder(rt: Path, epoch_id: str, lane: dict[str, Any]) -> Path:
-    source_epoch = (
-        lane.get("resume_from_epoch_id")
-        if lane.get("lifecycle") == "resuming" and isinstance(lane.get("resume_from_epoch_id"), str)
-        else epoch_id
-    )
+    resume_from_epoch = lane.get("resume_from_epoch_id")
+    source_epoch = epoch_id
+    if lane.get("lifecycle") == "resuming" and isinstance(resume_from_epoch, str):
+        source_epoch = resume_from_epoch
     return lane_record_dir(rt, source_epoch, lane["lane_id"]) / "resume-history" / str(lane["run_id"])
 
 
@@ -448,13 +457,17 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
         }
     if model is not None and launch_config is None:
         launch_config = {}
-    replacement_provider = lane.get("provider")
+    replacement_provider = lane["provider"]
     if profile_requested:
         try:
-            launch_config = normalize_fresh_launch_config(lane["provider"]["id"], launch_config)
+            if model is None:
+                raise ValueError("an explicit model is required for a profile change")
+            replacement_launch_config = _resume_launch_config(
+                lane["provider"]["id"], lane["provider"].get("launch_config"), launch_config or {}
+            )
             configured = _validate_provider_launch_config(
                 harness_root, provider_id=lane["provider"]["id"],
-                model=model, launch_config=launch_config,
+                model=model, launch_config=replacement_launch_config,
             )
         except Exception as exc:
             return {
@@ -467,7 +480,7 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             **lane["provider"], "model": model.strip(), "launch_config": configured,
         }
     profile_changed = profile_requested and (
-        _effective_profile(replacement_provider) != _effective_profile(lane.get("provider"))
+        _effective_profile(replacement_provider) != _effective_profile(lane["provider"])
     )
     if profile_requested and not profile_changed:
         replacement_provider = lane["provider"]
@@ -630,6 +643,8 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                     rationale=rationale or "explicit operator profile change",
                     output=output,
                 )
+                if history is None:
+                    raise ValueError("profile transition history was not prepared")
                 transition = read_json(history / "transition.json")
                 run_id = transition["to_run_id"]
                 from .retry_policy import record_profile_transition
@@ -655,6 +670,8 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             )
             _write_result_template(worktree, lane_id, run_id, output=output)
             if profile_changed:
+                if history is None:
+                    raise ValueError("profile transition history was not prepared")
                 prior_invocation_path = history / "invocation.json"
                 prior_invocation = read_json(prior_invocation_path)
             exclusive_resources = list(prior_invocation["exclusive_resources"])
