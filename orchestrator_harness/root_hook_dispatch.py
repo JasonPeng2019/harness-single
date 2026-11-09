@@ -185,7 +185,10 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
         from .shutdown import prove_runtime_closed
 
         try:
-            prove_runtime_closed(config.runtime_root, config.root_workspace, root)
+            root_workspace = config.root_workspace
+            if root_workspace is None:
+                raise ValueError("configured root workspace is unavailable")
+            prove_runtime_closed(config.runtime_root, root_workspace, root)
         except (RuntimeError, OSError, ValueError) as exc:
             reason = f"ROOT hook cannot prove CLOSED cleanup: {exc}"
             return (

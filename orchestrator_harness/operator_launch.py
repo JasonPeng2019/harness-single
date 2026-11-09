@@ -253,8 +253,12 @@ def _send_lane_notification(lane_id: str, prompt: str) -> dict[str, Any]:
     from . import processes
 
     process = lane.get("process") or {}
-    if lane.get("lifecycle") != "running" or not processes.identity_matches(
-        process.get("pid"), process.get("creation_time")
+    pid, creation = process.get("pid"), process.get("creation_time")
+    if (
+        lane.get("lifecycle") != "running"
+        or not processes._valid_pid(pid)
+        or not processes.valid_creation_identity(creation)
+        or not processes.identity_matches(pid, creation)
     ):
         return {
             "ok": False,

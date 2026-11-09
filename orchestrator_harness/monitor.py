@@ -366,6 +366,15 @@ def _transcript_contradicts(
     return False
 
 
+def _lease_owner_is_live(lease: dict[str, Any]) -> bool:
+    pid, creation = lease.get("pid"), lease.get("creation_time")
+    return (
+        processes._valid_pid(pid)
+        and processes.valid_creation_identity(creation)
+        and processes.identity_matches(pid, creation)
+    )
+
+
 def derive_lane_status(
     rt: Path,
     epoch_id: str,
@@ -390,12 +399,7 @@ def derive_lane_status(
             lease.get("lane_id") == lane.get("lane_id")
             and (
                 lease.get("run_id") != lane.get("run_id")
-                or not (
-                    isinstance(lease.get("pid"), int)
-                    and processes.identity_matches(
-                        lease.get("pid"), lease.get("creation_time")
-                    )
-                )
+                or not _lease_owner_is_live(lease)
             )
             for lease in leases
         )
@@ -410,8 +414,11 @@ def derive_lane_status(
     if lane.get("lifecycle") == "prepared":
         return None
     process = lane.get("process") or {}
-    controller_alive = processes.identity_matches(
-        process.get("pid"), process.get("creation_time")
+    process_pid, process_creation = process.get("pid"), process.get("creation_time")
+    controller_alive = (
+        processes._valid_pid(process_pid)
+        and processes.valid_creation_identity(process_creation)
+        and processes.identity_matches(process_pid, process_creation)
     )
     if lane.get("launch_pending") is True:
         return None

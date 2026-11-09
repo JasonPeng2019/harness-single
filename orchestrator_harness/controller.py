@@ -928,6 +928,7 @@ def run_controller(lane_id: str) -> int:
     attempt_number = 1
     # One provider invocation per launcher call. Failures are evidence for
     # diagnosis; they never cause an automatic resume/correction/fresh launch.
+    recorded = "review_pending"
     for _ in range(1):
         attempt_paths = _attempt_paths(lane, attempt_number)
         try:
@@ -1202,7 +1203,6 @@ def run_controller(lane_id: str) -> int:
                 lane_id,
                 lambda current: {**current, "lifecycle": "review_pending"},
             )
-            recorded = "review_pending"
             break
 
         # Preserve the session/result evidence for diagnosis without relaunching.

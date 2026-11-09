@@ -992,6 +992,7 @@ def serve_request(
         runtime_admission_lock(root / ".harness-runtime"),
         lane_operation_lock(root / ".harness-runtime", epoch, route["lane_id"]),
     ):
+        identity: tuple[int, int] | None = None
         try:
             if service_owner is not None:
                 _require_service_owner(config, service_owner)
@@ -1023,6 +1024,8 @@ def serve_request(
         except (OSError, ValueError, KeyError, TypeError):
             publish = False
         if publish:
+            if identity is None:
+                raise ValueError("public response worktree identity is unavailable")
             output = PreparedOutputTransaction(lane, allowed_roots=(lane.parent,))
             output.prepare()
             if output.root_identity != identity:
@@ -1208,6 +1211,7 @@ def run_service(root: Path) -> None:
 
 def stop_service(root: Path, harness: Path | None = None) -> dict | None:
     path = home(root) / "service.json"
+    startup_id: object = None
     with runtime_admission_lock(root / ".harness-runtime"), RecordLock(path):
         if not path.is_file():
             # No creation record is absence only when service was never enabled.
@@ -1227,6 +1231,8 @@ def stop_service(root: Path, harness: Path | None = None) -> dict | None:
         else:
             identity = _service_identity(record, root, harness)
             startup_id = record.get("startup_id")
+            if not isinstance(startup_id, str) or not startup_id:
+                raise ValueError("public check service startup identity is missing")
             record["stop_requested"] = True
             atomic_write_json(path, record)
     if identity is None:

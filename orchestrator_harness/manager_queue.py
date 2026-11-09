@@ -441,7 +441,7 @@ def append_assignment(rt: Path, lane: dict[str, Any], prompt: str) -> dict[str, 
     """ROOT appends one PENDING assignment to a running managed lane's inbox."""
     from .lanes import lane_operation_lock, read_lane, require_same_run
     from .setup import read_runtime_state
-    from .processes import identity_matches
+    from . import processes
 
     try:
         with runtime_admission_lock(rt):
@@ -453,13 +453,15 @@ def append_assignment(rt: Path, lane: dict[str, Any], prompt: str) -> dict[str, 
             with lane_operation_lock(rt, epoch_id, lane["lane_id"]):
                 current = read_lane(rt, epoch_id, lane["lane_id"])
                 require_same_run(current, lane)
-                process = current.get("process") or {}
+                process_value = current.get("process")
+                process = process_value if isinstance(process_value, dict) else {}
+                pid, creation = process.get("pid"), process.get("creation_time")
                 if (
                     current.get("lifecycle") != "running"
                     or not current.get("incoming_queue_path")
-                    or not identity_matches(
-                        process.get("pid"), process.get("creation_time")
-                    )
+                    or not processes._valid_pid(pid)
+                    or not processes.valid_creation_identity(creation)
+                    or not processes.identity_matches(pid, creation)
                 ):
                     raise ValueError("managed lane owner is no longer running")
                 worktree = Path(current["worktree_path"]).absolute()
@@ -476,7 +478,12 @@ def append_assignment(rt: Path, lane: dict[str, Any], prompt: str) -> dict[str, 
                 with RecordLock(path, root=worktree):
                     expected = capture_target(worktree, path.relative_to(worktree))
                     inbox = read_lane_inbox(worktree)
-                    if not expected.present or json.loads(expected.content) != inbox:
+                    content = expected.content
+                    if (
+                        not expected.present
+                        or content is None
+                        or json.loads(content) != inbox
+                    ):
                         raise ValueError(
                             "lane inbox changed during the assignment read"
                         )

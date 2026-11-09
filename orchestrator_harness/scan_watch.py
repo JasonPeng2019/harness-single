@@ -299,15 +299,21 @@ def run_watch(
         return _watch_evidence_failure(
             rt, ValueError("active epoch profile differs from configuration")
         )
+    watch_binding: tuple[str, str] | None = None
     if managed:
         try:
-            session_id, watch_binding_id = resolve_root_session(
+            watch_binding = resolve_root_session(
                 config, session_id=root_session_id, binding_id=binding_id
             )
         except Exception as exc:
             return _watch_evidence_failure(rt, exc)
     while True:
         if managed:
+            if watch_binding is None:
+                return _watch_evidence_failure(
+                    rt, ValueError("managed watch has no prepared ROOT binding")
+                )
+            session_id, watch_binding_id = watch_binding
             try:
                 with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
                     queue = read_manager_queue(rt)
