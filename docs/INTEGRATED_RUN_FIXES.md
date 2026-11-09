@@ -136,25 +136,57 @@ records exact cleanup. It publishes a v2 receipt only after those observed check
 probes read denial against a non-secret sentinel inside the actual active Codex
 home and tests two distinct strict profiles running concurrently. Failed concurrent
 operations remain evidence and cannot qualify strict mode. The probe preserves prior
-evidence and never resets machine ACLs.
+evidence and never repairs accounts or ACLs or retries setup. By default it does not configure the
+sandbox; the explicit `--prepare-profiles` flag runs the documented native no-op preparation on its
+temporary probe profiles before measurement.
 The example health files are UNVERIFIED templates; a copied PASS receipt is not
 a new probe.
 
 ```powershell
+$env:LOCALAPPDATA = (Join-Path (Resolve-Path .) 'runtime/windows-worker-cache')
 python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
   --output-dir runtime/windows-worker-probe/<run-id> `
-  --local-appdata runtime/windows-worker-probe-cache/<run-id>
+  --local-appdata runtime/windows-worker-cache `
+  --permission-mode worker-workspace --prepare-profiles
+# Strict isolation is an explicit alternative; retain the same installation cache.
+python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
+  --output-dir runtime/windows-worker-probe-strict/<run-id> `
+  --local-appdata runtime/windows-worker-cache `
+  --permission-mode worker-isolated --prepare-profiles
 python -B scripts/check_windows_sandbox.py --harness-dir . `
   --workspace <absolute-root-workspace> --permission-mode worker-workspace
-# Use the matching worker-isolated receipt only after a strict probe passes.
 ```
 
-The worker receipt is kept separately at
-`local-config/windows-sandbox-health-worker-workspace.json`. ROOT's historical
-generic receipt stays at `local-config/windows-sandbox-health.json`; neither
-replaces the other. To requalify an existing worker receipt, pass
-`--replace-existing-health`; the probe copies the prior receipt into its new
-evidence directory before updating the selected mode's health file.
+The probe writes `local-config/windows-sandbox-health-<permission-mode>.json`; ROOT's historical
+generic receipt `local-config/windows-sandbox-health.json` is separate. A prior worker receipt is
+preserved; pass `--replace-existing-health` only after retaining the prior evidence. The worker
+receipt records actual probe observations; `--prepare-profiles` adds a preparation step for the
+probe's temporary fixture profiles and is not itself health evidence.
+
+After the intended mode's actual probe passes, explicitly prepare the exact active Codex lanes
+before launch. Use one process-local `LOCALAPPDATA` below the harness runtime for preparation, ROOT,
+controllers and workers. The preparation script resolves each lane's operator-protected profile,
+assigned worktree, invocation and private per-run TEMP; it validates the entire batch before native
+setup, then runs one elevated sandboxed no-op per profile sequentially under a `CODEX_HOME`-scoped
+Windows mutex. It records the no-op process boundary and read-only capability SID-to-ACL evidence.
+This receipt is only a current-profile capability binding; it is not a health receipt or proof of
+read denial, protected-write denial, actual lane commits, concurrency or cleanup during real work.
+The separate mode-specific native probe must still pass. Strict preparation also refuses to alter
+the global deny set beneath a known active owned strict Codex lane. It does not coordinate
+untracked external Codex sessions.
+
+```powershell
+python -B scripts/prepare_windows_workers.py --harness-dir . `
+  --lane-id lane-01 --lane-id lane-02 `
+  --permission-mode worker-workspace `
+  --local-appdata $env:LOCALAPPDATA `
+  --evidence-dir runtime/windows-worker-preparation/<run-id>
+# Select worker-isolated in both probe and preparation commands only for strict read isolation.
+```
+
+The worker receipt is kept separately from ROOT's historical generic receipt; neither replaces the
+other. Preparation proofs are bound to the exact lane profile and must be regenerated when the
+profile, invocation, source contract, cache, TEMP or native CLI changes.
 
 Preserve sandbox errors and exact ownership evidence, diagnose and repair before
 a separate launch. The harness makes zero sandbox setup requests and has no setup

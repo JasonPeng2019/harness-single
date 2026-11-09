@@ -5,9 +5,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "probe_windows_worker_isolation.py"
 spec = importlib.util.spec_from_file_location("windows_worker_probe", SCRIPT)
@@ -53,6 +55,34 @@ class ProbePortabilityTests(unittest.TestCase):
         runtime = root / "runtime"
         self.assertTrue(probe._under(runtime / "probe-1", runtime))
         self.assertFalse(probe._under(root / "outside", runtime))
+
+    def test_profile_preparation_is_an_explicit_probe_option(self):
+        observed = []
+
+        def run(args):
+            observed.append(args.prepare_profiles)
+            return {"health_receipt_written": True}
+
+        common = [
+            "probe_windows_worker_isolation.py",
+            "--harness-dir",
+            "harness",
+            "--output-dir",
+            "runtime/probe",
+            "--local-appdata",
+            "runtime/cache",
+        ]
+        with (
+            patch.object(probe, "_probe", side_effect=run),
+            patch.object(sys, "argv", common),
+        ):
+            self.assertEqual(0, probe.main())
+        with (
+            patch.object(probe, "_probe", side_effect=run),
+            patch.object(sys, "argv", [*common, "--prepare-profiles"]),
+        ):
+            self.assertEqual(0, probe.main())
+        self.assertEqual([False, True], observed)
 
 
 if __name__ == "__main__":

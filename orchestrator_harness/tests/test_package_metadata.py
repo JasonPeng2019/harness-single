@@ -74,12 +74,13 @@ def _on_disk_required_files() -> list[str]:
         (PACKAGE_ROOT / "provider_adapters").rglob("launcher_binding.py")
     ):
         required.append(binding.relative_to(PACKAGE_ROOT).as_posix())
-    for relative in (
-        "install_wsl_codex.ps1",
-        "config.example.json",
-        "assets/codex/bounded-exclusions.gitignore",
-    ):
-        required.append(relative)
+    required.extend(
+        (
+            "install_wsl_codex.ps1",
+            "config.example.json",
+            "assets/codex/bounded-exclusions.gitignore",
+        )
+    )
     for sub in ("codex",):
         for path in sorted((PACKAGE_ROOT / "assets" / sub).iterdir()):
             if path.is_file() and path.name != "__init__.py":
@@ -111,7 +112,6 @@ def _copy_build_source(source: Path) -> None:
 
 class PackageMetadataStaticTests(unittest.TestCase):
     def test_packaged_scripts_invalidate_owning_release_unit_credit(self) -> None:
-        import subprocess
         from orchestrator_harness import release_checks
 
         spec = release_checks.get_check("S6.RELEASE.ORCHESTRATOR-UNIT")
@@ -137,6 +137,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
                     "claude_usage.py",
                     "token_ledger.py",
                     "probe_windows_worker_isolation.py",
+                    "prepare_windows_workers.py",
                 )
             ]
             for relative in scripts:
@@ -167,6 +168,10 @@ class PackageMetadataStaticTests(unittest.TestCase):
         ):
             self.assertIn(module, spec.command)
         self.assertIn("orchestrator_harness/lane_cleanup.py", spec.dependency_paths)
+        self.assertIn(
+            "orchestrator_harness/windows_worker_preparation.py", spec.dependency_paths
+        )
+        self.assertIn("scripts/prepare_windows_workers.py", spec.dependency_paths)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for relative in spec.dependency_paths:
@@ -206,6 +211,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
             completed = subprocess.run(
                 command,
                 cwd=source / "orchestrator_harness",
+                check=False,
                 capture_output=True,
                 text=True,
             )
@@ -325,9 +331,8 @@ class PackageWheelBuildTests(unittest.TestCase):
             previous = os.getcwd()
             try:
                 os.chdir(source / "orchestrator_harness")
-                from setuptools.build_meta import build_wheel
-
-                wheel_name = build_wheel(str(wheel_dir))
+                build_backend = importlib.import_module("setuptools.build_meta")
+                wheel_name = build_backend.build_wheel(str(wheel_dir))
             finally:
                 os.chdir(previous)
             wheel = wheel_dir / wheel_name
@@ -343,6 +348,7 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "orchestrator_harness/lane_authority.py",
                 "orchestrator_harness/result_validation.py",
                 "orchestrator_harness/retry_policy.py",
+                "orchestrator_harness/windows_worker_preparation.py",
                 "orchestrator_harness/windows_sandbox_preflight.py",
                 "orchestrator_harness/provider_adapters/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/__init__.py",
@@ -372,6 +378,7 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "scripts/claude_usage.py",
                 "scripts/token_ledger.py",
                 "scripts/probe_windows_worker_isolation.py",
+                "scripts/prepare_windows_workers.py",
                 "tools/worker_public_check.py",
                 "docs/BUILD_TEST_INTERFACE.md",
                 "docs/INTEGRATED_RUN_FIXES.md",

@@ -22,7 +22,9 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self.harness = self.base / "harness"
         self.home = self.base / "codex-home"
         self.workspace = self.base / "workspace"
-        self.cache = self.base / "cache"
+        self.cache = self.harness / "runtime" / "cache"
+        self.temporary = self.harness / "runtime" / "worker-temp"
+        self.temporary.mkdir(parents=True)
         self.native = self.base / "codex.exe"
         self.native.write_bytes(b"fixture binary: never execute")
         source_root = Path(__file__).resolve().parents[2]
@@ -31,7 +33,10 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
             "orchestrator_harness/isolation_policy.py",
             "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
             "adapters/codex/harness/launcher_binding.py",
+            "orchestrator_harness/windows_worker_preparation.py",
             "orchestrator_harness/windows_sandbox_preflight.py",
+            "scripts/prepare_windows_workers.py",
+            "scripts/probe_windows_worker_isolation.py",
         ):
             target = self.harness / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +55,13 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
             },
         )
         self.environment = patch.dict(
-            os.environ, {"CODEX_HOME": str(self.home), "LOCALAPPDATA": str(self.cache)}
+            os.environ,
+            {
+                "CODEX_HOME": str(self.home),
+                "LOCALAPPDATA": str(self.cache),
+                "TEMP": str(self.temporary),
+                "TMP": str(self.temporary),
+            },
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -88,7 +99,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         peer_profile = self.base / "probe-peer/.codex/config.toml"
         peer_profile.parent.mkdir(parents=True, exist_ok=True)
         peer_profile.write_bytes(profile.read_bytes())
-        peer_cache = self.harness / "runtime/peer-cache"
+        peer_cache = self.cache
         peer_cache.mkdir(parents=True)
         protected = {
             "root/.git/index": "1" * 64,
@@ -361,11 +372,66 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
             '":workspace_roots" = { "." = "write" }\n"C:/git/private" = "write"\n',
             encoding="utf-8",
         )
-        health = self.check(
-            permission_mode="worker-workspace", isolation_config_path=config
-        )
+        with patch(
+            "orchestrator_harness.windows_worker_preparation.validate_prepared_profile",
+            return_value={"proof_path": str(config) + ".preparation.json"},
+        ):
+            health = self.check(
+                permission_mode="worker-workspace", isolation_config_path=config
+            )
         self.assertEqual("worker-workspace", health["permission_mode"])
         self.assertEqual(sandbox.digest(config), health["worker_profile_sha256"])
+
+    def test_worker_launch_requires_matching_prepared_profile_proof(self):
+        self.ready()
+        profile = self.base / "probe-worker/.codex/config.toml"
+        from orchestrator_harness.windows_worker_preparation import WorkerProfileTarget
+
+        with (
+            patch(
+                "orchestrator_harness.windows_worker_preparation.resolve_active_profile_for_gate",
+                return_value=WorkerProfileTarget(
+                    config_path=profile,
+                    worktree=profile.parent.parent,
+                    temporary=self.temporary,
+                    lane_id="lane-1",
+                    run_id="run-1",
+                    invocation_hash="fixture",
+                    source_profile_path=profile,
+                    worktree_identity=(1, 1),
+                    permission_mode="worker-isolated",
+                ),
+            ),
+            self.assertRaisesRegex(
+                sandbox.SandboxPreflightError, "prepared profile proof"
+            ),
+        ):
+            self.check(isolation_config_path=profile)
+
+    def test_prepared_profile_proof_is_bound_to_current_worker_environment(self):
+        self.ready()
+        profile = self.base / "probe-worker/.codex/config.toml"
+        with patch(
+            "orchestrator_harness.windows_worker_preparation.validate_prepared_profile",
+            return_value={"proof_path": str(profile) + ".preparation.json"},
+        ) as prepared:
+            health = self.check(isolation_config_path=profile)
+        self.assertIsNotNone(health)
+        health_receipt = cast(dict[str, Any], health)
+        self.assertEqual(
+            str(profile) + ".preparation.json",
+            health_receipt["worker_preparation"]["proof_path"],
+        )
+        prepared.assert_called_once_with(
+            self.harness,
+            self.workspace,
+            profile,
+            "worker-isolated",
+            executable=self.native.resolve(),
+            codex_home=self.home.resolve(),
+            local_appdata=self.cache.resolve(),
+            temporary=self.temporary.resolve(),
+        )
 
     def test_reduced_health_cannot_use_strict_mode_receipt(self):
         self.ready()

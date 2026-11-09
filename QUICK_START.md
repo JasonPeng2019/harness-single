@@ -177,33 +177,58 @@ harness. It creates a temporary two-worktree fixture, checks lane writes and com
 writes to protected sentinels, records profile/CLI/config hashes and exact cleanup, and publishes a
 mode-specific health receipt only when the observations pass. The strict `worker-isolated` probe
 also attempts a read of a non-secret sentinel inside the actual active CODEX_HOME and runs two
-separately generated strict profiles concurrently, each with its own cache and TEMP directory.
+separately generated strict profiles concurrently, using the harness's shared process-local cache
+and each invocation's private TEMP directory.
 Strict qualification requires both concurrent worktrees to write and commit, the home reads and
-protected writes to be denied, and exact cleanup for both native CLI process boundaries. It does not
-configure or repair the sandbox. Reduced-mode proof does not qualify strict mode; absent or stale
+protected writes to be denied, and exact cleanup for both native CLI process boundaries. By default
+the probe does not configure the sandbox; the explicit `--prepare-profiles` flag runs the documented
+native no-op preparation before measurement. It never repairs accounts or ACLs or retries setup.
+Reduced-mode proof does not qualify strict mode; absent or stale
 receipts do not qualify a mode. Each installation and operator must qualify the intended workflow
 for that mode before relying on it.
 
 ```powershell
 python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
   --output-dir runtime/windows-worker-probe/<run-id> `
-  --local-appdata runtime/windows-worker-probe-cache/<run-id> `
-  --permission-mode worker-workspace
-# For strict isolation, use a fresh evidence/cache path and an explicit strict mode:
+  --local-appdata runtime/windows-worker-cache `
+  --permission-mode worker-workspace --prepare-profiles
+# Strict isolation is an explicit alternative; keep the same installation cache:
 python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
   --output-dir runtime/windows-worker-probe-strict/<run-id> `
-  --local-appdata runtime/windows-worker-probe-strict-cache/<run-id> `
-  --permission-mode worker-isolated
+  --local-appdata runtime/windows-worker-cache `
+  --permission-mode worker-isolated --prepare-profiles
 python -B scripts/check_windows_sandbox.py --harness-dir . `
   --workspace <absolute-root-workspace> --permission-mode worker-workspace
 ```
 
-This writes `local-config/windows-sandbox-health-<permission-mode>.json`; the legacy ROOT receipt
-`local-config/windows-sandbox-health.json` is separate. A prior worker receipt is preserved; pass
-`--replace-existing-health` only when intentionally replacing it after retaining the prior evidence.
-A strict receipt requires actual active-home read denial and successful concurrent two-profile
+The probe writes `local-config/windows-sandbox-health-<permission-mode>.json`; the legacy ROOT
+receipt `local-config/windows-sandbox-health.json` is separate. A prior worker receipt is preserved;
+pass `--replace-existing-health` only when intentionally replacing it after retaining the prior
+evidence. Strict health requires actual active-home read denial and successful concurrent two-profile
 native operation. The probe does not establish public-check workflow qualification; validate that
 workflow for the installation and mode you intend to use.
+
+After the intended mode's actual probe passes, explicitly prepare the exact active Codex lanes
+before launching them. This runs one native sandboxed no-op per lane, sequentially, against the
+operator-protected generated profile and verifies the native capability SID bindings. The proof
+does not qualify health by itself; the actual probe above is still required. Keep the same
+LOCALAPPDATA value for preparation, ROOT, controllers and workers.
+
+```powershell
+$env:LOCALAPPDATA = (Join-Path (Resolve-Path .) 'runtime/windows-worker-cache')
+python -B scripts/prepare_windows_workers.py --harness-dir . `
+  --lane-id lane-01 --lane-id lane-02 `
+  --permission-mode worker-workspace `
+  --local-appdata $env:LOCALAPPDATA `
+  --evidence-dir runtime/windows-worker-preparation/<run-id>
+```
+
+Choose `worker-isolated` explicitly in both commands only when strict read isolation is required.
+
+Preparation resolves each lane through the active operator records and uses its exact private
+per-run TEMP. The launch gate checks that protected profile, worktree, invocation, cache, TEMP,
+native CLI and source contract still match the published proof. It does not coordinate arbitrary
+external Codex sessions.
 
 ## 4. Launch
 

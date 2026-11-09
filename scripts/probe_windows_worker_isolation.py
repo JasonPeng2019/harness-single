@@ -100,17 +100,26 @@ result["native_helper_started"] = started
 print(json.dumps(result), flush=True)
 if result["unexpectedly_writable"] or result["probe_errors"] or (request.get("require_read_denial") and not result.get("read_denied", False)):
     raise SystemExit(3)
-git_env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+trace2_path = pathlib.Path(os.environ["TEMP"]) / ("git-trace2-" + request["worker_id"] + ".json")
+git_env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_OPTIONAL_LOCKS="0", GIT_TRACE2_EVENT=str(trace2_path))
 for args in (["add", "actual-change.txt"],
              ["-c", "user.name=Harness Probe", "-c", "user.email=probe@invalid",
               "commit", "-m", "native worker profile write probe"],
              ["log", "-1", "--format=%H"]):
-    command = ["git", "-c", "safe.directory=" + str(pathlib.Path.cwd()), *args]
+    command = ["git", "-c", "safe.directory=" + str(pathlib.Path.cwd()),
+               "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+               "-c", "gc.packRefs=false", "-c", "core.excludesFile=" + os.devnull, *args]
     completed = subprocess.run(command, capture_output=True, text=True, env=git_env)
-    print(json.dumps({"argv": args, "exit_code": completed.returncode,
+    print(json.dumps({"command": command, "argv": args, "exit_code": completed.returncode,
                       "stdout": completed.stdout, "stderr": completed.stderr}), flush=True)
     if completed.returncode:
         raise SystemExit(completed.returncode)
+if trace2_path.is_file():
+    trace = trace2_path.read_bytes()
+    print(json.dumps({"trace2_event_path": str(trace2_path),
+                      "trace2_event_sha256": hashlib.sha256(trace).hexdigest(),
+                      "trace2_event": trace.decode("utf-8", errors="replace")}), flush=True)
 """
 
 
@@ -231,20 +240,12 @@ def _probe(args: argparse.Namespace) -> dict:
     )
     helper = output / "native_probe.py"
     helper.write_text(_native_helper(), encoding="utf-8")
-    temporary = output / "private-temp"
-    temporary.mkdir()
-    peer_temporary = output / "peer-private-temp"
+    temporary = worker / ".agent-workspace" / "tmp" / output.name
+    temporary.mkdir(parents=True)
+    peer_temporary = peer / ".agent-workspace" / "tmp" / output.name
     if permission_mode == "worker-isolated":
-        peer_temporary.mkdir()
-    peer_cache = (
-        cache.parent / f"{cache.name}-peer"
-        if permission_mode == "worker-isolated"
-        else None
-    )
-    if peer_cache is not None and peer_cache.exists():
-        raise ValueError("concurrent worker LOCALAPPDATA must be a fresh owned path")
-    if peer_cache is not None:
-        peer_cache.mkdir(parents=True)
+        peer_temporary.mkdir(parents=True)
+    peer_cache = cache if permission_mode == "worker-isolated" else None
     profile_path = worker / ".codex" / "config.toml"
     _install_codex_worker_isolation(
         worker,
@@ -343,6 +344,37 @@ def _probe(args: argparse.Namespace) -> dict:
                 str(peer_request_path),
             )
         )
+    preparation_proofs = []
+    if args.prepare_profiles:
+        from orchestrator_harness.windows_worker_preparation import (
+            WorkerProfileTarget,
+            prepare_profiles,
+        )
+
+        preparation_targets = [
+            WorkerProfileTarget(
+                config_path=profile_path,
+                worktree=worker,
+                temporary=temporary,
+                permission_mode=permission_mode,
+            )
+        ]
+        if permission_mode == "worker-isolated":
+            preparation_targets.append(
+                WorkerProfileTarget(
+                    config_path=peer_profile_path,
+                    worktree=peer,
+                    temporary=peer_temporary,
+                    permission_mode=permission_mode,
+                )
+            )
+        preparation_proofs = prepare_profiles(
+            harness,
+            preparation_targets,
+            permission_mode=permission_mode,
+            local_appdata=cache,
+            evidence_dir=output / "preparation",
+        )
     environment = os.environ.copy()
     environment.update(TEMP=str(temporary), TMP=str(temporary), LOCALAPPDATA=str(cache))
     peer_environment = os.environ.copy()
@@ -350,7 +382,7 @@ def _probe(args: argparse.Namespace) -> dict:
         peer_environment.update(
             TEMP=str(peer_temporary),
             TMP=str(peer_temporary),
-            LOCALAPPDATA=str(peer_cache),
+            LOCALAPPDATA=str(cache),
         )
     result: dict = {
         "protected_write_targets": json.loads(
@@ -364,6 +396,18 @@ def _probe(args: argparse.Namespace) -> dict:
         "started_at": dt.datetime.now(dt.UTC).isoformat(),
         "local_appdata": str(cache),
         "permission_mode": permission_mode,
+        "preparation_proofs": [
+            {
+                "profile_path": proof["profile_path"],
+                "profile_sha256": proof["profile_sha256"],
+                "proof_path": str(
+                    Path(proof["profile_path"]).with_name(
+                        Path(proof["profile_path"]).name + ".preparation.json"
+                    )
+                ),
+            }
+            for proof in preparation_proofs
+        ],
         "codex_home": str(codex_home),
         "read_sentinel": str(read_sentinel) if read_sentinel else None,
         "profile_path": str(profile_path),
@@ -669,6 +713,11 @@ def main() -> int:
         "--replace-existing-health",
         action="store_true",
         help="back up the existing mode receipt into this new evidence directory",
+    )
+    parser.add_argument(
+        "--prepare-profiles",
+        action="store_true",
+        help="explicitly run serialized model-free preparation for the exact probe profiles before the real tool probes",
     )
     args = parser.parse_args()
     if not 10 <= args.timeout_seconds <= 600:

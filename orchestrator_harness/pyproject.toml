@@ -58,7 +58,8 @@ orchestrator_harness = [
 "scripts" = ["../scripts/prepare_root_launch.py", "../scripts/check_windows_sandbox.py",
              "../scripts/collect_codex_usage.py", "../scripts/collect_usage.py",
              "../scripts/claude_usage.py", "../scripts/token_ledger.py",
-             "../scripts/probe_windows_worker_isolation.py"]
+             "../scripts/probe_windows_worker_isolation.py",
+             "../scripts/prepare_windows_workers.py"]
 "tools" = ["../tools/worker_public_check.py"]
 "docs" = ["../docs/BUILD_TEST_INTERFACE.md", "../docs/INTEGRATED_RUN_FIXES.md",
           "../docs/PATH_PORTABILITY.md", "../docs/CHECKOUT_PATHS.md",

@@ -71,7 +71,10 @@ def profile_contract_digest(harness: Path, permission_mode: str) -> str:
         "orchestrator_harness/isolation_policy.py",
         "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
         "adapters/codex/harness/launcher_binding.py",
+        "orchestrator_harness/windows_worker_preparation.py",
         "orchestrator_harness/windows_sandbox_preflight.py",
+        "scripts/prepare_windows_workers.py",
+        "scripts/probe_windows_worker_isolation.py",
     )
     material = {"mode": permission_mode, "sources": {}}
     for relative in files:
@@ -194,6 +197,7 @@ def require_ready(
             "a worker profile path requires an explicit worker permission mode"
         )
     profile_hash = None
+    preparation: dict[str, Any] | None = None
     if isolation_config_path is not None:
         profile_mode = permission_mode
         if profile_mode is None:
@@ -219,6 +223,14 @@ def require_ready(
     try:
         native = _native_executable(executable)
         local_appdata = Path(os.environ["LOCALAPPDATA"]).resolve()
+        temporary: Path | None = None
+        if isolation_config_path is not None and permission_mode is not None:
+            temporary = Path(os.environ.get("TEMP", "")).resolve()
+            temporary_copy = Path(os.environ.get("TMP", "")).resolve()
+            if not os.environ.get("TEMP") or temporary != temporary_copy:
+                raise ValueError(
+                    "worker TEMP and TMP must name the same prepared private directory"
+                )
         evidence = Path(health["probe_evidence_path"]).resolve()
         if not evidence.is_relative_to(harness.resolve().parent):
             raise ValueError("probe evidence must belong to this run's repository area")
@@ -245,6 +257,21 @@ def require_ready(
             if health.get("backend_id") != "codex-windows-elevated":
                 raise ValueError(
                     "operator health receipt names an unsupported Windows Codex sandbox backend"
+                )
+            if isolation_config_path is not None:
+                if temporary is None:
+                    raise ValueError("worker private TEMP is unavailable")
+                from .windows_worker_preparation import validate_prepared_profile
+
+                preparation = validate_prepared_profile(
+                    harness,
+                    workspace or harness,
+                    Path(isolation_config_path),
+                    permission_mode,
+                    executable=native,
+                    codex_home=codex_home,
+                    local_appdata=local_appdata,
+                    temporary=temporary,
                 )
             probe_profile_hash = health.get("probe_profile_sha256")
             if (
@@ -323,7 +350,7 @@ def require_ready(
                         or worker_proof.get("cleanup_proven") is not True
                         or worker_proof.get("codex_home_read_denied") is not True
                         or worker_proof.get("sandbox_error") is not None
-                        or peer_cache_path == local_appdata
+                        or peer_cache_path != local_appdata
                         or not peer_cache_path.is_dir()
                         or peer_cache_path.is_symlink()
                         or not peer_cache_path.is_relative_to(
@@ -426,6 +453,7 @@ def require_ready(
         "permission_mode": permission_mode,
         "profile_contract_sha256": expected_contract,
         "worker_profile_sha256": profile_hash,
+        "worker_preparation": preparation,
         "backend_id": health.get("backend_id"),
         "isolation_config_path": str(isolation_config_path.resolve())
         if isolation_config_path
