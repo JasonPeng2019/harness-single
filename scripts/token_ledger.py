@@ -1,4 +1,4 @@
-"""Offline Codex JSONL accounting and native-harness attempt discovery.
+"""Offline provider-aware JSONL accounting and native-harness attempt discovery.
 
 This module only reads existing task evidence. It never starts an agent or reads
 Codex authentication. ``turn.completed.usage`` is a cumulative session value;
@@ -26,10 +26,12 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TOKEN_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
+    "cache_creation_input_tokens",
     "output_tokens",
     "reasoning_output_tokens",
     "reported_total_tokens",
 )
+PROVIDERS = {"codex", "claude-code", "ollama"}
 
 
 class LedgerError(ValueError):
@@ -84,8 +86,17 @@ def _worker_resume_index(argv: Any) -> int:
     return -1
 
 
-def launch_preferences(argv: Any) -> dict[str, str]:
-    """Read the model, effort, and tier actually passed to a Codex launch."""
+def _is_provider_resume(argv: Any, provider_id: str) -> bool:
+    if provider_id == "claude-code":
+        return isinstance(argv, list) and any(
+            word == "--resume" and index + 1 < len(argv)
+            for index, word in enumerate(argv[:-1])
+        )
+    return _worker_resume_index(argv) >= 0
+
+
+def launch_preferences(argv: Any, provider_id: str = "codex") -> dict[str, str | None]:
+    """Read provider model/effort/tier from the protected launch argv."""
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv):
         raise LedgerError("provider launch argv is missing or invalid")
     model: str | None = None
@@ -93,6 +104,10 @@ def launch_preferences(argv: Any) -> dict[str, str]:
     for index, word in enumerate(argv[:-1]):
         if word == "-m" or (word == "--model" and argv[0] == "ollama"):
             model = argv[index + 1]
+        if provider_id == "claude-code" and word == "--model":
+            model = argv[index + 1]
+        if provider_id == "claude-code" and word == "--effort":
+            settings["model_reasoning_effort"] = argv[index + 1]
         if word == "-c" and "=" in argv[index + 1]:
             key, raw = argv[index + 1].split("=", 1)
             if key in ("model_reasoning_effort", "service_tier"):
@@ -101,10 +116,15 @@ def launch_preferences(argv: Any) -> dict[str, str]:
                 except json.JSONDecodeError as exc:
                     raise LedgerError(f"invalid {key} in provider argv") from exc
                 settings[key] = nonempty_string(value, key)
+    effort = settings.get("model_reasoning_effort")
+    tier = settings.get("service_tier")
+    if provider_id == "claude-code":
+        effort = effort or settings.get("effort")
+        tier = None
     return {
         "model": nonempty_string(model, "launch model"),
-        "reasoning_effort": nonempty_string(settings.get("model_reasoning_effort"), "launch reasoning_effort"),
-        "service_tier": nonempty_string(settings.get("service_tier"), "launch service_tier"),
+        "reasoning_effort": nonempty_string(effort, "launch reasoning_effort"),
+        "service_tier": nonempty_string(tier, "launch service_tier") if tier is not None else None,
     }
 
 
@@ -174,6 +194,7 @@ def normalize_usage(raw: Any) -> dict[str, Any]:
     )
     values["derived_input_plus_output_tokens"] = derived
     values["comparison_total_tokens"] = supplied if supplied is not None else derived
+    values["comparison_metric"] = "codex_reported_total_or_input_plus_output"
     values["comparison_total_source"] = (
         "provider_reported_total_tokens"
         if supplied is not None
@@ -188,7 +209,8 @@ def normalize_usage(raw: Any) -> dict[str, Any]:
 
 
 def extract_usage(
-    path: Path, *, completed: bool = True, segment_index: int | None = None
+    path: Path, *, completed: bool = True, segment_index: int | None = None,
+    provider_id: str = "codex",
 ) -> dict[str, Any]:
     """Select the final top-level usage from a file or one provider segment.
 
@@ -196,6 +218,11 @@ def extract_usage(
     Each process begins with ``thread.started``; ``segment_index`` is its
     one-based occurrence, even when every process resumes the same thread.
     """
+    if provider_id == "claude-code":
+        from claude_usage import extract_claude_usage
+        return extract_claude_usage(path, completed=completed, segment_index=segment_index)
+    if provider_id not in ("codex", "ollama"):
+        raise LedgerError(f"unsupported usage provider: {provider_id}")
     if not path.is_file():
         return {"status": "missing_transcript", "transcript_sha256": None}
     digest = hashlib.sha256()
@@ -319,16 +346,21 @@ def _root_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
             raise LedgerError("root launch budget differs from task file")
         if task["arm"] == "harness" and launch.get("harness_runtime") != task["harness_runtime"]:
             raise LedgerError("root launch runtime differs from task file")
-        for key in ("model", "reasoning_effort", "service_tier", "started_at_utc"):
+        provider_id = launch.get("provider_id", "codex")
+        if provider_id not in PROVIDERS:
+            raise LedgerError(f"unsupported ROOT usage provider: {provider_id}")
+        for key in ("model", "reasoning_effort", "started_at_utc"):
             nonempty_string(launch.get(key), f"root {key}")
-        if launch_preferences(launch.get("command")) != {
+        if provider_id != "claude-code":
+            nonempty_string(launch.get("service_tier"), "root service_tier")
+        if launch_preferences(launch.get("command"), provider_id) != {
             "model": launch["model"],
             "reasoning_effort": launch["reasoning_effort"],
             "service_tier": launch["service_tier"],
         }:
             raise LedgerError("root command differs from declared model/effort/tier")
         if number > 1:
-            for key in ("model", "reasoning_effort", "service_tier", "sandbox", "workspace", "harness_runtime"):
+            for key in ("provider_id", "model", "reasoning_effort", "service_tier", "sandbox", "workspace", "harness_runtime"):
                 if launch.get(key) != first_launch.get(key):
                     raise LedgerError(f"ROOT resume changed {key}")
             if launch.get("segment_number") != number:
@@ -336,12 +368,15 @@ def _root_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
             if not nonempty_string(launch.get("resume_session_id"), "resume_session_id"):
                 raise LedgerError("ROOT resume session missing")
             command = launch["command"]
-            if command[:3] != ["codex", "exec", "resume"] or launch["resume_session_id"] not in command:
+            if provider_id == "claude-code":
+                if "--resume" not in command or launch["resume_session_id"] not in command:
+                    raise LedgerError("Claude ROOT resume command does not name saved session")
+            elif command[:3] != ["codex", "exec", "resume"] or launch["resume_session_id"] not in command:
                 raise LedgerError("ROOT resume command does not name saved session")
             prior = rows[-1]
             if not prior["completed"]:
                 raise LedgerError("ROOT resume began before prior segment was sealed")
-            prior_usage = extract_usage(Path(prior["transcript_path"]))
+            prior_usage = extract_usage(Path(prior["transcript_path"]), provider_id=provider_id)
             if prior_usage.get("thread_id") != launch["resume_session_id"]:
                 raise LedgerError("ROOT resume session differs from prior transcript")
         elif launch != first_launch:
@@ -357,6 +392,7 @@ def _root_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
             "lane_id": None,
             "lane_run_id": None,
             "attempt": number,
+            "provider_id": provider_id,
             "model": launch["model"],
             "reasoning_effort": launch["reasoning_effort"],
             "service_tier": launch["service_tier"],
@@ -370,7 +406,7 @@ def _root_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
             "resume": number > 1,
             "resume_session_id": launch.get("resume_session_id"),
             "launch_argv": launch["command"],
-            "transcript_path": str(directory / "codex-events.jsonl"),
+            "transcript_path": str(directory / ("claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl")),
             "source_manifest_paths": [str(directory / "launch.json"), str(final_path)] if final else [str(directory / "launch.json")],
         })
     return rows
@@ -482,14 +518,18 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                 if lane_id != lane_dir.name:
                     raise LedgerError(f"lane ID differs from worktree directory: {invocation_path}")
                 provider = invocation.get("provider")
-                if not isinstance(provider, dict) or provider.get("id") != "codex":
-                    raise LedgerError(f"uncounted non-Codex worker lane: {invocation_path}")
+                if not isinstance(provider, dict):
+                    raise LedgerError(f"worker provider identity is missing: {invocation_path}")
+                provider_id = provider.get("id")
+                if provider_id not in PROVIDERS:
+                    raise LedgerError(f"uncounted or unsupported worker provider {provider_id!r}: {invocation_path}")
                 launch_config = provider.get("launch_config") or {}
                 if not isinstance(launch_config, dict):
                     raise LedgerError(f"invalid worker launch_config: {invocation_path}")
                 nonempty_string(provider.get("model"), "worker model")
-                nonempty_string(launch_config.get("reasoning_effort"), "worker reasoning_effort")
-                nonempty_string(launch_config.get("service_tier"), "worker service_tier")
+                worker_effort = launch_config.get("effort") if provider_id == "claude-code" else launch_config.get("reasoning_effort")
+                nonempty_string(worker_effort, "worker effort")
+                worker_tier = None if provider_id == "claude-code" else nonempty_string(launch_config.get("service_tier"), "worker service_tier")
                 paths = invocation.get("paths") or {}
                 if not isinstance(paths, dict):
                     raise LedgerError(f"invalid worker paths: {invocation_path}")
@@ -574,7 +614,7 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                             raise LedgerError(f"worker activity occurred during paused interval: {events_path}")
                         continue
                     argv = row.get("argv") if row else None
-                    resume = _worker_resume_index(argv) >= 0
+                    resume = _is_provider_resume(argv, provider_id)
                     controller_run_id = valid_id(
                         start_event.get("run_id") or lane_run_id, "controller run_id"
                     )
@@ -586,14 +626,15 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                         "lane_id": lane_id,
                         "lane_run_id": controller_run_id,
                         "attempt": number,
+                        "provider_id": provider_id,
                         "model": provider.get("model"),
-                        "reasoning_effort": launch_config.get("reasoning_effort"),
-                        "service_tier": launch_config.get("service_tier"),
+                        "reasoning_effort": worker_effort,
+                        "service_tier": worker_tier,
                         "started_at_utc": started,
                         "ended_at_utc": row.get("at") if row else None,
                         "exit_code": row.get("exit_code") if row else None,
                         "completed": row is not None and isinstance(row.get("exit_code"), int),
-                        "resume": resume or number > 1,
+                        "resume": resume or (number > 1 and provider_id != "claude-code"),
                         "launch_argv": argv,
                         "attempt_provider": row.get("provider") if row else None,
                         "session_id": row.get("session_id") if row else None,
@@ -604,6 +645,36 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                             if path.is_file()
                         ],
                     })
+    # Profile migrations create a fresh provider session while retaining the
+    # prior invocation's provenance outside its immutable attempt record.
+    # Bind that transition archive into both sides' usage evidence.
+    transition_paths = sorted(runtime.glob("epochs/*/lanes/*/resume-history/*/transition.json"))
+    for transition_path in transition_paths:
+        if transition_path.parent.parent.parent.name not in {row["lane_id"] for row in results}:
+            continue
+        transition = read_object(transition_path)
+        lane_id = transition.get("lane_id")
+        from_run = transition.get("from_run_id")
+        to_run = transition.get("to_run_id")
+        if not isinstance(lane_id, str) or not isinstance(from_run, str) or not isinstance(to_run, str):
+            raise LedgerError(f"malformed protected profile transition: {transition_path}")
+        old_provider = transition.get("old_provider")
+        new_provider = transition.get("effective_new_provider")
+        for row in results:
+            if row["lane_id"] != lane_id:
+                continue
+            if row["lane_run_id"] == from_run:
+                if not isinstance(old_provider, dict) or old_provider.get("id") != row["provider_id"]:
+                    raise LedgerError(f"profile transition old provider differs from invocation: {transition_path}")
+                prior_session = transition.get("previous_session_id")
+                if prior_session and row.get("session_id") and prior_session != row["session_id"]:
+                    raise LedgerError(f"profile transition prior session differs from invocation: {transition_path}")
+                row["source_manifest_paths"].append(str(transition_path))
+            if row["lane_run_id"] == to_run:
+                if (not isinstance(new_provider, dict) or new_provider.get("id") != row["provider_id"]
+                        or new_provider.get("model") != row.get("model")):
+                    raise LedgerError(f"profile transition new provider differs from invocation: {transition_path}")
+                row["source_manifest_paths"].append(str(transition_path))
     return results
 
 
@@ -720,9 +791,9 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
     root_rows = [row for row in rows if row["role"] != "worker"]
     # Attempts within a Codex thread must be processed in chronological order.
     rows.sort(key=lambda row: (str(row.get("started_at_utc") or ""), row["invocation_id"]))
-    previous: dict[str, dict[str, Any]] = {}
+    previous: dict[tuple[str, str], dict[str, Any]] = {}
     unknown_sessions: dict[tuple[Path, str, str], dict[str, Any]] = {}
-    fingerprints: dict[tuple[str | None, str], str] = {}
+    fingerprints: dict[tuple[str, str | None, str], str] = {}
     errors: list[str] = []
     pause_seconds = 0.0
     for prior, following in zip(root_rows, root_rows[1:]):
@@ -770,7 +841,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                 errors.append(f"{row['invocation_id']}: missing process start/end time")
             if row["role"] == "worker":
                 try:
-                    effective = launch_preferences(row.get("launch_argv"))
+                    effective = launch_preferences(row.get("launch_argv"), row.get("provider_id", "codex"))
                 except LedgerError as exc:
                     errors.append(f"{row['invocation_id']}: {exc}")
                 else:
@@ -779,9 +850,13 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                         errors.append(f"{row['invocation_id']}: launch argv differs from configured model/effort/tier")
                 attempt_provider = row.get("attempt_provider")
                 if isinstance(attempt_provider, dict):
-                    if attempt_provider.get("model") != row.get("model") or (
-                        attempt_provider.get("launch_config") or {}).get("reasoning_effort") != row.get("reasoning_effort") or (
-                        attempt_provider.get("launch_config") or {}).get("service_tier") != row.get("service_tier"):
+                    attempt_config = attempt_provider.get("launch_config") or {}
+                    attempt_effort = attempt_config.get("effort") if row.get("provider_id") == "claude-code" else attempt_config.get("reasoning_effort")
+                    attempt_tier = None if row.get("provider_id") == "claude-code" else attempt_config.get("service_tier")
+                    if (attempt_provider.get("id", row.get("provider_id")) != row.get("provider_id")
+                            or attempt_provider.get("model") != row.get("model")
+                            or attempt_effort != row.get("reasoning_effort")
+                            or attempt_tier != row.get("service_tier")):
                         errors.append(f"{row['invocation_id']}: attempt provider record differs from invocation")
         gap = gaps.get(row["invocation_id"])
         transcript = Path(row["transcript_path"])
@@ -789,6 +864,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
             evidence = extract_usage(
                 transcript, completed=row["completed"],
                 segment_index=row.get("transcript_segment_index"),
+                provider_id=row.get("provider_id", "codex"),
             )
         except TranscriptError as exc:
             # Strict by default, including every ROOT transcript. The existing
@@ -831,21 +907,26 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                 errors.append(f"{row['invocation_id']}: no countable terminal usage")
             continue
         thread_id = evidence.get("thread_id")
-        fingerprint = (thread_id, evidence["transcript_segment_sha256"])
+        provider_id = row.get("provider_id", "codex")
+        fingerprint = (provider_id, thread_id, evidence["transcript_segment_sha256"])
         if fingerprint in fingerprints:
             row["duplicate_of"] = fingerprints[fingerprint]
             row["charged_tokens"] = 0
             row["charge_source"] = "exact_transcript_replay"
             continue
         fingerprints[fingerprint] = row["invocation_id"]
-        if row["resume"] and (not thread_id or thread_id not in previous):
+        chain_key = (provider_id, thread_id) if thread_id else None
+        if row["resume"] and (chain_key is None or chain_key not in previous):
             session_key = _protected_worker_session(task, row)
             unknown_prior = unknown_sessions.get(session_key) if session_key is not None else None
             argv = row.get("launch_argv") or []
             resume_index = _worker_resume_index(argv)
+            native_resume_id = (argv[resume_index + 1] if resume_index >= 0 else None)
+            if provider_id == "claude-code":
+                native_resume_id = next((argv[i + 1] for i, word in enumerate(argv[:-1]) if word == "--resume"), None)
             if (unknown_prior is not None and row["completed"] and evidence["status"] == "ok"
-                    and session_key[2] == thread_id and resume_index >= 0
-                    and argv[resume_index + 1:resume_index + 2] == [thread_id]):
+                    and session_key[2] == thread_id and _is_provider_resume(argv, provider_id)
+                    and native_resume_id == thread_id):
                 # R2's cumulative usage is readable but its R1 delta is not.
                 # Keep both charges unknown under the original validated receipt.
                 lane = read_object(Path(task["harness_runtime"]) / "epochs" / row["epoch_id"]
@@ -864,7 +945,7 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                 continue
             errors.append(f"{row['invocation_id']}: resumed thread has no prior baseline")
             continue
-        prior = previous.get(thread_id) if thread_id else None
+        prior = previous.get(chain_key) if chain_key else None
         if prior is not None:
             prior_total = prior["comparison_total_tokens"]
             charged = total - prior_total
@@ -881,15 +962,45 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                     if difference < 0:
                         errors.append(f"{row['invocation_id']}: cumulative {field} decreased")
                     row[f"charged_{field}"] = difference if difference >= 0 else None
+            if isinstance(row.get("model_usage"), dict):
+                prior_models = prior.get("model_usage") if isinstance(prior.get("model_usage"), dict) else {}
+                model_deltas: dict[str, dict[str, Any]] = {}
+                for model, counters in row["model_usage"].items():
+                    old = prior_models.get(model, {})
+                    delta: dict[str, Any] = {}
+                    for field in ("input_tokens", "output_tokens", "cached_input_tokens",
+                                  "cache_creation_input_tokens"):
+                        current_value, old_value = counters.get(field), old.get(field)
+                        if current_value is None:
+                            delta[field] = None
+                        elif model not in prior_models:
+                            delta[field] = current_value
+                        elif old_value is None:
+                            delta[field] = None
+                        else:
+                            difference = current_value - old_value
+                            if difference < 0:
+                                errors.append(f"{row['invocation_id']}: cumulative {model} {field} decreased")
+                            delta[field] = difference if difference >= 0 else None
+                    delta["usage_sha256"] = counters.get("usage_sha256")
+                    model_deltas[model] = delta
+                row["charged_model_usage"] = model_deltas
         else:
             charged = total
             row["charge_source"] = evidence.get("comparison_total_source")
             for field in TOKEN_FIELDS:
                 row[f"charged_{field}"] = row.get(field)
+            if isinstance(row.get("model_usage"), dict):
+                row["charged_model_usage"] = {
+                    model: {**{key: value for key, value in counters.items() if key != "usage_sha256"},
+                            "usage_sha256": counters.get("usage_sha256")}
+                    for model, counters in row["model_usage"].items()
+                }
         row["charged_tokens"] = charged
         known_total += charged
         if thread_id:
-            previous[thread_id] = row
+            if chain_key:
+                previous[chain_key] = row
     if used_gaps != set(gaps):
         raise LedgerError("usage-gap receipt names an unknown worker invocation")
     budget = task["budget_tokens"]
@@ -901,6 +1012,32 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
     for field in TOKEN_FIELDS:
         pieces = [row.get(f"charged_{field}") for row in counted_rows]
         aggregate_components[field] = sum(pieces) if pieces and all(piece is not None for piece in pieces) else None
+    provider_metric_totals: dict[str, dict[str, Any]] = {}
+    for row in counted_rows:
+        provider_id = row.get("provider_id", "codex")
+        metric = row.get("comparison_metric", "codex_reported_total_or_input_plus_output")
+        bucket = provider_metric_totals.setdefault(provider_id, {
+            "comparison_metric": metric, "known_total_tokens": 0,
+            "components": {field: 0 for field in TOKEN_FIELDS},
+            "components_complete": {field: True for field in TOKEN_FIELDS},
+        })
+        if bucket["comparison_metric"] != metric:
+            errors.append(f"provider {provider_id} has conflicting comparison metric definitions")
+        if row.get("charged_tokens") is not None:
+            bucket["known_total_tokens"] += row["charged_tokens"]
+        for field in TOKEN_FIELDS:
+            piece = row.get(f"charged_{field}")
+            if piece is None:
+                bucket["components_complete"][field] = False
+            else:
+                bucket["components"][field] += piece
+    for bucket in provider_metric_totals.values():
+        bucket["components"] = {
+            field: value if bucket["components_complete"][field] else None
+            for field, value in bucket["components"].items()
+        }
+        del bucket["components_complete"]
+    metric_definitions = {item["comparison_metric"] for item in provider_metric_totals.values()}
     return {
         "schema": LEDGER_SCHEMA,
         "generated_at_utc": utc_now(),
@@ -914,6 +1051,9 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
         "active_elapsed_seconds": round(sum(active_parts), 3) if len(active_parts) == len(root_rows) else None,
         "budget_tokens": budget,
         "known_total_tokens": known_total,
+        "provider_metric_totals": provider_metric_totals,
+        "aggregate_metric_scope": ("single_provider_metric" if len(metric_definitions) <= 1
+                                   else "mixed_provider_metrics; use provider_metric_totals for comparison"),
         "aggregate_components": aggregate_components,
         "remaining_tokens": max(0, budget - known_total) if budget is not None and not unknown_usage else None,
         "overshoot_tokens": max(0, known_total - budget) if budget is not None and not unknown_usage else None,
@@ -948,7 +1088,7 @@ def finalize(task_path: Path, output_dir: Path) -> dict[str, Any]:
             folder = temporary / "invocations" / f"{number:04d}"
             folder.mkdir(parents=True)
             transcript = Path(row["transcript_path"])
-            destination = folder / "codex-events.jsonl"
+            destination = folder / ("claude-events.jsonl" if row.get("provider_id") == "claude-code" else "codex-events.jsonl")
             shutil.copyfile(transcript, destination)
             digest = hashlib.sha256(destination.read_bytes()).hexdigest()
             if digest != row["transcript_sha256"]:
@@ -974,6 +1114,7 @@ def finalize(task_path: Path, output_dir: Path) -> dict[str, Any]:
         (temporary / "ledger.json").write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         summary = {key: snapshot[key] for key in (
             "schema", "task", "arm", "run_id", "budget_tokens", "known_total_tokens",
+            "provider_metric_totals", "aggregate_metric_scope",
             "aggregate_components", "remaining_tokens", "overshoot_tokens",
             "in_flight_invocations", "errors", "interruption_policy", "resume_count",
             "unknown_usage_invocations", "token_total_is_exact",

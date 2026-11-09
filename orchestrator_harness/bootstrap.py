@@ -162,6 +162,7 @@ def _git_worktree_add(
     base_commit: str,
     *,
     checkout_paths: tuple[str, ...] | None = None,
+    provider_id: str | None = None,
 ) -> None:
     if worktree_path.exists():
         raise BootstrapError(BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}")
@@ -187,6 +188,58 @@ def _git_worktree_add(
             raise BootstrapError(
                 BOOTSTRAP_REQUEST_INVALID,
                 f"checkout_paths directories absent from the base commit: {detail}",
+            )
+
+        # Cone mode intentionally keeps the requested materialization exact.
+        # Before creating a branch, refuse scopes that would hide tracked
+        # bootstrap inputs which are subsequently regenerated or overlaid.
+        tracked = _run_git(
+            root_workspace,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            base_commit,
+        )
+        if tracked.returncode != 0:
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID,
+                f"could not inspect tracked bootstrap inputs in base commit: {tracked.stderr.strip()}",
+            )
+        tracked_paths = tuple(path for path in tracked.stdout.split("\0") if path)
+
+        def included_by_cone(path: str) -> bool:
+            parts = path.split("/")
+            parent = "/".join(parts[:-1])
+            if not parent:  # Cone mode always includes repository-root files.
+                return True
+            for selected in checkout_paths:
+                # Cone mode includes files directly in every ancestor of a
+                # selected directory and all files beneath that directory.
+                if selected == parent or selected.startswith(parent + "/"):
+                    return True
+                if parent.startswith(selected + "/"):
+                    return True
+            return False
+
+        provider_inputs = {
+            "codex": (".codex/config.toml", ".codex/hooks.json"),
+            "claude-code": (".claude/settings.json",),
+            "qwen-code": (".qwen/settings.json",),
+        }.get(provider_id, ())
+        critical = {
+            path for path in tracked_paths
+            if path.startswith(".agent-workspace/") or path in provider_inputs
+        }
+        excluded = sorted(path for path in critical if not included_by_cone(path))
+        if excluded:
+            detail = ", ".join(excluded)
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID,
+                "checkout_paths excludes tracked bootstrap inputs required by this lane: "
+                f"{detail}. Add their containing directories to checkout_paths (for example, "
+                "'.agent-workspace' or the selected provider's config directory), or omit "
+                "checkout_paths for a full checkout; bootstrap will not broaden the requested scope.",
             )
 
     branch_ref = f"refs/heads/{branch}"
@@ -1284,6 +1337,7 @@ def run_bootstrap(
                 branch,
                 worktree_path,
                 base_commit,
+                provider_id=provider,
                 **(
                     {"checkout_paths": config.checkout_paths}
                     if config.checkout_paths is not None
@@ -1321,7 +1375,7 @@ def run_bootstrap(
                     worktree_path, harness_root, config.root_workspace,
                     enforce_git_isolation=configured_launch.get("permission_mode") != "yolo",
                     manager_workspace=config.manager_workspace,
-                    permission_mode=(configured_launch.get("permission_mode")
+                    permission_mode=(configured_launch.get("permission_mode", "worker-isolated")
                                      if configured_launch.get("permission_mode") != "yolo"
                                      else "worker-isolated"),
                 )
