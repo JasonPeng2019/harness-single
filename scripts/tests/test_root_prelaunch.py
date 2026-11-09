@@ -460,6 +460,60 @@ class RootPrelaunchTests(unittest.TestCase):
         self.assertEqual(set(preparation.HOOK_FILES),
                          set(preparation.check_installed(self.harness, self.workspace)))
 
+    def test_claude_prelaunch_admission_requires_canonical_project_root_command(self) -> None:
+        self.write(self.harness / "harness-config.json", {
+            "root_workspace": str(self.workspace), "manager_workspace": str(self.workspace),
+            "managed_coordination": "enabled",
+        })
+        files = preparation.hook_files("claude-code")
+        for relative in files:
+            path = self.workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+        settings_path = self.workspace / files[0]
+        canonical = 'python "${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_post_tool_use.py"'
+        hooks = {"hooks": {
+            "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": canonical}]}],
+            "Stop": [{"hooks": [{"type": "command", "command":
+                'python "${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_stop.py"'}]}],
+        }}
+        self.write(settings_path, hooks)
+        with patch.object(preparation, "_monitor_owner", return_value={}), \
+             patch.object(preparation, "_read_binding", return_value={}):
+            preparation.check_installed(self.harness, self.workspace, provider_id="claude-code")
+            for command in (
+                "python .claude/hooks/orchestrator_harness_post_tool_use.py",
+                'python "${CLAUDE_PROJECT_DIR}/.claude/hooks/other.py"',
+            ):
+                with self.subTest(command=command):
+                    altered = json.loads(json.dumps(hooks))
+                    altered["hooks"]["PostToolUse"][0]["hooks"][0]["command"] = command
+                    self.write(settings_path, altered)
+                    with self.assertRaisesRegex(ValueError, "native PostToolUse hook is missing"):
+                        preparation.check_installed(self.harness, self.workspace, provider_id="claude-code")
+
+    def test_qwen_prelaunch_admission_keeps_relative_hook_commands(self) -> None:
+        self.write(self.harness / "harness-config.json", {
+            "root_workspace": str(self.workspace), "manager_workspace": str(self.workspace),
+            "managed_coordination": "enabled",
+        })
+        files = preparation.hook_files("qwen-code")
+        for relative in files:
+            path = self.workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+        self.write(self.workspace / files[0], {"hooks": {
+            "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command":
+                "python .qwen/hooks/orchestrator_harness_post_tool_use.py"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command":
+                "python .qwen/hooks/orchestrator_harness_stop.py"}]}],
+            "Notification": [{"hooks": [{"type": "command", "command":
+                "python .qwen/hooks/orchestrator_harness_notification.py"}]}],
+        }})
+        with patch.object(preparation, "_monitor_owner", return_value={}), \
+             patch.object(preparation, "_read_binding", return_value={}):
+            preparation.check_installed(self.harness, self.workspace, provider_id="qwen-code")
+
     def test_prelaunch_cannot_accept_unknown_native_config_keys(self):
         self.installed()
         self.write(self.harness / "harness-config.json", {"root_workspace": str(self.workspace),

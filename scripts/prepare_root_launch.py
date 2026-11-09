@@ -178,7 +178,9 @@ def check_installed(harness: Path, workspace: Path, *, allow_closed: bool = Fals
     if provider_id == "qwen-code":
         events.append(("Notification", "orchestrator_harness_notification.py"))
     for event, filename in events:
-        expected = {"hooks": [{"type": "command", "command": f"python {dotdir}/hooks/{filename}"}]}
+        command = (f'python "${{CLAUDE_PROJECT_DIR}}/{dotdir}/hooks/{filename}"'
+                   if provider_id == "claude-code" else f"python {dotdir}/hooks/{filename}")
+        expected = {"hooks": [{"type": "command", "command": command}]}
         if event == "PostToolUse":
             expected["matcher"] = ".*"
         groups = hooks.get(event, []) if isinstance(hooks, dict) else []
