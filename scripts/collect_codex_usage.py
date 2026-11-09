@@ -24,16 +24,6 @@ from pathlib import Path
 from typing import Any
 
 from prepare_root_launch import validate_prepared_root
-from orchestrator_harness import processes
-from orchestrator_harness.config import load_config, path_identity
-from orchestrator_harness.root_session import bind_native_root_session
-from orchestrator_harness.records import atomic_write_json
-from orchestrator_harness.lane_cleanup import (
-    cleanup_is_proven,
-    observe_controller_status,
-)
-from orchestrator_harness.lanes import retained_lanes, LaneError
-
 from token_ledger import (
     RUN_SCHEMA,
     TASK_SCHEMA,
@@ -47,6 +37,15 @@ from token_ledger import (
     utc_now,
     valid_id,
 )
+
+from orchestrator_harness import processes
+from orchestrator_harness.config import load_config, path_identity
+from orchestrator_harness.lane_cleanup import (
+    cleanup_is_proven,
+)
+from orchestrator_harness.lanes import LaneError, retained_lanes
+from orchestrator_harness.records import atomic_write_json
+from orchestrator_harness.root_session import bind_native_root_session
 
 
 def write_once(path: Path, value: Any) -> None:
@@ -68,6 +67,19 @@ def write_stdout_safe(line: str) -> None:
             line = line.encode(encoding, errors="backslashreplace").decode(encoding)
     sys.stdout.write(line)
     sys.stdout.flush()
+
+
+def resolve_provider_executable(provider_id: str) -> str:
+    """Find the selected provider CLI, including native Windows installs."""
+    if provider_id == "claude-code":
+        candidates = ("claude", "claude.cmd") if os.name == "nt" else ("claude",)
+    else:
+        candidates = ("codex.cmd",) if os.name == "nt" else ("codex",)
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable is not None:
+            return executable
+    raise OSError(f"{provider_id} CLI executable not found on PATH")
 
 
 def inhibit_idle_sleep() -> bool:
@@ -510,14 +522,7 @@ def run_codex(args: argparse.Namespace) -> int:
             str(last_message_path),
             "-",
         ]
-    executable_name = (
-        ("claude.cmd" if os.name == "nt" else "claude")
-        if provider_id == "claude-code"
-        else ("codex.cmd" if os.name == "nt" else "codex")
-    )
-    provider_executable = shutil.which(executable_name)
-    if provider_executable is None:
-        raise OSError(f"{provider_id} CLI executable not found on PATH")
+    provider_executable = resolve_provider_executable(provider_id)
     launch = {
         "schema": RUN_SCHEMA,
         "run_id": args.run_id,
