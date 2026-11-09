@@ -779,6 +779,80 @@ class RootPrelaunchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different ROOT run"):
             preparation.validate_prepared_root(self.harness, self.workspace, "another")
 
+    def test_empty_git_directory_is_no_git_but_populated_and_pointer_bindings_refuse(
+        self,
+    ) -> None:
+        self.prepared()
+        receipt = preparation.read(self.workspace / preparation.RECEIPT)
+        self.assertIsNone(receipt["workspace_identity"]["git"])
+        git = self.workspace / ".git"
+        git.mkdir()
+
+        self.assertIsNone(preparation.workspace_identity(self.workspace)["git"])
+        preparation.validate_prepared_root(self.harness, self.workspace, "fixture")
+
+        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "workspace identity changed"):
+            preparation.validate_prepared_root(self.harness, self.workspace, "fixture")
+
+        (git / "HEAD").unlink()
+        git.rmdir()
+        (self.workspace / ".git").write_text(
+            "gitdir: ../repository.git\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ValueError, "workspace identity changed"):
+            preparation.validate_prepared_root(self.harness, self.workspace, "fixture")
+
+    def test_populated_git_directory_replacement_changes_workspace_identity(
+        self,
+    ) -> None:
+        git = self.workspace / ".git"
+        git.mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        original = preparation.workspace_identity(self.workspace)
+
+        git.rename(self.workspace / "old-git")
+        git.mkdir()
+        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+        self.assertNotEqual(original, preparation.workspace_identity(self.workspace))
+
+        shutil.rmtree(git)
+        git.write_text("gitdir: ../first.git\n", encoding="utf-8")
+        original_pointer = preparation.workspace_identity(self.workspace)
+        git.write_text("gitdir: ../replacement.git\n", encoding="utf-8")
+
+        self.assertNotEqual(
+            original_pointer, preparation.workspace_identity(self.workspace)
+        )
+
+    def test_git_reparse_point_is_refused_by_workspace_identity(self) -> None:
+        target = self.workspace.parent / "git-target"
+        target.mkdir()
+        link = self.workspace / ".git"
+        if os.name == "nt":
+            created = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if created.returncode:
+                self.skipTest(
+                    f"native directory junction creation is unavailable: {created.stderr}"
+                )
+            self.addCleanup(link.rmdir)
+        else:
+            try:
+                link.symlink_to(target, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"native symbolic-link creation is unavailable: {exc}")
+            self.addCleanup(link.unlink)
+
+        with self.assertRaisesRegex(OSError, "reparse point"):
+            preparation.workspace_identity(self.workspace)
+
     def test_filename_mentioned_in_inert_hook_does_not_prove_registration(self) -> None:
         self.installed()
         hooks = preparation.read(self.workspace / ".codex/hooks.json")

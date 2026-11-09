@@ -183,12 +183,35 @@ def workspace_identity(workspace: Path) -> dict[str, Any]:
             if git.kind == "file":
                 git_identity = {"pointer_sha256": git.content_sha256}
             elif git.kind == "directory":
+                # Strict Windows profile setup can materialize an empty deny-target directory at
+                # manager/.git. It is not a Git binding unless it has entries.
                 with _DirectoryAnchor(workspace, workspace / ".git") as git_anchor:
                     git_anchor.assert_stable()
-                    git_identity = {
-                        "device": git_anchor.parent_identity[0],
-                        "inode": git_anchor.parent_identity[1],
-                    }
+                    if git_anchor.parent_identity != git.identity:
+                        raise ValueError("ROOT Git binding changed while inspecting it")
+                    before = os.stat(workspace / ".git", follow_symlinks=False)
+                    entries = (
+                        os.listdir(git_anchor.parent_fd)
+                        if git_anchor.parent_fd is not None
+                        else os.listdir(workspace / ".git")
+                    )
+                    after = os.stat(workspace / ".git", follow_symlinks=False)
+                    git_anchor.assert_stable()
+                    if (int(before.st_dev), int(before.st_ino)) != git.identity or (
+                        int(after.st_dev),
+                        int(after.st_ino),
+                    ) != git.identity:
+                        raise ValueError("ROOT Git binding changed while inspecting it")
+                    if not entries and (
+                        before.st_mtime_ns != after.st_mtime_ns
+                        or before.st_ctime_ns != after.st_ctime_ns
+                    ):
+                        raise ValueError("ROOT Git binding changed while inspecting it")
+                    if entries:
+                        git_identity = {
+                            "device": git_anchor.parent_identity[0],
+                            "inode": git_anchor.parent_identity[1],
+                        }
             else:
                 raise ValueError("ROOT Git binding is not a plain file or directory")
         anchor.assert_stable()
