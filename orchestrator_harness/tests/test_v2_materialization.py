@@ -1077,7 +1077,14 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(setup.SETUP_CONFIG_INVALID, raised.exception.code)
 
     def test_managed_bootstrap_copies_only_selected_provider(self) -> None:
-        result, worktree = self._bootstrap("managed-lane", managed=True, provider="codex")
+        result, worktree = self._bootstrap(
+            "managed-lane", managed=True, provider="codex",
+            launch_config_override={
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+                "permission_mode": "worker-isolated",
+            },
+        )
         self.assertTrue(result["ok"], result)
         self.assertEqual(
             "codex-worker\n",
@@ -1142,7 +1149,14 @@ class V2MaterializationTests(unittest.TestCase):
 
     def _assert_split_manager_protection(self, *, managed: bool) -> None:
         manager = self.fixture.root
-        result, worktree = self._bootstrap("split-manager", managed=managed, provider="codex", manager=manager)
+        result, worktree = self._bootstrap(
+            "split-manager", managed=managed, provider="codex", manager=manager,
+            launch_config_override={
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+                "permission_mode": "worker-isolated",
+            },
+        )
         self.assertTrue(result["ok"], result)
         filesystem = tomllib.loads((worktree / ".codex/config.toml").read_text())["permissions"]["worker-isolated"]["filesystem"]
         for leaf in (".codex", ".claude", ".qwen", ".agent-workspace"):
@@ -1351,7 +1365,12 @@ class V2MaterializationTests(unittest.TestCase):
 
     def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(self) -> None:
         result, worktree = self._bootstrap(
-            "plain-lane", managed=False, provider="codex"
+            "plain-lane", managed=False, provider="codex",
+            launch_config_override={
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+                "permission_mode": "worker-isolated",
+            },
         )
         self.assertTrue(result["ok"], result)
         agent_workspace = worktree / ".agent-workspace"
@@ -1363,6 +1382,61 @@ class V2MaterializationTests(unittest.TestCase):
         )
         self.assertEqual("worker-isolated", config["default_permissions"])
         self.assertFalse((worktree / ".custom").exists())
+
+    @unittest.skipUnless(os.name == "nt", "fresh Windows Codex default policy")
+    def test_windows_codex_omission_materializes_reduced_profile_for_managed_and_plain(
+        self,
+    ) -> None:
+        from orchestrator_harness.records import read_record
+
+        for managed in (True, False):
+            with self.subTest(managed=managed):
+                self.fixture = MaterializationFixture()
+                self.addCleanup(self.fixture.close)
+                result, worktree = self._bootstrap(
+                    f"windows-omitted-mode-{managed}", managed=managed,
+                    provider="codex",
+                    launch_config_override={
+                        "reasoning_effort": "high",
+                        "service_tier": "priority",
+                    },
+                )
+                self.assertTrue(result["ok"], result)
+                lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+                self.assertEqual(
+                    {
+                        "reasoning_effort": "high",
+                        "service_tier": "priority",
+                        "permission_mode": "worker-workspace",
+                    },
+                    lane["provider"]["launch_config"],
+                )
+
+                config = tomllib.loads(
+                    (worktree / ".codex" / "config.toml").read_text(encoding="utf-8")
+                )
+                self.assertEqual("worker-workspace", config["default_permissions"])
+                filesystem = config["permissions"]["worker-workspace"]["filesystem"]
+                self.assertFalse(
+                    any(mode == "deny" for mode in filesystem.values()), filesystem
+                )
+
+                git_source = lane["git_source"]
+                common = Path(git_source["common_dir"])
+                branch_ref = git_source["branch_ref"]
+                branch_namespace = branch_ref.rsplit("/", 1)[0]
+                expected_writes = {
+                    Path(git_source["private_dir"]),
+                    common / "objects",
+                    common / branch_namespace,
+                    common / "logs" / branch_namespace,
+                }
+                writes = {
+                    Path(name) for name, mode in filesystem.items() if mode == "write"
+                }
+                self.assertEqual(expected_writes, writes)
+                self.assertNotIn(common, writes)
+                self.assertNotIn(common / "refs" / "heads", writes)
 
     def _commit_product(self, files: dict[str, str]) -> None:
         for name, text in files.items():
