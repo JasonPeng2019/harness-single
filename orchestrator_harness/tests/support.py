@@ -305,7 +305,12 @@ def exited_lease_holder_fixture(
         )
         boundary = None
         try:
-            job = child.take_job_handle() if os.name == "nt" else None
+            if os.name == "nt":
+                if not processes.is_windows_suspended_process(child):
+                    raise AssertionError("Windows provider was not suspended")
+                job = child.take_job_handle()
+            else:
+                job = None
             boundary = processes.ProcessBoundary.for_process(
                 child.pid, windows_job_handle=job
             )
@@ -319,7 +324,7 @@ def exited_lease_holder_fixture(
                 pid=child.pid,
                 creation_time=boundary.root_creation_time,
             )
-            if os.name == "nt":
+            if processes.is_windows_suspended_process(child):
                 child.resume()
             if child.wait(timeout=10) != 0:
                 raise AssertionError("lease fixture child failed")
@@ -333,7 +338,7 @@ def exited_lease_holder_fixture(
                     )
             finally:
                 child.wait(timeout=10)
-                if os.name == "nt":
+                if processes.is_windows_suspended_process(child):
                     child.close()
 
 

@@ -938,7 +938,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_setup_installs_shared_and_provider_files_in_one_worker_tree(self) -> None:
-        with self.fixture.native_setup() as spawn_detached:
+        with self.fixture.native_setup():
             result = setup.run_setup()
         self.assertTrue(result["ok"], result)
         composed = (
@@ -1105,7 +1105,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def test_setup_second_run_rejects_byte_changed_installed_payload(self) -> None:
-        with self.fixture.native_setup() as spawn_detached:
+        with self.fixture.native_setup():
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         changed = self.fixture.root_workspace / ".codex" / "root.txt"
@@ -1147,7 +1147,7 @@ class V2MaterializationTests(unittest.TestCase):
         spawn_detached.assert_called_once()
 
     def test_setup_second_run_rejects_binding_materialized_elsewhere(self) -> None:
-        with self.fixture.native_setup() as spawn_detached:
+        with self.fixture.native_setup():
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         binding_path = (
@@ -1942,7 +1942,9 @@ class V2MaterializationTests(unittest.TestCase):
                 managed=managed, manager=manager, checkout_paths=checkout_paths
             )
         else:
-            self.assertEqual("OPEN", setup.read_runtime_state(runtime)["state"])
+            runtime_state = setup.read_runtime_state(runtime)
+            assert runtime_state is not None
+            self.assertEqual("OPEN", runtime_state["state"])
             base = self.fixture.git("rev-parse", "HEAD")
         task_card = self.fixture.root / f"{lane_id}.json"
         self.fixture._write_json(

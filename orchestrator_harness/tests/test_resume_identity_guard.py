@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -64,8 +66,11 @@ class ResumeIdentityGuardTests(unittest.TestCase):
             seed_provider_history(root, lane, completed=1)
 
             def mutate_newer(
-                _rt: Path, _epoch: str, _lane: str, mutate: object
-            ) -> dict:
+                _rt: Path,
+                _epoch: str,
+                _lane: str,
+                mutate: Callable[[dict[str, Any]], dict[str, Any]],
+            ) -> dict[str, Any]:
                 return mutate({**lane, "run_id": "run-new"})
 
             with (

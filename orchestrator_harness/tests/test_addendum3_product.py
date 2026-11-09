@@ -4,7 +4,9 @@ import tempfile
 import os
 import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TextIO, TypedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -13,7 +15,6 @@ from orchestrator_harness import (
     controller,
     git_source,
     leases,
-    manager_queue,
     monitor,
     review,
     scan_watch,
@@ -41,6 +42,23 @@ from orchestrator_harness.tests.support import (
 )
 from orchestrator_harness.lanes import write_lane
 from orchestrator_harness.stable_io import PreparedOutputTransaction
+
+
+class CandidateCorrectionObservation(TypedDict):
+    exit_code: int
+    lane: dict[str, Any]
+    status: dict[str, Any]
+    events: list[dict[str, Any]]
+    attempts: list[dict[str, Any]]
+    calls: list[dict[str, object]]
+    boundaries: list[MagicMock]
+    lease_observations: list[dict[str, object]]
+    lane_transitions: list[dict[str, object]]
+    status_transitions: list[dict[str, object]]
+    release_observations: list[dict[str, object]]
+    lease_after: dict[str, Any] | None
+    correction_prompts: list[Path]
+    result_path: Path
 
 
 class Addendum3ProductTests(unittest.TestCase):
@@ -272,6 +290,7 @@ class Addendum3ProductTests(unittest.TestCase):
         from orchestrator_harness import processes
 
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         monitor_path = self.runtime / "monitor" / "MONITOR.json"
         atomic_write_json(
             monitor_path,
@@ -289,6 +308,7 @@ class Addendum3ProductTests(unittest.TestCase):
         setup.set_runtime_state(self.runtime, "OPEN")
         monitor._heartbeat(self.runtime, "config-1", 0, diagnostics)
         record = monitor.read_monitor_record(self.runtime)
+        assert record is not None
         self.assertEqual(0, record["watched_lane_count"])
         self.assertEqual("degraded", record["health"])
         self.assertEqual("outbox_promotion", record["diagnostics"][0]["kind"])
@@ -298,7 +318,7 @@ class Addendum3ProductTests(unittest.TestCase):
     ) -> None:
         from orchestrator_harness import resume
 
-        event = promote_event(
+        promote_event(
             self.runtime,
             event_type="LANE_RESUME_REQUIRED",
             lane_id="lane-1",
@@ -528,7 +548,7 @@ class Addendum3ProductTests(unittest.TestCase):
         valid_on_second: bool,
         scenario: str = "bounded",
         prior_invocations: int = 0,
-    ) -> dict[str, object]:
+    ) -> CandidateCorrectionObservation:
         suffix = {
             "bounded": "valid-second" if valid_on_second else "exhausted-second",
             "no-session": "no-session",
@@ -596,8 +616,13 @@ class Addendum3ProductTests(unittest.TestCase):
         real_write_status = controller._write_status
         real_release_leases = controller.release_leases
 
-        def track_update_lane(*args: object, **kwargs: object) -> dict[str, object]:
-            updated = real_update_lane(*args, **kwargs)
+        def track_update_lane(
+            rt: Path,
+            epoch_id: str,
+            lane_id: str,
+            mutate: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> dict[str, Any]:
+            updated = real_update_lane(rt, epoch_id, lane_id, mutate)
             lane_transitions.append(updated)
             return updated
 
@@ -622,13 +647,19 @@ class Addendum3ProductTests(unittest.TestCase):
             )
             real_release_leases(runtime, lane_id, run_id)
 
-        def run_provider(*args: object, **kwargs: object) -> ProviderExecution:
-            attempt_number = int(kwargs["attempt_number"])
-            resume = bool(kwargs["resume"])
-            current_lane = args[2]
-            self.assertIsInstance(current_lane, dict)
-            assert isinstance(current_lane, dict)
-            prompt_path = Path(str(args[5]))
+        def run_provider(
+            rt: Path,
+            epoch_id: str,
+            current_lane: dict[str, Any],
+            provider_invocation: dict[str, Any],
+            binding: Any,
+            prompt_path: Path,
+            *,
+            attempt_number: int = 1,
+            resume: bool | None = None,
+            sandbox_health: dict[str, Any] | None = None,
+        ) -> ProviderExecution:
+            resume = bool(resume)
             if boundaries:
                 boundaries[-1].cleanup.assert_called_once()
             held = leases.read_lease(self.runtime, "resource-1")
@@ -872,9 +903,9 @@ class Addendum3ProductTests(unittest.TestCase):
             argv: list[str],
             *,
             cwd: str,
-            stdin: object,
-            stdout: object,
-            stderr: object,
+            stdin: TextIO,
+            stdout: TextIO,
+            stderr: TextIO,
         ) -> MagicMock:
             self.assertEqual(expected_argv, argv)
             self.assertEqual(str(worktree), cwd)
@@ -1142,7 +1173,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "lane_id": "lane-1",
             "run_id": "run-1",
             "lifecycle": "running",
-            "process": {"pid": 7, "creation_time": "controller-created"},
+            "process": {"pid": 7, "creation_time": "2026-11-09T12:00:00Z"},
         }
         status = {"recorded_status": "correction_pending"}
         with patch.object(monitor.processes, "identity_matches", return_value=True):
@@ -1334,7 +1365,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "worktree_path": str(worktree),
             "result_path": str(worktree / "RESULT.json"),
             "lifecycle": "review_pending",
-            "process": {"pid": 7, "creation_time": "controller-created"},
+            "process": {"pid": 7, "creation_time": "2026-11-09T12:00:00Z"},
         }
         status = {
             "recorded_status": "review_pending",
@@ -1502,8 +1533,11 @@ class Addendum3ProductTests(unittest.TestCase):
         current = dict(lane)
 
         def update(
-            _rt: object, _epoch: object, _lane_id: object, mutate: object
-        ) -> dict[str, object]:
+            _rt: Path,
+            _epoch: str,
+            _lane_id: str,
+            mutate: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> dict[str, Any]:
             value = mutate(dict(current))
             current.update(value)
             updates.append(dict(current))
@@ -1584,8 +1618,11 @@ class Addendum3ProductTests(unittest.TestCase):
         seed_provider_history(self.runtime, lane)
 
         def update(
-            _rt: object, _epoch: object, _lane_id: object, mutate: object
-        ) -> dict[str, object]:
+            _rt: Path,
+            _epoch: str,
+            _lane_id: str,
+            mutate: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> dict[str, Any]:
             value = mutate(dict(lane))
             updates.append(value)
             lane.update(value)

@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from orchestrator_harness.provider_adapters.codex import launcher_binding as binding
@@ -41,8 +42,8 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         catalog_path.start()
         self.addCleanup(catalog_path.stop)
 
-    def argv(self, **overrides):
-        options = dict(
+    def argv(self, **overrides: Any) -> list[str]:
+        options: dict[str, Any] = dict(
             model="requested-model:cloud",
             launch_config={
                 "reasoning_effort": "max",
@@ -398,9 +399,9 @@ class CodexOllamaLaunchTests(unittest.TestCase):
                 json.dumps({"type": "thread.started", "thread_id": "native-session"})
             ),
         )
-        self.assertTrue(
-            binding.parse_line('{"type":"turn.failed"}')["non_retryable_failure"]
-        )
+        failure = binding.parse_line('{"type":"turn.failed"}')
+        assert failure is not None
+        self.assertTrue(failure["non_retryable_failure"])
         self.assertIsNone(binding.parse_line("Launching Codex with Ollama"))
 
     def test_native_final_text_survives_terminal_usage_event(self):
@@ -443,6 +444,7 @@ class CodexOllamaLaunchTests(unittest.TestCase):
         parsed = binding.parse_line(
             '{"type":"turn.completed","threadId":"saved-session","usage":{}}'
         )
+        assert parsed is not None
         self.assertEqual({"session_id": "saved-session"}, parsed)
         self.assertNotIn("message", parsed)
         for event in (

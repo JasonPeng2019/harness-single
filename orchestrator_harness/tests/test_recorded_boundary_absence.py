@@ -79,7 +79,9 @@ class RecordedJobAbsenceTests(unittest.TestCase):
 
     def test_malformed_record_is_not_absence_even_when_no_pid_is_live(self):
         record = recorded_boundary()
-        record["processes"].append({"pid": 33003})
+        inventory = record["processes"]
+        assert isinstance(inventory, list)
+        inventory.append({"pid": 33003})
         with (
             patch.object(p.os, "name", "nt"),
             patch.object(p, "process_alive", return_value=False),

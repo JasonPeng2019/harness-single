@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import tempfile
 import threading
@@ -211,7 +210,9 @@ class ShutdownInventoryIntegrityTests(unittest.TestCase):
                 closer.start()
                 self.assertTrue(shutdown_started.wait(5))
                 self.assertFalse(shutdown_done.wait(0.2), results)
-                self.assertEqual("OPEN", setup.read_runtime_state(self.rt)["state"])
+                runtime_state = setup.read_runtime_state(self.rt)
+                assert runtime_state is not None
+                self.assertEqual("OPEN", runtime_state["state"])
             finally:
                 finish_create.set()
                 creator.join(5)
@@ -220,7 +221,9 @@ class ShutdownInventoryIntegrityTests(unittest.TestCase):
         self.assertFalse(creator.is_alive() or closer.is_alive())
         self.assertTrue(results["bootstrap"]["ok"], results)
         self.assertTrue(results["shutdown"]["ok"], results)
-        self.assertEqual("CLOSED", setup.read_runtime_state(self.rt)["state"])
+        runtime_state = setup.read_runtime_state(self.rt)
+        assert runtime_state is not None
+        self.assertEqual("CLOSED", runtime_state["state"])
 
 
 if __name__ == "__main__":

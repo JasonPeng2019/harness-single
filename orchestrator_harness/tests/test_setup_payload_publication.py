@@ -488,12 +488,15 @@ class RootBindingPublicationTests(unittest.TestCase):
 
     def installed(self):
         captured = setup._capture_root_payloads(self.plan, self.workspace)
+        captured_sources: dict[Path, bytes] = {}
+        for file in captured.files:
+            content = file.source.state.content
+            assert content is not None
+            captured_sources[file.source.path] = content
         self.bindings = setup._plan_root_hook_bindings(
             self.harness,
             self.plan,
-            captured_sources={
-                file.source.path: file.source.state.content for file in captured.files
-            },
+            captured_sources=captured_sources,
         )
         templates = {
             self.workspace / relative: value for _, relative, value in self.bindings
@@ -638,12 +641,15 @@ class RootBindingPublicationTests(unittest.TestCase):
             if file.relative.name == setup.ROOT_HOOK_BINDING_NAME
         )
         source.write_bytes(b"foreign invalid JSON")
+        captured_sources: dict[Path, bytes] = {}
+        for file in captured.files:
+            content = file.source.state.content
+            assert content is not None
+            captured_sources[file.source.path] = content
         bindings = setup._plan_root_hook_bindings(
             self.harness,
             self.plan,
-            captured_sources={
-                file.source.path: file.source.state.content for file in captured.files
-            },
+            captured_sources=captured_sources,
         )
         planned = setup._preflight_root_payloads(
             self.plan, self.workspace, overwrite=False, captured=captured

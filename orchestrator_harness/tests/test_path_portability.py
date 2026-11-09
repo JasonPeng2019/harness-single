@@ -102,9 +102,12 @@ class PathPortabilityTests(unittest.TestCase):
                 )
                 query = processes._linux_process_query(11)
                 self.assertTrue(query.complete, query.errors)
-                self.assertEqual(10, query.process.ppid)
-                self.assertEqual("worker --example", query.process.command_line)
-                self.assertEqual(1005, query.process.created_utc.timestamp())
+                process = query.process
+                assert process is not None
+                self.assertEqual(10, process.ppid)
+                self.assertEqual("worker --example", process.command_line)
+                assert process.created_utc is not None
+                self.assertEqual(1005, process.created_utc.timestamp())
                 self.assertTrue(processes._linux_process_query(99).complete)
                 (root / "self" / "stat").unlink()
                 self.assertFalse(processes._linux_process_query(99).complete)

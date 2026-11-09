@@ -73,6 +73,7 @@ class PlatformMutationTests(unittest.TestCase):
         self.assertEqual(b"second", mutation.read_bytes(self.root, "a/nested/data"))
         appended = mutation.append_bytes(self.root, "a/nested/data", b" appended")
         self.assertEqual(b"second appended", appended.content)
+        assert appended.content is not None
         self.assertEqual(
             hashlib.sha256(appended.content).hexdigest(), appended.content_sha256
         )
@@ -1091,6 +1092,7 @@ class PlatformIdentityTests(unittest.TestCase):
     def test_native_identity_and_invalid_pid_observations(self):
         identity = process_identity.exact_process_identity(os.getpid())
         self.assertIsNotNone(identity)
+        assert identity is not None
         self.assertEqual(os.getpid(), identity["pid"])
         self.assertTrue(identity["created_utc"])
         for invalid in (True, False, 0, -1, "1", 1.0, 1 << 64):

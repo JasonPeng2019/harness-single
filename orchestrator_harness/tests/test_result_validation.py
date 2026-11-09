@@ -287,6 +287,7 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
 
         path = self.worker / ".agent-workspace/result-stop-check.py"
         spec = importlib.util.spec_from_file_location("fixture_worker_checker", path)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         valid, reason, result = module.check_result(path.parent)
@@ -571,20 +572,21 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
 
     def test_source_changed_while_waiting_for_review_lock_is_not_published(self):
         actual_lock = review.RecordLock
+        test_case = self
 
         class SourceChangesAtLock:
-            def __init__(inner, path):
-                inner.lock = actual_lock(path)
+            def __init__(self, path):
+                self.lock = actual_lock(path)
 
-            def __enter__(inner):
-                inner.lock.__enter__()
-                (self.worker / "source.txt").write_bytes(
+            def __enter__(self):
+                self.lock.__enter__()
+                (test_case.worker / "source.txt").write_bytes(
                     b"changed before publication\n"
                 )
-                return inner
+                return self
 
-            def __exit__(inner, *arguments):
-                return inner.lock.__exit__(*arguments)
+            def __exit__(self, *arguments):
+                return self.lock.__exit__(*arguments)
 
         with patch.object(review, "RecordLock", SourceChangesAtLock):
             with self.assertRaises(review.ReviewError):

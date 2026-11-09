@@ -89,19 +89,19 @@ class RootSessionTests(unittest.TestCase):
         real_ready = setup.require_monitor_ready
 
         class SessionLock:
-            def __init__(inner, path):
-                inner.real = real_lock(path)
+            def __init__(self, path):
+                self.real = real_lock(path)
 
-            def __enter__(inner):
+            def __enter__(self):
                 nonlocal held
-                inner.real.__enter__()
+                self.real.__enter__()
                 held = True
-                return inner
+                return self
 
-            def __exit__(inner, *args):
+            def __exit__(self, *args):
                 nonlocal held
                 held = False
-                return inner.real.__exit__(*args)
+                return self.real.__exit__(*args)
 
         def ready(*args):
             self.assertFalse(held)

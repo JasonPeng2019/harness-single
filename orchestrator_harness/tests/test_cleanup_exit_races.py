@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from orchestrator_harness import launch, processes
-from orchestrator_harness.records import atomic_write_json
 from orchestrator_harness.tests.support import seed_provider_history
 from orchestrator_harness.tests.result_fixture import LinkedResultFixture
 from orchestrator_harness.lane_authority import read_invocation
@@ -64,7 +64,7 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
             "recorded_status": "provider_start_failed",
         }
 
-    def _spawn_controller(self) -> tuple[subprocess.Popen, dict[str, object]]:
+    def _spawn_controller(self) -> tuple[subprocess.Popen[Any], dict[str, Any]]:
         """Spawn a real controller process and record its exact identity.
 
         The child writes the provider-start-failure event, then stays
@@ -89,7 +89,7 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
         return child, identity
 
     @staticmethod
-    def _stop_exact(child: subprocess.Popen, identity: dict[str, object]) -> None:
+    def _stop_exact(child: subprocess.Popen[Any], identity: dict[str, Any]) -> None:
         """Terminate the exact incarnation and reap the handle on cleanup."""
         if child.poll() is None and isinstance(identity.get("pid"), int):
             processes.terminate_process(
@@ -102,16 +102,22 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
 
     def _recording_updates(
         self,
-    ) -> tuple[callable, list[dict[str, object]]]:
+    ) -> tuple[
+        Callable[
+            [Path, str, str, Callable[[dict[str, Any]], dict[str, Any]]],
+            dict[str, Any],
+        ],
+        list[dict[str, object]],
+    ]:
         updates: list[dict[str, object]] = []
         current = dict(self.lane)
 
         def update(
-            _rt: object,
-            _epoch: object,
-            _lane_id: object,
-            mutate: object,
-        ) -> dict[str, object]:
+            _rt: Path,
+            _epoch: str,
+            _lane_id: str,
+            mutate: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> dict[str, Any]:
             value = mutate(dict(current))
             updates.append(value)
             current.update(value)

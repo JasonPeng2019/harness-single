@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from types import SimpleNamespace
 
 from orchestrator_harness import root_hook_wrapper as wrapper
 from orchestrator_harness.setup import _materialized_binding
@@ -286,7 +285,7 @@ class RootProviderPayloadTests(unittest.TestCase):
                     f"_root_{provider_id}_{filename}", path
                 )
                 self.assertIsNotNone(spec)
-                self.assertIsNotNone(spec.loader)
+                assert spec is not None and spec.loader is not None
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 self.assertTrue(callable(module.main))

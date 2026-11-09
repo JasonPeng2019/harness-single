@@ -47,6 +47,7 @@ class WorkerFileBoundaryTests(unittest.TestCase):
         second = mutation.append_bytes(self.root, path.name, b'{"second":true}\n')
         self.assertEqual(b'{"first":true}\n', first.content)
         self.assertEqual(b'{"first":true}\n{"second":true}\n', second.content)
+        assert second.content is not None
         self.assertEqual(path.read_bytes(), second.content)
         self.assertEqual(
             hashlib.sha256(second.content).hexdigest(), second.content_sha256
@@ -318,6 +319,7 @@ class WorkerFileBoundaryTests(unittest.TestCase):
             / "super-cache/workspace/.agent-workspace/lane-queue.py"
         )
         spec = importlib.util.spec_from_file_location("inbox_worker_fixture", helper)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         atomic_write_json(
@@ -556,6 +558,7 @@ class WorkerFileBoundaryTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location(
             "notice_producer_boundary_fixture", source
         )
+        assert spec is not None and spec.loader is not None
         producer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(producer)
         agent = self.root / "worker/.agent-workspace"

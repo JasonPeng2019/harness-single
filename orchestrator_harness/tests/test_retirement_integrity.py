@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator_harness import launch, processes
-from orchestrator_harness.config import HarnessConfig, ResourceManifest
 from orchestrator_harness.core import content_hash
-from orchestrator_harness.epochs import lane_record_dir, open_epoch, write_active_lanes
+from orchestrator_harness.epochs import lane_record_dir, write_active_lanes
 from orchestrator_harness.lanes import read_lane, write_lane
 from orchestrator_harness.models import ProcessQuery
 from orchestrator_harness.records import atomic_write_json

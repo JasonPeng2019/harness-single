@@ -1,6 +1,7 @@
 """Offline failure evidence for WSL cleanup; these are not live Linux proof."""
 
 from pathlib import Path
+import importlib.util
 import json
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -10,9 +11,15 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
+_DRIVER_PATH = Path(__file__).resolve().parent / "support" / "wsl_real_agent_driver.py"
+sys.path.insert(0, str(_DRIVER_PATH.parent))
 try:
-    import wsl_real_agent_driver as driver
+    _DRIVER_SPEC = importlib.util.spec_from_file_location(
+        "_wsl_real_agent_driver_fixture", _DRIVER_PATH
+    )
+    assert _DRIVER_SPEC is not None and _DRIVER_SPEC.loader is not None
+    driver = importlib.util.module_from_spec(_DRIVER_SPEC)
+    _DRIVER_SPEC.loader.exec_module(driver)
 finally:
     sys.path.pop(0)
 

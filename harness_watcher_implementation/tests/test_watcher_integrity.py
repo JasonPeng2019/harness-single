@@ -20,7 +20,6 @@ from harness_watcher_implementation.config import (
     WatcherConfig,
     load_config,
 )
-from harness_watcher_implementation.io import atomic_json
 from harness_watcher_implementation.logging import log
 from harness_watcher_implementation.state import _save as save_state
 
@@ -165,7 +164,9 @@ class WatcherIntegrityTests(unittest.TestCase):
         self.assertEqual(
             [{"event": "after-ready"}], self.routed()[0]["data"]["records"]
         )
-        self.assertEqual("stop-requested", cli._read(service)["exit_reason"])
+        state = cli._read(service)
+        assert state is not None
+        self.assertEqual("stop-requested", state["exit_reason"])
 
     def test_cursor_initialization_failure_never_publishes_ready(self):
         service = self.runtime / "watcher" / "service.json"
@@ -190,6 +191,7 @@ class WatcherIntegrityTests(unittest.TestCase):
             self.assertEqual(1, cli.main(["serve", "--startup-token", "test"]))
         poll.assert_not_called()
         state = cli._read(service)
+        assert state is not None
         self.assertEqual("STARTING", state["startup_status"])
         self.assertEqual("service-error", state["exit_reason"])
 

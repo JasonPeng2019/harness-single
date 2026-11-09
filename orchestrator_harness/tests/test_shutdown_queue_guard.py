@@ -59,9 +59,9 @@ class ShutdownQueueGuardTests(unittest.TestCase):
                 )
                 self.assertIn(event["event_id"], result["summary"])
                 write_state.assert_not_called()
-                self.assertEqual(
-                    "OPEN", setup.read_runtime_state(config.runtime_root)["state"]
-                )
+                runtime_state = setup.read_runtime_state(config.runtime_root)
+                assert runtime_state is not None
+                self.assertEqual("OPEN", runtime_state["state"])
 
 
 if __name__ == "__main__":

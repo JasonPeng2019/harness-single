@@ -892,7 +892,6 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         captured: dict[str, int] = {}
         owner = {"pid": 4242, "created_utc": "owner-utc"}
         watcher = {"pid": 4243, "created_utc": "watcher-utc"}
-        service = self.config.runtime_root / "watcher" / "service.json"
         read_calls = 0
 
         class Child:
@@ -1634,14 +1633,16 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             ),
             "",
         )
+        packet = capture.packet
+        assert packet is not None
         with patch(
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
+            CommandEvaluator(("configured-evaluator",)).evaluate(packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(
-            capture.packet["constraints"]["ownership_phase_rules"],
+            packet["constraints"]["ownership_phase_rules"],
             prompt["packet"]["constraints"]["ownership_phase_rules"],
         )
         for rule in OWNERSHIP_PHASE_RULES:
@@ -1715,11 +1716,13 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             ),
             "",
         )
+        packet = capture.packet
+        assert packet is not None
         with patch(
             "harness_watcher_implementation.evaluator.subprocess.run",
             return_value=completed,
         ) as run:
-            CommandEvaluator(("configured-evaluator",)).evaluate(capture.packet)
+            CommandEvaluator(("configured-evaluator",)).evaluate(packet)
         prompt = json.loads(run.call_args.kwargs["input"])
         self.assertIn("setup_preparation", prompt["packet"]["observations"][0]["text"])
         self.assertIn(

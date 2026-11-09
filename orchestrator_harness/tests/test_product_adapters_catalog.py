@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 from orchestrator_harness import bootstrap, setup
@@ -411,7 +412,7 @@ class RegisteredBindingTests(unittest.TestCase):
             Path(self.worktree) / ".agent-workspace" / "correction-prompt-1.md"
         )
 
-    def _load_registered(self, provider_id: str) -> object:
+    def _load_registered(self, provider_id: str) -> ModuleType:
         path = (
             REPOSITORY_ROOT
             / "orchestrator_harness"

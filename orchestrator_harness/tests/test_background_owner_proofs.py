@@ -43,9 +43,11 @@ class BackgroundOwnerProofTests(unittest.TestCase):
             return shutdown.run_shutdown()
 
     def record(self, identity=None, startup_id="3" * 32, **fields):
+        owner_identity = identity or processes.process_identity(os.getpid())
+        assert owner_identity is not None
         record = {
             "schema": setup.MONITOR_SCHEMA,
-            **(identity or processes.process_identity(os.getpid())),
+            **owner_identity,
             "config_identity": "fixture",
             "startup_id": startup_id,
             "health": "healthy",
@@ -66,6 +68,7 @@ class BackgroundOwnerProofTests(unittest.TestCase):
         try:
             identity = processes.process_identity(child.pid)
             self.assertIsNotNone(identity)
+            assert identity is not None
             child.communicate(b"x", timeout=10)
             self.assertTrue(
                 processes.identity_exit_proven(
@@ -149,7 +152,9 @@ class BackgroundOwnerProofTests(unittest.TestCase):
             result = self.shutdown()
         self.assertFalse(result["ok"], result)
         self.assertIn("ownership changed", result["summary"])
-        self.assertEqual("SHUTTING_DOWN", setup.read_runtime_state(self.rt)["state"])
+        runtime_state = setup.read_runtime_state(self.rt)
+        assert runtime_state is not None
+        self.assertEqual("SHUTTING_DOWN", runtime_state["state"])
         self.assertEqual(replacement, setup.read_monitor_record(self.rt))
 
     def test_legacy_closed_without_retained_owner_is_not_proof(self):

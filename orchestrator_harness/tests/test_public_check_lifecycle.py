@@ -63,8 +63,17 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
             env.pop(key, None)
         monitor = None
         service_started = False
+        old_results: list[Path] | None = None
+        old_bytes: dict[Path, bytes] | None = None
+        request: dict[str, object] | None = None
 
-        def run(argv, cwd, *, code=0, timeout=45):
+        def run(
+            argv,
+            cwd,
+            *,
+            code: int | tuple[int, ...] = 0,
+            timeout: int = 45,
+        ) -> str:
             started = time.monotonic()
             try:
                 completed = subprocess.run(
@@ -267,6 +276,7 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
             )
             public("harness", "setup", timeout=180)
             monitor = setup.read_monitor_record(rt)
+            assert monitor is not None
             prepared = json.loads(
                 run(
                     [
@@ -316,7 +326,9 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                 timeout=240,
             )
             public("scan", "--no-write")
-            epoch = read_current_epoch(rt)["epoch_id"]
+            current_epoch = read_current_epoch(rt)
+            assert current_epoch is not None
+            epoch = current_epoch["epoch_id"]
             lane = read_lane(rt, epoch, "worker")
             worktree = Path(lane["worktree_path"])
             agent = worktree / ".agent-workspace"
@@ -405,6 +417,7 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
             evidence["resumed_lane"] = lane
             close_events()
             if enabled:
+                assert old_bytes is not None and old_results is not None
                 feedback("after-pass", 0)
                 feedback("after-fail", 1)
                 for path, raw in old_bytes.items():
@@ -446,6 +459,7 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                         worktree,
                     )
                 )
+                assert request is not None
                 wait_for(
                     lambda: list(
                         (rt / "operator-only/public-check-service").glob(
@@ -456,11 +470,14 @@ class StagedPublicCheckLifecycleTests(unittest.TestCase):
                 )
                 evidence["active_request"] = request
             public("harness", "shutdown")
-            self.assertEqual("CLOSED", setup.read_runtime_state(rt)["state"])
+            runtime_state = setup.read_runtime_state(rt)
+            assert runtime_state is not None
+            self.assertEqual("CLOSED", runtime_state["state"])
             self.assertTrue(
                 processes.identity_exit_proven(monitor["pid"], monitor["creation_time"])
             )
             if enabled:
+                assert request is not None
                 from orchestrator_harness.public_checks import home, validate_service
 
                 stopped = validate_service(workspace, harness, runtime_closed=True)

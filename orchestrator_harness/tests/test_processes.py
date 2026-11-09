@@ -62,11 +62,10 @@ class ProcessProviderTests(unittest.TestCase):
         if sys.prefix == sys.base_prefix:
             self.skipTest("requires a Windows virtual environment")
         env = {"EXAMPLE": "value"}
+        base_executable = getattr(sys, "_base_executable", sys.executable)
         with patch.object(processes.subprocess, "Popen") as popen:
             processes.spawn_detached([sys.executable, "-m", "example"], env=env)
-        self.assertEqual(
-            [sys._base_executable, "-m", "example"], popen.call_args.args[0]
-        )
+        self.assertEqual([base_executable, "-m", "example"], popen.call_args.args[0])
         self.assertEqual(
             {"EXAMPLE": "value", "__PYVENV_LAUNCHER__": sys.executable},
             popen.call_args.kwargs["env"],

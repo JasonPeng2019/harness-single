@@ -160,6 +160,7 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             self.assertIn((33003, iso_utc(CREATED)), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
+            assert remaining is not None
             self.assertEqual(
                 {(22002, "2026-07-30T12:00:00Z"), (33003, iso_utc(CREATED))},
                 set(remaining),
@@ -449,6 +450,7 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
+            assert remaining is not None
             self.assertEqual(
                 {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
             )
@@ -569,6 +571,7 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
+            assert remaining is not None
             self.assertEqual(
                 {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
             )
@@ -656,6 +659,7 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
+            assert remaining is not None
             self.assertEqual(
                 {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
             )

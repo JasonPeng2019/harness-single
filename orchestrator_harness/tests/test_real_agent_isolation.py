@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 SUPPORT = Path(__file__).resolve().parent / "support"
@@ -80,7 +81,7 @@ class RealAgentIsolationTests(unittest.TestCase):
             workspace, home, release = (
                 root / name for name in ("workspace", "home", "release")
             )
-            layout = {
+            layout: dict[str, Any] = {
                 key: str(root / "namespace" / key)
                 for key in (
                     "root",

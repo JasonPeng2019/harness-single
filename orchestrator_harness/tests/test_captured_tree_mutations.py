@@ -48,6 +48,7 @@ class CapturedTreeMutationTests(unittest.TestCase):
         )
         state = dict(captured.entries)[Path("tree/a-first")]
         self.assertEqual(b"original first", state.content)
+        assert state.content is not None
         self.assertEqual(
             hashlib.sha256(state.content).hexdigest(), state.content_sha256
         )

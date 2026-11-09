@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
 
 from orchestrator_harness import processes, resume, retry_policy, setup
 from orchestrator_harness.config import ResourceManifest
@@ -82,7 +81,12 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
             )
             boundary = None
             try:
-                job = child.take_job_handle() if os.name == "nt" else None
+                if os.name == "nt":
+                    if not processes.is_windows_suspended_process(child):
+                        raise AssertionError("Windows provider was not suspended")
+                    job = child.take_job_handle()
+                else:
+                    job = None
                 boundary = processes.ProcessBoundary.for_process(
                     child.pid, windows_job_handle=job
                 )
@@ -91,14 +95,14 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
                 retry_policy.record_started(
                     self.rt, lane, token, process_boundary=record
                 )
-                if os.name == "nt":
+                if processes.is_windows_suspended_process(child):
                     child.resume()
                 self.assertEqual(0, child.wait(timeout=10))
             finally:
                 if boundary is not None:
                     self.assertTrue(boundary.cleanup(force=True, timeout_seconds=10))
                 child.wait(timeout=10)
-                if os.name == "nt":
+                if processes.is_windows_suspended_process(child):
                     child.close()
         retry_policy.record_outcome(
             self.rt,
@@ -158,7 +162,9 @@ class RetainedResumeTests(LinkedResultFixture, unittest.TestCase):
         return result
 
     def current(self):
-        epoch = read_current_epoch(self.rt)["epoch_id"]
+        current_epoch = read_current_epoch(self.rt)
+        assert current_epoch is not None
+        epoch = current_epoch["epoch_id"]
         return epoch, read_lane(self.rt, epoch, "worker")
 
     def snapshot(self):

@@ -259,9 +259,9 @@ class AuthorityConfigTests(unittest.TestCase):
                 ):
                     closed = shutdown.run_shutdown()
                 self.assertTrue(closed["ok"], closed)
-                self.assertEqual(
-                    "CLOSED", setup.read_runtime_state(config.runtime_root)["state"]
-                )
+                state = setup.read_runtime_state(config.runtime_root)
+                assert state is not None
+                self.assertEqual("CLOSED", state["state"])
                 self.assertTrue(
                     processes.identity_exit_proven(ready["pid"], ready["creation_time"])
                 )

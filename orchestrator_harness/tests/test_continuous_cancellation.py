@@ -141,7 +141,9 @@ class PublicContinuousCancellationTests(unittest.TestCase):
                 "--task-card",
                 str(card),
             )
-            epoch = read_current_epoch(rt)["epoch_id"]
+            current_epoch = read_current_epoch(rt)
+            assert current_epoch is not None
+            epoch = current_epoch["epoch_id"]
             lanes.append((epoch, lane_id))
             return read_lane(rt, epoch, lane_id)
 
@@ -275,6 +277,7 @@ class PublicContinuousCancellationTests(unittest.TestCase):
             )
             public("harness", "setup")
             monitor = setup.read_monitor_record(rt)
+            assert monitor is not None
             session = publish_root_session(
                 load_config(harness), run_id="continuous-fixture", provider_id="codex"
             )
@@ -287,6 +290,7 @@ class PublicContinuousCancellationTests(unittest.TestCase):
             )
             sentinel_identity = processes.process_identity(sentinel.pid)
             self.assertIsNotNone(sentinel_identity)
+            assert sentinel_identity is not None
             first = bootstrap("busy-first")
             first_owned = start(first)
             public("lane", "force-stop", "--lane-id", "busy-first")
@@ -306,7 +310,9 @@ class PublicContinuousCancellationTests(unittest.TestCase):
             drain_delivered()
             public("harness", "shutdown")
             prove_exits(second_owned)
-            self.assertEqual("CLOSED", setup.read_runtime_state(rt)["state"])
+            runtime_state = setup.read_runtime_state(rt)
+            assert runtime_state is not None
+            self.assertEqual("CLOSED", runtime_state["state"])
             self.assertTrue(
                 lane_cleanup.cleanup_is_proven(
                     read_lane(rt, lanes[-1][0], "busy-reuse")

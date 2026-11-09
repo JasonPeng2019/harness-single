@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import controller
@@ -122,7 +123,7 @@ class NativeAttemptReceipts(unittest.TestCase):
             ):
                 root = Path(raw)
                 transcript = root / "transcript.jsonl"
-                event = {
+                event: dict[str, Any] = {
                     "type": "result",
                     "uuid": "terminal",
                 }

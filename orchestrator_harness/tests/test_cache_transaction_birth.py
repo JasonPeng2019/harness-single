@@ -73,6 +73,7 @@ class DurableNativeIdentityTests(unittest.TestCase):
         self.assertIsNotNone(
             other, "configured native Python runtime must be available"
         )
+        assert other is not None
         source = Path(__file__).resolve().parents[2]
         code = (
             "import json,sys;from pathlib import Path;"
@@ -121,6 +122,7 @@ class DurableNativeIdentityTests(unittest.TestCase):
             expected_directories=chain,
         )
         self.assertEqual(b"original suffix", first.content)
+        assert first.content is not None
         self.path.rename(self.root / "retained")
         self.path.write_bytes(first.content)
         with self.assertRaises(mutation.MutationConflict):
@@ -542,9 +544,9 @@ class CacheTransactionBirthTests(unittest.TestCase):
         self.assertEqual(
             previous, setup._manifest_for_tree(self.runtime / "super-cache.old")
         )
-        self.assertEqual(
-            "cleanup_unproven", setup._read_cache_transaction(self.runtime)["state"]
-        )
+        transaction = setup._read_cache_transaction(self.runtime)
+        assert transaction is not None
+        self.assertEqual("cleanup_unproven", transaction["state"])
         self.install(overwrite=True)
         self.assertFalse((self.runtime / "super-cache.old").exists())
         self.assertFalse(setup._transaction_path(self.runtime).exists())
@@ -571,9 +573,9 @@ class CacheTransactionBirthTests(unittest.TestCase):
                 self.install(overwrite=True)
         self.assertEqual(1, attempts)
         self.assertTrue((self.runtime / "super-cache.old").exists())
-        self.assertEqual(
-            "cleanup_unproven", setup._read_cache_transaction(self.runtime)["state"]
-        )
+        transaction = setup._read_cache_transaction(self.runtime)
+        assert transaction is not None
+        self.assertEqual("cleanup_unproven", transaction["state"])
         self.install()
         self.assertFalse((self.runtime / "super-cache.old").exists())
         self.assertFalse(setup._transaction_path(self.runtime).exists())
@@ -744,6 +746,7 @@ raise SystemExit(99)
         before = setup._manifest_for_tree(stage)
         journal_before = setup._transaction_path(self.runtime).read_bytes()
         record = setup._read_cache_transaction(self.runtime)
+        assert record is not None
         expected_entries = {
             name
             for obj in record["objects"]
@@ -772,6 +775,7 @@ raise SystemExit(99)
     def test_python_312_peer_recovers_python_311_native_journal(self):
         other = shutil.which("python")
         self.assertIsNotNone(other)
+        assert other is not None
         version = subprocess.run(
             [
                 other,

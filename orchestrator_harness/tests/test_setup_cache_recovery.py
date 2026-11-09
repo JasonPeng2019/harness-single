@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator_harness import bootstrap, setup
+from orchestrator_harness import bootstrap, mutation, setup
 from orchestrator_harness.tests.test_v2_materialization import MaterializationFixture
 
 
@@ -165,10 +165,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                     return real_copy(root, relative, data, **kwargs)
 
                 def replace(root, source_relative, target_relative, **kwargs):
-                    source_path, target = (
-                        Path(root) / source_relative,
-                        Path(root) / target_relative,
-                    )
+                    source_path = Path(root) / source_relative
                     if source_path == destination:
                         if failure.endswith("-after"):
                             real_replace(
@@ -603,10 +600,16 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self.assertTrue(self._setup()["ok"])
         real_remove = setup.remove_tree
 
-        def fail_backup(root: Path, relative: Path, **kwargs: object) -> None:
+        def fail_backup(
+            root: Path,
+            relative: Path,
+            *,
+            expected: mutation.TargetState | None = None,
+            captured: mutation.CapturedTree | None = None,
+        ) -> None:
             if Path(root) / relative == self.backup:
                 raise OSError("injected backup cleanup failure")
-            real_remove(root, relative, **kwargs)
+            real_remove(root, relative, expected=expected, captured=captured)
 
         for partial in (False, True):
             with self.subTest(partial=partial):
@@ -862,6 +865,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         from orchestrator_harness.shutdown import _stop_monitor
 
         owner = _stop_monitor(self.runtime)
+        assert owner is not None
         self.assertTrue(
             setup.processes.identity_exit_proven(owner["pid"], owner["creation_time"])
         )

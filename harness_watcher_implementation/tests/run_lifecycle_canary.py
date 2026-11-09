@@ -61,7 +61,10 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
     state: dict[str, object] = {}
     while time.monotonic() < deadline:
         _, state = call(path, "status")
-        watcher = (state.get("state") or {}).get("watcher")
+        state_record = state.get("state")
+        if not isinstance(state_record, dict):
+            raise RuntimeError("watcher CLI status has no state record")
+        watcher = state_record.get("watcher")
         gone = isinstance(watcher, dict) and identity_exit_proven(
             watcher.get("pid"), watcher.get("created_utc")
         )
@@ -69,7 +72,7 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
             not state["running"]
             and not state.get("identity_unproven")
             and gone
-            and (reason is None or state.get("state", {}).get("exit_reason") == reason)
+            and (reason is None or state_record.get("exit_reason") == reason)
         ):
             return state
         time.sleep(0.1)
@@ -208,6 +211,8 @@ def main() -> None:
                 if state is None:
                     proof.append({"config": str(path), "never_published": True})
                     continue
+                if not isinstance(state, dict):
+                    raise RuntimeError("watcher CLI status state is not a record")
                 watcher = state.get("watcher")
                 if not isinstance(watcher, dict):
                     raise RuntimeError(

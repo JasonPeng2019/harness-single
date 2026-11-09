@@ -84,6 +84,7 @@ class SetupMonitorIdentityTests(unittest.TestCase):
 
         def observe_reservation(*args, **kwargs):
             reservation = setup.read_monitor_record(self.rt)
+            assert reservation is not None
             self.assertEqual("starting", reservation["health"])
             self.assertIsNone(reservation["pid"])
             self.assertIs(reservation["initialized"], False)
@@ -98,6 +99,7 @@ class SetupMonitorIdentityTests(unittest.TestCase):
         ):
             startup = self.start()
             record = setup.read_monitor_record(self.rt)
+            assert record is not None
             self.assertEqual(self.identity, record["config_identity"])
             self.assertIs(record["initialized"], False)
         ready = setup._wait_monitor_ready(self.rt, self.identity, startup)
@@ -163,6 +165,7 @@ class SetupMonitorIdentityTests(unittest.TestCase):
             processes.identity_exit_proven(startup["pid"], startup["creation_time"])
         )
         record = setup.read_monitor_record(self.rt)
+        assert record is not None
         self.assertIs(record["initialized"], False)
         self.assertIs(record["diagnostics"][0]["cleanup_proven"], True)
 
@@ -176,7 +179,9 @@ class SetupMonitorIdentityTests(unittest.TestCase):
             startup = self.start()
         with self.assertRaisesRegex(ConfigError, "owned startup diagnostic"):
             setup._wait_monitor_ready(self.rt, self.identity, startup)
-        diagnostic = setup.read_monitor_record(self.rt)["diagnostics"][0]
+        record = setup.read_monitor_record(self.rt)
+        assert record is not None
+        diagnostic = record["diagnostics"][0]
         self.assertEqual(7, diagnostic["child_exit_code"])
         self.assertIs(diagnostic["cleanup_proven"], True)
         self.assertIsNotNone(startup.child.poll())
@@ -201,6 +206,7 @@ class SetupMonitorIdentityTests(unittest.TestCase):
         self.assertEqual(1, len(self.children))
         self.assertIsNotNone(self.children[0].poll())
         record = setup.read_monitor_record(self.rt)
+        assert record is not None
         self.assertEqual("STOPPED", record["health"])
         self.assertIs(record["diagnostics"][0]["cleanup_proven"], True)
 
@@ -236,6 +242,7 @@ class SetupMonitorIdentityTests(unittest.TestCase):
         from orchestrator_harness.shutdown import _stop_monitor
 
         record = _stop_monitor(self.rt)
+        assert record is not None
         self.assertTrue(
             processes.identity_exit_proven(record["pid"], record["creation_time"])
         )

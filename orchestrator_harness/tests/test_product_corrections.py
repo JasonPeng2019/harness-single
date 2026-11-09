@@ -170,6 +170,7 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                         stdout=stdout_handle,
                         stderr=stderr_handle,
                     )
+                assert processes.is_windows_suspended_process(provider)
                 job_handle = provider.take_job_handle()
                 self.assertIsNotNone(job_handle)
                 boundary = processes.ProcessBoundary.for_process(
@@ -191,9 +192,7 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                 if boundary is not None:
                     boundary._close_job()
                 if provider is not None:
-                    if provider.poll() is None:
-                        provider.kill()
-                        provider.wait(timeout=5)
+                    assert processes.is_windows_suspended_process(provider)
                     provider.close()
 
     def test_windows_job_boundary_cleans_provider_descendant(self) -> None:
@@ -223,11 +222,12 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                         stderr=stderr_handle,
                     )
                 self.assertFalse(marker.exists(), "provider ran before containment")
+                assert processes.is_windows_suspended_process(provider)
                 boundary = processes.ProcessBoundary.for_process(
                     provider.pid,
                     windows_job_handle=provider.take_job_handle(),
                 )
-                getattr(provider, "resume")()
+                provider.resume()
                 helper_pid = self._read_complete_pid_marker(marker)
                 self.assertTrue(processes.process_alive(helper_pid))
                 self.assertTrue(boundary.observe())
@@ -237,10 +237,9 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             finally:
                 if boundary is not None:
                     boundary._close_job()
-                if provider is not None and provider.poll() is None:
-                    provider.kill()
-                    provider.wait(timeout=5)
                 if provider is not None:
+                    assert processes.is_windows_suspended_process(provider)
+                    provider.wait(timeout=5)
                     provider.close()
 
     def test_windows_job_handle_close_kills_members_and_serialized_boundary_recovers(
@@ -272,11 +271,12 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                         stderr=stderr_handle,
                     )
                 self.assertFalse(marker.exists(), "provider ran before containment")
+                assert processes.is_windows_suspended_process(provider)
                 boundary = processes.ProcessBoundary.for_process(
                     provider.pid,
                     windows_job_handle=provider.take_job_handle(),
                 )
-                getattr(provider, "resume")()
+                provider.resume()
                 helper_pid = self._read_complete_pid_marker(marker)
                 self.assertTrue(boundary.observe())
                 record = boundary.record()
@@ -310,10 +310,8 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             finally:
                 if boundary is not None:
                     boundary._close_job()
-                if provider is not None and provider.poll() is None:
-                    provider.kill()
-                    provider.wait(timeout=5)
                 if provider is not None:
+                    assert processes.is_windows_suspended_process(provider)
                     provider.close()
 
     def test_removed_boundary_inventory_symbols_have_no_tracked_references(

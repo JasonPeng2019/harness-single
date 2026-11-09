@@ -8,7 +8,6 @@ test-first RED slice: the unittest run must fail until hook-dispatch.py exists.
 import hashlib
 import importlib.util
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from orchestrator_harness.tests.result_fixture import LinkedResultFixture

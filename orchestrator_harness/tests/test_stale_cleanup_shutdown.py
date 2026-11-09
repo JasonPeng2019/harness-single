@@ -71,6 +71,7 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
         self.sentinel = self.waiter()
         self.sentinel_identity = processes.process_identity(self.sentinel.pid)
         self.assertIsNotNone(self.sentinel_identity)
+        assert self.sentinel_identity is not None
 
     def waiter(self) -> subprocess.Popen:
         child = subprocess.Popen(
@@ -141,6 +142,7 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
         controller = self.waiter()
         controller_identity = processes.process_identity(controller.pid)
         self.assertIsNotNone(controller_identity)
+        assert controller_identity is not None
         marker = self.base / f"helper-{lane['run_id']}.pid"
         token = retry_policy.reserve_invocation(self.rt, lane)
         with (
@@ -156,7 +158,12 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
                 stderr=err,
             )
         try:
-            job = child.take_job_handle() if os.name == "nt" else None
+            if os.name == "nt":
+                if not processes.is_windows_suspended_process(child):
+                    raise AssertionError("Windows provider was not suspended")
+                job = child.take_job_handle()
+            else:
+                job = None
             boundary = processes.ProcessBoundary.for_process(
                 child.pid, windows_job_handle=job
             )
@@ -168,11 +175,11 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
                 token,
                 process_boundary=self.rooted(boundary.record(), root),
             )
-            if os.name == "nt":
+            if processes.is_windows_suspended_process(child):
                 child.resume()
             self.assertEqual(0, child.wait(timeout=30))
         finally:
-            if os.name == "nt":
+            if processes.is_windows_suspended_process(child):
                 child.close()
         helper = int(marker.read_text(encoding="utf-8"))
         self.assertTrue(boundary.observe())
@@ -230,6 +237,7 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
 
     def reused_root_run(self) -> dict:
         """Workflow-1 r01: the exited Job root's PID belongs to an unrelated live process."""
+        assert self.sentinel_identity is not None
         ticks = int(self.sentinel_identity["creation_time"].split(":", 1)[1])
         root = {
             "pid": self.sentinel.pid,
@@ -278,13 +286,16 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
         self.assert_sentinel_survived()
 
     def assert_closed(self):
-        self.assertEqual("CLOSED", setup.read_runtime_state(self.rt)["state"])
+        runtime_state = setup.read_runtime_state(self.rt)
+        assert runtime_state is not None
+        self.assertEqual("CLOSED", runtime_state["state"])
         shutdown.prove_runtime_closed(self.rt, self.root, self.base)
         again = self.public("harness", "shutdown")
         self.assertTrue(again["ok"], again)
         self.assertEqual("runtime is already CLOSED", again["summary"])
 
     def assert_sentinel_survived(self):
+        assert self.sentinel_identity is not None
         self.assertTrue(
             processes.identity_matches(
                 self.sentinel.pid, self.sentinel_identity["creation_time"]
@@ -295,7 +306,9 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
         lane, boundary, record = self.native_run(self.epoch, self.lane, proven=False)
         live = self.public("harness", "shutdown")
         self.assertEqual(shutdown.SHUTDOWN_LANE_CLEANUP_UNPROVEN, live["code"], live)
-        self.assertEqual("SHUTTING_DOWN", setup.read_runtime_state(self.rt)["state"])
+        runtime_state = setup.read_runtime_state(self.rt)
+        assert runtime_state is not None
+        self.assertEqual("SHUTTING_DOWN", runtime_state["state"])
         self.assertFalse(lane_cleanup.cleanup_is_proven(lane))
         # Closing the provider Job stands in for the exited controller's kill-on-close.
         self.assertTrue(boundary.cleanup(force=True, timeout_seconds=10))
@@ -314,9 +327,9 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
                 "lane worker cleanup is unproven; force-stop the lane", stale["summary"]
             )
             self.assertIn("lane force-stop", stale["next_action"])
-            self.assertEqual(
-                "SHUTTING_DOWN", setup.read_runtime_state(self.rt)["state"]
-            )
+            runtime_state = setup.read_runtime_state(self.rt)
+            assert runtime_state is not None
+            self.assertEqual("SHUTTING_DOWN", runtime_state["state"])
         self.assertEqual(
             before, {path: path.read_bytes() for path in folder.rglob("*.json")}
         )
@@ -370,7 +383,9 @@ class StaleCleanupShutdownTests(LinkedResultFixture, unittest.TestCase):
                 str(self.card_path),
             )["ok"]
         )
-        epoch = read_current_epoch(self.rt)["epoch_id"]
+        current_epoch = read_current_epoch(self.rt)
+        assert current_epoch is not None
+        epoch = current_epoch["epoch_id"]
         self.assertNotEqual(self.epoch, epoch)
         fresh, _, _ = self.native_run(epoch, read_lane(self.rt, epoch, "worker"))
         self.assertEqual(2, retry_policy.completed_provider_invocations(fresh, self.rt))

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 
 from orchestrator_harness import controller, git_source, monitor, review
 from orchestrator_harness.bootstrap import (
@@ -23,7 +24,7 @@ from orchestrator_harness.lanes import write_lane
 from orchestrator_harness.records import atomic_write_json
 
 
-class LinkedResultFixture:
+class LinkedResultFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="result-source-")
         self.addCleanup(temporary.cleanup)
