@@ -1431,6 +1431,80 @@ class V2MaterializationTests(unittest.TestCase):
                 )
                 self.assertEqual((0, "true"), (sparse.returncode, sparse.stdout.strip()))
 
+    def test_sparse_scope_refuses_excluded_tracked_bootstrap_inputs_before_branch(self) -> None:
+        for managed in (True, False):
+            with self.subTest(managed=managed):
+                self.fixture = MaterializationFixture()
+                self.addCleanup(self.fixture.close)
+                self._commit_product({
+                    ".gitignore": ".harness-runtime/\n",
+                    "src/selected.txt": "selected product input\n",
+                    "unrelated/data.txt": "unrelated product input\n",
+                    ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
+                    ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
+                })
+                result, _ = self._bootstrap(
+                    f"critical-input-refusal-{managed}", managed=managed,
+                    provider="codex", checkout_paths=["src"], allow_refusal=True,
+                )
+                self.assertFalse(result["ok"])
+                self.assertEqual(bootstrap.BOOTSTRAP_REQUEST_INVALID, result["code"])
+                self.assertIn(".agent-workspace/root-policy.md", result["summary"])
+                self.assertIn(".codex/config.toml", result["summary"])
+                self.assertIn("will not broaden", result["summary"])
+                runtime = self.fixture.root_workspace / ".harness-runtime"
+                self.assertFalse(list((runtime / "worktrees").glob(f"*/critical-input-refusal-{managed}")))
+                branch = bootstrap._run_git(
+                    self.fixture.root_workspace, "show-ref", "--verify", "--quiet",
+                    f"refs/heads/lane/critical-input-refusal-{managed}",
+                )
+                self.assertEqual(1, branch.returncode)
+
+    def test_sparse_scope_including_required_inputs_preserves_them_and_excludes_unrelated_tree(self) -> None:
+        for managed in (True, False):
+            with self.subTest(managed=managed):
+                self.fixture = MaterializationFixture()
+                self.addCleanup(self.fixture.close)
+                self._commit_product({
+                    ".gitignore": ".harness-runtime/\n",
+                    "src/selected.txt": "selected product input\n",
+                    "unrelated/data.txt": "unrelated product input\n",
+                    ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
+                    ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
+                })
+                result, worktree = self._bootstrap(
+                    f"critical-input-present-{managed}", managed=managed,
+                    provider="codex", checkout_paths=["src", ".codex", ".agent-workspace"],
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertIn("preserve-me", (worktree / ".codex/config.toml").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "critical tracked agent policy\n",
+                    (worktree / ".agent-workspace/root-policy.md").read_text(encoding="utf-8"),
+                )
+                self.assertFalse((worktree / "unrelated").exists())
+
+    def test_non_windows_codex_omission_keeps_saved_profile_omitted_and_generates_isolation(self) -> None:
+        class PosixOsFacade:
+            name = "posix"
+
+            def __getattr__(self, attribute: str):
+                return getattr(os, attribute)
+
+        self.fixture = MaterializationFixture()
+        self.addCleanup(self.fixture.close)
+        with patch.object(bootstrap, "os", PosixOsFacade()):
+            result, worktree = self._bootstrap(
+                "nonwindows-omitted-codex-profile", managed=False, provider="codex",
+                launch_config_override={},
+            )
+        self.assertTrue(result["ok"], result)
+        from orchestrator_harness.records import read_record
+        lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+        self.assertEqual({}, lane["provider"]["launch_config"])
+        config = (worktree / ".codex/config.toml").read_text(encoding="utf-8")
+        self.assertIn('default_permissions = "worker-isolated"', config)
+
     def _assert_bootstrap_preserves_validated_task_card_copy(
         self, *, managed: bool
     ) -> None:
@@ -1451,6 +1525,7 @@ class V2MaterializationTests(unittest.TestCase):
     def _bootstrap(
         self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True,
         manager: Path | None = None, checkout_paths: list[str] | None = None,
+        allow_refusal: bool = False, launch_config_override: dict[str, str] | None = None,
     ) -> tuple[dict[str, object], Path]:
         from orchestrator_harness import processes
         from orchestrator_harness.records import read_record
@@ -1478,7 +1553,8 @@ class V2MaterializationTests(unittest.TestCase):
         ):
             result = bootstrap.run_bootstrap(
                 lane_id=lane_id, provider=provider, model="test-model",
-                launch_config=({"reasoning_effort": "high", "service_tier": "priority"}
+                launch_config=(launch_config_override if launch_config_override is not None else
+                               {"reasoning_effort": "high", "service_tier": "priority"}
                                if provider == "codex" else {"effort": "high"}
                                if provider == "claude-code" else {}),
                 exclusive_resources=[], task_card_path=str(task_card),
@@ -1493,9 +1569,12 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertEqual(base, lane["git_source"]["base_commit"])
             self.assertEqual(self.fixture.root_workspace / ".git", Path(lane["git_source"]["common_dir"]))
         else:
-            if prime_cache:
+            if prime_cache and not allow_refusal:
                 self.fail(f"actual prepared bootstrap failed: {result}")
-            git_add.assert_not_called()
+            if allow_refusal:
+                git_add.assert_called_once()
+            else:
+                git_add.assert_not_called()
             self.assertFalse(list((runtime / "worktrees").glob(f"*/{lane_id}")))
             worktree = runtime / "worktrees/not-admitted" / lane_id
         return result, worktree
