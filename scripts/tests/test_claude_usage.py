@@ -115,6 +115,14 @@ class ClaudeUsageTests(unittest.TestCase):
         with self.assertRaises(ledger.LedgerError):
             ledger.extract_usage(path, provider_id="claude-code")
 
+    def test_completed_result_requires_top_level_init_session_binding(self):
+        path = self.base / "events.jsonl"
+        self.transcript(path)
+        terminal = path.read_text(encoding="utf-8").splitlines()[-1]
+        path.write_text(terminal + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ledger.LedgerError, "no top-level init session binding"):
+            ledger.extract_usage(path, provider_id="claude-code")
+
     def test_appended_worker_resume_segments_select_their_own_terminal_rollups(self):
         first, second = self.base / "first.jsonl", self.base / "second.jsonl"
         combined = self.base / "combined.jsonl"
@@ -137,6 +145,39 @@ class ClaudeUsageTests(unittest.TestCase):
         self.assertEqual(5, snapshot["rows"][1]["cached_input_tokens"])
         self.assertEqual(15, snapshot["rows"][1]["charged_output_tokens"])
         self.assertEqual(100, snapshot["rows"][1]["charged_model_usage"]["claude-sonnet-4"]["input_tokens"])
+
+    def test_resume_rejects_dropped_prior_model_breakdown(self):
+        task = self.root_task(first_out=25, second_out=25)
+        transcript = task.parent / "segments/0002/claude-events.jsonl"
+        events = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+        events[-1]["modelUsage"] = {"claude-opus-4": {
+            "inputTokens": 200, "outputTokens": 25, "cacheReadInputTokens": 5}}
+        transcript.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+        snapshot = ledger.build_snapshot(task)
+        self.assertTrue(any("dropped prior model claude-sonnet-4" in error
+                            for error in snapshot["errors"]))
+        self.assertEqual(100, snapshot["rows"][1]["charged_tokens"])
+        self.assertIsNone(snapshot["rows"][1]["charged_model_usage"]["claude-opus-4"]["input_tokens"])
+        self.assertFalse(snapshot["token_total_is_exact"])
+
+    def test_resume_reconciles_a_legitimate_new_model_with_prior_model(self):
+        task = self.root_task(first_out=25, second_out=40)
+        transcript = task.parent / "segments/0002/claude-events.jsonl"
+        events = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+        events[-1]["modelUsage"] = {
+            "claude-sonnet-4": {"inputTokens": 150, "outputTokens": 25},
+            "claude-opus-4": {"inputTokens": 50, "outputTokens": 15},
+        }
+        transcript.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+        snapshot = ledger.build_snapshot(task)
+        self.assertEqual([], snapshot["errors"])
+        charged = snapshot["rows"][1]["charged_model_usage"]
+        self.assertEqual((50, 0), (charged["claude-sonnet-4"]["input_tokens"],
+                                  charged["claude-sonnet-4"]["output_tokens"]))
+        self.assertEqual((50, 15), (charged["claude-opus-4"]["input_tokens"],
+                                    charged["claude-opus-4"]["output_tokens"]))
 
     def test_resume_session_mismatch_is_rejected_and_decrease_is_not_zeroed(self):
         task = self.root_task(second_out=20, second_session="different-session")

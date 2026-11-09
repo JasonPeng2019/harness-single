@@ -965,6 +965,14 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
             if isinstance(row.get("model_usage"), dict):
                 prior_models = prior.get("model_usage") if isinstance(prior.get("model_usage"), dict) else {}
                 model_deltas: dict[str, dict[str, Any]] = {}
+                invalid_model_fields: set[str] = set()
+                for model, old in prior_models.items():
+                    if model not in row["model_usage"] and any(
+                            isinstance(old.get(field), int) and old[field] != 0
+                            for field in ("input_tokens", "output_tokens", "cached_input_tokens",
+                                          "cache_creation_input_tokens")):
+                        errors.append(f"{row['invocation_id']}: cumulative modelUsage dropped prior model {model}")
+                        invalid_model_fields.update(("input_tokens", "output_tokens"))
                 for model, counters in row["model_usage"].items():
                     old = prior_models.get(model, {})
                     delta: dict[str, Any] = {}
@@ -981,9 +989,24 @@ def build_snapshot(task_path: Path) -> dict[str, Any]:
                             difference = current_value - old_value
                             if difference < 0:
                                 errors.append(f"{row['invocation_id']}: cumulative {model} {field} decreased")
+                                invalid_model_fields.add(field)
                             delta[field] = difference if difference >= 0 else None
                     delta["usage_sha256"] = counters.get("usage_sha256")
                     model_deltas[model] = delta
+                # The model breakdown is part of the cumulative transcript evidence,
+                # so its required uncached counters must reconcile to the scalar
+                # deltas charged above. A renamed/dropped model must not become a
+                # plausible-looking complete per-model total.
+                for field in ("input_tokens", "output_tokens"):
+                    pieces = [delta.get(field) for delta in model_deltas.values()]
+                    expected = row.get(f"charged_{field}")
+                    if expected is not None and pieces and all(piece is not None for piece in pieces):
+                        if sum(pieces) != expected:
+                            errors.append(f"{row['invocation_id']}: cumulative modelUsage {field} conflicts with scalar delta")
+                            invalid_model_fields.add(field)
+                for field in invalid_model_fields:
+                    for delta in model_deltas.values():
+                        delta[field] = None
                 row["charged_model_usage"] = model_deltas
         else:
             charged = total

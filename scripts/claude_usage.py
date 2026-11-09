@@ -17,6 +17,7 @@ def extract_claude_usage(path: Path, *, completed: bool = True,
     digest, segment_digest = hashlib.sha256(), hashlib.sha256()
     session: str | None = None
     segment = terminals = records = 0
+    segment_bound = False
     selected: dict[str, Any] | None = None
     selected_line: int | None = None
     final_error = False
@@ -44,6 +45,11 @@ def extract_claude_usage(path: Path, *, completed: bool = True,
                     session = None
                     selected_line = None
                     final_error = False
+                    segment_bound = False
+                    init_session = event.get("session_id")
+                    if isinstance(init_session, str) and init_session:
+                        session = init_session
+                        segment_bound = True
             if segment_index is not None and segment != segment_index:
                 continue
             segment_digest.update(raw)
@@ -58,6 +64,8 @@ def extract_claude_usage(path: Path, *, completed: bool = True,
             terminals += 1
             if terminals > 1:
                 raise LedgerError(f"multiple terminal Claude results in one provider segment: {path}")
+            if not segment_bound:
+                raise LedgerError(f"Claude terminal result has no top-level init session binding: {path}:{number}")
             selected_line = number
             final_error = event.get("is_error") is True or event.get("subtype") != "success"
             models = event.get("modelUsage")
