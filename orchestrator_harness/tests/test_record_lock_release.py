@@ -31,6 +31,8 @@ class RecordLockReleaseTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location(
             "standalone_lock_release_fixture", source
         )
+        assert spec is not None
+        assert spec.loader is not None
         self.worker = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.worker)
 
@@ -55,7 +57,10 @@ class RecordLockReleaseTests(unittest.TestCase):
     @staticmethod
     def local_lock(lock):
         if isinstance(lock, PathKeyedAppendLock):
-            return lock._local_entry.lock
+            entry = lock._local_entry
+            assert entry is not None
+            return entry.lock
+        assert lock._local is not None
         return lock._local
 
     def assert_released(self, lock, local):
@@ -108,6 +113,7 @@ class RecordLockReleaseTests(unittest.TestCase):
                 lock.__enter__()
                 local = self.local_lock(lock)
                 handle = lock._handle
+                assert handle is not None
                 with patch.object(module, name, side_effect=fail_unlock):
                     with self.assertRaises(OSError):
                         lock.__exit__(None, None, None)
@@ -124,6 +130,7 @@ class RecordLockReleaseTests(unittest.TestCase):
                     lock.__enter__()
                     local = self.local_lock(lock)
                     handle = lock._handle
+                    assert handle is not None
                     native_close = handle.close
 
                     def fail_close():
@@ -150,6 +157,7 @@ class RecordLockReleaseTests(unittest.TestCase):
                 lock.__enter__()
                 local = self.local_lock(lock)
                 handle = lock._handle
+                assert handle is not None
                 native_close = handle.close
                 try:
                     with (
@@ -178,11 +186,12 @@ class RecordLockReleaseTests(unittest.TestCase):
             with self.subTest(kind=type(lock).__name__):
                 lock.__enter__()
                 local = self.local_lock(lock)
-                anchor = (
-                    lock._anchored.anchor
-                    if isinstance(lock, PathKeyedAppendLock)
-                    else lock._anchor.anchor
-                )
+                if isinstance(lock, PathKeyedAppendLock):
+                    anchored = lock._anchored
+                else:
+                    anchored = lock._anchor
+                assert anchored is not None
+                anchor = anchored.anchor
                 module, name = (
                     (mutation, "_CloseHandle")
                     if os.name == "nt"
@@ -336,10 +345,12 @@ class RecordLockReleaseTests(unittest.TestCase):
 
         thread = threading.Thread(target=contender, daemon=True)
         try:
+            assert child.stdout is not None
             self.assertEqual("held", child.stdout.readline().strip())
             thread.start()
             self.assertFalse(entered.wait(0.15))
         finally:
+            assert child.stdin is not None
             child.stdin.write("release\n")
             child.stdin.flush()
             stdout, stderr = child.communicate(timeout=15)
@@ -396,6 +407,7 @@ class RecordLockReleaseTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
+        assert child.stdout is not None
         identity = json.loads(child.stdout.readline())
         self.assertTrue(
             processes.identity_matches(identity["pid"], identity["creation_time"])

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from orchestrator_harness import root_hook_dispatch as hooks
@@ -31,11 +32,11 @@ class RootHookDispatchTests(unittest.TestCase):
         self,
         boundary: str,
         *,
-        recovery: dict[str, object] | None = None,
-        marker: dict[str, object] | None = None,
-        queue: dict[str, object] | None = None,
-        runtime: dict[str, object] | None = None,
-    ) -> dict[str, object]:
+        recovery: dict[str, Any] | None = None,
+        marker: dict[str, Any] | None = None,
+        queue: dict[str, Any] | None = None,
+        runtime: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         recovery = recovery or {"ok": True, "code": "MONITOR_HEALTHY"}
         marker = marker if marker is not None else {"epoch_id": "epoch-1"}
         queue = queue or {"events": []}

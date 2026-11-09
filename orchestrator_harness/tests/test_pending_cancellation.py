@@ -461,17 +461,22 @@ class FailedStartRecoveryTests(CancellationFixture):
                         stderr=stderr,
                         env=dict(os.environ),
                     )
-                job = child.take_job_handle() if os.name == "nt" else None
+                job = (
+                    child.take_job_handle()
+                    if processes.is_windows_suspended_process(child)
+                    else None
+                )
                 boundary = processes.ProcessBoundary.for_process(
                     child.pid, windows_job_handle=job
                 )
                 self.assertTrue(boundary.observe())
-                self.assertIsNotNone(boundary.root_creation_time)
+                assert boundary.root_creation_time is not None
                 identity = {
                     "pid": child.pid,
                     "creation_time": boundary.root_creation_time,
                 }
                 if os.name == "nt":
+                    assert processes.is_windows_suspended_process(child)
                     child.resume()
                 calls = 0
                 boundary_cleaned = False
@@ -584,6 +589,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
             with self.subTest(mode=mode, service=enabled):
                 root = Path(tempfile.mkdtemp(prefix="p")).resolve()
                 fixture_success = False
+                epoch = ""
                 fixture_commands = []
                 harness = root / "local-config" / "harness"
                 workspace = root / "runtime" / "project"
@@ -834,7 +840,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                 try:
                     public("harness", "setup")
                     monitor = setup.read_monitor_record(rt)
-                    self.assertIsNotNone(monitor)
+                    assert monitor is not None
                     from orchestrator_harness.config import load_config
                     from orchestrator_harness.root_session import publish_root_session
 
@@ -913,7 +919,9 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         "--task-card",
                         str(card),
                     )
-                    epoch = read_current_epoch(rt)["epoch_id"]
+                    current_epoch = read_current_epoch(rt)
+                    assert current_epoch is not None
+                    epoch = current_epoch["epoch_id"]
                     lane = read_lane(rt, epoch, "pending")
                     if mode != "initial-prepared":
                         public("lane", "launch", "--lane-id", "pending")
@@ -983,7 +991,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                     )
                     try:
                         holder_identity = processes.process_identity(holder.pid)
-                        self.assertIsNotNone(holder_identity)
+                        assert holder_identity is not None
                         acquire_leases(
                             rt,
                             ["shared"],
@@ -1058,8 +1066,12 @@ class PublicPendingShutdownTests(unittest.TestCase):
                     self.assertFalse(lease_path(rt, "shared").exists())
                     self.assertIsNone(read_current_epoch(rt))
                     self.assertEqual("closed", read_epoch_state(rt, epoch)["lifecycle"])
-                    self.assertEqual("CLOSED", setup.read_runtime_state(rt)["state"])
-                    self.assertEqual("STOPPED", setup.read_monitor_record(rt)["health"])
+                    runtime_state = setup.read_runtime_state(rt)
+                    monitor_record = setup.read_monitor_record(rt)
+                    assert runtime_state is not None
+                    assert monitor_record is not None
+                    self.assertEqual("CLOSED", runtime_state["state"])
+                    self.assertEqual("STOPPED", monitor_record["health"])
                     deadline = time.monotonic() + 5
                     while (
                         processes.identity_matches(
@@ -1206,6 +1218,7 @@ class PublicPendingShutdownTests(unittest.TestCase):
                         # recorded PID plus creation identity.
                         shutdown._stop_monitor(rt)
                     if fixture_success:
+                        assert monitor is not None
                         current = read_lane(rt, epoch, "pending")
                         self.assertTrue(lane_cleanup.cleanup_is_proven(current))
                         self.assertTrue(

@@ -67,6 +67,8 @@ def run_public_command(snapshot, command, *, timeout, cancel):
 spec = importlib.util.spec_from_file_location(
     "worker_public_check_client", SOURCE / "tools/worker_public_check.py"
 )
+assert spec is not None
+assert spec.loader is not None
 client = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(client)
 
@@ -262,7 +264,9 @@ class PublicCheckTests(unittest.TestCase):
         path = self.harness / service.POLICY
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps(self.policy), encoding="utf-8-sig")
-        self.assertEqual(10, service.policy(self.harness)["timeout_seconds"])
+        policy = service.policy(self.harness)
+        assert policy is not None
+        self.assertEqual(10, policy["timeout_seconds"])
 
     def test_native_windows_public_policy_rejects_strict_denials_when_reduced(self):
         selected = {
@@ -627,6 +631,7 @@ class PublicCheckTests(unittest.TestCase):
             patch.object(service.subprocess, "Popen", side_effect=capture_child),
         ):
             started = service.start_service(self.harness, self.root)
+        assert started is not None
         self.addCleanup(service.stop_service, self.root, self.harness)
         self.assertEqual("READY", started["status"])
         config = service.read(service.home(self.root) / "config.json")
@@ -777,6 +782,7 @@ class PublicCheckTests(unittest.TestCase):
 
     def bind_service_owner(self, *, starting=False):
         identity = service.processes.process_identity(os.getpid())
+        assert identity is not None
         self.config["startup_id"] = "3" * 32
         base = service.home(self.root)
         atomic_write_json(base / "config.json", self.config)
@@ -896,6 +902,7 @@ class PublicCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "did not become ready"):
                 service.start_service(self.harness, self.root)
         record = service.service_cleanup(self.root, self.harness)
+        assert record is not None
         self.assertEqual("STOPPED", record["status"])
         self.assertIn("did not become ready", record["error"])
         self.assertTrue(
@@ -1006,11 +1013,13 @@ class PublicCheckTests(unittest.TestCase):
         self.assertEqual("CLEANUP_UNPROVEN", record["status"])
 
     def test_closed_resume_rejects_still_live_service_identity(self):
+        identity = service.processes.process_identity(os.getpid())
+        assert identity is not None
         record = {
             "schema": "worker-public-check-service/v1",
             "root": str(self.root),
             "harness": str(self.harness),
-            **service.processes.process_identity(os.getpid()),
+            **identity,
             "status": "STOPPED",
             "cleanup_proven": True,
         }

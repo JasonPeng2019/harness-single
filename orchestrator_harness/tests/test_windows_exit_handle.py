@@ -25,7 +25,7 @@ class WindowsExitHandleTests(unittest.TestCase):
         )
         try:
             identity = processes.process_identity(child.pid)
-            self.assertIsNotNone(identity)
+            assert identity is not None
             child.communicate(timeout=10)
             self.assertEqual(0, child.returncode)
             with patch.object(
@@ -44,6 +44,7 @@ class WindowsExitHandleTests(unittest.TestCase):
 
     def test_exact_live_self_is_not_exit_even_if_inventory_claims_absence(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         with patch.object(
             processes, "targeted_process_query", return_value=ProcessQuery(True, None)
         ) as query:
@@ -56,6 +57,7 @@ class WindowsExitHandleTests(unittest.TestCase):
 
     def test_different_exact_creation_does_not_adopt_live_self(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         old_creation = (
             f"windows-filetime:{int(identity['creation_time'].split(':')[1]) - 100000}"
         )
@@ -70,6 +72,7 @@ class WindowsExitHandleTests(unittest.TestCase):
 
     def test_dword_overflow_cannot_wrap_to_an_existing_process(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         invalid = 2**32 + identity["pid"]
         with patch.object(common, "_windows_process_identity") as query:
             self.assertIsNone(common.exact_process_identity(invalid))
@@ -87,6 +90,7 @@ class WindowsExitHandleTests(unittest.TestCase):
 
     def test_denied_native_handle_remains_unknown(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         library = Mock()
         library.OpenProcess.return_value = None
         with (
@@ -119,6 +123,7 @@ class WindowsExitHandleTests(unittest.TestCase):
         # open now holds its PID; CIM reports its creation in microseconds.
         recorded = "windows-filetime:134365070009392287"
         recorded_time = processes._identity_time(recorded)
+        assert recorded_time is not None
         for created, complete, proven in (
             (recorded_time + timedelta(minutes=3), True, True),
             (recorded_time + timedelta(minutes=3), False, False),

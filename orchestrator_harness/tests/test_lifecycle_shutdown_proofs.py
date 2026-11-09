@@ -53,7 +53,7 @@ class NativeLinuxTerminalChildTests(unittest.TestCase):
         )
         self.addCleanup(self.reap, child)
         identity = processes.process_identity(child.pid)
-        self.assertIsNotNone(identity)
+        assert identity is not None
         return child, identity
 
     def reap(self, child):
@@ -95,7 +95,9 @@ class NativeLinuxTerminalChildTests(unittest.TestCase):
         self.assertFalse(
             processes.identity_exit_proven(child.pid, identity["creation_time"])
         )
-        legacy = processes._identity_time(identity["creation_time"]).isoformat()
+        legacy_time = processes._identity_time(identity["creation_time"])
+        assert legacy_time is not None
+        legacy = legacy_time.isoformat()
         self.exit_without_reaping(child, identity)
         with patch.object(
             processes.os,
@@ -169,6 +171,8 @@ class LinuxBootIdentityTests(unittest.TestCase):
             ),
         ):
             old, new = processes.process_identity(123), processes.process_identity(123)
+        assert old is not None
+        assert new is not None
         self.assertNotEqual(old, new)
         self.assertTrue(processes.valid_creation_identity(old["creation_time"]))
         self.assertTrue(processes.valid_creation_identity(new["creation_time"]))
@@ -349,6 +353,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
             )
         boundary = None
         try:
+            assert processes.is_windows_suspended_process(child)
             boundary = processes.ProcessBoundary.for_process(
                 child.pid, windows_job_handle=child.take_job_handle()
             )
@@ -360,13 +365,16 @@ class LifecycleAdversarialTests(unittest.TestCase):
                 side_effect=AssertionError("already-clean Job needs no inventory"),
             ):
                 self.assertTrue(boundary.cleanup(force=True))
+            root_creation_time = boundary.root_creation_time
+            assert root_creation_time is not None
             self.assertTrue(
-                processes.identity_exit_proven(child.pid, boundary.root_creation_time)
+                processes.identity_exit_proven(child.pid, root_creation_time)
             )
         finally:
             if boundary is not None:
                 boundary._close_job()
             self.assertTrue(processes.reap_created_process(child))
+            assert processes.is_windows_suspended_process(child)
             child.close()
 
     def test_shutdown_checks_run_with_a_nonempty_transcript_backlog(self):
@@ -447,7 +455,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
 
     def test_shutdown_does_not_close_with_exact_live_stopped_monitor(self):
         identity = processes.process_identity(os.getpid())
-        self.assertIsNotNone(identity)
+        assert identity is not None
         atomic_write_json(
             shutdown.monitor_record_path(self.rt),
             {
@@ -547,7 +555,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
 
     def service_record(self, **updates):
         identity = processes.process_identity(os.getpid())
-        self.assertIsNotNone(identity)
+        assert identity is not None
         record = {
             "schema": "worker-public-check-service/v1",
             **identity,
@@ -586,6 +594,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
 
     def test_unknown_process_query_is_not_exit_proof(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         with (
             patch.object(processes, "process_identity", return_value=None),
             patch.object(
@@ -602,6 +611,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
 
     def test_complete_absence_query_proves_exit(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         with (
             patch.object(processes, "process_identity", return_value=None),
             patch.object(processes, "_windows_identity_exit_proven", return_value=None),
@@ -631,6 +641,7 @@ class LifecycleAdversarialTests(unittest.TestCase):
 
     def test_exact_live_process_has_no_exit_proof(self):
         identity = processes.process_identity(os.getpid())
+        assert identity is not None
         self.assertFalse(
             processes.identity_exit_proven(identity["pid"], identity["creation_time"])
         )

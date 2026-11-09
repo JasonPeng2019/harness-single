@@ -5,8 +5,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from orchestrator_harness import (
@@ -47,7 +49,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         real_replace = records.os.replace
         calls = 0
 
-        def replace(source: object, destination: object) -> None:
+        def replace(source: Path, destination: Path) -> None:
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -250,6 +252,7 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             if child.poll() is None:
                 child.terminate()
             child.wait(timeout=10)
+            assert child.stdin is not None
             child.stdin.close()
 
         self.addCleanup(stop)
@@ -257,13 +260,14 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
 
     @staticmethod
     def _release(child: subprocess.Popen[bytes]) -> None:
+        assert child.stdin is not None
         child.stdin.write(b"x")
         child.stdin.close()
 
-    def _exited_identity(self) -> dict[str, object]:
+    def _exited_identity(self) -> dict[str, Any]:
         child = self._controller()
         identity = processes.process_identity(child.pid)
-        self.assertIsNotNone(identity)
+        assert identity is not None
         self._release(child)
         child.wait(timeout=10)
         self.assertTrue(
@@ -282,7 +286,7 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         seed_provider_history(self.runtime, lane)
         lane = lanes.write_lane(self.runtime, "epoch-1", "lane-1", lane)
         spawned: list[subprocess.Popen[bytes]] = []
-        updates: list[dict[str, object]] = []
+        updates: list[dict[str, Any]] = []
         real_update = launch.update_lane
 
         def spawn(_argv: object, **_options: object) -> subprocess.Popen[bytes]:
@@ -293,8 +297,8 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             rt: Path,
             epoch: str,
             lane_id: str,
-            mutate: object,
-        ) -> dict[str, object]:
+            mutate: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> dict[str, Any]:
             value = real_update(rt, epoch, lane_id, mutate)
             updates.append(value)
             if len(updates) == 2:
@@ -406,7 +410,7 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         provider = self._exited_identity()
         handle = self._controller()
         identity = processes.process_identity(handle.pid)
-        self.assertIsNotNone(identity)
+        assert identity is not None
         lane = lanes.write_lane(
             self.runtime,
             "epoch-1",
