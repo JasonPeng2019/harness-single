@@ -49,6 +49,7 @@ def preflight() -> dict:
     # Verify an already-prepared execution environment or raise on failure.
     return {"backend": "project-checks"}
 
+
 def run_public_command(snapshot, command, *, timeout, cancel) -> dict:
     # Run command argv against snapshot in the project's restricted backend.
     # Enforce timeout, observe cancel, and clean up owned processes/resources.
