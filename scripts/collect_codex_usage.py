@@ -28,7 +28,10 @@ from orchestrator_harness import processes
 from orchestrator_harness.config import load_config, path_identity
 from orchestrator_harness.root_session import bind_native_root_session
 from orchestrator_harness.records import atomic_write_json
-from orchestrator_harness.lane_cleanup import cleanup_is_proven, observe_controller_status
+from orchestrator_harness.lane_cleanup import (
+    cleanup_is_proven,
+    observe_controller_status,
+)
 from orchestrator_harness.lanes import retained_lanes, LaneError
 
 from token_ledger import (
@@ -89,7 +92,9 @@ def stop_process_tree(boundary: processes.ProcessBoundary) -> None:
         raise OSError("ROOT process boundary cleanup is unproven")
 
 
-def shutdown_harness_runtime(expected_runtime: Path, harness_dir: Path | None = None) -> str | None:
+def shutdown_harness_runtime(
+    expected_runtime: Path, harness_dir: Path | None = None
+) -> str | None:
     """Ask the native harness to stop any detached lanes after a watchdog fire."""
     harness_dir = harness_dir or Path(__file__).resolve().parent.parent
     config_path = harness_dir / "harness-config.json"
@@ -103,10 +108,19 @@ def shutdown_harness_runtime(expected_runtime: Path, harness_dir: Path | None = 
         return "harness configuration no longer selects this run's ROOT workspace"
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "orchestrator_harness.operator_launch",
-             "--json", "harness", "shutdown"],
-            cwd=harness_dir, capture_output=True, text=True,
-            timeout=90, check=False,
+            [
+                sys.executable,
+                "-m",
+                "orchestrator_harness.operator_launch",
+                "--json",
+                "harness",
+                "shutdown",
+            ],
+            cwd=harness_dir,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)
@@ -131,7 +145,11 @@ def active_harness_lanes(runtime: Path) -> bool:
             if not epoch.is_dir() or epoch.resolve() != epoch.absolute():
                 return True
             for lane in retained_lanes(runtime, epoch.name).values():
-                if lane.get("lifecycle") not in {"review_pending", "retired", "abandoned"} or not cleanup_is_proven(lane):
+                if lane.get("lifecycle") not in {
+                    "review_pending",
+                    "retired",
+                    "abandoned",
+                } or not cleanup_is_proven(lane):
                     return True
     except (OSError, ValueError, KeyError, TypeError, LaneError):
         return True
@@ -151,11 +169,14 @@ def quiescent_open_runtime(runtime: Path) -> bool:
             if lifecycle != "review_pending":
                 return False
             status = read_object(Path(lane["controller_status_path"]))
-            if (status.get("lane_id") != lane.get("lane_id") or status.get("run_id") != lane.get("run_id")
-                    or status.get("recorded_status") != "review_pending"
-                    or status.get("controller_state") != "exited"
-                    or status.get("cleanup_proven") is not True
-                    or status.get("provider_state", {}).get("state") != "exited"):
+            if (
+                status.get("lane_id") != lane.get("lane_id")
+                or status.get("run_id") != lane.get("run_id")
+                or status.get("recorded_status") != "review_pending"
+                or status.get("controller_state") != "exited"
+                or status.get("cleanup_proven") is not True
+                or status.get("provider_state", {}).get("state") != "exited"
+            ):
                 return False
         except (OSError, ValueError, KeyError, TypeError, LedgerError):
             return False
@@ -175,34 +196,59 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
         raise LedgerError(f"unsupported ROOT resume provider: {provider_id}")
     requested_provider = getattr(args, "provider", None)
     if requested_provider is not None and requested_provider != provider_id:
-        raise LedgerError("requested resume provider differs from original ROOT provider")
-    if (original.get("run_id") != task["run_id"] or original.get("arm") != task["arm"]
-            or original.get("task") != task["task"]
-            or original.get("budget_tokens") != task["budget_tokens"]
-            or original.get("harness_runtime") != task.get("harness_runtime")):
+        raise LedgerError(
+            "requested resume provider differs from original ROOT provider"
+        )
+    if (
+        original.get("run_id") != task["run_id"]
+        or original.get("arm") != task["arm"]
+        or original.get("task") != task["task"]
+        or original.get("budget_tokens") != task["budget_tokens"]
+        or original.get("harness_runtime") != task.get("harness_runtime")
+    ):
         raise LedgerError("resume task and original launch differ")
     if task["arm"] == "harness":
         runtime = Path(task["harness_runtime"])
-        configured_harness = Path(original.get("harness_dir") or Path(__file__).resolve().parent.parent)
+        configured_harness = Path(
+            original.get("harness_dir") or Path(__file__).resolve().parent.parent
+        )
         config = load_config(configured_harness)
-        if (path_identity(original.get("workspace", "")) != path_identity(config.manager_workspace)
-                or path_identity(runtime) != path_identity(config.runtime_root)):
-            raise LedgerError("ROOT workspace differs from the selected harness runtime")
+        if path_identity(original.get("workspace", "")) != path_identity(
+            config.manager_workspace
+        ) or path_identity(runtime) != path_identity(config.runtime_root):
+            raise LedgerError(
+                "ROOT workspace differs from the selected harness runtime"
+            )
         state = read_object(runtime / "RUNTIME_STATE.json")
         if state.get("state") == "CLOSED":
             if active_harness_lanes(runtime):
-                raise LedgerError("close the native harness runtime and retire lanes before ROOT resume")
-        elif (state.get("state") != "OPEN"
-              or not getattr(args, "continue_open_runtime", False)
-              or not quiescent_open_runtime(runtime)):
-            raise LedgerError("close the native harness runtime and retire lanes before ROOT resume, or explicitly continue a quiescent open review")
+                raise LedgerError(
+                    "close the native harness runtime and retire lanes before ROOT resume"
+                )
+        elif (
+            state.get("state") != "OPEN"
+            or not getattr(args, "continue_open_runtime", False)
+            or not quiescent_open_runtime(runtime)
+        ):
+            raise LedgerError(
+                "close the native harness runtime and retire lanes before ROOT resume, or explicitly continue a quiescent open review"
+            )
     snapshot = build_snapshot(task_path)
     if snapshot["errors"] or snapshot["in_flight_invocations"]:
-        raise LedgerError("prior task evidence is not sealed and countable: " + "; ".join(snapshot["errors"]))
+        raise LedgerError(
+            "prior task evidence is not sealed and countable: "
+            + "; ".join(snapshot["errors"])
+        )
     if not snapshot["gate_allows_new_work"]:
-        raise LedgerError("token budget cannot authorize resume: usage is unknown or the budget is exhausted")
+        raise LedgerError(
+            "token budget cannot authorize resume: usage is unknown or the budget is exhausted"
+        )
     segment_root = run_dir / "segments"
-    children = sorted(item for item in segment_root.iterdir() if item.is_dir()) if segment_root.is_dir() else []
+    children = (
+        sorted(item for item in segment_root.iterdir() if item.is_dir())
+        if segment_root.is_dir()
+        else []
+    )
     for number, child in enumerate(children, 2):
         if child.name != f"{number:04d}":
             raise LedgerError(f"nonconsecutive ROOT segment directory: {child}")
@@ -211,29 +257,53 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
     for directory in prior_dirs:
         launch = read_object(directory / "launch.json")
         final = read_object(directory / "manifest.json")
-        if launch.get("run_id") != task["run_id"] or final.get("run_id") != task["run_id"]:
+        if (
+            launch.get("run_id") != task["run_id"]
+            or final.get("run_id") != task["run_id"]
+        ):
             raise LedgerError("ROOT segment belongs to another task run")
         boundary = final.get("process_boundary")
-        if (final.get("cleanup_proven") is not True or not isinstance(boundary, dict)
-                or not processes.process_boundary_is_gone(boundary)):
-            raise LedgerError("prior ROOT process boundary cleanup is unproven; preserve its evidence before resume")
+        if (
+            final.get("cleanup_proven") is not True
+            or not isinstance(boundary, dict)
+            or not processes.process_boundary_is_gone(boundary)
+        ):
+            raise LedgerError(
+                "prior ROOT process boundary cleanup is unproven; preserve its evidence before resume"
+            )
         elapsed = final.get("elapsed_seconds")
-        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or elapsed < 0:
-            raise LedgerError(f"ROOT segment has no valid active elapsed time: {directory}")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or elapsed < 0
+        ):
+            raise LedgerError(
+                f"ROOT segment has no valid active elapsed time: {directory}"
+            )
         if final.get("watchdog_expired"):
-            raise LedgerError("the active-time watchdog expired; this task run cannot be resumed")
+            raise LedgerError(
+                "the active-time watchdog expired; this task run cannot be resumed"
+            )
         consumed += elapsed
     first_limit = original.get("watchdog_hours")
-    if isinstance(first_limit, bool) or not isinstance(first_limit, (int, float)) or first_limit <= 0:
+    if (
+        isinstance(first_limit, bool)
+        or not isinstance(first_limit, (int, float))
+        or first_limit <= 0
+    ):
         raise LedgerError("original active-time watchdog is missing")
     remaining = first_limit - consumed / 3600
     if remaining <= 0:
         raise LedgerError("the task's active-time allowance is exhausted")
     prior = prior_dirs[-1]
-    transcript_name = "claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl"
+    transcript_name = (
+        "claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl"
+    )
     usage = extract_usage(prior / transcript_name, provider_id=provider_id)
     if usage["status"] != "ok" or not usage.get("thread_id"):
-        raise LedgerError("prior ROOT segment lacks countable usage or a native session ID")
+        raise LedgerError(
+            "prior ROOT segment lacks countable usage or a native session ID"
+        )
     required_fields = ("model", "reasoning_effort", "workspace")
     if provider_id == "codex":
         required_fields += ("service_tier", "sandbox")
@@ -255,7 +325,12 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
     args.trust_project_hooks = bool(original.get("trust_project_hooks"))
     args.watchdog_hours = remaining
     args.results_dir = str(run_dir.parent)
-    return run_dir / "segments" / f"{len(prior_dirs) + 1:04d}", len(prior_dirs) + 1, usage["thread_id"], first_limit
+    return (
+        run_dir / "segments" / f"{len(prior_dirs) + 1:04d}",
+        len(prior_dirs) + 1,
+        usage["thread_id"],
+        first_limit,
+    )
 
 
 def run_codex(args: argparse.Namespace) -> int:
@@ -280,7 +355,11 @@ def run_codex(args: argparse.Namespace) -> int:
         nonempty_string(args.service_tier, "service-tier")
     else:
         nonempty_string(args.reasoning_effort, "effort")
-    if args.watchdog_hours is None or not math.isfinite(args.watchdog_hours) or args.watchdog_hours <= 0:
+    if (
+        args.watchdog_hours is None
+        or not math.isfinite(args.watchdog_hours)
+        or args.watchdog_hours <= 0
+    ):
         raise LedgerError("watchdog-hours must be positive")
     if args.arm == "harness" and not args.harness_runtime:
         raise LedgerError("harness runs require --harness-runtime")
@@ -288,8 +367,11 @@ def run_codex(args: argparse.Namespace) -> int:
         raise LedgerError("harness runs require --trust-project-hooks")
     if args.arm == "raw" and args.harness_runtime:
         raise LedgerError("raw runs must not name a harness runtime")
-    harness_dir = (Path(os.path.abspath(args.harness_dir)) if getattr(args, "harness_dir", None)
-                   else Path(__file__).resolve().parent.parent)
+    harness_dir = (
+        Path(os.path.abspath(args.harness_dir))
+        if getattr(args, "harness_dir", None)
+        else Path(__file__).resolve().parent.parent
+    )
     if args.arm == "harness":
         config_path = harness_dir / "harness-config.json"
         if not config_path.is_file():
@@ -299,36 +381,61 @@ def run_codex(args: argparse.Namespace) -> int:
         except (OSError, KeyError, ValueError, TypeError) as exc:
             raise LedgerError(f"invalid harness configuration: {exc}") from exc
         if path_identity(managed_config.manager_workspace) != path_identity(workspace):
-            raise LedgerError("harness configuration does not select this ROOT workspace")
-        if path_identity(managed_config.runtime_root) != path_identity(args.harness_runtime):
-            raise LedgerError("harness runtime must belong to the configured product workspace")
+            raise LedgerError(
+                "harness configuration does not select this ROOT workspace"
+            )
+        if path_identity(managed_config.runtime_root) != path_identity(
+            args.harness_runtime
+        ):
+            raise LedgerError(
+                "harness runtime must belong to the configured product workspace"
+            )
 
     root_prelaunch = None
     if args.arm == "harness":
         try:
             root_prelaunch = validate_prepared_root(
-                harness_dir, workspace, args.run_id, resuming=resuming,
+                harness_dir,
+                workspace,
+                args.run_id,
+                resuming=resuming,
                 provider_id=provider_id,
-                **({"sandbox": getattr(args, "sandbox", "workspace-write")} if provider_id == "codex" else {}),
+                **(
+                    {"sandbox": getattr(args, "sandbox", "workspace-write")}
+                    if provider_id == "codex"
+                    else {}
+                ),
             )
             native = root_prelaunch["native_session_id"]
             if resuming:
                 if native not in (None, session_id):
-                    raise LedgerError("saved native ROOT session differs from the prepared binding")
+                    raise LedgerError(
+                        "saved native ROOT session differs from the prepared binding"
+                    )
                 if native is None:
-                    bind_native_root_session(managed_config, run_id=args.run_id,
-                        session_id=root_prelaunch["root_session_id"], native_session_id=session_id)
+                    bind_native_root_session(
+                        managed_config,
+                        run_id=args.run_id,
+                        session_id=root_prelaunch["root_session_id"],
+                        native_session_id=session_id,
+                    )
                     root_prelaunch["native_session_id"] = session_id
             elif native is not None:
-                raise LedgerError("prepared ROOT already has a native thread; resume it or explicitly prepare a new run")
+                raise LedgerError(
+                    "prepared ROOT already has a native thread; resume it or explicitly prepare a new run"
+                )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise LedgerError(str(exc)) from exc
 
     task_run_dir = Path(args.results_dir).resolve() / args.run_id
     run_dir = segment_dir if resuming else task_run_dir
     run_dir.mkdir(parents=True, exist_ok=False)
-    events_path = run_dir / ("claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl")
-    stderr_path = run_dir / ("claude-stderr.txt" if provider_id == "claude-code" else "codex-stderr.txt")
+    events_path = run_dir / (
+        "claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl"
+    )
+    stderr_path = run_dir / (
+        "claude-stderr.txt" if provider_id == "claude-code" else "codex-stderr.txt"
+    )
     last_message_path = run_dir / "last-message.txt"
     started = utc_now()
     hook_trust_args = (
@@ -338,37 +445,76 @@ def run_codex(args: argparse.Namespace) -> int:
     )
     if args.arm == "harness":
         hook_trust_args += [
-            "-c", "features.hooks=true",
-            "-c", f'projects.{json.dumps(str(workspace))}.trust_level="trusted"',
+            "-c",
+            "features.hooks=true",
+            "-c",
+            f'projects.{json.dumps(str(workspace))}.trust_level="trusted"',
         ]
     if provider_id == "claude-code":
         command = ["claude", "--print", "--output-format", "stream-json", "--verbose"]
         if resuming:
             command.extend(["--resume", session_id])
-        command.extend(["--model", args.model, "--effort", args.reasoning_effort,
-                        "--permission-mode", "bypassPermissions"])
+        command.extend(
+            [
+                "--model",
+                args.model,
+                "--effort",
+                args.reasoning_effort,
+                "--permission-mode",
+                "bypassPermissions",
+            ]
+        )
     elif resuming:
         command = [
-            "codex", "exec", "resume", *hook_trust_args, "--json",
-            "-c", f"sandbox_mode={json.dumps(args.sandbox)}",
-            "-c", 'approval_policy="never"',
-            "--skip-git-repo-check", "-m", args.model,
-            "-c", f"model_reasoning_effort={json.dumps(args.reasoning_effort)}",
-            "-c", f"service_tier={json.dumps(args.service_tier)}",
-            "--output-last-message", str(last_message_path), session_id, "-",
+            "codex",
+            "exec",
+            "resume",
+            *hook_trust_args,
+            "--json",
+            "-c",
+            f"sandbox_mode={json.dumps(args.sandbox)}",
+            "-c",
+            'approval_policy="never"',
+            "--skip-git-repo-check",
+            "-m",
+            args.model,
+            "-c",
+            f"model_reasoning_effort={json.dumps(args.reasoning_effort)}",
+            "-c",
+            f"service_tier={json.dumps(args.service_tier)}",
+            "--output-last-message",
+            str(last_message_path),
+            session_id,
+            "-",
         ]
     else:
         command = [
-            "codex", "exec", *hook_trust_args, "--json", "--sandbox", args.sandbox,
-            "-c", 'approval_policy="never"',
-            "--skip-git-repo-check", "-m", args.model,
-            "-c", f"model_reasoning_effort={json.dumps(args.reasoning_effort)}",
-            "-c", f"service_tier={json.dumps(args.service_tier)}",
-            "--cd", str(workspace),
-            "--output-last-message", str(last_message_path),
+            "codex",
+            "exec",
+            *hook_trust_args,
+            "--json",
+            "--sandbox",
+            args.sandbox,
+            "-c",
+            'approval_policy="never"',
+            "--skip-git-repo-check",
+            "-m",
+            args.model,
+            "-c",
+            f"model_reasoning_effort={json.dumps(args.reasoning_effort)}",
+            "-c",
+            f"service_tier={json.dumps(args.service_tier)}",
+            "--cd",
+            str(workspace),
+            "--output-last-message",
+            str(last_message_path),
             "-",
         ]
-    executable_name = ("claude.cmd" if os.name == "nt" else "claude") if provider_id == "claude-code" else ("codex.cmd" if os.name == "nt" else "codex")
+    executable_name = (
+        ("claude.cmd" if os.name == "nt" else "claude")
+        if provider_id == "claude-code"
+        else ("codex.cmd" if os.name == "nt" else "codex")
+    )
     provider_executable = shutil.which(executable_name)
     if provider_executable is None:
         raise OSError(f"{provider_id} CLI executable not found on PATH")
@@ -390,7 +536,9 @@ def run_codex(args: argparse.Namespace) -> int:
         "resolved_executable": provider_executable,
         "watchdog_hours": args.watchdog_hours,
         "budget_tokens": args.budget_tokens,
-        "harness_runtime": str(Path(args.harness_runtime).resolve()) if args.harness_runtime else None,
+        "harness_runtime": str(Path(args.harness_runtime).resolve())
+        if args.harness_runtime
+        else None,
         "harness_dir": str(harness_dir) if args.arm == "harness" else None,
         "trust_project_hooks": bool(getattr(args, "trust_project_hooks", False)),
         "root_boundary_required": True,
@@ -402,7 +550,9 @@ def run_codex(args: argparse.Namespace) -> int:
         launch["resume_session_id"] = session_id
         launch["total_active_watchdog_hours"] = total_limit
     write_once(run_dir / "launch.json", launch)
-    task_path = Path(args.resume_task_file).resolve() if resuming else run_dir / "task.json"
+    task_path = (
+        Path(args.resume_task_file).resolve() if resuming else run_dir / "task.json"
+    )
     if not resuming:
         task = {
             "schema": TASK_SCHEMA,
@@ -425,7 +575,11 @@ def run_codex(args: argparse.Namespace) -> int:
         environment.pop("CLAUDE_SESSION_ID", None)
         environment.pop("QWEN_SESSION_ID", None)
         if resuming:
-            environment["CLAUDE_SESSION_ID" if provider_id == "claude-code" else "CODEX_THREAD_ID"] = session_id
+            environment[
+                "CLAUDE_SESSION_ID"
+                if provider_id == "claude-code"
+                else "CODEX_THREAD_ID"
+            ] = session_id
     # ROOT invokes the host-side harness package outside its writable workspace.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # An uncapped run must not inherit an earlier diagnostic gate by accident.
@@ -455,7 +609,9 @@ def run_codex(args: argparse.Namespace) -> int:
         assert boundary is not None
         with boundary_lock:
             root_boundary_gone = boundary.is_gone()
-        workers_live = args.arm == "harness" and active_harness_lanes(Path(args.harness_runtime))
+        workers_live = args.arm == "harness" and active_harness_lanes(
+            Path(args.harness_runtime)
+        )
         if root_boundary_gone and not workers_live:
             return
         watchdog_expired.set()
@@ -473,23 +629,41 @@ def run_codex(args: argparse.Namespace) -> int:
     try:
         if getattr(args, "inhibit_sleep", False):
             sleep_inhibited = inhibit_idle_sleep()
-        with prompt.open("rb") as prompt_stream, \
-             events_path.open("x", encoding="utf-8", newline="") as events_stream, \
-             stderr_path.open("x", encoding="utf-8", newline="") as stderr_stream:
+        with (
+            prompt.open("rb") as prompt_stream,
+            events_path.open("x", encoding="utf-8", newline="") as events_stream,
+            stderr_path.open("x", encoding="utf-8", newline="") as stderr_stream,
+        ):
             read_fd, write_fd = os.pipe()
-            with io.TextIOWrapper(os.fdopen(read_fd, "rb"), encoding="utf-8", errors="replace") as output:
+            with io.TextIOWrapper(
+                os.fdopen(read_fd, "rb"), encoding="utf-8", errors="replace"
+            ) as output:
                 with os.fdopen(write_fd, "wb", buffering=0) as child_output:
                     process = processes.spawn_provider(
-                        [provider_executable, *command[1:]], cwd=workspace, env=environment,
-                        stdin=prompt_stream, stdout=child_output, stderr=stderr_stream,
+                        [provider_executable, *command[1:]],
+                        cwd=workspace,
+                        env=environment,
+                        stdin=prompt_stream,
+                        stdout=child_output,
+                        stderr=stderr_stream,
                     )
                     take_job = getattr(process, "take_job_handle", None)
                     boundary = processes.ProcessBoundary.for_process(
-                        process.pid, windows_job_handle=take_job() if callable(take_job) else None,
+                        process.pid,
+                        windows_job_handle=take_job() if callable(take_job) else None,
                     )
-                    if not processes.valid_creation_identity(boundary.root_creation_time) or not boundary.observe():
-                        raise OSError("ROOT process boundary identity/membership is unproven")
-                    atomic_write_json(run_dir / "root-process-boundary.json", boundary.record())
+                    if (
+                        not processes.valid_creation_identity(
+                            boundary.root_creation_time
+                        )
+                        or not boundary.observe()
+                    ):
+                        raise OSError(
+                            "ROOT process boundary identity/membership is unproven"
+                        )
+                    atomic_write_json(
+                        run_dir / "root-process-boundary.json", boundary.record()
+                    )
 
                 def observe() -> None:
                     assert boundary is not None
@@ -497,12 +671,17 @@ def run_codex(args: argparse.Namespace) -> int:
                         try:
                             with boundary_lock:
                                 boundary.observe()
-                                atomic_write_json(run_dir / "root-process-boundary.json", boundary.record())
+                                atomic_write_json(
+                                    run_dir / "root-process-boundary.json",
+                                    boundary.record(),
+                                )
                         except (OSError, ValueError) as exc:
                             watchdog_errors.append(f"ROOT boundary observation: {exc}")
                             return
 
-                observer = threading.Thread(target=observe, name="root-boundary-observer", daemon=True)
+                observer = threading.Thread(
+                    target=observe, name="root-boundary-observer", daemon=True
+                )
                 observer.start()
                 timer = threading.Timer(args.watchdog_hours * 3600, expire)
                 timer.daemon = True
@@ -519,23 +698,51 @@ def run_codex(args: argparse.Namespace) -> int:
                             event = json.loads(line)
                         except json.JSONDecodeError:
                             continue  # Raw malformed evidence remains in the archive.
-                        is_native_start = (isinstance(event, dict) and
-                            ((provider_id == "codex" and event.get("type") == "thread.started") or
-                             (provider_id == "claude-code" and event.get("type") == "system" and event.get("subtype") == "init")))
+                        is_native_start = isinstance(event, dict) and (
+                            (
+                                provider_id == "codex"
+                                and event.get("type") == "thread.started"
+                            )
+                            or (
+                                provider_id == "claude-code"
+                                and event.get("type") == "system"
+                                and event.get("subtype") == "init"
+                            )
+                        )
                         if is_native_start:
-                            native = (event.get("thread_id") or event.get("threadId")) if provider_id == "codex" else event.get("session_id")
+                            native = (
+                                (event.get("thread_id") or event.get("threadId"))
+                                if provider_id == "codex"
+                                else event.get("session_id")
+                            )
                             if not isinstance(native, str) or not native:
-                                raise LedgerError(f"native ROOT {provider_id} start event has no session identity")
+                                raise LedgerError(
+                                    f"native ROOT {provider_id} start event has no session identity"
+                                )
                             if resuming and native != session_id:
-                                raise LedgerError("native ROOT resume event changed saved session identity")
-                            bind_native_root_session(managed_config, run_id=args.run_id,
-                                session_id=root_prelaunch["root_session_id"], native_session_id=native)
+                                raise LedgerError(
+                                    "native ROOT resume event changed saved session identity"
+                                )
+                            bind_native_root_session(
+                                managed_config,
+                                run_id=args.run_id,
+                                session_id=root_prelaunch["root_session_id"],
+                                native_session_id=native,
+                            )
                             native_session_seen = True
             exit_code = process.wait()
-            if root_prelaunch is not None and exit_code == 0 and not native_session_seen:
-                raise LedgerError(f"native ROOT exited successfully without a {provider_id} session identity")
+            if (
+                root_prelaunch is not None
+                and exit_code == 0
+                and not native_session_seen
+            ):
+                raise LedgerError(
+                    f"native ROOT exited successfully without a {provider_id} session identity"
+                )
             if args.arm == "harness":
-                while not watchdog_expired.is_set() and active_harness_lanes(Path(args.harness_runtime)):
+                while not watchdog_expired.is_set() and active_harness_lanes(
+                    Path(args.harness_runtime)
+                ):
                     time.sleep(2)
 
     except KeyboardInterrupt:
@@ -550,7 +757,9 @@ def run_codex(args: argparse.Namespace) -> int:
             try:
                 exit_code = process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                watchdog_errors.append("ROOT handle did not signal after boundary cleanup")
+                watchdog_errors.append(
+                    "ROOT handle did not signal after boundary cleanup"
+                )
         launch_error = "interrupted by operator"
     except (OSError, ValueError) as exc:
         launch_error = str(exc)
@@ -568,9 +777,14 @@ def run_codex(args: argparse.Namespace) -> int:
                     watchdog_errors.append("ROOT watchdog cleanup has not finished")
         if boundary is not None:
             with boundary_lock:
-                cleanup_proven = (processes.process_boundary_is_gone(boundary.record()) if cleanup_proven
-                                  else boundary.cleanup(force=True, timeout_seconds=30))
-                atomic_write_json(run_dir / "root-process-boundary.json", boundary.record())
+                cleanup_proven = (
+                    processes.process_boundary_is_gone(boundary.record())
+                    if cleanup_proven
+                    else boundary.cleanup(force=True, timeout_seconds=30)
+                )
+                atomic_write_json(
+                    run_dir / "root-process-boundary.json", boundary.record()
+                )
             if not cleanup_proven:
                 watchdog_errors.append("ROOT descendants are not proven gone")
         close_process = getattr(process, "close", None)
@@ -588,7 +802,9 @@ def run_codex(args: argparse.Namespace) -> int:
             "watchdog_stop_errors": watchdog_errors,
             "cleanup_proven": cleanup_proven,
             "process_boundary": boundary.record() if boundary is not None else None,
-            "process_boundary_errors": list(boundary.errors) if boundary is not None else [],
+            "process_boundary_errors": list(boundary.errors)
+            if boundary is not None
+            else [],
         }
         write_once(run_dir / "manifest.json", final)
     print(f"artifacts: {run_dir}", file=sys.stderr)
@@ -599,7 +815,10 @@ def run_codex(args: argparse.Namespace) -> int:
         print("error: run watchdog expired", file=sys.stderr)
         return 124
     if not cleanup_proven or watchdog_errors:
-        print("error: ROOT cleanup is unproven: " + "; ".join(watchdog_errors), file=sys.stderr)
+        print(
+            "error: ROOT cleanup is unproven: " + "; ".join(watchdog_errors),
+            file=sys.stderr,
+        )
         return 2
     return exit_code if exit_code is not None else 2
 
@@ -615,11 +834,19 @@ def gate(args: argparse.Namespace) -> int:
     summary = {
         key: report[key]
         for key in (
-            "run_id", "budget_tokens", "known_total_tokens", "remaining_tokens",
-            "aggregate_components", "provider_metric_totals", "aggregate_metric_scope",
-            "overshoot_tokens", "in_flight_invocations",
-            "unknown_usage_invocations", "token_total_is_exact",
-            "errors", "gate_allows_new_work",
+            "run_id",
+            "budget_tokens",
+            "known_total_tokens",
+            "remaining_tokens",
+            "aggregate_components",
+            "provider_metric_totals",
+            "aggregate_metric_scope",
+            "overshoot_tokens",
+            "in_flight_invocations",
+            "unknown_usage_invocations",
+            "token_total_is_exact",
+            "errors",
+            "gate_allows_new_work",
         )
     }
     print(json.dumps(summary, sort_keys=True))
@@ -653,49 +880,100 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="capture one ROOT or raw provider process")
-    run.add_argument("--run-id", required=True, type=lambda value: valid_id(value, "run-id"))
+    run.add_argument(
+        "--run-id", required=True, type=lambda value: valid_id(value, "run-id")
+    )
     run.add_argument("--task", required=True)
     run.add_argument("--arm", required=True, choices=("harness", "raw"))
-    run.add_argument("--provider", choices=("codex", "claude-code"), default="codex",
-                     help="ROOT CLI provider; Codex remains the default")
+    run.add_argument(
+        "--provider",
+        choices=("codex", "claude-code"),
+        default="codex",
+        help="ROOT CLI provider; Codex remains the default",
+    )
     run.add_argument("--cwd", required=True)
     run.add_argument("--prompt-file", required=True)
-    run.add_argument("--results-dir", required=True, help="explicit directory for owned ROOT usage evidence")
+    run.add_argument(
+        "--results-dir",
+        required=True,
+        help="explicit directory for owned ROOT usage evidence",
+    )
     run.add_argument("--model", required=True)
-    run.add_argument("--reasoning-effort", "--effort", dest="reasoning_effort", required=True,
-                     help="Codex reasoning effort or Claude effort")
+    run.add_argument(
+        "--reasoning-effort",
+        "--effort",
+        dest="reasoning_effort",
+        required=True,
+        help="Codex reasoning effort or Claude effort",
+    )
     run.add_argument("--service-tier", help="Codex service tier; unused by Claude Code")
-    run.add_argument("--sandbox", default="workspace-write", choices=("read-only", "workspace-write", "danger-full-access"))
-    run.add_argument("--budget-tokens", type=int,
-                     help="optional diagnostic launch cap; omit for uncapped reportable runs")
-    run.add_argument("--interrupted-run", action="store_true",
-                     help="declare planned pause/resume segments; label this run non-standard")
-    run.add_argument("--harness-runtime", help="active ROOT workspace's .harness-runtime")
-    run.add_argument("--harness-dir", help="isolated harness installation selecting this ROOT workspace")
-    run.add_argument("--trust-project-hooks", action="store_true",
-                     help="run the prepared project hooks without an interactive trust prompt; required for harness runs")
-    run.add_argument("--watchdog-hours", type=float, required=True,
-                     help="hard wall-clock limit; stops the provider and shuts down harness lanes")
+    run.add_argument(
+        "--sandbox",
+        default="workspace-write",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+    )
+    run.add_argument(
+        "--budget-tokens",
+        type=int,
+        help="optional diagnostic launch cap; omit for uncapped reportable runs",
+    )
+    run.add_argument(
+        "--interrupted-run",
+        action="store_true",
+        help="declare planned pause/resume segments; label this run non-standard",
+    )
+    run.add_argument(
+        "--harness-runtime", help="active ROOT workspace's .harness-runtime"
+    )
+    run.add_argument(
+        "--harness-dir",
+        help="isolated harness installation selecting this ROOT workspace",
+    )
+    run.add_argument(
+        "--trust-project-hooks",
+        action="store_true",
+        help="run the prepared project hooks without an interactive trust prompt; required for harness runs",
+    )
+    run.add_argument(
+        "--watchdog-hours",
+        type=float,
+        required=True,
+        help="hard wall-clock limit; stops the provider and shuts down harness lanes",
+    )
     run.set_defaults(handler=run_codex, inhibit_sleep=True)
 
-    resume = commands.add_parser("resume", help="continue a sealed task run in the same provider session")
+    resume = commands.add_parser(
+        "resume", help="continue a sealed task run in the same provider session"
+    )
     resume.add_argument("--task-file", dest="resume_task_file", required=True)
     resume.add_argument("--prompt-file", required=True)
-    resume.add_argument("--provider", choices=("codex", "claude-code"),
-                        help="optional provider assertion; defaults to the recorded ROOT provider")
-    resume.add_argument("--continue-open-runtime", action="store_true",
-                        help="continue a sealed ROOT turn with only cleanup-proven review-pending lanes")
+    resume.add_argument(
+        "--provider",
+        choices=("codex", "claude-code"),
+        help="optional provider assertion; defaults to the recorded ROOT provider",
+    )
+    resume.add_argument(
+        "--continue-open-runtime",
+        action="store_true",
+        help="continue a sealed ROOT turn with only cleanup-proven review-pending lanes",
+    )
     resume.set_defaults(handler=run_codex, inhibit_sleep=True)
 
     for name, handler, help_text in (
-        ("snapshot", show_snapshot, "read the current aggregate and invocation evidence"),
+        (
+            "snapshot",
+            show_snapshot,
+            "read the current aggregate and invocation evidence",
+        ),
         ("gate", gate, "allow another launch only while known usage is below B"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--task-file", required=True)
         command.set_defaults(handler=handler)
 
-    finish = commands.add_parser("finalize", help="write one immutable task evidence archive")
+    finish = commands.add_parser(
+        "finalize", help="write one immutable task evidence archive"
+    )
     finish.add_argument("--task-file", required=True)
     finish.add_argument("--output", required=True)
     finish.set_defaults(handler=archive)

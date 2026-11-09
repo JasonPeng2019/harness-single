@@ -1,4 +1,4 @@
-﻿"""Lane record helpers: the authoritative outside-worktree ``lane.json``."""
+"""Lane record helpers: the authoritative outside-worktree ``lane.json``."""
 
 from __future__ import annotations
 
@@ -54,7 +54,12 @@ def read_lane(rt: Path, epoch_id: str, lane_id: str) -> dict[str, Any]:
 
 
 def write_lane(
-    rt: Path, epoch_id: str, lane_id: str, fields: dict[str, Any], *, create_only: bool = False,
+    rt: Path,
+    epoch_id: str,
+    lane_id: str,
+    fields: dict[str, Any],
+    *,
+    create_only: bool = False,
 ) -> dict[str, Any]:
     record = dict(fields)
     record["schema"] = LANE_SCHEMA
@@ -84,7 +89,9 @@ def update_lane(
         current = read_lane(rt, epoch_id, lane_id)
         record = dict(mutate(current))
         if record.get("lane_id", lane_id) != lane_id:
-            raise LaneError("LANE_OWNERSHIP_CHANGED", "mutation cannot change lane identity")
+            raise LaneError(
+                "LANE_OWNERSHIP_CHANGED", "mutation cannot change lane identity"
+            )
         record["schema"] = LANE_SCHEMA
         record["lane_id"] = lane_id
         atomic_write_json(path, record)
@@ -98,16 +105,36 @@ def retained_lanes(rt: Path, epoch_id: str) -> dict[str, dict[str, Any]]:
         metadata = directory.lstat()
     except FileNotFoundError:
         return {}
-    if not directory.is_dir() or directory.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
-        raise LaneError("LANE_RECORD_INVALID", f"lane directory is not a plain directory: {directory}")
+    if (
+        not directory.is_dir()
+        or directory.is_symlink()
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise LaneError(
+            "LANE_RECORD_INVALID",
+            f"lane directory is not a plain directory: {directory}",
+        )
     result = {}
     for folder in sorted(directory.iterdir()):
         metadata = folder.lstat()
-        if not folder.is_dir() or folder.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
-            raise LaneError("LANE_RECORD_INVALID", f"unexpected durable lane entry: {folder}")
+        if (
+            not folder.is_dir()
+            or folder.is_symlink()
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise LaneError(
+                "LANE_RECORD_INVALID", f"unexpected durable lane entry: {folder}"
+            )
         lane = read_lane(rt, epoch_id, folder.name)
-        if lane.get("lifecycle") not in LANE_LIFECYCLES or not isinstance(lane.get("run_id"), str) or not lane["run_id"]:
-            raise LaneError("LANE_RECORD_INVALID", f"lane lifecycle or run identity is invalid: {folder}")
+        if (
+            lane.get("lifecycle") not in LANE_LIFECYCLES
+            or not isinstance(lane.get("run_id"), str)
+            or not lane["run_id"]
+        ):
+            raise LaneError(
+                "LANE_RECORD_INVALID",
+                f"lane lifecycle or run identity is invalid: {folder}",
+            )
         result[folder.name] = lane
     return result
 
@@ -119,8 +146,11 @@ def reconcile_active_lanes(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
     with runtime_admission_lock(rt):
         lanes = retained_lanes(rt, epoch_id)
         entries = [
-            {"lane_id": lane_id, "run_id": lane["run_id"],
-             "lane_record_path": str(lane_record_path(rt, epoch_id, lane_id))}
+            {
+                "lane_id": lane_id,
+                "run_id": lane["run_id"],
+                "lane_record_path": str(lane_record_path(rt, epoch_id, lane_id)),
+            }
             for lane_id, lane in lanes.items()
             if lane["lifecycle"] not in {"retired", "abandoned"}
         ]
@@ -139,11 +169,24 @@ def lane_operation_lock(rt: Path, epoch_id: str, lane_id: str) -> RecordLock:
 def require_same_run(current: dict[str, Any], captured: dict[str, Any]) -> None:
     if not captured.get("run_id") or any(
         current.get(field) != captured.get(field)
-        for field in ("lane_id", "run_id", "worktree_path", "provider", "exclusive_resources",
-                      "worktree_identity", "control_dir", "invocation_hash", "git_source",
-                      "result_assignment_hash", "source_exclusions")
+        for field in (
+            "lane_id",
+            "run_id",
+            "worktree_path",
+            "provider",
+            "exclusive_resources",
+            "worktree_identity",
+            "control_dir",
+            "invocation_hash",
+            "git_source",
+            "result_assignment_hash",
+            "source_exclusions",
+        )
     ):
-        raise LaneError("LANE_OWNERSHIP_CHANGED", "lane invocation changed before the operation's effect")
+        raise LaneError(
+            "LANE_OWNERSHIP_CHANGED",
+            "lane invocation changed before the operation's effect",
+        )
 
 
 def find_active_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
@@ -176,7 +219,11 @@ def find_retained_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
     matches = []
     for folder in sorted(directory.iterdir()):
         metadata = folder.lstat()
-        if not folder.is_dir() or folder.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        if (
+            not folder.is_dir()
+            or folder.is_symlink()
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
             raise LaneError("LANE_RECORD_INVALID", f"unexpected epoch entry: {folder}")
         lane = retained_lanes(rt, folder.name).get(lane_id)
         if lane is not None:
@@ -199,15 +246,29 @@ def find_retained_lane(rt: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
                 if parent_id is None:
                     break
                 parent = owners.get(parent_id)
-                if parent is None or child.get("resume_from_run_id") != parent["run_id"] or any(
-                    child.get(field) != parent.get(field) for field in (
-                        "worktree_path", "worktree_identity", "provider", "session", "git_source",
-                        "provider_history_path", "exclusive_resources", "git_write_namespace",
+                if (
+                    parent is None
+                    or child.get("resume_from_run_id") != parent["run_id"]
+                    or any(
+                        child.get(field) != parent.get(field)
+                        for field in (
+                            "worktree_path",
+                            "worktree_identity",
+                            "provider",
+                            "session",
+                            "git_source",
+                            "provider_history_path",
+                            "exclusive_resources",
+                            "git_write_namespace",
+                        )
                     )
                 ):
                     break
                 cursor = parent_id
-            if len(visited) == len(owners) and owners[cursor].get("resume_from_epoch_id") is None:
+            if (
+                len(visited) == len(owners)
+                and owners[cursor].get("resume_from_epoch_id") is None
+            ):
                 return selected, owners[selected]
     if len(matches) != 1:
         raise LaneError(

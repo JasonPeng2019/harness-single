@@ -20,7 +20,11 @@ LEGACY = {
 
 def _copy_claude_payload(harness: Path) -> None:
     for part in ("root", "super-cache"):
-        shutil.copytree(CLAUDE / part, harness / "adapters" / "claude-code" / part, dirs_exist_ok=True)
+        shutil.copytree(
+            CLAUDE / part,
+            harness / "adapters" / "claude-code" / part,
+            dirs_exist_ok=True,
+        )
     shutil.copytree(
         ROOT / "super-cache" / "workspace" / ".agent-workspace",
         harness / "super-cache" / "workspace" / ".agent-workspace",
@@ -43,7 +47,9 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
             value["hooks"][event][0]["hooks"][0]["command"] = command
         return value
 
-    def test_root_setup_migrates_exact_legacy_and_deduplicates_without_touching_users(self) -> None:
+    def test_root_setup_migrates_exact_legacy_and_deduplicates_without_touching_users(
+        self,
+    ) -> None:
         target = self.base / ".claude" / "settings.json"
         target.parent.mkdir()
         legacy = self._legacy_config()
@@ -59,7 +65,9 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
         self.assertEqual(merged, setup._merge_root_hook_config(self.source, target))
         self.assertEqual(json.dumps(legacy), target.read_text(encoding="utf-8"))
 
-    def test_root_setup_refuses_altered_owned_group_without_mutating_target(self) -> None:
+    def test_root_setup_refuses_altered_owned_group_without_mutating_target(
+        self,
+    ) -> None:
         target = self.base / ".claude" / "settings.json"
         target.parent.mkdir()
         legacy = self._legacy_config()
@@ -81,7 +89,9 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
         self.assertEqual(current, merged)
         self.assertEqual(before, target.read_bytes())
 
-    def test_qwen_current_settings_with_shared_hook_basenames_are_preserved(self) -> None:
+    def test_qwen_current_settings_with_shared_hook_basenames_are_preserved(
+        self,
+    ) -> None:
         source = ROOT / "adapters" / "qwen-code" / "root" / ".qwen" / "settings.json"
         target = self.base / ".qwen" / "settings.json"
         target.parent.mkdir()
@@ -95,38 +105,57 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
         self.assertEqual(current, merged)
         self.assertEqual(before, target.read_bytes())
 
-    def test_worker_bootstrap_migrates_exact_legacy_and_preserves_current_binding(self) -> None:
+    def test_worker_bootstrap_migrates_exact_legacy_and_preserves_current_binding(
+        self,
+    ) -> None:
         for cohort in ("legacy-only", "legacy-plus-current"):
             with self.subTest(cohort=cohort):
                 fixture = MaterializationFixture()
                 try:
                     _copy_claude_payload(fixture.harness)
-                    fixture._write_provider_to(fixture.harness, "claude-code", ".claude")
+                    fixture._write_provider_to(
+                        fixture.harness, "claude-code", ".claude"
+                    )
                     fixture.active_cache()
                     fixture.initialize_git()
                     runtime = fixture.root_workspace / ".harness-runtime"
                     lane_id = f"claude-{cohort}"
                     worktree = runtime / "worktrees" / "epoch-1" / lane_id
                     worktree.parent.mkdir(parents=True)
-                    fixture.git("worktree", "add", "-b", f"lane/{lane_id}", str(worktree), "HEAD")
+                    fixture.git(
+                        "worktree",
+                        "add",
+                        "-b",
+                        f"lane/{lane_id}",
+                        str(worktree),
+                        "HEAD",
+                    )
                     settings = worktree / ".claude" / "settings.json"
                     settings.parent.mkdir(parents=True)
                     inherited = self._legacy_config()
                     if cohort == "legacy-plus-current":
                         for event in LEGACY:
-                            inherited["hooks"][event].append(deepcopy(self.shipped["hooks"][event][0]))
+                            inherited["hooks"][event].append(
+                                deepcopy(self.shipped["hooks"][event][0])
+                            )
                     settings.write_text(json.dumps(inherited), encoding="utf-8")
                     (worktree / ".agent-workspace").mkdir(parents=True)
                     bootstrap._write_worker_binding(worktree, runtime, lane_id, "run-1")
                     bootstrap._install_managed_material(
-                        fixture.harness, runtime, worktree,
-                        provider_id="claude-code", lane_id=lane_id, run_id="run-1",
+                        fixture.harness,
+                        runtime,
+                        worktree,
+                        provider_id="claude-code",
+                        lane_id=lane_id,
+                        run_id="run-1",
                     )
                     actual = json.loads(settings.read_text(encoding="utf-8"))
                     self.assertEqual(inherited["env"], actual["env"])
                     self.assertEqual(self.shipped["hooks"], actual["hooks"])
                     binding = json.loads(
-                        (worktree / ".agent-workspace" / "harness-hook-binding.json").read_text(encoding="utf-8")
+                        (
+                            worktree / ".agent-workspace" / "harness-hook-binding.json"
+                        ).read_text(encoding="utf-8")
                     )
                     self.assertEqual("worker", binding["role"])
                     self.assertEqual(lane_id, binding["lane_id"])
@@ -140,7 +169,9 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
                 fixture = MaterializationFixture()
                 try:
                     _copy_claude_payload(fixture.harness)
-                    fixture._write_provider_to(fixture.harness, "claude-code", ".claude")
+                    fixture._write_provider_to(
+                        fixture.harness, "claude-code", ".claude"
+                    )
                     fixture.active_cache()
                     runtime = fixture.root_workspace / ".harness-runtime"
                     worktree = runtime / "worktrees" / "epoch-1" / f"claude-{kind}"
@@ -156,8 +187,12 @@ class ClaudeBootstrapHookMigrationTests(unittest.TestCase):
                     (worktree / ".agent-workspace").mkdir(parents=True)
                     with self.assertRaises(bootstrap.BootstrapError):
                         bootstrap._install_managed_material(
-                            fixture.harness, runtime, worktree,
-                            provider_id="claude-code", lane_id=f"claude-{kind}", run_id="run-1",
+                            fixture.harness,
+                            runtime,
+                            worktree,
+                            provider_id="claude-code",
+                            lane_id=f"claude-{kind}",
+                            run_id="run-1",
                         )
                     self.assertEqual(before, settings.read_bytes())
                 finally:

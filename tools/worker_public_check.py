@@ -1,4 +1,5 @@
 """Lane-local client for the operator's restricted public build/test service."""
+
 from __future__ import annotations
 
 import argparse
@@ -48,9 +49,12 @@ def current_route(agent: Path, expected: dict | None = None) -> dict:
     if route.get("schema") != "worker-public-check-route/v1":
         raise ValueError("public check route is not installed")
     for field in ("lane_id", "run_id"):
-        if (not isinstance(route.get(field), str) or not route[field]
-                or binding.get(field) != route[field]
-                or (expected is not None and expected.get(field) != route[field])):
+        if (
+            not isinstance(route.get(field), str)
+            or not route[field]
+            or binding.get(field) != route[field]
+            or (expected is not None and expected.get(field) != route[field])
+        ):
             raise ValueError("public check route is stale; ROOT must refresh the lane")
     return route
 
@@ -58,27 +62,39 @@ def current_route(agent: Path, expected: dict | None = None) -> dict:
 def request(agent: Path, check: str, command: list[str]) -> dict:
     route = current_route(agent)
     revision = subprocess.check_output(
-        ["git", "-C", str(agent.parent), "rev-parse", "HEAD"], text=True,
+        ["git", "-C", str(agent.parent), "rev-parse", "HEAD"],
+        text=True,
     ).strip()
     paths = route.get("input_paths")
-    if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or not all(isinstance(path, str) and path for path in paths)
+    ):
         raise ValueError("public check route lacks its configured input paths")
     dirty = subprocess.check_output(
-        ["git", "-C", str(agent.parent), "status", "--porcelain", "--",
-         *paths],
+        ["git", "-C", str(agent.parent), "status", "--porcelain", "--", *paths],
         text=True,
     )
     if dirty.strip():
-        raise ValueError("commit the configured project inputs before requesting a check")
+        raise ValueError(
+            "commit the configured project inputs before requesting a check"
+        )
     identifier = uuid.uuid4().hex
     value = {
-        "schema": REQUEST_SCHEMA, "request_id": identifier,
-        "lane_id": route["lane_id"], "run_id": route["run_id"],
-        "revision": revision, "check": check, "command": command,
+        "schema": REQUEST_SCHEMA,
+        "request_id": identifier,
+        "lane_id": route["lane_id"],
+        "run_id": route["run_id"],
+        "revision": revision,
+        "check": check,
+        "command": command,
     }
     path = agent / "public-checks" / identifier / "request.json"
     if len(_json_bytes(value)) > MAX_REQUEST_BYTES:
-        raise ValueError("public check request exceeds its 65536-byte limit; shorten the focused command")
+        raise ValueError(
+            "public check request exceeds its 65536-byte limit; shorten the focused command"
+        )
     current_route(agent, value)
     atomic(path, value)
     return {"request_id": identifier, "request_path": str(path), "revision": revision}
@@ -90,8 +106,11 @@ def wait(agent: Path, identifier: str, timeout: float) -> tuple[dict, int]:
     directory = agent / "public-checks" / identifier
     source = (directory / "request.json").read_bytes()
     original = json.loads(source)
-    if (not isinstance(original, dict) or original.get("schema") != REQUEST_SCHEMA
-            or original.get("request_id") != identifier):
+    if (
+        not isinstance(original, dict)
+        or original.get("schema") != REQUEST_SCHEMA
+        or original.get("request_id") != identifier
+    ):
         raise ValueError("invalid public check request identity")
     digest = hashlib.sha256(source).hexdigest()
     deadline = time.monotonic() + min(max(timeout, 0), 30)
@@ -101,7 +120,10 @@ def wait(agent: Path, identifier: str, timeout: float) -> tuple[dict, int]:
             raise ValueError("public check request changed while waiting")
         if (directory / "result.json").is_file():
             result = read(directory / "result.json")
-            if result.get("schema") != RESULT_SCHEMA or result.get("request_sha256") != digest:
+            if (
+                result.get("schema") != RESULT_SCHEMA
+                or result.get("request_sha256") != digest
+            ):
                 raise ValueError("uncorrelated public check result")
             for field in ("request_id", "lane_id", "run_id", "revision"):
                 if result.get(field) != original.get(field):
@@ -109,19 +131,28 @@ def wait(agent: Path, identifier: str, timeout: float) -> tuple[dict, int]:
             code = result.get("exit_code")
             current_route(agent, original)
             # Reserve PENDING for absent results, even if a finished backend uses 75.
-            return result, code if isinstance(code, int) and 0 <= code <= 255 and code != PENDING else 2
+            return result, code if isinstance(
+                code, int
+            ) and 0 <= code <= 255 and code != PENDING else 2
         if time.monotonic() >= deadline:
-            return {"request_id": identifier, "status": "PENDING",
-                    "next_action": "wait again for this same request; remain in this worker session"}, PENDING
+            return {
+                "request_id": identifier,
+                "status": "PENDING",
+                "next_action": "wait again for this same request; remain in this worker session",
+            }, PENDING
         time.sleep(0.25)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent-workspace", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument(
+        "--agent-workspace", type=Path, default=Path(__file__).resolve().parent
+    )
     commands = parser.add_subparsers(dest="action", required=True)
     submit = commands.add_parser("request")
-    submit.add_argument("--check", choices=("build", "public", "focused"), default="public")
+    submit.add_argument(
+        "--check", choices=("build", "public", "focused"), default="public"
+    )
     submit.add_argument("command", nargs=argparse.REMAINDER)
     poll = commands.add_parser("wait")
     poll.add_argument("--request-id", required=True)
@@ -132,7 +163,9 @@ def main() -> int:
         if args.action == "request":
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if (args.check == "focused") != bool(command):
-                raise ValueError("focused checks require command argv; build/public checks use configured commands")
+                raise ValueError(
+                    "focused checks require command argv; build/public checks use configured commands"
+                )
             result, code = request(agent, args.check, command), 0
         else:
             result, code = wait(agent, args.request_id, args.timeout)

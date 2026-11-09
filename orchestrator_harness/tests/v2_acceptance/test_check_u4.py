@@ -8,23 +8,41 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator_harness.tests.v2_acceptance.contract import assert_valid_result, atomic_json, content_hash
+from orchestrator_harness.tests.v2_acceptance.contract import (
+    assert_valid_result,
+    atomic_json,
+    content_hash,
+)
 
 
 class CheckU4Tests(unittest.TestCase):
     """CHECK-U4 — REQ-013/014 strict record and atomic-write oracle."""
 
     def test_result_rejects_stale_identity_bad_enum_and_bad_hash(self) -> None:
-        result = {"schema": "result/v1", "lane_id": "lane", "run_id": "run", "outcome": "PASS", "summary": "done", "evidence": [], "completed_at": "2026-01-01T00:00:00Z"}
+        result = {
+            "schema": "result/v1",
+            "lane_id": "lane",
+            "run_id": "run",
+            "outcome": "PASS",
+            "summary": "done",
+            "evidence": [],
+            "completed_at": "2026-01-01T00:00:00Z",
+        }
         result["content_hash"] = content_hash(result)
         assert_valid_result(result, "lane", "run")
-        for field, value in (("run_id", "old-run"), ("outcome", "SUCCESS"), ("content_hash", "0" * 64)):
+        for field, value in (
+            ("run_id", "old-run"),
+            ("outcome", "SUCCESS"),
+            ("content_hash", "0" * 64),
+        ):
             mutated = dict(result)
             mutated[field] = value
             with self.subTest(field=field), self.assertRaises(AssertionError):
                 assert_valid_result(mutated, "lane", "run")
 
-    def test_rejected_replacement_preserves_complete_prior_record_and_leaves_no_temp(self) -> None:
+    def test_rejected_replacement_preserves_complete_prior_record_and_leaves_no_temp(
+        self,
+    ) -> None:
         workspace = Path(__file__).resolve().parents[3] / ".agent-workspace"
         workspace.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=workspace) as temporary:
@@ -40,18 +58,25 @@ class CheckU4Tests(unittest.TestCase):
                 self.assertTrue(temporary_path.exists())
                 self.assertEqual(prior, decode_json(path.read_text(encoding="utf-8")))
                 self.assertEqual(replacement, decode_json(document))
-                raise json.JSONDecodeError("synthetic post-write rejection", document, 0)
+                raise json.JSONDecodeError(
+                    "synthetic post-write rejection", document, 0
+                )
 
-            with patch(
-                "orchestrator_harness.tests.v2_acceptance.contract.json.loads",
-                side_effect=reject_post_write_validation,
-            ), self.assertRaises(json.JSONDecodeError):
+            with (
+                patch(
+                    "orchestrator_harness.tests.v2_acceptance.contract.json.loads",
+                    side_effect=reject_post_write_validation,
+                ),
+                self.assertRaises(json.JSONDecodeError),
+            ):
                 atomic_json(path, replacement)
 
             self.assertEqual(prior, json.loads(path.read_text(encoding="utf-8")))
             self.assertFalse(temporary_path.exists())
 
-    def test_public_launcher_exposes_the_complete_normative_v2_command_vocabulary(self) -> None:
+    def test_public_launcher_exposes_the_complete_normative_v2_command_vocabulary(
+        self,
+    ) -> None:
         root = Path(__file__).resolve().parents[3]
         help_surfaces = (
             (

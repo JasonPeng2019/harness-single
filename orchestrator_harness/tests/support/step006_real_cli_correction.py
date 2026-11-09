@@ -32,9 +32,7 @@ class InvalidOnceThenDelegate:
         self.injected_invalid_count = 0
         self.delegated_count = 0
 
-    def __call__(
-        self, lane: dict[str, Any]
-    ) -> tuple[str, dict[str, Any] | None]:
+    def __call__(self, lane: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         self.validation_calls += 1
         if self.injected_invalid_count == 0:
             self.injected_invalid_count = 1

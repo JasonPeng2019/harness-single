@@ -1,4 +1,4 @@
-﻿"""Shared primitives for the v2 harness: time, ids, canonical JSON, hashing."""
+"""Shared primitives for the v2 harness: time, ids, canonical JSON, hashing."""
 
 from __future__ import annotations
 

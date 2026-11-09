@@ -78,7 +78,13 @@ class AdapterCatalogLayoutTests(unittest.TestCase):
     def test_each_provider_tree(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
             adapter = REPOSITORY_ROOT / "adapters" / provider_id
-            for required in ("README.md", "root", "super-cache", "harness", "shipped-machinery"):
+            for required in (
+                "README.md",
+                "root",
+                "super-cache",
+                "harness",
+                "shipped-machinery",
+            ):
                 self.assertTrue(
                     (adapter / required).exists(), f"{provider_id}: missing {required}"
                 )
@@ -90,15 +96,21 @@ class AdapterCatalogLayoutTests(unittest.TestCase):
 class RootPayloadTests(unittest.TestCase):
     def test_exact_eight_root_skills(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
-            skills = REPOSITORY_ROOT / "adapters" / provider_id / "root" / dotdir / "skills"
+            skills = (
+                REPOSITORY_ROOT / "adapters" / provider_id / "root" / dotdir / "skills"
+            )
             self.assertTrue(skills.is_dir(), f"{provider_id}: skills dir missing")
             names = sorted(item.name for item in skills.iterdir() if item.is_dir())
             self.assertEqual(names, sorted(ROOT_SKILLS), provider_id)
             for name in ROOT_SKILLS:
                 skill_md = skills / name / "SKILL.md"
-                self.assertTrue(skill_md.is_file(), f"{provider_id}: missing {name}/SKILL.md")
+                self.assertTrue(
+                    skill_md.is_file(), f"{provider_id}: missing {name}/SKILL.md"
+                )
                 self.assertGreater(
-                    skill_md.stat().st_size, 200, f"{provider_id}: {name} SKILL.md too small"
+                    skill_md.stat().st_size,
+                    200,
+                    f"{provider_id}: {name} SKILL.md too small",
                 )
 
     def test_root_payload_has_config_binding_hooks(self) -> None:
@@ -117,7 +129,9 @@ class RootPayloadTests(unittest.TestCase):
                 (root / "hooks" / "orchestrator_harness_stop.py").is_file(),
                 provider_id,
             )
-            self.assertFalse((root / "hooks" / "post-tool-use.py").exists(), provider_id)
+            self.assertFalse(
+                (root / "hooks" / "post-tool-use.py").exists(), provider_id
+            )
             declarations = [root / "hooks.json", root / "settings.json"]
             self.assertTrue(any(path.is_file() for path in declarations), provider_id)
 
@@ -133,7 +147,9 @@ class RootPayloadTests(unittest.TestCase):
             "harness-shutdown": "harness shutdown",
         }
         for provider_id, dotdir in PROVIDERS.items():
-            skills = REPOSITORY_ROOT / "adapters" / provider_id / "root" / dotdir / "skills"
+            skills = (
+                REPOSITORY_ROOT / "adapters" / provider_id / "root" / dotdir / "skills"
+            )
             for name, command in expectations.items():
                 text = (skills / name / "SKILL.md").read_text(encoding="utf-8")
                 self.assertIn(command, text, f"{provider_id}: {name}")
@@ -155,7 +171,9 @@ class RootPayloadTests(unittest.TestCase):
 
 
 class WorkerPayloadTests(unittest.TestCase):
-    def test_installed_composition_is_the_worker_overlay_for_each_provider(self) -> None:
+    def test_installed_composition_is_the_worker_overlay_for_each_provider(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             harness = root / "harness"
@@ -166,15 +184,28 @@ class WorkerPayloadTests(unittest.TestCase):
             # configuration (or write test configuration into the source tree).
             for directory in ("super-cache", "adapters"):
                 shutil.copytree(
-                    REPOSITORY_ROOT / directory, harness / directory,
+                    REPOSITORY_ROOT / directory,
+                    harness / directory,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
                 )
-            (harness / "harness-config.json").write_text(json.dumps({
-                "root_workspace": str(workspace), "managed_coordination": "enabled",
-            }), encoding="utf-8")
-            (harness / "resource-manifest.json").write_text(json.dumps({
-                "schema": "resource-manifest/v1", "resources": [],
-            }), encoding="utf-8")
+            (harness / "harness-config.json").write_text(
+                json.dumps(
+                    {
+                        "root_workspace": str(workspace),
+                        "managed_coordination": "enabled",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (harness / "resource-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "resource-manifest/v1",
+                        "resources": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             runtime = workspace / ".harness-runtime"
             plan = setup._plan_active_cache(harness)
             setup._install_active_cache(harness, runtime, plan=plan, overwrite=False)
@@ -189,10 +220,19 @@ class WorkerPayloadTests(unittest.TestCase):
                     qwen_settings = worktree / ".qwen" / "settings.json"
                     qwen_settings.parent.mkdir(parents=True)
                     config = json.loads(
-                        (REPOSITORY_ROOT / "adapters" / provider_id / "root" / ".qwen" / "settings.json").read_text(encoding="utf-8")
+                        (
+                            REPOSITORY_ROOT
+                            / "adapters"
+                            / provider_id
+                            / "root"
+                            / ".qwen"
+                            / "settings.json"
+                        ).read_text(encoding="utf-8")
                     )
                     config["custom"] = {"product": True}
-                    qwen_settings.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+                    qwen_settings.write_text(
+                        json.dumps(config, indent=2) + "\n", encoding="utf-8"
+                    )
                     qwen_settings_before = qwen_settings.read_bytes()
                 installed = bootstrap._managed_payload(harness, runtime, provider_id)
                 self.assertEqual(
@@ -200,8 +240,12 @@ class WorkerPayloadTests(unittest.TestCase):
                     installed,
                 )
                 bootstrap._install_managed_material(
-                    harness, runtime, worktree,
-                    provider_id=provider_id, lane_id=f"lane-{provider_id}", run_id="run-1",
+                    harness,
+                    runtime,
+                    worktree,
+                    provider_id=provider_id,
+                    lane_id=f"lane-{provider_id}",
+                    run_id="run-1",
                 )
                 for name in HELPERS:
                     self.assertEqual(
@@ -210,19 +254,34 @@ class WorkerPayloadTests(unittest.TestCase):
                     )
                 for name in WORKER_SKILLS:
                     relative = Path(dotdir) / "skills" / name / "SKILL.md"
-                    self.assertEqual((installed / relative).read_bytes(), (worktree / relative).read_bytes())
+                    self.assertEqual(
+                        (installed / relative).read_bytes(),
+                        (worktree / relative).read_bytes(),
+                    )
                 for source in installed.rglob("*"):
                     if source.is_file():
                         relative = source.relative_to(installed)
                         if worktree / relative != qwen_settings:
-                            self.assertEqual(source.read_bytes(), (worktree / relative).read_bytes(),
-                                             f"{provider_id}: {relative}")
-                binding = json.loads((worktree / ".agent-workspace" / "harness-hook-binding.json").read_text())
+                            self.assertEqual(
+                                source.read_bytes(),
+                                (worktree / relative).read_bytes(),
+                                f"{provider_id}: {relative}",
+                            )
+                binding = json.loads(
+                    (
+                        worktree / ".agent-workspace" / "harness-hook-binding.json"
+                    ).read_text()
+                )
                 self.assertEqual(f"lane-{provider_id}", binding["lane_id"])
                 self.assertEqual("run-1", binding["run_id"])
                 self.assertEqual(str(worktree / "RESULT.json"), binding["result_path"])
-                self.assertEqual(str(runtime / "manager" / "QUEUE.json"), binding["manager_queue_path"])
-                self.assertEqual(b"checked-out product instructions\n", instructions.read_bytes())
+                self.assertEqual(
+                    str(runtime / "manager" / "QUEUE.json"),
+                    binding["manager_queue_path"],
+                )
+                self.assertEqual(
+                    b"checked-out product instructions\n", instructions.read_bytes()
+                )
                 if qwen_settings is not None:
                     self.assertEqual(qwen_settings_before, qwen_settings.read_bytes())
                 for other_provider, other_dotdir in PROVIDERS.items():
@@ -232,16 +291,27 @@ class WorkerPayloadTests(unittest.TestCase):
     def test_exact_two_worker_skills(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
             skills = (
-                REPOSITORY_ROOT / "adapters" / provider_id / "super-cache" / dotdir / "skills"
+                REPOSITORY_ROOT
+                / "adapters"
+                / provider_id
+                / "super-cache"
+                / dotdir
+                / "skills"
             )
-            self.assertTrue(skills.is_dir(), f"{provider_id}: worker skills dir missing")
+            self.assertTrue(
+                skills.is_dir(), f"{provider_id}: worker skills dir missing"
+            )
             names = sorted(item.name for item in skills.iterdir() if item.is_dir())
             self.assertEqual(names, sorted(WORKER_SKILLS), provider_id)
             for name in WORKER_SKILLS:
                 skill_md = skills / name / "SKILL.md"
-                self.assertTrue(skill_md.is_file(), f"{provider_id}: missing {name}/SKILL.md")
+                self.assertTrue(
+                    skill_md.is_file(), f"{provider_id}: missing {name}/SKILL.md"
+                )
                 self.assertGreater(
-                    skill_md.stat().st_size, 200, f"{provider_id}: {name} SKILL.md too small"
+                    skill_md.stat().st_size,
+                    200,
+                    f"{provider_id}: {name} SKILL.md too small",
                 )
 
     def test_worker_skills_use_only_shipped_helpers(self) -> None:
@@ -251,7 +321,12 @@ class WorkerPayloadTests(unittest.TestCase):
         }
         for provider_id, dotdir in PROVIDERS.items():
             skills = (
-                REPOSITORY_ROOT / "adapters" / provider_id / "super-cache" / dotdir / "skills"
+                REPOSITORY_ROOT
+                / "adapters"
+                / provider_id
+                / "super-cache"
+                / dotdir
+                / "skills"
             )
             for name in WORKER_SKILLS:
                 text = (skills / name / "SKILL.md").read_text(encoding="utf-8")
@@ -262,7 +337,9 @@ class WorkerPayloadTests(unittest.TestCase):
 
     def test_worker_payload_has_config_binding_hooks(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
-            payload = REPOSITORY_ROOT / "adapters" / provider_id / "super-cache" / dotdir
+            payload = (
+                REPOSITORY_ROOT / "adapters" / provider_id / "super-cache" / dotdir
+            )
             configs = [payload / "config.toml", payload / "settings.json"]
             self.assertTrue(any(path.is_file() for path in configs), provider_id)
             self.assertTrue(
@@ -270,7 +347,9 @@ class WorkerPayloadTests(unittest.TestCase):
             )
             if provider_id in ("codex", "claude-code", "qwen-code"):
                 self.assertTrue(
-                    (payload / "hooks" / "orchestrator_harness_post_tool_use.py").is_file(),
+                    (
+                        payload / "hooks" / "orchestrator_harness_post_tool_use.py"
+                    ).is_file(),
                     provider_id,
                 )
                 self.assertTrue(
@@ -328,7 +407,9 @@ class RegisteredBindingTests(unittest.TestCase):
         self.fixture_root = Path(temporary.name)
         self.worktree = str(self.fixture_root / "worker")
         self.prompt = str(Path(self.worktree) / ".agent-workspace" / "worker-prompt.md")
-        self.correction_prompt = str(Path(self.worktree) / ".agent-workspace" / "correction-prompt-1.md")
+        self.correction_prompt = str(
+            Path(self.worktree) / ".agent-workspace" / "correction-prompt-1.md"
+        )
 
     def _load_registered(self, provider_id: str) -> object:
         path = (
@@ -358,7 +439,11 @@ class RegisteredBindingTests(unittest.TestCase):
     def test_catalog_binding_matches_registered(self) -> None:
         for provider_id in PROVIDERS:
             catalog = (
-                REPOSITORY_ROOT / "adapters" / provider_id / "harness" / "launcher_binding.py"
+                REPOSITORY_ROOT
+                / "adapters"
+                / provider_id
+                / "harness"
+                / "launcher_binding.py"
             )
             registered = (
                 REPOSITORY_ROOT
@@ -409,7 +494,10 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
         self.assertIn("--verbose", argv)
-        self.assertEqual(["--effort", "low"], argv[argv.index("--effort") : argv.index("--effort") + 2])
+        self.assertEqual(
+            ["--effort", "low"],
+            argv[argv.index("--effort") : argv.index("--effort") + 2],
+        )
         claude_resume = claude.build_argv(
             model="sonnet",
             launch_config={"effort": "max"},
@@ -542,12 +630,16 @@ class RegisteredBindingTests(unittest.TestCase):
 
         claude = self._load_registered("claude-code")
         self.assertEqual(
-            claude.parse_line('{"type": "system", "subtype": "init", "session_id": "s1"}'),
+            claude.parse_line(
+                '{"type": "system", "subtype": "init", "session_id": "s1"}'
+            ),
             {"session_id": "s1"},
         )
 
         qwen = self._load_registered("qwen-code")
-        parsed = qwen.parse_line('{"type": "result", "subtype": "success", "session_id": "s2"}')
+        parsed = qwen.parse_line(
+            '{"type": "result", "subtype": "success", "session_id": "s2"}'
+        )
         self.assertEqual(parsed.get("session_id"), "s2")
         self.assertIn("message", parsed)
 
@@ -576,7 +668,11 @@ class HelperCompilationTests(unittest.TestCase):
 class LaneQueueAcknowledgeTests(unittest.TestCase):
     def test_lane_queue_acknowledge_without_summary_advances_pending(self) -> None:
         helper = (
-            REPOSITORY_ROOT / "super-cache" / "workspace" / ".agent-workspace" / "lane-queue.py"
+            REPOSITORY_ROOT
+            / "super-cache"
+            / "workspace"
+            / ".agent-workspace"
+            / "lane-queue.py"
         )
         spec = importlib.util.spec_from_file_location("_lane_queue", helper)
         self.assertIsNotNone(spec)
@@ -614,7 +710,13 @@ class LaneQueueAcknowledgeTests(unittest.TestCase):
             queue_path.write_text(json.dumps(inbox, indent=2), encoding="utf-8")
 
             exit_code = module.main(
-                ["--agent-workspace", str(workspace), "acknowledge", "--event-id", event_id]
+                [
+                    "--agent-workspace",
+                    str(workspace),
+                    "acknowledge",
+                    "--event-id",
+                    event_id,
+                ]
             )
 
             self.assertEqual(exit_code, 0)

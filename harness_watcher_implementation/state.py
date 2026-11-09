@@ -47,7 +47,12 @@ def save_alert(
         return _save_alert(root, verdict, packet, evaluator_identity)
 
 
-def _save_alert(root: Path, verdict: Any, packet: dict[str, Any], evaluator_identity: dict[str, str] | None) -> dict[str, Any]:
+def _save_alert(
+    root: Path,
+    verdict: Any,
+    packet: dict[str, Any],
+    evaluator_identity: dict[str, str] | None,
+) -> dict[str, Any]:
     signature = hashlib.sha256(
         json.dumps(
             {

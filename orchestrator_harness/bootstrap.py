@@ -37,10 +37,22 @@ from .task_cards import validate_task_card
 from .records import RecordLock, atomic_write_bytes, atomic_write_json
 from .records import runtime_admission_lock
 from .stable_io import PreparedOutputTransaction
-from .mutation import (CapturedTree, DirectoryExpectations, FileMetadata, MutationConflict,
-                       TargetState, capture_target, capture_tree, create_directory,
-                       safe_relative_path, _DirectoryAnchor, _revalidate_tree, _same_state,
-                       _require_anchored_directories, _require_anchored_expected)
+from .mutation import (
+    CapturedTree,
+    DirectoryExpectations,
+    FileMetadata,
+    MutationConflict,
+    TargetState,
+    capture_target,
+    capture_tree,
+    create_directory,
+    safe_relative_path,
+    _DirectoryAnchor,
+    _revalidate_tree,
+    _same_state,
+    _require_anchored_directories,
+    _require_anchored_expected,
+)
 from .git_source import environment as git_environment
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
@@ -93,12 +105,20 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     return record
 
 
-def _run_git(
-    root_workspace: Path, *args: str
-) -> subprocess.CompletedProcess[str]:
+def _run_git(root_workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "--no-replace-objects", "--no-lazy-fetch", "-C", str(root_workspace),
-         "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", *args],
+        [
+            "git",
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "-C",
+            str(root_workspace),
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
+            *args,
+        ],
         env=git_environment(),
         capture_output=True,
         text=True,
@@ -165,7 +185,9 @@ def _git_worktree_add(
     provider_id: str | None = None,
 ) -> None:
     if worktree_path.exists():
-        raise BootstrapError(BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}")
+        raise BootstrapError(
+            BOOTSTRAP_WORKTREE_EXISTS, f"worktree exists: {worktree_path}"
+        )
 
     if checkout_paths is not None:
         # Validate the exact assigned commit before creating a branch/worktree.
@@ -232,7 +254,8 @@ def _git_worktree_add(
             else ()
         )
         critical = {
-            path for path in tracked_paths
+            path
+            for path in tracked_paths
             if path.startswith(".agent-workspace/") or path in provider_inputs
         }
         excluded = sorted(path for path in critical if not included_by_cone(path))
@@ -283,9 +306,7 @@ def _git_worktree_add(
         )
         if completed.returncode == 0:
             stage = "git checkout"
-            completed = _run_git(
-                worktree_path, "checkout", "--no-recurse-submodules"
-            )
+            completed = _run_git(worktree_path, "checkout", "--no-recurse-submodules")
     if completed.returncode != 0:
         # ``git worktree add -b`` creates the branch before checkout.  A checkout
         # failure (for example a Windows long-path refusal) can therefore leave a
@@ -351,7 +372,9 @@ class _OverlayPlan:
     files: tuple[_OverlayFile, ...]
 
 
-def _overlay_chain(relative: Path, directories: dict[Path, TargetState]) -> DirectoryExpectations:
+def _overlay_chain(
+    relative: Path, directories: dict[Path, TargetState]
+) -> DirectoryExpectations:
     chain = [Path(".")]
     current = Path(".")
     for part in relative.parts:
@@ -360,30 +383,43 @@ def _overlay_chain(relative: Path, directories: dict[Path, TargetState]) -> Dire
     return tuple((path, directories[path]) for path in chain)
 
 
-def _overlay_metadata(root: Path, relative: Path, state: TargetState,
-                      directories: DirectoryExpectations | None = None) -> FileMetadata:
+def _overlay_metadata(
+    root: Path,
+    relative: Path,
+    state: TargetState,
+    directories: DirectoryExpectations | None = None,
+) -> FileMetadata:
     with _DirectoryAnchor(root, (root / relative).parent) as anchor:
         _require_anchored_directories(anchor, directories)
         _require_anchored_expected(anchor, relative.name, state)
         info = anchor.stat(relative.name)
-        metadata = FileMetadata(stat.S_IMODE(info.st_mode), info.st_atime_ns, info.st_mtime_ns)
+        metadata = FileMetadata(
+            stat.S_IMODE(info.st_mode), info.st_atime_ns, info.st_mtime_ns
+        )
         _require_anchored_expected(anchor, relative.name, state)
         return metadata
 
 
 def _overlay_source_directories(source: CapturedTree) -> dict[Path, TargetState]:
-    return {Path("."): TargetState(True, "directory", source.root_identity, None, None, None),
-            **{path: state for path, state in source.entries if state.kind == "directory"}}
+    return {
+        Path("."): TargetState(
+            True, "directory", source.root_identity, None, None, None
+        ),
+        **{path: state for path, state in source.entries if state.kind == "directory"},
+    }
 
 
 def _overlay_source_file(plan: _OverlayPlan, item: _OverlayFile) -> None:
     source = plan.source
     relative = source.relative / item.relative
     directories = _overlay_source_directories(source)
-    actual = _overlay_metadata(source.root, relative, item.source,
-                               _overlay_chain(relative.parent, directories))
+    actual = _overlay_metadata(
+        source.root, relative, item.source, _overlay_chain(relative.parent, directories)
+    )
     if (actual.mode, actual.mtime_ns) != (item.metadata.mode, item.metadata.mtime_ns):
-        raise MutationConflict("overlay source permissions or modification time changed")
+        raise MutationConflict(
+            "overlay source permissions or modification time changed"
+        )
 
 
 def _overlay_predecessor(item: _OverlayFile) -> None:
@@ -396,12 +432,15 @@ def _overlay_predecessor(item: _OverlayFile) -> None:
         _require_anchored_expected(anchor, path.name, state)
 
 
-def _overlay_check_destinations(plan: _OverlayPlan, directories: dict[Path, TargetState],
-                                *, files: bool) -> None:
+def _overlay_check_destinations(
+    plan: _OverlayPlan, directories: dict[Path, TargetState], *, files: bool
+) -> None:
     with _DirectoryAnchor(plan.authority, plan.authority) as anchor:
         if anchor.root_identity != plan.authority_identity:
             raise MutationConflict("overlay destination authority changed")
-        for relative in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+        for relative in sorted(
+            directories, key=lambda path: (len(path.parts), str(path))
+        ):
             state = directories[relative]
             if relative == Path("."):
                 continue
@@ -417,8 +456,12 @@ def _overlay_check_destinations(plan: _OverlayPlan, directories: dict[Path, Targ
                 target = plan.destination / item.relative
                 relative = target.relative_to(plan.authority)
                 if directories[relative.parent].present:
-                    if not _same_state(capture_target(plan.authority, relative), item.target):
-                        raise MutationConflict("overlay destination file changed after planning")
+                    if not _same_state(
+                        capture_target(plan.authority, relative), item.target
+                    ):
+                        raise MutationConflict(
+                            "overlay destination file changed after planning"
+                        )
                 elif item.target.present:
                     raise MutationConflict("overlay file census is inconsistent")
         anchor.assert_stable()
@@ -440,8 +483,12 @@ def _overlay_plan(
         excluded = {safe_relative_path(relative).as_posix() for relative in exclude}
         references = replace_if_matches or {}
         source_directories = _overlay_source_directories(snapshot)
-        selected = [(path.relative_to(snapshot.relative), state) for path, state in snapshot.entries
-                    if state.kind == "file" and path.relative_to(snapshot.relative).as_posix() not in excluded]
+        selected = [
+            (path.relative_to(snapshot.relative), state)
+            for path, state in snapshot.entries
+            if state.kind == "file"
+            and path.relative_to(snapshot.relative).as_posix() not in excluded
+        ]
         if not selected:
             return _OverlayPlan(snapshot, destination, None, None, (), ())
         authority = destination
@@ -449,7 +496,9 @@ def _overlay_plan(
             authority = authority.parent
         with _DirectoryAnchor(authority, authority) as anchor:
             identity = anchor.root_identity
-            directories = {Path("."): TargetState(True, "directory", identity, None, None, None)}
+            directories = {
+                Path("."): TargetState(True, "directory", identity, None, None, None)
+            }
             planned = []
             for relative, state in selected:
                 target = destination / relative
@@ -459,15 +508,29 @@ def _overlay_plan(
                     parent = current
                     current /= part
                     if current not in directories:
-                        entry = (capture_target(authority, current) if directories[parent].present
-                                 else TargetState.absent())
+                        entry = (
+                            capture_target(authority, current)
+                            if directories[parent].present
+                            else TargetState.absent()
+                        )
                         if entry.present and entry.kind != "directory":
-                            raise MutationConflict(f"overlay parent is not a directory: {authority / current}")
+                            raise MutationConflict(
+                                f"overlay parent is not a directory: {authority / current}"
+                            )
                         directories[current] = entry
-                target_state = (capture_target(authority, target_relative)
-                                if directories[target_relative.parent].present else TargetState.absent())
-                metadata = _overlay_metadata(snapshot.root, snapshot.relative / relative, state,
-                                             _overlay_chain((snapshot.relative / relative).parent, source_directories))
+                target_state = (
+                    capture_target(authority, target_relative)
+                    if directories[target_relative.parent].present
+                    else TargetState.absent()
+                )
+                metadata = _overlay_metadata(
+                    snapshot.root,
+                    snapshot.relative / relative,
+                    state,
+                    _overlay_chain(
+                        (snapshot.relative / relative).parent, source_directories
+                    ),
+                )
                 predecessor = None
                 write = True
                 if target_state.present:
@@ -480,22 +543,50 @@ def _overlay_plan(
                         if expected_path is None:
                             raise MutationConflict(f"overlay collision at {target}")
                         expected_path = Path(expected_path).absolute()
-                        with _DirectoryAnchor(expected_path.parent, expected_path.parent) as reference_anchor:
-                            expected = capture_target(expected_path.parent, expected_path.name)
-                            if not expected.present or expected.kind != "file" or expected.content != target_state.content:
-                                raise MutationConflict(f"overlay predecessor differs at {target}")
-                            predecessor = (expected_path, reference_anchor.root_identity, expected)
-                planned.append(_OverlayFile(relative, state, metadata, target_state, write, predecessor))
+                        with _DirectoryAnchor(
+                            expected_path.parent, expected_path.parent
+                        ) as reference_anchor:
+                            expected = capture_target(
+                                expected_path.parent, expected_path.name
+                            )
+                            if (
+                                not expected.present
+                                or expected.kind != "file"
+                                or expected.content != target_state.content
+                            ):
+                                raise MutationConflict(
+                                    f"overlay predecessor differs at {target}"
+                                )
+                            predecessor = (
+                                expected_path,
+                                reference_anchor.root_identity,
+                                expected,
+                            )
+                planned.append(
+                    _OverlayFile(
+                        relative, state, metadata, target_state, write, predecessor
+                    )
+                )
                 if write and target.is_relative_to(source):
-                    raise MutationConflict("overlay publication would mutate its observed source")
+                    raise MutationConflict(
+                        "overlay publication would mutate its observed source"
+                    )
             anchor.assert_stable()
-        plan = _OverlayPlan(snapshot, destination, authority, identity,
-                            tuple(sorted(directories.items())), tuple(planned))
+        plan = _OverlayPlan(
+            snapshot,
+            destination,
+            authority,
+            identity,
+            tuple(sorted(directories.items())),
+            tuple(planned),
+        )
         _revalidate_tree(snapshot)
         _overlay_check_destinations(plan, directories, files=True)
         return plan
     except (OSError, ValueError, TypeError) as exc:
-        raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"overlay preflight rejected: {exc}") from exc
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION, f"overlay preflight rejected: {exc}"
+        ) from exc
 
 
 def _copy_overlay(
@@ -506,7 +597,9 @@ def _copy_overlay(
     replace_if_matches: dict[str, Path] | None = None,
 ) -> None:
     """Publish the original captured overlay without adopting later substitutions."""
-    plan = _overlay_plan(source, destination, exclude=exclude, replace_if_matches=replace_if_matches)
+    plan = _overlay_plan(
+        source, destination, exclude=exclude, replace_if_matches=replace_if_matches
+    )
     if not plan.files:
         return
     try:
@@ -516,15 +609,22 @@ def _copy_overlay(
         for item in plan.files:
             _overlay_source_file(plan, item)
             _overlay_predecessor(item)
-        output = PreparedOutputTransaction(plan.authority, allowed_roots=(plan.authority.parent,))
+        output = PreparedOutputTransaction(
+            plan.authority, allowed_roots=(plan.authority.parent,)
+        )
         output.prepare()
         if output.root_identity != plan.authority_identity:
             raise MutationConflict("overlay prepared authority changed")
-        for relative in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+        for relative in sorted(
+            directories, key=lambda path: (len(path.parts), str(path))
+        ):
             if not directories[relative].present:
                 directories[relative] = create_directory(
-                    plan.authority, relative, expected_root_identity=plan.authority_identity,
-                    expected_directories=_overlay_chain(relative.parent, directories))
+                    plan.authority,
+                    relative,
+                    expected_root_identity=plan.authority_identity,
+                    expected_directories=_overlay_chain(relative.parent, directories),
+                )
         for item in plan.files:
             _overlay_source_file(plan, item)
             _overlay_predecessor(item)
@@ -533,8 +633,13 @@ def _copy_overlay(
             chain = _overlay_chain(relative.parent, directories)
             if item.write:
                 output.admit(target)
-                output.write_bytes(target, item.source.content, expected=item.target,
-                                   expected_directories=chain, metadata=item.metadata)
+                output.write_bytes(
+                    target,
+                    item.source.content,
+                    expected=item.target,
+                    expected_directories=chain,
+                    metadata=item.metadata,
+                )
             else:
                 with _DirectoryAnchor(plan.authority, target.parent) as anchor:
                     _require_anchored_directories(anchor, chain)
@@ -542,15 +647,19 @@ def _copy_overlay(
             _overlay_source_file(plan, item)
         _revalidate_tree(plan.source)
     except (OSError, ValueError, TypeError) as exc:
-        raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, f"overlay publication rejected: {exc}") from exc
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION, f"overlay publication rejected: {exc}"
+        ) from exc
 
 
-
-
-def _worker_output(worktree: Path, output: PreparedOutputTransaction | None = None) -> PreparedOutputTransaction:
+def _worker_output(
+    worktree: Path, output: PreparedOutputTransaction | None = None
+) -> PreparedOutputTransaction:
     if output is not None:
         if output.root != worktree.absolute():
-            raise ValueError("worker publication root differs from the assigned worktree")
+            raise ValueError(
+                "worker publication root differs from the assigned worktree"
+            )
         output.revalidate(worktree)
         return output
     output = PreparedOutputTransaction(worktree, allowed_roots=(worktree.parent,))
@@ -569,9 +678,7 @@ def _write_worker_prompt(
     acceptance_criteria = "\n".join(
         f"- {item.strip()}" for item in task_card["acceptance_criteria"]
     )
-    deliverables = "\n".join(
-        f"- {item.strip()}" for item in task_card["deliverables"]
-    )
+    deliverables = "\n".join(f"- {item.strip()}" for item in task_card["deliverables"])
     lines = [
         str(task_card["task"]).strip(),
         f"## Acceptance criteria\n{acceptance_criteria}",
@@ -597,7 +704,7 @@ def _write_worker_prompt(
             "\n## Escalation (managed coordination)\n"
             "If this work needs a ROOT decision, authority, missing input, or help, run:\n"
             "  python .agent-workspace/manager-notify.py --severity blocking "
-            "--summary \"<decision/action needed>\"\n"
+            '--summary "<decision/action needed>"\n'
             "Include the decision/action ROOT needs plus relevant local evidence.  Do not "
             "rely on a final chat answer as a notification.  After a blocking escalation, "
             "stop at a safe boundary rather than inventing the missing decision."
@@ -618,8 +725,13 @@ def _write_worker_prompt(
     return path
 
 
-def _write_result_template(worktree: Path, lane_id: str, run_id: str, *,
-                           output: PreparedOutputTransaction | None = None) -> Path:
+def _write_result_template(
+    worktree: Path,
+    lane_id: str,
+    run_id: str,
+    *,
+    output: PreparedOutputTransaction | None = None,
+) -> Path:
     path = worktree / ".agent-workspace" / "result-template.json"
     template = {
         "schema": "result/v1",
@@ -637,8 +749,12 @@ def _write_result_template(worktree: Path, lane_id: str, run_id: str, *,
     return path
 
 
-def _ignore_generated_material(worktree: Path, generated: list[str], *,
-                               output: PreparedOutputTransaction | None = None) -> list[str]:
+def _ignore_generated_material(
+    worktree: Path,
+    generated: list[str],
+    *,
+    output: PreparedOutputTransaction | None = None,
+) -> list[str]:
     """Keep generated lane material out of the worker's ordinary Git view.
 
     Each generated directory receives an untracked, self-ignoring .gitignore
@@ -659,9 +775,14 @@ def _ignore_generated_material(worktree: Path, generated: list[str], *,
         path = worktree / top / ".gitignore"
         if os.path.lexists(path):
             continue
-        text = "# Generated lane material only; other files here remain project source.\n"
+        text = (
+            "# Generated lane material only; other files here remain project source.\n"
+        )
         output.ensure_parent(path)
-        output.publish_bytes(output.admit(path), (text + "\n".join(sorted(entries)) + "\n").encode("utf-8"))
+        output.publish_bytes(
+            output.admit(path),
+            (text + "\n".join(sorted(entries)) + "\n").encode("utf-8"),
+        )
         written.append(top + "/.gitignore")
     return written
 
@@ -717,8 +838,14 @@ def _write_invocation(
     return invocation
 
 
-def _write_worker_binding(worktree: Path, rt: Path, lane_id: str, run_id: str, *,
-                          output: PreparedOutputTransaction | None = None) -> Path:
+def _write_worker_binding(
+    worktree: Path,
+    rt: Path,
+    lane_id: str,
+    run_id: str,
+    *,
+    output: PreparedOutputTransaction | None = None,
+) -> Path:
     agent_workspace = worktree / ".agent-workspace"
     binding = {
         "schema": HOOK_BINDING_SCHEMA,
@@ -733,7 +860,9 @@ def _write_worker_binding(worktree: Path, rt: Path, lane_id: str, run_id: str, *
     }
     output = _worker_output(worktree, output)
     output.ensure_parent(agent_workspace / "harness-hook-binding.json")
-    output.publish_json(output.admit(agent_workspace / "harness-hook-binding.json"), binding)
+    output.publish_json(
+        output.admit(agent_workspace / "harness-hook-binding.json"), binding
+    )
     return agent_workspace / "harness-hook-binding.json"
 
 
@@ -788,13 +917,17 @@ def _install_managed_material(
             try:
                 merged = _merge_root_hook_config(payload_hooks, worktree_hooks)
                 existing_bytes = worktree_hooks.read_bytes()
-                existing = _read_json_object(worktree_hooks, description="existing hook configuration")
+                existing = _read_json_object(
+                    worktree_hooks, description="existing hook configuration"
+                )
             except (OSError, ValueError, SetupError) as exc:
                 raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
             if merged != existing and not (
                 provider_id == "claude-code"
                 and _is_exact_claude_hook_migration(
-                    read_json(payload_hooks), existing, merged,
+                    read_json(payload_hooks),
+                    existing,
+                    merged,
                 )
             ):
                 raise BootstrapError(
@@ -850,33 +983,56 @@ def _install_managed_material(
 
 
 def _install_codex_worker_isolation(
-    worktree: Path, harness_root: Path, root_workspace: Path, *, enforce_git_isolation: bool = True,
-    manager_workspace: Path | None = None, permission_mode: str = "worker-isolated",
+    worktree: Path,
+    harness_root: Path,
+    root_workspace: Path,
+    *,
+    enforce_git_isolation: bool = True,
+    manager_workspace: Path | None = None,
+    permission_mode: str = "worker-isolated",
 ) -> None:
     """Install the selected write boundary and strict-mode read denials."""
     import os
     import tomllib
 
     if permission_mode not in {"worker-isolated", "worker-workspace"}:
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "unsupported Codex worker isolation mode")
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID, "unsupported Codex worker isolation mode"
+        )
 
     from .mutation import _DirectoryAnchor, capture_target
-    manager = Path(os.path.abspath(manager_workspace if manager_workspace is not None else root_workspace))
-    protected_manager = {manager / leaf for leaf in (".codex", ".claude", ".qwen", ".agent-workspace")}
+
+    manager = Path(
+        os.path.abspath(
+            manager_workspace if manager_workspace is not None else root_workspace
+        )
+    )
+    protected_manager = {
+        manager / leaf for leaf in (".codex", ".claude", ".qwen", ".agent-workspace")
+    }
     try:
         with _DirectoryAnchor(manager, manager) as anchor:
             anchor.assert_stable()
             for path in protected_manager:
                 state = capture_target(manager, path.name)
                 if state.present and state.kind != "directory":
-                    raise ValueError(f"manager ROOT destination is not a plain directory: {path}")
+                    raise ValueError(
+                        f"manager ROOT destination is not a plain directory: {path}"
+                    )
             anchor.assert_stable()
     except (OSError, ValueError) as exc:
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"invalid manager authority: {exc}") from exc
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID, f"invalid manager authority: {exc}"
+        ) from exc
     for path in protected_manager:
-        if any(path == target or path in target.parents for target in (root_workspace.absolute(), worktree.absolute())):
-            raise BootstrapError(BOOTSTRAP_REQUEST_INVALID,
-                                 f"manager ROOT destination contains the product or worker: {path}")
+        if any(
+            path == target or path in target.parents
+            for target in (root_workspace.absolute(), worktree.absolute())
+        ):
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID,
+                f"manager ROOT destination contains the product or worker: {path}",
+            )
 
     config_path = worktree / ".codex" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -888,23 +1044,39 @@ def _install_codex_worker_isolation(
             BOOTSTRAP_CACHE_COLLISION, f"invalid Codex worker config: {exc}"
         ) from exc
     marker = "# Harness-owned worker isolation; regenerated for every lane.\n"
-    legacy_marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
-    candidates = (("worker-isolated", legacy_marker), ("worker-isolated", marker),
-                  ("worker-workspace", marker))
+    legacy_marker = (
+        "# Harness-owned worker read isolation; regenerated for every lane.\n"
+    )
+    candidates = (
+        ("worker-isolated", legacy_marker),
+        ("worker-isolated", marker),
+        ("worker-workspace", marker),
+    )
     for candidate_mode, current_marker in candidates:
         default_line = f'default_permissions = "{candidate_mode}"\n'
-        if not (existing.startswith(default_line) and existing.count(current_marker) == 1):
+        if not (
+            existing.startswith(default_line) and existing.count(current_marker) == 1
+        ):
             continue
         # A completed worker may commit this generated suffix before a child
         # branches from it. Discard only the complete owned shape; all grants
         # below are then derived again from the child's captured Git identity.
         from pathlib import PurePosixPath, PureWindowsPath
-        user_config, inherited_suffix = existing[len(default_line):].split(current_marker, 1)
+
+        user_config, inherited_suffix = existing[len(default_line) :].split(
+            current_marker, 1
+        )
         try:
             inherited = tomllib.loads(inherited_suffix)
             permissions = inherited.get("permissions", {})
-            profile = permissions.get(candidate_mode, {}) if isinstance(permissions, dict) else {}
-            filesystem = profile.get("filesystem", {}) if isinstance(profile, dict) else {}
+            profile = (
+                permissions.get(candidate_mode, {})
+                if isinstance(permissions, dict)
+                else {}
+            )
+            filesystem = (
+                profile.get("filesystem", {}) if isinstance(profile, dict) else {}
+            )
             if (
                 isinstance(profile, dict)
                 and inherited == {"permissions": {candidate_mode: profile}}
@@ -912,11 +1084,19 @@ def _install_codex_worker_isolation(
                 and profile["extends"] == ":workspace"
                 and isinstance(filesystem, dict)
                 and filesystem.get(":workspace_roots") == {".": "write"}
-                and (candidate_mode == "worker-workspace" or any(value == "deny" for value in filesystem.values()))
+                and (
+                    candidate_mode == "worker-workspace"
+                    or any(value == "deny" for value in filesystem.values())
+                )
                 and all(
-                    isinstance(value, str) and value in {"deny", "write"}
-                    and (PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute())
-                    for name, value in filesystem.items() if name != ":workspace_roots"
+                    isinstance(value, str)
+                    and value in {"deny", "write"}
+                    and (
+                        PurePosixPath(name).is_absolute()
+                        or PureWindowsPath(name).is_absolute()
+                    )
+                    for name, value in filesystem.items()
+                    if name != ":workspace_roots"
                 )
             ):
                 parsed = tomllib.loads(user_config)
@@ -929,7 +1109,8 @@ def _install_codex_worker_isolation(
         "sandbox_mode" in parsed
         or "default_permissions" in parsed
         or not isinstance(permissions, dict)
-        or "worker-isolated" in permissions or "worker-workspace" in permissions
+        or "worker-isolated" in permissions
+        or "worker-workspace" in permissions
     ):
         raise BootstrapError(
             BOOTSTRAP_CACHE_COLLISION,
@@ -937,30 +1118,49 @@ def _install_codex_worker_isolation(
         )
 
     from .isolation_policy import require_git_read_access, strict_read_denials
+
     root_workspace = root_workspace.resolve()
-    denied = strict_read_denials(harness_root, root_workspace, manager) if permission_mode == "worker-isolated" else set()
+    denied = (
+        strict_read_denials(harness_root, root_workspace, manager)
+        if permission_mode == "worker-isolated"
+        else set()
+    )
 
     git_writes: set[Path] = set()
     git_pointer = worktree / ".git"
     if git_pointer.exists() and not git_pointer.is_file():
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "worker Git metadata is not a linked worktree")
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID, "worker Git metadata is not a linked worktree"
+        )
     if git_pointer.is_file():
         try:
             from .git_source import capture, require_exclusive_namespace
+
             source = capture(root_workspace, worktree)
-            common_dir, lane_git_dir = Path(source["common_dir"]), Path(source["private_dir"])
+            common_dir, lane_git_dir = (
+                Path(source["common_dir"]),
+                Path(source["private_dir"]),
+            )
             if enforce_git_isolation:
                 # Explicit yolo launches do not select the worker isolation profile.
                 if denied:
                     require_git_read_access(denied, common_dir, lane_git_dir)
-                branch_namespace = require_exclusive_namespace(root_workspace, source["branch_ref"])
+                branch_namespace = require_exclusive_namespace(
+                    root_workspace, source["branch_ref"]
+                )
                 # Native filesystem policy needs directory grants for lock
                 # creation and rename. The branch parent must be exclusive;
                 # never grant refs/heads or a shared lane namespace.
-                git_writes = {lane_git_dir, common_dir / "objects",
-                              common_dir / branch_namespace, common_dir / ("logs/" + branch_namespace)}
+                git_writes = {
+                    lane_git_dir,
+                    common_dir / "objects",
+                    common_dir / branch_namespace,
+                    common_dir / ("logs/" + branch_namespace),
+                }
         except (OSError, ValueError) as exc:
-            raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, f"invalid linked worktree metadata: {exc}") from exc
+            raise BootstrapError(
+                BOOTSTRAP_REQUEST_INVALID, f"invalid linked worktree metadata: {exc}"
+            ) from exc
 
     lines = [
         marker.rstrip(),
@@ -993,8 +1193,12 @@ def _install_codex_worker_isolation(
 
 
 def regenerate_codex_worker_profile(
-    worktree: Path, harness_root: Path, root_workspace: Path, *,
-    permission_mode: str, manager_workspace: Path | None = None,
+    worktree: Path,
+    harness_root: Path,
+    root_workspace: Path,
+    *,
+    permission_mode: str,
+    manager_workspace: Path | None = None,
 ) -> Path:
     """Regenerate only an exact harness-owned profile for an explicit transition.
 
@@ -1003,7 +1207,10 @@ def regenerate_codex_worker_profile(
     invocation identity under their own lane transaction before using it.
     """
     _install_codex_worker_isolation(
-        worktree, harness_root, root_workspace, manager_workspace=manager_workspace,
+        worktree,
+        harness_root,
+        root_workspace,
+        manager_workspace=manager_workspace,
         permission_mode=permission_mode,
     )
     return worktree / ".codex" / "config.toml"
@@ -1023,7 +1230,10 @@ def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
     try:
         _require_plain_workspace_boundary(rt, code=SETUP_CACHE_INVALID)
         if not payload.is_dir():
-            raise BootstrapError(BOOTSTRAP_CACHE_MISSING, f"installed worker composition missing: {payload}")
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_MISSING,
+                f"installed worker composition missing: {payload}",
+            )
         return _validated_worker_payload(harness_root, rt, provider_id)
     except (SetupError, OSError) as exc:
         raise BootstrapError(
@@ -1077,10 +1287,7 @@ def _validate_provider_launch_config(
     except (TypeError, ValueError) as exc:
         raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
     if not isinstance(configured, dict) or not all(
-        isinstance(key, str)
-        and key
-        and isinstance(value, str)
-        and value
+        isinstance(key, str) and key and isinstance(value, str) and value
         for key, value in configured.items()
     ):
         raise BootstrapError(
@@ -1095,9 +1302,15 @@ def normalize_fresh_launch_config(
 ) -> dict[str, Any]:
     """Apply defaults only to an explicitly selected new worker profile."""
     if not isinstance(launch_config, dict):
-        raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, "launch configuration must be an object")
+        raise BootstrapError(
+            BOOTSTRAP_REQUEST_INVALID, "launch configuration must be an object"
+        )
     normalized = dict(launch_config)
-    if provider_id == "codex" and os.name == "nt" and "permission_mode" not in normalized:
+    if (
+        provider_id == "codex"
+        and os.name == "nt"
+        and "permission_mode" not in normalized
+    ):
         normalized["permission_mode"] = "worker-workspace"
     return normalized
 
@@ -1167,6 +1380,7 @@ def run_bootstrap(
         }
 
     from .portable_paths import component as portable_component
+
     try:
         portable_component(lane_id)
     except ValueError:
@@ -1236,6 +1450,7 @@ def run_bootstrap(
                 "evidence_paths": [],
                 "next_action": "run harness setup and verify the installed cache",
             }
+
     def allowance_expired() -> bool:
         """Report one absolute expiry without touching any effectful phase."""
 
@@ -1309,7 +1524,10 @@ def run_bootstrap(
         with runtime_admission_lock(rt):
             runtime = read_runtime_state(rt)
             if not runtime or runtime.get("state") != "OPEN":
-                raise BootstrapError(BOOTSTRAP_RUNTIME_NOT_OPEN, "runtime must be OPEN before lane admission; run setup first")
+                raise BootstrapError(
+                    BOOTSTRAP_RUNTIME_NOT_OPEN,
+                    "runtime must be OPEN before lane admission; run setup first",
+                )
             task_card = _read_task_card(Path(task_card_path))
             if allowance_expired():
                 raise refuse_expired_allowance("epoch was opened")
@@ -1322,16 +1540,25 @@ def run_bootstrap(
                         f"lane id already used this epoch: {lane_id}",
                     )
             if (lane_record_dir(rt, epoch_id, lane_id) / "lane.json").exists():
-                raise BootstrapError(BOOTSTRAP_LANE_ID_IN_USE, f"durable lane id already used this epoch: {lane_id}")
+                raise BootstrapError(
+                    BOOTSTRAP_LANE_ID_IN_USE,
+                    f"durable lane id already used this epoch: {lane_id}",
+                )
             run_id = new_id()
             worktree_path = rt / "worktrees" / epoch_id / lane_id
             branch = str(task_card.get("branch") or f"lane/{epoch_id}/{lane_id}/work")
             base_commit = str(task_card.get("base_commit") or "HEAD")
             git_write_namespace = None
-            if provider == "codex" and configured_launch.get("permission_mode") != "yolo":
+            if (
+                provider == "codex"
+                and configured_launch.get("permission_mode") != "yolo"
+            ):
                 from .git_source import require_exclusive_namespace
+
                 try:
-                    git_write_namespace = require_exclusive_namespace(config.root_workspace, "refs/heads/" + branch, rt=rt)
+                    git_write_namespace = require_exclusive_namespace(
+                        config.root_workspace, "refs/heads/" + branch, rt=rt
+                    )
                 except (OSError, ValueError) as exc:
                     raise BootstrapError(BOOTSTRAP_REQUEST_INVALID, str(exc)) from exc
             if allowance_expired():
@@ -1379,19 +1606,29 @@ def run_bootstrap(
                 )
             if provider == "codex":
                 _install_codex_worker_isolation(
-                    worktree_path, harness_root, config.root_workspace,
-                    enforce_git_isolation=configured_launch.get("permission_mode") != "yolo",
+                    worktree_path,
+                    harness_root,
+                    config.root_workspace,
+                    enforce_git_isolation=configured_launch.get("permission_mode")
+                    != "yolo",
                     manager_workspace=config.manager_workspace,
-                    permission_mode=(configured_launch.get("permission_mode", "worker-isolated")
-                                     if configured_launch.get("permission_mode") != "yolo"
-                                     else "worker-isolated"),
+                    permission_mode=(
+                        configured_launch.get("permission_mode", "worker-isolated")
+                        if configured_launch.get("permission_mode") != "yolo"
+                        else "worker-isolated"
+                    ),
                 )
             source_exclusions = [".codex/config.toml"] if provider == "codex" else []
             if managed:
                 payload = _managed_payload(harness_root, rt, provider)
-                source_exclusions.extend(path.relative_to(payload).as_posix()
-                                         for path in payload.rglob("*") if path.is_file())
-            source_exclusions.extend(_ignore_generated_material(worktree_path, source_exclusions))
+                source_exclusions.extend(
+                    path.relative_to(payload).as_posix()
+                    for path in payload.rglob("*")
+                    if path.is_file()
+                )
+            source_exclusions.extend(
+                _ignore_generated_material(worktree_path, source_exclusions)
+            )
             receipt = {
                 "schema": OVERLAY_RECEIPT_SCHEMA,
                 "lane_id": lane_id,
@@ -1404,6 +1641,7 @@ def run_bootstrap(
                 receipt["provider_payload"] = f"composed-payloads/{provider}"
             atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
             atomic_write_json(agent_workspace / "task-card.json", task_card)
+
             def publish_lane(lane: dict[str, Any]) -> None:
                 """Persist one prepared-or-pending lane record and declare it active."""
                 nonlocal lane_record_written
@@ -1413,7 +1651,10 @@ def run_bootstrap(
                     raise refuse_expired_allowance("lane record was published")
                 runtime = read_runtime_state(rt)
                 if not runtime or runtime.get("state") != "OPEN":
-                    raise BootstrapError(BOOTSTRAP_RUNTIME_NOT_OPEN, "runtime changed before lane publication")
+                    raise BootstrapError(
+                        BOOTSTRAP_RUNTIME_NOT_OPEN,
+                        "runtime changed before lane publication",
+                    )
                 write_lane(rt, epoch_id, lane_id, lane)
                 lane_record_written = True
                 entries = read_active_lanes(rt, epoch_id)
@@ -1439,9 +1680,15 @@ def run_bootstrap(
                     "git_write_namespace": git_write_namespace,
                     "source_exclusions": sorted(set(source_exclusions)),
                     "result_path": str(worktree_path / "RESULT.json"),
-                    "controller_status_path": str(agent_workspace / "controller.status.json"),
-                    "controller_events_path": str(agent_workspace / "controller.events.jsonl"),
-                    "transcript_path": str(agent_workspace / "provider-transcript.jsonl"),
+                    "controller_status_path": str(
+                        agent_workspace / "controller.status.json"
+                    ),
+                    "controller_events_path": str(
+                        agent_workspace / "controller.events.jsonl"
+                    ),
+                    "transcript_path": str(
+                        agent_workspace / "provider-transcript.jsonl"
+                    ),
                     "stderr_path": str(agent_workspace / "provider-stderr.txt"),
                     "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
                     "last_message_path": str(agent_workspace / "last-message.txt"),
@@ -1461,12 +1708,17 @@ def run_bootstrap(
                     record["checkout_paths"] = list(config.checkout_paths)
                 if managed:
                     record["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
-                    record["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
+                    record["incoming_queue_command"] = str(
+                        agent_workspace / "lane-queue.py"
+                    )
                 return record
 
             if managed:
                 from .public_checks import install_route
-                install_route(harness_root, config.root_workspace, worktree_path, lane_id, run_id)
+
+                install_route(
+                    harness_root, config.root_workspace, worktree_path, lane_id, run_id
+                )
             _write_worker_prompt(worktree_path, task_card, managed=managed)
             _write_result_template(worktree_path, lane_id, run_id)
             _write_invocation(
@@ -1482,8 +1734,10 @@ def run_bootstrap(
 
             lane = base_lane_record()
             from .lane_authority import stage_authority
+
             lane = stage_authority(rt, epoch_id, lane, task_card)
             from .retry_policy import initialize_history
+
             initialize_history(rt, lane)
             publish_lane(lane)
     except BootstrapError as exc:

@@ -180,28 +180,43 @@ def minimal_auth(source: Path, destination: Path) -> tuple[list[str], str, str]:
     return secrets, expiry, id_expiry
 
 
-def cgroup_processes(cgroup: Path, *, expected_identity: tuple[int, int] | None = None) -> set[int]:
+def cgroup_processes(
+    cgroup: Path, *, expected_identity: tuple[int, int] | None = None
+) -> set[int]:
     """Return a complete recursive inventory, or raise for unknown evidence."""
     try:
         metadata = cgroup.lstat()
     except FileNotFoundError:
         return set()  # Confirmed absent, distinct from unreadable inventory.
-    if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
+    if (
+        expected_identity is not None
+        and (metadata.st_dev, metadata.st_ino) != expected_identity
+    ):
         raise RuntimeError("owned cgroup identity changed")
     result: set[int] = set()
     pending = [cgroup]
     while pending:
         directory = pending.pop()
         metadata = directory.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
-            raise RuntimeError("cgroup inventory contains a redirected/non-directory group")
-        for line in (directory / "cgroup.procs").read_text(encoding="ascii").splitlines():
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise RuntimeError(
+                "cgroup inventory contains a redirected/non-directory group"
+            )
+        for line in (
+            (directory / "cgroup.procs").read_text(encoding="ascii").splitlines()
+        ):
             if not line.isdecimal() or int(line) <= 0:
                 raise ValueError("cgroup inventory contains an invalid PID")
             result.add(int(line))
         for child in directory.iterdir():
             child_metadata = child.lstat()
-            if stat.S_ISLNK(child_metadata.st_mode) or getattr(child_metadata, "st_file_attributes", 0) & 0x400:
+            if (
+                stat.S_ISLNK(child_metadata.st_mode)
+                or getattr(child_metadata, "st_file_attributes", 0) & 0x400
+            ):
                 raise RuntimeError("cgroup inventory contains a redirected entry")
             if stat.S_ISDIR(child_metadata.st_mode):
                 pending.append(child)
@@ -277,7 +292,9 @@ def discover_codex(
     deadline = time.monotonic() + timeout
     pinned_stat = pinned_codex.resolve(strict=True).stat()
     while time.monotonic() < deadline:
-        for pid in sorted(cgroup_processes(cgroup, expected_identity=expected_identity)):
+        for pid in sorted(
+            cgroup_processes(cgroup, expected_identity=expected_identity)
+        ):
             executable = proc_exe(pid)
             if executable is None:
                 continue
@@ -363,11 +380,21 @@ table inet harness {{
 def isolation_layout(workspace: Path, manifest: Path) -> dict[str, Any]:
     """Resolve an operator-authored OS mount allowlist and private namespace paths."""
     value = json.loads(manifest.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) != {"readonly_paths", "forbidden_probe_paths"}:
-        raise RuntimeError("system mounts must declare readonly_paths and forbidden_probe_paths")
+    if not isinstance(value, dict) or set(value) != {
+        "readonly_paths",
+        "forbidden_probe_paths",
+    }:
+        raise RuntimeError(
+            "system mounts must declare readonly_paths and forbidden_probe_paths"
+        )
     for key in value:
-        if not isinstance(value[key], list) or not value[key] or any(
-            not isinstance(item, str) or not Path(item).is_absolute() for item in value[key]
+        if (
+            not isinstance(value[key], list)
+            or not value[key]
+            or any(
+                not isinstance(item, str) or not Path(item).is_absolute()
+                for item in value[key]
+            )
         ):
             raise RuntimeError(f"{key} must contain explicit absolute Linux paths")
     readonly = [Path(item) for item in value["readonly_paths"]]
@@ -384,11 +411,19 @@ def isolation_layout(workspace: Path, manifest: Path) -> dict[str, Any]:
     if git is None:
         raise RuntimeError("Git is unavailable on PATH")
     certificates = ssl.get_default_verify_paths()
-    cert_paths = [Path(item).resolve(strict=True) for item in
-                  (certificates.capath, certificates.cafile) if item]
+    cert_paths = [
+        Path(item).resolve(strict=True)
+        for item in (certificates.capath, certificates.cafile)
+        if item
+    ]
     for required in (python, Path(git).resolve(strict=True), *cert_paths):
-        if not any(required == path.resolve() or required.is_relative_to(path.resolve()) for path in readonly):
-            raise RuntimeError(f"system mount allowlist does not cover a required OS file: {required}")
+        if not any(
+            required == path.resolve() or required.is_relative_to(path.resolve())
+            for path in readonly
+        ):
+            raise RuntimeError(
+                f"system mount allowlist does not cover a required OS file: {required}"
+            )
     private = Path(workspace.anchor) / ".harness-provider"
     home = private / "home"
     return {
@@ -404,10 +439,20 @@ def isolation_layout(workspace: Path, manifest: Path) -> dict[str, Any]:
         "proc_target": str(procfs_root()),
         "dev_target": str(Path(os.devnull).parent),
         "python": str(python),
-        "path": os.pathsep.join(dict.fromkeys([str(private / "codex" / "bin"),
-                                              str(python.parent), str(Path(git).parent), *os.defpath.split(os.pathsep)])),
+        "path": os.pathsep.join(
+            dict.fromkeys(
+                [
+                    str(private / "codex" / "bin"),
+                    str(python.parent),
+                    str(Path(git).parent),
+                    *os.defpath.split(os.pathsep),
+                ]
+            )
+        ),
         "ssl_cert_dir": str(cert_paths[0]) if certificates.capath else "",
-        "ssl_cert_file": str(Path(certificates.cafile).resolve()) if certificates.cafile else "",
+        "ssl_cert_file": str(Path(certificates.cafile).resolve())
+        if certificates.cafile
+        else "",
     }
 
 
@@ -422,27 +467,61 @@ def bwrap_base(
 ) -> list[str]:
     """Only the assigned workspace and disposable auth home get writable binds."""
     argv = [
-        "setpriv", f"--reuid={NOBODY}", f"--regid={NOBODY}", "--clear-groups",
-        str(bwrap), "--unshare-user", "--unshare-ipc", "--unshare-pid",
-        "--unshare-uts", "--unshare-cgroup", "--die-with-parent", "--new-session",
-        "--tmpfs", layout["root"],
+        "setpriv",
+        f"--reuid={NOBODY}",
+        f"--regid={NOBODY}",
+        "--clear-groups",
+        str(bwrap),
+        "--unshare-user",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--die-with-parent",
+        "--new-session",
+        "--tmpfs",
+        layout["root"],
     ]
     for path in layout["readonly_paths"]:
         argv.extend(("--ro-bind", path, path))
-    argv.extend((
-        "--proc", layout["proc_target"], "--dev", layout["dev_target"],
-        "--dir", layout["private"], "--tmpfs", layout["temp_target"],
-        "--ro-bind", str(release), layout["release_target"],
-        "--dir", layout["home_target"],
-        "--bind", str(codex_home), layout["codex_home_target"],
-        "--bind", str(workspace), layout["workspace_target"],
-        "--chdir", layout["workspace_target"], "--clearenv",
-    ))
+    argv.extend(
+        (
+            "--proc",
+            layout["proc_target"],
+            "--dev",
+            layout["dev_target"],
+            "--dir",
+            layout["private"],
+            "--tmpfs",
+            layout["temp_target"],
+            "--ro-bind",
+            str(release),
+            layout["release_target"],
+            "--dir",
+            layout["home_target"],
+            "--bind",
+            str(codex_home),
+            layout["codex_home_target"],
+            "--bind",
+            str(workspace),
+            layout["workspace_target"],
+            "--chdir",
+            layout["workspace_target"],
+            "--clearenv",
+        )
+    )
     environment = {
-        "HOME": layout["home_target"], "CODEX_HOME": layout["codex_home_target"],
-        "PATH": layout["path"], "TMPDIR": layout["temp_target"], "PYTHONNOUSERSITE": "1",
-        "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url,
-        "http_proxy": proxy_url, "https_proxy": proxy_url, "NO_PROXY": "", "no_proxy": "",
+        "HOME": layout["home_target"],
+        "CODEX_HOME": layout["codex_home_target"],
+        "PATH": layout["path"],
+        "TMPDIR": layout["temp_target"],
+        "PYTHONNOUSERSITE": "1",
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+        "NO_PROXY": "",
+        "no_proxy": "",
     }
     for key in ("ssl_cert_dir", "ssl_cert_file"):
         if layout.get(key):
@@ -453,9 +532,15 @@ def bwrap_base(
 
 
 def preflight(
-    namespace: str, base: list[str], proxy_host: str, proxy_port: int, *, layout: dict[str, Any]
+    namespace: str,
+    base: list[str],
+    proxy_host: str,
+    proxy_port: int,
+    *,
+    layout: dict[str, Any],
 ) -> dict[str, Any]:
-    script = r"""
+    script = (
+        r"""
 import json, os, pathlib, socket, subprocess
 LAYOUT = json.loads(LAYOUT_JSON)
 workspace = pathlib.Path(LAYOUT["workspace_target"])
@@ -515,7 +600,10 @@ value = {
  },
 }
 print(json.dumps(value, sort_keys=True))
-""".replace("PROXY_HOST", repr(proxy_host)).replace("PROXY_PORT", str(proxy_port)).replace("LAYOUT_JSON", repr(json.dumps(layout)))
+""".replace("PROXY_HOST", repr(proxy_host))
+        .replace("PROXY_PORT", str(proxy_port))
+        .replace("LAYOUT_JSON", repr(json.dumps(layout)))
+    )
     completed = run(
         ["ip", "netns", "exec", namespace, *base, layout["python"], "-c", script],
         timeout=30,
@@ -593,18 +681,27 @@ def copy_evidence(
     redact_tree(evidence, secrets)
 
 
-def kill_cgroup(cgroup: Path, *, expected_identity: tuple[int, int] | None = None) -> None:
+def kill_cgroup(
+    cgroup: Path, *, expected_identity: tuple[int, int] | None = None
+) -> None:
     try:
         metadata = cgroup.lstat()
     except FileNotFoundError:
         return
-    if (not stat.S_ISDIR(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400
-            or expected_identity is None or (metadata.st_dev, metadata.st_ino) != expected_identity):
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+        or expected_identity is None
+        or (metadata.st_dev, metadata.st_ino) != expected_identity
+    ):
         raise RuntimeError("exact owned cgroup identity is required before cleanup")
     # Killing must precede inventory: an unreadable inventory cannot skip it.
     (cgroup / "cgroup.kill").write_text("1\n", encoding="ascii")
     deadline = time.monotonic() + 10
-    while cgroup_processes(cgroup, expected_identity=expected_identity) and time.monotonic() < deadline:
+    while (
+        cgroup_processes(cgroup, expected_identity=expected_identity)
+        and time.monotonic() < deadline
+    ):
         time.sleep(0.05)
     if cgroup_processes(cgroup, expected_identity=expected_identity):
         raise RuntimeError("prepared real-agent cgroup did not become empty")
@@ -647,15 +744,24 @@ def validate_prepared_state(
     if not isinstance(value.get("isolation_layout"), dict):
         raise RuntimeError("prepared state lacks the operator isolation layout")
     identity = value.get("cgroup_identity")
-    if not isinstance(identity, list) or len(identity) != 2 or any(type(part) is not int or part < 0 for part in identity):
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 2
+        or any(type(part) is not int or part < 0 for part in identity)
+    ):
         raise RuntimeError("prepared state lacks the exact owned cgroup identity")
     _valid_hex(value.get("run_id", ""), 32, "prepared run-id")
     group = cgroup_root() / ("orchestrator-harness-" + value["run_id"])
     if Path(value["cgroup"]).absolute() != group.absolute():
-        raise RuntimeError("prepared cgroup does not bind to the run's discovered kernel mount")
+        raise RuntimeError(
+            "prepared cgroup does not bind to the run's discovered kernel mount"
+        )
     metadata = group.lstat()
-    if (not stat.S_ISDIR(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400
-            or (metadata.st_dev, metadata.st_ino) != tuple(identity)):
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+        or (metadata.st_dev, metadata.st_ino) != tuple(identity)
+    ):
         raise RuntimeError("prepared cgroup identity changed before provider creation")
     return value
 
@@ -694,7 +800,9 @@ def _prepare(args: argparse.Namespace) -> int:
         raise RuntimeError("invocation ID is invalid")
     codex_root = Path(args.codex_root).resolve(strict=True)
     if not Path(args.codex_root).is_absolute() or not codex_root.is_dir():
-        raise RuntimeError("Codex root must be an explicit absolute installation directory")
+        raise RuntimeError(
+            "Codex root must be an explicit absolute installation directory"
+        )
     codex_link = codex_root / "bin" / "codex"
     pinned_codex = codex_link.resolve(strict=True)
     release = pinned_codex.parent.parent
@@ -708,7 +816,9 @@ def _prepare(args: argparse.Namespace) -> int:
     if not bwrap.is_file():
         discovered = shutil.which("bwrap")
         if discovered is None:
-            raise RuntimeError("bubblewrap is unavailable on PATH or in the pinned release")
+            raise RuntimeError(
+                "bubblewrap is unavailable on PATH or in the pinned release"
+            )
         bwrap = Path(discovered).resolve(strict=True)
         bwrap_source = "system-discovered"
     if not bwrap.is_file():
@@ -719,7 +829,9 @@ def _prepare(args: argparse.Namespace) -> int:
     state_path = Path(args.state).resolve(strict=False)
     release_signal = Path(args.release_signal).resolve(strict=False)
     evidence = Path(args.evidence).resolve(strict=False)
-    temp_root = Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    temp_root = (
+        Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    )
     temp_root.mkdir(mode=0o700)
     # The sandbox uid must be able to traverse the whole disposable root to
     # reach the bound auth/codex-home; giving the root itself to the sandbox
@@ -838,7 +950,9 @@ def _prepare(args: argparse.Namespace) -> int:
         except BaseException as exc:
             cleanup_errors.append(f"cgroup kill: {type(exc).__name__}")
         try:
-            remaining = sorted(cgroup_processes(cgroup, expected_identity=cgroup_identity))
+            remaining = sorted(
+                cgroup_processes(cgroup, expected_identity=cgroup_identity)
+            )
             inventory_complete = True
         except BaseException as exc:
             remaining, inventory_complete = None, False
@@ -854,9 +968,15 @@ def _prepare(args: argparse.Namespace) -> int:
                 limits[name] = path.read_text(encoding="ascii").strip()
         except BaseException as exc:
             cleanup_errors.append(f"cgroup limit evidence: {type(exc).__name__}")
-        cgroup_evidence = {"limits": limits, "remaining_pids": remaining, "inventory_complete": inventory_complete,
-                           "cgroup_identity": list(cgroup_identity) if cgroup_identity is not None else None,
-                           "captured_utc": utc_now()}
+        cgroup_evidence = {
+            "limits": limits,
+            "remaining_pids": remaining,
+            "inventory_complete": inventory_complete,
+            "cgroup_identity": list(cgroup_identity)
+            if cgroup_identity is not None
+            else None,
+            "captured_utc": utc_now(),
+        }
         atomic_json(temp_root / "cgroup-evidence.json", cgroup_evidence)
         if network is not None:
             try:
@@ -880,13 +1000,17 @@ def _prepare(args: argparse.Namespace) -> int:
             except BaseException as exc:
                 cleanup_errors.append(f"credential/temp removal: {type(exc).__name__}")
         else:
-            cleanup_errors.append("credential/temp retained because process cleanup is unproven")
+            cleanup_errors.append(
+                "credential/temp retained because process cleanup is unproven"
+            )
         if cgroup_clean and cgroup_identity is not None:
             try:
                 metadata = cgroup.lstat()
                 if (metadata.st_dev, metadata.st_ino) != cgroup_identity:
                     raise RuntimeError("owned cgroup identity changed before removal")
-                for child in sorted(cgroup.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+                for child in sorted(
+                    cgroup.rglob("*"), key=lambda path: len(path.parts), reverse=True
+                ):
                     if child.is_dir():
                         child.rmdir()
                 cgroup.rmdir()
@@ -898,9 +1022,14 @@ def _prepare(args: argparse.Namespace) -> int:
         atomic_json(
             state_path,
             {
-                "schema": PREPARED_STATE_SCHEMA, "run_id": args.run_id,
-                "nonce": args.nonce, "invocation_id": args.invocation_id,
-                "cgroup": str(cgroup), "cgroup_identity": list(cgroup_identity) if cgroup_identity is not None else None,
+                "schema": PREPARED_STATE_SCHEMA,
+                "run_id": args.run_id,
+                "nonce": args.nonce,
+                "invocation_id": args.invocation_id,
+                "cgroup": str(cgroup),
+                "cgroup_identity": list(cgroup_identity)
+                if cgroup_identity is not None
+                else None,
                 "temp_root": str(temp_root),
                 **(ready_state or {}),
                 "status": "CLEANED" if cleanup_complete else "CLEANUP_UNPROVEN",
@@ -915,9 +1044,14 @@ def _prepare(args: argparse.Namespace) -> int:
                 else None,
             },
         )
-        atomic_json(evidence / "prepared-state.json", json.loads(state_path.read_text(encoding="utf-8")))
+        atomic_json(
+            evidence / "prepared-state.json",
+            json.loads(state_path.read_text(encoding="utf-8")),
+        )
         if cleanup_errors and failure is None:
-            failure = RuntimeError("prepared resources cleanup is unproven: " + "; ".join(cleanup_errors))
+            failure = RuntimeError(
+                "prepared resources cleanup is unproven: " + "; ".join(cleanup_errors)
+            )
     if failure is not None:
         raise failure
     return 0
@@ -937,8 +1071,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--auth-json", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--codex-root", required=True)
-    parser.add_argument("--system-mounts", required=True,
-                        help="Operator JSON: readonly_paths and forbidden_probe_paths (absolute Linux paths)")
+    parser.add_argument(
+        "--system-mounts",
+        required=True,
+        help="Operator JSON: readonly_paths and forbidden_probe_paths (absolute Linux paths)",
+    )
     parser.add_argument("--cgroup-launcher", required=True)
     parser.add_argument("--provider-entry", required=True)
     parser.add_argument("--wait-seconds", type=float, default=300.0)

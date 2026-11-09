@@ -29,17 +29,23 @@ class ActivityLogTests(unittest.TestCase):
 
             records = [
                 json.loads(line)
-                for line in monitor_log_path(runtime).read_text(encoding="utf-8").splitlines()
+                for line in monitor_log_path(runtime)
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             self.assertEqual(
                 ["manual", "pass.started", "pass.completed"],
                 [record["event"] for record in records],
             )
-            self.assertTrue(all(record["schema"] == "harness-activity/v1" for record in records))
+            self.assertTrue(
+                all(record["schema"] == "harness-activity/v1" for record in records)
+            )
 
             detailed = [
                 json.loads(line)
-                for line in detail_log_path(runtime).read_text(encoding="utf-8").splitlines()
+                for line in detail_log_path(runtime)
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             self.assertEqual(
                 ["manual", "pass.started", "pass.completed"],

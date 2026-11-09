@@ -14,7 +14,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import processes as p
-from orchestrator_harness.models import ProcessInfo, ProcessQuery, ProcessSnapshot, iso_utc
+from orchestrator_harness.models import (
+    ProcessInfo,
+    ProcessQuery,
+    ProcessSnapshot,
+    iso_utc,
+)
 
 CREATED = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 # Snapshot facts in the motivating regressions capture the old child
@@ -80,15 +85,23 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         native.start()
         self.addCleanup(native.stop)
         # The fake OS reports complete absence only for fixture PIDs known dead.
-        query = patch.object(p, "targeted_process_query", side_effect=lambda pid: ProcessQuery(not p.process_alive(pid), None))
+        query = patch.object(
+            p,
+            "targeted_process_query",
+            side_effect=lambda pid: ProcessQuery(not p.process_alive(pid), None),
+        )
         query.start()
         self.addCleanup(query.stop)
 
     def test_reused_child_pid_is_not_adopted_and_never_terminated(self) -> None:
         record = recorded_boundary()
         processes = snapshot(
-            ProcessInfo(22002, 90000, "unrelated.exe", "unrelated user process", CREATED),
-            ProcessInfo(33003, 22002, "unrelated-child.exe", "unrelated descendant", CREATED),
+            ProcessInfo(
+                22002, 90000, "unrelated.exe", "unrelated user process", CREATED
+            ),
+            ProcessInfo(
+                33003, 22002, "unrelated-child.exe", "unrelated descendant", CREATED
+            ),
         )
         identities = {22002: "2026-07-30T12:02:00Z", 33003: "2026-07-30T12:03:00Z"}
         terminate = MagicMock(return_value=True)
@@ -98,18 +111,23 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertTrue(boundary.observe())
             self.assertNotIn((22002, "2026-07-30T12:02:00Z"), boundary._owned)
             self.assertNotIn((33003, "2026-07-30T12:03:00Z"), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertEqual([], boundary._remaining())
             self.assertTrue(p.process_boundary_is_gone(record))
             self.assertTrue(boundary.cleanup())
             self.assertTrue(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         unrelated_terminations = [
             call
@@ -119,11 +137,15 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         ]
         self.assertEqual([], unrelated_terminations)
 
-    def test_exact_live_owned_child_still_anchors_its_legitimate_descendant(self) -> None:
+    def test_exact_live_owned_child_still_anchors_its_legitimate_descendant(
+        self,
+    ) -> None:
         record = recorded_boundary()
         processes = snapshot(
             ProcessInfo(22002, 90000, "child.exe", "owned child", CREATED),
-            ProcessInfo(33003, 22002, "descendant.exe", "legitimate descendant", CREATED),
+            ProcessInfo(
+                33003, 22002, "descendant.exe", "legitimate descendant", CREATED
+            ),
         )
         identities = {22002: "2026-07-30T12:00:00Z", 33003: iso_utc(CREATED)}
         with (
@@ -131,13 +153,16 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
             patch.object(p, "process_snapshot", return_value=processes),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertTrue(boundary.observe())
             self.assertIn((33003, iso_utc(CREATED)), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
             self.assertEqual(
-                {(22002, "2026-07-30T12:00:00Z"), (33003, iso_utc(CREATED))}, set(remaining)
+                {(22002, "2026-07-30T12:00:00Z"), (33003, iso_utc(CREATED))},
+                set(remaining),
             )
             self.assertFalse(p.process_boundary_is_gone(record))
 
@@ -150,7 +175,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         # adopted nor terminated.
         record = recorded_boundary()
         processes = snapshot(
-            ProcessInfo(22002, 90000, "child.exe", "owned child", SNAPSHOT_CHILD_CREATED),
+            ProcessInfo(
+                22002, 90000, "child.exe", "owned child", SNAPSHOT_CHILD_CREATED
+            ),
             ProcessInfo(
                 33003,
                 22002,
@@ -170,24 +197,28 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertNotIn((33003, iso_utc(REUSED_CHILD_CREATED)), boundary._owned)
             self.assertIn((22002, "2026-07-30T12:00:00Z"), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertEqual([(22002, "2026-07-30T12:00:00Z")], boundary._remaining())
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         reused_terminations = [
             call
             for call in terminate.call_args_list
-            if call.args[0] == 33003
-            or call.args[1] == iso_utc(REUSED_CHILD_CREATED)
+            if call.args[0] == 33003 or call.args[1] == iso_utc(REUSED_CHILD_CREATED)
         ]
         self.assertEqual([], reused_terminations)
 
@@ -229,22 +260,26 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertNotIn((22002, iso_utc(REUSED_CHILD_CREATED)), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         reused_terminations = [
             call
             for call in terminate.call_args_list
-            if call.args[0] == 22002
-            and call.args[1] == iso_utc(REUSED_CHILD_CREATED)
+            if call.args[0] == 22002 and call.args[1] == iso_utc(REUSED_CHILD_CREATED)
         ]
         self.assertEqual([], reused_terminations)
 
@@ -256,18 +291,28 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         )
         terminate = MagicMock(return_value=True)
         with (
-            patch.object(p, "process_identity", side_effect=fake_identity({11001: "2026-07-30T12:00:00Z"})),
-            patch.object(p, "process_alive", side_effect=lambda pid: pid in (11001, 22002)),
+            patch.object(
+                p,
+                "process_identity",
+                side_effect=fake_identity({11001: "2026-07-30T12:00:00Z"}),
+            ),
+            patch.object(
+                p, "process_alive", side_effect=lambda pid: pid in (11001, 22002)
+            ),
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertIsNone(boundary._remaining())
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         self.assertEqual([], terminate.call_args_list)
 
@@ -284,18 +329,23 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertNotIn((11001, "2026-07-30T12:01:00Z"), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             # Capture/cleanup still refuses the reused root. Read-only Windows
             # Job absence can separately prove every recorded incarnation gone.
             self.assertEqual(os.name == "nt", p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         self.assertEqual([], terminate.call_args_list)
 
@@ -314,7 +364,11 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             if pid == 22002:
                 # Sequential reads: old-child at admission, new-unrelated on any
                 # later probe (the child exits and its PID is reused mid-observe).
-                creation = "2026-07-30T12:00:00Z" if probe_counts[pid] == 1 else "2026-07-30T12:02:00Z"
+                creation = (
+                    "2026-07-30T12:00:00Z"
+                    if probe_counts[pid] == 1
+                    else "2026-07-30T12:02:00Z"
+                )
                 return {"pid": pid, "creation_time": creation}
             if pid == 33003:
                 return {"pid": pid, "creation_time": "2026-07-30T12:03:00Z"}
@@ -323,17 +377,22 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         terminate = MagicMock(return_value=True)
         with (
             patch.object(p, "process_identity", side_effect=identity),
-            patch.object(p, "process_alive", side_effect=lambda pid: pid in (22002, 33003)),
+            patch.object(
+                p, "process_alive", side_effect=lambda pid: pid in (22002, 33003)
+            ),
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertIn((22002, "2026-07-30T12:00:00Z"), boundary._owned)
             self.assertNotIn((22002, "2026-07-30T12:02:00Z"), boundary._owned)
             self.assertNotIn((33003, "2026-07-30T12:03:00Z"), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertTrue(p.process_boundary_is_gone(record))
             # The same instance keeps the drift error and fails closed on a
@@ -341,7 +400,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             # completes using only the recorded identities.
             self.assertFalse(boundary.cleanup())
             self.assertTrue(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         # Admission probe, descendant capture probe, then parent re-verification.
         self.assertEqual([22002, 33003, 22002], reads[:3])
@@ -381,17 +442,23 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "terminate_process", terminate),
         ):
             self.assertEqual(p._identity_time(token), LINUX_CHILD_CREATED)
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertTrue(boundary.observe())
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
-            self.assertEqual({(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining))
+            self.assertEqual(
+                {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
+            )
             self.assertFalse(p.process_boundary_is_gone(record))
             # Adoption itself never terminates anything.
             self.assertEqual([], terminate.call_args_list)
 
-    def test_linux_native_reused_start_ticks_rejected_and_never_terminated(self) -> None:
+    def test_linux_native_reused_start_ticks_rejected_and_never_terminated(
+        self,
+    ) -> None:
         # A reused Linux incarnation (different start_ticks) discovered
         # through the stale snapshot edge must fail closed and never be
         # adopted or terminated.
@@ -417,17 +484,22 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "_linux_clock_ticks", return_value=LINUX_CLOCK_TICKS),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertNotIn((33003, reused_token), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertEqual([(22002, "2026-07-30T12:00:00Z")], boundary._remaining())
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         reused_terminations = [
             call
@@ -436,7 +508,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         ]
         self.assertEqual([], reused_terminations)
 
-    def test_windows_native_filetime_conversion_matches_snapshot_precision(self) -> None:
+    def test_windows_native_filetime_conversion_matches_snapshot_precision(
+        self,
+    ) -> None:
         # Finding S2: the live FILETIME must floor to whole microseconds like
         # the CIM snapshot's .NET 'o' string truncation. Float division would
         # round ROOT-681's 134341817652159491 (and remainder >= 5
@@ -469,7 +543,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         record = recorded_boundary()
         token = f"windows-filetime:{WINDOWS_FILETIME}"
         processes = snapshot(
-            ProcessInfo(22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED),
+            ProcessInfo(
+                22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED
+            ),
             ProcessInfo(
                 33003,
                 22002,
@@ -486,12 +562,16 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertTrue(boundary.observe())
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
-            self.assertEqual({(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining))
+            self.assertEqual(
+                {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
+            )
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertEqual([], terminate.call_args_list)
 
@@ -501,7 +581,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         record = recorded_boundary()
         later_token = f"windows-filetime:{WINDOWS_FILETIME + 10}"
         processes = snapshot(
-            ProcessInfo(22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED),
+            ProcessInfo(
+                22002, 90000, "child.exe", "owned child", WINDOWS_NATIVE_CREATED
+            ),
             ProcessInfo(
                 33003,
                 22002,
@@ -518,16 +600,21 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "process_snapshot", return_value=processes),
             patch.object(p, "terminate_process", terminate),
         ):
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertFalse(boundary.observe())
             self.assertNotIn((33003, later_token), boundary._owned)
             self.assertEqual(
-                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")}, set(boundary._owned)
+                {(11001, "2026-07-30T12:00:00Z"), (22002, "2026-07-30T12:00:00Z")},
+                set(boundary._owned),
             )
             self.assertEqual([(22002, "2026-07-30T12:00:00Z")], boundary._remaining())
             self.assertFalse(boundary.cleanup())
             self.assertFalse(
-                p.cleanup_recorded_process_boundary(record, force=False, timeout_seconds=1.0)
+                p.cleanup_recorded_process_boundary(
+                    record, force=False, timeout_seconds=1.0
+                )
             )
         reused_terminations = [
             call
@@ -542,7 +629,9 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
         record = recorded_boundary()
         token = f"darwin-start-time:{DARWIN_SECONDS}:{DARWIN_MICROSECONDS}"
         processes = snapshot(
-            ProcessInfo(22002, 90000, "child.exe", "owned child", DARWIN_NATIVE_CREATED),
+            ProcessInfo(
+                22002, 90000, "child.exe", "owned child", DARWIN_NATIVE_CREATED
+            ),
             ProcessInfo(
                 33003,
                 22002,
@@ -560,12 +649,16 @@ class RecordedBoundaryIdentityTests(unittest.TestCase):
             patch.object(p, "terminate_process", terminate),
         ):
             self.assertEqual(p._identity_time(token), DARWIN_NATIVE_CREATED)
-            boundary = p.ProcessBoundary.from_record(record, snapshot_provider=lambda: processes)
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes
+            )
             self.assertTrue(boundary.observe())
             self.assertIn((33003, token), boundary._owned)
             remaining = boundary._remaining()
             self.assertIsNotNone(remaining)
-            self.assertEqual({(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining))
+            self.assertEqual(
+                {(22002, "2026-07-30T12:00:00Z"), (33003, token)}, set(remaining)
+            )
             self.assertFalse(p.process_boundary_is_gone(record))
             self.assertEqual([], terminate.call_args_list)
         self.assertIsNone(p._identity_time("darwin-start-time:abc:def"))

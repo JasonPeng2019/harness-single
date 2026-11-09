@@ -1,4 +1,5 @@
 """Harness combined automatic/manual retry boundary regressions."""
+
 import json
 import hashlib
 import os
@@ -10,7 +11,10 @@ from unittest.mock import patch
 
 from orchestrator_harness import controller, resume
 from orchestrator_harness import retry_policy as policy
-from orchestrator_harness.retry_policy import completed_provider_invocations, WORKER_RETRY_LIMIT
+from orchestrator_harness.retry_policy import (
+    completed_provider_invocations,
+    WORKER_RETRY_LIMIT,
+)
 
 
 class RetryPolicyTests(unittest.TestCase):
@@ -22,37 +26,65 @@ class RetryPolicyTests(unittest.TestCase):
         self.workspace.mkdir()
         self.path = self.workspace / "controller.attempts.jsonl"
         self.lane = {
-            "lane_id": "lane", "run_id": "run-new", "lifecycle": "review_pending",
-            "worktree_path": str(self.root), "attempts_path": str(self.path),
+            "lane_id": "lane",
+            "run_id": "run-new",
+            "lifecycle": "review_pending",
+            "worktree_path": str(self.root),
+            "attempts_path": str(self.path),
             "controller_status_path": str(self.workspace / "controller.status.json"),
             "controller_events_path": str(self.workspace / "controller.events.jsonl"),
-            "provider": {"id": "codex"}, "session": {}, "process": {},
+            "provider": {"id": "codex"},
+            "session": {},
+            "process": {},
         }
         self.protected = policy.initialize_history(self.root, self.lane)
 
     def history(self, *rows):
-        facts = [{"schema": "worker-provider-history/v1", "lane_id": "lane",
-                  "worktree": os.path.normcase(str(self.root.resolve())), "provider": {"id": "codex"}}]
+        facts = [
+            {
+                "schema": "worker-provider-history/v1",
+                "lane_id": "lane",
+                "worktree": os.path.normcase(str(self.root.resolve())),
+                "provider": {"id": "codex"},
+            }
+        ]
         seen = set()
         for row in rows:
             if "run_id" not in row:
                 continue
-            token = hashlib.sha256((row["run_id"] + str(row["attempt"])).encode()).hexdigest()[:32]
-            identity = {"invocation_id": token, "run_id": row["run_id"], "attempt": row["attempt"]}
+            token = hashlib.sha256(
+                (row["run_id"] + str(row["attempt"])).encode()
+            ).hexdigest()[:32]
+            identity = {
+                "invocation_id": token,
+                "run_id": row["run_id"],
+                "attempt": row["attempt"],
+            }
             if token not in seen:
                 facts.append({**identity, "kind": "RESERVED"})
                 seen.add(token)
-            facts.append({**identity, "kind": "COMPLETED" if row["provider_started"] else "NO_PROVIDER",
-                          "provider_started": row["provider_started"], "cleanup_proven": True,
-                          "session_id": "native"})
-        self.protected.write_text("\n".join(json.dumps(row) for row in facts) + "\n", encoding="utf-8")
+            facts.append(
+                {
+                    **identity,
+                    "kind": "COMPLETED" if row["provider_started"] else "NO_PROVIDER",
+                    "provider_started": row["provider_started"],
+                    "cleanup_proven": True,
+                    "session_id": "native",
+                }
+            )
+        self.protected.write_text(
+            "\n".join(json.dumps(row) for row in facts) + "\n", encoding="utf-8"
+        )
 
     def launch(self, run, attempt):
         return {"run_id": run, "attempt": attempt, "provider_started": True}
 
     def test_initial_lane_and_pre_provider_failures_cost_zero(self):
         self.assertEqual(0, completed_provider_invocations(self.lane))
-        self.history({"schema": "controller-attempts/v1"}, {"run_id": "old", "attempt": 1, "provider_started": False})
+        self.history(
+            {"schema": "controller-attempts/v1"},
+            {"run_id": "old", "attempt": 1, "provider_started": False},
+        )
         self.assertEqual(0, completed_provider_invocations(self.lane))
 
     def test_auto_correction_and_manual_run_id_reset_share_budget(self):
@@ -83,7 +115,11 @@ class RetryPolicyTests(unittest.TestCase):
         original = self.protected.read_bytes()
         with (
             patch.object(resume, "find_harness_root", return_value=self.root),
-            patch.object(resume, "load_config", return_value=SimpleNamespace(runtime_root=self.root)),
+            patch.object(
+                resume,
+                "load_config",
+                return_value=SimpleNamespace(runtime_root=self.root),
+            ),
             patch.object(resume, "find_active_lane", return_value=("epoch", self.lane)),
             patch.object(resume, "_has_valid_acceptance_chain", return_value=False),
             patch.object(resume, "_live_controller", return_value=False),
@@ -104,8 +140,14 @@ class RetryPolicyTests(unittest.TestCase):
 
     def test_proven_no_provider_failure_does_not_spend_budget(self):
         token = policy.reserve_invocation(self.root, self.lane)
-        policy.record_outcome(self.root, self.lane, token, provider_started=False,
-                              cleanup_proven=True, session_id=None)
+        policy.record_outcome(
+            self.root,
+            self.lane,
+            token,
+            provider_started=False,
+            cleanup_proven=True,
+            session_id=None,
+        )
         self.assertEqual(0, completed_provider_invocations(self.lane))
         policy.reserve_invocation(self.root, self.lane)
 
@@ -114,8 +156,14 @@ class RetryPolicyTests(unittest.TestCase):
         policy.record_started(self.root, self.lane, token)
         before = self.protected.read_bytes()
         with self.assertRaises(ValueError):
-            policy.record_outcome(self.root, self.lane, token, provider_started=False,
-                                  cleanup_proven=True, session_id=None)
+            policy.record_outcome(
+                self.root,
+                self.lane,
+                token,
+                provider_started=False,
+                cleanup_proven=True,
+                session_id=None,
+            )
         self.assertEqual(before, self.protected.read_bytes())
 
     def test_one_manual_same_session_retry_then_third_rejected(self):
@@ -123,17 +171,26 @@ class RetryPolicyTests(unittest.TestCase):
             self.lane["run_id"] = run
             token = policy.reserve_invocation(self.root, self.lane)
             policy.record_started(self.root, self.lane, token)
-            policy.record_outcome(self.root, self.lane, token, provider_started=True,
-                                  cleanup_proven=True, session_id="native")
+            policy.record_outcome(
+                self.root,
+                self.lane,
+                token,
+                provider_started=True,
+                cleanup_proven=True,
+                session_id="native",
+            )
             self.lane["session"] = {"session_id": "native"}
         self.assertEqual(2, completed_provider_invocations(self.lane))
         self.lane["run_id"] = "third"
         with self.assertRaisesRegex(ValueError, "exhausted"):
             policy.reserve_invocation(self.root, self.lane)
 
-    def test_explicit_profile_transition_starts_fresh_session_without_refunding_retry(self):
+    def test_explicit_profile_transition_starts_fresh_session_without_refunding_retry(
+        self,
+    ):
         old_provider = {
-            "id": "codex", "model": "old-model",
+            "id": "codex",
+            "model": "old-model",
             "launch_config": {"reasoning_effort": "high", "service_tier": "default"},
         }
         self.lane["provider"] = old_provider
@@ -143,22 +200,43 @@ class RetryPolicyTests(unittest.TestCase):
         self.lane.pop("provider_history_path")
         self.protected = policy.initialize_history(self.root, self.lane)
         token = policy.reserve_invocation(self.root, self.lane)
-        policy.record_outcome(self.root, self.lane, token, provider_started=True,
-                              cleanup_proven=True, session_id="old-session")
+        policy.record_outcome(
+            self.root,
+            self.lane,
+            token,
+            provider_started=True,
+            cleanup_proven=True,
+            session_id="old-session",
+        )
         self.lane["session"] = {"session_id": "old-session"}
         new_provider = {
-            "id": "codex", "model": "new-model",
+            "id": "codex",
+            "model": "new-model",
             "launch_config": {"reasoning_effort": "xhigh", "service_tier": "priority"},
         }
         policy.record_profile_transition(
-            self.root, self.lane, new_run_id="fresh-run", new_provider=new_provider,
+            self.root,
+            self.lane,
+            new_run_id="fresh-run",
+            new_provider=new_provider,
             rationale="continue the retained dirty work with a replacement model",
         )
-        migrated = {**self.lane, "run_id": "fresh-run", "provider": new_provider, "session": {}}
+        migrated = {
+            **self.lane,
+            "run_id": "fresh-run",
+            "provider": new_provider,
+            "session": {},
+        }
         self.assertEqual(1, completed_provider_invocations(migrated))
         token = policy.reserve_invocation(self.root, migrated)
-        policy.record_outcome(self.root, migrated, token, provider_started=True,
-                              cleanup_proven=True, session_id="new-session")
+        policy.record_outcome(
+            self.root,
+            migrated,
+            token,
+            provider_started=True,
+            cleanup_proven=True,
+            session_id="new-session",
+        )
         migrated["session"] = {"session_id": "new-session"}
         self.assertEqual(2, completed_provider_invocations(migrated))
         with self.assertRaisesRegex(ValueError, "exhausted"):
@@ -166,8 +244,14 @@ class RetryPolicyTests(unittest.TestCase):
 
     def test_duplicate_launch_same_run_and_changed_native_session_rejected(self):
         token = policy.reserve_invocation(self.root, self.lane)
-        policy.record_outcome(self.root, self.lane, token, provider_started=True,
-                              cleanup_proven=True, session_id="native")
+        policy.record_outcome(
+            self.root,
+            self.lane,
+            token,
+            provider_started=True,
+            cleanup_proven=True,
+            session_id="native",
+        )
         self.lane["session"] = {"session_id": "native"}
         with self.assertRaisesRegex(ValueError, "already invoked"):
             policy.reserve_invocation(self.root, self.lane)
@@ -183,25 +267,47 @@ class RetryPolicyTests(unittest.TestCase):
 
     def test_concurrent_reservations_allow_only_one_start(self):
         from concurrent.futures import ThreadPoolExecutor
+
         def reserve():
             try:
                 return policy.reserve_invocation(self.root, self.lane)
             except ValueError:
                 return None
+
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: reserve(), range(2)))
         self.assertEqual(1, sum(result is not None for result in results))
 
     def test_controller_cannot_launch_a_third_provider(self):
         from orchestrator_harness import lane_authority
+
         self.lane["prompt_path"] = str(self.workspace / "worker-prompt.md")
         self.history(self.launch("old", 1), self.launch("old", 2))
         with (
             patch.object(controller, "find_harness_root", return_value=self.root),
-            patch.object(controller, "load_config", return_value=SimpleNamespace(runtime_root=self.root)),
-            patch.object(controller, "find_active_lane", return_value=("epoch", self.lane)),
-            patch.object(lane_authority, "read_invocation", return_value={"lane_id": "lane", "run_id": "run-new", "provider": {"id": "codex"}, "exclusive_resources": []}),
-            patch.object(controller.processes, "process_identity", return_value={"pid": 7, "creation_time": "controller"}),
+            patch.object(
+                controller,
+                "load_config",
+                return_value=SimpleNamespace(runtime_root=self.root),
+            ),
+            patch.object(
+                controller, "find_active_lane", return_value=("epoch", self.lane)
+            ),
+            patch.object(
+                lane_authority,
+                "read_invocation",
+                return_value={
+                    "lane_id": "lane",
+                    "run_id": "run-new",
+                    "provider": {"id": "codex"},
+                    "exclusive_resources": [],
+                },
+            ),
+            patch.object(
+                controller.processes,
+                "process_identity",
+                return_value={"pid": 7, "creation_time": "controller"},
+            ),
             patch.object(controller, "_write_status") as status,
             patch.object(controller, "_append_event"),
             patch.object(controller, "update_lane", return_value=self.lane),

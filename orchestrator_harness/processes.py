@@ -47,8 +47,12 @@ BOUNDARY_WAIT_SECONDS = 5.0
 
 
 def _valid_pid(pid: object) -> bool:
-    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-            and (os.name != "nt" or pid <= 0xFFFFFFFF))
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and (os.name != "nt" or pid <= 0xFFFFFFFF)
+    )
 
 
 def process_identity(pid: int) -> dict[str, Any] | None:
@@ -67,7 +71,11 @@ def process_identity(pid: int) -> dict[str, Any] | None:
 
 
 def _linux_boot_id() -> str:
-    value = (procfs_root() / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    value = (
+        (procfs_root() / "sys/kernel/random/boot_id")
+        .read_text(encoding="ascii")
+        .strip()
+    )
     if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) is None:
         raise ValueError("Linux boot identity is unavailable")
     return value
@@ -75,7 +83,8 @@ def _linux_boot_id() -> str:
 
 def _linux_scoped_identity(value: str) -> tuple[str, int] | None:
     match = re.fullmatch(
-        r"linux-boot:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}):(0|[1-9][0-9]{0,19})", value
+        r"linux-boot:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}):(0|[1-9][0-9]{0,19})",
+        value,
     )
     if match is None or int(match[2]) >= 2**64:
         return None
@@ -86,9 +95,14 @@ def _linux_process_stat(pid: int) -> tuple[str, int]:
     """Read state and start ticks from the same validated native object."""
     text = (procfs_root() / str(pid) / "stat").read_text(encoding="ascii")
     opening, closing = text.find("("), text.rfind(")")
-    fields = text[closing + 1:].split()
-    if (opening < 0 or closing <= opening or int(text[:opening].strip()) != pid
-            or len(fields) <= 19 or len(fields[0]) != 1):
+    fields = text[closing + 1 :].split()
+    if (
+        opening < 0
+        or closing <= opening
+        or int(text[:opening].strip()) != pid
+        or len(fields) <= 19
+        or len(fields[0]) != 1
+    ):
         raise ValueError("process stat record is incomplete or belongs to another PID")
     ticks = int(fields[19])
     if ticks < 0:
@@ -110,9 +124,16 @@ def process_alive(pid: int) -> bool:
             import ctypes
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+            kernel32.OpenProcess.argtypes = (
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            )
             kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+            kernel32.GetExitCodeProcess.argtypes = (
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            )
             kernel32.GetExitCodeProcess.restype = ctypes.c_int
             kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
             kernel32.CloseHandle.restype = ctypes.c_int
@@ -121,7 +142,10 @@ def process_alive(pid: int) -> bool:
                 return False
             try:
                 exit_code = ctypes.c_uint32()
-                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+                return (
+                    bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+                    and exit_code.value == 259
+                )
             finally:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
@@ -150,7 +174,9 @@ def identity_matches(pid: int, creation_time: str | None) -> bool:
 
     if not _valid_pid(pid) or not creation_time:
         return False
-    if sys.platform.startswith("linux") and creation_time.startswith("linux-start-ticks:"):
+    if sys.platform.startswith("linux") and creation_time.startswith(
+        "linux-start-ticks:"
+    ):
         return False  # Legacy saved ticks carry no boot identity or signal authority.
     if not process_alive(pid):
         return False
@@ -184,6 +210,7 @@ def _windows_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
         return None
     try:
         import ctypes
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
         kernel32.OpenProcess.restype = ctypes.c_void_p
@@ -201,8 +228,13 @@ def _windows_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
             return True if ctypes.get_last_error() == 87 else None
         try:
             creation, exited, kernel, user = (ctypes.c_ulonglong() for _ in range(4))
-            if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exited),
-                                           ctypes.byref(kernel), ctypes.byref(user)):
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
                 return None
             if f"windows-filetime:{creation.value}" != creation_time:
                 return True
@@ -255,13 +287,18 @@ def identity_exit_proven(pid: int, creation_time: str) -> bool:
         if not valid_creation_identity(observed):
             return False
         same = observed == creation_time
-        if sys.platform.startswith("linux") and creation_time.startswith("linux-start-ticks:"):
+        if sys.platform.startswith("linux") and creation_time.startswith(
+            "linux-start-ticks:"
+        ):
             scoped = _linux_scoped_identity(observed)
             if scoped is None:
                 return False
             same = scoped[1] == int(creation_time.split(":")[1])
         if parse_utc(creation_time) is not None:
-            expected_time, observed_time = _identity_time(creation_time), _identity_time(observed)
+            expected_time, observed_time = (
+                _identity_time(creation_time),
+                _identity_time(observed),
+            )
             if observed_time is None:
                 return False
             same = observed_time == expected_time
@@ -282,7 +319,11 @@ def identity_exit_proven(pid: int, creation_time: str) -> bool:
     # proves reuse. CIM truncates native 100 ns times to microseconds, as does
     # _identity_time; one more microsecond covers a rounding provider.
     observed, recorded = query.process.created_utc, _identity_time(creation_time)
-    return observed is not None and recorded is not None and observed - recorded > timedelta(microseconds=1)
+    return (
+        observed is not None
+        and recorded is not None
+        and observed - recorded > timedelta(microseconds=1)
+    )
 
 
 def terminate_process(
@@ -301,14 +342,22 @@ def terminate_process(
 
     if identity_exit_proven(pid, creation_time):
         return True
-    if not _valid_pid(pid) or not valid_creation_identity(creation_time) or not identity_matches(pid, creation_time):
+    if (
+        not _valid_pid(pid)
+        or not valid_creation_identity(creation_time)
+        or not identity_matches(pid, creation_time)
+    ):
         return False
     if os.name == "nt":
         try:
             import ctypes
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+            kernel32.OpenProcess.argtypes = (
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            )
             kernel32.OpenProcess.restype = ctypes.c_void_p
             kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
             kernel32.TerminateProcess.restype = ctypes.c_int
@@ -323,8 +372,16 @@ def terminate_process(
             if not handle:
                 return False
             try:
-                creation, exit_time, kernel, user = (ctypes.c_ulonglong() for _ in range(4))
-                if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel), ctypes.byref(user)):
+                creation, exit_time, kernel, user = (
+                    ctypes.c_ulonglong() for _ in range(4)
+                )
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
                     return False
                 observed = f"windows-filetime:{creation.value}"
                 if observed != creation_time and not (
@@ -334,7 +391,12 @@ def terminate_process(
                     return False
                 if not kernel32.TerminateProcess(handle, 1):
                     return False
-                return kernel32.WaitForSingleObject(handle, max(0, int(timeout_seconds * 1000))) == 0
+                return (
+                    kernel32.WaitForSingleObject(
+                        handle, max(0, int(timeout_seconds * 1000))
+                    )
+                    == 0
+                )
             finally:
                 kernel32.CloseHandle(handle)
         except (AttributeError, OSError):
@@ -346,7 +408,9 @@ def terminate_process(
                 try:
                     if not identity_matches(pid, creation_time):
                         return identity_exit_proven(pid, creation_time)
-                    signal.pidfd_send_signal(descriptor, signal.SIGKILL if force else signal.SIGTERM)
+                    signal.pidfd_send_signal(
+                        descriptor, signal.SIGKILL if force else signal.SIGTERM
+                    )
                 finally:
                     os.close(descriptor)
             else:
@@ -355,10 +419,14 @@ def terminate_process(
             return identity_exit_proven(pid, creation_time)
         except OSError:
             return False
-    return wait_for_exit(pid, timeout_seconds=timeout_seconds, creation_time=creation_time)
+    return wait_for_exit(
+        pid, timeout_seconds=timeout_seconds, creation_time=creation_time
+    )
 
 
-def reap_created_process(child: Any, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
+def reap_created_process(
+    child: Any, timeout_seconds: float = BOUNDARY_WAIT_SECONDS
+) -> bool:
     """Reap a child through its original handle after failed registration.
 
     This cannot adopt a numeric PID or an unrelated persisted process. Callers
@@ -377,7 +445,12 @@ def reap_created_process(child: Any, timeout_seconds: float = BOUNDARY_WAIT_SECO
         return False
 
 
-def wait_for_exit(pid: int, timeout_seconds: float = BOUNDARY_WAIT_SECONDS, *, creation_time: str | None = None) -> bool:
+def wait_for_exit(
+    pid: int,
+    timeout_seconds: float = BOUNDARY_WAIT_SECONDS,
+    *,
+    creation_time: str | None = None,
+) -> bool:
     """Poll for proven exit of one recorded incarnation."""
 
     if creation_time is None:
@@ -577,7 +650,9 @@ class _WindowsSuspendedProcess:
         import _winapi
 
         if self.poll() is None:
-            milliseconds = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+            milliseconds = (
+                0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+            )
             result = _winapi.WaitForSingleObject(self._handle, milliseconds)
             if result == 0x102:  # WAIT_TIMEOUT
                 raise subprocess.TimeoutExpired(self.args, timeout)
@@ -722,7 +797,9 @@ def _spawn_windows_suspended(
         kernel32.CreateProcessW.restype = wintypes.BOOL
 
         attribute_size = ctypes.c_size_t()
-        kernel32.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(attribute_size))
+        kernel32.InitializeProcThreadAttributeList(
+            None, 2, 0, ctypes.byref(attribute_size)
+        )
         if not attribute_size.value:
             raise ctypes.WinError(ctypes.get_last_error())
         attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
@@ -730,7 +807,11 @@ def _spawn_windows_suspended(
         startupinfo = StartupInfoEx()
         startupinfo.startup_info.cb = ctypes.sizeof(StartupInfoEx)
         startupinfo.startup_info.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
-        startupinfo.startup_info.hStdInput, startupinfo.startup_info.hStdOutput, startupinfo.startup_info.hStdError = handles
+        (
+            startupinfo.startup_info.hStdInput,
+            startupinfo.startup_info.hStdOutput,
+            startupinfo.startup_info.hStdError,
+        ) = handles
         startupinfo.attribute_list = attribute_list
         if not kernel32.InitializeProcThreadAttributeList(
             attribute_list, 2, 0, ctypes.byref(attribute_size)
@@ -762,11 +843,23 @@ def _spawn_windows_suspended(
         command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(list(argv)))
         environment_block = None
         if env is not None:
-            if any(not isinstance(key, str) or not isinstance(value, str) or "\0" in key + value
-                   or not key or "=" in key for key, value in env.items()):
+            if any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or "\0" in key + value
+                or not key
+                or "=" in key
+                for key, value in env.items()
+            ):
                 raise ValueError("child environment contains an invalid name/value")
             environment_block = ctypes.create_unicode_buffer(
-                "\0".join(f"{key}={value}" for key, value in sorted(env.items(), key=lambda pair: pair[0].upper())) + "\0\0"
+                "\0".join(
+                    f"{key}={value}"
+                    for key, value in sorted(
+                        env.items(), key=lambda pair: pair[0].upper()
+                    )
+                )
+                + "\0\0"
             )
         process_info = ProcessInformation()
         if not kernel32.CreateProcessW(
@@ -779,7 +872,9 @@ def _spawn_windows_suspended(
             | WINDOWS_CREATE_SUSPENDED
             | WINDOWS_EXTENDED_STARTUPINFO_PRESENT
             | (0x00000400 if env is not None else 0),  # CREATE_UNICODE_ENVIRONMENT
-            ctypes.cast(environment_block, ctypes.c_void_p) if environment_block is not None else None,
+            ctypes.cast(environment_block, ctypes.c_void_p)
+            if environment_block is not None
+            else None,
             str(cwd) if cwd is not None else None,
             ctypes.byref(startupinfo),
             ctypes.byref(process_info),
@@ -814,13 +909,22 @@ def _spawn_windows_suspended(
         if process_handle is not None:
             _close_windows_handle(process_handle)
         _close_windows_handle(job_handle)
-        raise ProviderSpawnError(str(native_error), no_provider_created=process_handle is None) from native_error
-    if result is None or job_handle is None or process_handle is None or thread_handle is None:
+        raise ProviderSpawnError(
+            str(native_error), no_provider_created=process_handle is None
+        ) from native_error
+    if (
+        result is None
+        or job_handle is None
+        or process_handle is None
+        or thread_handle is None
+    ):
         _close_windows_handle(job_handle)
         _close_windows_handle(process_handle)
         _close_windows_handle(thread_handle)
-        raise ProviderSpawnError("Windows provider creation returned incomplete process handles",
-                                 no_provider_created=process_handle is None)
+        raise ProviderSpawnError(
+            "Windows provider creation returned incomplete process handles",
+            no_provider_created=process_handle is None,
+        )
     return result
 
 
@@ -854,8 +958,15 @@ def spawn_provider(
         )
     try:
         return subprocess.Popen(
-            list(argv), cwd=str(cwd), stdin=stdin, stdout=stdout, stderr=stderr,
-            text=True, encoding="utf-8", errors="replace", creationflags=0,
+            list(argv),
+            cwd=str(cwd),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=0,
             start_new_session=True,
             **({"env": env} if env is not None else {}),
         )
@@ -910,7 +1021,12 @@ def windows_process_snapshot(
 
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
     if powershell is None:
-        return ProcessSnapshot(False, (), ("PowerShell executable is not discoverable on PATH",), "windows-cim")
+        return ProcessSnapshot(
+            False,
+            (),
+            ("PowerShell executable is not discoverable on PATH",),
+            "windows-cim",
+        )
     argv = [
         powershell,
         "-NoProfile",
@@ -932,7 +1048,9 @@ def windows_process_snapshot(
             creationflags=WINDOWS_CREATE_NO_WINDOW,
         )
     except Exception as exc:
-        return ProcessSnapshot(False, (), (f"CIM invocation failed: {exc}",), "windows-cim")
+        return ProcessSnapshot(
+            False, (), (f"CIM invocation failed: {exc}",), "windows-cim"
+        )
     if completed.returncode != 0:
         return ProcessSnapshot(
             False,
@@ -970,7 +1088,9 @@ def windows_process_snapshot(
             "windows-cim",
         )
     except Exception as exc:
-        return ProcessSnapshot(False, (), (f"invalid CIM output: {exc}",), "windows-cim")
+        return ProcessSnapshot(
+            False, (), (f"invalid CIM output: {exc}",), "windows-cim"
+        )
 
 
 def windows_process_query(
@@ -985,7 +1105,9 @@ def windows_process_query(
         return ProcessQuery(True, None, ("PID is invalid",))
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
     if powershell is None:
-        return ProcessQuery(False, None, ("PowerShell executable is not discoverable on PATH",))
+        return ProcessQuery(
+            False, None, ("PowerShell executable is not discoverable on PATH",)
+        )
     argv = [
         powershell,
         "-NoProfile",
@@ -1012,7 +1134,9 @@ def windows_process_query(
         return ProcessQuery(
             False,
             None,
-            (f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",),
+            (
+                f"CIM identity query returned {completed.returncode}: {completed.stderr.strip()}",
+            ),
         )
     try:
         raw = json.loads(completed.stdout.lstrip("\ufeff") or "[]")
@@ -1125,9 +1249,7 @@ def _darwin_process_query(pid: int) -> ProcessQuery:
             created_utc=cast(datetime, info["created_utc"]),
             process_group_id=int(info["pgid"]) if info.get("pgid") else None,
             session_id=(
-                int(info["session_id"])
-                if info.get("session_id") is not None
-                else None
+                int(info["session_id"]) if info.get("session_id") is not None else None
             ),
         ),
     )
@@ -1148,7 +1270,10 @@ def targeted_process_query(
         query = _linux_process_query(pid)
     else:
         return ProcessQuery(False, None, ("unsupported process platform",))
-    if expected_parent_pid is not None and query.parent_matches(expected_parent_pid) is False:
+    if (
+        expected_parent_pid is not None
+        and query.parent_matches(expected_parent_pid) is False
+    ):
         return ProcessQuery(
             query.complete,
             query.process,
@@ -1167,7 +1292,9 @@ def linux_process_snapshot() -> ProcessSnapshot:
         ticks = _linux_clock_ticks()
         entries = list(procfs_root().iterdir())
     except Exception as exc:
-        return ProcessSnapshot(False, (), (f"process filesystem setup failed: {exc}",), "linux-proc")
+        return ProcessSnapshot(
+            False, (), (f"process filesystem setup failed: {exc}",), "linux-proc"
+        )
     for entry in entries:
         if not entry.name.isdigit():
             continue
@@ -1191,7 +1318,9 @@ def darwin_process_snapshot() -> ProcessSnapshot:
 
     pids = darwin_process_ids()
     if pids is None:
-        return ProcessSnapshot(False, (), ("libproc process inventory is unavailable",), "darwin-libproc")
+        return ProcessSnapshot(
+            False, (), ("libproc process inventory is unavailable",), "darwin-libproc"
+        )
     errors: list[str] = []
     processes: list[ProcessInfo] = []
     for pid in pids:
@@ -1332,7 +1461,11 @@ class ProcessBoundary:
             self.errors.append("provider root PID is invalid")
         if not isinstance(root_creation_time, str) or not root_creation_time:
             self.errors.append("provider root creation identity is unavailable")
-        if _valid_pid(root_pid) and isinstance(root_creation_time, str) and root_creation_time:
+        if (
+            _valid_pid(root_pid)
+            and isinstance(root_creation_time, str)
+            and root_creation_time
+        ):
             self._owned[_identity_key(root_pid, root_creation_time)] = root_process
         self._job_handle: Any = windows_job_handle
         self._job_cleanup_proven = False
@@ -1548,7 +1681,9 @@ class ProcessBoundary:
         if root is not None:
             root_identity = self._snapshot_identity(root)
             if root_identity != self.root_creation_time:
-                self.errors.append(f"root PID {self.root_pid} creation identity was reused")
+                self.errors.append(
+                    f"root PID {self.root_pid} creation identity was reused"
+                )
                 self._last_observation_complete = False
                 return False
             if self.process_group_id is None:
@@ -1563,9 +1698,7 @@ class ProcessBoundary:
             in_boundary = (
                 self.process_group_id is not None
                 and item.process_group_id == self.process_group_id
-            ) or (
-                self.session_id is not None and item.session_id == self.session_id
-            )
+            ) or (self.session_id is not None and item.session_id == self.session_id)
             if not in_boundary and item.pid not in known_pids:
                 continue
             creation = self._snapshot_identity(item)
@@ -1578,7 +1711,9 @@ class ProcessBoundary:
                     # A saved group/session number can be reused after its
                     # original members exit. Without the original root, retain
                     # exact known members and refuse new containment-only claims.
-                    self.errors.append(f"PID {item.pid} containment owner is no longer observable")
+                    self.errors.append(
+                        f"PID {item.pid} containment owner is no longer observable"
+                    )
                     continue
                 # Membership would rest on a snapshot containment fact alone;
                 # the snapshot incarnation must be the live incarnation.
@@ -1652,12 +1787,16 @@ class ProcessBoundary:
         for pid, creation in self._owned:
             if identity_exit_proven(pid, creation):
                 continue
-            if not valid_creation_identity(creation) or not identity_matches(pid, creation):
+            if not valid_creation_identity(creation) or not identity_matches(
+                pid, creation
+            ):
                 return None
             remaining.append((pid, creation))
         return remaining
 
-    def cleanup(self, *, force: bool = False, timeout_seconds: float = BOUNDARY_WAIT_SECONDS) -> bool:
+    def cleanup(
+        self, *, force: bool = False, timeout_seconds: float = BOUNDARY_WAIT_SECONDS
+    ) -> bool:
         """Terminate every recorded/contained member and prove the boundary gone."""
 
         if self._job_cleanup_proven:
@@ -1676,13 +1815,20 @@ class ProcessBoundary:
                 if not self._observe_job():
                     return False
                 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+                kernel32.TerminateJobObject.argtypes = (
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                )
                 kernel32.TerminateJobObject.restype = ctypes.c_int
                 if not kernel32.TerminateJobObject(self._job_handle, 1):
-                    self.errors.append(f"TerminateJobObject failed with native error {ctypes.get_last_error()}")
+                    self.errors.append(
+                        f"TerminateJobObject failed with native error {ctypes.get_last_error()}"
+                    )
                     return False
                 if not self._wait_job_empty(timeout_seconds):
-                    self.errors.append("Windows Job empty-membership proof is unavailable")
+                    self.errors.append(
+                        "Windows Job empty-membership proof is unavailable"
+                    )
                     return False
                 cleanup_proven = True
             except (AttributeError, OSError, ValueError) as exc:
@@ -1696,7 +1842,9 @@ class ProcessBoundary:
                 return False
             exact = self._wait_exact_members(timeout_seconds)
             if not exact:
-                self.errors.append("Windows Job recorded-member exit proof is unavailable")
+                self.errors.append(
+                    "Windows Job recorded-member exit proof is unavailable"
+                )
             self._job_cleanup_proven = exact
             return exact
 
@@ -1774,7 +1922,9 @@ def cleanup_recorded_process_boundary(
     )
 
 
-def process_boundary_is_gone(record: dict[str, Any], *, timeout_seconds: float = 0.0) -> bool:
+def process_boundary_is_gone(
+    record: dict[str, Any], *, timeout_seconds: float = 0.0
+) -> bool:
     """Prove a serialized boundary is absent without terminating anything."""
 
     boundary = ProcessBoundary.from_record(record)

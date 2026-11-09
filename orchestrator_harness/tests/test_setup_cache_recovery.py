@@ -55,33 +55,63 @@ class SetupCacheRecoveryTests(unittest.TestCase):
     def _manifest(root: Path) -> dict:
         entries = list(root.rglob("*"))
         return {
-            "directories": sorted(path.relative_to(root).as_posix() for path in entries if path.is_dir()),
+            "directories": sorted(
+                path.relative_to(root).as_posix() for path in entries if path.is_dir()
+            ),
             "files": {
-                path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in entries if path.is_file()
+                path.relative_to(root).as_posix(): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in entries
+                if path.is_file()
             },
         }
 
-    def _record_transaction(self, stage: Path, *, previous: dict | None = None, target: dict | None = None) -> None:
+    def _record_transaction(
+        self, stage: Path, *, previous: dict | None = None, target: dict | None = None
+    ) -> None:
         # These fixture trees were genuinely created by this test. Capture
         # their original native births before any interrupted-copy/rename fault.
-        root_state = setup.TargetState(True, "directory", (self.runtime.stat().st_dev, self.runtime.stat().st_ino), None, None)
+        root_state = setup.TargetState(
+            True,
+            "directory",
+            (self.runtime.stat().st_dev, self.runtime.stat().st_ino),
+            None,
+            None,
+        )
         objects = []
-        for path, purpose in ((self.destination, "target" if self.backup.exists() else "previous"),
-                              (stage, "target"), (self.backup, "previous")):
+        for path, purpose in (
+            (self.destination, "target" if self.backup.exists() else "previous"),
+            (stage, "target"),
+            (self.backup, "previous"),
+        ):
             if path.exists():
-                objects.append(setup._cache_tree_proof(setup.capture_tree(self.runtime, path.name), purpose))
-        self.journal.write_bytes(setup._journal_snapshot_bytes({
-            "schema": setup.CACHE_TRANSACTION_SCHEMA,
-            "runtime_root": str(self.runtime.absolute()),
-            "runtime_identity": setup.durable_identity(self.runtime, ".", expected=root_state),
-            "config_identity": setup._cache_config_identity(setup._capture_cache_catalog(self.fixture.harness)),
-            "transaction_id": "a" * 32,
-            "stage_name": stage.name,
-            "previous": previous,
-            "target": target or self._manifest(self.destination),
-            "objects": objects, "state": "promoting", "error": None,
-        }))
+                objects.append(
+                    setup._cache_tree_proof(
+                        setup.capture_tree(self.runtime, path.name), purpose
+                    )
+                )
+        self.journal.write_bytes(
+            setup._journal_snapshot_bytes(
+                {
+                    "schema": setup.CACHE_TRANSACTION_SCHEMA,
+                    "runtime_root": str(self.runtime.absolute()),
+                    "runtime_identity": setup.durable_identity(
+                        self.runtime, ".", expected=root_state
+                    ),
+                    "config_identity": setup._cache_config_identity(
+                        setup._capture_cache_catalog(self.fixture.harness)
+                    ),
+                    "transaction_id": "a" * 32,
+                    "stage_name": stage.name,
+                    "previous": previous,
+                    "target": target or self._manifest(self.destination),
+                    "objects": objects,
+                    "state": "promoting",
+                    "error": None,
+                }
+            )
+        )
 
     def _blocked_payload(self) -> None:
         with self.assertRaises(setup.SetupError):
@@ -90,11 +120,17 @@ class SetupCacheRecoveryTests(unittest.TestCase):
             bootstrap._managed_payload(self.fixture.harness, self.runtime, "codex")
         result = self._bootstrap_preflight()
         self.assertFalse(result["ok"], result)
-        self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
+        self.assertIn(
+            result["code"],
+            (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION),
+        )
 
     def _bootstrap_preflight(self) -> dict:
         with (
-            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
             patch.object(bootstrap, "open_epoch") as open_epoch,
         ):
             result = bootstrap.run_bootstrap(
@@ -108,7 +144,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         open_epoch.assert_not_called()
         return result
 
-    def test_failed_stage_or_first_rename_keeps_prior_cache_and_next_setup_repairs(self) -> None:
+    def test_failed_stage_or_first_rename_keeps_prior_cache_and_next_setup_repairs(
+        self,
+    ) -> None:
         for failure in ("copy", "destination-to-backup", "destination-to-backup-after"):
             with self.subTest(failure=failure):
                 fixture = MaterializationFixture()
@@ -127,12 +165,19 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                     return real_copy(root, relative, data, **kwargs)
 
                 def replace(root, source_relative, target_relative, **kwargs):
-                    source_path, target = Path(root) / source_relative, Path(root) / target_relative
+                    source_path, target = (
+                        Path(root) / source_relative,
+                        Path(root) / target_relative,
+                    )
                     if source_path == destination:
                         if failure.endswith("-after"):
-                            real_replace(root, source_relative, target_relative, **kwargs)
+                            real_replace(
+                                root, source_relative, target_relative, **kwargs
+                            )
                         raise OSError("injected first rename failure")
-                    return real_replace(root, source_relative, target_relative, **kwargs)
+                    return real_replace(
+                        root, source_relative, target_relative, **kwargs
+                    )
 
                 with patch.object(
                     setup,
@@ -151,12 +196,16 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertFalse((runtime / "super-cache.old").exists())
                 self.assertEqual([], list(runtime.glob(".super-cache.*")))
                 with (
-                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=fixture.harness
+                    ),
                     fixture.native_setup(),
                 ):
                     recovered = setup.run_setup(overwrite=True)
                 self.assertTrue(recovered["ok"], recovered)
-                setup._validate_active_cache(setup._plan_active_cache(fixture.harness), destination)
+                setup._validate_active_cache(
+                    setup._plan_active_cache(fixture.harness), destination
+                )
 
     def test_failed_promotion_or_post_validation_rolls_back_prior_bytes(self) -> None:
         for failure in (
@@ -176,22 +225,44 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 real_validate = setup._validate_active_cache
 
                 def replace(root, source_relative, target_relative, **kwargs):
-                    source_path, target = Path(root) / source_relative, Path(root) / target_relative
-                    if target == destination and source_path.name.startswith(".super-cache."):
+                    source_path, target = (
+                        Path(root) / source_relative,
+                        Path(root) / target_relative,
+                    )
+                    if target == destination and source_path.name.startswith(
+                        ".super-cache."
+                    ):
                         if failure.endswith("-after"):
-                            real_replace(root, source_relative, target_relative, **kwargs)
+                            real_replace(
+                                root, source_relative, target_relative, **kwargs
+                            )
                         raise OSError("injected promotion failure")
-                    return real_replace(root, source_relative, target_relative, **kwargs)
+                    return real_replace(
+                        root, source_relative, target_relative, **kwargs
+                    )
 
-                def validate(plan: list[tuple[Path, Path]], target: Path, **kwargs) -> None:
-                    if target == destination and (target / "custom" / "README.md").read_bytes() == b"updated catalog\n":
-                        raise setup.SetupError(setup.SETUP_CACHE_INVALID, "injected post-promotion validation failure")
+                def validate(
+                    plan: list[tuple[Path, Path]], target: Path, **kwargs
+                ) -> None:
+                    if (
+                        target == destination
+                        and (target / "custom" / "README.md").read_bytes()
+                        == b"updated catalog\n"
+                    ):
+                        raise setup.SetupError(
+                            setup.SETUP_CACHE_INVALID,
+                            "injected post-promotion validation failure",
+                        )
                     real_validate(plan, target, **kwargs)
 
                 with patch.object(
                     setup,
-                    "rename" if failure.startswith("staged-to-destination") else "_validate_active_cache",
-                    side_effect=replace if failure.startswith("staged-to-destination") else validate,
+                    "rename"
+                    if failure.startswith("staged-to-destination")
+                    else "_validate_active_cache",
+                    side_effect=replace
+                    if failure.startswith("staged-to-destination")
+                    else validate,
                 ):
                     with self.assertRaises(setup.SetupError):
                         setup._install_active_cache(
@@ -204,14 +275,20 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertFalse((runtime / "super-cache.old").exists())
                 self.assertEqual([], list(runtime.glob(".super-cache.*")))
                 with (
-                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=fixture.harness
+                    ),
                     fixture.native_setup(),
                 ):
                     recovered = setup.run_setup(overwrite=True)
                 self.assertTrue(recovered["ok"], recovered)
-                setup._validate_active_cache(setup._plan_active_cache(fixture.harness), destination)
+                setup._validate_active_cache(
+                    setup._plan_active_cache(fixture.harness), destination
+                )
 
-    def test_interrupted_current_backup_is_restored_and_owned_stage_removed(self) -> None:
+    def test_interrupted_current_backup_is_restored_and_owned_stage_removed(
+        self,
+    ) -> None:
         first = self._setup()
         self.assertTrue(first["ok"], first)
         before = self._bytes(self.destination)
@@ -222,14 +299,18 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self.destination.rename(self.backup)
         (stage / "custom" / "README.md").unlink()
         self._blocked_payload()
-        with patch.object(setup, "_replace_tree", side_effect=AssertionError("must restore backup")):
+        with patch.object(
+            setup, "_replace_tree", side_effect=AssertionError("must restore backup")
+        ):
             recovered = self._setup()
         self.assertTrue(recovered["ok"], recovered)
         self.assertEqual(before, self._bytes(self.destination))
         self._assert_clean_boundary()
         self.assertEqual(b"preserve this file\n", self.unrelated.read_bytes())
 
-    def test_ambiguous_backup_or_stage_fails_closed_without_changing_bytes(self) -> None:
+    def test_ambiguous_backup_or_stage_fails_closed_without_changing_bytes(
+        self,
+    ) -> None:
         for name in ("super-cache.old", ".super-cache.ambiguous"):
             with self.subTest(name=name):
                 fixture = MaterializationFixture()
@@ -241,14 +322,18 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 (suspect / "unknown.txt").write_bytes(b"foreign bytes\n")
                 before = self._bytes(destination)
                 with (
-                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=fixture.harness
+                    ),
                     fixture.native_setup() as monitor,
                 ):
                     result = setup.run_setup(overwrite=True)
                 self.assertFalse(result["ok"], result)
                 self.assertEqual(setup.SETUP_CACHE_INVALID, result["code"])
                 self.assertEqual(before, self._bytes(destination))
-                self.assertEqual({"unknown.txt": b"foreign bytes\n"}, self._bytes(suspect))
+                self.assertEqual(
+                    {"unknown.txt": b"foreign bytes\n"}, self._bytes(suspect)
+                )
                 with self.assertRaises(setup.SetupError):
                     setup._validated_worker_payload(fixture.harness, runtime, "codex")
                 monitor.assert_not_called()
@@ -269,7 +354,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                     b"new current plan\n"
                 )
                 with (
-                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=fixture.harness
+                    ),
                     fixture.native_setup() as monitor,
                 ):
                     result = setup.run_setup(overwrite=True)
@@ -286,7 +373,13 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         hooks_before = hooks.read_bytes()
         config = self.fixture.root_workspace / ".codex" / "config.toml"
         config_before = config.read_bytes()
-        owned = self.destination / "composed-payloads" / "codex" / ".agent-workspace" / "lane-queue.py"
+        owned = (
+            self.destination
+            / "composed-payloads"
+            / "codex"
+            / ".agent-workspace"
+            / "lane-queue.py"
+        )
         original = owned.read_bytes()
         for fault in ("changed", "missing"):
             with self.subTest(fault=fault):
@@ -298,7 +391,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertFalse(rejected["ok"], rejected)
                 self.assertEqual(setup.SETUP_CACHE_INVALID, rejected["code"])
                 with self.assertRaises(setup.SetupError):
-                    setup._validated_worker_payload(self.fixture.harness, self.runtime, "codex")
+                    setup._validated_worker_payload(
+                        self.fixture.harness, self.runtime, "codex"
+                    )
                 repaired = self._setup(overwrite=True)
                 self.assertTrue(repaired["ok"], repaired)
                 self._assert_clean_boundary()
@@ -308,7 +403,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertEqual(b"preserve this file\n", self.unrelated.read_bytes())
                 self.assertEqual(
                     self.destination / "composed-payloads" / "codex",
-                    setup._validated_worker_payload(self.fixture.harness, self.runtime, "codex"),
+                    setup._validated_worker_payload(
+                        self.fixture.harness, self.runtime, "codex"
+                    ),
                 )
 
     def test_unknown_live_cache_paths_block_overwrite_without_mutation(self) -> None:
@@ -346,7 +443,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
 
     def test_unjournaled_artifacts_name_every_path_and_safe_resolution(self) -> None:
         self.assertTrue(self._setup()["ok"])
-        stages = [self.runtime / (".super-cache." + letter * 32) for letter in ("a", "b")]
+        stages = [
+            self.runtime / (".super-cache." + letter * 32) for letter in ("a", "b")
+        ]
         artifacts = [self.backup, *stages]
         for artifact in artifacts:
             artifact.mkdir()
@@ -360,7 +459,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
             self.assertIn(str(artifact), rejected["next_action"])
             self.assertEqual(before[str(artifact)], self._bytes(artifact))
         self.assertIn("inspect", rejected["next_action"].lower())
-        self.assertIn("move each artifact outside the runtime root", rejected["next_action"])
+        self.assertIn(
+            "move each artifact outside the runtime root", rejected["next_action"]
+        )
 
     @unittest.skipUnless(os.name == "nt", "Windows junction contract")
     def test_root_payload_junction_blocks_preflight_and_install_recheck(self) -> None:
@@ -369,11 +470,17 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         link = self.fixture.root_workspace / ".codex"
         outside = self.fixture.root / "outside-root-payload"
         changed = outside / "hooks" / "post-tool-use.py"
-        setup._preflight_root_payloads(plan, self.fixture.root_workspace, overwrite=True)
+        setup._preflight_root_payloads(
+            plan, self.fixture.root_workspace, overwrite=True
+        )
         link.rename(outside)
         try:
             changed.write_bytes(b"UNRELATED EXTERNAL BYTES\n")
-            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True, capture_output=True)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+                check=True,
+                capture_output=True,
+            )
             before = self._bytes(outside)
             runtime_before = self._bytes(self.runtime)
             rejected = self._setup(overwrite=True)
@@ -407,7 +514,11 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         (outside / "sentinel.txt").write_bytes(b"EXTERNAL DATA\n")
         target.rename(saved)
         try:
-            subprocess.run(["cmd", "/c", "mklink", "/J", str(target), str(outside)], check=True, capture_output=True)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(target), str(outside)],
+                check=True,
+                capture_output=True,
+            )
             before = self._bytes(outside)
             runtime_before = self._bytes(self.runtime)
             rejected = self._setup(overwrite=True)
@@ -425,13 +536,17 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         first = self._setup()
         self.assertTrue(first["ok"], first)
         before = self._bytes(self.destination)
-        with patch.object(setup, "_replace_tree", side_effect=AssertionError("unexpected replacement")):
+        with patch.object(
+            setup, "_replace_tree", side_effect=AssertionError("unexpected replacement")
+        ):
             repeated = self._setup(overwrite=True)
         self.assertTrue(repeated["ok"], repeated)
         self.assertEqual(before, self._bytes(self.destination))
         self._assert_clean_boundary()
 
-    def test_valid_live_cache_repairs_incomplete_owned_stage_without_replacement(self) -> None:
+    def test_valid_live_cache_repairs_incomplete_owned_stage_without_replacement(
+        self,
+    ) -> None:
         first = self._setup()
         self.assertTrue(first["ok"], first)
         before = self._bytes(self.destination)
@@ -440,14 +555,18 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self._record_transaction(stage, previous=self._manifest(self.destination))
         (stage / "custom" / "README.md").unlink()
         self._blocked_payload()
-        with patch.object(setup, "_replace_tree", side_effect=AssertionError("unexpected replacement")):
+        with patch.object(
+            setup, "_replace_tree", side_effect=AssertionError("unexpected replacement")
+        ):
             repeated = self._setup()
         self.assertTrue(repeated["ok"], repeated)
         self.assertEqual(before, self._bytes(self.destination))
         self._assert_clean_boundary()
         self.assertEqual(b"preserve this file\n", self.unrelated.read_bytes())
 
-    def test_owned_old_backup_survives_source_catalog_change_after_interruption(self) -> None:
+    def test_owned_old_backup_survives_source_catalog_change_after_interruption(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         stage = self.runtime / (".super-cache." + "a" * 32)
         shutil.copytree(self.destination, stage)
@@ -459,9 +578,14 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         repaired = self._setup(overwrite=True)
         self.assertTrue(repaired["ok"], repaired)
         self._assert_clean_boundary()
-        self.assertEqual(b"later source catalog\n", (self.destination / "custom" / "README.md").read_bytes())
+        self.assertEqual(
+            b"later source catalog\n",
+            (self.destination / "custom" / "README.md").read_bytes(),
+        )
 
-    def test_byte_exact_unowned_stage_and_backup_are_preserved_and_block_dispatch(self) -> None:
+    def test_byte_exact_unowned_stage_and_backup_are_preserved_and_block_dispatch(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         for name in (".super-cache." + "a" * 32, "super-cache.old"):
             with self.subTest(name=name):
@@ -493,7 +617,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertFalse(failed["ok"], failed)
                 self.assertTrue(self.journal.is_file())
                 self.assertTrue(self.backup.is_dir())
-                self.assertEqual(expected, (self.destination / "custom" / "README.md").read_bytes())
+                self.assertEqual(
+                    expected, (self.destination / "custom" / "README.md").read_bytes()
+                )
                 self._blocked_payload()
                 if partial:
                     (self.backup / "custom" / "README.md").unlink()
@@ -502,7 +628,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self._assert_clean_boundary()
         self.assertEqual(
             self.destination / "composed-payloads" / "codex",
-            setup._validated_worker_payload(self.fixture.harness, self.runtime, "codex"),
+            setup._validated_worker_payload(
+                self.fixture.harness, self.runtime, "codex"
+            ),
         )
         self.assertEqual(
             self.destination / "composed-payloads" / "codex",
@@ -515,7 +643,10 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         shutil.copytree(self.destination, stage)
         self._record_transaction(stage, previous=self._manifest(self.destination))
         valid = json.loads(self.journal.read_text(encoding="utf-8"))
-        for changed in ({**valid, "credential": "should not be accepted"}, {**valid, "runtime_root": str(self.fixture.harness)}):
+        for changed in (
+            {**valid, "credential": "should not be accepted"},
+            {**valid, "runtime_root": str(self.fixture.harness)},
+        ):
             with self.subTest(changed=changed):
                 self.journal.write_text(json.dumps(changed), encoding="utf-8")
                 rejected = self._setup(overwrite=True)
@@ -523,21 +654,38 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertTrue(stage.is_dir())
                 self._blocked_payload()
 
-    def test_hardlinked_transaction_journal_blocks_recovery_without_mutation(self) -> None:
+    def test_hardlinked_transaction_journal_blocks_recovery_without_mutation(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         stage = self.runtime / (".super-cache." + "a" * 32)
         shutil.copytree(self.destination, stage)
         shutil.copytree(self.destination, self.backup)
         self._record_transaction(stage, previous=self._manifest(self.destination))
-        setup.atomic_write_json(self.journal, json.loads(self.journal.read_text(encoding="utf-8")))
+        setup.atomic_write_json(
+            self.journal, json.loads(self.journal.read_text(encoding="utf-8"))
+        )
         outside_link = self.fixture.root / "linked-transaction.json"
         os.link(self.journal, outside_link)
-        before = (self.journal.read_bytes(), self._bytes(stage), self._bytes(self.backup), self._bytes(self.destination))
+        before = (
+            self.journal.read_bytes(),
+            self._bytes(stage),
+            self._bytes(self.backup),
+            self._bytes(self.destination),
+        )
 
         rejected = self._setup(overwrite=True)
         self.assertFalse(rejected["ok"], rejected)
         self.assertEqual(setup.SETUP_CACHE_INVALID, rejected["code"])
-        self.assertEqual(before, (self.journal.read_bytes(), self._bytes(stage), self._bytes(self.backup), self._bytes(self.destination)))
+        self.assertEqual(
+            before,
+            (
+                self.journal.read_bytes(),
+                self._bytes(stage),
+                self._bytes(self.backup),
+                self._bytes(self.destination),
+            ),
+        )
         self._blocked_payload()
 
         outside_link.unlink()
@@ -546,7 +694,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self.assertTrue(repaired["ok"], repaired)
         self._assert_clean_boundary()
 
-    def test_journal_owned_partial_copy_bytes_at_planned_path_are_repairable(self) -> None:
+    def test_journal_owned_partial_copy_bytes_at_planned_path_are_repairable(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         prior = self._bytes(self.destination)
         stage = self.runtime / (".super-cache." + "a" * 32)
@@ -562,10 +712,13 @@ class SetupCacheRecoveryTests(unittest.TestCase):
 
     def test_plain_bootstrap_blocks_unresolved_cache_artifacts(self) -> None:
         self.assertTrue(self._setup()["ok"])
-        self.fixture._write_json(self.fixture.harness / "harness-config.json", {
-            "root_workspace": str(self.fixture.root_workspace),
-            "managed_coordination": "disabled",
-        })
+        self.fixture._write_json(
+            self.fixture.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.fixture.root_workspace),
+                "managed_coordination": "disabled",
+            },
+        )
         stage = self.runtime / (".super-cache." + "a" * 32)
         shutil.copytree(self.destination, stage)
         result = self._bootstrap_preflight()
@@ -594,7 +747,10 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         repaired = self._setup(overwrite=True)
         self.assertTrue(repaired["ok"], repaired)
         self._assert_clean_boundary()
-        self.assertEqual(b"updated catalog\n", (self.destination / "custom" / "README.md").read_bytes())
+        self.assertEqual(
+            b"updated catalog\n",
+            (self.destination / "custom" / "README.md").read_bytes(),
+        )
 
     def test_invalid_live_with_exact_owned_prior_backup_is_restored(self) -> None:
         self.assertTrue(self._setup()["ok"])
@@ -603,12 +759,16 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         stage = self.runtime / (".super-cache." + "a" * 32)
         shutil.copytree(self.destination, self.backup)
         self._record_transaction(stage, previous=previous)
-        (self.destination / "custom" / "README.md").write_bytes(b"corrupt promoted bytes\n")
+        (self.destination / "custom" / "README.md").write_bytes(
+            b"corrupt promoted bytes\n"
+        )
         self._blocked_payload()
         repaired = self._setup()
         self.assertTrue(repaired["ok"], repaired)
         self._assert_clean_boundary()
-        self.assertEqual(prior_bytes, (self.destination / "custom" / "README.md").read_bytes())
+        self.assertEqual(
+            prior_bytes, (self.destination / "custom" / "README.md").read_bytes()
+        )
 
     def test_foreign_bytes_inside_claimed_transaction_stage_fail_closed(self) -> None:
         self.assertTrue(self._setup()["ok"])
@@ -622,15 +782,27 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self._blocked_payload()
 
     @unittest.skipUnless(os.name == "nt", "Windows junction contract")
-    def test_junction_at_root_or_beneath_cache_blocks_validation_and_dispatch(self) -> None:
+    def test_junction_at_root_or_beneath_cache_blocks_validation_and_dispatch(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         for relative in (Path("."), Path("workspace")):
             with self.subTest(relative=relative):
-                link = self.destination if relative == Path(".") else self.destination / relative
-                target = self.runtime / ("junction-target-" + ("root" if relative == Path(".") else "child"))
+                link = (
+                    self.destination
+                    if relative == Path(".")
+                    else self.destination / relative
+                )
+                target = self.runtime / (
+                    "junction-target-" + ("root" if relative == Path(".") else "child")
+                )
                 link.rename(target)
                 try:
-                    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        check=True,
+                        capture_output=True,
+                    )
                     self._blocked_payload()
                     rejected = self._setup(overwrite=True)
                     self.assertFalse(rejected["ok"], rejected)
@@ -641,7 +813,9 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                     target.rename(link)
 
     @unittest.skipUnless(os.name == "nt", "Windows junction contract")
-    def test_workspace_and_runtime_junctions_block_first_setup_without_writes(self) -> None:
+    def test_workspace_and_runtime_junctions_block_first_setup_without_writes(
+        self,
+    ) -> None:
         for boundary in ("workspace", "runtime"):
             with self.subTest(boundary=boundary):
                 fixture = MaterializationFixture()
@@ -655,10 +829,16 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 else:
                     target.mkdir()
                 try:
-                    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        check=True,
+                        capture_output=True,
+                    )
                     before = self._bytes(target)
                     with (
-                        patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                        patch.object(
+                            setup, "find_harness_root", return_value=fixture.harness
+                        ),
                         fixture.native_setup() as monitor,
                     ):
                         rejected = setup.run_setup(overwrite=True)
@@ -673,37 +853,61 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                         target.rename(link)
 
     @unittest.skipUnless(os.name == "nt", "Windows junction contract")
-    def test_workspace_and_runtime_junctions_block_setup_and_both_bootstrap_profiles(self) -> None:
+    def test_workspace_and_runtime_junctions_block_setup_and_both_bootstrap_profiles(
+        self,
+    ) -> None:
         self.assertTrue(self._setup()["ok"])
         # The first setup used a genuine monitor. Release its held runtime
         # handles before this test deliberately redirects the owned fixture.
         from orchestrator_harness.shutdown import _stop_monitor
+
         owner = _stop_monitor(self.runtime)
-        self.assertTrue(setup.processes.identity_exit_proven(owner["pid"], owner["creation_time"]))
+        self.assertTrue(
+            setup.processes.identity_exit_proven(owner["pid"], owner["creation_time"])
+        )
         for boundary in ("workspace", "runtime"):
             with self.subTest(boundary=boundary):
-                link = self.fixture.root_workspace if boundary == "workspace" else self.runtime
+                link = (
+                    self.fixture.root_workspace
+                    if boundary == "workspace"
+                    else self.runtime
+                )
                 target = self.fixture.root / f"outside-{boundary}"
                 link.rename(target)
                 try:
-                    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        check=True,
+                        capture_output=True,
+                    )
                     before = self._bytes(target)
                     rejected = self._setup(overwrite=True)
                     self.assertFalse(rejected["ok"], rejected)
-                    self.assertIn(rejected["code"], (setup.SETUP_CONFIG_INVALID, setup.SETUP_CACHE_INVALID))
+                    self.assertIn(
+                        rejected["code"],
+                        (setup.SETUP_CONFIG_INVALID, setup.SETUP_CACHE_INVALID),
+                    )
                     self.assertEqual(before, self._bytes(target))
                     with self.assertRaises(setup.SetupError):
-                        setup._validated_cache_for_dispatch(self.fixture.harness, self.runtime)
+                        setup._validated_cache_for_dispatch(
+                            self.fixture.harness, self.runtime
+                        )
                     for profile in ("enabled", "disabled"):
                         with self.subTest(profile=profile):
-                            self.fixture._write_json(self.fixture.harness / "harness-config.json", {
-                                "root_workspace": str(self.fixture.root_workspace),
-                                "managed_coordination": profile,
-                            })
+                            self.fixture._write_json(
+                                self.fixture.harness / "harness-config.json",
+                                {
+                                    "root_workspace": str(self.fixture.root_workspace),
+                                    "managed_coordination": profile,
+                                },
+                            )
                             result = self._bootstrap_preflight()
                             self.assertFalse(result["ok"], result)
-                            expected = (bootstrap.BOOTSTRAP_REQUEST_INVALID if boundary == "workspace"
-                                        else bootstrap.BOOTSTRAP_CACHE_COLLISION)
+                            expected = (
+                                bootstrap.BOOTSTRAP_REQUEST_INVALID
+                                if boundary == "workspace"
+                                else bootstrap.BOOTSTRAP_CACHE_COLLISION
+                            )
                             self.assertEqual(expected, result["code"])
                             self.assertEqual(before, self._bytes(target))
                 finally:

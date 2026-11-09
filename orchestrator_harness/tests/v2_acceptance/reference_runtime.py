@@ -21,10 +21,17 @@ class ReferenceRuntime:
     events: list[dict[str, Any]] = field(default_factory=list)
     leases: dict[str, dict[str, str]] = field(default_factory=dict)
 
-    def bootstrap(self, lane_id: str, run_id: str, resources: tuple[str, ...] = ()) -> None:
+    def bootstrap(
+        self, lane_id: str, run_id: str, resources: tuple[str, ...] = ()
+    ) -> None:
         if lane_id in self.lanes:
             raise ValueError("BOOTSTRAP_LANE_ID_IN_USE")
-        self.lanes[lane_id] = {"run_id": run_id, "lifecycle": "prepared", "resources": resources, "last": None}
+        self.lanes[lane_id] = {
+            "run_id": run_id,
+            "lifecycle": "prepared",
+            "resources": resources,
+            "last": None,
+        }
 
     def launch(self, lane_id: str, holder: str) -> None:
         lane = self.lanes[lane_id]
@@ -32,7 +39,11 @@ class ReferenceRuntime:
         if any(resource in self.leases for resource in wanted):
             raise ValueError("LAUNCH_LEASE_BUSY")
         for resource in wanted:
-            self.leases[resource] = {"lane_id": lane_id, "run_id": lane["run_id"], "holder": holder}
+            self.leases[resource] = {
+                "lane_id": lane_id,
+                "run_id": lane["run_id"],
+                "holder": holder,
+            }
         lane["lifecycle"] = "running"
 
     def terminal(self, lane_id: str, status: str) -> None:
@@ -41,8 +52,21 @@ class ReferenceRuntime:
             raise ValueError("invalid controller status")
         lane["lifecycle"] = status
         if self.mode == "managed" and lane["last"] != status:
-            event_type = "COMPLETION_REVIEW_REQUIRED" if status == "review_pending" else "LANE_RESULT_INVALID"
-            self.events.append({"event_id": f"event-{len(self.events) + 1}", "type": event_type, "lane_id": lane_id, "run_id": lane["run_id"], "state": "PENDING", "history": ["PENDING"]})
+            event_type = (
+                "COMPLETION_REVIEW_REQUIRED"
+                if status == "review_pending"
+                else "LANE_RESULT_INVALID"
+            )
+            self.events.append(
+                {
+                    "event_id": f"event-{len(self.events) + 1}",
+                    "type": event_type,
+                    "lane_id": lane_id,
+                    "run_id": lane["run_id"],
+                    "state": "PENDING",
+                    "history": ["PENDING"],
+                }
+            )
             lane["last"] = status
 
     def acknowledge(self, event_id: str) -> None:
@@ -67,12 +91,31 @@ class ReferenceRuntime:
             raise ValueError("LANE_RUNNING")
         lane.update(run_id=new_run_id, lifecycle="running", last=None)
 
-    def review_pair(self, lane_id: str, outcome: str, approval: str, force_reason: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    def review_pair(
+        self, lane_id: str, outcome: str, approval: str, force_reason: str | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         lane = self.lanes[lane_id]
         if approval == "ACCEPTED" and outcome != "PASS" and not force_reason:
             raise ValueError("COMPLETION_REVIEW_FORCE_REASON_INVALID")
-        review = {"schema": "completion-review/v1", "lane_id": lane_id, "run_id": lane["run_id"], "review_outcome": outcome, "task_card_hash": "task", "result_hash": "result", "commit": "commit"}
-        acceptance = {"schema": "orchestrator-acceptance/v1", "lane_id": lane_id, "run_id": lane["run_id"], "approval": approval, "task_card_hash": "task", "result_hash": "result", "commit": "commit", "review_ref": content_hash(review)}
+        review = {
+            "schema": "completion-review/v1",
+            "lane_id": lane_id,
+            "run_id": lane["run_id"],
+            "review_outcome": outcome,
+            "task_card_hash": "task",
+            "result_hash": "result",
+            "commit": "commit",
+        }
+        acceptance = {
+            "schema": "orchestrator-acceptance/v1",
+            "lane_id": lane_id,
+            "run_id": lane["run_id"],
+            "approval": approval,
+            "task_card_hash": "task",
+            "result_hash": "result",
+            "commit": "commit",
+            "review_ref": content_hash(review),
+        }
         if force_reason:
             acceptance["force_accept_reason"] = force_reason
         if approval == "ACCEPTED":

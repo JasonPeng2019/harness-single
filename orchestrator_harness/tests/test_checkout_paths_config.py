@@ -1,4 +1,5 @@
 """Configuration contracts for optional sparse checkout scope."""
+
 from __future__ import annotations
 
 import json
@@ -27,19 +28,23 @@ class CheckoutPathsConfigTests(unittest.TestCase):
         self.path = self.harness / "harness-config.json"
 
     def write(self, **extra: object) -> None:
-        self.path.write_text(json.dumps({"root_workspace": str(self.product), **extra}), encoding="utf-8")
+        self.path.write_text(
+            json.dumps({"root_workspace": str(self.product), **extra}), encoding="utf-8"
+        )
 
     def test_omission_retains_historical_full_checkout_identity(self) -> None:
         self.write()
         config = load_config(self.harness)
         self.assertIsNone(config.checkout_paths)
         self.assertEqual(
-            sha256_hex({
-                "root_workspace": str(self.product),
-                "managed_coordination": "enabled",
-                "resource_manifest": [],
-                "runtime_record_schema_version": 1,
-            }),
+            sha256_hex(
+                {
+                    "root_workspace": str(self.product),
+                    "managed_coordination": "enabled",
+                    "resource_manifest": [],
+                    "runtime_record_schema_version": 1,
+                }
+            ),
             compute_config_identity(config, ResourceManifest()),
         )
 
@@ -50,7 +55,9 @@ class CheckoutPathsConfigTests(unittest.TestCase):
         self.assertEqual(tuple(selected), config.checkout_paths)
         scoped_identity = compute_config_identity(config, ResourceManifest())
         self.write()
-        full_identity = compute_config_identity(load_config(self.harness), ResourceManifest())
+        full_identity = compute_config_identity(
+            load_config(self.harness), ResourceManifest()
+        )
         self.assertNotEqual(
             scoped_identity,
             full_identity,

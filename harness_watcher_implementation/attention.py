@@ -2077,6 +2077,7 @@ def analyze_event(
 
 def _path_safe(root: Path, target: Path) -> None:
     from .io import validate_path
+
     try:
         validate_path(root, target)
     except OSError as exc:
@@ -2099,6 +2100,7 @@ def _advisory_lock(path: Path, timeout: float):
     """A real OS advisory lock; the file is never unlinked while another writer may hold it."""
     from orchestrator_harness.mutation import open_append_file
     from .io import output
+
     transaction = output(path.parent, path)
     anchored = open_append_file(transaction.root, path.name)
     fd = anchored.handle.fileno()
@@ -2161,6 +2163,7 @@ def append_producer_record(
             "runtime root may not be a symlink/reparse point"
         )
     from .io import output
+
     root = supplied
     path = producer_path(root, role, source_id)
     transaction = output(root, path)
@@ -2179,20 +2182,21 @@ def append_producer_record(
         if path.exists():
             _path_safe(root, path)
             for line in transaction.read_bytes(path).splitlines():
-                    try:
-                        existing = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if existing.get("record_id") == record["record_id"]:
-                        if canonical_bytes(existing) != canonical_bytes(record):
-                            raise AttentionConflictError(
-                                "record_id collision with different bytes"
-                            )
-                        return path
+                try:
+                    existing = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if existing.get("record_id") == record["record_id"]:
+                    if canonical_bytes(existing) != canonical_bytes(record):
+                        raise AttentionConflictError(
+                            "record_id collision with different bytes"
+                        )
+                    return path
         _path_safe(root, path)
         if (root.stat().st_dev, root.stat().st_ino) != identity:
             raise AttentionValidationError("runtime root identity changed")
         from orchestrator_harness.mutation import append_bytes
+
         transaction.revalidate(path)
         append_bytes(root, path.relative_to(root), encoded)
         return path
@@ -2200,6 +2204,7 @@ def append_producer_record(
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     from .io import atomic_json
+
     atomic_json(path.parent, path, dict(value))
 
 
@@ -2308,6 +2313,7 @@ def ingest_attention(config: Any) -> dict[str, Any]:
     if not getattr(config, "attention_logging_enabled", False):
         return {"disabled": True, "findings": []}
     from .io import lock
+
     root = Path(config.runtime_root)
     with lock(root, root / "watcher" / "attention-cursor.json"):
         return _ingest_attention(config)
@@ -2320,11 +2326,16 @@ def _ingest_attention(config: Any) -> dict[str, Any]:
     timeline_path = watcher / "attention-timeline.jsonl"
     errors_path = watcher / "attention-observation-errors.jsonl"
     from .io import read_json, append_records, output
+
     cursor = read_json(root, cursor_path)
     if cursor is None:
         cursor = {"schema": "manager-attention-cursor/v1", "sources": {}, "dedup": {}}
-    if cursor.get("schema") != "manager-attention-cursor/v1" or not isinstance(cursor.get("sources"), dict):
-        raise AttentionValidationError("invalid attention cursor; preserve it for reconciliation")
+    if cursor.get("schema") != "manager-attention-cursor/v1" or not isinstance(
+        cursor.get("sources"), dict
+    ):
+        raise AttentionValidationError(
+            "invalid attention cursor; preserve it for reconciliation"
+        )
     for destination in (timeline_path, errors_path):
         output(root, destination)
     sources = (

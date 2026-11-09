@@ -95,11 +95,22 @@ def write_notice(
     event_class: str = "WORKER_ESCALATION",
 ) -> dict[str, Any]:
     binding = _binding(agent_workspace)
-    if (severity not in SEVERITIES
-            or any(not isinstance(value, str) or not value.strip()
-                   for value in (binding.get("lane_id"), binding.get("run_id"), summary, event_class))
-            or (detail is not None and not isinstance(detail, str))):
-        raise ValueError("notice requires lane/run identity, summary, event class and a supported severity")
+    if (
+        severity not in SEVERITIES
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in (
+                binding.get("lane_id"),
+                binding.get("run_id"),
+                summary,
+                event_class,
+            )
+        )
+        or (detail is not None and not isinstance(detail, str))
+    ):
+        raise ValueError(
+            "notice requires lane/run identity, summary, event class and a supported severity"
+        )
     notice: dict[str, Any] = {
         "schema": NOTICE_SCHEMA,
         "notice_id": uuid.uuid4().hex,
@@ -114,11 +125,18 @@ def write_notice(
     if detail:
         notice["detail"] = detail
     if _runtime_atomic_write_json is not None:
-        encoded = (json.dumps(notice, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        encoded = (
+            json.dumps(
+                notice, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            + "\n"
+        ).encode("utf-8")
     else:
         encoded = (json.dumps(notice, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > MAX_NOTICE_BYTES:
-        raise ValueError("notice exceeds its 65536-byte limit; shorten it or reference a local evidence file")
+        raise ValueError(
+            "notice exceeds its 65536-byte limit; shorten it or reference a local evidence file"
+        )
     outbox = _outbox_dir(agent_workspace)
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / f"notice-{notice['notice_id']}.json"
@@ -146,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         "--summary", required=True, help="the decision or action ROOT needs"
     )
     parser.add_argument(
-        "--event-class", default="WORKER_ESCALATION",
+        "--event-class",
+        default="WORKER_ESCALATION",
         help="structured manager event class (default: WORKER_ESCALATION)",
     )
     parser.add_argument("--detail", default=None, help="relevant local evidence")

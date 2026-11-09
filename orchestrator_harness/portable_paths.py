@@ -1,4 +1,5 @@
 """One spelling for product identifiers and portable repository entries."""
+
 from __future__ import annotations
 
 from pathlib import PureWindowsPath
@@ -6,10 +7,14 @@ from pathlib import PureWindowsPath
 
 def component(value: object) -> str:
     """Reject components that escape, alias or select Windows devices/streams."""
-    if (not isinstance(value, str) or not value or value in {".", ".."}
-            or value[-1] in {".", " "}
-            or any(ord(char) < 32 or char in '<>:"/\\|?*' for char in value)
-            or PureWindowsPath(value).is_reserved()):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or value[-1] in {".", " "}
+        or any(ord(char) < 32 or char in '<>:"/\\|?*' for char in value)
+        or PureWindowsPath(value).is_reserved()
+    ):
         raise ValueError(f"invalid portable path component: {value!r}")
     return value
 

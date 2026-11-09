@@ -13,7 +13,9 @@ from orchestrator_harness.tests.v2_acceptance.reference_runtime import Reference
 class CheckU3Tests(unittest.TestCase):
     """CHECK-U3 synthetic lifecycle contracts; this class is not live proof."""
 
-    def test_lease_contention_is_fail_fast_all_or_nothing_then_exact_cleanup_reuses(self) -> None:
+    def test_lease_contention_is_fail_fast_all_or_nothing_then_exact_cleanup_reuses(
+        self,
+    ) -> None:
         runtime = ReferenceRuntime()
         runtime.bootstrap("holder", "run-holder", ("fixture-a", "fixture-b"))
         runtime.bootstrap("contender", "run-contender", ("fixture-a",))
@@ -21,7 +23,9 @@ class CheckU3Tests(unittest.TestCase):
         held_before = dict(runtime.leases)
         with self.assertRaisesRegex(ValueError, "LAUNCH_LEASE_BUSY"):
             runtime.launch("contender", "pid:22@created:two")
-        self.assertEqual(held_before, runtime.leases, "failed launch must not partially acquire")
+        self.assertEqual(
+            held_before, runtime.leases, "failed launch must not partially acquire"
+        )
         runtime.cleanup("holder", "pid:11@created:one")
         runtime.launch("contender", "pid:22@created:two")
         self.assertEqual("contender", runtime.leases["fixture-a"]["lane_id"])
@@ -38,10 +42,14 @@ class CheckU3Tests(unittest.TestCase):
     def test_non_pass_acceptance_requires_recorded_force_reason(self) -> None:
         runtime = ReferenceRuntime()
         runtime.bootstrap("lane", "run-1")
-        with self.assertRaisesRegex(ValueError, "COMPLETION_REVIEW_FORCE_REASON_INVALID"):
+        with self.assertRaisesRegex(
+            ValueError, "COMPLETION_REVIEW_FORCE_REASON_INVALID"
+        ):
             runtime.review_pair("lane", "FAIL", "ACCEPTED")
 
-    def test_bound_009_candidate_observable_resume_order_rejects_ordering_mutants(self) -> None:
+    def test_bound_009_candidate_observable_resume_order_rejects_ordering_mutants(
+        self,
+    ) -> None:
         class CandidateBoundary:
             def __init__(self, mutation: str | None = None) -> None:
                 self.mutation = mutation
@@ -68,19 +76,29 @@ class CheckU3Tests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     assert_resume_order(CandidateBoundary(mutation).resume())
 
-    def test_bound_010_candidate_observable_review_resume_boundary_rejects_mutants(self) -> None:
+    def test_bound_010_candidate_observable_review_resume_boundary_rejects_mutants(
+        self,
+    ) -> None:
         class CandidateBoundary:
             def __init__(self, mutation: str | None = None) -> None:
                 self.events: list[dict[str, str]] = []
                 self.mutation = mutation
 
             def reject_review(self) -> None:
-                producer = "resume" if self.mutation == "wrong-producer" else "completion-review"
-                self.events.append({"type": "LANE_RESUME_REQUIRED", "producer": producer})
+                producer = (
+                    "resume"
+                    if self.mutation == "wrong-producer"
+                    else "completion-review"
+                )
+                self.events.append(
+                    {"type": "LANE_RESUME_REQUIRED", "producer": producer}
+                )
 
             def resume(self) -> None:
                 if self.mutation == "duplicate-on-resume":
-                    self.events.append({"type": "LANE_RESUME_REQUIRED", "producer": "resume"})
+                    self.events.append(
+                        {"type": "LANE_RESUME_REQUIRED", "producer": "resume"}
+                    )
 
         assert_rejected_review_resume_boundary(CandidateBoundary())
         for mutation in ("duplicate-on-resume", "wrong-producer"):

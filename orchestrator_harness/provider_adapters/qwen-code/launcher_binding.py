@@ -10,7 +10,9 @@ PROVIDER_ID = "qwen-code"
 ADAPTER_VERSION = "qwen-code-v2"
 
 
-def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+def validate_launch_config(
+    *, model: str, launch_config: dict[str, Any]
+) -> dict[str, str]:
     """Validate Qwen's explicit model selection and reject hidden preferences."""
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Qwen Code model must be configured")
@@ -37,7 +39,14 @@ def build_argv(
     del worktree, prompt_path
     validate_launch_config(model=model, launch_config=launch_config)
     executable = shutil.which("qwen") or "qwen"
-    argv = [executable, "--approval-mode=yolo", "--model", model, "--output-format", "stream-json"]
+    argv = [
+        executable,
+        "--approval-mode=yolo",
+        "--model",
+        model,
+        "--output-format",
+        "stream-json",
+    ]
     if resume:
         if not session_id:
             raise ValueError("Qwen Code resume requires a session ID")
@@ -69,7 +78,10 @@ def parse_line(line: str) -> dict[str, Any] | None:
         return parsed
     if raw_type == "result":
         parsed["message"] = value.get("result") or subtype or "result"
-        if value.get("is_error") is True or subtype in {"error", "error_during_execution"}:
+        if value.get("is_error") is True or subtype in {
+            "error",
+            "error_during_execution",
+        }:
             parsed["non_retryable_failure"] = True
         return parsed
     return None

@@ -32,7 +32,8 @@ class ProviderFinalizationTests(unittest.TestCase):
         # Exercise the same persisted status snapshot consumed by the monitor.
         controller._write_status(self.lane, fields)
         return read_record(
-            Path(self.lane["controller_status_path"]), controller.CONTROLLER_STATUS_SCHEMA
+            Path(self.lane["controller_status_path"]),
+            controller.CONTROLLER_STATUS_SCHEMA,
         )
 
     def derive(
@@ -95,7 +96,9 @@ class ProviderFinalizationTests(unittest.TestCase):
             "creation_time": str(self.identity["creation_time"]) + "-different",
         }
         self.assertTrue(
-            processes.identity_matches(self.identity["pid"], self.identity["creation_time"])
+            processes.identity_matches(
+                self.identity["pid"], self.identity["creation_time"]
+            )
         )
         self.assertEqual("controller_exited", self.derive(status))
 

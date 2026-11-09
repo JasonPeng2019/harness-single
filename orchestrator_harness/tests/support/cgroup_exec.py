@@ -31,7 +31,9 @@ def main() -> int:
         command = ["ip", "netns", "exec", args.network_namespace, *command]
     cgroup = Path(args.cgroup).resolve()
     if cgroup.parent != cgroup_root().resolve():
-        raise RuntimeError(f"cgroup must be a direct child of the discovered cgroup-v2 mount: {cgroup}")
+        raise RuntimeError(
+            f"cgroup must be a direct child of the discovered cgroup-v2 mount: {cgroup}"
+        )
     (cgroup / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="ascii")
     os.execvp(command[0], command)
     raise AssertionError("exec returned")

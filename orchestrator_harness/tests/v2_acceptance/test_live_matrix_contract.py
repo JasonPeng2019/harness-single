@@ -11,7 +11,14 @@ from unittest.mock import patch
 from pathlib import Path
 
 from orchestrator_harness.tests.v2_acceptance.contract import PLATFORM_CLAIMS
-from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NATIVE_GAPS, execute, expected_cells
+from examples.v2_live_matrix import (
+    AUTHORIZATION_ENV,
+    CHECKS,
+    MANAGED_ONLY,
+    NATIVE_GAPS,
+    execute,
+    expected_cells,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -19,83 +26,153 @@ MATRIX = ROOT / "examples" / "v2_live_matrix.py"
 
 
 class LiveMatrixContractTests(unittest.TestCase):
-
-
     @staticmethod
     def _coordinate(name, provider, *, depends_on=(), input_hashes=None):
         """A deliberately disposable coordinate; the outer runner never receives a live argv here."""
         root = Path(tempfile.gettempdir()) / "a3-live-matrix-contract"
-        evidence = {kind: str(root / name / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+        evidence = {
+            kind: str(root / name / f"{kind}.txt")
+            for kind in ("transcript", "hook", "state", "cleanup")
+        }
         return {
-            "name": name, "coordinate_id": name, "target": name, "provider": provider,
-            "profile": "managed", "platform": "Windows", "command": [sys.executable, "-c", "pass"],
-            "cleanup_command": [sys.executable, "-c", "pass"], "evidence": evidence,
+            "name": name,
+            "coordinate_id": name,
+            "target": name,
+            "provider": provider,
+            "profile": "managed",
+            "platform": "Windows",
+            "command": [sys.executable, "-c", "pass"],
+            "cleanup_command": [sys.executable, "-c", "pass"],
+            "evidence": evidence,
             "evidence_oracles": {kind: ["required token"] for kind in evidence},
-            "agent_expectations": [{"classification": "Observed"}], "depends_on": list(depends_on),
-            "input_hashes": input_hashes or {"fixture": name}, "budget_seconds": 1,
+            "agent_expectations": [{"classification": "Observed"}],
+            "depends_on": list(depends_on),
+            "input_hashes": input_hashes or {"fixture": name},
+            "budget_seconds": 1,
         }
 
     def test_coordinate_scheduler_overlaps_only_different_provider_homes(self) -> None:
         """Two providers may overlap; a shared provider home remains exclusive."""
-        manifest = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
-            self._coordinate("CHECK-LIVE-1", "codex"),
-            self._coordinate("CHECK-LIVE-2", "qwen-code"),
-            self._coordinate("CHECK-LIVE-3", "codex"),
-        ]}
+        manifest = {
+            "native_runner_identity": {"platform": "Windows"},
+            "total_budget_seconds": 3,
+            "attempts": [
+                self._coordinate("CHECK-LIVE-1", "codex"),
+                self._coordinate("CHECK-LIVE-2", "qwen-code"),
+                self._coordinate("CHECK-LIVE-3", "codex"),
+            ],
+        }
         calls = []
 
         def fake_run(argv, *, timeout_seconds=None):
             calls.append((argv[-1], time.monotonic()))
-            time.sleep(.12)
+            time.sleep(0.12)
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}),
+            patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run),
+        ):
             started = time.monotonic()
             result = execute(manifest, Path(temporary) / "checkpoint.json")
             elapsed = time.monotonic() - started
         self.assertEqual(6, len(calls))
-        self.assertLess(elapsed, .58, "different providers should overlap under the two-coordinate cap")
-        self.assertGreaterEqual(calls[4][1] - calls[0][1], .20, "same-provider coordinates must not overlap")
-        self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3"], [row["name"] for row in result["checks"]])
+        self.assertLess(
+            elapsed,
+            0.58,
+            "different providers should overlap under the two-coordinate cap",
+        )
+        self.assertGreaterEqual(
+            calls[4][1] - calls[0][1],
+            0.20,
+            "same-provider coordinates must not overlap",
+        )
+        self.assertEqual(
+            ["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3"],
+            [row["name"] for row in result["checks"]],
+        )
 
-    def test_dependency_failure_blocks_only_its_dependent_and_keeps_collecting(self) -> None:
-        manifest = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
-            self._coordinate("CHECK-LIVE-1", "codex"),
-            self._coordinate("CHECK-LIVE-2", "qwen-code", depends_on=("CHECK-LIVE-1",)),
-            self._coordinate("CHECK-LIVE-3", "claude-code"),
-        ]}
+    def test_dependency_failure_blocks_only_its_dependent_and_keeps_collecting(
+        self,
+    ) -> None:
+        manifest = {
+            "native_runner_identity": {"platform": "Windows"},
+            "total_budget_seconds": 3,
+            "attempts": [
+                self._coordinate("CHECK-LIVE-1", "codex"),
+                self._coordinate(
+                    "CHECK-LIVE-2", "qwen-code", depends_on=("CHECK-LIVE-1",)
+                ),
+                self._coordinate("CHECK-LIVE-3", "claude-code"),
+            ],
+        }
         calls = []
 
         def fake_run(argv, *, timeout_seconds=None):
             calls.append(argv)
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}),
+            patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run),
+        ):
             result = execute(manifest, Path(temporary) / "checkpoint.json")
         rows = {row["name"]: row for row in result["checks"]}
         self.assertEqual("FAIL", rows["CHECK-LIVE-2"]["outcome"])
-        self.assertEqual("DEPENDENCY_EVIDENCE_FAILED", rows["CHECK-LIVE-2"]["acceptance_outcome"])
-        self.assertEqual(6, len(calls), "terminal failed evidence still permits CHECK16-style dependent collection")
+        self.assertEqual(
+            "DEPENDENCY_EVIDENCE_FAILED", rows["CHECK-LIVE-2"]["acceptance_outcome"]
+        )
+        self.assertEqual(
+            6,
+            len(calls),
+            "terminal failed evidence still permits CHECK16-style dependent collection",
+        )
 
-    def test_resume_reuses_matching_coordinate_and_invalidates_changed_consumed_input(self) -> None:
-        first = {"native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3, "attempts": [
-            self._coordinate("CHECK-LIVE-1", "codex", input_hashes={"fixture": "a"}),
-            self._coordinate("CHECK-LIVE-2", "qwen-code", input_hashes={"fixture": "b"}),
-        ]}
-        changed = {**first, "attempts": [first["attempts"][0], {**first["attempts"][1], "input_hashes": {"fixture": "changed"}}]}
+    def test_resume_reuses_matching_coordinate_and_invalidates_changed_consumed_input(
+        self,
+    ) -> None:
+        first = {
+            "native_runner_identity": {"platform": "Windows"},
+            "total_budget_seconds": 3,
+            "attempts": [
+                self._coordinate(
+                    "CHECK-LIVE-1", "codex", input_hashes={"fixture": "a"}
+                ),
+                self._coordinate(
+                    "CHECK-LIVE-2", "qwen-code", input_hashes={"fixture": "b"}
+                ),
+            ],
+        }
+        changed = {
+            **first,
+            "attempts": [
+                first["attempts"][0],
+                {**first["attempts"][1], "input_hashes": {"fixture": "changed"}},
+            ],
+        }
         calls = []
 
         def fake_run(argv, *, timeout_seconds=None):
             calls.append(argv)
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}),
+            patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run),
+        ):
             checkpoint = Path(temporary) / "checkpoint.json"
             execute(first, checkpoint)
             calls.clear()
             resumed = execute(changed, checkpoint)
-        self.assertEqual(2, len(calls), "only the changed coordinate receives command plus cleanup")
-        self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2"], [row["name"] for row in resumed["checks"]])
+        self.assertEqual(
+            2, len(calls), "only the changed coordinate receives command plus cleanup"
+        )
+        self.assertEqual(
+            ["CHECK-LIVE-1", "CHECK-LIVE-2"], [row["name"] for row in resumed["checks"]]
+        )
 
     """Controls prove that M08 rehearsal cannot impersonate M09 native proof."""
 
@@ -105,20 +182,47 @@ class LiveMatrixContractTests(unittest.TestCase):
             {item.name for item in PLATFORM_CLAIMS},
         )
         for item in PLATFORM_CLAIMS:
-            self.assertTrue(all((item.scenario, item.trigger, item.expected, item.oracle, item.cleanup)))
+            self.assertTrue(
+                all(
+                    (
+                        item.scenario,
+                        item.trigger,
+                        item.expected,
+                        item.oracle,
+                        item.cleanup,
+                    )
+                )
+            )
 
     def test_live_checks_remain_reserved_without_m09_authorization(self) -> None:
-        completed = subprocess.run([sys.executable, str(MATRIX)], cwd=ROOT, text=True, capture_output=True, check=True)
+        completed = subprocess.run(
+            [sys.executable, str(MATRIX)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
         result = json.loads(completed.stdout)
         self.assertEqual("RESERVED_FOR_M09", result["outcome"])
-        self.assertEqual([f"CHECK-LIVE-{number}" for number in range(1, 17)], [item["name"] for item in result["checks"]])
+        self.assertEqual(
+            [f"CHECK-LIVE-{number}" for number in range(1, 17)],
+            [item["name"] for item in result["checks"]],
+        )
         self.assertEqual(set(CHECKS), {item["name"] for item in result["checks"]})
 
     def test_exhaustive_matrix_keeps_native_gaps_and_profile_reasons(self) -> None:
         cells = expected_cells()
-        self.assertGreater(len(cells), 100, "matrix must not retain the obsolete four-attempt ceiling")
+        self.assertGreater(
+            len(cells), 100, "matrix must not retain the obsolete four-attempt ceiling"
+        )
         self.assertTrue(all(cell["applicability_reason"] for cell in cells))
-        completed = subprocess.run([sys.executable, str(MATRIX)], cwd=ROOT, text=True, capture_output=True, check=True)
+        completed = subprocess.run(
+            [sys.executable, str(MATRIX)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
         rows = json.loads(completed.stdout)["cells"]
         for platform, gap in NATIVE_GAPS.items():
             with self.subTest(platform=platform):
@@ -132,37 +236,57 @@ class LiveMatrixContractTests(unittest.TestCase):
             for command in MANAGED_ONLY:
                 with self.subTest(platform=platform, command=command):
                     managed_only_plain = [
-                        row for row in rows
-                        if row["platform"] == platform and row["command"] == command and row["profile"] == "plain"
+                        row
+                        for row in rows
+                        if row["platform"] == platform
+                        and row["command"] == command
+                        and row["profile"] == "plain"
                     ]
                     self.assertTrue(managed_only_plain)
-                    self.assertTrue(all(row["applicable"] == "false" for row in managed_only_plain))
-                    self.assertTrue(all(row["outcome"] == "NOT_APPLICABLE" for row in managed_only_plain))
+                    self.assertTrue(
+                        all(row["applicable"] == "false" for row in managed_only_plain)
+                    )
+                    self.assertTrue(
+                        all(
+                            row["outcome"] == "NOT_APPLICABLE"
+                            for row in managed_only_plain
+                        )
+                    )
 
-    def test_same_input_failed_attempt_is_terminal_without_duplicate_side_effect(self) -> None:
+    def test_same_input_failed_attempt_is_terminal_without_duplicate_side_effect(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             counter = root / "counter.txt"
-            evidence = {kind: str(root / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}
+            evidence = {
+                kind: str(root / f"{kind}.txt")
+                for kind in ("transcript", "hook", "state", "cleanup")
+            }
             increment = (
                 "from pathlib import Path; "
                 f"counter = Path({str(counter)!r}); "
                 "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')"
             )
             manifest = {
-                "native_runner_identity": {"platform": "Windows"}, "total_budget_seconds": 3,
-                "attempts": [{
-                    "name": "CHECK-LIVE-1",
-                    "target": "counter regression",
-                    "provider": "codex",
-                    "profile": "managed",
-                    "platform": "Windows",
-                    "command": [sys.executable, "-c", increment],
-                    "cleanup_command": [sys.executable, "-c", "pass"],
-                    "evidence": evidence,
-                    "evidence_oracles": {kind: ["required token"] for kind in evidence},
-                    "agent_expectations": [{"classification": "Observed"}],
-                }],
+                "native_runner_identity": {"platform": "Windows"},
+                "total_budget_seconds": 3,
+                "attempts": [
+                    {
+                        "name": "CHECK-LIVE-1",
+                        "target": "counter regression",
+                        "provider": "codex",
+                        "profile": "managed",
+                        "platform": "Windows",
+                        "command": [sys.executable, "-c", increment],
+                        "cleanup_command": [sys.executable, "-c", "pass"],
+                        "evidence": evidence,
+                        "evidence_oracles": {
+                            kind: ["required token"] for kind in evidence
+                        },
+                        "agent_expectations": [{"classification": "Observed"}],
+                    }
+                ],
             }
             checkpoint = root / "checkpoint.json"
             with patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}):
@@ -172,5 +296,7 @@ class LiveMatrixContractTests(unittest.TestCase):
             self.assertEqual("1", counter.read_text(encoding="utf-8"))
             self.assertEqual("FAIL", first["outcome"])
             self.assertEqual("FAIL", resumed["outcome"])
-            self.assertEqual(["CHECK-LIVE-1"], [row["name"] for row in resumed["checks"]])
+            self.assertEqual(
+                ["CHECK-LIVE-1"], [row["name"] for row in resumed["checks"]]
+            )
             self.assertEqual("FAIL", resumed["checks"][0]["outcome"])

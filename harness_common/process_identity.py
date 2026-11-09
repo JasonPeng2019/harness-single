@@ -19,8 +19,12 @@ from .platform_paths import procfs_root
 
 
 def _valid_pid(pid: object) -> bool:
-    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-            and pid <= (0xFFFFFFFF if os.name == "nt" else 0x7FFFFFFF))
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and pid <= (0xFFFFFFFF if os.name == "nt" else 0x7FFFFFFF)
+    )
 
 
 def _windows_process_identity(pid: int) -> dict[str, Any] | None:
@@ -171,7 +175,9 @@ def darwin_process_ids() -> tuple[int, ...] | None:
         count = max(32, (required + 3) // 4 + 32)
         for _ in range(3):
             pids = (ctypes.c_uint32 * count)()
-            received = libproc.proc_listpids(1, 0, ctypes.byref(pids), ctypes.sizeof(pids))
+            received = libproc.proc_listpids(
+                1, 0, ctypes.byref(pids), ctypes.sizeof(pids)
+            )
             if received < 0 or received % 4:
                 return None
             if received < ctypes.sizeof(pids):
@@ -186,12 +192,14 @@ def _linux_process_identity(pid: int) -> dict[str, Any] | None:
     if not _valid_pid(pid):
         return None
     try:
-        with open(procfs_root() / str(pid) / "stat", encoding="utf-8", errors="replace") as handle:
+        with open(
+            procfs_root() / str(pid) / "stat", encoding="utf-8", errors="replace"
+        ) as handle:
             stat = handle.read(1_000_001)
         if len(stat) > 1_000_000 or not stat.startswith(f"{pid} ("):
             return None
         close = stat.rfind(")")
-        if close < len(str(pid)) + 2 or stat[close + 1:close + 2] != " ":
+        if close < len(str(pid)) + 2 or stat[close + 1 : close + 2] != " ":
             return None
         fields = stat[close + 2 :].split()
         start_ticks = fields[19]  # /proc/<pid>/stat field 22

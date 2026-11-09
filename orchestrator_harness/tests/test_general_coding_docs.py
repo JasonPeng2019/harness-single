@@ -67,10 +67,22 @@ class GeneralCodingDocumentationTests(unittest.TestCase):
             set(invocation["provider"]["launch_config"]),
         )
         self.assertIn("exclusive_resources", invocation)
-        result = json.loads((REPOSITORY_ROOT / "examples/coding.result.example.json").read_text(encoding="utf-8"))
+        result = json.loads(
+            (REPOSITORY_ROOT / "examples/coding.result.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
         self.assertEqual("result/v1", result["schema"])
         self.assertEqual(result["run_id"], result["worker_invocation_id"])
-        for field in ("task_card_hash", "branch", "commit", "checks", "evidence", "completed_at", "content_hash"):
+        for field in (
+            "task_card_hash",
+            "branch",
+            "commit",
+            "checks",
+            "evidence",
+            "completed_at",
+            "content_hash",
+        ):
             self.assertIn(field, result)
 
     def test_v2_operator_contract_is_explicit_and_scoped(self) -> None:

@@ -9,10 +9,23 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from orchestrator_harness import controller, git_source, leases, manager_queue, monitor, review, scan_watch, setup
+from orchestrator_harness import (
+    controller,
+    git_source,
+    leases,
+    manager_queue,
+    monitor,
+    review,
+    scan_watch,
+    setup,
+)
 from orchestrator_harness.controller import ProviderExecution
 from orchestrator_harness.core import content_hash, iso_utc
-from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA, lane_record_dir
+from orchestrator_harness.epochs import (
+    CURRENT_EPOCH_SCHEMA,
+    MANAGER_QUEUE_SCHEMA,
+    lane_record_dir,
+)
 from orchestrator_harness.manager_queue import (
     append_assignment,
     append_watch_delivery,
@@ -21,7 +34,11 @@ from orchestrator_harness.manager_queue import (
     read_manager_queue,
 )
 from orchestrator_harness.records import atomic_write_json, read_jsonl, read_record
-from orchestrator_harness.tests.support import PreparedRootFixture, prepare_lane_fixture, seed_provider_history
+from orchestrator_harness.tests.support import (
+    PreparedRootFixture,
+    prepare_lane_fixture,
+    seed_provider_history,
+)
 from orchestrator_harness.lanes import write_lane
 from orchestrator_harness.stable_io import PreparedOutputTransaction
 
@@ -71,18 +88,37 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def _reviewable_lane(self) -> dict[str, object]:
         """A real linked lane whose current committed PASS RESULT awaits ROOT review."""
-        lane = prepare_lane_fixture(self.runtime, "epoch-1", {
-            "lane_id": "lane-1", "run_id": "run-1", "lifecycle": "review_pending",
-            "worktree_path": str(Path(self.temp.name) / "review-worktree"),
-            "provider": {"id": "claude-code"}, "last_reported_actionable_status": None,
-        })
+        lane = prepare_lane_fixture(
+            self.runtime,
+            "epoch-1",
+            {
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "lifecycle": "review_pending",
+                "worktree_path": str(Path(self.temp.name) / "review-worktree"),
+                "provider": {"id": "claude-code"},
+                "last_reported_actionable_status": None,
+            },
+        )
         result = {
-            "schema": "result/v1", "lane_id": "lane-1", "run_id": "run-1",
-            "worker_invocation_id": "run-1", "task_card_hash": lane["task_card_hash"],
+            "schema": "result/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worker_invocation_id": "run-1",
+            "task_card_hash": lane["task_card_hash"],
             "branch": lane["git_source"]["branch_ref"].removeprefix("refs/heads/"),
-            "commit": git_source.current_tip(lane), "outcome": "PASS", "summary": "completed",
-            "checks": [{"name": "fixture", "command": ["python", "-m", "unittest"], "outcome": "PASS"}],
-            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}], "completed_at": iso_utc(),
+            "commit": git_source.current_tip(lane),
+            "outcome": "PASS",
+            "summary": "completed",
+            "checks": [
+                {
+                    "name": "fixture",
+                    "command": ["python", "-m", "unittest"],
+                    "outcome": "PASS",
+                }
+            ],
+            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}],
+            "completed_at": iso_utc(),
         }
         result["content_hash"] = content_hash(result)
         atomic_write_json(Path(str(lane["result_path"])), result)
@@ -91,7 +127,11 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_outbox_promotes_before_archive_and_retries_to_one_event(self) -> None:
         lane = self._lane()
-        outbox = Path(str(lane["worktree_path"])) / ".agent-workspace" / "manager-notifications"
+        outbox = (
+            Path(str(lane["worktree_path"]))
+            / ".agent-workspace"
+            / "manager-notifications"
+        )
         notice_path = outbox / "notice-1.json"
         atomic_write_json(
             notice_path,
@@ -107,10 +147,17 @@ class Addendum3ProductTests(unittest.TestCase):
                 "summary": "ROOT action needed",
             },
         )
-        with patch.object(PreparedOutputTransaction, "write_bytes", side_effect=OSError("archive unavailable")):
+        with patch.object(
+            PreparedOutputTransaction,
+            "write_bytes",
+            side_effect=OSError("archive unavailable"),
+        ):
             diagnostics = monitor._consume_outbox(self.runtime, "epoch-1", lane)
         self.assertTrue(diagnostics)
-        self.assertTrue(notice_path.is_file(), "promotion failure/archive failure must retain source")
+        self.assertTrue(
+            notice_path.is_file(),
+            "promotion failure/archive failure must retain source",
+        )
         event = read_manager_queue(self.runtime)["events"][0]
         self.assertEqual("worker-signal-1", event["data"]["signal_id"])
         self.assertEqual("WORKER_ESCALATION", event["event_class"])
@@ -120,11 +167,17 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_malformed_outbox_is_retained_and_reported(self) -> None:
         lane = self._lane()
-        outbox = Path(str(lane["worktree_path"])) / ".agent-workspace" / "manager-notifications"
+        outbox = (
+            Path(str(lane["worktree_path"]))
+            / ".agent-workspace"
+            / "manager-notifications"
+        )
         bad_path = outbox / "malformed.json"
         atomic_write_json(bad_path, ["not", "a", "notice"])
         diagnostics = monitor._consume_outbox(self.runtime, "epoch-1", lane)
-        self.assertTrue(any(item["kind"] == "outbox_inspection" for item in diagnostics))
+        self.assertTrue(
+            any(item["kind"] == "outbox_inspection" for item in diagnostics)
+        )
         self.assertTrue(bad_path.is_file())
         self.assertEqual([], read_manager_queue(self.runtime)["events"])
 
@@ -141,9 +194,7 @@ class Addendum3ProductTests(unittest.TestCase):
         )
         queue = read_manager_queue(self.runtime)
         self.assertIsNotNone(
-            scan_watch._watch_event(
-                queue, root_session_id="root-1", binding_id="codex"
-            )
+            scan_watch._watch_event(queue, root_session_id="root-1", binding_id="codex")
         )
         self.assertTrue(
             append_watch_delivery(
@@ -155,17 +206,15 @@ class Addendum3ProductTests(unittest.TestCase):
         )
         queue = read_manager_queue(self.runtime)
         self.assertIsNone(
-            scan_watch._watch_event(
-                queue, root_session_id="root-1", binding_id="codex"
-            )
+            scan_watch._watch_event(queue, root_session_id="root-1", binding_id="codex")
         )
         self.assertIsNotNone(
-            scan_watch._watch_event(
-                queue, root_session_id="root-2", binding_id="codex"
-            )
+            scan_watch._watch_event(queue, root_session_id="root-2", binding_id="codex")
         )
 
-    def test_force_release_audit_retains_holder_and_reports_partial_terminal_audit(self) -> None:
+    def test_force_release_audit_retains_holder_and_reports_partial_terminal_audit(
+        self,
+    ) -> None:
         path = leases.lease_path(self.runtime, "resource-1")
         holder = {
             "schema": leases.LEASE_SCHEMA,
@@ -176,27 +225,52 @@ class Addendum3ProductTests(unittest.TestCase):
             "creation_time": "windows-filetime:134361777213898726",
         }
         atomic_write_json(path, holder)
-        lane = {"lane_id": "lane-1", "run_id": "run-1", "lifecycle": "running",
-                "process": {key: holder[key] for key in ("pid", "creation_time")},
-                "controller_status_path": str(self.runtime / "epochs/epoch/lanes/lane-1/runs/run-1/controller.status.json")}
-        atomic_write_json(Path(lane["controller_status_path"]), {"schema": "controller-status/v1",
-            "lane_id": "lane-1", "run_id": "run-1", "controller_identity": lane["process"],
-            "controller_state": "exited", "provider_state": {"state": "not_started"}, "cleanup_proven": True})
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "lifecycle": "running",
+            "process": {key: holder[key] for key in ("pid", "creation_time")},
+            "controller_status_path": str(
+                self.runtime
+                / "epochs/epoch/lanes/lane-1/runs/run-1/controller.status.json"
+            ),
+        }
+        atomic_write_json(
+            Path(lane["controller_status_path"]),
+            {
+                "schema": "controller-status/v1",
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "controller_identity": lane["process"],
+                "controller_state": "exited",
+                "provider_state": {"state": "not_started"},
+                "cleanup_proven": True,
+            },
+        )
         with (
             patch.object(leases, "identity_matches", return_value=False),
             patch.object(leases, "identity_exit_proven", return_value=True),
-            patch("orchestrator_harness.processes.identity_exit_proven", return_value=True),
-            patch.object(leases, "append_jsonl", side_effect=[None, OSError("audit full")]),
+            patch(
+                "orchestrator_harness.processes.identity_exit_proven", return_value=True
+            ),
+            patch.object(
+                leases, "append_jsonl", side_effect=[None, OSError("audit full")]
+            ),
         ):
             with self.assertRaises(leases.LeaseError) as raised:
-                leases.force_release_lease_audited(self.runtime, "resource-1", lane=lane)
-        self.assertEqual(leases.FORCE_RELEASE_AUDIT_TERMINAL_FAILED, raised.exception.code)
+                leases.force_release_lease_audited(
+                    self.runtime, "resource-1", lane=lane
+                )
+        self.assertEqual(
+            leases.FORCE_RELEASE_AUDIT_TERMINAL_FAILED, raised.exception.code
+        )
         self.assertTrue(raised.exception.released)
         self.assertFalse(path.exists())
 
     def test_monitor_heartbeat_records_zero_and_diagnostics_atomically(self) -> None:
         import os
         from orchestrator_harness import processes
+
         identity = processes.process_identity(os.getpid())
         monitor_path = self.runtime / "monitor" / "MONITOR.json"
         atomic_write_json(
@@ -219,7 +293,9 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("degraded", record["health"])
         self.assertEqual("outbox_promotion", record["diagnostics"][0]["kind"])
 
-    def test_rejected_review_signal_is_consumed_without_creating_another_event(self) -> None:
+    def test_rejected_review_signal_is_consumed_without_creating_another_event(
+        self,
+    ) -> None:
         from orchestrator_harness import resume
 
         event = promote_event(
@@ -240,21 +316,29 @@ class Addendum3ProductTests(unittest.TestCase):
         lane = self._reviewable_lane()
         lane_dir = lane_record_dir(self.runtime, "epoch-1", "lane-1")
         # Valid current work with no ROOT pair and no open request regains one request.
-        self.assertFalse(monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane))
+        self.assertFalse(
+            monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane)
+        )
         monitor._recover_lost_review_event(self.runtime, "epoch-1", lane)
         monitor._recover_lost_review_event(
-            self.runtime, "epoch-1", monitor.read_lane(self.runtime, "epoch-1", "lane-1")
+            self.runtime,
+            "epoch-1",
+            monitor.read_lane(self.runtime, "epoch-1", "lane-1"),
         )
         events = read_manager_queue(self.runtime)["events"]
         self.assertEqual(1, len(events))
         self.assertEqual("COMPLETION_REVIEW_REQUIRED", events[0]["type"])
-        recovered = monitor.read_lane(self.runtime, "epoch-1", "lane-1")["review_recovery"]
+        recovered = monitor.read_lane(self.runtime, "epoch-1", "lane-1")[
+            "review_recovery"
+        ]
         self.assertEqual(events[0]["event_id"], recovered["event_id"])
         # A malformed ROOT decision is preserved for explicit reconciliation, never deleted.
         review_path = lane_dir / "COMPLETION_REVIEW.json"
         atomic_write_json(review_path, {"broken": True})
         before = review_path.read_bytes()
-        with self.assertRaisesRegex(ValueError, "preserve it for explicit ROOT reconciliation"):
+        with self.assertRaisesRegex(
+            ValueError, "preserve it for explicit ROOT reconciliation"
+        ):
             monitor._recover_broken_review_pair(self.runtime, "epoch-1", lane)
         self.assertEqual(before, review_path.read_bytes())
         self.assertFalse((lane_dir / "ORCHESTRATOR_ACCEPTANCE.json").exists())
@@ -262,7 +346,10 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_review_recovery_waits_for_pair_publication(self) -> None:
         lane = self._reviewable_lane()
-        review_path = lane_record_dir(self.runtime, "epoch-1", "lane-1") / "COMPLETION_REVIEW.json"
+        review_path = (
+            lane_record_dir(self.runtime, "epoch-1", "lane-1")
+            / "COMPLETION_REVIEW.json"
+        )
         first_write = threading.Event()
         allow_second_write = threading.Event()
         recovery_lock_requested = threading.Event()
@@ -281,7 +368,9 @@ class Addendum3ProductTests(unittest.TestCase):
             if path == review_path:
                 first_write.set()
                 if not allow_second_write.wait(timeout):
-                    raise AssertionError("timed out waiting to complete review publication")
+                    raise AssertionError(
+                        "timed out waiting to complete review publication"
+                    )
 
         def tracked_lock(path: Path) -> RecordLock:
             if Path(path).absolute() == review_path.absolute():
@@ -328,14 +417,15 @@ class Addendum3ProductTests(unittest.TestCase):
             recovery.join(timeout)
 
         self.assertTrue(lock_observed, "recovery must acquire the writer's review lock")
-        self.assertTrue(waited_for_writer, "recovery must not inspect a half-published pair")
+        self.assertTrue(
+            waited_for_writer, "recovery must not inspect a half-published pair"
+        )
         self.assertFalse(writer.is_alive())
         self.assertFalse(recovery.is_alive())
         self.assertEqual([], writer_errors)
         self.assertEqual([], recovery_errors)
         self.assertEqual([False], recovery_result)
         self.assertTrue(monitor._review_pair_is_valid(self.runtime, "epoch-1", lane))
-
 
     def test_invalid_result_launches_once_without_automatic_resume(self) -> None:
         worktree = self.runtime / "controller-worktree"
@@ -395,29 +485,49 @@ class Addendum3ProductTests(unittest.TestCase):
 
         with (
             patch.object(controller, "find_harness_root", return_value=Path("root")),
-            patch.object(controller, "load_config", return_value=type("Config", (), {"runtime_root": self.runtime})()),
-            patch.object(controller, "find_active_lane", return_value=("epoch-1", lane)),
+            patch.object(
+                controller,
+                "load_config",
+                return_value=type("Config", (), {"runtime_root": self.runtime})(),
+            ),
+            patch.object(
+                controller, "find_active_lane", return_value=("epoch-1", lane)
+            ),
             patch.object(controller, "read_record", return_value=invocation),
             patch.object(controller, "_write_status"),
             patch.object(controller, "_append_event"),
-            patch.object(controller.processes, "process_identity", return_value=self.controller_identity),
+            patch.object(
+                controller.processes,
+                "process_identity",
+                return_value=self.controller_identity,
+            ),
             patch.object(controller, "update_lane", return_value=lane),
             patch.object(controller, "_load_binding", return_value=object()),
             patch.object(controller, "acquire_leases"),
             patch.object(controller, "release_leases"),
             patch.object(controller, "_run_provider", side_effect=record_call),
             patch.object(controller, "_validate_result", side_effect=validate_results),
-            patch.object(controller, "_read_acceptance_chain", return_value={"acceptance": {"approval": "REJECTED"}}),
+            patch.object(
+                controller,
+                "_read_acceptance_chain",
+                return_value={"acceptance": {"approval": "REJECTED"}},
+            ),
         ):
             self.assertEqual(0, controller.run_controller("lane-1"))
         self.assertEqual(1, len(calls))
         self.assertFalse(calls[0][1]["resume"])
         attempts = read_jsonl(Path(lane["attempts_path"]))
         self.assertEqual(1, len(attempts) - 1)  # exactly one actual launch
-        self.assertEqual(0, len(list((workspace / "attempts").glob("correction-prompt-*.md"))))
+        self.assertEqual(
+            0, len(list((workspace / "attempts").glob("correction-prompt-*.md")))
+        )
 
     def _run_candidate_correction_boundary(
-        self, *, valid_on_second: bool, scenario: str = "bounded", prior_invocations: int = 0
+        self,
+        *,
+        valid_on_second: bool,
+        scenario: str = "bounded",
+        prior_invocations: int = 0,
     ) -> dict[str, object]:
         suffix = {
             "bounded": "valid-second" if valid_on_second else "exhausted-second",
@@ -457,9 +567,12 @@ class Addendum3ProductTests(unittest.TestCase):
         if prior_invocations:
             Path(lane["attempts_path"]).write_text(
                 '{"schema":"controller-attempts/v1"}\n'
-                '{"run_id":"previous-run","attempt":1,"provider_started":true}\n', encoding="utf-8"
+                '{"run_id":"previous-run","attempt":1,"provider_started":true}\n',
+                encoding="utf-8",
             )
-        lane_path = self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1" / "lane.json"
+        lane_path = (
+            self.runtime / "epochs" / "epoch-1" / "lanes" / "lane-1" / "lane.json"
+        )
         atomic_write_json(lane_path, {"schema": "lane/v1", **lane})
         atomic_write_json(
             workspace / "invocation.json",
@@ -494,9 +607,7 @@ class Addendum3ProductTests(unittest.TestCase):
             status_transitions.append(dict(fields))
             real_write_status(current_lane, fields)
 
-        def track_release_leases(
-            runtime: Path, lane_id: str, run_id: str
-        ) -> None:
+        def track_release_leases(runtime: Path, lane_id: str, run_id: str) -> None:
             held = leases.read_lease(runtime, "resource-1")
             self.assertIsNotNone(held)
             for boundary in boundaries:
@@ -527,7 +638,10 @@ class Addendum3ProductTests(unittest.TestCase):
 
             if attempt_number == 1:
                 self.assertEqual(bool(prior_invocations), resume)
-                self.assertEqual({"session_id": "native-session-1"} if prior_invocations else {}, current_lane.get("session"))
+                self.assertEqual(
+                    {"session_id": "native-session-1"} if prior_invocations else {},
+                    current_lane.get("session"),
+                )
                 self.assertEqual(Path(current_lane["prompt_path"]), prompt_path)
             else:
                 self.assertTrue(resume)
@@ -640,9 +754,14 @@ class Addendum3ProductTests(unittest.TestCase):
                 "load_config",
                 return_value=type("Config", (), {"runtime_root": self.runtime})(),
             ),
-            patch.object(controller.processes, "process_identity", return_value=self.controller_identity),
             patch.object(
-                controller, "_load_binding",
+                controller.processes,
+                "process_identity",
+                return_value=self.controller_identity,
+            ),
+            patch.object(
+                controller,
+                "_load_binding",
                 return_value=(
                     SimpleNamespace(parse_line=lambda _line: None)
                     if scenario in {"receipts", "receipt-failure", "malformed-receipt"}
@@ -651,7 +770,9 @@ class Addendum3ProductTests(unittest.TestCase):
             ),
             patch.object(controller, "update_lane", side_effect=track_update_lane),
             patch.object(controller, "_write_status", side_effect=track_write_status),
-            patch.object(controller, "release_leases", side_effect=track_release_leases),
+            patch.object(
+                controller, "release_leases", side_effect=track_release_leases
+            ),
             patch.object(controller, "_run_provider", side_effect=run_provider),
             patch.object(
                 controller,
@@ -686,14 +807,15 @@ class Addendum3ProductTests(unittest.TestCase):
         }
 
     def test_prior_manual_invocation_leaves_no_automatic_retry(self) -> None:
-        observed = self._run_candidate_correction_boundary(valid_on_second=False, prior_invocations=1)
+        observed = self._run_candidate_correction_boundary(
+            valid_on_second=False, prior_invocations=1
+        )
         self.assertEqual(1, len(observed["calls"]))
         self.assertEqual([], observed["correction_prompts"])
-        self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+        self.assertEqual(
+            "provider_exited_no_result", observed["status"]["recorded_status"]
+        )
         self.assertIsNone(observed["lease_after"])
-
-
-
 
     def test_run_provider_passes_saved_session_and_resume_to_binding(self) -> None:
         worktree = self.runtime / "provider-wiring-worktree"
@@ -764,7 +886,9 @@ class Addendum3ProductTests(unittest.TestCase):
             return child
 
         with (
-            patch.object(controller.processes, "spawn_provider", side_effect=spawn) as spawned,
+            patch.object(
+                controller.processes, "spawn_provider", side_effect=spawn
+            ) as spawned,
             patch.object(
                 controller.processes.ProcessBoundary,
                 "for_process",
@@ -801,19 +925,27 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(1, len(observed["calls"]))
         self.assertEqual([], observed["correction_prompts"])
         self.assertFalse(observed["result_path"].exists())
-        self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+        self.assertEqual(
+            "provider_exited_no_result", observed["status"]["recorded_status"]
+        )
         self.assertTrue(observed["status"]["diagnosis_required"])
         self.assertFalse(observed["status"]["automatic_retry"])
         self.assertEqual("result_invalid", observed["lane"]["lifecycle"])
-        self.assertEqual({"session_id": "native-session-1"}, observed["lane"]["session"])
+        self.assertEqual(
+            {"session_id": "native-session-1"}, observed["lane"]["session"]
+        )
         self.assertIsNone(observed["lease_after"])
 
     def test_single_failed_launch_retains_its_native_receipt(self) -> None:
-        observed = self._run_candidate_correction_boundary(valid_on_second=True, scenario="receipts")
+        observed = self._run_candidate_correction_boundary(
+            valid_on_second=True, scenario="receipts"
+        )
         rows = observed["attempts"][1:]
         self.assertEqual(1, len(rows))
         row = rows[0]
-        self.assertEqual(("lane-1", "run-1", 1), (row["lane_id"], row["run_id"], row["attempt"]))
+        self.assertEqual(
+            ("lane-1", "run-1", 1), (row["lane_id"], row["run_id"], row["attempt"])
+        )
         self.assertEqual("native-session-1", row["session_id"])
         self.assertEqual("observed", row["native_usage_state"])
         self.assertEqual(1, len(row["native_usage_observations"]))
@@ -822,7 +954,9 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual([], observed["correction_prompts"])
 
     def test_failed_provider_still_appends_its_native_receipt(self) -> None:
-        observed = self._run_candidate_correction_boundary(valid_on_second=False, scenario="receipt-failure")
+        observed = self._run_candidate_correction_boundary(
+            valid_on_second=False, scenario="receipt-failure"
+        )
         self.assertEqual(0, observed["exit_code"])
         rows = observed["attempts"][1:]
         self.assertEqual(1, len(rows))
@@ -831,22 +965,29 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("observed", rows[0]["native_usage_state"])
         self.assertEqual("turn-1", rows[0]["native_usage_observations"][0]["turn_id"])
 
-    def test_malformed_receipt_still_appends_failed_attempt_and_releases_lease(self) -> None:
+    def test_malformed_receipt_still_appends_failed_attempt_and_releases_lease(
+        self,
+    ) -> None:
         observed = self._run_candidate_correction_boundary(
             valid_on_second=False, scenario="malformed-receipt"
         )
         self.assertEqual(0, observed["exit_code"])
         row = observed["attempts"][1]
-        self.assertEqual(("lane-1", "run-1", 1),
-                         (row["lane_id"], row["run_id"], row["attempt"]))
+        self.assertEqual(
+            ("lane-1", "run-1", 1), (row["lane_id"], row["run_id"], row["attempt"])
+        )
         self.assertEqual("incomplete", row["native_usage_state"])
         self.assertEqual([], row["native_usage_observations"])
         self.assertIn("malformed", row["native_usage_capture_error"])
-        self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+        self.assertEqual(
+            "provider_exited_no_result", observed["status"]["recorded_status"]
+        )
         self.assertTrue(row["cleanup_proven"])
         self.assertIsNone(observed["lease_after"])
 
-    def test_first_invalid_result_is_terminal_with_durable_cleanup_evidence(self) -> None:
+    def test_first_invalid_result_is_terminal_with_durable_cleanup_evidence(
+        self,
+    ) -> None:
         observed = self._run_candidate_correction_boundary(valid_on_second=False)
         self.assertEqual(1, len(observed["calls"]))
         self.assertEqual([], observed["correction_prompts"])
@@ -859,17 +1000,23 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(0, observed["status"]["correction_attempts"])
         observed["boundaries"][0].cleanup.assert_called_once()
         self.assertIsNone(observed["lease_after"])
-        events = [item["event_type"] for item in observed["events"] if "event_type" in item]
+        events = [
+            item["event_type"] for item in observed["events"] if "event_type" in item
+        ]
         self.assertNotIn("correction_requested", events)
         self.assertEqual(1, events.count("provider_exited_no_result"))
 
     def test_session_availability_never_causes_a_second_launch(self) -> None:
         for scenario in ("no-session", "resume-unavailable"):
             with self.subTest(scenario=scenario):
-                observed = self._run_candidate_correction_boundary(valid_on_second=False, scenario=scenario)
+                observed = self._run_candidate_correction_boundary(
+                    valid_on_second=False, scenario=scenario
+                )
                 self.assertEqual(1, len(observed["calls"]))
                 self.assertEqual([], observed["correction_prompts"])
-                self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+                self.assertEqual(
+                    "provider_exited_no_result", observed["status"]["recorded_status"]
+                )
                 self.assertEqual("result_invalid", observed["lane"]["lifecycle"])
                 self.assertEqual(1, len(observed["attempts"][1:]))
 
@@ -882,9 +1029,7 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual([], observed["correction_prompts"])
         self.assertEqual("provider_start_failed", observed["status"]["recorded_status"])
         event_types = [
-            item["event_type"]
-            for item in observed["events"]
-            if "event_type" in item
+            item["event_type"] for item in observed["events"] if "event_type" in item
         ]
         self.assertEqual(1, event_types.count("provider_start_failed"))
         self.assertEqual(0, event_types.count("correction_requested"))
@@ -944,19 +1089,37 @@ class Addendum3ProductTests(unittest.TestCase):
         seed_provider_history(self.runtime, lane)
         with (
             patch.object(controller, "find_harness_root", return_value=Path("root")),
-            patch.object(controller, "load_config", return_value=type("Config", (), {"runtime_root": self.runtime})()),
-            patch.object(controller, "find_active_lane", return_value=("epoch-1", lane)),
+            patch.object(
+                controller,
+                "load_config",
+                return_value=type("Config", (), {"runtime_root": self.runtime})(),
+            ),
+            patch.object(
+                controller, "find_active_lane", return_value=("epoch-1", lane)
+            ),
             patch.object(controller, "read_record", return_value=invocation),
             patch.object(controller, "_write_status") as write_status,
             patch.object(controller, "_append_event") as append_event,
-            patch.object(controller.processes, "process_identity", return_value=self.controller_identity),
+            patch.object(
+                controller.processes,
+                "process_identity",
+                return_value=self.controller_identity,
+            ),
             patch.object(controller, "update_lane", return_value=lane),
             patch.object(controller, "_load_binding", return_value=object()),
             patch.object(controller, "acquire_leases"),
             patch.object(controller, "release_leases"),
             patch.object(controller, "_run_provider", return_value=execution),
-            patch.object(controller, "_validate_result", return_value=("valid", {"outcome": "PASS"})),
-            patch.object(controller, "_read_acceptance_chain", return_value={"acceptance": {"approval": "REJECTED"}}),
+            patch.object(
+                controller,
+                "_validate_result",
+                return_value=("valid", {"outcome": "PASS"}),
+            ),
+            patch.object(
+                controller,
+                "_read_acceptance_chain",
+                return_value={"acceptance": {"approval": "REJECTED"}},
+            ),
         ):
             self.assertEqual(0, controller.run_controller("lane-1"))
 
@@ -1004,12 +1167,18 @@ class Addendum3ProductTests(unittest.TestCase):
                 ),
             )
 
-    def test_managed_watch_waits_for_queue_publication_despite_local_lane_status(self) -> None:
+    def test_managed_watch_waits_for_queue_publication_despite_local_lane_status(
+        self,
+    ) -> None:
         fixture = PreparedRootFixture(self)
         with (
             patch.dict(os.environ, fixture.environment, clear=True),
             patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
-            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")) as local_status,
+            patch.object(
+                scan_watch,
+                "_find_actionable",
+                return_value=("lane-1", "review_pending"),
+            ) as local_status,
         ):
             result = scan_watch.run_watch(timeout="0s")
         self.assertFalse(result["ok"], result)
@@ -1025,13 +1194,19 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
             patch.object(scan_watch, "_discover_orphaned_leases", return_value=[]),
             patch.object(scan_watch, "read_manager_queue", side_effect=fail_queue),
-            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")),
+            patch.object(
+                scan_watch,
+                "_find_actionable",
+                return_value=("lane-1", "review_pending"),
+            ),
         ):
             result = scan_watch.run_watch(timeout="0s", root_session_id="root-1")
         self.assertTrue(result["ok"], result)
         self.assertEqual("WATCH_ACTIONABLE", result["code"])
 
-    def test_managed_watch_prefers_delivered_manager_event_over_lane_status(self) -> None:
+    def test_managed_watch_prefers_delivered_manager_event_over_lane_status(
+        self,
+    ) -> None:
         fixture = PreparedRootFixture(self)
         event = promote_event(
             fixture.rt,
@@ -1046,7 +1221,11 @@ class Addendum3ProductTests(unittest.TestCase):
         with (
             patch.dict(os.environ, fixture.environment, clear=True),
             patch.object(scan_watch, "find_harness_root", return_value=fixture.harness),
-            patch.object(scan_watch, "_find_actionable", side_effect=AssertionError("managed watch is queue only")),
+            patch.object(
+                scan_watch,
+                "_find_actionable",
+                side_effect=AssertionError("managed watch is queue only"),
+            ),
         ):
             result = scan_watch.run_watch(timeout="0s")
         self.assertTrue(result["ok"], result)
@@ -1058,7 +1237,9 @@ class Addendum3ProductTests(unittest.TestCase):
         workspace = worktree / ".agent-workspace"
         workspace.mkdir(parents=True)
         transcript_path = workspace / "provider-transcript.jsonl"
-        transcript_path.write_text('{"message": "prior attempt line"}\n', encoding="utf-8")
+        transcript_path.write_text(
+            '{"message": "prior attempt line"}\n', encoding="utf-8"
+        )
         prompt_path = workspace / "worker-prompt.md"
         prompt_path.write_text("do the work\n", encoding="utf-8")
         lane = {
@@ -1076,7 +1257,10 @@ class Addendum3ProductTests(unittest.TestCase):
         invocation = {
             "provider": {
                 "model": "model-1",
-                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
             }
         }
         binding = MagicMock()
@@ -1112,7 +1296,9 @@ class Addendum3ProductTests(unittest.TestCase):
         boundary.record.return_value = {"root": {"pid": 41}}
         boundary.cleanup.return_value = True
         with (
-            patch.object(controller.processes, "spawn_provider", side_effect=fake_spawn),
+            patch.object(
+                controller.processes, "spawn_provider", side_effect=fake_spawn
+            ),
             patch.object(controller.processes, "ProcessBoundary") as boundary_cls,
         ):
             boundary_cls.for_process.return_value = boundary
@@ -1126,7 +1312,9 @@ class Addendum3ProductTests(unittest.TestCase):
             Path(lane["last_message_path"]).read_text(encoding="utf-8"),
         )
 
-    def test_validated_review_pending_with_nonzero_exit_is_not_a_contradiction(self) -> None:
+    def test_validated_review_pending_with_nonzero_exit_is_not_a_contradiction(
+        self,
+    ) -> None:
         worktree = self.runtime / "review-contradiction-worktree"
         (worktree / ".agent-workspace").mkdir(parents=True)
         result = {
@@ -1175,6 +1363,7 @@ class Addendum3ProductTests(unittest.TestCase):
     def test_concurrent_inbox_appends_preserve_both_assignments(self) -> None:
         import os
         from orchestrator_harness import processes
+
         worktree = self.runtime / "inbox-worktree"
         workspace = worktree / ".agent-workspace"
         workspace.mkdir(parents=True)
@@ -1197,7 +1386,10 @@ class Addendum3ProductTests(unittest.TestCase):
             "process": processes.process_identity(os.getpid()),
         }
         lane = write_lane(self.runtime, "epoch-1", "lane-1", lane)
-        atomic_write_json(self.runtime / "RUNTIME_STATE.json", {"schema": "runtime-state/v1", "state": "OPEN"})
+        atomic_write_json(
+            self.runtime / "RUNTIME_STATE.json",
+            {"schema": "runtime-state/v1", "state": "OPEN"},
+        )
         errors: list[BaseException] = []
         results: list[dict[str, object]] = []
 
@@ -1248,7 +1440,9 @@ class Addendum3ProductTests(unittest.TestCase):
                 ),
             )
 
-    def test_prepared_lane_does_not_report_controller_exited_before_launch(self) -> None:
+    def test_prepared_lane_does_not_report_controller_exited_before_launch(
+        self,
+    ) -> None:
         lane = {
             "lane_id": "lane-1",
             "run_id": "run-1",
@@ -1277,7 +1471,10 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider": {
                 "id": "codex",
                 "model": "model-1",
-                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
             },
             "session": {"session_id": "session-1"},
             "lifecycle": "review_pending",
@@ -1285,7 +1482,8 @@ class Addendum3ProductTests(unittest.TestCase):
             "controller_status_path": str(workspace / "controller.status.json"),
         }
         (workspace / "controller.attempts.jsonl").write_text(
-            '{"run_id":"run-old","attempt":1,"provider_started":true}\n', encoding="utf-8"
+            '{"run_id":"run-old","attempt":1,"provider_started":true}\n',
+            encoding="utf-8",
         )
         seed_provider_history(self.runtime, lane, completed=1)
         task_card = {
@@ -1316,10 +1514,14 @@ class Addendum3ProductTests(unittest.TestCase):
             patch.object(
                 resume,
                 "load_config",
-                return_value=SimpleNamespace(runtime_root=self.runtime, profile="plain"),
+                return_value=SimpleNamespace(
+                    runtime_root=self.runtime, profile="plain"
+                ),
             ),
             patch.object(resume, "find_active_lane", return_value=("epoch-1", lane)),
-            patch.object(resume, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(
+                resume, "read_current_epoch", return_value={"epoch_id": "epoch-1"}
+            ),
             patch.object(resume, "read_runtime_state", return_value={"state": "OPEN"}),
             patch.object(resume, "_read_task_card", return_value=task_card),
             patch.object(resume, "_clear_prior_run"),
@@ -1367,7 +1569,10 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider": {
                 "id": "codex",
                 "model": "configured-model",
-                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
             },
         }
         child = MagicMock(pid=41)
@@ -1394,7 +1599,9 @@ class Addendum3ProductTests(unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
-            patch.object(launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}),
+            patch.object(
+                launch, "read_current_epoch", return_value={"epoch_id": "epoch-1"}
+            ),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
             patch.object(launch, "read_lane", side_effect=lambda *_: dict(lane)),
             patch.object(launch, "read_record", return_value=invocation),
@@ -1418,6 +1625,7 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual(
             {"pid": 41, "creation_time": "created-1"}, updates[-1]["process"]
         )
+
 
 if __name__ == "__main__":
     unittest.main()

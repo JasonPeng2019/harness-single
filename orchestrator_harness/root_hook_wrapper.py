@@ -8,8 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from .core import iso_utc
-from .config import compute_config_identity, load_config, load_resource_manifest, path_identity
-from .mutation import ensure_directory_path, open_append_file, read_bytes, safe_relative_path
+from .config import (
+    compute_config_identity,
+    load_config,
+    load_resource_manifest,
+    path_identity,
+)
+from .mutation import (
+    ensure_directory_path,
+    open_append_file,
+    read_bytes,
+    safe_relative_path,
+)
 from .manager_queue import append_delivery_history
 from .root_hook_dispatch import dispatch, unresolved_event_ids
 from .root_session import resolve_root_session
@@ -48,22 +58,38 @@ def _read_binding(path: Path, provider_id: str) -> dict[str, Any]:
             raise RootHookBindingError(
                 f"installed {provider_id} hook has invalid binding {field}"
             )
-    for field in ("harness_root", "runtime_root", "manager_workspace", "root_workspace"):
+    for field in (
+        "harness_root",
+        "runtime_root",
+        "manager_workspace",
+        "root_workspace",
+    ):
         raw = value.get(field)
         if not isinstance(raw, str) or not raw or not Path(raw).is_absolute():
             raise RootHookBindingError(
                 f"installed {provider_id} hook has no bound {field}"
             )
     config = load_config(Path(value["harness_root"]))
-    expected_identity = compute_config_identity(config, load_resource_manifest(config.harness_root))
-    expected_paths = {"runtime_root": config.runtime_root,
-                      "manager_workspace": config.manager_workspace,
-                      "root_workspace": config.root_workspace}
-    if (value.get("config_identity") != expected_identity
-            or any(path_identity(value[field]) != path_identity(wanted)
-                   for field, wanted in expected_paths.items())
-            or path_identity(path.absolute().parent.parent) != path_identity(config.manager_workspace)):
-        raise RootHookBindingError("ROOT_BINDING_STALE: explicitly prepare hooks for the current manager/product configuration")
+    expected_identity = compute_config_identity(
+        config, load_resource_manifest(config.harness_root)
+    )
+    expected_paths = {
+        "runtime_root": config.runtime_root,
+        "manager_workspace": config.manager_workspace,
+        "root_workspace": config.root_workspace,
+    }
+    if (
+        value.get("config_identity") != expected_identity
+        or any(
+            path_identity(value[field]) != path_identity(wanted)
+            for field, wanted in expected_paths.items()
+        )
+        or path_identity(path.absolute().parent.parent)
+        != path_identity(config.manager_workspace)
+    ):
+        raise RootHookBindingError(
+            "ROOT_BINDING_STALE: explicitly prepare hooks for the current manager/product configuration"
+        )
     return value
 
 
@@ -78,7 +104,11 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     path = path.absolute()
     ensure_directory_path(path.parent)
     with open_append_file(path.parent, path.name) as handle:
-        handle.write((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+        handle.write(
+            (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+        )
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -116,7 +146,9 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
         managed = config.profile == "managed"
         scope = {}
         if managed:
-            session_id, binding_id = resolve_root_session(config, provider_id=provider_id)
+            session_id, binding_id = resolve_root_session(
+                config, provider_id=provider_id
+            )
             scope = {"session_id": session_id, "binding_id": binding_id}
         liveness = _workspace_path(
             binding_path, binding.get("liveness_path"), "liveness_path"
@@ -144,7 +176,9 @@ def run(provider_id: str, boundary: str, binding_path: Path) -> dict[str, Any]:
         event_ids = (
             [event_id]
             if event_id
-            else (unresolved_event_ids(Path(binding["runtime_root"])) if managed else [])
+            else (
+                unresolved_event_ids(Path(binding["runtime_root"])) if managed else []
+            )
         )
         if boundary == "post-tool-use" and event_ids:
             receipt_path = _workspace_path(

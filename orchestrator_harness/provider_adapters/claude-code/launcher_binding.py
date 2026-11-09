@@ -11,7 +11,9 @@ ADAPTER_VERSION = "claude-code-v2"
 _LAUNCH_CONFIG_KEYS = frozenset({"effort"})
 
 
-def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+def validate_launch_config(
+    *, model: str, launch_config: dict[str, Any]
+) -> dict[str, str]:
     """Validate every Claude model preference before a provider can start."""
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Claude Code model must be configured")

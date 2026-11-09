@@ -81,7 +81,9 @@ def _emit(result: dict[str, Any], *, as_json: bool) -> int:
     elif result.get("ok"):
         sys.stdout.write(str(result.get("summary", "")).strip() + "\n")
     else:
-        sys.stderr.write(f"{result.get('code', 'FAILED')}: {result.get('summary', '')}\n")
+        sys.stderr.write(
+            f"{result.get('code', 'FAILED')}: {result.get('summary', '')}\n"
+        )
     return 0 if result.get("ok") else 1
 
 
@@ -106,7 +108,11 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
         with runtime_admission_lock(rt), RecordLock(manager_queue_path(rt)):
             queue = read_manager_queue(rt)
         event = next(
-            (item for item in queue.get("events", []) if item.get("event_id") == event_id),
+            (
+                item
+                for item in queue.get("events", [])
+                if item.get("event_id") == event_id
+            ),
             None,
         )
         if event is None:
@@ -121,9 +127,15 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
         acknowledge_event(rt, event_id, **scope)
     except ConfigError as exc:
         code = str(exc).partition(":")[0]
-        return {"ok": False, "code": code if code.startswith("ROOT_SESSION_") else MANAGER_ACK_EVENT_NOT_FOUND,
-                "summary": str(exc), "evidence_paths": [],
-                "next_action": "explicitly prepare ROOT for the current configuration and session"}
+        return {
+            "ok": False,
+            "code": code
+            if code.startswith("ROOT_SESSION_")
+            else MANAGER_ACK_EVENT_NOT_FOUND,
+            "summary": str(exc),
+            "evidence_paths": [],
+            "next_action": "explicitly prepare ROOT for the current configuration and session",
+        }
     except ManagerQueueError as exc:
         return {
             "ok": False,
@@ -149,9 +161,7 @@ def _manager_acknowledge(event_id: str) -> dict[str, Any]:
     }
 
 
-def _manager_close(
-    event_id: str, outcome: str, summary: str | None
-) -> dict[str, Any]:
+def _manager_close(event_id: str, outcome: str, summary: str | None) -> dict[str, Any]:
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
@@ -167,7 +177,11 @@ def _manager_close(
     try:
         queue = read_manager_queue(rt)
         event = next(
-            (item for item in queue.get("events", []) if item.get("event_id") == event_id),
+            (
+                item
+                for item in queue.get("events", [])
+                if item.get("event_id") == event_id
+            ),
             None,
         )
         if event is None:
@@ -294,6 +308,7 @@ def _lease_force_release(resource_id: str) -> dict[str, Any]:
     def resolve_current_lane(lane_id: str) -> dict[str, Any] | None:
         from .epochs import read_current_epoch
         from .lanes import read_lane
+
         marker = read_current_epoch(rt)
         if marker is None:
             return None
@@ -338,7 +353,10 @@ def _lease_force_release(resource_id: str) -> dict[str, Any]:
         "ok": True,
         "code": FORCE_RELEASE_OK,
         "summary": f"lease force-released: {resource_id}; audit recorded",
-        "evidence_paths": [str(lease_path(rt, resource_id)), audit_result["audit_path"]],
+        "evidence_paths": [
+            str(lease_path(rt, resource_id)),
+            audit_result["audit_path"],
+        ],
         "next_action": "none",
         "released": True,
         "lease_absent": bool(audit_result["lease_absent"]),
@@ -357,12 +375,16 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="operator_launch",
         description="The harness v2 public launcher.",
     )
-    parser.add_argument("--json", action="store_true", help="emit the machine-readable result object")
+    parser.add_argument(
+        "--json", action="store_true", help="emit the machine-readable result object"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     harness = subparsers.add_parser("harness", help="runtime lifecycle commands")
     harness_sub = harness.add_subparsers(dest="harness_command", required=True)
-    setup_parser = harness_sub.add_parser("setup", help="one-time idempotent integration")
+    setup_parser = harness_sub.add_parser(
+        "setup", help="one-time idempotent integration"
+    )
     setup_parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -388,22 +410,34 @@ def _build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--task-card", required=True)
     launch_parser = lane_sub.add_parser("launch", help="start one prepared lane")
     launch_parser.add_argument("--lane-id", required=True)
-    review_parser = lane_sub.add_parser("completion-review", help="record ROOT's review and acceptance")
+    review_parser = lane_sub.add_parser(
+        "completion-review", help="record ROOT's review and acceptance"
+    )
     review_selector = review_parser.add_mutually_exclusive_group(required=True)
     review_selector.add_argument("--event-id")
     review_selector.add_argument("--lane-id")
-    review_parser.add_argument("--review-outcome", required=True, choices=["PASS", "FAIL", "BLOCKED"])
-    review_parser.add_argument("--approval", required=True, choices=["ACCEPTED", "REJECTED"])
+    review_parser.add_argument(
+        "--review-outcome", required=True, choices=["PASS", "FAIL", "BLOCKED"]
+    )
+    review_parser.add_argument(
+        "--approval", required=True, choices=["ACCEPTED", "REJECTED"]
+    )
     review_parser.add_argument("--review-summary", required=True)
     review_parser.add_argument("--evidence", action="append", default=[])
     review_parser.add_argument("--force-accept", action="store_true")
     review_parser.add_argument("--force-reason")
-    force_stop_parser = lane_sub.add_parser("force-stop", help="hard-stop one stuck lane")
+    force_stop_parser = lane_sub.add_parser(
+        "force-stop", help="hard-stop one stuck lane"
+    )
     force_stop_parser.add_argument("--lane-id", required=True)
-    retire_parser = lane_sub.add_parser("retire", help="gracefully retire one accepted lane")
+    retire_parser = lane_sub.add_parser(
+        "retire", help="gracefully retire one accepted lane"
+    )
     retire_parser.add_argument("--acceptance-ref", required=True)
 
-    resume_parser = subparsers.add_parser("resume-lane", help="re-run a stopped, unaccepted lane")
+    resume_parser = subparsers.add_parser(
+        "resume-lane", help="re-run a stopped, unaccepted lane"
+    )
     resume_parser.add_argument("--lane-id", required=True)
     resume_parser.add_argument("--resume-task-card", required=True)
     resume_parser.add_argument("--rationale")
@@ -422,11 +456,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     manager = subparsers.add_parser("manager", help="manager-queue commands (managed)")
     manager_sub = manager.add_subparsers(dest="manager_command", required=True)
-    ack_parser = manager_sub.add_parser("acknowledge", help="move one event PENDING -> ACKNOWLEDGED")
+    ack_parser = manager_sub.add_parser(
+        "acknowledge", help="move one event PENDING -> ACKNOWLEDGED"
+    )
     ack_parser.add_argument("--event-id", required=True)
     close_parser = manager_sub.add_parser("close", help="close an acknowledged event")
     close_parser.add_argument("--event-id", required=True)
-    close_parser.add_argument("--outcome", required=True, choices=["COMPLETE", "BLOCKED"])
+    close_parser.add_argument(
+        "--outcome", required=True, choices=["COMPLETE", "BLOCKED"]
+    )
     close_parser.add_argument("--summary", required=True, type=_nonblank_summary)
 
     lease = subparsers.add_parser("lease", help="exclusive-resource lease commands")
@@ -436,13 +474,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     force_release_parser.add_argument("--resource-id", required=True)
 
-    send_parser = subparsers.add_parser("send-lane-notification", help="append one assignment to a running managed lane")
+    send_parser = subparsers.add_parser(
+        "send-lane-notification", help="append one assignment to a running managed lane"
+    )
     send_parser.add_argument("--lane-id", required=True)
     send_parser.add_argument("--prompt", required=True)
 
     scan_parser = subparsers.add_parser("scan", help="read-only lane-status snapshot")
     scan_parser.add_argument("--no-write", action="store_true")
-    watch_parser = subparsers.add_parser("watch", help="block until an actionable condition exists")
+    watch_parser = subparsers.add_parser(
+        "watch", help="block until an actionable condition exists"
+    )
     watch_parser.add_argument("--until-actionable", action="store_true")
     watch_parser.add_argument("--timeout")
     watch_parser.add_argument("--until-event")

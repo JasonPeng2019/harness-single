@@ -75,9 +75,12 @@ def log(
                 if isinstance(prior, dict) and prior.get("event_id") == event_id:
                     fields = ("source_category", "source_id", "event_type", "data")
                     if any(prior.get(field) != record[field] for field in fields):
-                        raise ValueError("routed watcher event identity has conflicting content")
+                        raise ValueError(
+                            "routed watcher event identity has conflicting content"
+                        )
                     return
         # The path-keyed kernel lock is already held; use the anchored append
         # directly rather than recursively acquiring that same lock.
         from orchestrator_harness.mutation import append_bytes
+
         append_bytes(transaction.root, path.relative_to(transaction.root), encoded)

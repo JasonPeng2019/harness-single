@@ -1,4 +1,5 @@
 """Real native interleavings for captured overlay publication."""
+
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -30,10 +31,12 @@ class OverlayPublicationTests(unittest.TestCase):
 
     def after_plan(self, callback):
         original = bootstrap._overlay_plan
+
         def plan(*args, **kwargs):
             captured = original(*args, **kwargs)
             callback()
             return captured
+
         return patch.object(bootstrap, "_overlay_plan", side_effect=plan)
 
     def assert_no_output(self):
@@ -48,7 +51,9 @@ class OverlayPublicationTests(unittest.TestCase):
         unrelated = self.destination / "unrelated"
         unrelated.write_bytes(b"preserved")
         self.copy()
-        self.assertEqual(b"new first", (self.destination / "nested/a-first").read_bytes())
+        self.assertEqual(
+            b"new first", (self.destination / "nested/a-first").read_bytes()
+        )
         self.assertEqual(b"new later", (self.destination / "z-later").read_bytes())
         self.assertEqual(b"preserved", unrelated.read_bytes())
         self.assertEqual(b"new first", (self.source / "nested/a-first").read_bytes())
@@ -80,8 +85,10 @@ class OverlayPublicationTests(unittest.TestCase):
         expected = first.stat()
         self.copy()
         actual = first.stat()
-        self.assertEqual((expected.st_dev, expected.st_ino, expected.st_mtime_ns),
-                         (actual.st_dev, actual.st_ino, actual.st_mtime_ns))
+        self.assertEqual(
+            (expected.st_dev, expected.st_ino, expected.st_mtime_ns),
+            (actual.st_dev, actual.st_ino, actual.st_mtime_ns),
+        )
         self.assertEqual(b"new later", (self.destination / "z-later").read_bytes())
 
     def test_predecessor_bytes_authorize_replacement(self):
@@ -115,10 +122,12 @@ class OverlayPublicationTests(unittest.TestCase):
 
     def test_source_tree_replacement_is_rejected_before_any_output(self):
         retained = self.base / "retained-source"
+
         def substitute():
             self.source.rename(retained)
             self.source.mkdir()
             (self.source / "foreign").write_bytes(b"foreign source")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -129,9 +138,11 @@ class OverlayPublicationTests(unittest.TestCase):
     def test_byte_identical_source_leaf_replacement_is_rejected(self):
         leaf = self.source / "nested/a-first"
         retained = self.base / "retained-source-leaf"
+
         def substitute():
             leaf.rename(retained)
             leaf.write_bytes(b"new first")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -141,8 +152,10 @@ class OverlayPublicationTests(unittest.TestCase):
 
     def test_source_metadata_change_is_rejected_before_any_output(self):
         source = self.source / "nested/a-first"
+
         def substitute():
             os.utime(source, ns=(1600000000000000000, 1600000000000000000))
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -150,23 +163,29 @@ class OverlayPublicationTests(unittest.TestCase):
 
     def test_destination_root_replacement_preserves_both_owners(self):
         retained = self.base / "retained-destination"
+
         def substitute():
             self.destination.rename(retained)
             self.destination.mkdir()
             (self.destination / "foreign").write_bytes(b"foreign destination")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
-        self.assertEqual(b"foreign destination", (self.destination / "foreign").read_bytes())
+        self.assertEqual(
+            b"foreign destination", (self.destination / "foreign").read_bytes()
+        )
         self.assertFalse((retained / "nested/a-first").exists())
 
     def test_plain_parent_replacement_is_rejected_before_any_output(self):
         parent = self.destination / "nested"
         retained = self.base / "retained-parent"
+
         def substitute():
             parent.rename(retained)
             parent.mkdir()
             (parent / "foreign").write_bytes(b"foreign parent")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -182,10 +201,16 @@ class OverlayPublicationTests(unittest.TestCase):
         referent.mkdir()
         foreign = referent / "a-first"
         foreign.write_bytes(b"referent owner")
+
         def substitute():
             parent.rename(retained)
-            subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(parent), str(referent)],
-                           capture_output=True, text=True, check=True)
+            subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(parent), str(referent)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -196,9 +221,11 @@ class OverlayPublicationTests(unittest.TestCase):
         target = self.destination / "nested/a-first"
         target.write_bytes(b"new first")
         retained = self.base / "retained-identical"
+
         def substitute():
             target.rename(retained)
             target.write_bytes(b"new first")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -211,24 +238,30 @@ class OverlayPublicationTests(unittest.TestCase):
         old.write_bytes(b"prior first")
         (self.destination / "nested/a-first").write_bytes(b"prior first")
         retained = self.base / "retained-predecessor"
+
         def substitute():
             old.rename(retained)
             old.write_bytes(b"prior first")
+
         with self.after_plan(substitute):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy(replace_if_matches={"nested/a-first": old})
-        self.assertEqual(b"prior first", (self.destination / "nested/a-first").read_bytes())
+        self.assertEqual(
+            b"prior first", (self.destination / "nested/a-first").read_bytes()
+        )
         self.assertFalse((self.destination / "z-later").exists())
 
     def test_parent_substitution_at_publication_entry_is_not_adopted(self):
         original = stable_io.mutation_replace
         parent = self.destination / "nested"
         retained = self.base / "retained-last-use-parent"
+
         def publish(*args, **kwargs):
             parent.rename(retained)
             parent.mkdir()
             (parent / "foreign").write_bytes(b"new last-use parent")
             return original(*args, **kwargs)
+
         with patch.object(stable_io, "mutation_replace", side_effect=publish):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
@@ -241,21 +274,31 @@ class OverlayPublicationTests(unittest.TestCase):
         target = self.destination / "z-later"
         if os.name == "nt":
             original = mutation._windows_rename_handle
+
             def rename(*args, **kwargs):
                 target.write_bytes(b"late native owner")
                 return original(*args, **kwargs)
-            injection = patch.object(mutation, "_windows_rename_handle", side_effect=rename)
+
+            injection = patch.object(
+                mutation, "_windows_rename_handle", side_effect=rename
+            )
         else:
             original = mutation._posix_rename
+
             def rename(*args, **kwargs):
                 target.write_bytes(b"late native owner")
                 return original(*args, **kwargs)
+
             injection = patch.object(mutation, "_posix_rename", side_effect=rename)
         with injection:
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
         self.assertEqual(b"late native owner", target.read_bytes())
-        self.assertFalse(any(path.name.startswith(".z-later.") for path in self.destination.iterdir()))
+        self.assertFalse(
+            any(
+                path.name.startswith(".z-later.") for path in self.destination.iterdir()
+            )
+        )
 
     def test_late_directory_at_native_creation_is_preserved(self):
         parent = self.destination / "nested"
@@ -263,22 +306,35 @@ class OverlayPublicationTests(unittest.TestCase):
         with ExitStack() as injection:
             if os.name == "nt":
                 original = mutation._windows_open_directory
+
                 def create(path, **kwargs):
                     if kwargs.get("create"):
                         parent.mkdir()
                         (parent / "foreign").write_bytes(b"late directory owner")
                     return original(path, **kwargs)
-                injection.enter_context(patch.object(mutation, "_windows_open_directory", side_effect=create))
+
+                injection.enter_context(
+                    patch.object(
+                        mutation, "_windows_open_directory", side_effect=create
+                    )
+                )
             else:
                 original = mutation.os.mkdir
+
                 def create(path, mode=0o777, *, dir_fd=None):
                     if dir_fd is not None and str(path) == "nested":
                         original(parent)
                         (parent / "foreign").write_bytes(b"late directory owner")
                     return original(path, mode, dir_fd=dir_fd)
+
                 injection.enter_context(patch.object(mutation.os, "mkdir", new=create))
-                injection.enter_context(patch.object(mutation.os, "supports_dir_fd",
-                                                      mutation.os.supports_dir_fd | {create}))
+                injection.enter_context(
+                    patch.object(
+                        mutation.os,
+                        "supports_dir_fd",
+                        mutation.os.supports_dir_fd | {create},
+                    )
+                )
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
         self.assertEqual(b"late directory owner", (parent / "foreign").read_bytes())
@@ -287,13 +343,19 @@ class OverlayPublicationTests(unittest.TestCase):
     def test_late_foreign_second_file_reports_partial_publication(self):
         original = stable_io.PreparedOutputTransaction.write_bytes
         foreign = self.destination / "z-later"
+
         def publish(output, path, data, **kwargs):
             original(output, path, data, **kwargs)
             foreign.write_bytes(b"foreign during publication")
-        with patch.object(stable_io.PreparedOutputTransaction, "write_bytes", new=publish):
+
+        with patch.object(
+            stable_io.PreparedOutputTransaction, "write_bytes", new=publish
+        ):
             with self.assertRaises(bootstrap.BootstrapError):
                 self.copy()
-        self.assertEqual(b"new first", (self.destination / "nested/a-first").read_bytes())
+        self.assertEqual(
+            b"new first", (self.destination / "nested/a-first").read_bytes()
+        )
         self.assertEqual(b"foreign during publication", foreign.read_bytes())
         self.assertEqual(b"new later", (self.source / "z-later").read_bytes())
 
@@ -307,8 +369,10 @@ class OverlayPublicationTests(unittest.TestCase):
         before = source.stat()
         bootstrap._copy_overlay(self.source, self.source)
         after = source.stat()
-        self.assertEqual((before.st_dev, before.st_ino, before.st_mtime_ns),
-                         (after.st_dev, after.st_ino, after.st_mtime_ns))
+        self.assertEqual(
+            (before.st_dev, before.st_ino, before.st_mtime_ns),
+            (after.st_dev, after.st_ino, after.st_mtime_ns),
+        )
         self.assertEqual(b"new first", source.read_bytes())
 
     def test_ancestor_destination_can_publish_outside_observed_source(self):
@@ -323,11 +387,19 @@ class OverlayPublicationTests(unittest.TestCase):
         target = self.destination / "z-later"
         target.write_bytes(b"original owner")
         before = mutation.capture_target(self.destination, "z-later")
-        invalid = mutation.FileMetadata(stat.S_IMODE(target.stat().st_mode),
-                                        target.stat().st_atime_ns, -11644473600000000000)
+        invalid = mutation.FileMetadata(
+            stat.S_IMODE(target.stat().st_mode),
+            target.stat().st_atime_ns,
+            -11644473600000000000,
+        )
         with self.assertRaises(mutation.MutationConflict):
-            mutation.replace(self.destination, "z-later", b"must not be written",
-                             expected=before, metadata=invalid)
+            mutation.replace(
+                self.destination,
+                "z-later",
+                b"must not be written",
+                expected=before,
+                metadata=invalid,
+            )
         self.assertEqual(b"original owner", target.read_bytes())
 
 

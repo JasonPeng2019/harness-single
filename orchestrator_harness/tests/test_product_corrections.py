@@ -17,7 +17,9 @@ from orchestrator_harness.models import ProcessInfo, ProcessQuery
 from orchestrator_harness.records import atomic_write_json, read_record
 
 
-TEST_TEMP_ROOT = Path(__file__).resolve().parents[2] / "runtime" / "product-correction-fixtures"
+TEST_TEMP_ROOT = (
+    Path(__file__).resolve().parents[2] / "runtime" / "product-correction-fixtures"
+)
 
 
 class ProcessIdentityCorrectionTests(unittest.TestCase):
@@ -57,17 +59,20 @@ class ProcessIdentityCorrectionTests(unittest.TestCase):
                         common_identity.exact_process_identity(41),
                     )
 
-    def test_unavailable_identity_is_not_live_and_recycled_pid_does_not_match(self) -> None:
+    def test_unavailable_identity_is_not_live_and_recycled_pid_does_not_match(
+        self,
+    ) -> None:
         backends = (
             ("nt", "win32", "_windows_process_identity"),
             ("posix", "darwin", "darwin_process_info"),
             ("posix", "linux", "_linux_process_identity"),
         )
         for os_name, platform, backend_name in backends:
-            with self.subTest(platform=platform), patch.object(
-                common_identity, backend_name, return_value=None
-            ), patch.object(common_identity.os, "name", os_name), patch.object(
-                common_identity.sys, "platform", platform
+            with (
+                self.subTest(platform=platform),
+                patch.object(common_identity, backend_name, return_value=None),
+                patch.object(common_identity.os, "name", os_name),
+                patch.object(common_identity.sys, "platform", platform),
             ):
                 self.assertIsNone(common_identity.exact_process_identity(41))
         with (
@@ -92,8 +97,16 @@ class ProcessIdentityCorrectionTests(unittest.TestCase):
         with (
             patch.object(processes.os, "name", "posix"),
             patch.object(processes.sys, "platform", "darwin"),
-            patch.object(processes, "_darwin_process_query", return_value=ProcessQuery(True, process)),
-            patch.object(processes, "_linux_process_query", side_effect=AssertionError("macOS used /proc")),
+            patch.object(
+                processes,
+                "_darwin_process_query",
+                return_value=ProcessQuery(True, process),
+            ),
+            patch.object(
+                processes,
+                "_linux_process_query",
+                side_effect=AssertionError("macOS used /proc"),
+            ),
         ):
             query = processes.targeted_process_query(41)
         self.assertTrue(query.complete)
@@ -126,9 +139,13 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             if content and content.isascii() and content.isdecimal():
                 return int(content)
             time.sleep(0.05)
-        raise AssertionError(f"PID marker was not published with complete content: {marker}")
+        raise AssertionError(
+            f"PID marker was not published with complete content: {marker}"
+        )
 
-    def test_windows_preassigned_job_close_kills_suspended_provider_before_resume(self) -> None:
+    def test_windows_preassigned_job_close_kills_suspended_provider_before_resume(
+        self,
+    ) -> None:
         if os.name != "nt":
             self.skipTest("requires the Windows Job Object containment path")
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -160,12 +177,16 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                     windows_job_handle=job_handle,
                 )
                 self.assertIsNotNone(boundary.root_creation_time)
-                self.assertFalse(marker.exists(), "provider ran before its Job boundary was closed")
+                self.assertFalse(
+                    marker.exists(), "provider ran before its Job boundary was closed"
+                )
                 record = boundary.record()
                 self.assertEqual(provider.pid, record["root"]["pid"])
                 boundary._close_job()
                 provider.wait(timeout=5)
-                self.assertFalse(marker.exists(), "provider resumed after preassigned Job close")
+                self.assertFalse(
+                    marker.exists(), "provider resumed after preassigned Job close"
+                )
             finally:
                 if boundary is not None:
                     boundary._close_job()
@@ -222,7 +243,9 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                 if provider is not None:
                     provider.close()
 
-    def test_windows_job_handle_close_kills_members_and_serialized_boundary_recovers(self) -> None:
+    def test_windows_job_handle_close_kills_members_and_serialized_boundary_recovers(
+        self,
+    ) -> None:
         if os.name != "nt":
             self.skipTest("requires the Windows Job Object containment path")
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -270,11 +293,20 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                 # rather than replacing its inventory with a fabricated empty
                 # snapshot or treating a preliminary liveness miss as exit.
                 deadline = time.monotonic() + 5
-                while not processes.process_boundary_is_gone(record) and time.monotonic() < deadline:
+                while (
+                    not processes.process_boundary_is_gone(record)
+                    and time.monotonic() < deadline
+                ):
                     time.sleep(0.05)
                 self.assertTrue(processes.process_boundary_is_gone(record))
-                helper = next(item for item in record["processes"] if item["pid"] == helper_pid)
-                self.assertTrue(processes.identity_exit_proven(helper["pid"], helper["creation_time"]))
+                helper = next(
+                    item for item in record["processes"] if item["pid"] == helper_pid
+                )
+                self.assertTrue(
+                    processes.identity_exit_proven(
+                        helper["pid"], helper["creation_time"]
+                    )
+                )
             finally:
                 if boundary is not None:
                     boundary._close_job()
@@ -284,7 +316,9 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
                 if provider is not None:
                     provider.close()
 
-    def test_removed_boundary_inventory_symbols_have_no_tracked_references(self) -> None:
+    def test_removed_boundary_inventory_symbols_have_no_tracked_references(
+        self,
+    ) -> None:
         repository = Path(__file__).resolve().parents[2]
         symbols = ("process_group_" + "inventory", "ProcessBoundary" + "Inventory")
         top = subprocess.run(
@@ -298,7 +332,16 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             for symbol in symbols:
                 with self.subTest(symbol=symbol):
                     result = subprocess.run(
-                        ["git", "-C", str(repository), "grep", "-n", "-e", symbol, "--"],
+                        [
+                            "git",
+                            "-C",
+                            str(repository),
+                            "grep",
+                            "-n",
+                            "-e",
+                            symbol,
+                            "--",
+                        ],
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
@@ -308,14 +351,27 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             return
         # A shipped archive copy has no Git metadata; its files are the shipped
         # source, apart from runtime output that tests and tools may create.
-        generated = {".git", ".agent-workspace", ".harness-runtime", "__pycache__", "runtime"}
+        generated = {
+            ".git",
+            ".agent-workspace",
+            ".harness-runtime",
+            "__pycache__",
+            "runtime",
+        }
         matches = []
         for directory, names, files in os.walk(repository):
-            names[:] = [name for name in names if name not in generated and not name.endswith(".egg-info")]
+            names[:] = [
+                name
+                for name in names
+                if name not in generated and not name.endswith(".egg-info")
+            ]
             for name in files:
                 data = (Path(directory) / name).read_bytes()
-                matches.extend(f"{Path(directory, name).relative_to(repository)}: {symbol}"
-                               for symbol in symbols if symbol.encode() in data)
+                matches.extend(
+                    f"{Path(directory, name).relative_to(repository)}: {symbol}"
+                    for symbol in symbols
+                    if symbol.encode() in data
+                )
         self.assertEqual([], matches)
 
     def test_cleanup_status_transition_retains_boundary_evidence(self) -> None:
@@ -333,7 +389,10 @@ class ProviderBoundaryCorrectionTests(unittest.TestCase):
             }
             controller._write_status(lane, {"process_boundary": boundary})
             controller._write_status(lane, {"cleanup_proven": True})
-            status = read_record(Path(lane["controller_status_path"]), controller.CONTROLLER_STATUS_SCHEMA)
+            status = read_record(
+                Path(lane["controller_status_path"]),
+                controller.CONTROLLER_STATUS_SCHEMA,
+            )
         self.assertTrue(status["cleanup_proven"])
         self.assertEqual(boundary, status["process_boundary"])
 
@@ -384,21 +443,36 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
             acceptance["content_hash"] = content_hash(acceptance)
             atomic_write_json(root / "COMPLETION_REVIEW.json", review)
             atomic_write_json(root / "ORCHESTRATOR_ACCEPTANCE.json", acceptance)
-            self.assertIsNone(monitor._read_acceptance_chain(Path(raw) / "runtime", "epoch-1", "lane-1"))
+            self.assertIsNone(
+                monitor._read_acceptance_chain(
+                    Path(raw) / "runtime", "epoch-1", "lane-1"
+                )
+            )
 
             review, acceptance = self._pair()
             atomic_write_json(root / "COMPLETION_REVIEW.json", review)
             atomic_write_json(root / "ORCHESTRATOR_ACCEPTANCE.json", acceptance)
             self.assertEqual(
                 acceptance,
-                monitor._read_acceptance_chain(Path(raw) / "runtime", "epoch-1", "lane-1"),
+                monitor._read_acceptance_chain(
+                    Path(raw) / "runtime", "epoch-1", "lane-1"
+                ),
             )
 
     def test_monitor_rejects_mismatched_task_result_or_commit_identity(self) -> None:
         TEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        for field in ("task_card_id", "task_card_hash", "result_id", "result_hash", "commit",
-                      "source_assignment_hash"):
-            with self.subTest(field=field), tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as raw:
+        for field in (
+            "task_card_id",
+            "task_card_hash",
+            "result_id",
+            "result_hash",
+            "commit",
+            "source_assignment_hash",
+        ):
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory(dir=TEST_TEMP_ROOT) as raw,
+            ):
                 root = Path(raw) / "runtime" / "epochs" / "epoch-1" / "lanes" / "lane-1"
                 root.mkdir(parents=True)
                 review, acceptance = self._pair()
@@ -407,7 +481,9 @@ class AcceptanceLinkCorrectionTests(unittest.TestCase):
                 atomic_write_json(root / "COMPLETION_REVIEW.json", review)
                 atomic_write_json(root / "ORCHESTRATOR_ACCEPTANCE.json", acceptance)
                 self.assertIsNone(
-                    monitor._read_acceptance_chain(Path(raw) / "runtime", "epoch-1", "lane-1")
+                    monitor._read_acceptance_chain(
+                        Path(raw) / "runtime", "epoch-1", "lane-1"
+                    )
                 )
 
 

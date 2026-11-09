@@ -50,10 +50,7 @@ def _command(raw: Any, *, enabled: bool) -> tuple[str, ...]:
 def _identity(raw: Any, *, enabled: bool) -> tuple[tuple[str, str], ...]:
     identity = {} if raw is None else raw
     if not isinstance(identity, dict) or not all(
-        isinstance(key, str)
-        and key
-        and isinstance(value, str)
-        and value
+        isinstance(key, str) and key and isinstance(value, str) and value
         for key, value in identity.items()
     ):
         raise ValueError("evaluator_identity must contain non-empty string fields")
@@ -65,7 +62,9 @@ def _identity(raw: Any, *, enabled: bool) -> tuple[tuple[str, str], ...]:
 def load_config(path: str | Path | None = None) -> WatcherConfig:
     repo = Path(__file__).resolve().parents[1]
     if not path:
-        raise ValueError("watcher requires explicit configuration with a fresh runtime epoch")
+        raise ValueError(
+            "watcher requires explicit configuration with a fresh runtime epoch"
+        )
     raw: dict[str, Any] = {}
     if path:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -83,8 +82,11 @@ def load_config(path: str | Path | None = None) -> WatcherConfig:
         if len(relative.parts) < 2:
             raise ValueError("runtime_root must name a service and epoch below runtime")
     except ValueError as exc:
-        raise ValueError("runtime_root must select a service epoch below repository runtime/") from exc
+        raise ValueError(
+            "runtime_root must select a service epoch below repository runtime/"
+        ) from exc
     from .io import validate_path
+
     validate_path(repo / "runtime", runtime)
     declared = raw.get("observed_sources")
     sources: list[ObservedSource] = []
@@ -110,7 +112,11 @@ def load_config(path: str | Path | None = None) -> WatcherConfig:
             sources.append(ObservedSource(resolved, item["role"], item["source_id"]))
     else:
         roots = raw.get("observed_log_roots")
-        if not isinstance(roots, list) or not roots or not all(isinstance(x, str) and x for x in roots):
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or not all(isinstance(x, str) and x for x in roots)
+        ):
             raise ValueError("observed_log_roots must be strings")
         sources = [
             ObservedSource(
@@ -181,11 +187,21 @@ def load_config(path: str | Path | None = None) -> WatcherConfig:
     epoch = raw.get("attention_epoch_id")
     if epoch is not None and (not isinstance(epoch, str) or not epoch):
         raise ValueError("attention_epoch_id must be a non-empty string")
-    for observed in [source.path for source in sources] + [Path(path).absolute()] + ([identity_path] if identity_path else []):
+    for observed in (
+        [source.path for source in sources]
+        + [Path(path).absolute()]
+        + ([identity_path] if identity_path else [])
+    ):
         resolved = observed.resolve(strict=False)
         selected = runtime.resolve(strict=False)
-        if resolved == selected or resolved.is_relative_to(selected) or selected.is_relative_to(resolved):
-            raise ValueError("watcher runtime must be disjoint from configured observations and configuration")
+        if (
+            resolved == selected
+            or resolved.is_relative_to(selected)
+            or selected.is_relative_to(resolved)
+        ):
+            raise ValueError(
+                "watcher runtime must be disjoint from configured observations and configuration"
+            )
     if len({os.path.normcase(str(source.path)) for source in sources}) != len(sources):
         raise ValueError("duplicate observed source paths")
     if len(set(producers)) != len(producers):

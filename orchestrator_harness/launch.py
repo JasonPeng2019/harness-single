@@ -29,13 +29,32 @@ from .epochs import (
     read_epoch_state,
     write_active_lanes,
 )
-from .lanes import LaneError, find_active_lane, lane_operation_lock, read_lane, require_same_run, update_lane
-from .lane_cleanup import cleanup_is_proven, controller_not_created, never_launched, observe_controller_status, retired_lane_record, publish_forced_cleanup
+from .lanes import (
+    LaneError,
+    find_active_lane,
+    lane_operation_lock,
+    read_lane,
+    require_same_run,
+    update_lane,
+)
+from .lane_cleanup import (
+    cleanup_is_proven,
+    controller_not_created,
+    never_launched,
+    observe_controller_status,
+    retired_lane_record,
+    publish_forced_cleanup,
+)
 from .leases import force_release_leases, release_leases
 from .manager_queue import read_manager_queue
 from .records import read_record
 from .records import runtime_admission_lock
-from .retry_policy import MAX_LANE_PROVIDER_INVOCATIONS, WORKER_RETRY_LIMIT, completed_provider_invocations, initialize_history
+from .retry_policy import (
+    MAX_LANE_PROVIDER_INVOCATIONS,
+    WORKER_RETRY_LIMIT,
+    completed_provider_invocations,
+    initialize_history,
+)
 from .setup import read_runtime_state
 from .windows_sandbox_preflight import require_not_blocked
 
@@ -80,15 +99,22 @@ class ControllerNotCreated(LaunchError):
 
 
 def _controller_spawn_options(
-    harness_root: Path, lane: Mapping[str, Any], invocation: Mapping[str, Any],
+    harness_root: Path,
+    lane: Mapping[str, Any],
+    invocation: Mapping[str, Any],
 ) -> dict[str, Any]:
     options: dict[str, Any] = {"cwd": str(harness_root)}
     provider = invocation["provider"]
-    if (sys.platform == "win32" and provider["id"] == "codex"
-            and provider["launch_config"].get("permission_mode") != "yolo"):
+    if (
+        sys.platform == "win32"
+        and provider["id"] == "codex"
+        and provider["launch_config"].get("permission_mode") != "yolo"
+    ):
         # Windows applies sandbox ACLs through writable temporary roots. Avoid
         # traversing the shared user TEMP and retain each invocation's artifacts.
-        temporary = Path(lane["worktree_path"]) / ".agent-workspace" / "tmp" / lane["run_id"]
+        temporary = (
+            Path(lane["worktree_path"]) / ".agent-workspace" / "tmp" / lane["run_id"]
+        )
         temporary.mkdir(parents=True, exist_ok=True)
         environment = os.environ.copy()
         environment.update(TEMP=str(temporary), TMP=str(temporary))
@@ -104,13 +130,19 @@ def _spawn_controller_logged(
 ) -> subprocess.Popen[Any]:
     try:
         append_detail(
-            rt, "launch.controller.requested", component="launch",
-            lane_id=lane.get("lane_id"), run_id=lane.get("run_id"),
-            argv=list(argv), cwd=spawn_options.get("cwd"),
+            rt,
+            "launch.controller.requested",
+            component="launch",
+            lane_id=lane.get("lane_id"),
+            run_id=lane.get("run_id"),
+            argv=list(argv),
+            cwd=spawn_options.get("cwd"),
             environment_mode="explicit" if "env" in spawn_options else "inherited",
         )
         # Keep early controller/import failures, which occur before status exists.
-        stderr_path = Path(lane["controller_status_path"]).with_name("controller-stderr.txt")
+        stderr_path = Path(lane["controller_status_path"]).with_name(
+            "controller-stderr.txt"
+        )
         with stderr_path.open("a", encoding="utf-8") as stderr:
             return processes.spawn_detached(argv, **{**spawn_options, "stderr": stderr})
     except (OSError, ValueError) as exc:
@@ -151,9 +183,7 @@ def _clear_exited_controller_identity(
     update_lane(rt, epoch_id, lane_id, clear)
 
 
-def _wait_for_controller_exit(
-    lane: dict[str, Any], timeout_seconds: float
-) -> bool:
+def _wait_for_controller_exit(lane: dict[str, Any], timeout_seconds: float) -> bool:
     """Wait for the recorded controller incarnation to disappear exactly."""
     process = lane.get("process")
     if process == {}:
@@ -165,9 +195,7 @@ def _wait_for_controller_exit(
     )
 
 
-def _wait_for_pid_exit(
-    pid: int, creation: str | None, timeout_seconds: float
-) -> bool:
+def _wait_for_pid_exit(pid: int, creation: str | None, timeout_seconds: float) -> bool:
     """Wait for proven exit of the exact PID-plus-creation incarnation."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -196,9 +224,7 @@ def _reap_controller_and_prove_exit(
     if not isinstance(pid, int):
         return False
     if processes.identity_matches(pid, creation):
-        if not _wait_for_pid_exit(
-            pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
-        ):
+        if not _wait_for_pid_exit(pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS):
             if not processes.terminate_process(pid, creation, force=True):
                 return False
     try:
@@ -208,37 +234,59 @@ def _reap_controller_and_prove_exit(
     return processes.identity_exit_proven(pid, creation)
 
 
-def _stop_failed_controller(child: subprocess.Popen[Any], identity: dict[str, Any]) -> bool:
+def _stop_failed_controller(
+    child: subprocess.Popen[Any], identity: dict[str, Any]
+) -> bool:
     """Record only what exact termination plus the owned handle actually proves."""
     try:
-        if not processes.terminate_process(identity["pid"], identity["creation_time"], force=True):
+        if not processes.terminate_process(
+            identity["pid"], identity["creation_time"], force=True
+        ):
             return False
         child.wait(timeout=10.0)
-        return processes.identity_exit_proven(identity["pid"], identity["creation_time"])
+        return processes.identity_exit_proven(
+            identity["pid"], identity["creation_time"]
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
 def _record_launch_failure(
-    rt: Path, epoch_id: str, lane: dict[str, Any], *,
-    controller_not_created: bool, identity: dict[str, Any] | None = None,
+    rt: Path,
+    epoch_id: str,
+    lane: dict[str, Any],
+    *,
+    controller_not_created: bool,
+    identity: dict[str, Any] | None = None,
     controller_reaped: bool = False,
 ) -> None:
     def record(current: dict[str, Any]) -> dict[str, Any]:
         require_same_run(current, lane)
-        if current.get("lifecycle") in ("retired", "resuming") or current.get("launch_pending") is not False:
-            raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "lane changed before failed-start recovery")
+        if (
+            current.get("lifecycle") in ("retired", "resuming")
+            or current.get("launch_pending") is not False
+        ):
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                "lane changed before failed-start recovery",
+            )
         if identity is not None and current.get("process") not in ({}, identity):
-            raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "controller owner changed before failed-start recovery")
+            raise LaunchError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                "controller owner changed before failed-start recovery",
+            )
         return {
             **current,
-            "process": dict(identity) if identity is not None else current.get("process"),
+            "process": dict(identity)
+            if identity is not None
+            else current.get("process"),
             "launch_failure": {
                 "run_id": lane["run_id"],
                 "controller_not_created": controller_not_created,
                 "controller_reaped": controller_reaped,
             },
         }
+
     update_lane(rt, epoch_id, lane["lane_id"], record)
 
 
@@ -273,9 +321,15 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 )
             try:
                 from .lane_authority import read_invocation
+
                 invocation = read_invocation(lane)
-                if invocation.get("lane_id") != lane_id or invocation.get("run_id") != lane.get("run_id"):
-                    raise LaunchError(LAUNCH_INVOCATION_INVALID, "invocation does not match the lane's current run")
+                if invocation.get("lane_id") != lane_id or invocation.get(
+                    "run_id"
+                ) != lane.get("run_id"):
+                    raise LaunchError(
+                        LAUNCH_INVOCATION_INVALID,
+                        "invocation does not match the lane's current run",
+                    )
             except (OSError, ValueError, KeyError) as exc:
                 raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
             provider_id = invocation["provider"]["id"]
@@ -294,24 +348,42 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     "provider launch configuration is not in its validated canonical form",
                 )
             binding_path = (
-                harness_root / "orchestrator_harness" / "provider_adapters" / provider_id / "launcher_binding.py"
+                harness_root
+                / "orchestrator_harness"
+                / "provider_adapters"
+                / provider_id
+                / "launcher_binding.py"
             )
             if not binding_path.is_file():
-                raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
+                raise LaunchError(
+                    LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}"
+                )
 
             # Legacy migration is allowed only with native proof of no launch.
             # A missing journal for a saved/possibly started session fails closed.
             current = read_lane(rt, epoch_id, lane_id)
             require_same_run(current, lane)
-            if not current.get("provider_history_path") and never_launched(current, observe_controller_status(current)):
+            if not current.get("provider_history_path") and never_launched(
+                current, observe_controller_status(current)
+            ):
                 initialize_history(rt, current)
+
                 def attach_history(record: dict[str, Any]) -> dict[str, Any]:
                     require_same_run(record, lane)
-                    return {**record, "provider_history_path": current["provider_history_path"]}
+                    return {
+                        **record,
+                        "provider_history_path": current["provider_history_path"],
+                    }
+
                 lane = update_lane(rt, epoch_id, lane_id, attach_history)
             try:
-                if completed_provider_invocations(lane, rt) >= MAX_LANE_PROVIDER_INVOCATIONS:
-                    raise ValueError("initial provider invocation plus one explicit retry exhausted")
+                if (
+                    completed_provider_invocations(lane, rt)
+                    >= MAX_LANE_PROVIDER_INVOCATIONS
+                ):
+                    raise ValueError(
+                        "initial provider invocation plus one explicit retry exhausted"
+                    )
             except (OSError, ValueError, TypeError) as exc:
                 raise LaunchError(WORKER_RETRY_LIMIT, str(exc)) from exc
 
@@ -322,36 +394,73 @@ def run_launch(lane_id: str) -> dict[str, Any]:
             def consume_launch(current: dict[str, Any]) -> dict[str, Any]:
                 require_same_run(current, captured)
                 if current.get("lifecycle") != captured.get("lifecycle") or (
-                    current.get("lifecycle") == "running" and current.get("launch_pending") is not True
+                    current.get("lifecycle") == "running"
+                    and current.get("launch_pending") is not True
                 ):
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "lane is no longer pending launch")
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "lane is no longer pending launch",
+                    )
                 if current.get("process") != {}:
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "controller ownership is already recorded")
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "controller ownership is already recorded",
+                    )
                 if not cleanup_is_proven(current):
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "prior controller cleanup is unproven")
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "prior controller cleanup is unproven",
+                    )
                 state = read_runtime_state(rt)
                 marker = read_current_epoch(rt)
-                if not state or state.get("state") != "OPEN" or not marker or marker.get("epoch_id") != epoch_id:
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "runtime or epoch changed before launch")
-                return {**current, "lifecycle": "running", "launch_pending": False, "launch_failure": None}
+                if (
+                    not state
+                    or state.get("state") != "OPEN"
+                    or not marker
+                    or marker.get("epoch_id") != epoch_id
+                ):
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "runtime or epoch changed before launch",
+                    )
+                return {
+                    **current,
+                    "lifecycle": "running",
+                    "launch_pending": False,
+                    "launch_failure": None,
+                }
 
             lane = update_lane(rt, epoch_id, lane_id, consume_launch)
             # Recheck immediately at the spawn boundary, while the native operation
             # lock prevents resume or cancellation from replacing this invocation.
             state = read_runtime_state(rt)
             marker = read_current_epoch(rt)
-            if not state or state.get("state") != "OPEN" or not marker or marker.get("epoch_id") != epoch_id:
+            if (
+                not state
+                or state.get("state") != "OPEN"
+                or not marker
+                or marker.get("epoch_id") != epoch_id
+            ):
                 _record_launch_failure(rt, epoch_id, lane, controller_not_created=True)
-                raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "runtime or epoch changed before spawn")
+                raise LaunchError(
+                    LAUNCH_CONTROLLER_START_FAILED,
+                    "runtime or epoch changed before spawn",
+                )
             try:
                 try:
-                    spawn_options = _controller_spawn_options(harness_root, lane, invocation)
+                    spawn_options = _controller_spawn_options(
+                        harness_root, lane, invocation
+                    )
                 except (OSError, ValueError) as exc:
                     # Pending launch was already consumed, but no controller
                     # exists. Retain the same native proof as a failed spawn.
-                    raise ControllerNotCreated(LAUNCH_CONTROLLER_START_FAILED, str(exc)) from exc
+                    raise ControllerNotCreated(
+                        LAUNCH_CONTROLLER_START_FAILED, str(exc)
+                    ) from exc
                 child = _spawn_controller_logged(
-                    rt, lane, processes.python_argv("orchestrator_harness.controller", lane_id),
+                    rt,
+                    lane,
+                    processes.python_argv("orchestrator_harness.controller", lane_id),
                     spawn_options,
                 )
             except ControllerNotCreated:
@@ -366,35 +475,58 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     LAUNCH_CONTROLLER_START_FAILED,
                     "cannot record the launched controller process identity",
                 )
+
             def register_controller(current: dict[str, Any]) -> dict[str, Any]:
                 require_same_run(current, lane)
-                if current.get("lifecycle") in ("retired", "resuming") or current.get("launch_pending") is not False:
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "lane changed before controller registration")
+                if (
+                    current.get("lifecycle") in ("retired", "resuming")
+                    or current.get("launch_pending") is not False
+                ):
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "lane changed before controller registration",
+                    )
                 if current.get("process") not in ({}, controller_identity):
-                    raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "controller owner changed before registration")
+                    raise LaunchError(
+                        LAUNCH_CONTROLLER_START_FAILED,
+                        "controller owner changed before registration",
+                    )
                 return {
-                    **current, "process": {
-                        "pid": controller_identity["pid"], "creation_time": controller_identity["creation_time"],
+                    **current,
+                    "process": {
+                        "pid": controller_identity["pid"],
+                        "creation_time": controller_identity["creation_time"],
                     },
                 }
 
             try:
                 lane = update_lane(
-                    rt, epoch_id, lane_id, register_controller,
+                    rt,
+                    epoch_id,
+                    lane_id,
+                    register_controller,
                 )
             except Exception as exc:
                 reaped = _stop_failed_controller(child, controller_identity)
                 _record_launch_failure(
-                    rt, epoch_id, lane, controller_not_created=False,
-                    identity=controller_identity, controller_reaped=reaped,
+                    rt,
+                    epoch_id,
+                    lane,
+                    controller_not_created=False,
+                    identity=controller_identity,
+                    controller_reaped=reaped,
                 )
                 raise LaunchError(
                     LAUNCH_CONTROLLER_START_FAILED,
                     f"cannot persist the launched controller process identity: {exc}",
                 ) from exc
         append_detail(
-            rt, "launch.controller.spawned", component="launch",
-            lane_id=lane_id, run_id=lane.get("run_id"), pid=child.pid,
+            rt,
+            "launch.controller.spawned",
+            component="launch",
+            lane_id=lane_id,
+            run_id=lane.get("run_id"),
+            pid=child.pid,
         )
         deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
@@ -412,8 +544,11 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 status is not None
                 and provider_state.get("state") == "exited"
                 and status.get("cleanup_proven") is True
-                and status.get("recorded_status") in (
-                    "review_pending", "result_invalid", "provider_exited_no_result",
+                and status.get("recorded_status")
+                in (
+                    "review_pending",
+                    "result_invalid",
+                    "provider_exited_no_result",
                 )
             )
             if running or terminal:
@@ -434,7 +569,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         code = LAUNCH_CONTROLLER_START_FAILED
         summary = "controller exited before the provider started"
         if events_path.is_file():
-            for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in events_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
                 if "lease_busy" in line:
                     code = LAUNCH_LEASE_BUSY
                     summary = "a declared resource is held; no lane started"
@@ -446,7 +583,10 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     summary = "the provider process could not be started"
         status = _read_controller_status(lane)
         evidence = [str(Path(lane["controller_status_path"]))] if status else []
-        for path in (events_path, Path(lane["controller_status_path"]).with_name("controller-stderr.txt")):
+        for path in (
+            events_path,
+            Path(lane["controller_status_path"]).with_name("controller-stderr.txt"),
+        ):
             if path.is_file():
                 evidence.append(str(path))
         if (
@@ -498,53 +638,101 @@ def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
     if "forced_cleanup_ref" in lane:
         if cleanup_is_proven(lane):
             return True, "", ""
-        return False, FORCE_STOP_CLEANUP_UNPROVEN, "retained forced cleanup is invalid or unproven"
+        return (
+            False,
+            FORCE_STOP_CLEANUP_UNPROVEN,
+            "retained forced cleanup is invalid or unproven",
+        )
     observation = observe_controller_status(lane)
     if never_launched(lane, observation) or controller_not_created(lane, observation):
         return True, "", ""
     if observation.kind != "valid":
-        return False, FORCE_STOP_CLEANUP_UNPROVEN, f"controller status is {observation.kind}: {observation.reason}"
+        return (
+            False,
+            FORCE_STOP_CLEANUP_UNPROVEN,
+            f"controller status is {observation.kind}: {observation.reason}",
+        )
     process = lane.get("process")
     if not isinstance(process, dict):
-        return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller process metadata is unknown"
+        return (
+            False,
+            FORCE_STOP_CLEANUP_UNPROVEN,
+            "controller process metadata is unknown",
+        )
     controller_pid = process.get("pid")
     controller_creation = process.get("creation_time")
     status = observation.status
     assert status is not None
-    if process and (type(controller_pid) is not int or controller_pid <= 0 or not processes.valid_creation_identity(controller_creation)):
+    if process and (
+        type(controller_pid) is not int
+        or controller_pid <= 0
+        or not processes.valid_creation_identity(controller_creation)
+    ):
         return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller identity is incomplete"
     status_identity = status.get("controller_identity") or {}
     if not isinstance(status_identity, dict):
-        return False, FORCE_STOP_CLEANUP_UNPROVEN, "status controller identity is invalid"
+        return (
+            False,
+            FORCE_STOP_CLEANUP_UNPROVEN,
+            "status controller identity is invalid",
+        )
     if not process and not status_identity:
         return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller exit identity is missing"
     if status_identity and not process:
         controller_pid = status_identity.get("pid")
         controller_creation = status_identity.get("creation_time")
-        if type(controller_pid) is not int or controller_pid <= 0 or not processes.valid_creation_identity(controller_creation):
-            return False, FORCE_STOP_CLEANUP_UNPROVEN, "status controller identity is incomplete"
+        if (
+            type(controller_pid) is not int
+            or controller_pid <= 0
+            or not processes.valid_creation_identity(controller_creation)
+        ):
+            return (
+                False,
+                FORCE_STOP_CLEANUP_UNPROVEN,
+                "status controller identity is incomplete",
+            )
     if status_identity and process and status_identity != process:
         return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller identities disagree"
     provider_pid = None
     provider_creation = None
     provider_state = status.get("provider_state")
     if not isinstance(provider_state, dict):
-        return False, FORCE_STOP_CLEANUP_UNPROVEN, "provider process metadata is unknown"
+        return (
+            False,
+            FORCE_STOP_CLEANUP_UNPROVEN,
+            "provider process metadata is unknown",
+        )
     if lane.get("provider_history_path"):
         try:
             from .retry_policy import current_invocation_facts
+
             facts = current_invocation_facts(lane)
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            return False, FORCE_STOP_CLEANUP_UNPROVEN, f"protected creation evidence is invalid: {exc}"
+            return (
+                False,
+                FORCE_STOP_CLEANUP_UNPROVEN,
+                f"protected creation evidence is invalid: {exc}",
+            )
         boundary = status.get("process_boundary")
         for fact in facts:
             if fact["kind"] == "RESERVED":
-                return False, FORCE_STOP_CLEANUP_UNPROVEN, "provider creation reservation has no exact boundary proof"
+                return (
+                    False,
+                    FORCE_STOP_CLEANUP_UNPROVEN,
+                    "provider creation reservation has no exact boundary proof",
+                )
             if fact["kind"] in {"STARTED", "COMPLETED"}:
                 original = fact.get("process_boundary")
-                if (not isinstance(original, dict) or not isinstance(boundary, dict)
-                        or boundary.get("root") != original.get("root")):
-                    return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller status contradicts protected provider creation evidence"
+                if (
+                    not isinstance(original, dict)
+                    or not isinstance(boundary, dict)
+                    or boundary.get("root") != original.get("root")
+                ):
+                    return (
+                        False,
+                        FORCE_STOP_CLEANUP_UNPROVEN,
+                        "controller status contradicts protected provider creation evidence",
+                    )
     ok = True
     if isinstance(controller_pid, int):
         if not processes.terminate_process(
@@ -561,21 +749,41 @@ def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
         if isinstance(boundary, dict):
             # Closing the killed controller's Job is asynchronous. Give its
             # exact recorded members time to exit before an inventory fallback.
-            boundary_ok = (processes.process_boundary_is_gone(boundary, timeout_seconds=processes.BOUNDARY_WAIT_SECONDS)
-                           or processes.cleanup_recorded_process_boundary(boundary))
-        elif status.get("cleanup_proven") is True and status.get("controller_state") == "exited" and provider_state == {"state": "not_started"}:
+            boundary_ok = processes.process_boundary_is_gone(
+                boundary, timeout_seconds=processes.BOUNDARY_WAIT_SECONDS
+            ) or processes.cleanup_recorded_process_boundary(boundary)
+        elif (
+            status.get("cleanup_proven") is True
+            and status.get("controller_state") == "exited"
+            and provider_state == {"state": "not_started"}
+        ):
             boundary_ok = True
-    if ok and boundary_ok and processes.identity_exit_proven(controller_pid, controller_creation):
+    if (
+        ok
+        and boundary_ok
+        and processes.identity_exit_proven(controller_pid, controller_creation)
+    ):
         return True, "", ""
-    identities = [(controller_pid, controller_creation), (provider_pid, provider_creation)]
+    identities = [
+        (controller_pid, controller_creation),
+        (provider_pid, provider_creation),
+    ]
     boundary = status.get("process_boundary")
     if isinstance(boundary, dict):
         for member in [boundary.get("root"), *boundary.get("processes", [])]:
             if isinstance(member, dict):
                 identities.append((member.get("pid"), member.get("creation_time")))
     if any(processes.identity_matches(pid, creation) for pid, creation in identities):
-        return False, FORCE_STOP_PROCESS_SURVIVED, "an exact recorded lane process remains live after cleanup"
-    return False, FORCE_STOP_CLEANUP_UNPROVEN, "controller or provider boundary cleanup could not be proven"
+        return (
+            False,
+            FORCE_STOP_PROCESS_SURVIVED,
+            "an exact recorded lane process remains live after cleanup",
+        )
+    return (
+        False,
+        FORCE_STOP_CLEANUP_UNPROVEN,
+        "controller or provider boundary cleanup could not be proven",
+    )
 
 
 def run_force_stop(
@@ -648,16 +856,32 @@ def run_force_stop(
         }
     try:
         with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane_id):
+
             def prove_cleanup(current: dict[str, Any]) -> dict[str, Any]:
                 require_same_run(current, lane)
                 marker = read_current_epoch(rt)
-                if not marker or marker.get("epoch_id") != epoch_id or current.get("lifecycle") == "resuming":
-                    raise LaneError(FORCE_STOP_OWNERSHIP_CHANGED, "epoch or lane ownership changed before cancellation")
-                if force_stop_deadline is not None and time.monotonic() >= force_stop_deadline:
-                    raise LaunchError(FORCE_STOP_ALLOWANCE_EXPIRED, "allowance expired before cancellation effects")
+                if (
+                    not marker
+                    or marker.get("epoch_id") != epoch_id
+                    or current.get("lifecycle") == "resuming"
+                ):
+                    raise LaneError(
+                        FORCE_STOP_OWNERSHIP_CHANGED,
+                        "epoch or lane ownership changed before cancellation",
+                    )
+                if (
+                    force_stop_deadline is not None
+                    and time.monotonic() >= force_stop_deadline
+                ):
+                    raise LaunchError(
+                        FORCE_STOP_ALLOWANCE_EXPIRED,
+                        "allowance expired before cancellation effects",
+                    )
                 clean, code, reason = _cleanup_lane_processes(current)
                 if not clean:
-                    raise LaunchError(code, reason, evidence_paths=[current["controller_status_path"]])
+                    raise LaunchError(
+                        code, reason, evidence_paths=[current["controller_status_path"]]
+                    )
                 try:
                     return publish_forced_cleanup(rt, epoch_id, current)
                 except (OSError, ValueError) as exc:
@@ -669,27 +893,47 @@ def run_force_stop(
                 require_same_run(current, lane)
                 marker = read_current_epoch(rt)
                 if not marker or marker.get("epoch_id") != epoch_id:
-                    raise LaneError(FORCE_STOP_OWNERSHIP_CHANGED, "epoch changed after cleanup proof")
+                    raise LaneError(
+                        FORCE_STOP_OWNERSHIP_CHANGED,
+                        "epoch changed after cleanup proof",
+                    )
                 if not cleanup_is_proven(current):
-                    raise LaunchError(FORCE_STOP_CLEANUP_UNPROVEN, "durable cancellation proof is unproven")
-                if force_stop_deadline is not None and time.monotonic() >= force_stop_deadline:
-                    raise LaunchError(FORCE_STOP_ALLOWANCE_EXPIRED, "allowance expired before lease release and retirement")
+                    raise LaunchError(
+                        FORCE_STOP_CLEANUP_UNPROVEN,
+                        "durable cancellation proof is unproven",
+                    )
+                if (
+                    force_stop_deadline is not None
+                    and time.monotonic() >= force_stop_deadline
+                ):
+                    raise LaunchError(
+                        FORCE_STOP_ALLOWANCE_EXPIRED,
+                        "allowance expired before lease release and retirement",
+                    )
                 # Still under the lane-record lock: no newer run can take ownership
                 # between proof, exact-owner lease release, and retirement.
                 try:
                     force_release_leases(rt, lane_id, current["run_id"])
                 except Exception as exc:
-                    raise LaunchError(FORCE_STOP_LEASE_RELEASE_FAILED, str(exc)) from exc
+                    raise LaunchError(
+                        FORCE_STOP_LEASE_RELEASE_FAILED, str(exc)
+                    ) from exc
                 return retired_lane_record(current)
 
             update_lane(rt, epoch_id, lane_id, cancel)
-            entries = [e for e in read_active_lanes(rt, epoch_id) if e.get("lane_id") != lane_id]
+            entries = [
+                e
+                for e in read_active_lanes(rt, epoch_id)
+                if e.get("lane_id") != lane_id
+            ]
             write_active_lanes(rt, epoch_id, entries)
             _prune_worktrees(config.root_workspace)
     except (LaunchError, LaneError) as exc:
         return {
             "ok": False,
-            "code": FORCE_STOP_OWNERSHIP_CHANGED if isinstance(exc, LaneError) else exc.code,
+            "code": FORCE_STOP_OWNERSHIP_CHANGED
+            if isinstance(exc, LaneError)
+            else exc.code,
             "summary": str(exc),
             "evidence_paths": getattr(exc, "evidence_paths", []),
             "next_action": "reconcile the exact invocation and its cleanup evidence before retrying",
@@ -731,30 +975,50 @@ def _validate_acceptance_ref(path: Path) -> dict[str, Any]:
     return acceptance
 
 
-def _validate_current_acceptance(rt: Path, epoch_id: str, lane: dict[str, Any], acceptance: dict[str, Any]) -> None:
+def _validate_current_acceptance(
+    rt: Path, epoch_id: str, lane: dict[str, Any], acceptance: dict[str, Any]
+) -> None:
     from .review import COMPLETION_REVIEW_SCHEMA, validate_acceptance_chain
+
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     try:
-        review = read_record(folder / "COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA)
-        authoritative = _validate_acceptance_ref(folder / "ORCHESTRATOR_ACCEPTANCE.json")
+        review = read_record(
+            folder / "COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA
+        )
+        authoritative = _validate_acceptance_ref(
+            folder / "ORCHESTRATOR_ACCEPTANCE.json"
+        )
     except (OSError, ValueError) as exc:
-        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, f"current acceptance chain is unreadable: {exc}") from exc
+        raise LaunchError(
+            RETIRE_ACCEPTANCE_INVALID, f"current acceptance chain is unreadable: {exc}"
+        ) from exc
     if acceptance != authoritative or not validate_acceptance_chain(
         review, authoritative, lane_id=lane["lane_id"], run_id=lane["run_id"]
     ):
-        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, "acceptance does not match the authoritative current-run review")
+        raise LaunchError(
+            RETIRE_ACCEPTANCE_INVALID,
+            "acceptance does not match the authoritative current-run review",
+        )
     from .lane_authority import read_invocation
     from .result_validation import read_result
+
     try:
         read_invocation(lane)
         result = read_result(lane, clean=True)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, f"accepted source is no longer valid: {exc}") from exc
-    if (authoritative["source_assignment_hash"] != lane["result_assignment_hash"]
-            or authoritative["commit"] != result["commit"]
-            or authoritative["result_hash"] != result["content_hash"]
-            or authoritative["task_card_hash"] != lane["task_card_hash"]):
-        raise LaunchError(RETIRE_ACCEPTANCE_INVALID, "acceptance differs from the current protected source or result")
+        raise LaunchError(
+            RETIRE_ACCEPTANCE_INVALID, f"accepted source is no longer valid: {exc}"
+        ) from exc
+    if (
+        authoritative["source_assignment_hash"] != lane["result_assignment_hash"]
+        or authoritative["commit"] != result["commit"]
+        or authoritative["result_hash"] != result["content_hash"]
+        or authoritative["task_card_hash"] != lane["task_card_hash"]
+    ):
+        raise LaunchError(
+            RETIRE_ACCEPTANCE_INVALID,
+            "acceptance differs from the current protected source or result",
+        )
 
 
 def run_retire(acceptance_ref: str) -> dict[str, Any]:
@@ -824,12 +1088,18 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
             require_same_run(current, lane)
             _validate_current_acceptance(rt, epoch_id, current, acceptance)
             if not cleanup_is_proven(current):
-                raise LaunchError(RETIRE_CLEANUP_UNPROVEN, "lane cleanup is unknown; preserve ownership and force-stop first")
+                raise LaunchError(
+                    RETIRE_CLEANUP_UNPROVEN,
+                    "lane cleanup is unknown; preserve ownership and force-stop first",
+                )
 
             def retire(current: dict[str, Any]) -> dict[str, Any]:
                 require_same_run(current, lane)
                 if not cleanup_is_proven(current):
-                    raise LaunchError(RETIRE_CLEANUP_UNPROVEN, "lane cleanup is unknown; preserve ownership and force-stop first")
+                    raise LaunchError(
+                        RETIRE_CLEANUP_UNPROVEN,
+                        "lane cleanup is unknown; preserve ownership and force-stop first",
+                    )
                 try:
                     release_leases(rt, lane_id, current["run_id"], strict=True)
                 except Exception as exc:
@@ -837,7 +1107,11 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
                 return retired_lane_record(current)
 
             update_lane(rt, epoch_id, lane_id, retire)
-            entries = [e for e in read_active_lanes(rt, epoch_id) if e.get("lane_id") != lane_id]
+            entries = [
+                e
+                for e in read_active_lanes(rt, epoch_id)
+                if e.get("lane_id") != lane_id
+            ]
             write_active_lanes(rt, epoch_id, entries)
             _prune_worktrees(config.root_workspace)
             if not entries:
@@ -871,6 +1145,7 @@ def _maybe_close_epoch(rt: Path, epoch_id: str) -> None:
     """Close the epoch when no active lane remains and no unresolved ROOT
     manager event remains (managed)."""
     from .lanes import reconcile_active_lanes
+
     with runtime_admission_lock(rt):
         state = read_epoch_state(rt, epoch_id)
         if state.get("lifecycle") != "active":
@@ -879,6 +1154,9 @@ def _maybe_close_epoch(rt: Path, epoch_id: str) -> None:
             return
         if state.get("lane_mode") == "managed":
             queue = read_manager_queue(rt)
-            if any(event["state"] in ("PENDING", "ACKNOWLEDGED") for event in queue["events"]):
+            if any(
+                event["state"] in ("PENDING", "ACKNOWLEDGED")
+                for event in queue["events"]
+            ):
                 return
         close_epoch(rt, epoch_id)

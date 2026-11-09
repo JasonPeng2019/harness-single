@@ -1,4 +1,5 @@
 """Real kernel locks and deterministic acquisition/unlock/close failure fixtures."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -23,23 +24,32 @@ class RecordLockReleaseTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="l")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
-        source = Path(__file__).resolve().parents[2] / "super-cache/workspace/.agent-workspace/lane-queue.py"
-        spec = importlib.util.spec_from_file_location("standalone_lock_release_fixture", source)
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "super-cache/workspace/.agent-workspace/lane-queue.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "standalone_lock_release_fixture", source
+        )
         self.worker = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.worker)
 
     def locks(self):
-        return (records.RecordLock(self.root / "record"),
-                records.RecordLock(self.root / "anchored", root=self.root),
-                PathKeyedAppendLock(self.root / "append"),
-                self.worker._RecordLock(self.root / "standalone"))
+        return (
+            records.RecordLock(self.root / "record"),
+            records.RecordLock(self.root / "anchored", root=self.root),
+            PathKeyedAppendLock(self.root / "append"),
+            self.worker._RecordLock(self.root / "standalone"),
+        )
 
     @staticmethod
     def native_api():
         if os.name == "nt":
             import msvcrt
+
             return msvcrt, "locking", msvcrt.LK_UNLCK
         import fcntl
+
         return fcntl, "flock", fcntl.LOCK_UN
 
     @staticmethod
@@ -50,7 +60,10 @@ class RecordLockReleaseTests(unittest.TestCase):
 
     def assert_released(self, lock, local):
         self.assertIsNone(lock._handle)
-        self.assertTrue(local.acquire(blocking=False), "the local lock must be released on every failure path")
+        self.assertTrue(
+            local.acquire(blocking=False),
+            "the local lock must be released on every failure path",
+        )
         local.release()
         if isinstance(lock, PathKeyedAppendLock):
             self.assertIsNone(lock._anchored)
@@ -84,10 +97,12 @@ class RecordLockReleaseTests(unittest.TestCase):
     def test_unlock_failure_closes_handle_and_releases_local_lock(self):
         module, name, unlock = self.native_api()
         native = getattr(module, name)
+
         def fail_unlock(descriptor, mode, *args):
             if mode == unlock:
                 raise OSError("controlled unlock failure")
             return native(descriptor, mode, *args)
+
         for lock in self.locks():
             with self.subTest(kind=type(lock).__name__):
                 lock.__enter__()
@@ -110,10 +125,12 @@ class RecordLockReleaseTests(unittest.TestCase):
                     local = self.local_lock(lock)
                     handle = lock._handle
                     native_close = handle.close
+
                     def fail_close():
                         if close_first:
                             native_close()
                         raise OSError("controlled close failure")
+
                     try:
                         with patch.object(handle, "close", side_effect=fail_close):
                             with self.assertRaises(OSError):
@@ -135,8 +152,18 @@ class RecordLockReleaseTests(unittest.TestCase):
                 handle = lock._handle
                 native_close = handle.close
                 try:
-                    with patch.object(module, name, side_effect=OSError("controlled unlock failure")), patch.object(
-                        handle, "close", side_effect=OSError("controlled close failure")):
+                    with (
+                        patch.object(
+                            module,
+                            name,
+                            side_effect=OSError("controlled unlock failure"),
+                        ),
+                        patch.object(
+                            handle,
+                            "close",
+                            side_effect=OSError("controlled close failure"),
+                        ),
+                    ):
                         with self.assertRaises(OSError):
                             lock.__exit__(None, None, None)
                     self.assert_released(lock, local)
@@ -146,14 +173,27 @@ class RecordLockReleaseTests(unittest.TestCase):
 
     def test_native_anchor_close_failure_still_releases_the_local_lock(self):
         from orchestrator_harness import mutation
+
         for lock in self.locks()[:3]:
             with self.subTest(kind=type(lock).__name__):
                 lock.__enter__()
                 local = self.local_lock(lock)
-                anchor = lock._anchored.anchor if isinstance(lock, PathKeyedAppendLock) else lock._anchor.anchor
-                module, name = (mutation, "_CloseHandle") if os.name == "nt" else (mutation.os, "close")
+                anchor = (
+                    lock._anchored.anchor
+                    if isinstance(lock, PathKeyedAppendLock)
+                    else lock._anchor.anchor
+                )
+                module, name = (
+                    (mutation, "_CloseHandle")
+                    if os.name == "nt"
+                    else (mutation.os, "close")
+                )
                 try:
-                    with patch.object(module, name, side_effect=OSError("controlled native anchor close failure")):
+                    with patch.object(
+                        module,
+                        name,
+                        side_effect=OSError("controlled native anchor close failure"),
+                    ):
                         with self.assertRaises(OSError):
                             lock.__exit__(None, None, None)
                     self.assert_released(lock, local)
@@ -170,22 +210,39 @@ class RecordLockReleaseTests(unittest.TestCase):
                 opened = []
                 original_open = Path.open
                 from orchestrator_harness import mutation
+
                 anchored_open = mutation.open_append_file
+
                 def wrap(handle):
                     original_close = handle.close
-                    handle.close = lambda: (_ for _ in ()).throw(OSError("controlled close failure"))
+                    handle.close = lambda: (_ for _ in ()).throw(
+                        OSError("controlled close failure")
+                    )
                     opened.append((handle, original_close))
                     return handle
+
                 def open_file(path, *args, **kwargs):
                     return wrap(original_open(path, *args, **kwargs))
+
                 def open_anchor(*args, **kwargs):
                     anchor = anchored_open(*args, **kwargs)
                     wrap(anchor.handle)
                     return anchor
+
                 try:
-                    with patch.object(Path, "open", open_file), patch.object(mutation, "open_append_file", open_anchor), patch(
-                        "orchestrator_harness.stable_io.open_append_file", open_anchor), patch.object(
-                        module, name, side_effect=OSError("controlled acquisition failure")):
+                    with (
+                        patch.object(Path, "open", open_file),
+                        patch.object(mutation, "open_append_file", open_anchor),
+                        patch(
+                            "orchestrator_harness.stable_io.open_append_file",
+                            open_anchor,
+                        ),
+                        patch.object(
+                            module,
+                            name,
+                            side_effect=OSError("controlled acquisition failure"),
+                        ),
+                    ):
                         with self.assertRaises(OSError):
                             lock.__enter__()
                     self.assertIsNone(lock._handle)
@@ -230,13 +287,17 @@ class RecordLockReleaseTests(unittest.TestCase):
         records.write_record(path, "counter/v1", {"value": 0})
         errors = []
         barrier = threading.Barrier(3)
+
         def writer():
             try:
                 barrier.wait(timeout=5)
                 for _ in range(8):
-                    records.update_record(path, "counter/v1", lambda old: {"value": old["value"] + 1})
+                    records.update_record(
+                        path, "counter/v1", lambda old: {"value": old["value"] + 1}
+                    )
             except BaseException as exc:
                 errors.append(exc)
+
         threads = [threading.Thread(target=writer, daemon=True) for _ in range(2)]
         for thread in threads:
             thread.start()
@@ -249,20 +310,30 @@ class RecordLockReleaseTests(unittest.TestCase):
 
     def test_kernel_lock_serializes_an_independent_native_process(self):
         repository = Path(__file__).resolve().parents[2]
-        code = ("import sys; from pathlib import Path; from orchestrator_harness.records import RecordLock; "
-                "lock=RecordLock(Path(sys.argv[1])); lock.__enter__(); print('held',flush=True); "
-                "sys.stdin.readline(); lock.__exit__(None,None,None)")
+        code = (
+            "import sys; from pathlib import Path; from orchestrator_harness.records import RecordLock; "
+            "lock=RecordLock(Path(sys.argv[1])); lock.__enter__(); print('held',flush=True); "
+            "sys.stdin.readline(); lock.__exit__(None,None,None)"
+        )
         path = self.root / "cross-process"
-        child = subprocess.Popen([sys.executable, "-B", "-c", code, str(path)], cwd=repository,
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", code, str(path)],
+            cwd=repository,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         entered = threading.Event()
         errors = []
+
         def contender():
             try:
                 with records.RecordLock(path):
                     entered.set()
             except BaseException as exc:
                 errors.append(exc)
+
         thread = threading.Thread(target=contender, daemon=True)
         try:
             self.assertEqual("held", child.stdout.readline().strip())
@@ -281,13 +352,16 @@ class RecordLockReleaseTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows LK_LOCK finite wait")
     def test_windows_retries_acquisition_only_and_preserves_body_error(self):
         import msvcrt
+
         native = msvcrt.locking
         calls = []
+
         def locking(fd, mode, size):
             calls.append(mode)
             if mode == msvcrt.LK_LOCK and calls.count(mode) == 1:
                 raise OSError(errno.EDEADLK, "native contention")
             return native(fd, mode, size)
+
         bodies = []
         with patch.object(msvcrt, "locking", side_effect=locking):
             with self.assertRaisesRegex(OSError, "body failure"):
@@ -296,7 +370,9 @@ class RecordLockReleaseTests(unittest.TestCase):
                     raise OSError(errno.EDEADLK, "body failure")
         self.assertEqual([True], bodies)
         self.assertEqual([msvcrt.LK_LOCK, msvcrt.LK_LOCK, msvcrt.LK_UNLCK], calls)
-        with patch.object(msvcrt, "locking", side_effect=PermissionError(errno.EACCES, "denied")) as lock:
+        with patch.object(
+            msvcrt, "locking", side_effect=PermissionError(errno.EACCES, "denied")
+        ) as lock:
             with self.assertRaises(PermissionError):
                 with records.RecordLock(self.root / "retry"):
                     self.fail("denied acquisition entered body")
@@ -305,16 +381,25 @@ class RecordLockReleaseTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows LK_LOCK native contention")
     def test_windows_admission_waits_past_native_window_for_exact_child(self):
         from orchestrator_harness import processes
-        code = ("import json,os,sys,time; from pathlib import Path; "
-                "from orchestrator_harness import processes; "
-                "from orchestrator_harness.records import runtime_admission_lock; "
-                "lock=runtime_admission_lock(Path(sys.argv[1])); lock.__enter__(); "
-                "print(json.dumps(processes.process_identity(os.getpid())),flush=True); "
-                "time.sleep(12); lock.__exit__(None,None,None)")
-        child = subprocess.Popen([sys.executable, "-B", "-c", code, str(self.root)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        code = (
+            "import json,os,sys,time; from pathlib import Path; "
+            "from orchestrator_harness import processes; "
+            "from orchestrator_harness.records import runtime_admission_lock; "
+            "lock=runtime_admission_lock(Path(sys.argv[1])); lock.__enter__(); "
+            "print(json.dumps(processes.process_identity(os.getpid())),flush=True); "
+            "time.sleep(12); lock.__exit__(None,None,None)"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", code, str(self.root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         identity = json.loads(child.stdout.readline())
-        self.assertTrue(processes.identity_matches(identity["pid"], identity["creation_time"]))
+        self.assertTrue(
+            processes.identity_matches(identity["pid"], identity["creation_time"])
+        )
         start = time.monotonic()
         try:
             with records.runtime_admission_lock(self.root):
@@ -322,7 +407,9 @@ class RecordLockReleaseTests(unittest.TestCase):
         finally:
             stdout, stderr = child.communicate(timeout=30)
         self.assertEqual(0, child.returncode, stdout + stderr)
-        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
+        self.assertTrue(
+            processes.identity_exit_proven(identity["pid"], identity["creation_time"])
+        )
 
 
 if __name__ == "__main__":

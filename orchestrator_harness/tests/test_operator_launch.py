@@ -44,8 +44,12 @@ class OperatorLaunchV2Tests(unittest.TestCase):
         for outcome in ("COMPLETE", "BLOCKED"):
             for summary in (None, "", "   "):
                 argv = [
-                    "manager", "close", "--event-id", "event-1",
-                    "--outcome", outcome,
+                    "manager",
+                    "close",
+                    "--event-id",
+                    "event-1",
+                    "--outcome",
+                    outcome,
                 ]
                 if summary is not None:
                     argv.extend(["--summary", summary])
@@ -55,8 +59,13 @@ class OperatorLaunchV2Tests(unittest.TestCase):
                             parser.parse_args(argv)
             parsed = parser.parse_args(
                 [
-                    "manager", "close", "--event-id", "event-1",
-                    "--outcome", outcome, "--summary",
+                    "manager",
+                    "close",
+                    "--event-id",
+                    "event-1",
+                    "--outcome",
+                    outcome,
+                    "--summary",
                     "  operator decision  ",
                 ]
             )
@@ -66,11 +75,20 @@ class OperatorLaunchV2Tests(unittest.TestCase):
         parser = operator_launch._build_parser()
         parsed = parser.parse_args(
             [
-                "lane", "bootstrap", "--lane-id", "lane-1",
-                "--provider", "codex", "--model", "configured-model",
-                "--provider-option", "reasoning_effort=xhigh",
-                "--provider-option", "service_tier=flex",
-                "--task-card", "task.json",
+                "lane",
+                "bootstrap",
+                "--lane-id",
+                "lane-1",
+                "--provider",
+                "codex",
+                "--model",
+                "configured-model",
+                "--provider-option",
+                "reasoning_effort=xhigh",
+                "--provider-option",
+                "service_tier=flex",
+                "--task-card",
+                "task.json",
             ]
         )
         self.assertEqual(

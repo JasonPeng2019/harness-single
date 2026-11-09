@@ -162,9 +162,15 @@ def _launch_local_fake_child(
             "creation_time_utc": ready.get("creation_time_utc"),
             "identity_token": ready.get("identity_token"),
         }
-        if ready["event"] != "observer-ready" or observed_identity["pid"] != process.pid:
+        if (
+            ready["event"] != "observer-ready"
+            or observed_identity["pid"] != process.pid
+        ):
             raise RuntimeError("local fake observer did not report its spawned process")
-        if observed_identity["identity_token"] != identity_token or not observed_identity["creation_time_utc"]:
+        if (
+            observed_identity["identity_token"] != identity_token
+            or not observed_identity["creation_time_utc"]
+        ):
             raise RuntimeError("local fake observer identity token mismatch")
         if process.poll() is not None:
             raise RuntimeError("local fake child was not still running when observed")
@@ -174,17 +180,21 @@ def _launch_local_fake_child(
         for stream in (process.stdin, process.stdout, process.stderr):
             stream.close()
         raise
-    return process, {
-        "attempt": attempt,
-        "unit": unit,
-        "command": command,
-        "started_at": started_at,
-        "observer_ready_at": observer_ready_at,
-        "requested_process_identity": requested_identity,
-        "observed_process_identity": observed_identity,
-        "observer_record": ready,
-        "still_running_when_observed": True,
-    }, ready
+    return (
+        process,
+        {
+            "attempt": attempt,
+            "unit": unit,
+            "command": command,
+            "started_at": started_at,
+            "observer_ready_at": observer_ready_at,
+            "requested_process_identity": requested_identity,
+            "observed_process_identity": observed_identity,
+            "observer_record": ready,
+            "still_running_when_observed": True,
+        },
+        ready,
+    )
 
 
 def _abort_local_fake_child(
@@ -221,7 +231,9 @@ def _complete_local_fake_child(
     """Complete a distinct child after sending its one local fake action."""
     assert process.stdin and process.stdout and process.stderr
     action_dispatched_at = _timestamp()
-    process.stdin.write(json.dumps({"name": action, "unit": attempt_record["unit"]}) + "\n")
+    process.stdin.write(
+        json.dumps({"name": action, "unit": attempt_record["unit"]}) + "\n"
+    )
     process.stdin.flush()
     process.stdin.close()
     stdout_tail = process.stdout.read()
@@ -229,7 +241,11 @@ def _complete_local_fake_child(
     exit_code = process.wait()
     ended_at = _timestamp()
     action_records = [json.loads(line) for line in stdout_tail.splitlines() if line]
-    if len(action_records) != 1 or action_records[0]["event"] != "action-complete" or exit_code != 0:
+    if (
+        len(action_records) != 1
+        or action_records[0]["event"] != "action-complete"
+        or exit_code != 0
+    ):
         raise RuntimeError("local fake child failed its correlated action")
     attempt_record.update(
         {
@@ -331,7 +347,11 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
             shutil.rmtree(fake_target_root)
         resource_closed = not fake_target_root.exists()
         cleanup_passes += 1
-    if not resource_closed or not aborted["terminal_process_closed"] or not recovered["terminal_process_closed"]:
+    if (
+        not resource_closed
+        or not aborted["terminal_process_closed"]
+        or not recovered["terminal_process_closed"]
+    ):
         raise RuntimeError("local fake terminal closure was not verified")
     return {
         "schema": "v2-disposable-readiness/v1",
@@ -350,7 +370,8 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
         "checkpoint": {
             "path": str(checkpoint_path),
             "failed_attempt_atomic_write": True,
-            "failed_attempt_read_back_matches": failed_checkpoint_read == failed_checkpoint,
+            "failed_attempt_read_back_matches": failed_checkpoint_read
+            == failed_checkpoint,
             "final_read_back_matches": final_checkpoint_read == final_checkpoint,
             "resume_from_earliest_pending_unit": resume_unit,
             "failed_attempt": failed_checkpoint_read["attempts"][0],
@@ -386,21 +407,45 @@ def run_readiness_only(root: Path, input_arguments: list[str]) -> dict[str, obje
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--fake-only", action="store_true", help="run the existing fake-only rehearsal")
-    mode.add_argument("--readiness-only", action="store_true", help="run only local readiness fakes; never M09")
-    parser.add_argument("--keep", type=Path, help="retain the disposable workspace-local root for diagnosis")
+    mode.add_argument(
+        "--fake-only", action="store_true", help="run the existing fake-only rehearsal"
+    )
+    mode.add_argument(
+        "--readiness-only",
+        action="store_true",
+        help="run only local readiness fakes; never M09",
+    )
+    parser.add_argument(
+        "--keep",
+        type=Path,
+        help="retain the disposable workspace-local root for diagnosis",
+    )
     args = parser.parse_args(argv)
     try:
-        root = _validate_keep_root(args.keep) if args.keep else _disposable_root("harness-v2-")
+        root = (
+            _validate_keep_root(args.keep)
+            if args.keep
+            else _disposable_root("harness-v2-")
+        )
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        result = run_readiness_only(root, sys.argv[1:] if argv is None else argv) if args.readiness_only else run_fake_only(root)
+        result = (
+            run_readiness_only(root, sys.argv[1:] if argv is None else argv)
+            if args.readiness_only
+            else run_fake_only(root)
+        )
         if args.keep:
-            result["cleanup"] = {"disposable_root": "retained by --keep", "root_exists": root.is_dir()}
+            result["cleanup"] = {
+                "disposable_root": "retained by --keep",
+                "root_exists": root.is_dir(),
+            }
         else:
             shutil.rmtree(root)
-            result["cleanup"] = {"disposable_root_removed": not root.exists(), "artifacts_proven_gone": not root.exists()}
+            result["cleanup"] = {
+                "disposable_root_removed": not root.exists(),
+                "artifacts_proven_gone": not root.exists(),
+            }
         print(json.dumps(result, sort_keys=True))
         return 0
     except BaseException as exc:

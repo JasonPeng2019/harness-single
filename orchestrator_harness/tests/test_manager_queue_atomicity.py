@@ -42,9 +42,7 @@ class ManagerQueueAtomicityTests(unittest.TestCase):
                         "run_id": "run-1",
                         "state": "ACKNOWLEDGED",
                         "summary": "pending review",
-                        "history": [
-                            {"state": "ACKNOWLEDGED", "at": "earlier"}
-                        ],
+                        "history": [{"state": "ACKNOWLEDGED", "at": "earlier"}],
                         "delivery_history": [],
                     }
                 ],

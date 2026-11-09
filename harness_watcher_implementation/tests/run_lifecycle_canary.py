@@ -22,7 +22,11 @@ def config(runtime: str) -> Path:
             {
                 "runtime_root": str((DEST / runtime).relative_to(ROOT)),
                 "observed_sources": [
-                    {"path": str(DEST / "empty.log"), "role": "harness", "source_id": "native"}
+                    {
+                        "path": str(DEST / "empty.log"),
+                        "role": "harness",
+                        "source_id": "native",
+                    }
                 ],
                 "poll_interval_seconds": 2,
                 "evaluator_enabled": False,
@@ -58,9 +62,14 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
     while time.monotonic() < deadline:
         _, state = call(path, "status")
         watcher = (state.get("state") or {}).get("watcher")
-        gone = (isinstance(watcher, dict) and identity_exit_proven(watcher.get("pid"), watcher.get("created_utc")))
-        if not state["running"] and not state.get("identity_unproven") and gone and (
-            reason is None or state.get("state", {}).get("exit_reason") == reason
+        gone = isinstance(watcher, dict) and identity_exit_proven(
+            watcher.get("pid"), watcher.get("created_utc")
+        )
+        if (
+            not state["running"]
+            and not state.get("identity_unproven")
+            and gone
+            and (reason is None or state.get("state", {}).get("exit_reason") == reason)
         ):
             return state
         time.sleep(0.1)
@@ -69,7 +78,9 @@ def wait_not_running(path: Path, reason: str | None = None) -> dict[str, object]
 
 def new_activity(runtime: str) -> dict[str, object]:
     source = DEST / "empty.log"
-    cursor = json.loads((DEST / runtime / "watcher" / "cursor.json").read_text(encoding="utf-8"))
+    cursor = json.loads(
+        (DEST / runtime / "watcher" / "cursor.json").read_text(encoding="utf-8")
+    )
     baseline = cursor["sources"][str(source)]["offset"]
     if baseline != source.stat().st_size:
         raise RuntimeError("READY did not establish the existing source baseline")
@@ -79,10 +90,19 @@ def new_activity(runtime: str) -> dict[str, object]:
     events = DEST / runtime / "harness" / "events.jsonl"
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()] if events.exists() else []
+        rows = (
+            [
+                json.loads(line)
+                for line in events.read_text(encoding="utf-8").splitlines()
+            ]
+            if events.exists()
+            else []
+        )
         if any(record in row["data"].get("records", []) for row in rows):
             if len(rows) != 1:
-                raise RuntimeError("service replayed baseline history or duplicated new activity")
+                raise RuntimeError(
+                    "service replayed baseline history or duplicated new activity"
+                )
             return {"baseline_offset": baseline, "record": record, "routed": rows}
         time.sleep(0.1)
     raise RuntimeError("post-READY activity was not recorded")
@@ -100,7 +120,9 @@ def _run_canary() -> None:
     stopped = wait_not_running(ordinary, "stop-requested")
 
     restart_config = config("restart_runtime")
-    restart_code, restart = call(restart_config, "start", "--owner-pid", str(os.getpid()))
+    restart_code, restart = call(
+        restart_config, "start", "--owner-pid", str(os.getpid())
+    )
     restart_activity = new_activity("restart_runtime")
     restart_stop_code, restart_stop = call(restart_config, "stop")
     restarted_stopped = wait_not_running(restart_config, "stop-requested")
@@ -143,10 +165,31 @@ def _run_canary() -> None:
         json.dumps(result, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(result, indent=2))
-    if (any(code != 0 for code in (start_code, duplicate_code, status_code, stop_code, restart_code, restart_stop_code))
-            or duplicate.get("result") != "already-started"
-            or not all(result[key] for key in ("live_has_pid_and_creation", "cooperative_stop_reason", "owner_loss_reason"))):
-        raise RuntimeError("native watcher lifecycle assertions failed; inspect retained result")
+    if (
+        any(
+            code != 0
+            for code in (
+                start_code,
+                duplicate_code,
+                status_code,
+                stop_code,
+                restart_code,
+                restart_stop_code,
+            )
+        )
+        or duplicate.get("result") != "already-started"
+        or not all(
+            result[key]
+            for key in (
+                "live_has_pid_and_creation",
+                "cooperative_stop_reason",
+                "owner_loss_reason",
+            )
+        )
+    ):
+        raise RuntimeError(
+            "native watcher lifecycle assertions failed; inspect retained result"
+        )
 
 
 def main() -> None:
@@ -167,23 +210,40 @@ def main() -> None:
                     continue
                 watcher = state.get("watcher")
                 if not isinstance(watcher, dict):
-                    raise RuntimeError("published startup has no provable watcher identity")
-                if not identity_exit_proven(watcher.get("pid"), watcher.get("created_utc")):
+                    raise RuntimeError(
+                        "published startup has no provable watcher identity"
+                    )
+                if not identity_exit_proven(
+                    watcher.get("pid"), watcher.get("created_utc")
+                ):
                     code, requested = call(path, "stop")
                     if code != 0:
                         raise RuntimeError(f"cooperative stop refused: {requested}")
                     current = wait_not_running(path)
-                gone = identity_exit_proven(watcher.get("pid"), watcher.get("created_utc"))
-                proof.append({"config": str(path), "watcher": watcher, "exact_exit_proven": gone,
-                              "terminal": current.get("state")})
+                gone = identity_exit_proven(
+                    watcher.get("pid"), watcher.get("created_utc")
+                )
+                proof.append(
+                    {
+                        "config": str(path),
+                        "watcher": watcher,
+                        "exact_exit_proven": gone,
+                        "terminal": current.get("state"),
+                    }
+                )
                 if not gone:
                     raise RuntimeError("exact watcher exit remains unproven")
             except Exception as exc:
                 failures.append({"config": str(path), "error": str(exc)})
         DEST.mkdir(parents=True, exist_ok=True)
-        (DEST / "cleanup.json").write_text(json.dumps({"proof": proof, "failures": failures}, indent=2), encoding="utf-8")
+        (DEST / "cleanup.json").write_text(
+            json.dumps({"proof": proof, "failures": failures}, indent=2),
+            encoding="utf-8",
+        )
         if failures:
-            raise RuntimeError("canary cleanup is unproven; retained fixtures were not deleted")
+            raise RuntimeError(
+                "canary cleanup is unproven; retained fixtures were not deleted"
+            )
 
 
 if __name__ == "__main__":

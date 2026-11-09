@@ -3,6 +3,7 @@
 Offline fixtures use shallow OS Temp, real linked Git worktrees and finite owned
 Python processes. No model/provider is launched and no lifecycle source is patched.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,58 +42,116 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.git(f.product, "init", "-q")
         (f.product / ".gitignore").write_text(".harness-runtime/\n", encoding="utf-8")
         self.git(f.product, "add", ".gitignore")
-        self.git(f.product, "-c", "user.name=Fixture", "-c", "user.email=fixture@local",
-                 "commit", "-qm", "base")
+        self.git(
+            f.product,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@local",
+            "commit",
+            "-qm",
+            "base",
+        )
         self.git(f.product, "worktree", "add", "-qb", "lane/w/work", str(f.worktree))
         (f.worktree / ".codex").mkdir()
-        codex_home = str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve())
+        codex_home = str(
+            Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
+        )
         (f.worktree / ".codex/config.toml").write_text(
             '[features]\nhooks = true\n[permissions.worker-isolated]\nextends=":workspace"\nfilesystem='
-            + binding._toml_inline({codex_home: "deny", str(f.worktree): "write"}), encoding="utf-8")
+            + binding._toml_inline({codex_home: "deny", str(f.worktree): "write"}),
+            encoding="utf-8",
+        )
         f.lane["provider"]["launch_config"]["launcher"] = self.launcher
         self.catalog = f.base / "ollama-model-catalog.json"
-        f.write(self.catalog, {"models": [{"slug": "fixture", "supported_reasoning_levels": [{"effort": "high"}]}]})
-        self.card = {"schema": "project-task-card/v1", "task": "Account for retained retry",
-                     "acceptance_criteria": ["All actual invocations counted"], "deliverables": ["Evidence"],
-                     "reason_for_acceptance_and_deliverables": "Verify actual saved-session accounting"}
-        initial = {"schema": "lane/v1", "lane_id": "w", "run_id": "worker-run", "lifecycle": "retired",
-                   "worktree_path": str(f.worktree), "branch": "lane/w/work", "provider": f.lane["provider"],
-                   "exclusive_resources": [], "process": f.controller_boundary["root"]}
+        f.write(
+            self.catalog,
+            {
+                "models": [
+                    {
+                        "slug": "fixture",
+                        "supported_reasoning_levels": [{"effort": "high"}],
+                    }
+                ]
+            },
+        )
+        self.card = {
+            "schema": "project-task-card/v1",
+            "task": "Account for retained retry",
+            "acceptance_criteria": ["All actual invocations counted"],
+            "deliverables": ["Evidence"],
+            "reason_for_acceptance_and_deliverables": "Verify actual saved-session accounting",
+        }
+        initial = {
+            "schema": "lane/v1",
+            "lane_id": "w",
+            "run_id": "worker-run",
+            "lifecycle": "retired",
+            "worktree_path": str(f.worktree),
+            "branch": "lane/w/work",
+            "provider": f.lane["provider"],
+            "exclusive_resources": [],
+            "process": f.controller_boundary["root"],
+        }
         f.lane = self.stage("e", initial)
         f.control = Path(f.lane["control_dir"])
         f.transcript = Path(f.lane["transcript_path"])
         f.transcript.write_bytes(f.damaged_bytes)
         retry_policy.initialize_history(f.runtime, f.lane)
-        self.finish("e", f.lane, f.controller_boundary, f.worker_boundary, resumed=False)
+        self.finish(
+            "e", f.lane, f.controller_boundary, f.worker_boundary, resumed=False
+        )
         f.write(f.native / "lane.json", f.lane)
         self.first_lane_bytes = (f.native / "lane.json").read_bytes()
         self.retry_controller = f.owned_exit("retry-controller")
         self.retry_worker = f.owned_exit("retry-worker")
-        self.second = self.stage("later", {**f.lane, "run_id": "retry-run",
-                            "resume_from_epoch_id": "e", "session": {"session_id": "worker-session"},
-                            "process": self.retry_controller["root"]})
+        self.second = self.stage(
+            "later",
+            {
+                **f.lane,
+                "run_id": "retry-run",
+                "resume_from_epoch_id": "e",
+                "session": {"session_id": "worker-session"},
+                "process": self.retry_controller["root"],
+            },
+        )
         self.second_transcript = Path(self.second["transcript_path"])
         f.write_usage(self.second_transcript, "worker-session", 42)
-        self.finish("later", self.second, self.retry_controller, self.retry_worker, resumed=True)
+        self.finish(
+            "later", self.second, self.retry_controller, self.retry_worker, resumed=True
+        )
         f.write(f.runtime / "epochs/later/lanes/w/lane.json", self.second)
         self.seal()
         self.assertFalse((f.runtime / "worktrees/later").exists())
-        self.assertEqual(2, retry_policy.completed_provider_invocations(self.second, f.runtime))
+        self.assertEqual(
+            2, retry_policy.completed_provider_invocations(self.second, f.runtime)
+        )
         self.assertEqual(self.first_lane_bytes, (f.native / "lane.json").read_bytes())
 
     def cleanup_fixture(self):
         self.assertTrue(self.f.doCleanups(), "continuation fixture cleanup failed")
 
     def git(self, root, *args):
-        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                                env=git_source.environment(), timeout=20)
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            env=git_source.environment(),
+            timeout=20,
+        )
         self.assertEqual(0, result.returncode, result.stderr.decode("utf-8", "replace"))
 
     def stage(self, epoch, lane):
         f = self.f
         bootstrap._write_worker_prompt(f.worktree, self.card, managed=False)
-        bootstrap._write_invocation(f.worktree, lane_id="w", run_id=lane["run_id"], provider_id="codex",
-            model="fixture", launch_config=lane["provider"]["launch_config"], exclusive_resources=[])
+        bootstrap._write_invocation(
+            f.worktree,
+            lane_id="w",
+            run_id=lane["run_id"],
+            provider_id="codex",
+            model="fixture",
+            launch_config=lane["provider"]["launch_config"],
+            exclusive_resources=[],
+        )
         lane = lane_authority.stage_authority(f.runtime, epoch, lane, self.card)
         self.assertEqual(lane["run_id"], lane_authority.read_invocation(lane)["run_id"])
         return lane
@@ -100,38 +159,85 @@ class CrossEpochUsageTests(unittest.TestCase):
     def finish(self, epoch, lane, controller_boundary, worker_boundary, *, resumed):
         f = self.f
         token = retry_policy.reserve_invocation(f.runtime, lane)
-        retry_policy.record_started(f.runtime, lane, token, process_boundary=worker_boundary)
+        retry_policy.record_started(
+            f.runtime, lane, token, process_boundary=worker_boundary
+        )
         lane["_history_token"], lane["_history_runtime"] = token, str(f.runtime)
         # Offline fixtures substitute catalog/executable discovery only; argv,
         # grammar and isolation still use the actual shipped provider binding.
-        with patch.object(binding, "_ollama_catalog_path", return_value=self.catalog), \
-                patch.object(binding, "_direct_codex_executable", return_value="codex"):
-            command = binding.build_argv(model=lane["provider"]["model"],
-                launch_config=lane["provider"]["launch_config"], worktree=lane["worktree_path"],
-                prompt_path=lane["prompt_path"], session_id="worker-session" if resumed else None,
-                resume=resumed, isolation_config_path=lane["isolation_config_path"])
+        with (
+            patch.object(binding, "_ollama_catalog_path", return_value=self.catalog),
+            patch.object(binding, "_direct_codex_executable", return_value="codex"),
+        ):
+            command = binding.build_argv(
+                model=lane["provider"]["model"],
+                launch_config=lane["provider"]["launch_config"],
+                worktree=lane["worktree_path"],
+                prompt_path=lane["prompt_path"],
+                session_id="worker-session" if resumed else None,
+                resume=resumed,
+                isolation_config_path=lane["isolation_config_path"],
+            )
         self.assertEqual("codex", command[0])
         self.assertEqual(resumed, "resume" in command)
         if resumed:
-            self.assertEqual(6 if self.launcher == "ollama" else 3, command.index("resume"))
+            self.assertEqual(
+                6 if self.launcher == "ollama" else 3, command.index("resume")
+            )
         control = Path(lane["control_dir"])
-        (control / "controller.events.jsonl").write_text(json.dumps({"event_type": "provider_started",
-            "run_id": lane["run_id"], "ts": ledger.utc_now()}) + "\n", encoding="utf-8")
+        (control / "controller.events.jsonl").write_text(
+            json.dumps(
+                {
+                    "event_type": "provider_started",
+                    "run_id": lane["run_id"],
+                    "ts": ledger.utc_now(),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         # Real writer: native session, byte ranges, usage observations and history.
         from orchestrator_harness import controller
-        controller._append_attempt(lane, attempt_number=1, argv=command, session_id="worker-session",
-            prompt_path=Path(lane["prompt_path"]), paths={"transcript": Path(lane["transcript_path"]),
-            "stderr": Path(lane["stderr_path"])}, exit_code=0, result_state="invalid", cleanup_proven=True,
-            provider_started=True)
+
+        controller._append_attempt(
+            lane,
+            attempt_number=1,
+            argv=command,
+            session_id="worker-session",
+            prompt_path=Path(lane["prompt_path"]),
+            paths={
+                "transcript": Path(lane["transcript_path"]),
+                "stderr": Path(lane["stderr_path"]),
+            },
+            exit_code=0,
+            result_state="invalid",
+            cleanup_proven=True,
+            provider_started=True,
+        )
         lane.pop("_history_token")
         lane.pop("_history_runtime")
         lane["session"] = {"session_id": "worker-session"}
-        f.write(Path(lane["controller_status_path"]), {"schema": "controller-status/v1", "lane_id": "w",
-            "run_id": lane["run_id"], "controller_identity": controller_boundary["root"],
-            "controller_state": "exited", "provider_state": {"state": "exited", **worker_boundary["root"]},
-            "process_boundary": worker_boundary, "cleanup_proven": True})
-        f.write(f.runtime / "epochs" / epoch / "epoch-state.json", {
-            "schema": "epoch-state/v1", "lifecycle": "closed", "closed_at": f.closed_at})
+        f.write(
+            Path(lane["controller_status_path"]),
+            {
+                "schema": "controller-status/v1",
+                "lane_id": "w",
+                "run_id": lane["run_id"],
+                "controller_identity": controller_boundary["root"],
+                "controller_state": "exited",
+                "provider_state": {"state": "exited", **worker_boundary["root"]},
+                "process_boundary": worker_boundary,
+                "cleanup_proven": True,
+            },
+        )
+        f.write(
+            f.runtime / "epochs" / epoch / "epoch-state.json",
+            {
+                "schema": "epoch-state/v1",
+                "lifecycle": "closed",
+                "closed_at": f.closed_at,
+            },
+        )
 
     def seal(self):
         f = self.f
@@ -141,7 +247,10 @@ class CrossEpochUsageTests(unittest.TestCase):
     def retain_evidence(self):
         destination = os.environ.get("CROSS_EPOCH_USAGE_EVIDENCE")
         if destination:
-            shutil.copytree(self.f.base, Path(destination) / type(self).__name__ / self.id().rsplit(".", 1)[-1])
+            shutil.copytree(
+                self.f.base,
+                Path(destination) / type(self).__name__ / self.id().rsplit(".", 1)[-1],
+            )
 
     def snapshot(self):
         result = ledger.build_snapshot(self.f.task_path)
@@ -152,21 +261,43 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.f.write_usage(self.f.transcript, "worker-session", 17)
 
     def command(self, name):
-        completed = subprocess.run([sys.executable, "-B", str(Path(collector.__file__)), name,
-            "--task-file", str(self.f.task_path)], capture_output=True, text=True, timeout=20)
-        self.f.write(self.f.base / (name + "-command.json"), {"command": completed.args,
-            "stdout": completed.stdout, "stderr": completed.stderr, "exit": completed.returncode})
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(Path(collector.__file__)),
+                name,
+                "--task-file",
+                str(self.f.task_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.f.write(
+            self.f.base / (name + "-command.json"),
+            {
+                "command": completed.args,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "exit": completed.returncode,
+            },
+        )
         return completed
 
     def test_actual_discovery_counts_both_authority_epochs_once(self):
         self.known_first()
         rows = ledger.discover_invocations(ledger.load_task(self.f.task_path))
         workers = [r for r in rows if r["role"] == "worker"]
-        self.assertEqual([("e", "worker-run"), ("later", "retry-run")],
-                         [(r["epoch_id"], r["lane_run_id"]) for r in workers])
+        self.assertEqual(
+            [("e", "worker-run"), ("later", "retry-run")],
+            [(r["epoch_id"], r["lane_run_id"]) for r in workers],
+        )
         self.assertEqual(2, len({r["invocation_id"] for r in workers}))
-        self.assertEqual({str(self.f.transcript), str(self.second_transcript)},
-                         {r["transcript_path"] for r in workers})
+        self.assertEqual(
+            {str(self.f.transcript), str(self.second_transcript)},
+            {r["transcript_path"] for r in workers},
+        )
 
     def test_snapshot_delta_and_public_capped_gate_include_retry(self):
         self.known_first()
@@ -200,10 +331,19 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.assertIn("baseline is unknown", workers[1]["accounting_error"])
         prepared = collector.prepare_resume(self.f.args())
         self.assertEqual((2, "saved-root", 1), prepared[1:])
-        self.f.write(self.f.base / "prepared.json", {"segment": str(prepared[0]), "number": prepared[1],
-                                                    "session": prepared[2], "watchdog": prepared[3]})
+        self.f.write(
+            self.f.base / "prepared.json",
+            {
+                "segment": str(prepared[0]),
+                "number": prepared[1],
+                "session": prepared[2],
+                "watchdog": prepared[3],
+            },
+        )
         archive = self.f.base / "archive"
-        self.assertFalse(ledger.finalize(self.f.task_path, archive)["token_total_is_exact"])
+        self.assertFalse(
+            ledger.finalize(self.f.task_path, archive)["token_total_is_exact"]
+        )
         self.assertEqual(self.f.damaged_bytes, self.f.transcript.read_bytes())
 
     def test_recovered_retry_cannot_authorize_capped_work(self):
@@ -227,11 +367,15 @@ class CrossEpochUsageTests(unittest.TestCase):
         for epoch, run in (("e", "worker-run"), ("later", "retry-run")):
             with self.subTest(epoch=epoch):
                 rows = ledger._worker_invocations({**task, "epoch_id": epoch})
-                self.assertEqual([(epoch, run)], [(r["epoch_id"], r["lane_run_id"]) for r in rows])
+                self.assertEqual(
+                    [(epoch, run)], [(r["epoch_id"], r["lane_run_id"]) for r in rows]
+                )
         self.f.task["epoch_id"] = "later"
         self.f.write(self.f.task_path, self.f.task)
         snapshot = self.snapshot()
-        self.assertIn("resumed thread has no prior baseline", "; ".join(snapshot["errors"]))
+        self.assertIn(
+            "resumed thread has no prior baseline", "; ".join(snapshot["errors"])
+        )
         self.assertFalse(snapshot["gate_allows_new_work"])
 
     def test_retry_outside_root_window_is_excluded(self):
@@ -252,12 +396,22 @@ class CrossEpochUsageTests(unittest.TestCase):
         f = self.f
         end = dt.datetime.fromisoformat(f.final["ended_at_utc"])
         segment = f.run / "segments/0002"
-        launch = {**f.launch, "segment_number": 2, "resume_session_id": "saved-root",
-                  "started_at_utc": (end + dt.timedelta(seconds=60)).isoformat(),
-                  "command": ["codex", "exec", "resume", "saved-root", *f.argv()[2:]]}
+        launch = {
+            **f.launch,
+            "segment_number": 2,
+            "resume_session_id": "saved-root",
+            "started_at_utc": (end + dt.timedelta(seconds=60)).isoformat(),
+            "command": ["codex", "exec", "resume", "saved-root", *f.argv()[2:]],
+        }
         f.write(segment / "launch.json", launch)
-        f.write(segment / "manifest.json", {**f.final, **launch,
-            "ended_at_utc": (end + dt.timedelta(seconds=120)).isoformat()})
+        f.write(
+            segment / "manifest.json",
+            {
+                **f.final,
+                **launch,
+                "ended_at_utc": (end + dt.timedelta(seconds=120)).isoformat(),
+            },
+        )
         f.write_usage(segment / "codex-events.jsonl", "saved-root", 50)
         self.retime_retry(end + dt.timedelta(seconds=30))
         with self.assertRaisesRegex(ledger.LedgerError, "paused interval"):
@@ -267,7 +421,12 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.known_first()
         invocation = Path(self.second["invocation_path"])
         original = invocation.read_bytes()
-        for change in (None, {"cwd": str(self.f.base)}, {"lane_id": "other"}, {"run_id": "other"}):
+        for change in (
+            None,
+            {"cwd": str(self.f.base)},
+            {"lane_id": "other"},
+            {"run_id": "other"},
+        ):
             with self.subTest(change=change):
                 if change is None:
                     invocation.unlink()
@@ -281,13 +440,17 @@ class CrossEpochUsageTests(unittest.TestCase):
 
     def test_retry_missing_terminal_usage_remains_error(self):
         self.known_first()
-        self.second_transcript.write_text('{"type":"thread.started","thread_id":"worker-session"}\n')
+        self.second_transcript.write_text(
+            '{"type":"thread.started","thread_id":"worker-session"}\n'
+        )
         snapshot = self.snapshot()
         self.assertTrue(snapshot["errors"], snapshot)
         self.assertFalse(snapshot["token_total_is_exact"])
         self.assertFalse(snapshot["gate_allows_new_work"])
 
-    def test_recovery_without_attempt_receipt_uses_original_native_session_history(self):
+    def test_recovery_without_attempt_receipt_uses_original_native_session_history(
+        self,
+    ):
         Path(self.f.lane["attempts_path"]).unlink()
         self.f.recover()
         snapshot = self.snapshot()
@@ -295,14 +458,20 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.assertEqual(2, snapshot["unknown_usage_invocations"])
         self.assertEqual("saved-root", collector.prepare_resume(self.f.args())[2])
         workers = [r for r in snapshot["rows"] if r["role"] == "worker"]
-        self.assertEqual(["worker-session", "worker-session"], [r["session_id"] for r in workers])
-        self.assertIn(self.f.lane["provider_history_path"], workers[0]["source_manifest_paths"])
+        self.assertEqual(
+            ["worker-session", "worker-session"], [r["session_id"] for r in workers]
+        )
+        self.assertIn(
+            self.f.lane["provider_history_path"], workers[0]["source_manifest_paths"]
+        )
 
     def mutate_attempt(self, lane, **changes):
         path = Path(lane["attempts_path"])
         records = ledger.read_lines(path)
         records[-1].update(changes)
-        path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        path.write_text(
+            "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+        )
 
     def test_discovery_distinguishes_resume_subcommand_from_values_and_prompt(self):
         attempt = Path(self.second["attempts_path"])
@@ -311,21 +480,38 @@ class CrossEpochUsageTests(unittest.TestCase):
         initial = ledger.read_lines(Path(self.f.lane["attempts_path"]))[-1]["argv"]
         # These values can occur before or after exec options. Only the actual
         # first positional subcommand selects saved-session accounting.
-        cases = [(resumed, True), (initial, False),
-                 ([initial[0], "review", "resume"], False),
-                 ([*initial, "resume"], False),
-                 ([*initial[:-1], "--", "resume", "worker-session"], False)]
-        for option in ("-m", "--model", "-c", "--config", "--local-provider",
-                       "--output-last-message", "--output-schema", "--cd"):
-            cases.extend([([*initial[:2], option, "resume", *initial[2:]], False),
-                          ([*resumed[:2], option, "resume", *resumed[2:]], True)])
+        cases = [
+            (resumed, True),
+            (initial, False),
+            ([initial[0], "review", "resume"], False),
+            ([*initial, "resume"], False),
+            ([*initial[:-1], "--", "resume", "worker-session"], False),
+        ]
+        for option in (
+            "-m",
+            "--model",
+            "-c",
+            "--config",
+            "--local-provider",
+            "--output-last-message",
+            "--output-schema",
+            "--cd",
+        ):
+            cases.extend(
+                [
+                    ([*initial[:2], option, "resume", *initial[2:]], False),
+                    ([*resumed[:2], option, "resume", *resumed[2:]], True),
+                ]
+            )
             if option.startswith("--"):
                 cases.append(([*resumed[:2], option + "=resume", *resumed[2:]], True))
         try:
             for argv, expected in cases:
                 with self.subTest(argv=argv):
                     self.mutate_attempt(self.second, argv=argv)
-                    rows = ledger._worker_invocations(ledger.load_task(self.f.task_path))
+                    rows = ledger._worker_invocations(
+                        ledger.load_task(self.f.task_path)
+                    )
                     retry = next(r for r in rows if r["lane_run_id"] == "retry-run")
                     self.assertIs(expected, retry["resume"])
         finally:
@@ -336,7 +522,9 @@ class CrossEpochUsageTests(unittest.TestCase):
         attempt = Path(self.second["attempts_path"])
         original = attempt.read_bytes()
         argv = ledger.read_lines(attempt)[-1]["argv"]
-        self.mutate_attempt(self.second, argv=[*argv[:2], "--output-last-message", "resume", *argv[2:]])
+        self.mutate_attempt(
+            self.second, argv=[*argv[:2], "--output-last-message", "resume", *argv[2:]]
+        )
         try:
             snapshot = self.snapshot()
             self.assertEqual([], snapshot["errors"], snapshot)
@@ -352,8 +540,11 @@ class CrossEpochUsageTests(unittest.TestCase):
         transcript = self.second_transcript.read_bytes()
         wrong_target = ledger.read_lines(attempt_path)[-1]["argv"]
         wrong_target[wrong_target.index("resume") + 1] = "different"
-        for change in ({"session_id": "different"}, {"session_id": None},
-                       {"argv": wrong_target}):
+        for change in (
+            {"session_id": "different"},
+            {"session_id": None},
+            {"argv": wrong_target},
+        ):
             with self.subTest(change=change):
                 try:
                     self.mutate_attempt(self.second, **change)
@@ -381,12 +572,16 @@ class CrossEpochUsageTests(unittest.TestCase):
         original = status.read_bytes()
         self.f.write(status, {**json.loads(original), "cleanup_proven": False})
         try:
-            with self.assertRaisesRegex(ledger.LedgerError, "close the native harness runtime"):
+            with self.assertRaisesRegex(
+                ledger.LedgerError, "close the native harness runtime"
+            ):
                 collector.prepare_resume(self.f.args())
             self.assertTrue(self.snapshot()["errors"])
         finally:
             status.write_bytes(original)
-        self.second_transcript.write_text('{"type":"thread.started","thread_id":"worker-session"}\n')
+        self.second_transcript.write_text(
+            '{"type":"thread.started","thread_id":"worker-session"}\n'
+        )
         with self.assertRaisesRegex(ledger.LedgerError, "not sealed and countable"):
             collector.prepare_resume(self.f.args())
 
@@ -415,10 +610,21 @@ class CrossEpochUsageTests(unittest.TestCase):
         control.rename(saved)
         try:
             if os.name == "nt":
-                result = subprocess.run(["cmd", "/c", "mklink", "/J", str(control), str(saved)],
-                                        capture_output=True, text=True, timeout=10)
-                self.f.write(self.f.base / "redirect-command.json", {"command": result.args,
-                    "stdout": result.stdout, "stderr": result.stderr, "exit": result.returncode})
+                result = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(control), str(saved)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.f.write(
+                    self.f.base / "redirect-command.json",
+                    {
+                        "command": result.args,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "exit": result.returncode,
+                    },
+                )
                 self.assertEqual(0, result.returncode, result.stderr)
             else:
                 control.symlink_to(saved, target_is_directory=True)
@@ -441,20 +647,34 @@ class CrossEpochUsageTests(unittest.TestCase):
         self.assertEqual(workers[0]["invocation_id"], workers[1]["duplicate_of"])
         self.f.write_usage(self.second_transcript, "worker-session", 16)
         snapshot = self.snapshot()
-        self.assertIn("cumulative session total decreased", "; ".join(snapshot["errors"]))
+        self.assertIn(
+            "cumulative session total decreased", "; ".join(snapshot["errors"])
+        )
         self.assertFalse(snapshot["gate_allows_new_work"])
 
     def test_valid_retry_in_next_root_window_uses_that_parent_and_session_delta(self):
         self.known_first()
         f = self.f
-        start = dt.datetime.fromisoformat(f.final["ended_at_utc"]) + dt.timedelta(seconds=60)
+        start = dt.datetime.fromisoformat(f.final["ended_at_utc"]) + dt.timedelta(
+            seconds=60
+        )
         segment = f.run / "segments/0002"
-        launch = {**f.launch, "segment_number": 2, "resume_session_id": "saved-root",
-                  "started_at_utc": start.isoformat(),
-                  "command": ["codex", "exec", "resume", "saved-root", *f.argv()[2:]]}
+        launch = {
+            **f.launch,
+            "segment_number": 2,
+            "resume_session_id": "saved-root",
+            "started_at_utc": start.isoformat(),
+            "command": ["codex", "exec", "resume", "saved-root", *f.argv()[2:]],
+        }
         f.write(segment / "launch.json", launch)
-        f.write(segment / "manifest.json", {**f.final, **launch,
-            "ended_at_utc": (start + dt.timedelta(seconds=60)).isoformat()})
+        f.write(
+            segment / "manifest.json",
+            {
+                **f.final,
+                **launch,
+                "ended_at_utc": (start + dt.timedelta(seconds=60)).isoformat(),
+            },
+        )
         f.write_usage(segment / "codex-events.jsonl", "saved-root", 50)
         self.retime_retry(start + dt.timedelta(seconds=10))
         snapshot = self.snapshot()

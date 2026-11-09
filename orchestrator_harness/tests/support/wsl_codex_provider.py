@@ -41,7 +41,14 @@ def _sandbox_arguments(arguments: list[str], layout: dict[str, Any]) -> list[str
             continue
         if value == "--output-last-message" and index + 1 < len(arguments):
             rewritten.extend(
-                (value, str(Path(layout["workspace_target"]) / ".agent-workspace" / "real_agent_last_message.txt"))
+                (
+                    value,
+                    str(
+                        Path(layout["workspace_target"])
+                        / ".agent-workspace"
+                        / "real_agent_last_message.txt"
+                    ),
+                )
             )
             index += 2
             continue
@@ -50,7 +57,9 @@ def _sandbox_arguments(arguments: list[str], layout: dict[str, Any]) -> list[str
     return rewritten
 
 
-def _provider_argv(command: list[str], base: list[str], layout: dict[str, Any]) -> list[str]:
+def _provider_argv(
+    command: list[str], base: list[str], layout: dict[str, Any]
+) -> list[str]:
     """Build the exact pinned Codex argv, retaining the adapter's ``exec``."""
 
     if not command or command[0] != "exec":
@@ -69,7 +78,9 @@ def _linux_creation_identity(pid: int) -> str:
     if len(fields) <= 19:
         raise RuntimeError("Linux process stat lacks a start identity")
     boot_id = (
-        (proc / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="ascii").strip()
+        (proc / "sys" / "kernel" / "random" / "boot_id")
+        .read_text(encoding="ascii")
+        .strip()
     )
     return f"{boot_id}:{fields[19]}"
 
@@ -173,7 +184,10 @@ def main() -> int:
     failure: BaseException | None = None
     try:
         codex_pid, codex_chain = discover_codex(
-            Path(state["cgroup"]), pinned, linux_bridge_pid, timeout=30.0,
+            Path(state["cgroup"]),
+            pinned,
+            linux_bridge_pid,
+            timeout=30.0,
             expected_identity=tuple(state["cgroup_identity"]),
         )
         codex_created = _linux_creation_identity(codex_pid)
@@ -185,7 +199,9 @@ def main() -> int:
     except BaseException as exc:
         failure = exc
         try:
-            kill_cgroup(Path(state["cgroup"]), expected_identity=tuple(state["cgroup_identity"]))
+            kill_cgroup(
+                Path(state["cgroup"]), expected_identity=tuple(state["cgroup_identity"])
+            )
         except BaseException as cleanup_error:
             failure = RuntimeError(f"{exc}; cleanup failed: {cleanup_error}")
         try:
@@ -197,8 +213,15 @@ def main() -> int:
         inventory_complete = False
         try:
             # Even successful ROOT/provider exit does not prove descendant exit.
-            kill_cgroup(Path(state["cgroup"]), expected_identity=tuple(state["cgroup_identity"]))
-            remaining = sorted(cgroup_processes(Path(state["cgroup"]), expected_identity=tuple(state["cgroup_identity"])))
+            kill_cgroup(
+                Path(state["cgroup"]), expected_identity=tuple(state["cgroup_identity"])
+            )
+            remaining = sorted(
+                cgroup_processes(
+                    Path(state["cgroup"]),
+                    expected_identity=tuple(state["cgroup_identity"]),
+                )
+            )
             inventory_complete = True
         except BaseException as exc:
             remaining = None
@@ -206,7 +229,9 @@ def main() -> int:
                 failure = exc
         evidence = {
             "schema": BRIDGE_SCHEMA,
-            "status": "PASS" if failure is None and inventory_complete and not remaining else "FAIL",
+            "status": "PASS"
+            if failure is None and inventory_complete and not remaining
+            else "FAIL",
             "nonce": args.nonce,
             "invocation_id": args.invocation_id,
             "prepared_claim": claim,

@@ -11,25 +11,54 @@ from typing import Any
 
 
 _TOKEN_FIELDS = {
-    "codex": frozenset({
-        "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-        "output_tokens", "reasoning_output_tokens", "total_tokens",
-    }),
-    "claude-code": frozenset({
-        "input_tokens", "output_tokens", "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    }),
-    "qwen-code": frozenset({
-        "input_tokens", "output_tokens", "cache_read_input_tokens",
-        "cache_creation_input_tokens", "thoughts_token_count",
-    }),
+    "codex": frozenset(
+        {
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        }
+    ),
+    "claude-code": frozenset(
+        {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        }
+    ),
+    "qwen-code": frozenset(
+        {
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "thoughts_token_count",
+        }
+    ),
 }
-_CLAUDE_MODEL_TOKENS = frozenset({
-    "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
-})
+_CLAUDE_MODEL_TOKENS = frozenset(
+    {
+        "inputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+    }
+)
 _IDENTITY_FIELDS = (
-    "subtype", "uuid", "id", "turn_id", "turnId", "thread_id", "threadId",
-    "session_id", "sessionId", "model", "parent_tool_use_id",
+    "subtype",
+    "uuid",
+    "id",
+    "turn_id",
+    "turnId",
+    "thread_id",
+    "threadId",
+    "session_id",
+    "sessionId",
+    "model",
+    "parent_tool_use_id",
 )
 
 
@@ -76,14 +105,11 @@ def usage_observation(event: dict[str, Any], provider_id: str) -> dict[str, Any]
         return None
     message = event.get("message")
     nested = message if isinstance(message, dict) else {}
-    usage = (
-        nested.get("usage")
-        if event_type == "assistant"
-        else event.get("usage")
-    )
+    usage = nested.get("usage") if event_type == "assistant" else event.get("usage")
     has_generic_usage = isinstance(usage, dict)
     safe_usage = {
-        key: value for key, value in (usage.items() if has_generic_usage else ())
+        key: value
+        for key, value in (usage.items() if has_generic_usage else ())
         if key in _TOKEN_FIELDS[provider_id] and _token_count(value)
     }
     model_usage: dict[str, dict[str, int | float]] = {}
@@ -94,7 +120,8 @@ def usage_observation(event: dict[str, Any], provider_id: str) -> dict[str, Any]
                 if not _identity(model) or not isinstance(counters, dict):
                     continue
                 safe_counters = {
-                    key: value for key, value in counters.items()
+                    key: value
+                    for key, value in counters.items()
                     if (key in _CLAUDE_MODEL_TOKENS and _token_count(value))
                     or (key == "costUSD" and _cost(value))
                 }
@@ -102,9 +129,7 @@ def usage_observation(event: dict[str, Any], provider_id: str) -> dict[str, Any]
                     model_usage[model] = safe_counters
     source_cost = event.get("total_cost_usd")
     has_cost = (
-        provider_id == "claude-code"
-        and event_type == "result"
-        and _cost(source_cost)
+        provider_id == "claude-code" and event_type == "result" and _cost(source_cost)
     )
     if not has_generic_usage and not model_usage and not has_cost:
         return None

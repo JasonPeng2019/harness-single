@@ -4,6 +4,7 @@ Workers need a writable private Git directory for atomic lock creation. That
 directory also contains redirects: ROOT pins them before launch and selects the
 protected common repository explicitly, rather than trusting worker Git config.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -23,10 +24,17 @@ SCHEMA = "linked-git-source/v1"
 
 def environment(*, index: Path | None = None) -> dict[str, str]:
     """Discard inherited repository/config/command redirects for operator reads."""
-    result = {key: value for key, value in os.environ.items()
-              if not key.upper().startswith("GIT_")}
-    result.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                  GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1")
+    result = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    result.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_OPTIONAL_LOCKS="0",
+        GIT_NO_LAZY_FETCH="1",
+    )
     if index is not None:
         result["GIT_INDEX_FILE"] = str(index)
     return result
@@ -34,15 +42,29 @@ def environment(*, index: Path | None = None) -> dict[str, str]:
 
 def root_git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["git", "--no-replace-objects", "--no-lazy-fetch", "-C", str(root),
-         "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", *arguments],
-        env=environment(), capture_output=True, timeout=20,
+        [
+            "git",
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "-C",
+            str(root),
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
+            *arguments,
+        ],
+        env=environment(),
+        capture_output=True,
+        timeout=20,
     )
 
 
 def _checked(completed: subprocess.CompletedProcess[bytes]) -> bytes:
     if completed.returncode:
-        raise ValueError(f"Git source observation failed: {completed.stderr.decode('utf-8', 'replace').strip()}")
+        raise ValueError(
+            f"Git source observation failed: {completed.stderr.decode('utf-8', 'replace').strip()}"
+        )
     return completed.stdout
 
 
@@ -52,7 +74,10 @@ def _plain(path: Path) -> None:
             metadata = component.lstat()
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
             raise ValueError(f"linked Git metadata path is not plain: {component}")
 
 
@@ -96,7 +121,12 @@ def _path_value(value: bytes, parent: Path) -> Path:
 
 
 def common_directory(root: Path) -> Path:
-    selected = _path_value(_checked(root_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")), root)
+    selected = _path_value(
+        _checked(
+            root_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        ),
+        root,
+    )
     _identity(selected)
     return selected
 
@@ -106,22 +136,31 @@ def namespace(branch_ref: str) -> str:
         raise ValueError("worker must remain on its assigned branch")
     parts = repository_parts(branch_ref.removeprefix("refs/heads/"))
     if len(parts) < 2:
-        raise ValueError("isolated worker branch needs a dedicated parent namespace, for example lane/<lane>/work")
+        raise ValueError(
+            "isolated worker branch needs a dedicated parent namespace, for example lane/<lane>/work"
+        )
     return "refs/heads/" + "/".join(parts[:-1])
 
 
-def require_exclusive_namespace(root: Path, branch_ref: str, *, rt: Path | None = None) -> str:
+def require_exclusive_namespace(
+    root: Path, branch_ref: str, *, rt: Path | None = None
+) -> str:
     """Never give a worker directory-write capability over ROOT or a peer ref."""
     selected = namespace(branch_ref)
     if root_git(root, "check-ref-format", branch_ref).returncode:
         raise ValueError("worker branch name is invalid")
-    refs = _checked(root_git(root, "for-each-ref", "--format=%(refname)", "refs/heads/")).decode().splitlines()
+    refs = (
+        _checked(root_git(root, "for-each-ref", "--format=%(refname)", "refs/heads/"))
+        .decode()
+        .splitlines()
+    )
     _exclusive_refs(refs, branch_ref, selected)
     common = common_directory(root)
     for relative in (selected, "logs/" + selected):
         _plain(common / relative)
     if rt is not None:
         from .lanes import retained_lanes
+
         epochs = rt / "epochs"
         if epochs.exists():
             _identity(epochs)
@@ -135,16 +174,27 @@ def require_exclusive_namespace(root: Path, branch_ref: str, *, rt: Path | None 
                         continue
                     prior = lane["git_write_namespace"].casefold()
                     proposed = selected.casefold()
-                    if prior == proposed or prior.startswith(proposed + "/") or proposed.startswith(prior + "/"):
-                        raise ValueError("worker branch namespace is reserved by a retained lane; choose a fresh dedicated parent")
+                    if (
+                        prior == proposed
+                        or prior.startswith(proposed + "/")
+                        or proposed.startswith(prior + "/")
+                    ):
+                        raise ValueError(
+                            "worker branch namespace is reserved by a retained lane; choose a fresh dedicated parent"
+                        )
     return selected
 
 
 def _exclusive_refs(refs: list[str], branch_ref: str, selected: str) -> None:
     selected_folded = selected.casefold() + "/"
     for ref in refs:
-        if ref != branch_ref and (ref.casefold() == selected.casefold() or ref.casefold().startswith(selected_folded)):
-            raise ValueError(f"worker branch namespace contains another branch: {ref}; choose a dedicated parent")
+        if ref != branch_ref and (
+            ref.casefold() == selected.casefold()
+            or ref.casefold().startswith(selected_folded)
+        ):
+            raise ValueError(
+                f"worker branch namespace contains another branch: {ref}; choose a dedicated parent"
+            )
 
 
 def capture(root: Path, worktree: Path, *, branch: str | None = None) -> dict[str, Any]:
@@ -154,14 +204,18 @@ def capture(root: Path, worktree: Path, *, branch: str | None = None) -> dict[st
     pointer = _read(worktree, ".git")
     if not pointer.startswith(b"gitdir: "):
         raise ValueError("worker Git metadata is not a linked worktree")
-    private = _path_value(pointer[len(b"gitdir: "):], worktree)
+    private = _path_value(pointer[len(b"gitdir: ") :], worktree)
     if private.parent != common / "worktrees":
         raise ValueError("worker Git metadata is not a linked worktree of ROOT")
     private_identity = _identity(private)
     redirects = {name: _read(private, name) for name in ("HEAD", "commondir", "gitdir")}
-    if (_path_value(redirects["commondir"], private) != common
-            or _path_value(redirects["gitdir"], private) != worktree / ".git"):
-        raise ValueError("linked worktree common directory or backlink differs from its assignment")
+    if (
+        _path_value(redirects["commondir"], private) != common
+        or _path_value(redirects["gitdir"], private) != worktree / ".git"
+    ):
+        raise ValueError(
+            "linked worktree common directory or backlink differs from its assignment"
+        )
     head = redirects["HEAD"].decode("utf-8").strip()
     if not head.startswith("ref: refs/heads/"):
         raise ValueError("worker must remain on its assigned branch")
@@ -172,39 +226,65 @@ def capture(root: Path, worktree: Path, *, branch: str | None = None) -> dict[st
     if branch is not None and branch_ref != "refs/heads/" + branch:
         raise ValueError("worker branch differs from the operator assignment")
     source = {
-        "schema": SCHEMA, "root_workspace": str(root), "root_identity": root_identity,
-        "worktree": str(worktree), "worktree_identity": worktree_identity,
-        "common_dir": str(common), "common_identity": _identity(common),
-        "objects_identity": _identity(common / "objects"), "alternates_sha256": _alternates(common),
+        "schema": SCHEMA,
+        "root_workspace": str(root),
+        "root_identity": root_identity,
+        "worktree": str(worktree),
+        "worktree_identity": worktree_identity,
+        "common_dir": str(common),
+        "common_identity": _identity(common),
+        "objects_identity": _identity(common / "objects"),
+        "alternates_sha256": _alternates(common),
         "attributes_sha256": _attributes(common),
-        "private_dir": str(private), "private_identity": private_identity,
-        "branch_ref": branch_ref, "pointer_sha256": hashlib.sha256(pointer).hexdigest(),
-        "redirect_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in redirects.items()},
+        "private_dir": str(private),
+        "private_identity": private_identity,
+        "branch_ref": branch_ref,
+        "pointer_sha256": hashlib.sha256(pointer).hexdigest(),
+        "redirect_sha256": {
+            name: hashlib.sha256(value).hexdigest() for name, value in redirects.items()
+        },
         "config_sha256": hashlib.sha256(_read(common, "config")).hexdigest(),
     }
-    source["base_commit"] = _checked(_run(source, "rev-parse", "--verify", branch_ref + "^{commit}")).decode().strip()
+    source["base_commit"] = (
+        _checked(_run(source, "rev-parse", "--verify", branch_ref + "^{commit}"))
+        .decode()
+        .strip()
+    )
     source["content_hash"] = content_hash(source)
     validate(source)
     return source
 
 
 def validate(source: dict[str, Any]) -> None:
-    if (not isinstance(source, dict) or source.get("schema") != SCHEMA
-            or source.get("content_hash") != content_hash(source)):
-        raise ValueError("protected Git assignment is missing or corrupt; reconcile or create a fresh lane")
+    if (
+        not isinstance(source, dict)
+        or source.get("schema") != SCHEMA
+        or source.get("content_hash") != content_hash(source)
+    ):
+        raise ValueError(
+            "protected Git assignment is missing or corrupt; reconcile or create a fresh lane"
+        )
     for name in ("root_workspace", "worktree", "common_dir", "private_dir"):
         selected = Path(source[name])
         if not selected.is_absolute():
             raise ValueError("protected Git assignment path must be absolute")
-        identity_name = {"root_workspace": "root_identity", "worktree": "worktree_identity",
-                         "common_dir": "common_identity", "private_dir": "private_identity"}[name]
+        identity_name = {
+            "root_workspace": "root_identity",
+            "worktree": "worktree_identity",
+            "common_dir": "common_identity",
+            "private_dir": "private_identity",
+        }[name]
         if not same_identity(_identity(selected), source[identity_name]):
             raise ValueError(f"assigned Git source directory changed: {name}")
-    private, common, worktree = (Path(source[name]) for name in ("private_dir", "common_dir", "worktree"))
+    private, common, worktree = (
+        Path(source[name]) for name in ("private_dir", "common_dir", "worktree")
+    )
     if private.parent != common / "worktrees":
         raise ValueError("assigned private Git directory is outside ROOT metadata")
-    if (not same_identity(_identity(common / "objects"), source["objects_identity"])
-            or _alternates(common) != source["alternates_sha256"]):
+    if (
+        not same_identity(_identity(common / "objects"), source["objects_identity"])
+        or _alternates(common) != source["alternates_sha256"]
+    ):
         raise ValueError("assigned Git object store or alternates changed")
     if _attributes(common) != source["attributes_sha256"]:
         raise ValueError("ROOT Git attributes changed after preparation")
@@ -221,8 +301,12 @@ def validate(source: dict[str, Any]) -> None:
         raise ValueError("protected Git origin is not an exact full commit")
 
 
-def _run(source: dict[str, Any], *arguments: str, input_bytes: bytes | None = None,
-         config_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+def _run(
+    source: dict[str, Any],
+    *arguments: str,
+    input_bytes: bytes | None = None,
+    config_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     env = environment(index=Path(source["private_dir"]) / "index")
     if config_overrides:
         # Keep key/value separate: a valid Git subsection can contain '=' and
@@ -232,31 +316,61 @@ def _run(source: dict[str, Any], *arguments: str, input_bytes: bytes | None = No
             env[f"GIT_CONFIG_KEY_{index}"] = key
             env[f"GIT_CONFIG_VALUE_{index}"] = value
     return subprocess.run(
-        ["git", "--no-replace-objects", "--no-lazy-fetch", "--git-dir", source["common_dir"],
-         "--work-tree", source["worktree"], "-c", f"core.hooksPath={os.devnull}",
-         "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", *arguments],
+        [
+            "git",
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--git-dir",
+            source["common_dir"],
+            "--work-tree",
+            source["worktree"],
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.commitGraph=false",
+            *arguments,
+        ],
         env=env,
-        input=input_bytes, capture_output=True, timeout=20,
+        input=input_bytes,
+        capture_output=True,
+        timeout=20,
     )
 
 
-def git(source: dict[str, Any], *arguments: str, input_bytes: bytes | None = None,
-        config_overrides: dict[str, str] | None = None) -> bytes:
+def git(
+    source: dict[str, Any],
+    *arguments: str,
+    input_bytes: bytes | None = None,
+    config_overrides: dict[str, str] | None = None,
+) -> bytes:
     validate(source)
-    result = _checked(_run(source, *arguments, input_bytes=input_bytes, config_overrides=config_overrides))
+    result = _checked(
+        _run(
+            source,
+            *arguments,
+            input_bytes=input_bytes,
+            config_overrides=config_overrides,
+        )
+    )
     validate(source)
     return result
 
 
 def object_digest(kind: str, value: bytes, oid_length: int) -> str:
-    digest = hashlib.sha1(usedforsecurity=False) if oid_length == 40 else hashlib.sha256()
+    digest = (
+        hashlib.sha1(usedforsecurity=False) if oid_length == 40 else hashlib.sha256()
+    )
     digest.update(f"{kind} {len(value)}\0".encode("ascii"))
     digest.update(value)
     return digest.hexdigest()
 
 
 def verified_object(source: dict[str, Any], kind: str, oid: str) -> bytes:
-    if kind not in {"commit", "tree", "blob"} or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", oid):
+    if kind not in {"commit", "tree", "blob"} or not re.fullmatch(
+        r"[a-f0-9]{40}|[a-f0-9]{64}", oid
+    ):
         raise ValueError("Git object identity is not exact")
     value = git(source, "cat-file", kind, oid)
     if object_digest(kind, value, len(oid)) != oid:
@@ -269,19 +383,32 @@ def verify_objects(source: dict[str, Any], kind: str, oids: list[str]) -> None:
     unique = list(dict.fromkeys(oids))
     if not unique:
         return
-    if kind not in {"commit", "tree", "blob"} or any(not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", oid) for oid in unique):
+    if kind not in {"commit", "tree", "blob"} or any(
+        not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", oid) for oid in unique
+    ):
         raise ValueError("Git batch object identities are invalid")
-    output = git(source, "cat-file", "--batch", input_bytes=("\n".join(unique) + "\n").encode("ascii"))
+    output = git(
+        source,
+        "cat-file",
+        "--batch",
+        input_bytes=("\n".join(unique) + "\n").encode("ascii"),
+    )
     offset = 0
     for oid in unique:
         end = output.index(b"\n", offset)
         fields = output[offset:end].decode("ascii").split()
         if len(fields) != 3 or fields[:2] != [oid, kind]:
-            raise ValueError("Git batch returned a missing, foreign or wrong-kind object")
+            raise ValueError(
+                "Git batch returned a missing, foreign or wrong-kind object"
+            )
         size = int(fields[2])
         start = end + 1
-        value = memoryview(output)[start:start + size]
-        if size < 0 or len(value) != size or output[start + size:start + size + 1] != b"\n":
+        value = memoryview(output)[start : start + size]
+        if (
+            size < 0
+            or len(value) != size
+            or output[start + size : start + size + 1] != b"\n"
+        ):
             raise ValueError("Git batch object is truncated")
         if object_digest(kind, value, len(oid)) != oid:
             raise ValueError(f"Git {kind} bytes do not match their object identity")
@@ -301,6 +428,7 @@ def tree_entries(source: dict[str, Any], tip: str) -> dict[str, tuple[str, str]]
     result: dict[str, tuple[str, str]] = {}
     pending = [("", root_tree)]
     from .portable_paths import admit_entry
+
     nodes: dict[str, tuple[str, str]] = {}
     while pending:
         prefix, oid = pending.pop()
@@ -309,7 +437,7 @@ def tree_entries(source: dict[str, Any], tip: str) -> dict[str, tuple[str, str]]
         while offset < len(tree):
             end = tree.index(b"\0", offset)
             mode, name = tree[offset:end].split(b" ", 1)
-            digest = tree[end + 1:end + 1 + width]
+            digest = tree[end + 1 : end + 1 + width]
             if len(digest) != width:
                 raise ValueError("Git tree object is truncated")
             offset = end + 1 + width
@@ -338,9 +466,17 @@ def current_tip(lane: dict[str, Any]) -> str:
         selected = namespace(source["branch_ref"])
         if selected != lane["git_write_namespace"]:
             raise ValueError("protected Git namespace differs from the assigned branch")
-        refs = git(source, "for-each-ref", "--format=%(refname)", "refs/heads/").decode().splitlines()
+        refs = (
+            git(source, "for-each-ref", "--format=%(refname)", "refs/heads/")
+            .decode()
+            .splitlines()
+        )
         _exclusive_refs(refs, source["branch_ref"], selected)
-    tip = git(source, "rev-parse", "--verify", source["branch_ref"] + "^{commit}").decode().strip()
+    tip = (
+        git(source, "rev-parse", "--verify", source["branch_ref"] + "^{commit}")
+        .decode()
+        .strip()
+    )
     if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", tip):
         raise ValueError("assigned branch has no exact full commit")
     ancestry = _run(source, "merge-base", "--is-ancestor", source["base_commit"], tip)
@@ -348,6 +484,12 @@ def current_tip(lane: dict[str, Any]) -> str:
         raise ValueError("assigned branch no longer descends from its protected origin")
     verified_object(source, "commit", source["base_commit"])
     if tip != source["base_commit"]:
-        verify_objects(source, "commit", git(source, "rev-list", source["base_commit"] + ".." + tip).decode().splitlines())
+        verify_objects(
+            source,
+            "commit",
+            git(source, "rev-list", source["base_commit"] + ".." + tip)
+            .decode()
+            .splitlines(),
+        )
     validate(source)
     return tip

@@ -64,9 +64,7 @@ def _glob_matches(pattern: str, relative_path: str) -> bool:
 
 
 def _package_data_patterns(pyproject: dict) -> list[str]:
-    return list(
-        pyproject["tool"]["setuptools"]["package-data"]["orchestrator_harness"]
-    )
+    return list(pyproject["tool"]["setuptools"]["package-data"]["orchestrator_harness"])
 
 
 def _on_disk_required_files() -> list[str]:
@@ -100,17 +98,13 @@ def _copy_build_source(source: Path) -> None:
     ignored = shutil.ignore_patterns(
         "__pycache__", "*.pyc", "*.egg-info", "build", "dist"
     )
-    shutil.copytree(
-        PACKAGE_ROOT, source / "orchestrator_harness", ignore=ignored
-    )
+    shutil.copytree(PACKAGE_ROOT, source / "orchestrator_harness", ignore=ignored)
     shutil.copytree(
         REPOSITORY_ROOT / "harness_common",
         source / "harness_common",
         ignore=ignored,
     )
-    shutil.copytree(
-        REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
-    )
+    shutil.copytree(REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored)
     for directory in ("scripts", "tools", "docs"):
         shutil.copytree(REPOSITORY_ROOT / directory, source / directory, ignore=ignored)
 
@@ -119,6 +113,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
     def test_packaged_scripts_invalidate_owning_release_unit_credit(self) -> None:
         import subprocess
         from orchestrator_harness import release_checks
+
         spec = release_checks.get_check("S6.RELEASE.ORCHESTRATOR-UNIT")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -132,10 +127,18 @@ class PackageMetadataStaticTests(unittest.TestCase):
             for relative in spec.dependency_paths:
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("fixture")
-            scripts = ["scripts/" + name for name in (
-                "prepare_root_launch.py", "check_windows_sandbox.py", "collect_codex_usage.py",
-                "collect_usage.py", "claude_usage.py", "token_ledger.py",
-                "probe_windows_worker_isolation.py")]
+            scripts = [
+                "scripts/" + name
+                for name in (
+                    "prepare_root_launch.py",
+                    "check_windows_sandbox.py",
+                    "collect_codex_usage.py",
+                    "collect_usage.py",
+                    "claude_usage.py",
+                    "token_ledger.py",
+                    "probe_windows_worker_isolation.py",
+                )
+            ]
             for relative in scripts:
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("baseline")
@@ -145,15 +148,23 @@ class PackageMetadataStaticTests(unittest.TestCase):
                 with self.subTest(script=relative):
                     before = release_checks.dependency_fingerprint(spec, root)
                     (root / relative).write_text("changed")
-                    self.assertNotEqual(before, release_checks.dependency_fingerprint(spec, root))
+                    self.assertNotEqual(
+                        before, release_checks.dependency_fingerprint(spec, root)
+                    )
 
-    def test_integrated_registry_executes_contract_suites_and_invalidates_credit_inputs(self) -> None:
+    def test_integrated_registry_executes_contract_suites_and_invalidates_credit_inputs(
+        self,
+    ) -> None:
         from orchestrator_harness import release_checks
+
         spec = release_checks.get_check("S6.AFFECTED.INTEGRATED-CONTRACTS")
-        for module in ("orchestrator_harness.tests.test_protected_retry_history",
-                       "orchestrator_harness.tests.test_public_checks",
-                       "orchestrator_harness.tests.test_worker_isolation_boundaries",
-                       "orchestrator_harness.tests.test_path_portability", "scripts.tests.test_root_prelaunch"):
+        for module in (
+            "orchestrator_harness.tests.test_protected_retry_history",
+            "orchestrator_harness.tests.test_public_checks",
+            "orchestrator_harness.tests.test_worker_isolation_boundaries",
+            "orchestrator_harness.tests.test_path_portability",
+            "scripts.tests.test_root_prelaunch",
+        ):
             self.assertIn(module, spec.command)
         self.assertIn("orchestrator_harness/lane_cleanup.py", spec.dependency_paths)
         with tempfile.TemporaryDirectory() as temporary:
@@ -163,13 +174,18 @@ class PackageMetadataStaticTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"baseline fixture")
             before = release_checks.dependency_fingerprint(spec, root)
-            (root / "orchestrator_harness/retry_policy.py").write_bytes(b"changed launch authority")
-            self.assertNotEqual(before, release_checks.dependency_fingerprint(spec, root))
+            (root / "orchestrator_harness/retry_policy.py").write_bytes(
+                b"changed launch authority"
+            )
+            self.assertNotEqual(
+                before, release_checks.dependency_fingerprint(spec, root)
+            )
 
     def test_runtime_and_build_versions_are_coherent(self) -> None:
         pyproject = _load_pyproject()
         self.assertEqual("2.0.0", pyproject["project"]["version"])
         from orchestrator_harness import __version__
+
         self.assertEqual(pyproject["project"]["version"], __version__)
         # A clean checkout has no egg-info. Ask the declared build backend for
         # real distribution metadata in a private copy, just as a wheel build
@@ -180,22 +196,38 @@ class PackageMetadataStaticTests(unittest.TestCase):
             _copy_build_source(source)
             metadata_root = temporary / "metadata"
             metadata_root.mkdir()
-            command = [sys.executable, "-B", "-c",
-                       "from setuptools.build_meta import prepare_metadata_for_build_wheel; "
-                       "prepare_metadata_for_build_wheel(" + repr(str(metadata_root)) + ")"]
-            completed = subprocess.run(command, cwd=source / "orchestrator_harness",
-                                       capture_output=True, text=True)
-            self.assertEqual(0, completed.returncode,
-                             f"{command!r}\n{completed.stdout}\n{completed.stderr}")
+            command = [
+                sys.executable,
+                "-B",
+                "-c",
+                "from setuptools.build_meta import prepare_metadata_for_build_wheel; "
+                "prepare_metadata_for_build_wheel(" + repr(str(metadata_root)) + ")",
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=source / "orchestrator_harness",
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                0,
+                completed.returncode,
+                f"{command!r}\n{completed.stdout}\n{completed.stderr}",
+            )
             # Setuptools also stages egg-info beside the wheel's dist-info.
             # Validate the wheel metadata specifically, not both representations.
-            distributions = [importlib.metadata.Distribution.at(path)
-                             for path in metadata_root.glob("*.dist-info")]
+            distributions = [
+                importlib.metadata.Distribution.at(path)
+                for path in metadata_root.glob("*.dist-info")
+            ]
             self.assertEqual(1, len(distributions))
             metadata = distributions[0]
             self.assertEqual(pyproject["project"]["name"], metadata.metadata["Name"])
             self.assertEqual(__version__, metadata.version)
-            self.assertEqual(pyproject["project"]["requires-python"], metadata.metadata["Requires-Python"])
+            self.assertEqual(
+                pyproject["project"]["requires-python"],
+                metadata.metadata["Requires-Python"],
+            )
 
     def test_removed_candidate_modules_are_not_packaged(self) -> None:
         removed = (
@@ -283,9 +315,7 @@ class PackageWheelBuildTests(unittest.TestCase):
             importlib.util.find_spec("setuptools") is None
             or importlib.util.find_spec("wheel") is None
         ):
-            self.skipTest(
-                "setuptools/wheel are not importable in this environment"
-            )
+            self.skipTest("setuptools/wheel are not importable in this environment")
         with tempfile.TemporaryDirectory(prefix="orchestrator-package-wheel-") as raw:
             temporary = Path(raw)
             source = temporary / "source"
@@ -334,17 +364,34 @@ class PackageWheelBuildTests(unittest.TestCase):
             )
             for entry in required_entries:
                 self.assertIn(entry, names, entry)
-            for entry in ("scripts/prepare_root_launch.py", "scripts/check_windows_sandbox.py",
-                          "scripts/collect_codex_usage.py", "scripts/collect_usage.py",
-                          "scripts/claude_usage.py", "scripts/token_ledger.py",
-                          "scripts/probe_windows_worker_isolation.py",
-                          "tools/worker_public_check.py", "docs/BUILD_TEST_INTERFACE.md",
-                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md",
-                          "docs/RESUME_PROFILES.md"):
-                self.assertTrue(any(name.endswith(".data/data/" + entry) for name in names), entry)
-            self.assertTrue(any(name.endswith(".data/data/examples/windows-sandbox-health-worker-workspace.example.json")
-                                for name in names))
-            self.assertFalse(any(name.endswith("/ROOT_TASK_POLICY.md") for name in names))
+            for entry in (
+                "scripts/prepare_root_launch.py",
+                "scripts/check_windows_sandbox.py",
+                "scripts/collect_codex_usage.py",
+                "scripts/collect_usage.py",
+                "scripts/claude_usage.py",
+                "scripts/token_ledger.py",
+                "scripts/probe_windows_worker_isolation.py",
+                "tools/worker_public_check.py",
+                "docs/BUILD_TEST_INTERFACE.md",
+                "docs/INTEGRATED_RUN_FIXES.md",
+                "docs/PATH_PORTABILITY.md",
+                "docs/RESUME_PROFILES.md",
+            ):
+                self.assertTrue(
+                    any(name.endswith(".data/data/" + entry) for name in names), entry
+                )
+            self.assertTrue(
+                any(
+                    name.endswith(
+                        ".data/data/examples/windows-sandbox-health-worker-workspace.example.json"
+                    )
+                    for name in names
+                )
+            )
+            self.assertFalse(
+                any(name.endswith("/ROOT_TASK_POLICY.md") for name in names)
+            )
             self.assertTrue(any(".data/data/examples/" in name for name in names))
             self.assertTrue(
                 any(

@@ -41,7 +41,10 @@ def dispatch_decision() -> dict[str, Any]:
             text=True,
         )
     except Exception as exc:
-        return {"decision": "REJECT", "reason": f"hook-dispatch execution failed: {exc}"}
+        return {
+            "decision": "REJECT",
+            "reason": f"hook-dispatch execution failed: {exc}",
+        }
     if completed.returncode != 0:
         try:
             parsed = json.loads(completed.stdout)
@@ -58,13 +61,19 @@ def dispatch_decision() -> dict[str, Any]:
             "reason": f"hook-dispatch exited nonzero: {completed.returncode}",
         }
     if not completed.stdout or not completed.stdout.strip():
-        return {"decision": "REJECT", "reason": f"hook-dispatch produced no output: {helper}"}
+        return {
+            "decision": "REJECT",
+            "reason": f"hook-dispatch produced no output: {helper}",
+        }
     try:
         decision = json.loads(completed.stdout)
     except (ValueError, TypeError) as exc:
         return {"decision": "REJECT", "reason": f"hook-dispatch output invalid: {exc}"}
     if not isinstance(decision, dict) or decision.get("decision") not in DECISIONS:
-        return {"decision": "REJECT", "reason": "hook-dispatch output is not a valid decision"}
+        return {
+            "decision": "REJECT",
+            "reason": "hook-dispatch output is not a valid decision",
+        }
     return decision
 
 

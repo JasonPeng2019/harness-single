@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import controller
 from orchestrator_harness.records import read_jsonl
-from orchestrator_harness.tests.support import prepare_lane_fixture, seed_provider_history
+from orchestrator_harness.tests.support import (
+    prepare_lane_fixture,
+    seed_provider_history,
+)
 
 
 ADAPTERS = Path(__file__).resolve().parents[1] / "provider_adapters"
@@ -65,25 +68,35 @@ class NativeAttemptReceipts(unittest.TestCase):
     def test_untrusted_usage_fields_are_dropped_and_do_not_mark_observed(self):
         cases = (
             ({"latency_ms": 5, "access_token": "TOPSECRET"}, "incomplete", {}),
-            ({
-                "input_tokens": 4,
-                "latency_ms": 5,
-                "access_token": "TOPSECRET",
-                "cached_input_tokens": float("inf"),
-                "reasoning_output_tokens": True,
-            }, "observed", {"input_tokens": 4}),
+            (
+                {
+                    "input_tokens": 4,
+                    "latency_ms": 5,
+                    "access_token": "TOPSECRET",
+                    "cached_input_tokens": float("inf"),
+                    "reasoning_output_tokens": True,
+                },
+                "observed",
+                {"input_tokens": 4},
+            ),
         )
         for usage, state, expected in cases:
             with self.subTest(usage=usage), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
                 transcript = root / "transcript.jsonl"
-                transcript.write_text(json.dumps({
-                    "type": "turn.completed",
-                    "model": {"access_token": "TOPSECRET"},
-                    "turn_id": {"access_token": "TOPSECRET"},
-                    "uuid": "x" * 300,
-                    "usage": usage,
-                }) + "\n", encoding="utf-8")
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "model": {"access_token": "TOPSECRET"},
+                            "turn_id": {"access_token": "TOPSECRET"},
+                            "uuid": "x" * 300,
+                            "usage": usage,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
                 row = append_observed_attempt(root, "codex", transcript)
                 self.assertEqual(state, row["native_usage_state"])
                 self.assertEqual(expected, row["native_usage_observations"][0]["usage"])
@@ -99,8 +112,14 @@ class NativeAttemptReceipts(unittest.TestCase):
             (None, True, False),
             (None, False, True),
         ):
-            with self.subTest(generic_usage=generic_usage, keep_models=keep_models,
-                              keep_cost=keep_cost), tempfile.TemporaryDirectory() as raw:
+            with (
+                self.subTest(
+                    generic_usage=generic_usage,
+                    keep_models=keep_models,
+                    keep_cost=keep_cost,
+                ),
+                tempfile.TemporaryDirectory() as raw,
+            ):
                 root = Path(raw)
                 transcript = root / "transcript.jsonl"
                 event = {
@@ -129,11 +148,13 @@ class NativeAttemptReceipts(unittest.TestCase):
                 self.assertEqual({}, receipt["usage"])
                 if keep_models:
                     self.assertEqual(
-                        {"claude-native": {
-                            "inputTokens": 6,
-                            "cacheReadInputTokens": 3,
-                            "costUSD": 0.006,
-                        }},
+                        {
+                            "claude-native": {
+                                "inputTokens": 6,
+                                "cacheReadInputTokens": 3,
+                                "costUSD": 0.006,
+                            }
+                        },
                         receipt["modelUsage"],
                     )
                 else:
@@ -147,11 +168,17 @@ class NativeAttemptReceipts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             transcript = root / "transcript.jsonl"
-            transcript.write_text(json.dumps({
-                "type": "result",
-                "usage": {"latency_ms": 5},
-                "total_cost_usd": float("inf"),
-            }) + "\n", encoding="utf-8")
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "usage": {"latency_ms": 5},
+                        "total_cost_usd": float("inf"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             row = append_observed_attempt(root, "claude-code", transcript)
             self.assertEqual("incomplete", row["native_usage_state"])
             self.assertEqual({}, row["native_usage_observations"][0]["usage"])
@@ -187,37 +214,43 @@ class NativeAttemptReceipts(unittest.TestCase):
                     },
                 }
                 for event, message in (("event-a", "msg-a"), ("event-b", "msg-b"))
-            ] + [{
-                "type": "result",
-                "uuid": "terminal",
-                "session_id": "s",
-                "usage": {"input_tokens": 6, "output_tokens": 8},
-                "modelUsage": {"claude-native": {"inputTokens": 6}},
-                "total_cost_usd": 0.01,
-            }],
-            "qwen-code": [{
-                "type": "assistant",
-                "uuid": "partial",
-                "session_id": "s",
-                "message": {
-                    "id": "msg-a",
-                    "model": "qwen-native",
-                    "usage": {
-                        "input_tokens": 2,
-                        "output_tokens": 1,
-                        "cache_read_input_tokens": 1,
+            ]
+            + [
+                {
+                    "type": "result",
+                    "uuid": "terminal",
+                    "session_id": "s",
+                    "usage": {"input_tokens": 6, "output_tokens": 8},
+                    "modelUsage": {"claude-native": {"inputTokens": 6}},
+                    "total_cost_usd": 0.01,
+                }
+            ],
+            "qwen-code": [
+                {
+                    "type": "assistant",
+                    "uuid": "partial",
+                    "session_id": "s",
+                    "message": {
+                        "id": "msg-a",
+                        "model": "qwen-native",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "cache_read_input_tokens": 1,
+                        },
                     },
                 },
-            }, {
-                "type": "result",
-                "uuid": "terminal",
-                "session_id": "s",
-                "usage": {
-                    "input_tokens": 5,
-                    "output_tokens": 3,
-                    "cache_read_input_tokens": 2,
+                {
+                    "type": "result",
+                    "uuid": "terminal",
+                    "session_id": "s",
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 2,
+                    },
                 },
-            }],
+            ],
         }
         for provider, events in cases.items():
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as raw:
@@ -227,35 +260,56 @@ class NativeAttemptReceipts(unittest.TestCase):
                     ("prior run\n" + "\n".join(map(json.dumps, events)) + "\n").encode()
                 )
                 row = append_observed_attempt(
-                    root, provider, transcript,
-                    attempt_number=2, offset=len(b"prior run\n"), exit_code=1,
+                    root,
+                    provider,
+                    transcript,
+                    attempt_number=2,
+                    offset=len(b"prior run\n"),
+                    exit_code=1,
                 )
                 receipts = row["native_usage_observations"]
                 expected_usage = [
                     event.get("usage", event.get("message", {}).get("usage"))
                     for event in events
                 ]
-                self.assertEqual(("lane-1", "run-1", 2),
-                                 (row["lane_id"], row["run_id"], row["attempt"]))
+                self.assertEqual(
+                    ("lane-1", "run-1", 2),
+                    (row["lane_id"], row["run_id"], row["attempt"]),
+                )
                 self.assertEqual("observed", row["native_usage_state"])
                 self.assertEqual(expected_usage, [item["usage"] for item in receipts])
-                self.assertEqual(list(range(1, len(events) + 1)),
-                                 [item["line_number"] for item in receipts])
-                self.assertEqual([event.get("uuid") for event in events],
-                                 [item.get("uuid") for item in receipts])
+                self.assertEqual(
+                    list(range(1, len(events) + 1)),
+                    [item["line_number"] for item in receipts],
+                )
+                self.assertEqual(
+                    [event.get("uuid") for event in events],
+                    [item.get("uuid") for item in receipts],
+                )
                 self.assertNotIn("total_tokens", row)
                 if provider == "codex":
-                    self.assertEqual(["turn-a", "turn-a", "turn-b"],
-                                     [item["turn_id"] for item in receipts])
+                    self.assertEqual(
+                        ["turn-a", "turn-a", "turn-b"],
+                        [item["turn_id"] for item in receipts],
+                    )
                     self.assertEqual(2, receipts[0]["usage"]["reasoning_output_tokens"])
                 else:
-                    expected_ids = ["msg-a", "msg-b"] if provider == "claude-code" else ["msg-a"]
-                    self.assertEqual(expected_ids,
-                                     [item["message_id"] for item in receipts if "message_id" in item])
+                    expected_ids = (
+                        ["msg-a", "msg-b"] if provider == "claude-code" else ["msg-a"]
+                    )
+                    self.assertEqual(
+                        expected_ids,
+                        [
+                            item["message_id"]
+                            for item in receipts
+                            if "message_id" in item
+                        ],
+                    )
                     self.assertEqual("terminal", receipts[-1]["uuid"])
                     if provider == "claude-code":
                         self.assertEqual(
-                            {"claude-native": {"inputTokens": 6}}, receipts[-1]["modelUsage"]
+                            {"claude-native": {"inputTokens": 6}},
+                            receipts[-1]["modelUsage"],
                         )
                         self.assertEqual(0.01, receipts[-1]["total_cost_usd"])
 
@@ -270,32 +324,46 @@ class NativeAttemptReceipts(unittest.TestCase):
                 transcript.write_bytes((json.dumps(event) + "\n").encode())
                 row = append_observed_attempt(root, "codex", transcript)
                 self.assertEqual("incomplete", row["native_usage_state"])
-                self.assertEqual(expected_receipts,
-                                 [item["usage"] for item in row["native_usage_observations"]])
+                self.assertEqual(
+                    expected_receipts,
+                    [item["usage"] for item in row["native_usage_observations"]],
+                )
                 self.assertNotIn("usage", row)
 
     def test_parser_error_does_not_drop_failed_attempt_or_raw_usage(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             transcript = root / "transcript.jsonl"
-            transcript.write_bytes(b'{"type":"turn.failed","usage":{"input_tokens":4}}\n')
+            transcript.write_bytes(
+                b'{"type":"turn.failed","usage":{"input_tokens":4}}\n'
+            )
 
             def broken_parser(_line):
                 raise ValueError("unexpected native field")
 
             row = append_observed_attempt(
-                root, "codex", transcript, exit_code=1,
+                root,
+                "codex",
+                transcript,
+                exit_code=1,
                 parser=SimpleNamespace(parse_line=broken_parser),
             )
             self.assertEqual("invalid", row["result_state"])
-            self.assertEqual(4, row["native_usage_observations"][0]["usage"]["input_tokens"])
+            self.assertEqual(
+                4, row["native_usage_observations"][0]["usage"]["input_tokens"]
+            )
             self.assertIn("provider parser failed", row["native_usage_capture_error"])
 
     def test_json_value_and_recursion_errors_still_append_incomplete_attempt(self):
         malformed_lines = (
-            b'{"type":"turn.completed","usage":{"input_tokens":' + b"9" * 5000 + b'}}\n',
             b'{"type":"turn.completed","usage":{"input_tokens":'
-            + b"[" * 5000 + b"0" + b"]" * 5000 + b'}}\n',
+            + b"9" * 5000
+            + b"}}\n",
+            b'{"type":"turn.completed","usage":{"input_tokens":'
+            + b"[" * 5000
+            + b"0"
+            + b"]" * 5000
+            + b"}}\n",
         )
         for line in malformed_lines:
             with self.subTest(length=len(line)), tempfile.TemporaryDirectory() as raw:
@@ -305,7 +373,9 @@ class NativeAttemptReceipts(unittest.TestCase):
                 row = append_observed_attempt(root, "codex", transcript, exit_code=1)
                 self.assertEqual("incomplete", row["native_usage_state"])
                 self.assertEqual([], row["native_usage_observations"])
-                self.assertIn("malformed native JSON", row["native_usage_capture_error"])
+                self.assertIn(
+                    "malformed native JSON", row["native_usage_capture_error"]
+                )
 
     def test_late_tail_after_exit_is_captured_for_started_attempt(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -334,8 +404,10 @@ class NativeAttemptReceipts(unittest.TestCase):
             child = MagicMock(pid=123, returncode=0)
             child.take_job_handle.return_value = 45
             boundary = MagicMock(
-                root_pid=123, root_creation_time="created",
-                process_group_id=123, session_id="boundary",
+                root_pid=123,
+                root_creation_time="created",
+                process_group_id=123,
+                session_id="boundary",
             )
             boundary.record.return_value = {"root": {"pid": 123}}
 
@@ -358,14 +430,19 @@ class NativeAttemptReceipts(unittest.TestCase):
                 "provider": {
                     "model": "m",
                     "launch_config": {
-                        "reasoning_effort": "high", "service_tier": "normal"
+                        "reasoning_effort": "high",
+                        "service_tier": "normal",
                     },
                 }
             }
             with (
                 patch.object(adapter, "build_argv", return_value=["codex"]),
                 patch.object(controller.processes, "spawn_provider", side_effect=spawn),
-                patch.object(controller.processes.ProcessBoundary, "for_process", return_value=boundary),
+                patch.object(
+                    controller.processes.ProcessBoundary,
+                    "for_process",
+                    return_value=boundary,
+                ),
                 patch.object(controller, "update_lane"),
             ):
                 execution = controller._run_provider(
@@ -386,9 +463,15 @@ class NativeAttemptReceipts(unittest.TestCase):
                 transcript_start_byte=execution.transcript_start_byte,
             )
             row = read_jsonl(Path(lane["attempts_path"]))[-1]
-            self.assertEqual(9, row["native_usage_observations"][0]["usage"]["input_tokens"])
+            self.assertEqual(
+                9, row["native_usage_observations"][0]["usage"]["input_tokens"]
+            )
             self.assertEqual(3, row["native_usage_observations"][0]["line_number"])
             self.assertIn("malformed", row["native_usage_capture_error"])
-            self.assertEqual(len(b"stale earlier invocation\n"), execution.transcript_start_byte)
-            self.assertEqual(execution.transcript_start_byte, row["transcript_start_byte"])
+            self.assertEqual(
+                len(b"stale earlier invocation\n"), execution.transcript_start_byte
+            )
+            self.assertEqual(
+                execution.transcript_start_byte, row["transcript_start_byte"]
+            )
             self.assertEqual(transcript.stat().st_size, row["transcript_end_byte"])

@@ -192,9 +192,7 @@ class QwenWorkerHooksTestCase(unittest.TestCase):
         command = _invoked_command(run)
         self.assertIn(str(HOOK_DISPATCH_PATH), command)
         self.assertIn("--boundary", command)
-        self.assertEqual(
-            command[command.index("--boundary") + 1], STOP_BOUNDARY
-        )
+        self.assertEqual(command[command.index("--boundary") + 1], STOP_BOUNDARY)
         self.assertNotIn(POST_TOOL_USE_BOUNDARY, command)
 
     def test_post_tool_use_dispatch_nonzero_return_fails_closed(self):

@@ -28,7 +28,9 @@ def main() -> int:
         arguments = arguments[1:]
     cgroup = cgroup_root() / f"orchestrator-harness-{args.run_id}"
     namespace = f"oh-{args.run_id[:8]}"
-    temporary = Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    temporary = (
+        Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    )
     try:
         return subprocess.run(
             [

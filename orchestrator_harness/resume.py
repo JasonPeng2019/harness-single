@@ -25,15 +25,38 @@ from .bootstrap import (
 from .config import find_harness_root, load_config
 from .config import compute_config_identity, load_resource_manifest, same_path
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
-from .epochs import lane_record_dir, open_epoch, read_active_lanes, read_current_epoch, read_epoch_state
+from .epochs import (
+    lane_record_dir,
+    open_epoch,
+    read_active_lanes,
+    read_current_epoch,
+    read_epoch_state,
+)
 from .setup import read_runtime_state
-from .lanes import LaneError, find_active_lane, find_retained_lane, lane_operation_lock, read_lane, update_lane, write_lane
-from .lane_cleanup import cleanup_is_proven, controller_not_created, never_launched, observe_controller_status
+from .lanes import (
+    LaneError,
+    find_active_lane,
+    find_retained_lane,
+    lane_operation_lock,
+    read_lane,
+    update_lane,
+    write_lane,
+)
+from .lane_cleanup import (
+    cleanup_is_proven,
+    controller_not_created,
+    never_launched,
+    observe_controller_status,
+)
 from .records import atomic_write_bytes, atomic_write_json, remove_record
 from .records import runtime_admission_lock
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
 from .task_cards import validate_task_card
-from .retry_policy import MAX_LANE_PROVIDER_INVOCATIONS, WORKER_RETRY_LIMIT, completed_provider_invocations
+from .retry_policy import (
+    MAX_LANE_PROVIDER_INVOCATIONS,
+    WORKER_RETRY_LIMIT,
+    completed_provider_invocations,
+)
 
 INVOCATION_SCHEMA = "controller-invocation/v1"
 OVERLAY_RECEIPT_SCHEMA = "overlay-receipt/v1"
@@ -58,30 +81,46 @@ def _live_controller(lane: dict[str, Any]) -> bool:
     """Check both the lane process and the controller's exact attestation."""
     status_value = lane.get("controller_status_path")
     if not isinstance(status_value, str) or not status_value:
-        raise ValueError("controller status path is missing; resume cannot prove prior ownership")
+        raise ValueError(
+            "controller status path is missing; resume cannot prove prior ownership"
+        )
     observation = observe_controller_status(lane)
     if observation.kind in ("invalid", "unreadable"):
-        raise ValueError("controller status is invalid or unreadable; resume cannot prove prior ownership")
+        raise ValueError(
+            "controller status is invalid or unreadable; resume cannot prove prior ownership"
+        )
     identities = [lane.get("process")]
     status = observation.status
     if status is not None:
         identities.append(status.get("controller_identity", {}))
     for identity in identities:
-        if not isinstance(identity, dict) or (identity and (
-            type(identity.get("pid")) is not int or not processes.valid_creation_identity(identity.get("creation_time"))
-        )):
-            raise ValueError("controller identity is unknown; resume cannot replace its run")
+        if not isinstance(identity, dict) or (
+            identity
+            and (
+                type(identity.get("pid")) is not int
+                or not processes.valid_creation_identity(identity.get("creation_time"))
+            )
+        ):
+            raise ValueError(
+                "controller identity is unknown; resume cannot replace its run"
+            )
         if identity:
             pid, creation = identity["pid"], identity["creation_time"]
             if processes.identity_matches(pid, creation):
                 return True
             if not processes.identity_exit_proven(pid, creation):
-                raise ValueError("controller identity is unobservable; resume cannot replace its run")
+                raise ValueError(
+                    "controller identity is unobservable; resume cannot replace its run"
+                )
     if (
-        status is None and lane.get("lifecycle") == "running"
-        and not never_launched(lane, observation) and not controller_not_created(lane, observation)
+        status is None
+        and lane.get("lifecycle") == "running"
+        and not never_launched(lane, observation)
+        and not controller_not_created(lane, observation)
     ):
-        raise ValueError("started invocation cleanup is unknown; resume cannot discard its evidence")
+        raise ValueError(
+            "started invocation cleanup is unknown; resume cannot discard its evidence"
+        )
     return False
 
 
@@ -118,7 +157,9 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     return record
 
 
-def _effective_profile(provider: dict[str, Any]) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+def _effective_profile(
+    provider: dict[str, Any],
+) -> tuple[str, str, tuple[tuple[str, str], ...]]:
     """Compare provider behavior while preserving historical omitted-mode meaning."""
     provider_id = provider.get("id")
     launch_config = dict(provider.get("launch_config") or {})
@@ -128,7 +169,8 @@ def _effective_profile(provider: dict[str, Any]) -> tuple[str, str, tuple[tuple[
         launch_config["launcher"] = launcher
         launch_config["permission_mode"] = permission_mode
     return (
-        str(provider_id), str(provider.get("model") or ""),
+        str(provider_id),
+        str(provider.get("model") or ""),
         tuple(sorted((str(key), str(value)) for key, value in launch_config.items())),
     )
 
@@ -154,32 +196,41 @@ def _effective_provider_record(provider: dict[str, Any]) -> dict[str, Any]:
 
 
 def _regenerate_codex_profile_if_needed(
-    worktree: Path, harness_root: Path, config: Any,
-    old_provider: dict[str, Any], new_provider: dict[str, Any],
+    worktree: Path,
+    harness_root: Path,
+    config: Any,
+    old_provider: dict[str, Any],
+    new_provider: dict[str, Any],
 ) -> Path | None:
     """Regenerate the owned file only when the replacement selects a worker profile."""
     if old_provider.get("id") != "codex" or new_provider.get("id") != "codex":
         return None
-    old_mode = old_provider.get("launch_config", {}).get("permission_mode", "worker-isolated")
-    new_mode = new_provider.get("launch_config", {}).get("permission_mode", "worker-isolated")
+    old_mode = old_provider.get("launch_config", {}).get(
+        "permission_mode", "worker-isolated"
+    )
+    new_mode = new_provider.get("launch_config", {}).get(
+        "permission_mode", "worker-isolated"
+    )
     if old_mode == new_mode or new_mode == "yolo":
         return None
     from .bootstrap import regenerate_codex_worker_profile
+
     return regenerate_codex_worker_profile(
-        worktree, harness_root, config.root_workspace,
+        worktree,
+        harness_root,
+        config.root_workspace,
         permission_mode=new_mode,
         manager_workspace=config.manager_workspace,
     )
 
 
-def _has_valid_acceptance_chain(
-    rt: Path, epoch_id: str, lane: dict[str, Any]
-) -> bool:
+def _has_valid_acceptance_chain(rt: Path, epoch_id: str, lane: dict[str, Any]) -> bool:
     """Return whether a complete, linked ACCEPTED chain exists for this run."""
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     import stat
+
     present = []
     for path in (review_path, acceptance_path):
         try:
@@ -187,9 +238,14 @@ def _has_valid_acceptance_chain(
         except FileNotFoundError:
             present.append(False)
             continue
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or getattr(info, "st_file_attributes", 0) & 0x400):
-            raise ValueError("ROOT decision is not a plain record; preserve it for explicit reconciliation")
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or getattr(info, "st_file_attributes", 0) & 0x400
+        ):
+            raise ValueError(
+                "ROOT decision is not a plain record; preserve it for explicit reconciliation"
+            )
         present.append(True)
     if not any(present):
         return False
@@ -199,38 +255,62 @@ def _has_valid_acceptance_chain(
         require_schema(review, COMPLETION_REVIEW_SCHEMA, review_path)
         require_schema(acceptance, ACCEPTANCE_SCHEMA, acceptance_path)
     except (OSError, ValueError) as exc:
-        raise ValueError("ROOT decision is unreadable or incomplete; preserve it for explicit reconciliation") from exc
+        raise ValueError(
+            "ROOT decision is unreadable or incomplete; preserve it for explicit reconciliation"
+        ) from exc
     from .review import validate_acceptance_chain
-    if not validate_acceptance_chain(review, acceptance, lane_id=lane["lane_id"], run_id=lane.get("run_id")):
-        raise ValueError("ROOT decision is invalid or stale; preserve it for explicit reconciliation")
-    if (acceptance["source_assignment_hash"] != lane.get("result_assignment_hash")
-            or acceptance["task_card_hash"] != lane.get("task_card_hash")):
-        raise ValueError("ROOT decision differs from the protected assignment; reconcile before resume")
+
+    if not validate_acceptance_chain(
+        review, acceptance, lane_id=lane["lane_id"], run_id=lane.get("run_id")
+    ):
+        raise ValueError(
+            "ROOT decision is invalid or stale; preserve it for explicit reconciliation"
+        )
+    if acceptance["source_assignment_hash"] != lane.get(
+        "result_assignment_hash"
+    ) or acceptance["task_card_hash"] != lane.get("task_card_hash"):
+        raise ValueError(
+            "ROOT decision differs from the protected assignment; reconcile before resume"
+        )
     if acceptance["approval"] == "REJECTED":
         return False
     from .launch import LaunchError, _validate_current_acceptance
+
     try:
         _validate_current_acceptance(rt, epoch_id, lane, acceptance)
     except LaunchError as exc:
-        raise ValueError(f"accepted source is no longer valid; reconcile before resume: {exc}") from exc
+        raise ValueError(
+            f"accepted source is no longer valid; reconcile before resume: {exc}"
+        ) from exc
     return True
 
 
-def _clear_prior_run(rt: Path, epoch_id: str, lane: dict[str, Any], *, output=None) -> None:
+def _clear_prior_run(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, output=None
+) -> None:
     """Retain prior decisions/result before replacing their current projections."""
     worktree = Path(lane["worktree_path"])
     output = _worker_output(worktree, output)
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     archive = Path(lane["control_dir"])
-    for name in ("RESULT.json", "COMPLETION_REVIEW.json", "ORCHESTRATOR_ACCEPTANCE.json"):
+    for name in (
+        "RESULT.json",
+        "COMPLETION_REVIEW.json",
+        "ORCHESTRATOR_ACCEPTANCE.json",
+    ):
         try:
-            value = (output.read_bytes(worktree / name) if name == "RESULT.json"
-                     else (folder / name).read_bytes())
+            value = (
+                output.read_bytes(worktree / name)
+                if name == "RESULT.json"
+                else (folder / name).read_bytes()
+            )
         except FileNotFoundError:
             continue
         target = archive / name
         if target.exists() and target.read_bytes() != value:
-            raise ValueError(f"prior run archive already contains different {name}; reconcile before resume")
+            raise ValueError(
+                f"prior run archive already contains different {name}; reconcile before resume"
+            )
         atomic_write_bytes(target, value)
     output.delete(worktree / "RESULT.json")
     remove_record(folder / "COMPLETION_REVIEW.json")
@@ -246,7 +326,11 @@ def _profile_history_folder(rt: Path, epoch_id: str, lane: dict[str, Any]) -> Pa
     source_epoch = epoch_id
     if lane.get("lifecycle") == "resuming" and isinstance(resume_from_epoch, str):
         source_epoch = resume_from_epoch
-    return lane_record_dir(rt, source_epoch, lane["lane_id"]) / "resume-history" / str(lane["run_id"])
+    return (
+        lane_record_dir(rt, source_epoch, lane["lane_id"])
+        / "resume-history"
+        / str(lane["run_id"])
+    )
 
 
 def _archive_profile_transition(
@@ -281,10 +365,21 @@ def _archive_profile_transition(
     }
     if record_path.exists():
         existing = read_json(record_path)
-        for key in ("lane_id", "from_epoch_id", "from_run_id", "worktree_path", "provider_id",
-                    "old_provider", "new_provider", "previous_session_id", "rationale"):
+        for key in (
+            "lane_id",
+            "from_epoch_id",
+            "from_run_id",
+            "worktree_path",
+            "provider_id",
+            "old_provider",
+            "new_provider",
+            "previous_session_id",
+            "rationale",
+        ):
             if existing.get(key) != transition[key]:
-                raise ValueError("an interrupted profile transition has different protected inputs")
+                raise ValueError(
+                    "an interrupted profile transition has different protected inputs"
+                )
         return history
 
     worktree = Path(lane["worktree_path"])
@@ -292,10 +387,16 @@ def _archive_profile_transition(
         "lane.json": folder / "lane.json",
         "invocation.json": Path(lane["invocation_path"]),
         "worker-invocation.json": worktree / ".agent-workspace" / "invocation.json",
-        "controller.status.json": worktree / ".agent-workspace" / "controller.status.json",
+        "controller.status.json": worktree
+        / ".agent-workspace"
+        / "controller.status.json",
         "task-card.json": worktree / ".agent-workspace" / "task-card.json",
-        "controller.attempts.jsonl": worktree / ".agent-workspace" / "controller.attempts.jsonl",
-        "provider-transcript.jsonl": worktree / ".agent-workspace" / "provider-transcript.jsonl",
+        "controller.attempts.jsonl": worktree
+        / ".agent-workspace"
+        / "controller.attempts.jsonl",
+        "provider-transcript.jsonl": worktree
+        / ".agent-workspace"
+        / "provider-transcript.jsonl",
         "provider-stderr.txt": worktree / ".agent-workspace" / "provider-stderr.txt",
         "last-message.txt": worktree / ".agent-workspace" / "last-message.txt",
         "RESULT.json": worktree / "RESULT.json",
@@ -304,20 +405,28 @@ def _archive_profile_transition(
     }
     for name, source in sources.items():
         try:
-            data = output.read_bytes(source) if source == worktree or worktree in source.parents else source.read_bytes()
+            data = (
+                output.read_bytes(source)
+                if source == worktree or worktree in source.parents
+                else source.read_bytes()
+            )
         except FileNotFoundError:
             continue
         target = history / name
         if target.exists():
             if target.read_bytes() != data:
-                raise ValueError(f"prior profile evidence changed after archival: {target}")
+                raise ValueError(
+                    f"prior profile evidence changed after archival: {target}"
+                )
         else:
             atomic_write_bytes(target, data)
     atomic_write_json(record_path, transition)
     return history
 
 
-def _reset_worker_inbox(worktree: Path, lane_id: str, run_id: str, *, output=None) -> None:
+def _reset_worker_inbox(
+    worktree: Path, lane_id: str, run_id: str, *, output=None
+) -> None:
     """Reset the managed worker inbox to a valid empty queue for the new run."""
     inbox = {
         "schema": LANE_INBOX_SCHEMA,
@@ -326,7 +435,9 @@ def _reset_worker_inbox(worktree: Path, lane_id: str, run_id: str, *, output=Non
         "assignments": [],
     }
     output = _worker_output(worktree, output)
-    output.publish_json(output.admit(worktree / ".agent-workspace" / "QUEUE.json"), inbox)
+    output.publish_json(
+        output.admit(worktree / ".agent-workspace" / "QUEUE.json"), inbox
+    )
 
 
 def _rewrite_overlay_receipt(
@@ -341,12 +452,18 @@ def _rewrite_overlay_receipt(
         "applied_at": iso_utc(),
     }
     if managed:
-        receipt["provider_payload"] = f"{COMPOSED_PAYLOADS.as_posix()}/{lane['provider']['id']}"
+        receipt["provider_payload"] = (
+            f"{COMPOSED_PAYLOADS.as_posix()}/{lane['provider']['id']}"
+        )
     output = _worker_output(worktree, output)
-    output.publish_json(output.admit(worktree / ".agent-workspace" / "overlay-receipt.json"), receipt)
+    output.publish_json(
+        output.admit(worktree / ".agent-workspace" / "overlay-receipt.json"), receipt
+    )
 
 
-def _validate_retained_resume(config, epoch_id: str, lane: dict[str, Any], task_card: dict[str, Any]) -> None:
+def _validate_retained_resume(
+    config, epoch_id: str, lane: dict[str, Any], task_card: dict[str, Any]
+) -> None:
     """Validate protected native inputs without reconstructing worker authority."""
     from .git_source import current_tip, git
     from .lane_authority import read_invocation
@@ -359,7 +476,9 @@ def _validate_retained_resume(config, epoch_id: str, lane: dict[str, Any], task_
     if state["lifecycle"] != "closed":
         raise ValueError("retained lane must belong to a closed epoch")
     if state.get("config_identity") != compute_config_identity(config, manifest):
-        raise ValueError("retained epoch configuration is incompatible with this runtime")
+        raise ValueError(
+            "retained epoch configuration is incompatible with this runtime"
+        )
     read_invocation(lane)
     source = lane["git_source"]
     if not same_path(source["root_workspace"], config.root_workspace):
@@ -371,7 +490,9 @@ def _validate_retained_resume(config, epoch_id: str, lane: dict[str, Any], task_
     if task_card.get("base_commit") is not None:
         git(source, "merge-base", "--is-ancestor", task_card["base_commit"], tip)
     if not cleanup_is_proven(lane):
-        raise ValueError("retained controller/provider/helper cleanup is live or unproven")
+        raise ValueError(
+            "retained controller/provider/helper cleanup is live or unproven"
+        )
 
 
 def _adopt_retained_lane(config, epoch_id: str, lane: dict[str, Any]) -> str:
@@ -384,10 +505,19 @@ def _adopt_retained_lane(config, epoch_id: str, lane: dict[str, Any]) -> str:
     read_active_lanes(rt, destination)
     if config.profile == "managed":
         read_manager_queue(rt)
-    write_lane(rt, destination, lane["lane_id"], {
-        **lane, "lifecycle": "resuming", "resume_from_epoch_id": epoch_id,
-    }, create_only=True)
+    write_lane(
+        rt,
+        destination,
+        lane["lane_id"],
+        {
+            **lane,
+            "lifecycle": "resuming",
+            "resume_from_epoch_id": epoch_id,
+        },
+        create_only=True,
+    )
     from .lanes import reconcile_active_lanes
+
     reconcile_active_lanes(rt, destination)
     return destination
 
@@ -415,20 +545,34 @@ def run_resume(
     try:
         with runtime_admission_lock(config.runtime_root):
             return _run_resume(
-                config, harness_root, lane_id, resume_task_card, rationale,
-                model=model, launch_config=launch_config,
+                config,
+                harness_root,
+                lane_id,
+                resume_task_card,
+                rationale,
+                model=model,
+                launch_config=launch_config,
             )
     except Exception as exc:
         return {
-            "ok": False, "code": RESUME_LANE_WRITE_FAILED, "summary": str(exc),
+            "ok": False,
+            "code": RESUME_LANE_WRITE_FAILED,
+            "summary": str(exc),
             "evidence_paths": [str(config.runtime_root)],
             "next_action": "preserve the retained records and reconcile the named failure",
         }
 
 
-def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
-                rationale: str | None, *, model: str | None = None,
-                launch_config: dict[str, Any] | None = None) -> dict[str, Any]:
+def _run_resume(
+    config,
+    harness_root: Path,
+    lane_id: str,
+    resume_task_card: str,
+    rationale: str | None,
+    *,
+    model: str | None = None,
+    launch_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     rt = config.runtime_root
     retained = False
     try:
@@ -450,7 +594,8 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
     profile_requested = model is not None or launch_config is not None
     if model is None and launch_config is not None:
         return {
-            "ok": False, "code": PROFILE_CHANGE_INVALID,
+            "ok": False,
+            "code": PROFILE_CHANGE_INVALID,
             "summary": "provider options require an explicit --model on resume",
             "evidence_paths": [],
             "next_action": "pass --model with the complete provider profile, or omit model and provider options to keep the saved profile",
@@ -463,21 +608,28 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             if model is None:
                 raise ValueError("an explicit model is required for a profile change")
             replacement_launch_config = _resume_launch_config(
-                lane["provider"]["id"], lane["provider"].get("launch_config"), launch_config or {}
+                lane["provider"]["id"],
+                lane["provider"].get("launch_config"),
+                launch_config or {},
             )
             configured = _validate_provider_launch_config(
-                harness_root, provider_id=lane["provider"]["id"],
-                model=model, launch_config=replacement_launch_config,
+                harness_root,
+                provider_id=lane["provider"]["id"],
+                model=model,
+                launch_config=replacement_launch_config,
             )
         except Exception as exc:
             return {
-                "ok": False, "code": PROFILE_CHANGE_INVALID,
+                "ok": False,
+                "code": PROFILE_CHANGE_INVALID,
                 "summary": f"replacement profile is invalid: {exc}",
                 "evidence_paths": [],
                 "next_action": "provide a supported model and complete provider options for the lane's existing adapter",
             }
         replacement_provider = {
-            **lane["provider"], "model": model.strip(), "launch_config": configured,
+            **lane["provider"],
+            "model": model.strip(),
+            "launch_config": configured,
         }
     profile_changed = profile_requested and (
         _effective_profile(replacement_provider) != _effective_profile(lane["provider"])
@@ -486,20 +638,26 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
         replacement_provider = lane["provider"]
     if profile_changed and (not isinstance(rationale, str) or not rationale.strip()):
         return {
-            "ok": False, "code": PROFILE_CHANGE_INVALID,
+            "ok": False,
+            "code": PROFILE_CHANGE_INVALID,
             "summary": "an explicit profile change requires a nonblank --rationale",
             "evidence_paths": [],
             "next_action": "explain why the lane is moving to this complete replacement profile",
         }
 
     try:
-        if _has_valid_acceptance_chain(rt, epoch_id, lane) or lane.get("acceptance_advancement"):
+        if _has_valid_acceptance_chain(rt, epoch_id, lane) or lane.get(
+            "acceptance_advancement"
+        ):
             return {
                 "ok": False,
                 "code": ALREADY_ACCEPTED,
                 "summary": f"lane {lane_id} already has a valid ACCEPTED chain; it is not re-resumed",
                 "evidence_paths": [
-                    str(lane_record_dir(rt, epoch_id, lane_id) / "ORCHESTRATOR_ACCEPTANCE.json")
+                    str(
+                        lane_record_dir(rt, epoch_id, lane_id)
+                        / "ORCHESTRATOR_ACCEPTANCE.json"
+                    )
                 ],
                 "next_action": "retire the lane with `lane retire --acceptance-ref <file>`",
             }
@@ -532,18 +690,25 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             prior_invocations = completed_provider_invocations(lane, rt)
         except (OSError, ValueError, TypeError) as exc:
             return {
-                "ok": False, "code": WORKER_RETRY_LIMIT, "summary": str(exc),
+                "ok": False,
+                "code": WORKER_RETRY_LIMIT,
+                "summary": str(exc),
                 "evidence_paths": [str(lane.get("provider_history_path") or "")],
                 "next_action": "bootstrap a fresh lane and native session; preserve prior invocation evidence",
             }
         if prior_invocations >= MAX_LANE_PROVIDER_INVOCATIONS:
             return {
-                "ok": False, "code": WORKER_RETRY_LIMIT,
+                "ok": False,
+                "code": WORKER_RETRY_LIMIT,
                 "summary": f"lane {lane_id} used its initial assignment plus one retry",
                 "evidence_paths": [str(lane.get("provider_history_path") or "")],
                 "next_action": "settle the previous lane and bootstrap a fresh lane and native session",
             }
-        if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle != "running" and not (retained and lifecycle == "retired"):
+        if (
+            lifecycle not in _RESUMABLE_LIFECYCLES
+            and lifecycle != "running"
+            and not (retained and lifecycle == "retired")
+        ):
             return {
                 "ok": False,
                 "code": RESUME_LANE_WRITE_FAILED,
@@ -592,16 +757,35 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 epoch_id = _adopt_retained_lane(config, epoch_id, lane)
             lane = read_lane(rt, epoch_id, lane_id)
             lifecycle = "resuming"
+
         def mark_resuming(current: dict[str, Any]) -> dict[str, Any]:
-            if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != lifecycle:
+            if (
+                any(
+                    current.get(field) != lane.get(field)
+                    for field in ("lane_id", "run_id", "worktree_path", "provider")
+                )
+                or current.get("lifecycle") != lifecycle
+            ):
                 raise ValueError("lane run or status changed before resume mutation")
             if _live_controller(current):
-                raise ValueError("an exact controller is still live; resume cannot replace its run")
-            if completed_provider_invocations(current, rt) >= MAX_LANE_PROVIDER_INVOCATIONS:
-                raise ValueError("initial provider invocation plus one explicit retry exhausted")
+                raise ValueError(
+                    "an exact controller is still live; resume cannot replace its run"
+                )
+            if (
+                completed_provider_invocations(current, rt)
+                >= MAX_LANE_PROVIDER_INVOCATIONS
+            ):
+                raise ValueError(
+                    "initial provider invocation plus one explicit retry exhausted"
+                )
             marker = read_current_epoch(rt)
             runtime = read_runtime_state(rt)
-            if not marker or marker.get("epoch_id") != epoch_id or not runtime or runtime.get("state") != "OPEN":
+            if (
+                not marker
+                or marker.get("epoch_id") != epoch_id
+                or not runtime
+                or runtime.get("state") != "OPEN"
+            ):
                 raise ValueError("runtime or epoch changed before resume")
             return {
                 **current,
@@ -613,9 +797,12 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
         with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane_id):
             from .lane_authority import read_invocation, stage_authority
             from .lanes import require_same_run
+
             require_same_run(read_lane(rt, epoch_id, lane_id), lane)
             if _has_valid_acceptance_chain(rt, epoch_id, lane):
-                raise ValueError("ROOT accepted this run before resume; retire it instead")
+                raise ValueError(
+                    "ROOT accepted this run before resume; retire it instead"
+                )
             output = _worker_output(worktree)
             if output.root_identity != tuple(lane["worktree_identity"]):
                 raise ValueError("assigned worktree changed before resume mutation")
@@ -632,13 +819,19 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 prior_invocation = read_invocation(lane)
             if managed:
                 from .public_checks import home, policy, validate_service
-                if (policy(harness_root) is not None
-                        or (home(config.root_workspace) / "config.json").exists()
-                        or (home(config.root_workspace) / "service.json").exists()):
+
+                if (
+                    policy(harness_root) is not None
+                    or (home(config.root_workspace) / "config.json").exists()
+                    or (home(config.root_workspace) / "service.json").exists()
+                ):
                     validate_service(config.root_workspace, harness_root)
             if profile_changed:
                 history = history or _archive_profile_transition(
-                    rt, epoch_id, lane, new_run_id=run_id,
+                    rt,
+                    epoch_id,
+                    lane,
+                    new_run_id=run_id,
                     new_provider=replacement_provider,
                     rationale=rationale or "explicit operator profile change",
                     output=output,
@@ -648,23 +841,45 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 transition = read_json(history / "transition.json")
                 run_id = transition["to_run_id"]
                 from .retry_policy import record_profile_transition
+
                 record_profile_transition(
-                    rt, lane, new_run_id=run_id, new_provider=replacement_provider,
+                    rt,
+                    lane,
+                    new_run_id=run_id,
+                    new_provider=replacement_provider,
                     rationale=transition["rationale"],
                 )
             update_lane(rt, epoch_id, lane_id, mark_resuming)
             current = read_lane(rt, epoch_id, lane_id)
-            if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
+            if (
+                any(
+                    current.get(field) != lane.get(field)
+                    for field in ("lane_id", "run_id", "worktree_path", "provider")
+                )
+                or current.get("lifecycle") != "resuming"
+            ):
                 raise ValueError("lane run or status changed before prior run cleanup")
             if profile_changed:
                 _regenerate_codex_profile_if_needed(
-                    worktree, harness_root, config, lane["provider"], replacement_provider
+                    worktree,
+                    harness_root,
+                    config,
+                    lane["provider"],
+                    replacement_provider,
                 )
             _clear_prior_run(rt, epoch_id, lane, output=output)
             if managed:
                 _reset_worker_inbox(worktree, lane_id, run_id, output=output)
                 from .public_checks import install_route
-                install_route(harness_root, config.root_workspace, worktree, lane_id, run_id, output=output)
+
+                install_route(
+                    harness_root,
+                    config.root_workspace,
+                    worktree,
+                    lane_id,
+                    run_id,
+                    output=output,
+                )
             _write_worker_prompt(
                 worktree, task_card, managed=managed, rationale=rationale, output=output
             )
@@ -688,39 +903,92 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             )
             invocation_path = worktree / ".agent-workspace" / "invocation.json"
             import json
+
             written_invocation = json.loads(output.read_bytes(invocation_path))
             require_schema(written_invocation, INVOCATION_SCHEMA, invocation_path)
             if (
                 written_invocation.get("lane_id") != lane_id
                 or written_invocation.get("run_id") != run_id
-                or written_invocation.get("provider", {}).get("id") != lane["provider"]["id"]
-                or written_invocation.get("content_hash") != content_hash(written_invocation)
+                or written_invocation.get("provider", {}).get("id")
+                != lane["provider"]["id"]
+                or written_invocation.get("content_hash")
+                != content_hash(written_invocation)
             ):
-                raise ValueError("fresh resume invocation failed identity or hash validation")
-            _rewrite_overlay_receipt(worktree, lane, run_id, managed=managed, output=output)
+                raise ValueError(
+                    "fresh resume invocation failed identity or hash validation"
+                )
+            _rewrite_overlay_receipt(
+                worktree, lane, run_id, managed=managed, output=output
+            )
             if managed:
                 _write_worker_binding(worktree, rt, lane_id, run_id, output=output)
             # The resume task card is a per-lane input; keep the current copy.
-            output.publish_json(output.admit(worktree / ".agent-workspace" / "task-card.json"), task_card)
+            output.publish_json(
+                output.admit(worktree / ".agent-workspace" / "task-card.json"),
+                task_card,
+            )
             replacement = stage_authority(
-                rt, epoch_id, {**lane, "run_id": run_id, "provider": replacement_provider}, task_card
+                rt,
+                epoch_id,
+                {**lane, "run_id": run_id, "provider": replacement_provider},
+                task_card,
             )
 
             def replace_run(current: dict[str, Any]) -> dict[str, Any]:
-                if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
-                    raise ValueError("lane run or status changed before fresh run ownership")
+                if (
+                    any(
+                        current.get(field) != lane.get(field)
+                        for field in ("lane_id", "run_id", "worktree_path", "provider")
+                    )
+                    or current.get("lifecycle") != "resuming"
+                ):
+                    raise ValueError(
+                        "lane run or status changed before fresh run ownership"
+                    )
                 marker = read_current_epoch(rt)
                 runtime = read_runtime_state(rt)
-                if not marker or marker.get("epoch_id") != epoch_id or not runtime or runtime.get("state") != "OPEN":
-                    raise ValueError("runtime or epoch changed before fresh run ownership")
+                if (
+                    not marker
+                    or marker.get("epoch_id") != epoch_id
+                    or not runtime
+                    or runtime.get("state") != "OPEN"
+                ):
+                    raise ValueError(
+                        "runtime or epoch changed before fresh run ownership"
+                    )
                 return {
-                    **{key: value for key, value in current.items()
-                       if key not in {"forced_cleanup_ref", "retirement_proof"}},
-                    **{key: value for key, value in replacement.items() if key in {
-                        "control_dir", "worktree_identity", "result_assignment_hash", "invocation_path", "invocation_hash", "prompt_path", "prompt_sha256",
-                        "task_card_path", "task_card_hash", "controller_status_path", "controller_events_path",
-                        "transcript_path", "stderr_path", "attempts_path", "last_message_path"}},
-                    **{key: replacement[key] for key in ("isolation_config_path", "isolation_config_sha256") if key in replacement},
+                    **{
+                        key: value
+                        for key, value in current.items()
+                        if key not in {"forced_cleanup_ref", "retirement_proof"}
+                    },
+                    **{
+                        key: value
+                        for key, value in replacement.items()
+                        if key
+                        in {
+                            "control_dir",
+                            "worktree_identity",
+                            "result_assignment_hash",
+                            "invocation_path",
+                            "invocation_hash",
+                            "prompt_path",
+                            "prompt_sha256",
+                            "task_card_path",
+                            "task_card_hash",
+                            "controller_status_path",
+                            "controller_events_path",
+                            "transcript_path",
+                            "stderr_path",
+                            "attempts_path",
+                            "last_message_path",
+                        }
+                    },
+                    **{
+                        key: replacement[key]
+                        for key in ("isolation_config_path", "isolation_config_sha256")
+                        if key in replacement
+                    },
                     "run_id": run_id,
                     "lifecycle": "running",
                     "process": {},
@@ -735,6 +1003,7 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
 
             update_lane(rt, epoch_id, lane_id, replace_run)
             from .lanes import reconcile_active_lanes
+
             reconcile_active_lanes(rt, epoch_id)
             if managed:
                 _consume_resume_signal(rt, lane_id, prior_run_id)

@@ -1,4 +1,5 @@
 """Regression for retirement racing the accepted controller's final exit."""
+
 from __future__ import annotations
 
 import subprocess
@@ -124,10 +125,12 @@ class AcceptedRetirementExitRaceTests(LinkedResultFixture, unittest.TestCase):
         lane = {**self.lane, "lifecycle": "accepted", "process": identity}
         self.lane = write_lane(self.runtime, self.epoch, "worker", lane)
         self.acceptance = self.pair()[1]
+
         def observed_status(current):
             status = status_reader(current)
             atomic_write_json(Path(lane["controller_status_path"]), status)
             return status
+
         with ExitStack() as stack:
             stack.enter_context(
                 patch.object(launch, "find_harness_root", return_value=self.root)
@@ -165,9 +168,7 @@ class AcceptedRetirementExitRaceTests(LinkedResultFixture, unittest.TestCase):
                     return_value=boundary_gone,
                 )
             )
-            release_leases = stack.enter_context(
-                patch.object(launch, "release_leases")
-            )
+            release_leases = stack.enter_context(patch.object(launch, "release_leases"))
             update_lane = stack.enter_context(patch.object(launch, "update_lane"))
             stack.enter_context(
                 patch.object(launch, "read_active_lanes", return_value=[])
@@ -218,9 +219,7 @@ class AcceptedRetirementExitRaceTests(LinkedResultFixture, unittest.TestCase):
         self.assertGreaterEqual(
             reads, 2, "status must be re-read while the live controller runs"
         )
-        self.assertLessEqual(
-            reads, 8, "the bounded re-read must stop at the deadline"
-        )
+        self.assertLessEqual(reads, 8, "the bounded re-read must stop at the deadline")
         self.assertTrue(
             launch.processes.identity_matches(
                 identity["pid"], identity["creation_time"]

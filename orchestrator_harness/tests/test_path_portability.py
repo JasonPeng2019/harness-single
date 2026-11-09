@@ -1,4 +1,5 @@
 """Distribution and host discovery must not select a developer's paths."""
+
 from __future__ import annotations
 
 import json
@@ -33,8 +34,12 @@ class PathPortabilityTests(unittest.TestCase):
             executable = str(Path(temporary) / "tools" / "powershell.exe")
             runner = Mock(return_value=subprocess.CompletedProcess([], 0, "[]", ""))
             with patch("shutil.which", return_value=executable):
-                self.assertTrue(processes.windows_process_snapshot(runner=runner).complete)
-                self.assertTrue(processes.windows_process_query(11, runner=runner).complete)
+                self.assertTrue(
+                    processes.windows_process_snapshot(runner=runner).complete
+                )
+                self.assertTrue(
+                    processes.windows_process_query(11, runner=runner).complete
+                )
             for call in runner.call_args_list:
                 self.assertEqual(executable, call.args[0][0])
 
@@ -43,9 +48,10 @@ class PathPortabilityTests(unittest.TestCase):
             library = str(Path(temporary) / "native" / "libproc.dylib")
             native = Mock()
             native.proc_listpids.return_value = 0
-            with patch("ctypes.util.find_library", return_value=library), patch(
-                "ctypes.CDLL", return_value=native
-            ) as loader:
+            with (
+                patch("ctypes.util.find_library", return_value=library),
+                patch("ctypes.CDLL", return_value=native) as loader,
+            ):
                 self.assertEqual((), process_identity.darwin_process_ids())
             loader.assert_called_once_with(library)
 
@@ -53,11 +59,16 @@ class PathPortabilityTests(unittest.TestCase):
         with patch("shutil.which", return_value=None):
             runner = Mock()
             self.assertFalse(processes.windows_process_snapshot(runner=runner).complete)
-            self.assertFalse(processes.windows_process_query(11, runner=runner).complete)
+            self.assertFalse(
+                processes.windows_process_query(11, runner=runner).complete
+            )
             runner.assert_not_called()
             self.assertIsNone(process_identity._linux_process_identity(11))
             self.assertFalse(processes._linux_process_query(11).complete)
-        with patch("ctypes.util.find_library", return_value=None), patch("ctypes.CDLL") as loader:
+        with (
+            patch("ctypes.util.find_library", return_value=None),
+            patch("ctypes.CDLL") as loader,
+        ):
             self.assertIsNone(process_identity.darwin_process_ids())
             loader.assert_not_called()
 
@@ -69,16 +80,26 @@ class PathPortabilityTests(unittest.TestCase):
             (root / "stat").write_text("btime 1000\n")
             (root / "11").mkdir()
             fields = ["S", "10", "11", "11", *(["0"] * 15), "500"]
-            (root / "11" / "stat").write_text("11 (name with spaces) " + " ".join(fields))
+            (root / "11" / "stat").write_text(
+                "11 (name with spaces) " + " ".join(fields)
+            )
             (root / "11" / "cmdline").write_bytes(b"worker\0--example\0")
-            output = json.dumps({"filesystems": [{"target": str(root), "fstype": "proc"}]})
-            with patch("shutil.which", return_value="findmnt"), patch(
-                "harness_common.platform_paths.subprocess.run",
-                return_value=subprocess.CompletedProcess([], 0, output, ""),
-            ), patch.object(processes, "_linux_clock_ticks", return_value=100):
+            output = json.dumps(
+                {"filesystems": [{"target": str(root), "fstype": "proc"}]}
+            )
+            with (
+                patch("shutil.which", return_value="findmnt"),
+                patch(
+                    "harness_common.platform_paths.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0, output, ""),
+                ),
+                patch.object(processes, "_linux_clock_ticks", return_value=100),
+            ):
                 self.assertEqual(root, platform_paths.procfs_root())
-                self.assertEqual({"pid": 11, "created_utc": "linux-start-ticks:500"},
-                                 process_identity._linux_process_identity(11))
+                self.assertEqual(
+                    {"pid": 11, "created_utc": "linux-start-ticks:500"},
+                    process_identity._linux_process_identity(11),
+                )
                 query = processes._linux_process_query(11)
                 self.assertTrue(query.complete, query.errors)
                 self.assertEqual(10, query.process.ppid)

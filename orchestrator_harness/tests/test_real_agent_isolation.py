@@ -77,40 +77,103 @@ class RealAgentIsolationTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             readonly = root / "os-runtime"
-            workspace, home, release = (root / name for name in ("workspace", "home", "release"))
-            layout = {key: str(root / "namespace" / key) for key in (
-                "root", "private", "proc_target", "dev_target", "temp_target", "release_target",
-                "home_target", "codex_home_target", "workspace_target")}
+            workspace, home, release = (
+                root / name for name in ("workspace", "home", "release")
+            )
+            layout = {
+                key: str(root / "namespace" / key)
+                for key in (
+                    "root",
+                    "private",
+                    "proc_target",
+                    "dev_target",
+                    "temp_target",
+                    "release_target",
+                    "home_target",
+                    "codex_home_target",
+                    "workspace_target",
+                )
+            }
             layout.update(readonly_paths=[str(readonly)], path=str(root / "tools"))
-            argv = bwrap_base(root / "bwrap", release, workspace, home,
-                              "http://10.0.0.1:1234", layout=layout)
-            binds = [tuple(argv[index + 1:index + 3]) for index, value in enumerate(argv) if value == "--bind"]
-            self.assertEqual([(str(home), layout["codex_home_target"]),
-                              (str(workspace), layout["workspace_target"])], binds)
-            readonly_binds = [tuple(argv[index + 1:index + 3]) for index, value in enumerate(argv) if value == "--ro-bind"]
-            self.assertEqual([(str(readonly), str(readonly)), (str(release), layout["release_target"])], readonly_binds)
+            argv = bwrap_base(
+                root / "bwrap",
+                release,
+                workspace,
+                home,
+                "http://10.0.0.1:1234",
+                layout=layout,
+            )
+            binds = [
+                tuple(argv[index + 1 : index + 3])
+                for index, value in enumerate(argv)
+                if value == "--bind"
+            ]
+            self.assertEqual(
+                [
+                    (str(home), layout["codex_home_target"]),
+                    (str(workspace), layout["workspace_target"]),
+                ],
+                binds,
+            )
+            readonly_binds = [
+                tuple(argv[index + 1 : index + 3])
+                for index, value in enumerate(argv)
+                if value == "--ro-bind"
+            ]
+            self.assertEqual(
+                [
+                    (str(readonly), str(readonly)),
+                    (str(release), layout["release_target"]),
+                ],
+                readonly_binds,
+            )
             self.assertIn("--clearenv", argv)
             self.assertEqual(["--cap-drop", "ALL"], argv[-2:])
-            for restriction in ("--unshare-user", "--unshare-pid", "--unshare-cgroup", "--die-with-parent"):
+            for restriction in (
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-cgroup",
+                "--die-with-parent",
+            ):
                 self.assertIn(restriction, argv)
 
-    def test_operator_mounts_cover_discovered_tools_and_exclude_private_roots(self) -> None:
+    def test_operator_mounts_cover_discovered_tools_and_exclude_private_roots(
+        self,
+    ) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            system, workspace, home = (root / name for name in ("os-runtime", "worker", "operator-home"))
+            system, workspace, home = (
+                root / name for name in ("os-runtime", "worker", "operator-home")
+            )
             for path in (system, workspace, home):
                 path.mkdir()
-            python, git, certs = system / "python", system / "git", system / "certificates"
-            python.touch(); git.touch(); certs.mkdir()
+            python, git, certs = (
+                system / "python",
+                system / "git",
+                system / "certificates",
+            )
+            python.touch()
+            git.touch()
+            certs.mkdir()
             manifest = root / "mounts.json"
-            selected = {"readonly_paths": [str(system)], "forbidden_probe_paths": [str(home)]}
+            selected = {
+                "readonly_paths": [str(system)],
+                "forbidden_probe_paths": [str(home)],
+            }
             manifest.write_text(json.dumps(selected))
-            with patch.object(driver_module.sys, "executable", str(python)), patch.object(
-                driver_module.shutil, "which", return_value=str(git)
-            ), patch.object(driver_module.ssl, "get_default_verify_paths",
-                            return_value=SimpleNamespace(capath=str(certs), cafile=None)), patch.object(
-                driver_module, "procfs_root", return_value=root / "kernel-processes"
-            ), patch.object(Path, "home", return_value=home):
+            with (
+                patch.object(driver_module.sys, "executable", str(python)),
+                patch.object(driver_module.shutil, "which", return_value=str(git)),
+                patch.object(
+                    driver_module.ssl,
+                    "get_default_verify_paths",
+                    return_value=SimpleNamespace(capath=str(certs), cafile=None),
+                ),
+                patch.object(
+                    driver_module, "procfs_root", return_value=root / "kernel-processes"
+                ),
+                patch.object(Path, "home", return_value=home),
+            ):
                 layout = driver_module.isolation_layout(workspace, manifest)
                 self.assertEqual(str(python), layout["python"])
                 self.assertEqual(str(root / "kernel-processes"), layout["proc_target"])
@@ -118,7 +181,10 @@ class RealAgentIsolationTests(unittest.TestCase):
                 for unsafe in (workspace, home, root, Path(root.anchor)):
                     selected["readonly_paths"] = [str(unsafe)]
                     manifest.write_text(json.dumps(selected))
-                    with self.subTest(unsafe=unsafe), self.assertRaisesRegex(RuntimeError, "protected"):
+                    with (
+                        self.subTest(unsafe=unsafe),
+                        self.assertRaisesRegex(RuntimeError, "protected"),
+                    ):
                         driver_module.isolation_layout(workspace, manifest)
                 selected["readonly_paths"] = [str(certs)]
                 manifest.write_text(json.dumps(selected))
@@ -129,16 +195,36 @@ class RealAgentIsolationTests(unittest.TestCase):
         provider = load_support("wsl_codex_provider")
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            layout = {"workspace_target": str(root / "namespace" / "worker"),
-                      "release_target": str(root / "namespace" / "provider")}
+            layout = {
+                "workspace_target": str(root / "namespace" / "worker"),
+                "release_target": str(root / "namespace" / "provider"),
+            }
             command = provider._provider_argv(
-                ["exec", "--cd", str(root / "host-worker"), "--output-last-message", str(root / "old-output"), "-"],
-                ["sandbox"], layout,
+                [
+                    "exec",
+                    "--cd",
+                    str(root / "host-worker"),
+                    "--output-last-message",
+                    str(root / "old-output"),
+                    "-",
+                ],
+                ["sandbox"],
+                layout,
             )
-            self.assertEqual(str(Path(layout["release_target"]) / "bin" / "codex"), command[1])
-            self.assertEqual(layout["workspace_target"], command[command.index("--cd") + 1])
-            self.assertEqual(str(Path(layout["workspace_target"]) / ".agent-workspace" / "real_agent_last_message.txt"),
-                             command[command.index("--output-last-message") + 1])
+            self.assertEqual(
+                str(Path(layout["release_target"]) / "bin" / "codex"), command[1]
+            )
+            self.assertEqual(
+                layout["workspace_target"], command[command.index("--cd") + 1]
+            )
+            self.assertEqual(
+                str(
+                    Path(layout["workspace_target"])
+                    / ".agent-workspace"
+                    / "real_agent_last_message.txt"
+                ),
+                command[command.index("--output-last-message") + 1],
+            )
 
     def test_connect_proxy_denies_nonallowlisted_destination(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from harness_common.process_identity import exact_process_identity
-from orchestrator_harness.processes import identity_exit_proven, valid_creation_identity, spawn_detached
+from orchestrator_harness.processes import (
+    identity_exit_proven,
+    valid_creation_identity,
+    spawn_detached,
+)
 
 from . import settings
 from .attention import (
@@ -47,9 +51,12 @@ def _same(record: object) -> bool:
 
 
 def _gone(record: object) -> bool:
-    return (isinstance(record, dict) and type(record.get("pid")) is int
-            and valid_creation_identity(record.get("created_utc"))
-            and identity_exit_proven(record["pid"], record["created_utc"]))
+    return (
+        isinstance(record, dict)
+        and type(record.get("pid")) is int
+        and valid_creation_identity(record.get("created_utc"))
+        and identity_exit_proven(record["pid"], record["created_utc"])
+    )
 
 
 def _read(path: Path) -> dict[str, object] | None:
@@ -60,13 +67,20 @@ def _atomic(path: Path, value: dict[str, object]) -> None:
     atomic_json(path.parent.parent, path, value)
 
 
-def _sleep_until(seconds: int, service: Path, owner: dict[str, object],
-                 startup_token: str | None = None, watcher: dict[str, object] | None = None) -> str:
+def _sleep_until(
+    seconds: int,
+    service: Path,
+    owner: dict[str, object],
+    startup_token: str | None = None,
+    watcher: dict[str, object] | None = None,
+) -> str:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         state = _read(service) or {}
-        if startup_token is not None and (state.get("startup_token") != startup_token
-                                         or state.get("watcher") != watcher):
+        if startup_token is not None and (
+            state.get("startup_token") != startup_token
+            or state.get("watcher") != watcher
+        ):
             return "service-ownership-lost"
         if state.get("stop_requested"):
             return "stop-requested"
@@ -88,8 +102,13 @@ def _terminal(
         return _write_terminal(service, runtime, reason, startup_token, watcher)
 
 
-def _write_terminal(service: Path, runtime: Path, reason: str,
-                    startup_token: str, watcher: dict[str, object] | None) -> bool:
+def _write_terminal(
+    service: Path,
+    runtime: Path,
+    reason: str,
+    startup_token: str,
+    watcher: dict[str, object] | None,
+) -> bool:
     current = _read(service)
     if not isinstance(current, dict) or current.get("startup_token") != startup_token:
         return False
@@ -206,21 +225,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "status":
         state = _read(service)
         running = bool(
-            state
-            and _same(state.get("watcher"))
-            and not _gone(state.get("watcher"))
+            state and _same(state.get("watcher")) and not _gone(state.get("watcher"))
         )
         unknown = bool(state and not running and not _gone(state.get("watcher")))
-        print(json.dumps({"running": running, "identity_unproven": unknown, "state": state}))
+        print(
+            json.dumps(
+                {"running": running, "identity_unproven": unknown, "state": state}
+            )
+        )
         return 0
     if args.cmd == "stop":
         with lock(runtime, service):
             state = _read(service)
             if not state or _gone(state.get("watcher")):
-                print(json.dumps({"stop_requested": False, "reason": "no-live-service"}))
+                print(
+                    json.dumps({"stop_requested": False, "reason": "no-live-service"})
+                )
                 return 0
             if not _same(state.get("watcher")):
-                print(json.dumps({"stop_requested": False, "reason": "identity-unproven"}))
+                print(
+                    json.dumps({"stop_requested": False, "reason": "identity-unproven"})
+                )
                 return 1
             state["stop_requested"] = True
             state["stop_requested_utc"] = datetime.now(timezone.utc).isoformat()
@@ -239,11 +264,24 @@ def main(argv: list[str] | None = None) -> int:
             state = _read(service)
             if state:
                 if _same(state.get("watcher")) and not _gone(state.get("watcher")):
-                    print(json.dumps({"running": True, "result": "stopping" if state.get("stop_requested") else "already-started"}))
+                    print(
+                        json.dumps(
+                            {
+                                "running": True,
+                                "result": "stopping"
+                                if state.get("stop_requested")
+                                else "already-started",
+                            }
+                        )
+                    )
                     return 0
                 if not _gone(state.get("watcher")):
-                    raise RuntimeError("existing watcher identity is unproven; preserve service state")
-                raise RuntimeError("watcher epoch has already been used; configure a fresh runtime")
+                    raise RuntimeError(
+                        "existing watcher identity is unproven; preserve service state"
+                    )
+                raise RuntimeError(
+                    "watcher epoch has already been used; configure a fresh runtime"
+                )
             owner = _identity(
                 args.owner_pid if args.owner_pid is not None else os.getppid()
             )
@@ -273,9 +311,13 @@ def main(argv: list[str] | None = None) -> int:
             if os.name == "nt":
                 child = spawn_detached(command, cwd=cfg.repository_root)
             else:
-                child = subprocess.Popen(command, cwd=str(cfg.repository_root),
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                         start_new_session=True)
+                child = subprocess.Popen(
+                    command,
+                    cwd=str(cfg.repository_root),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 published = _read(service)
@@ -341,8 +383,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("cannot establish watcher process identity")
             with lock(runtime, service):
                 current = _read(service)
-                if current is None or current.get("startup_token") != args.startup_token or current.get("watcher") not in (None, watcher_identity):
-                    raise RuntimeError("startup ownership changed before readiness publication")
+                if (
+                    current is None
+                    or current.get("startup_token") != args.startup_token
+                    or current.get("watcher") not in (None, watcher_identity)
+                ):
+                    raise RuntimeError(
+                        "startup ownership changed before readiness publication"
+                    )
                 initialize_service_cursor(cfg)
                 current["watcher"] = watcher_identity
                 current["startup_status"] = "READY"
@@ -356,7 +404,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             while True:
                 current = _read(service)
-                if current is None or current.get("startup_token") != args.startup_token or current.get("watcher") != watcher:
+                if (
+                    current is None
+                    or current.get("startup_token") != args.startup_token
+                    or current.get("watcher") != watcher
+                ):
                     reason = "service-ownership-lost"
                     break
                 if current.get("stop_requested"):
@@ -374,7 +426,13 @@ def main(argv: list[str] | None = None) -> int:
                     if cfg.evaluator_enabled
                     else None,
                 )
-                reason = _sleep_until(cfg.poll_interval_seconds, service, owner, args.startup_token, watcher)
+                reason = _sleep_until(
+                    cfg.poll_interval_seconds,
+                    service,
+                    owner,
+                    args.startup_token,
+                    watcher,
+                )
                 if reason != "poll":
                     break
             return 0

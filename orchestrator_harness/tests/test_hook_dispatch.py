@@ -15,10 +15,18 @@ from orchestrator_harness.tests.result_fixture import LinkedResultFixture
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
 HOOK_DISPATCH_PATH = (
-    WORKTREE_ROOT / "super-cache" / "workspace" / ".agent-workspace" / "hook-dispatch.py"
+    WORKTREE_ROOT
+    / "super-cache"
+    / "workspace"
+    / ".agent-workspace"
+    / "hook-dispatch.py"
 )
 RESULT_STOP_CHECK_PATH = (
-    WORKTREE_ROOT / "super-cache" / "workspace" / ".agent-workspace" / "result-stop-check.py"
+    WORKTREE_ROOT
+    / "super-cache"
+    / "workspace"
+    / ".agent-workspace"
+    / "result-stop-check.py"
 )
 
 BINDING_SCHEMA = "harness-hook-binding/v1"
@@ -67,9 +75,15 @@ def _make_binding(manager_queue_path, inbox_path, result_path, role="worker"):
     }
 
 
-def _make_result(outcome, summary="slice completed", evidence=None,
-                 completed_at="2026-09-02T00:00:00Z"):
-    evidence = evidence if evidence is not None else [{"check": "example", "status": "PASS"}]
+def _make_result(
+    outcome,
+    summary="slice completed",
+    evidence=None,
+    completed_at="2026-09-02T00:00:00Z",
+):
+    evidence = (
+        evidence if evidence is not None else [{"check": "example", "status": "PASS"}]
+    )
     payload = {
         "schema": RESULT_SCHEMA,
         "lane_id": "lane-1",
@@ -88,7 +102,9 @@ class HookDispatchTestCase(LinkedResultFixture, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("hook_dispatch", HOOK_DISPATCH_PATH)
+        spec = importlib.util.spec_from_file_location(
+            "hook_dispatch", HOOK_DISPATCH_PATH
+        )
         if spec is None or spec.loader is None:
             raise AssertionError(
                 "RED: hook-dispatch.py not found at %s" % HOOK_DISPATCH_PATH

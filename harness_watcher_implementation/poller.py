@@ -20,7 +20,9 @@ def _load_cursor(root: Path) -> dict[str, Any]:
     value = read_json(root, _cursor_path(root))
     if value is None:
         return {"schema": "harness-watcher-cursor/v2", "sources": {}}
-    if value.get("schema") != "harness-watcher-cursor/v2" or not isinstance(value.get("sources"), dict):
+    if value.get("schema") != "harness-watcher-cursor/v2" or not isinstance(
+        value.get("sources"), dict
+    ):
         raise ValueError("invalid watcher cursor; preserve it for reconciliation")
     return value
 
@@ -74,7 +76,11 @@ def _read(path: Path, limit: int, prior: dict[str, Any]) -> dict[str, Any]:
             prior_offset = prior.get("offset", 0)
             if type(prior_offset) is not int or prior_offset < 0:
                 raise ValueError("invalid watcher source offset")
-            old = prior_offset if prior.get("file_id") == fid and prior_offset <= st.st_size else 0
+            old = (
+                prior_offset
+                if prior.get("file_id") == fid and prior_offset <= st.st_size
+                else 0
+            )
             offset = max(old, st.st_size - limit)
             handle.seek(offset)
             # Capture exactly the sampled interval. Appends after fstat are
@@ -147,7 +153,11 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
     role, source = _role(cfg, item["path"])
     records = []
     byte_cursor = item["offset"]
-    data = base64.b64decode(item["raw_b64"]) if "raw_b64" in item else item["text"].encode("utf-8")
+    data = (
+        base64.b64decode(item["raw_b64"])
+        if "raw_b64" in item
+        else item["text"].encode("utf-8")
+    )
     raw_lines = data.split(b"\n")
     if raw_lines and raw_lines[-1] == b"":
         raw_lines.pop()
@@ -197,7 +207,8 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
                     {
                         "source_path": item["path"],
                         "offset": item["offset"],
-                        "byte_start": byte_start, "byte_end": byte_end,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
                         "records": [record],
                     },
                     source,
@@ -211,7 +222,8 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
                     {
                         "source_path": item["path"],
                         "offset": item["offset"],
-                        "byte_start": byte_start, "byte_end": byte_end,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
                         "record": record,
                     },
                     str(
@@ -230,7 +242,8 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
                     {
                         "source_path": item["path"],
                         "offset": item["offset"],
-                        "byte_start": byte_start, "byte_end": byte_end,
+                        "byte_start": byte_start,
+                        "byte_end": byte_end,
                         "records": [record],
                     },
                     source,
@@ -257,8 +270,17 @@ def _route(cfg: WatcherConfig, item: dict[str, Any]) -> None:
 
 
 def _route_id(item: dict[str, Any], begin: int, end: int, raw: bytes) -> str:
-    identity = [item["path"], item.get("file_id"), begin, end, hashlib.sha256(raw).hexdigest()]
-    return "hwr-" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    identity = [
+        item["path"],
+        item.get("file_id"),
+        begin,
+        end,
+        hashlib.sha256(raw).hexdigest(),
+    ]
+    return (
+        "hwr-"
+        + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    )
 
 
 def _attention_only_source(cfg: WatcherConfig, path: str) -> bool:
@@ -510,10 +532,17 @@ def _poll(config: WatcherConfig, evaluator: Evaluator | None = None) -> dict[str
         item["elapsed_since_change_seconds"] = max(0, now - last)
         items.append(item)
         if item.get("dropped_bytes"):
-            log(config.runtime_root, "watcher", "SOURCE_TAIL_TRUNCATED", {
-                "source_path": str(path), "byte_start": item["sample_start"] - item["dropped_bytes"],
-                "byte_end": item["sample_start"], "dropped_bytes": item["dropped_bytes"],
-            })
+            log(
+                config.runtime_root,
+                "watcher",
+                "SOURCE_TAIL_TRUNCATED",
+                {
+                    "source_path": str(path),
+                    "byte_start": item["sample_start"] - item["dropped_bytes"],
+                    "byte_end": item["sample_start"],
+                    "dropped_bytes": item["dropped_bytes"],
+                },
+            )
         _route(config, item)
     evaluator_items = []
     for item in items:
@@ -575,7 +604,9 @@ def _poll(config: WatcherConfig, evaluator: Evaluator | None = None) -> dict[str
             "partial_bytes": x.get("partial_bytes", 0),
             "generation": x.get("generation"),
             "context": {
-                k: x[k] for k in ("path", "sha256", "offset", "text", "raw_b64") if k in x
+                k: x[k]
+                for k in ("path", "sha256", "offset", "text", "raw_b64")
+                if k in x
             },
             "last_changed_epoch": now
             if x.get("changed")

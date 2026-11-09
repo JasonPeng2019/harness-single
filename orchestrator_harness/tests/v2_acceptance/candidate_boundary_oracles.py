@@ -24,7 +24,9 @@ def assert_resume_order(observations: Sequence[Mapping[str, Any]]) -> None:
     validated = _index(observations, kind="fresh-invocation-validated")
     running = _index(observations, kind="lane-record-persisted", lifecycle="running")
     if resuming >= replaced:
-        raise AssertionError("RESUMING was not persisted before current-run replacement")
+        raise AssertionError(
+            "RESUMING was not persisted before current-run replacement"
+        )
     if running <= validated:
         raise AssertionError("RUNNING was persisted before fresh-invocation validation")
 
@@ -33,8 +35,14 @@ def assert_rejected_review_resume_boundary(candidate: Any) -> None:
     """Require exactly one review-owned resume-required event across resume."""
     candidate.reject_review()
     candidate.resume()
-    signals = [event for event in candidate.events if event.get("type") == "LANE_RESUME_REQUIRED"]
+    signals = [
+        event
+        for event in candidate.events
+        if event.get("type") == "LANE_RESUME_REQUIRED"
+    ]
     if len(signals) != 1:
-        raise AssertionError(f"expected one LANE_RESUME_REQUIRED event, found {len(signals)}")
+        raise AssertionError(
+            f"expected one LANE_RESUME_REQUIRED event, found {len(signals)}"
+        )
     if signals[0].get("producer") != "completion-review":
         raise AssertionError("LANE_RESUME_REQUIRED must be owned by completion-review")

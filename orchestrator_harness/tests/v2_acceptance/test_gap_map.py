@@ -12,7 +12,9 @@ from orchestrator_harness.tests.v2_acceptance.gap_map import GAP_ORACLES
 class GapMapTests(unittest.TestCase):
     """CHECK-ASSET-DISCOVERY: no audited [!] row can silently lose an oracle."""
 
-    def test_every_authoritative_snapshot_gap_has_one_strong_observable_oracle(self) -> None:
+    def test_every_authoritative_snapshot_gap_has_one_strong_observable_oracle(
+        self,
+    ) -> None:
         oracle_ids = [item.gap_id for item in GAP_ORACLES]
         self.assertEqual(82, len(AUDITED_GAP_IDS))
         self.assertEqual(82, len(set(AUDITED_GAP_IDS)))

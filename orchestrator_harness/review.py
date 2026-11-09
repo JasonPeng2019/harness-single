@@ -92,9 +92,15 @@ def validate_acceptance_chain(
         return False
     if acceptance.get("approval") not in APPROVALS:
         return False
-    if acceptance.get("approval") == "ACCEPTED" and review.get("review_outcome") != "PASS":
+    if (
+        acceptance.get("approval") == "ACCEPTED"
+        and review.get("review_outcome") != "PASS"
+    ):
         return False
-    if not isinstance(acceptance.get("accepted_by"), str) or not acceptance["accepted_by"]:
+    if (
+        not isinstance(acceptance.get("accepted_by"), str)
+        or not acceptance["accepted_by"]
+    ):
         return False
     return review.get("review_outcome") in REVIEW_OUTCOMES
 
@@ -115,18 +121,24 @@ def _read_task_card(worktree: Path, lane: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def _read_result(worktree: Path, lane: dict[str, Any], *, clean: bool | None = None) -> dict[str, Any]:
+def _read_result(
+    worktree: Path, lane: dict[str, Any], *, clean: bool | None = None
+) -> dict[str, Any]:
     try:
         from .lane_authority import read_invocation
         from .result_validation import read_result
+
         read_invocation(lane)
         return read_result(lane, clean=clean)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
 
 
-def _worktree_commit(worktree: Path, task_card: dict[str, Any], lane: dict[str, Any]) -> str:
+def _worktree_commit(
+    worktree: Path, task_card: dict[str, Any], lane: dict[str, Any]
+) -> str:
     from .git_source import current_tip
+
     try:
         return current_tip(lane)
     except (OSError, ValueError) as exc:
@@ -182,10 +194,14 @@ def _write_pair(
     force_accept_reason: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if review_outcome not in REVIEW_OUTCOMES or approval not in APPROVALS:
-        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "invalid review finding or approval")
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT, "invalid review finding or approval"
+        )
     if approval == "ACCEPTED" and review_outcome != "PASS":
-        raise ReviewError(COMPLETION_REVIEW_FORCE_REASON_INVALID, "ACCEPTED requires a PASS finding")
-    with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane['lane_id']):
+        raise ReviewError(
+            COMPLETION_REVIEW_FORCE_REASON_INVALID, "ACCEPTED requires a PASS finding"
+        )
+    with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane["lane_id"]):
         require_same_run(read_lane(rt, epoch_id, lane["lane_id"]), lane)
         folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
         review_path = folder / "COMPLETION_REVIEW.json"
@@ -195,7 +211,10 @@ def _write_pair(
         result = _read_result(worktree, lane, clean=approval == "ACCEPTED")
         commit = _worktree_commit(worktree, task_card, lane)
         if commit != result["commit"]:
-            raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "assigned tip changed after reading RESULT")
+            raise ReviewError(
+                COMPLETION_REVIEW_STALE_SOURCE,
+                "assigned tip changed after reading RESULT",
+            )
         task_card_id = str(task_card.get("card_id") or task_card.get("id") or "")
         if not task_card_id:
             task_card_id = content_hash(task_card)
@@ -243,21 +262,34 @@ def _write_pair(
             # publishing; the operation lock cannot prevent external Git edits.
             latest = _read_result(worktree, lane, clean=approval == "ACCEPTED")
             if latest != result or _read_task_card(worktree, lane) != task_card:
-                raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, "review source changed before publication")
+                raise ReviewError(
+                    COMPLETION_REVIEW_STALE_SOURCE,
+                    "review source changed before publication",
+                )
             if acceptance_path.exists():
                 if not review_path.exists():
                     try:
                         existing_acceptance = read_json(acceptance_path)
-                        require_schema(existing_acceptance, ACCEPTANCE_SCHEMA, acceptance_path)
+                        require_schema(
+                            existing_acceptance, ACCEPTANCE_SCHEMA, acceptance_path
+                        )
                     except (OSError, ValueError) as exc:
-                        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+                        raise ReviewError(
+                            COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)
+                        ) from exc
                     review["reviewed_at"] = existing_acceptance.get("decided_at")
                     review["content_hash"] = content_hash(review)
                     acceptance["review_ref"] = review["content_hash"]
                     acceptance["decided_at"] = review["reviewed_at"]
                     acceptance["content_hash"] = content_hash(acceptance)
-                    if existing_acceptance != acceptance or not validate_acceptance_chain(
-                        review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"]
+                    if (
+                        existing_acceptance != acceptance
+                        or not validate_acceptance_chain(
+                            review,
+                            acceptance,
+                            lane_id=lane["lane_id"],
+                            run_id=lane["run_id"],
+                        )
                     ):
                         raise ReviewError(
                             COMPLETION_REVIEW_OUTPUT_CONFLICT,
@@ -266,9 +298,13 @@ def _write_pair(
                     atomic_write_json(review_path, review)
                     return review, existing_acceptance
                 existing_review, existing_acceptance = _replay_pair(
-                    folder, lane, review_outcome=review_outcome,
-                    review_summary=review_summary, evidence=evidence,
-                    approval=approval, force_accept_reason=force_accept_reason,
+                    folder,
+                    lane,
+                    review_outcome=review_outcome,
+                    review_summary=review_summary,
+                    evidence=evidence,
+                    approval=approval,
+                    force_accept_reason=force_accept_reason,
                 )
                 review["reviewed_at"] = existing_review["reviewed_at"]
                 review["content_hash"] = content_hash(review)
@@ -286,7 +322,9 @@ def _write_pair(
                     existing = read_json(review_path)
                     require_schema(existing, COMPLETION_REVIEW_SCHEMA, review_path)
                 except (OSError, ValueError) as exc:
-                    raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+                    raise ReviewError(
+                        COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)
+                    ) from exc
                 review["reviewed_at"] = existing.get("reviewed_at")
                 review["content_hash"] = content_hash(review)
                 if existing != review:
@@ -300,7 +338,10 @@ def _write_pair(
                 if not validate_acceptance_chain(
                     review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"]
                 ):
-                    raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "existing review chain is invalid")
+                    raise ReviewError(
+                        COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                        "existing review chain is invalid",
+                    )
                 atomic_write_json(acceptance_path, acceptance)
                 return review, acceptance
             atomic_write_json(review_path, review)
@@ -309,8 +350,13 @@ def _write_pair(
 
 
 def _replay_pair(
-    folder: Path, lane: dict[str, Any], *, review_outcome: str,
-    review_summary: str, evidence: list[str], approval: str,
+    folder: Path,
+    lane: dict[str, Any],
+    *,
+    review_outcome: str,
+    review_summary: str,
+    evidence: list[str],
+    approval: str,
     force_accept_reason: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Verify an already published pair before retrying manager close."""
@@ -344,10 +390,16 @@ def _replay_pair(
     worktree = Path(lane["worktree_path"])
     task = _read_task_card(worktree, lane)
     result = _read_result(worktree, lane, clean=approval == "ACCEPTED")
-    if (review["task_card_hash"] != content_hash(task) or review["result_hash"] != content_hash(result)
-            or review["commit"] != result["commit"]
-            or review["source_assignment_hash"] != lane["result_assignment_hash"]):
-        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "replayed review source differs from the current assignment/result/tip")
+    if (
+        review["task_card_hash"] != content_hash(task)
+        or review["result_hash"] != content_hash(result)
+        or review["commit"] != result["commit"]
+        or review["source_assignment_hash"] != lane["result_assignment_hash"]
+    ):
+        raise ReviewError(
+            COMPLETION_REVIEW_OUTPUT_CONFLICT,
+            "replayed review source differs from the current assignment/result/tip",
+        )
     return review, acceptance
 
 
@@ -402,9 +454,13 @@ def run_completion_review(
             )
         folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
         exact_reason = None
-        if event is not None and event.get("state") == "COMPLETE" and not (
-            (folder / "COMPLETION_REVIEW.json").is_file()
-            and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+        if (
+            event is not None
+            and event.get("state") == "COMPLETE"
+            and not (
+                (folder / "COMPLETION_REVIEW.json").is_file()
+                and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+            )
         ):
             raise ReviewError(
                 COMPLETION_REVIEW_OUTPUT_CONFLICT,
@@ -415,8 +471,8 @@ def run_completion_review(
         if review_exists and acceptance_exists:
             replay_lifecycles = (
                 ("review_pending", "result_invalid", "accepted", "retired")
-                if event is not None else
-                ("review_pending", "result_invalid", "accepted")
+                if event is not None
+                else ("review_pending", "result_invalid", "accepted")
             )
             if lane.get("lifecycle") not in replay_lifecycles:
                 raise ReviewError(
@@ -424,18 +480,30 @@ def run_completion_review(
                     f"lane {lane['lane_id']} is not reviewable (lifecycle={lane.get('lifecycle')})",
                 )
             if event is not None:
-                with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane["lane_id"]):
+                with (
+                    runtime_admission_lock(rt),
+                    lane_operation_lock(rt, epoch_id, lane["lane_id"]),
+                ):
                     require_same_run(read_lane(rt, epoch_id, lane["lane_id"]), lane)
                     review, acceptance = _replay_pair(
-                        folder, lane, review_outcome=review_outcome,
-                        review_summary=review_summary, evidence=evidence,
-                        approval=approval, force_accept_reason=exact_reason,
+                        folder,
+                        lane,
+                        review_outcome=review_outcome,
+                        review_summary=review_summary,
+                        evidence=evidence,
+                        approval=approval,
+                        force_accept_reason=exact_reason,
                     )
             else:
                 review, acceptance = _write_pair(
-                    rt, epoch_id, lane, review_outcome=review_outcome,
-                    review_summary=review_summary, evidence=evidence,
-                    approval=approval, force_accept_reason=exact_reason,
+                    rt,
+                    epoch_id,
+                    lane,
+                    review_outcome=review_outcome,
+                    review_summary=review_summary,
+                    evidence=evidence,
+                    approval=approval,
+                    force_accept_reason=exact_reason,
                 )
         else:
             if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
@@ -444,9 +512,14 @@ def run_completion_review(
                     f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
                 )
             review, acceptance = _write_pair(
-                rt, epoch_id, lane, review_outcome=review_outcome,
-                review_summary=review_summary, evidence=evidence,
-                approval=approval, force_accept_reason=exact_reason,
+                rt,
+                epoch_id,
+                lane,
+                review_outcome=review_outcome,
+                review_summary=review_summary,
+                evidence=evidence,
+                approval=approval,
+                force_accept_reason=exact_reason,
             )
         if event is not None and event.get("state") != "COMPLETE":
             try:

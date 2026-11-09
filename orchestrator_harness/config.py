@@ -1,4 +1,4 @@
-﻿"""Configuration: harness-config/v1, resource-manifest/v1, and config identity.
+"""Configuration: harness-config/v1, resource-manifest/v1, and config identity.
 
 The configuration is a closed set in ``<harness-root>/harness-config.json``
 plus the ROOT-authored resource manifest.  ROOT never passes paths, feature
@@ -71,7 +71,9 @@ class HarnessConfig:
 
     @property
     def profile(self) -> str:
-        return PROFILE_MANAGED if self.managed_coordination == "enabled" else PROFILE_PLAIN
+        return (
+            PROFILE_MANAGED if self.managed_coordination == "enabled" else PROFILE_PLAIN
+        )
 
     @property
     def runtime_root(self) -> Path:
@@ -82,6 +84,7 @@ class HarnessConfig:
         """Explicit diagnostics for removed policy keys, never live settings."""
 
         return self.legacy_config_diagnostics
+
 
 @dataclass(frozen=True)
 class ResourceManifest:
@@ -260,11 +263,14 @@ def _load_legacy_config(
 def _workspace_path(value: object, field: str, config_path: Path) -> Path:
     """Keep configured authority paths lexical and reject existing redirects."""
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"harness config {field} missing: configure an absolute operator workspace in {config_path}")
+        raise ConfigError(
+            f"harness config {field} missing: configure an absolute operator workspace in {config_path}"
+        )
     workspace = Path(value).expanduser()
     if not workspace.is_absolute():
         raise ConfigError(f"harness config {field} must be absolute: {config_path}")
     from .mutation import _validate_directory_input
+
     try:
         _validate_directory_input(workspace)
         for component in (*reversed(workspace.parents), workspace):
@@ -272,9 +278,13 @@ def _workspace_path(value: object, field: str, config_path: Path) -> Path:
                 info = component.lstat()
             except FileNotFoundError:
                 break
-            if (not stat.S_ISDIR(info.st_mode)
-                    or getattr(info, "st_file_attributes", 0) & 0x400):
-                raise ConfigError(f"harness config {field} must have plain directory ancestry: {component}")
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400
+            ):
+                raise ConfigError(
+                    f"harness config {field} must have plain directory ancestry: {component}"
+                )
     except OSError as exc:
         raise ConfigError(f"harness config {field} cannot be inspected: {exc}") from exc
     return workspace
@@ -288,7 +298,9 @@ def _checkout_paths(value: object, config_path: Path) -> tuple[str, ...]:
     interpret as a pathspec, absolute path, or traversal before any setup.
     """
     if not isinstance(value, list) or not value:
-        raise ConfigError(f"harness config checkout_paths must be a non-empty list: {config_path}")
+        raise ConfigError(
+            f"harness config checkout_paths must be a non-empty list: {config_path}"
+        )
     selected: list[str] = []
     for directory in value:
         if (
@@ -305,7 +317,9 @@ def _checkout_paths(value: object, config_path: Path) -> tuple[str, ...]:
             )
         selected.append(directory)
     if len(set(selected)) != len(selected):
-        raise ConfigError(f"harness config checkout_paths contains duplicate directories: {config_path}")
+        raise ConfigError(
+            f"harness config checkout_paths contains duplicate directories: {config_path}"
+        )
     return tuple(selected)
 
 
@@ -327,15 +341,26 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"harness config unreadable: {path}: {exc}") from exc
-    unknown = sorted(set(record) - {"root_workspace", "manager_workspace", "managed_coordination", "checkout_paths"})
+    unknown = sorted(
+        set(record)
+        - {
+            "root_workspace",
+            "manager_workspace",
+            "managed_coordination",
+            "checkout_paths",
+        }
+    )
     if unknown:
         raise ConfigError(
             f"harness config unknown key {unknown[0]!r} "
             f"(closed keys: root_workspace, manager_workspace, managed_coordination, checkout_paths): {path}"
         )
     workspace = _workspace_path(record.get("root_workspace"), "root_workspace", path)
-    manager = _workspace_path(record.get("manager_workspace", record.get("root_workspace")),
-                              "manager_workspace", path)
+    manager = _workspace_path(
+        record.get("manager_workspace", record.get("root_workspace")),
+        "manager_workspace",
+        path,
+    )
     managed = record.get("managed_coordination", "enabled")
     if managed not in ("enabled", "disabled"):
         raise ConfigError(
@@ -343,7 +368,8 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         )
     checkout_paths = (
         _checkout_paths(record["checkout_paths"], path)
-        if "checkout_paths" in record else None
+        if "checkout_paths" in record
+        else None
     )
     return HarnessConfig(
         harness_root=root,
@@ -429,9 +455,7 @@ def load_resource_manifest(harness_root: str | os.PathLike[str]) -> ResourceMani
     return ResourceManifest(tuple(validated))
 
 
-def compute_config_identity(
-    config: HarnessConfig, manifest: ResourceManifest
-) -> str:
+def compute_config_identity(config: HarnessConfig, manifest: ResourceManifest) -> str:
     """Return the epoch-immutable configuration identity.
 
     Changing any epoch-immutable fact (root_workspace, profile, the declared
@@ -444,7 +468,9 @@ def compute_config_identity(
         "resource_manifest": [dict(item) for item in manifest.resources],
         "runtime_record_schema_version": 1,
     }
-    if config.manager_workspace is not None and not same_path(config.manager_workspace, config.root_workspace):
+    if config.manager_workspace is not None and not same_path(
+        config.manager_workspace, config.root_workspace
+    ):
         payload["manager_workspace"] = path_identity(config.manager_workspace)
     if config.checkout_paths is not None:
         # Preserve the historical identity for unscoped full checkouts.

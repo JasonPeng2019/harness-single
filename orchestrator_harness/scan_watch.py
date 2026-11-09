@@ -1,4 +1,4 @@
-﻿"""``scan``, ``watch``, and ``health reconcile``: ROOT-side polling.
+"""``scan``, ``watch``, and ``health reconcile``: ROOT-side polling.
 
 ``scan --no-write`` returns a read-only snapshot; ``watch --until-actionable``
 blocks the ROOT session until an actionable condition exists (or a named
@@ -165,9 +165,9 @@ def _find_actionable(
         derived = derive_lane_status(
             rt, epoch_id, lane, status, orphaned_leases=orphaned_leases
         )
-        if derived == "review_pending" and (
-            lane_id, lane.get("run_id", "")
-        ) in (acknowledged_reviews or set()):
+        if derived == "review_pending" and (lane_id, lane.get("run_id", "")) in (
+            acknowledged_reviews or set()
+        ):
             continue
         if derived in ACTIONABLE_STATUSES:
             return lane_id, derived
@@ -175,17 +175,28 @@ def _find_actionable(
 
 
 def _watch_evidence_failure(rt: Path, exc: Exception) -> dict[str, Any]:
-    code = str(exc).partition(":")[0] if isinstance(exc, ConfigError) else WATCH_EVIDENCE_INVALID
+    code = (
+        str(exc).partition(":")[0]
+        if isinstance(exc, ConfigError)
+        else WATCH_EVIDENCE_INVALID
+    )
     if not code.startswith("ROOT_SESSION_"):
         code = WATCH_EVIDENCE_INVALID
-    return {"ok": False, "code": code,
-            "summary": f"watch cannot inspect or record native evidence: {exc}",
-            "evidence_paths": [str(rt)],
-            "next_action": "reconcile the named native record before waiting again"}
+    return {
+        "ok": False,
+        "code": code,
+        "summary": f"watch cannot inspect or record native evidence: {exc}",
+        "evidence_paths": [str(rt)],
+        "next_action": "reconcile the named native record before waiting again",
+    }
 
 
 def _watch_delivered(
-    event: dict[str, Any], *, queue_id: Any, root_session_id: str, binding_id: str,
+    event: dict[str, Any],
+    *,
+    queue_id: Any,
+    root_session_id: str,
+    binding_id: str,
 ) -> bool:
     event_id = event.get("event_id")
     if not isinstance(event_id, str) or not event_id:
@@ -202,7 +213,10 @@ def _watch_delivered(
 
 
 def _watch_event(
-    queue: dict[str, Any], *, root_session_id: str, binding_id: str,
+    queue: dict[str, Any],
+    *,
+    root_session_id: str,
+    binding_id: str,
     requested_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     queue_id = queue.get("queue_id")
@@ -214,16 +228,26 @@ def _watch_event(
             continue
         if requested_event_id is not None and event_id != requested_event_id:
             continue
-        scope = {"queue_id": queue_id, "event_id": event_id,
-                 "session_id": root_session_id, "binding_id": binding_id,
-                 "lane_id": event.get("lane_id"), "run_id": event.get("run_id")}
+        scope = {
+            "queue_id": queue_id,
+            "event_id": event_id,
+            "session_id": root_session_id,
+            "binding_id": binding_id,
+            "lane_id": event.get("lane_id"),
+            "run_id": event.get("run_id"),
+        }
         if event.get("state") == "ACKNOWLEDGED" and any(
-                receipt.get("state") == "ACKNOWLEDGED"
-                and all(receipt.get(key) == value for key, value in scope.items())
-                for receipt in event.get("history", []) if isinstance(receipt, dict)):
+            receipt.get("state") == "ACKNOWLEDGED"
+            and all(receipt.get(key) == value for key, value in scope.items())
+            for receipt in event.get("history", [])
+            if isinstance(receipt, dict)
+        ):
             continue
         if not _watch_delivered(
-            event, queue_id=queue_id, root_session_id=root_session_id, binding_id=binding_id,
+            event,
+            queue_id=queue_id,
+            root_session_id=root_session_id,
+            binding_id=binding_id,
         ):
             return event
     return None
@@ -272,11 +296,14 @@ def run_watch(
         }
     managed = config.profile == "managed"
     if _state.get("lane_mode") != config.profile:
-        return _watch_evidence_failure(rt, ValueError("active epoch profile differs from configuration"))
+        return _watch_evidence_failure(
+            rt, ValueError("active epoch profile differs from configuration")
+        )
     if managed:
         try:
             session_id, watch_binding_id = resolve_root_session(
-                config, session_id=root_session_id, binding_id=binding_id)
+                config, session_id=root_session_id, binding_id=binding_id
+            )
         except Exception as exc:
             return _watch_evidence_failure(rt, exc)
     while True:
@@ -323,7 +350,8 @@ def run_watch(
             if actionable is not None:
                 lane_id, status = actionable
                 result = {
-                    "ok": True, "code": "WATCH_ACTIONABLE",
+                    "ok": True,
+                    "code": "WATCH_ACTIONABLE",
                     "summary": f"{lane_id} is actionable: {status}",
                     "evidence_paths": [],
                     "next_action": "act on the condition per the operator-responses table",

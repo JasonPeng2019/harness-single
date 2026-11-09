@@ -35,14 +35,10 @@ class ManagerQueueCloseTests(unittest.TestCase):
                 mock.patch.object(
                     manager_queue, "read_manager_queue", return_value=record
                 ) as read_queue,
-                mock.patch.object(
-                    manager_queue, "_write_manager_queue"
-                ) as write_queue,
+                mock.patch.object(manager_queue, "_write_manager_queue") as write_queue,
             ):
                 with self.subTest(summary=summary):
-                    with self.assertRaises(
-                        manager_queue.ManagerQueueError
-                    ) as raised:
+                    with self.assertRaises(manager_queue.ManagerQueueError) as raised:
                         manager_queue.close_event(
                             runtime, "event-1", "COMPLETE", summary=summary
                         )
@@ -62,9 +58,7 @@ class ManagerQueueCloseTests(unittest.TestCase):
                 mock.patch.object(
                     manager_queue, "read_manager_queue", return_value=record
                 ),
-                mock.patch.object(
-                    manager_queue, "_write_manager_queue"
-                ) as write_queue,
+                mock.patch.object(manager_queue, "_write_manager_queue") as write_queue,
             ):
                 event = manager_queue.close_event(
                     runtime,
@@ -75,9 +69,7 @@ class ManagerQueueCloseTests(unittest.TestCase):
             self.assertEqual(outcome, event["state"])
             self.assertEqual("operator decision", event["summary"])
             self.assertEqual(outcome, event["history"][-1]["state"])
-            self.assertEqual(
-                "operator decision", event["history"][-1]["summary"]
-            )
+            self.assertEqual("operator decision", event["history"][-1]["summary"])
             write_queue.assert_called_once_with(runtime, record)
 
 

@@ -84,6 +84,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
     def test_diagnostic_only_start_serve_never_runs_evaluator(self) -> None:
         root = Path(__file__).resolve().parents[2]
         import uuid
+
         token = "diagnostic-" + uuid.uuid4().hex
         fixture_root = root / "runtime" / "merge-validation" / "watcher-smoke"
         runtime = fixture_root / token
@@ -138,7 +139,10 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             deadline = time.monotonic() + 5
             events_path = runtime / "watcher" / "events.jsonl"
             while time.monotonic() < deadline:
-                if events_path.exists() and "EVALUATOR_SKIPPED" in events_path.read_text():
+                if (
+                    events_path.exists()
+                    and "EVALUATOR_SKIPPED" in events_path.read_text()
+                ):
                     break
                 time.sleep(0.05)
             self.assertFalse(sentinel.exists())
@@ -180,27 +184,48 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
                 time.sleep(0.1)
             self.assertFalse(json.loads(status.stdout)["running"])
             from orchestrator_harness.processes import identity_exit_proven
+
             self.assertTrue(identity_exit_proven(pid, state["watcher"]["created_utc"]))
         finally:
             import shutil
             from orchestrator_harness.processes import identity_exit_proven
+
             service_path = runtime / "watcher" / "service.json"
             if service_path.exists():
                 retained = json.loads(service_path.read_text(encoding="utf-8"))
                 recorded = retained.get("watcher")
-                self.assertIsInstance(recorded, dict, "preserve fixture with unproven startup owner")
-                if not identity_exit_proven(recorded.get("pid"), recorded.get("created_utc")):
-                    cleanup = subprocess.run([sys.executable, "-m", "harness_watcher_implementation",
-                                              "--config", str(config), "stop"], cwd=root,
-                                             capture_output=True, text=True, timeout=10)
+                self.assertIsInstance(
+                    recorded, dict, "preserve fixture with unproven startup owner"
+                )
+                if not identity_exit_proven(
+                    recorded.get("pid"), recorded.get("created_utc")
+                ):
+                    cleanup = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "harness_watcher_implementation",
+                            "--config",
+                            str(config),
+                            "stop",
+                        ],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
                     self.assertEqual(0, cleanup.returncode, cleanup.stderr)
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
-                        if identity_exit_proven(recorded["pid"], recorded["created_utc"]):
+                        if identity_exit_proven(
+                            recorded["pid"], recorded["created_utc"]
+                        ):
                             break
                         time.sleep(0.05)
-                self.assertTrue(identity_exit_proven(recorded["pid"], recorded["created_utc"]),
-                                "preserve fixture with unproven watcher exit")
+                self.assertTrue(
+                    identity_exit_proven(recorded["pid"], recorded["created_utc"]),
+                    "preserve fixture with unproven watcher exit",
+                )
             self.assertTrue(runtime.resolve().is_relative_to(fixture_root.resolve()))
             shutil.rmtree(runtime, ignore_errors=True)
             config.unlink(missing_ok=True)
@@ -398,9 +423,15 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
     ) -> None:
         config = self.root / "watcher.json"
         product = Path(__file__).resolve().parents[2]
-        runtime = product / "runtime" / "harness-watcher" / ("config-" + uuid.uuid4().hex)
-        base = {"runtime_root": str(runtime.relative_to(product)),
-                "observed_sources": [{"path": str(self.log_file), "role": "harness", "source_id": "native"}]}
+        runtime = (
+            product / "runtime" / "harness-watcher" / ("config-" + uuid.uuid4().hex)
+        )
+        base = {
+            "runtime_root": str(runtime.relative_to(product)),
+            "observed_sources": [
+                {"path": str(self.log_file), "role": "harness", "source_id": "native"}
+            ],
+        }
         config.write_text(json.dumps(base), encoding="utf-8")
         self.assertFalse(load_config(config).evaluator_enabled)
         self.assertFalse(runtime.exists())
@@ -418,8 +449,13 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
             load_config(config)
         self.assertFalse(runtime.exists())
         config.write_text(
-            json.dumps({**base, "evaluator_enabled": True,
-                        "evaluator_command": ["configured-provider", "--configured"]}),
+            json.dumps(
+                {
+                    **base,
+                    "evaluator_enabled": True,
+                    "evaluator_command": ["configured-provider", "--configured"],
+                }
+            ),
             encoding="utf-8",
         )
         with self.assertRaisesRegex(ValueError, "evaluator_identity is required"):
@@ -444,10 +480,16 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertTrue(loaded.evaluator_enabled)
         self.assertEqual(runtime, loaded.runtime_root)
         self.assertEqual((self.log_file,), loaded.observed_log_roots)
-        self.assertEqual(("configured-provider", "--configured"), loaded.evaluator_command)
+        self.assertEqual(
+            ("configured-provider", "--configured"), loaded.evaluator_command
+        )
         self.assertFalse(runtime.exists())
-        self.assertEqual('{"event":"progress"}\n', self.log_file.read_text(encoding="utf-8"))
-        self.assertEqual(True, json.loads(config.read_text(encoding="utf-8"))["evaluator_enabled"])
+        self.assertEqual(
+            '{"event":"progress"}\n', self.log_file.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            True, json.loads(config.read_text(encoding="utf-8"))["evaluator_enabled"]
+        )
         self.assertEqual(
             {
                 "provider": "configured-provider",
@@ -855,6 +897,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
         class Child:
             pid = watcher["pid"]
+
             def poll(self):
                 return None
 
@@ -877,9 +920,7 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
         with (
             patch.object(runner.os, "name", "nt"),
-            patch.object(
-                runner.subprocess, "CREATE_NO_WINDOW", no_window, create=True
-            ),
+            patch.object(runner.subprocess, "CREATE_NO_WINDOW", no_window, create=True),
             patch.object(
                 runner.subprocess, "CREATE_BREAKAWAY_FROM_JOB", breakaway, create=True
             ),

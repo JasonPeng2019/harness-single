@@ -62,10 +62,17 @@ def check_result(
         return False, str(exc), None
     try:
         assignment = _read_json(agent_workspace / "result-assignment.json")
-        if assignment.get("schema") != "worker-result-assignment/v1" or assignment.get("content_hash") != content_hash(assignment):
+        if assignment.get("schema") != "worker-result-assignment/v1" or assignment.get(
+            "content_hash"
+        ) != content_hash(assignment):
             raise ValueError("worker result assignment is missing or corrupt")
-        if binding.get("role") != "worker" or any(not binding.get(key) or binding[key] != assignment.get(key) for key in ("lane_id", "run_id")):
-            raise ValueError("worker result assignment differs from its current hook binding")
+        if binding.get("role") != "worker" or any(
+            not binding.get(key) or binding[key] != assignment.get(key)
+            for key in ("lane_id", "run_id")
+        ):
+            raise ValueError(
+                "worker result assignment differs from its current hook binding"
+            )
         worktree = agent_workspace.parent
         if Path(assignment["worktree_path"]) != worktree:
             raise ValueError("worker result assignment names a different worktree")
@@ -73,23 +80,32 @@ def check_result(
             raise ValueError("worker RESULT path differs from its assigned location")
         validation = agent_workspace / "validation-runtime"
         if not (validation / "orchestrator_harness/result_validation.py").is_file():
-            raise ValueError("staged canonical result validator is missing; prepare a fresh lane")
+            raise ValueError(
+                "staged canonical result validator is missing; prepare a fresh lane"
+            )
         # Providers may call this API in an interpreter that already imported
         # the installed harness. Load the staged package in its own namespace
         # rather than reusing or replacing that interpreter's operator modules.
         namespace = "worker_result_validation_" + uuid.uuid4().hex
         package = validation / "orchestrator_harness"
-        spec = importlib.util.spec_from_file_location(namespace, package / "__init__.py",
-                                                     submodule_search_locations=[str(package)])
+        spec = importlib.util.spec_from_file_location(
+            namespace,
+            package / "__init__.py",
+            submodule_search_locations=[str(package)],
+        )
         if spec is None or spec.loader is None:
             raise ValueError("staged result validator package is not importable")
         try:
             module = importlib.util.module_from_spec(spec)
             sys.modules[namespace] = module
             spec.loader.exec_module(module)
-            result_validation = importlib.import_module(namespace + ".result_validation")
+            result_validation = importlib.import_module(
+                namespace + ".result_validation"
+            )
             if not Path(result_validation.__file__).is_relative_to(validation):
-                raise ValueError("result validator was imported from a different runtime")
+                raise ValueError(
+                    "result validator was imported from a different runtime"
+                )
             return True, "result is valid", result_validation.read_result(assignment)
         finally:
             for name in list(sys.modules):

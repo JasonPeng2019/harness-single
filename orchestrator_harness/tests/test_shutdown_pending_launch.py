@@ -15,8 +15,11 @@ class ShutdownPendingLaunchTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.status = self.root / "controller.status.json"
         self.lane = {
-            "lane_id": "pending", "run_id": "fresh-resume",
-            "lifecycle": "running", "launch_pending": True, "process": {},
+            "lane_id": "pending",
+            "run_id": "fresh-resume",
+            "lifecycle": "running",
+            "launch_pending": True,
+            "process": {},
             "controller_status_path": str(self.status),
         }
 
@@ -54,8 +57,13 @@ class ShutdownPendingLaunchTests(unittest.TestCase):
         self.assertFalse(self.clean())
 
     def test_observed_live_controller_prevents_closure(self) -> None:
-        lane = {**self.lane, "process": {"pid": 42, "creation_time": "2026-10-11T06:00:00Z"}}
-        with patch.object(shutdown.processes, "identity_exit_proven", return_value=False):
+        lane = {
+            **self.lane,
+            "process": {"pid": 42, "creation_time": "2026-10-11T06:00:00Z"},
+        }
+        with patch.object(
+            shutdown.processes, "identity_exit_proven", return_value=False
+        ):
             self.assertFalse(shutdown._lane_clean(self.root, lane))
 
 

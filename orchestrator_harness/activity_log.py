@@ -49,12 +49,20 @@ def is_important_record(record: dict[str, Any]) -> bool:
     """Select events useful for following a run; the detailed log keeps everything."""
 
     event = str(record.get("event", ""))
-    if event in {"prompt.root_to_worker", "launch.worker.requested", "queue.manager.added"}:
+    if event in {
+        "prompt.root_to_worker",
+        "launch.worker.requested",
+        "queue.manager.added",
+    }:
         return True
     if event == "worker.lifecycle":
         return record.get("worker_event") in {
-            "provider_started", "provider_exited", "result_valid", "result_invalid",
-            "provider_exited_no_result", "acceptance_copied",
+            "provider_started",
+            "provider_exited",
+            "result_valid",
+            "result_invalid",
+            "provider_exited_no_result",
+            "acceptance_copied",
         }
     if event == "worker.native_event":
         native = record.get("native_event") or {}
@@ -63,7 +71,8 @@ def is_important_record(record: dict[str, Any]) -> bool:
         item = native.get("item") or {}
         return isinstance(item, dict) and item.get("type") in {"agent_message", "error"}
     return event.endswith(".failed") or event in {
-        "process.stop_request.completed", "process.stopped",
+        "process.stop_request.completed",
+        "process.stopped",
     }
 
 
@@ -82,14 +91,14 @@ def _redact(value: Any, *, key: str = "") -> Any:
     lowered = key.lower().replace("-", "_")
     if lowered and (
         lowered in _SENSITIVE_KEYS
-        or any(
-            lowered.endswith(f"_{marker}")
-            for marker in _SENSITIVE_KEYS
-        )
+        or any(lowered.endswith(f"_{marker}") for marker in _SENSITIVE_KEYS)
     ):
         return "[REDACTED]"
     if isinstance(value, dict):
-        return {str(item_key): _redact(item, key=str(item_key)) for item_key, item in value.items()}
+        return {
+            str(item_key): _redact(item, key=str(item_key))
+            for item_key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
     if isinstance(value, str):
@@ -198,9 +207,7 @@ def append_current_detail(
         from .config import find_harness_root, load_config
 
         config = load_config(find_harness_root())
-        return append_detail(
-            config.runtime_root, event, component=component, **details
-        )
+        return append_detail(config.runtime_root, event, component=component, **details)
     except Exception:
         # Detailed observability must never become execution authority.
         return None

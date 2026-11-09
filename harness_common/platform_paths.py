@@ -3,6 +3,7 @@
 findmnt's explicit JSON columns are the OS mount-table interface. Discovery
 failures are unknown state, never proof that a process or cgroup is absent.
 """
+
 from __future__ import annotations
 
 import json
@@ -18,25 +19,40 @@ def _mount_candidates(filesystem: str, configured: str | None) -> tuple[Path, ..
     executable = shutil.which("findmnt")
     if executable is None:
         raise RuntimeError("Linux mount discovery requires findmnt on PATH")
-    argv = [executable, "--json", "--list", "--types", filesystem, "--output", "TARGET,FSTYPE"]
+    argv = [
+        executable,
+        "--json",
+        "--list",
+        "--types",
+        filesystem,
+        "--output",
+        "TARGET,FSTYPE",
+    ]
     if configured:
         if not Path(configured).is_absolute():
             raise RuntimeError("configured kernel mount must be absolute")
         argv.extend(("--mountpoint", configured))
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=5, check=False
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"cannot discover {filesystem} mount") from exc
     if completed.returncode != 0:
-        raise RuntimeError(f"cannot discover {filesystem} mount: {completed.stderr.strip()}")
+        raise RuntimeError(
+            f"cannot discover {filesystem} mount: {completed.stderr.strip()}"
+        )
     try:
         records = json.loads(completed.stdout)["filesystems"]
-        if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) for record in records
+        ):
             raise ValueError("mount records must be a list of objects")
         roots = tuple(
             Path(record["target"])
             for record in records
-            if record["fstype"] == filesystem and isinstance(record["target"], str)
+            if record["fstype"] == filesystem
+            and isinstance(record["target"], str)
             and Path(record["target"]).is_absolute()
             and (not configured or Path(record["target"]) == Path(configured))
         )
@@ -59,7 +75,9 @@ def procfs_root() -> Path:
         except (OSError, ValueError):
             continue
     if len(valid) != 1:
-        raise RuntimeError("process filesystem is unavailable or ambiguous; configure HARNESS_PROCFS_ROOT")
+        raise RuntimeError(
+            "process filesystem is unavailable or ambiguous; configure HARNESS_PROCFS_ROOT"
+        )
     return valid[0]
 
 
@@ -67,5 +85,7 @@ def cgroup_root() -> Path:
     roots = _mount_candidates("cgroup2", os.environ.get("HARNESS_CGROUP_ROOT"))
     valid = [root for root in roots if (root / "cgroup.controllers").is_file()]
     if len(valid) != 1:
-        raise RuntimeError("cgroup-v2 mount is unavailable or ambiguous; configure HARNESS_CGROUP_ROOT")
+        raise RuntimeError(
+            "cgroup-v2 mount is unavailable or ambiguous; configure HARNESS_CGROUP_ROOT"
+        )
     return valid[0]

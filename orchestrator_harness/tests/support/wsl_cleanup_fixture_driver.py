@@ -16,7 +16,9 @@ def main() -> int:
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
     cgroup = cgroup_root() / f"orchestrator-harness-{args.run_id}"
-    temporary = Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    temporary = (
+        Path(tempfile.gettempdir()) / f"orchestrator-harness-real-agent-{args.run_id}"
+    )
     cgroup.mkdir()
     (cgroup / "pids.max").write_text("8\n", encoding="ascii")
     temporary.mkdir()

@@ -17,7 +17,9 @@ class CheckU1Tests(unittest.TestCase):
         self.assertEqual("epoch-1", runtime.epoch_id)
         self.assertEqual("prepared", runtime.lanes["layout"]["lifecycle"])
 
-    def test_shipped_source_has_the_normative_v2_setup_inputs_and_adapter_roots(self) -> None:
+    def test_shipped_source_has_the_normative_v2_setup_inputs_and_adapter_roots(
+        self,
+    ) -> None:
         """This is a source-layout acceptance check, not a candidate API import."""
         root = Path(__file__).resolve().parents[3]
         required = (
@@ -28,9 +30,13 @@ class CheckU1Tests(unittest.TestCase):
             "orchestrator_harness/provider_adapters",
         )
         missing = [relative for relative in required if not (root / relative).exists()]
-        self.assertEqual([], missing, f"normative v2 shipped layout is missing: {missing}")
+        self.assertEqual(
+            [], missing, f"normative v2 shipped layout is missing: {missing}"
+        )
 
-    def test_setup_configuration_is_an_epoch_boundary_not_a_per_lane_override(self) -> None:
+    def test_setup_configuration_is_an_epoch_boundary_not_a_per_lane_override(
+        self,
+    ) -> None:
         managed = ReferenceRuntime(mode="managed", epoch_id="epoch-managed")
         plain = ReferenceRuntime(mode="plain", epoch_id="epoch-plain")
         self.assertNotEqual(managed.epoch_id, plain.epoch_id)

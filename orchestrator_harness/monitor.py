@@ -35,7 +35,13 @@ from .epochs import (
     read_current_epoch,
     read_epoch_state,
 )
-from .lanes import LANE_SCHEMA, read_lane, update_lane, lane_operation_lock, require_same_run
+from .lanes import (
+    LANE_SCHEMA,
+    read_lane,
+    update_lane,
+    lane_operation_lock,
+    require_same_run,
+)
 from .manager_queue import ManagerQueueError, promote_event, read_manager_queue
 from .records import RecordLock, atomic_write_json, atomic_write_bytes, read_record
 from .records import runtime_admission_lock
@@ -43,7 +49,12 @@ from .mutation import TargetState, MutationConflict, delete as anchored_delete
 from .stable_io import PreparedOutputTransaction
 from .portable_paths import component as portable_component
 from .review import validate_acceptance_chain
-from .setup import MONITOR_SCHEMA, monitor_record_path, read_monitor_record, read_runtime_state
+from .setup import (
+    MONITOR_SCHEMA,
+    monitor_record_path,
+    read_monitor_record,
+    read_runtime_state,
+)
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 LEASE_SCHEMA = "resource-lease/v1"
@@ -112,6 +123,7 @@ def _read_acceptance_chain(
 
 def _lease_files(rt: Path) -> list[dict[str, Any]]:
     from .leases import lease_records
+
     return [record for _path, record in lease_records(rt)]
 
 
@@ -131,6 +143,7 @@ def _orphaned_lease_for(rt: Path, lane: dict[str, Any]) -> bool:
 def _retained_lanes(rt: Path, epoch_id: str) -> dict[str, dict[str, Any]]:
     """Read retained lane records, including retired records omitted from the index."""
     from .lanes import retained_lanes
+
     return retained_lanes(rt, epoch_id)
 
 
@@ -180,6 +193,7 @@ def _valid_current_result(lane: dict[str, Any]) -> bool:
     try:
         from .lane_authority import read_invocation
         from .result_validation import read_result
+
         read_invocation(lane)
         read_result(lane)
         return True
@@ -187,9 +201,7 @@ def _valid_current_result(lane: dict[str, Any]) -> bool:
         return False
 
 
-def _review_pair_is_valid(
-    rt: Path, epoch_id: str, lane: dict[str, Any]
-) -> bool:
+def _review_pair_is_valid(rt: Path, epoch_id: str, lane: dict[str, Any]) -> bool:
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
@@ -202,23 +214,27 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    if not validate_acceptance_chain(review, acceptance, lane_id=lane["lane_id"], run_id=lane.get("run_id")):
+    if not validate_acceptance_chain(
+        review, acceptance, lane_id=lane["lane_id"], run_id=lane.get("run_id")
+    ):
         return False
     try:
         from .lane_authority import read_invocation
         from .result_validation import read_result
+
         read_invocation(lane)
         result = read_result(lane, clean=acceptance["approval"] == "ACCEPTED")
-        return (review["source_assignment_hash"] == lane["result_assignment_hash"]
-                and review["task_card_hash"] == lane["task_card_hash"]
-                and review["result_hash"] == result["content_hash"] and review["commit"] == result["commit"])
+        return (
+            review["source_assignment_hash"] == lane["result_assignment_hash"]
+            and review["task_card_hash"] == lane["task_card_hash"]
+            and review["result_hash"] == result["content_hash"]
+            and review["commit"] == result["commit"]
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
 
-def _recover_broken_review_pair(
-    rt: Path, epoch_id: str, lane: dict[str, Any]
-) -> bool:
+def _recover_broken_review_pair(rt: Path, epoch_id: str, lane: dict[str, Any]) -> bool:
     """Preserve broken ROOT decisions and expose an actionable diagnostic."""
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
     review_path = folder / "COMPLETION_REVIEW.json"
@@ -228,7 +244,9 @@ def _recover_broken_review_pair(
             return False
         if _review_pair_is_valid(rt, epoch_id, lane):
             return False
-        raise ValueError("ROOT review/acceptance pair is invalid or incomplete; preserve it for explicit ROOT reconciliation")
+        raise ValueError(
+            "ROOT review/acceptance pair is invalid or incomplete; preserve it for explicit ROOT reconciliation"
+        )
 
 
 def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
@@ -323,7 +341,9 @@ def _recover_lost_review_event(
     return [event]
 
 
-def _transcript_contradicts(lane: dict[str, Any], status: dict[str, Any] | None) -> bool:
+def _transcript_contradicts(
+    lane: dict[str, Any], status: dict[str, Any] | None
+) -> bool:
     """Recorded status vs the provider transcript's terminal state.
 
     The controller records the provider's exit code in its status snapshot;
@@ -362,8 +382,7 @@ def derive_lane_status(
         return None
     if orphaned_leases is not None:
         has_orphan = any(
-            lease.get("lane_id") == lane.get("lane_id")
-            for lease in orphaned_leases
+            lease.get("lane_id") == lane.get("lane_id") for lease in orphaned_leases
         )
     else:
         leases = lease_records if lease_records is not None else _lease_files(rt)
@@ -418,6 +437,7 @@ def derive_lane_status(
 
 def reconcile_active_lanes(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
     from .lanes import reconcile_active_lanes as reconcile
+
     return reconcile(rt, epoch_id)
 
 
@@ -443,16 +463,23 @@ def _consume_outbox(
             current = read_lane(rt, epoch_id, lane["lane_id"])
             require_same_run(current, lane)
             portable_component(lane["run_id"])
-            output = PreparedOutputTransaction(worktree, allowed_roots=(worktree.parent,))
+            output = PreparedOutputTransaction(
+                worktree, allowed_roots=(worktree.parent,)
+            )
             output.prepare()
-            if "worktree_identity" in current and tuple(current["worktree_identity"]) != output.root_identity:
+            if (
+                "worktree_identity" in current
+                and tuple(current["worktree_identity"]) != output.root_identity
+            ):
                 raise ValueError("notice worktree changed after preparation")
             output.revalidate(outbox)
             if not outbox.exists():
                 return diagnostics
             paths = sorted(outbox.iterdir())
         except Exception as exc:
-            return [{"kind": "outbox_inspection", "path": str(outbox), "error": str(exc)}]
+            return [
+                {"kind": "outbox_inspection", "path": str(outbox), "error": str(exc)}
+            ]
         for path in paths:
             if path.suffix != ".json":
                 continue
@@ -460,56 +487,123 @@ def _consume_outbox(
             try:
                 raw = output.read_bytes(path, max_bytes=65536)
                 notice = json.loads(raw)
-                if (not isinstance(notice, dict) or notice.get("schema") != "manager-notice/v1"
-                        or notice.get("lane_id") != lane["lane_id"]
-                        or notice.get("run_id") != lane["run_id"]
-                        or notice.get("severity") not in {"blocking", "error", "warning", "info"}
-                        or any(not isinstance(notice.get(field), str) or not notice[field].strip()
-                               for field in ("notice_id", "signal_id", "summary", "event_class", "created_at"))):
-                    raise ValueError("notice schema, current lane/run identity or required fields are invalid")
+                if (
+                    not isinstance(notice, dict)
+                    or notice.get("schema") != "manager-notice/v1"
+                    or notice.get("lane_id") != lane["lane_id"]
+                    or notice.get("run_id") != lane["run_id"]
+                    or notice.get("severity")
+                    not in {"blocking", "error", "warning", "info"}
+                    or any(
+                        not isinstance(notice.get(field), str)
+                        or not notice[field].strip()
+                        for field in (
+                            "notice_id",
+                            "signal_id",
+                            "summary",
+                            "event_class",
+                            "created_at",
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "notice schema, current lane/run identity or required fields are invalid"
+                    )
                 metadata = path.lstat()
                 digest = hashlib.sha256(raw).hexdigest()
-                source = TargetState(True, "file", (metadata.st_dev, metadata.st_ino), digest, len(raw), raw)
+                source = TargetState(
+                    True,
+                    "file",
+                    (metadata.st_dev, metadata.st_ino),
+                    digest,
+                    len(raw),
+                    raw,
+                )
                 archived = output.admit(processed / path.name)
                 output.ensure_parent(archived)
                 dedup = f"worker-notice:{lane['lane_id']}:{lane['run_id']}:{notice['signal_id']}"
                 for existing in read_manager_queue(rt)["events"]:
-                    if existing.get("dedup_key") == dedup and existing.get("data", {}).get("notice_sha256") != digest:
-                        raise ValueError("notice identity was reused with different bytes")
+                    if (
+                        existing.get("dedup_key") == dedup
+                        and existing.get("data", {}).get("notice_sha256") != digest
+                    ):
+                        raise ValueError(
+                            "notice identity was reused with different bytes"
+                        )
                 require_same_run(read_lane(rt, epoch_id, lane["lane_id"]), lane)
                 phase = "outbox_promotion"
                 event = promote_event(
-                    rt, event_type="LANE_STATUS_CHANGED", lane_id=lane["lane_id"], run_id=lane["run_id"],
-                    summary=notice["summary"], actionable_status="worker_escalation",
-                    event_class=notice["event_class"], severity=notice["severity"],
-                    data={"signal_id": notice["signal_id"], "notice_id": notice["notice_id"],
-                          "lane_id": lane["lane_id"], "run_id": lane["run_id"], "notice_sha256": digest},
+                    rt,
+                    event_type="LANE_STATUS_CHANGED",
+                    lane_id=lane["lane_id"],
+                    run_id=lane["run_id"],
+                    summary=notice["summary"],
+                    actionable_status="worker_escalation",
+                    event_class=notice["event_class"],
+                    severity=notice["severity"],
+                    data={
+                        "signal_id": notice["signal_id"],
+                        "notice_id": notice["notice_id"],
+                        "lane_id": lane["lane_id"],
+                        "run_id": lane["run_id"],
+                        "notice_sha256": digest,
+                    },
                     dedup_key=dedup,
                 )
-                append_activity(rt, "outbox.item.promoted", epoch_id=epoch_id,
-                                lane_id=lane["lane_id"], signal_id=notice["signal_id"], event_id=event.get("event_id"))
+                append_activity(
+                    rt,
+                    "outbox.item.promoted",
+                    epoch_id=epoch_id,
+                    lane_id=lane["lane_id"],
+                    signal_id=notice["signal_id"],
+                    event_id=event.get("event_id"),
+                )
                 phase = "outbox_archive"
-                retained = lane_record_dir(rt, epoch_id, lane["lane_id"]) / "notice-archive" / lane["run_id"] / f"{digest}.json"
+                retained = (
+                    lane_record_dir(rt, epoch_id, lane["lane_id"])
+                    / "notice-archive"
+                    / lane["run_id"]
+                    / f"{digest}.json"
+                )
                 if retained.exists():
                     if retained.read_bytes() != raw:
-                        raise ValueError("protected notice archive conflicts with the original bytes")
+                        raise ValueError(
+                            "protected notice archive conflicts with the original bytes"
+                        )
                 else:
                     atomic_write_bytes(retained, raw)
                 if archived.exists():
                     if output.read_bytes(archived, max_bytes=65536) != raw:
-                        raise ValueError("processed notice filename already contains different bytes")
+                        raise ValueError(
+                            "processed notice filename already contains different bytes"
+                        )
                 else:
                     output.write_bytes(archived, raw)
                 # Never delete a replacement notice or follow a changed parent.
                 output.revalidate(path)
-                if output.root_identity != (worktree.stat().st_dev, worktree.stat().st_ino):
+                if output.root_identity != (
+                    worktree.stat().st_dev,
+                    worktree.stat().st_ino,
+                ):
                     raise MutationConflict("notice root changed before source removal")
-                anchored_delete(worktree, path.relative_to(worktree), expected=source,
-                                expected_root_identity=output.root_identity)
-                append_activity(rt, "outbox.item.archived", epoch_id=epoch_id,
-                                lane_id=lane["lane_id"], path=str(archived), retained_path=str(retained))
+                anchored_delete(
+                    worktree,
+                    path.relative_to(worktree),
+                    expected=source,
+                    expected_root_identity=output.root_identity,
+                )
+                append_activity(
+                    rt,
+                    "outbox.item.archived",
+                    epoch_id=epoch_id,
+                    lane_id=lane["lane_id"],
+                    path=str(archived),
+                    retained_path=str(retained),
+                )
             except Exception as exc:
-                diagnostics.append({"kind": phase, "path": str(path), "error": str(exc)})
+                diagnostics.append(
+                    {"kind": phase, "path": str(path), "error": str(exc)}
+                )
     return diagnostics
 
 
@@ -545,14 +639,21 @@ def _promote_status(rt: Path, epoch_id: str, lane: dict[str, Any], status: str) 
         dedup_key=f"lane-status:{lane['lane_id']}:{lane.get('run_id', '')}:{status}",
     )
     append_activity(
-        rt, "lane.status.promoted", epoch_id=epoch_id,
-        lane_id=lane["lane_id"], run_id=lane.get("run_id", ""),
-        status=status, event_id=event.get("event_id"),
+        rt,
+        "lane.status.promoted",
+        epoch_id=epoch_id,
+        lane_id=lane["lane_id"],
+        run_id=lane.get("run_id", ""),
+        status=status,
+        event_id=event.get("event_id"),
     )
 
 
 def _monitor_owner(record: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(record.get(field) for field in ("pid", "creation_time", "config_identity", "startup_id"))
+    return tuple(
+        record.get(field)
+        for field in ("pid", "creation_time", "config_identity", "startup_id")
+    )
 
 
 def _require_monitor_owner(rt: Path, owner: tuple[Any, ...]) -> dict[str, Any]:
@@ -563,7 +664,10 @@ def _require_monitor_owner(rt: Path, owner: tuple[Any, ...]) -> dict[str, Any]:
 
 
 def _monitor_pass(
-    rt: Path, config_identity: str, *, monitor_owner: tuple[Any, ...] | None = None,
+    rt: Path,
+    config_identity: str,
+    *,
+    monitor_owner: tuple[Any, ...] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     with runtime_admission_lock(rt):
         if monitor_owner is not None:
@@ -590,7 +694,9 @@ def _monitor_pass(
             return 0, [{"kind": "epoch_inspection", "error": str(exc)}]
         if state.get("lifecycle") != "active":
             append_activity(
-                rt, "epoch.inactive", epoch_id=epoch_id,
+                rt,
+                "epoch.inactive",
+                epoch_id=epoch_id,
                 lifecycle=state.get("lifecycle"),
             )
             return 0, diagnostics
@@ -599,8 +705,12 @@ def _monitor_pass(
         retained = _retained_lanes(rt, epoch_id)
         orphaned = _discover_orphaned_leases(rt, epoch_id, retained)
         append_activity(
-            rt, "epoch.scanned", epoch_id=epoch_id, managed=managed,
-            active_lanes=len(lanes), retained_lanes=len(retained),
+            rt,
+            "epoch.scanned",
+            epoch_id=epoch_id,
+            managed=managed,
+            active_lanes=len(lanes),
+            retained_lanes=len(retained),
             orphaned_leases=len(orphaned),
         )
         for entry in lanes:
@@ -631,8 +741,12 @@ def _monitor_pass(
                 orphaned_leases=orphaned,
             )
             append_activity(
-                rt, "lane.scanned", epoch_id=epoch_id, lane_id=lane_id,
-                run_id=lane.get("run_id", ""), lifecycle=lane.get("lifecycle"),
+                rt,
+                "lane.scanned",
+                epoch_id=epoch_id,
+                lane_id=lane_id,
+                run_id=lane.get("run_id", ""),
+                lifecycle=lane.get("lifecycle"),
                 controller_status=(status or {}).get("recorded_status"),
                 derived_status=derived,
             )
@@ -651,14 +765,21 @@ def _monitor_pass(
                     _promote_status(rt, epoch_id, lane, derived)
                 except Exception as exc:
                     diagnostics.append(
-                        {"kind": "status_promotion", "lane_id": lane_id, "error": str(exc)}
+                        {
+                            "kind": "status_promotion",
+                            "lane_id": lane_id,
+                            "error": str(exc),
+                        }
                     )
                     continue
             update_lane(
                 rt,
                 epoch_id,
                 lane_id,
-                lambda current, value=derived: {**current, "last_reported_actionable_status": value},
+                lambda current, value=derived: {
+                    **current,
+                    "last_reported_actionable_status": value,
+                },
             )
         if managed:
             for lease in orphaned:
@@ -677,8 +798,11 @@ def _monitor_pass(
                         dedup_key=f"orphan-lease:{resource_id}",
                     )
                     append_activity(
-                        rt, "lease.orphan.promoted", epoch_id=epoch_id,
-                        resource_id=resource_id, lane_id=lease.get("lane_id"),
+                        rt,
+                        "lease.orphan.promoted",
+                        epoch_id=epoch_id,
+                        resource_id=resource_id,
+                        lane_id=lease.get("lane_id"),
                     )
                 except Exception as exc:
                     diagnostics.append(
@@ -696,7 +820,8 @@ def _heartbeat(
     config_identity: str,
     watched_lane_count: int = 0,
     diagnostics: list[dict[str, Any]] | None = None,
-    *, monitor_owner: tuple[Any, ...] | None = None,
+    *,
+    monitor_owner: tuple[Any, ...] | None = None,
 ) -> None:
     record_path = monitor_record_path(rt)
     with runtime_admission_lock(rt), RecordLock(record_path):
@@ -713,8 +838,12 @@ def _heartbeat(
         if monitor_owner is None:
             identity = processes.process_identity(os.getpid())
             if identity is None or (record.get("pid"), record.get("creation_time")) != (
-                    identity["pid"], identity["creation_time"]):
-                append_activity(rt, "heartbeat.skipped", reason="process_identity_mismatch")
+                identity["pid"],
+                identity["creation_time"],
+            ):
+                append_activity(
+                    rt, "heartbeat.skipped", reason="process_identity_mismatch"
+                )
                 return
         elif _monitor_owner(record) != monitor_owner:
             append_activity(rt, "heartbeat.skipped", reason="owner_mismatch")
@@ -731,22 +860,39 @@ def _heartbeat(
             record["ready_at"] = record["last_heartbeat_at"]
         atomic_write_json(record_path, record)
     append_activity(
-        rt, "heartbeat.written", health=record["health"],
+        rt,
+        "heartbeat.written",
+        health=record["health"],
         watched_lane_count=watched_lane_count,
         diagnostic_count=len(record["diagnostics"]),
     )
 
 
-def run_monitor_once(rt: Path, config_identity: str, *, monitor_owner: tuple[Any, ...] | None = None) -> None:
+def run_monitor_once(
+    rt: Path, config_identity: str, *, monitor_owner: tuple[Any, ...] | None = None
+) -> None:
     append_activity(rt, "pass.started", config_identity=config_identity)
     try:
-        watched_lane_count, diagnostics = _monitor_pass(rt, config_identity, monitor_owner=monitor_owner)
+        watched_lane_count, diagnostics = _monitor_pass(
+            rt, config_identity, monitor_owner=monitor_owner
+        )
     except Exception as exc:
-        watched_lane_count, diagnostics = 0, [{"kind": "monitor_pass", "error": str(exc)}]
+        watched_lane_count, diagnostics = (
+            0,
+            [{"kind": "monitor_pass", "error": str(exc)}],
+        )
         append_activity(rt, "pass.failed", error_type=type(exc).__name__)
-    _heartbeat(rt, config_identity, watched_lane_count, diagnostics, monitor_owner=monitor_owner)
+    _heartbeat(
+        rt,
+        config_identity,
+        watched_lane_count,
+        diagnostics,
+        monitor_owner=monitor_owner,
+    )
     append_activity(
-        rt, "pass.completed", watched_lane_count=watched_lane_count,
+        rt,
+        "pass.completed",
+        watched_lane_count=watched_lane_count,
         diagnostic_count=len(diagnostics),
     )
 
@@ -759,7 +905,11 @@ def main() -> int:
         manifest = load_resource_manifest(harness_root)
         config_identity = compute_config_identity(config, manifest)
     except Exception as exc:
-        print(f"monitor configuration initialization failed: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"monitor configuration initialization failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
     rt = config.runtime_root
     identity = processes.process_identity(os.getpid())
@@ -767,15 +917,20 @@ def main() -> int:
         return 1
     with runtime_admission_lock(rt):
         record = read_monitor_record(rt)
-        if (record is None or not os.environ.get("HARNESS_MONITOR_STARTUP_ID")
-                or record.get("startup_id") != os.environ["HARNESS_MONITOR_STARTUP_ID"]
-                or record.get("config_identity") != config_identity
-                or (record.get("pid"), record.get("creation_time")) != (
-                    identity["pid"], identity["creation_time"])):
+        if (
+            record is None
+            or not os.environ.get("HARNESS_MONITOR_STARTUP_ID")
+            or record.get("startup_id") != os.environ["HARNESS_MONITOR_STARTUP_ID"]
+            or record.get("config_identity") != config_identity
+            or (record.get("pid"), record.get("creation_time"))
+            != (identity["pid"], identity["creation_time"])
+        ):
             return 1
         owner = _monitor_owner(record)
     append_activity(
-        rt, "process.started", config_identity=config_identity,
+        rt,
+        "process.started",
+        config_identity=config_identity,
         pass_interval_seconds=PASS_INTERVAL_SECONDS,
     )
     next_pass = time.monotonic()
@@ -785,7 +940,11 @@ def main() -> int:
         except (OSError, ValueError):
             return 1
         state = read_runtime_state(rt)
-        if record.get("stop_requested", False) or not state or state.get("state") != "OPEN":
+        if (
+            record.get("stop_requested", False)
+            or not state
+            or state.get("state") != "OPEN"
+        ):
             append_activity(rt, "process.stop_requested")
             record_path = monitor_record_path(rt)
             with runtime_admission_lock(rt), RecordLock(record_path):
@@ -801,7 +960,9 @@ def main() -> int:
             try:
                 run_monitor_once(rt, config_identity, monitor_owner=owner)
             except Exception as exc:
-                append_activity(rt, "process.loop.failed", error_type=type(exc).__name__)
+                append_activity(
+                    rt, "process.loop.failed", error_type=type(exc).__name__
+                )
             next_pass = time.monotonic() + PASS_INTERVAL_SECONDS
         # Retain the configured scan cadence while observing cooperative stop
         # promptly; sleeping a whole scan interval delays exact shutdown proof.

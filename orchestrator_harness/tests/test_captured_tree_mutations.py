@@ -1,4 +1,5 @@
 """Actual filesystem interleavings for validated captured-tree removal."""
+
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -36,11 +37,20 @@ class CapturedTreeMutationTests(unittest.TestCase):
         sentinel = self.root / "sentinel"
         sentinel.write_bytes(b"unselected")
         captured = self.capture()
-        self.assertEqual({Path("tree"), Path("tree/nested"), Path("tree/a-first"), Path("tree/nested/z-last")},
-                         {path for path, state in captured.entries})
+        self.assertEqual(
+            {
+                Path("tree"),
+                Path("tree/nested"),
+                Path("tree/a-first"),
+                Path("tree/nested/z-last"),
+            },
+            {path for path, state in captured.entries},
+        )
         state = dict(captured.entries)[Path("tree/a-first")]
         self.assertEqual(b"original first", state.content)
-        self.assertEqual(hashlib.sha256(state.content).hexdigest(), state.content_sha256)
+        self.assertEqual(
+            hashlib.sha256(state.content).hexdigest(), state.content_sha256
+        )
         mutation.remove_tree(self.root, "tree", captured=captured)
         self.assertFalse(self.tree.exists())
         self.assertEqual(b"unselected", sentinel.read_bytes())
@@ -114,34 +124,53 @@ class CapturedTreeMutationTests(unittest.TestCase):
 
     def test_incomplete_census_cannot_delete_uncaptured_entries(self):
         captured = self.capture()
-        incomplete = replace(captured, entries=tuple((path, state) for path, state in captured.entries
-                                                    if path != Path("tree/nested/z-last")))
+        incomplete = replace(
+            captured,
+            entries=tuple(
+                (path, state)
+                for path, state in captured.entries
+                if path != Path("tree/nested/z-last")
+            ),
+        )
         with self.assertRaises(mutation.MutationConflict):
             mutation.remove_tree(self.root, "tree", captured=incomplete)
         self.assert_original_retained()
 
-    def test_late_addition_after_deletion_reports_partial_cleanup_and_preserves_foreign_file(self):
+    def test_late_addition_after_deletion_reports_partial_cleanup_and_preserves_foreign_file(
+        self,
+    ):
         captured = self.capture()
         foreign = self.tree / "new-owner"
         if os.name == "nt":
             real_delete = mutation._windows_delete_existing
+
             def delete(path, state):
                 real_delete(path, state)
                 foreign.write_bytes(b"foreign during cleanup")
-            operation = patch.object(mutation, "_windows_delete_existing", side_effect=delete)
+
+            operation = patch.object(
+                mutation, "_windows_delete_existing", side_effect=delete
+            )
         else:
             real_delete = mutation.os.unlink
+
             def delete(path, *, dir_fd=None):
                 real_delete(path, dir_fd=dir_fd)
                 foreign.write_bytes(b"foreign during cleanup")
+
             operation = patch.object(mutation.os, "unlink", new=delete)
         with ExitStack() as interleaving:
             interleaving.enter_context(operation)
             if os.name != "nt":
                 # The wrapper delegates the real dir_fd unlink; retain that
                 # capability declaration for the primitive's native host gate.
-                interleaving.enter_context(patch.object(
-                    mutation.os, "supports_dir_fd", mutation.os.supports_dir_fd | {delete}))
+                interleaving.enter_context(
+                    patch.object(
+                        mutation.os,
+                        "supports_dir_fd",
+                        mutation.os.supports_dir_fd | {delete},
+                    )
+                )
             with self.assertRaises(OSError):
                 mutation.remove_tree(self.root, "tree", captured=captured)
         self.assertTrue(self.tree.exists())
@@ -152,17 +181,23 @@ class CapturedTreeMutationTests(unittest.TestCase):
         manifest = setup._manifest_for_tree(self.tree)
         real_check = setup._check_owned_tree
         retained = self.root / "retained-tree"
+
         def validate_then_substitute(*args, **kwargs):
             result = real_check(*args, **kwargs)
             self.tree.rename(retained)
             self.tree.mkdir()
             (self.tree / "foreign").write_bytes(b"foreign after validation")
             return result
-        with patch.object(setup, "_check_owned_tree", side_effect=validate_then_substitute):
+
+        with patch.object(
+            setup, "_check_owned_tree", side_effect=validate_then_substitute
+        ):
             with self.assertRaises(mutation.MutationConflict):
                 setup._remove_owned_tree(self.tree, manifest, verify_bytes=True)
         self.assertEqual(b"original first", (retained / "a-first").read_bytes())
-        self.assertEqual(b"foreign after validation", (self.tree / "foreign").read_bytes())
+        self.assertEqual(
+            b"foreign after validation", (self.tree / "foreign").read_bytes()
+        )
 
     def test_setup_partial_owned_tree_can_complete_verified_cleanup(self):
         manifest = setup._manifest_for_tree(self.tree)
@@ -176,16 +211,20 @@ class CapturedTreeMutationTests(unittest.TestCase):
         (staging / "new").write_bytes(b"promoted")
         old = setup._manifest_for_tree(self.tree)
         retained = self.root / "retained-backup"
+
         def validate_backup(path):
             setup._check_owned_tree(path, old, verify_bytes=True)
             path.rename(retained)
             path.mkdir()
             (path / "foreign").write_bytes(b"foreign backup")
+
         with self.assertRaises(mutation.MutationConflict):
             setup._replace_tree(staging, self.tree, validate_backup=validate_backup)
         self.assertEqual(b"promoted", (self.tree / "new").read_bytes())
         self.assertEqual(b"original first", (retained / "a-first").read_bytes())
-        self.assertEqual(b"foreign backup", (self.root / "tree.old/foreign").read_bytes())
+        self.assertEqual(
+            b"foreign backup", (self.root / "tree.old/foreign").read_bytes()
+        )
 
 
 if __name__ == "__main__":

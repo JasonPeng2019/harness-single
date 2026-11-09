@@ -22,7 +22,14 @@ from .activity_log import append_current_detail, append_detail
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir, read_current_epoch
-from .lanes import LaneError, find_active_lane, lane_operation_lock, read_lane, require_same_run, update_lane
+from .lanes import (
+    LaneError,
+    find_active_lane,
+    lane_operation_lock,
+    read_lane,
+    require_same_run,
+    update_lane,
+)
 from .leases import acquire_leases, release_leases
 from .provider_adapters import has_native_counter, usage_observation
 from .records import (
@@ -34,9 +41,20 @@ from .records import (
 )
 from .records import runtime_admission_lock
 from .review import validate_acceptance_chain
-from .retry_policy import MAX_LANE_PROVIDER_INVOCATIONS, completed_provider_invocations, reserve_invocation, record_started, record_outcome
+from .retry_policy import (
+    MAX_LANE_PROVIDER_INVOCATIONS,
+    completed_provider_invocations,
+    reserve_invocation,
+    record_started,
+    record_outcome,
+)
 from .setup import read_runtime_state
-from .windows_sandbox_preflight import BLOCK, require_not_blocked, require_ready, startup_failure
+from .windows_sandbox_preflight import (
+    BLOCK,
+    require_not_blocked,
+    require_ready,
+    startup_failure,
+)
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 CONTROLLER_EVENTS_SCHEMA = "controller-events/v1"
@@ -121,7 +139,10 @@ def _write_status(lane: dict[str, Any], fields: dict[str, Any]) -> None:
             ):
                 record.update(existing)
             else:
-                raise ControllerError(LAUNCH_CONTROLLER_START_FAILED, "controller status belongs to a different run")
+                raise ControllerError(
+                    LAUNCH_CONTROLLER_START_FAILED,
+                    "controller status belongs to a different run",
+                )
         record.update(fields)
         record["updated_at"] = iso_utc()
         atomic_write_json(path, record)
@@ -130,7 +151,12 @@ def _write_status(lane: dict[str, Any], fields: dict[str, Any]) -> None:
 def _append_event(lane: dict[str, Any], event_type: str, detail: str) -> None:
     append_jsonl(
         Path(lane["controller_events_path"]),
-        {"ts": iso_utc(), "run_id": lane["run_id"], "event_type": event_type, "detail": detail},
+        {
+            "ts": iso_utc(),
+            "run_id": lane["run_id"],
+            "event_type": event_type,
+            "detail": detail,
+        },
         header={"schema": CONTROLLER_EVENTS_SCHEMA},
     )
     append_current_detail(
@@ -176,6 +202,7 @@ def _validate_result(lane: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
     try:
         from .lane_authority import read_invocation
         from .result_validation import read_result
+
         read_invocation(lane)
         return "valid", read_result(lane)
     except (OSError, ValueError, KeyError, TypeError):
@@ -184,12 +211,13 @@ def _validate_result(lane: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
 
 def _attempt_paths(lane: dict[str, Any], attempt_number: int) -> dict[str, Path]:
     """Return isolated transcript/evidence paths for one provider attempt."""
-    workspace = Path(lane.get("control_dir") or Path(lane["worktree_path"]) / ".agent-workspace")
+    workspace = Path(
+        lane.get("control_dir") or Path(lane["worktree_path"]) / ".agent-workspace"
+    )
     if attempt_number == 1:
         return {
             "transcript": Path(
-                lane.get("transcript_path")
-                or workspace / "provider-transcript.jsonl"
+                lane.get("transcript_path") or workspace / "provider-transcript.jsonl"
             ),
             "stderr": Path(
                 lane.get("stderr_path") or workspace / "provider-stderr.txt"
@@ -271,8 +299,11 @@ def _append_attempt(
                         )
                     try:
                         receipt = (
-                            usage_observation(native_event, lane.get("provider", {}).get("id", ""))
-                            if isinstance(native_event, dict) else None
+                            usage_observation(
+                                native_event, lane.get("provider", {}).get("id", "")
+                            )
+                            if isinstance(native_event, dict)
+                            else None
                         )
                     except Exception as exc:
                         receipt = None
@@ -281,18 +312,22 @@ def _append_attempt(
                             f"{type(exc).__name__}"
                         )
                     if receipt is not None:
-                        observations.append({
-                            "line_number": line_number,
-                            "byte_offset": byte_offset,
-                            **receipt,
-                        })
+                        observations.append(
+                            {
+                                "line_number": line_number,
+                                "byte_offset": byte_offset,
+                                **receipt,
+                            }
+                        )
                     byte_offset += len(raw_line)
         except OSError as exc:
             capture_error = f"transcript read failed: {exc}"
     append_jsonl(
         Path(
             lane.get("attempts_path")
-            or Path(lane["worktree_path"]) / ".agent-workspace" / "controller.attempts.jsonl"
+            or Path(lane["worktree_path"])
+            / ".agent-workspace"
+            / "controller.attempts.jsonl"
         ),
         {
             "lane_id": lane["lane_id"],
@@ -306,7 +341,9 @@ def _append_attempt(
             "transcript_start_byte": transcript_start_byte,
             "transcript_end_byte": transcript_end_byte,
             "stderr_path": str(paths["stderr"]),
-            "provider_started": bool(argv) if provider_started is None else provider_started,
+            "provider_started": bool(argv)
+            if provider_started is None
+            else provider_started,
             "exit_code": exit_code,
             "result_state": result_state,
             "validation_error": validation_error,
@@ -317,7 +354,7 @@ def _append_attempt(
             ),
             "native_usage_observations": observations,
             "native_usage_capture_error": capture_error,
-                "cleanup_proven": cleanup_proven,
+            "cleanup_proven": cleanup_proven,
             "at": iso_utc(),
         },
         header={"schema": "controller-attempts/v1"},
@@ -325,9 +362,14 @@ def _append_attempt(
     token = lane.get("_history_token")
     started = bool(argv) if provider_started is None else provider_started
     if token is not None and (started or cleanup_proven):
-        record_outcome(Path(lane["_history_runtime"]), lane, token,
-                       provider_started=started,
-                       cleanup_proven=cleanup_proven, session_id=native_session_id)
+        record_outcome(
+            Path(lane["_history_runtime"]),
+            lane,
+            token,
+            provider_started=started,
+            cleanup_proven=cleanup_proven,
+            session_id=native_session_id,
+        )
 
 
 def _read_acceptance_chain(
@@ -354,8 +396,11 @@ def _read_acceptance_chain(
 
 
 def _record_sandbox_failure(
-    rt: Path, lane: dict[str, Any], child: Any,
-    boundary: processes.ProcessBoundary | None, failure: str,
+    rt: Path,
+    lane: dict[str, Any],
+    child: Any,
+    boundary: processes.ProcessBoundary | None,
+    failure: str,
 ) -> None:
     """Latch only this owned invocation's failure; never relaunch or repair."""
     block_path = rt.parent / BLOCK
@@ -364,15 +409,26 @@ def _record_sandbox_failure(
         try:
             block_path.lstat()
         except FileNotFoundError:
-            atomic_write_json(block_path, {
-                "schema": "sandbox-launch-block/v1", "lane_id": lane["lane_id"],
-                "run_id": lane["run_id"], "reason": failure,
-                "provider_pid": child.pid if child is not None else None,
-                "provider_creation_time": boundary.root_creation_time if boundary is not None else None,
-                "provider_started": child is not None,
-                "recorded_at": iso_utc(), "automatic_retry": False,
-            })
-    _write_status(lane, {"sandbox_startup_error": failure, "sandbox_launch_block": str(block_path)})
+            atomic_write_json(
+                block_path,
+                {
+                    "schema": "sandbox-launch-block/v1",
+                    "lane_id": lane["lane_id"],
+                    "run_id": lane["run_id"],
+                    "reason": failure,
+                    "provider_pid": child.pid if child is not None else None,
+                    "provider_creation_time": boundary.root_creation_time
+                    if boundary is not None
+                    else None,
+                    "provider_started": child is not None,
+                    "recorded_at": iso_utc(),
+                    "automatic_retry": False,
+                },
+            )
+    _write_status(
+        lane,
+        {"sandbox_startup_error": failure, "sandbox_launch_block": str(block_path)},
+    )
     _append_event(lane, "sandbox_startup_failed", failure)
 
 
@@ -406,7 +462,11 @@ def _run_provider(
     lane["_attempt_started"] = False
     lane.pop("_attempt_boundary_record", None)
     try:
-        isolation = {"isolation_config_path": lane["isolation_config_path"]} if lane["provider"]["id"] == "codex" else {}
+        isolation = (
+            {"isolation_config_path": lane["isolation_config_path"]}
+            if lane["provider"]["id"] == "codex"
+            else {}
+        )
         argv = binding.build_argv(
             model=invocation["provider"]["model"],
             launch_config=invocation["provider"]["launch_config"],
@@ -417,20 +477,31 @@ def _run_provider(
             **isolation,
         )
     except (OSError, ValueError, TypeError) as exc:
-        raise ControllerError(LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True) from exc
+        raise ControllerError(
+            LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True
+        ) from exc
     lane["_attempt_argv"] = list(argv)
     if sandbox_health is not None:
         try:
             sandbox_health = require_ready(
-                Path(sandbox_health["harness_dir"]), workspace=rt.parent, executable=argv[0],
-                permission_mode=sandbox_health.get("permission_mode", "worker-isolated"),
-                isolation_config_path=(Path(sandbox_health["isolation_config_path"])
-                                       if sandbox_health.get("isolation_config_path") else None),
+                Path(sandbox_health["harness_dir"]),
+                workspace=rt.parent,
+                executable=argv[0],
+                permission_mode=sandbox_health.get(
+                    "permission_mode", "worker-isolated"
+                ),
+                isolation_config_path=(
+                    Path(sandbox_health["isolation_config_path"])
+                    if sandbox_health.get("isolation_config_path")
+                    else None
+                ),
             )
         except (OSError, ValueError) as exc:
             _record_sandbox_failure(rt, lane, None, None, str(exc))
             raise ControllerError(
-                LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True,
+                LAUNCH_PROVIDER_START_FAILED,
+                str(exc),
+                no_provider_started=True,
             ) from exc
     stderr_start_byte = stderr_path.stat().st_size if stderr_path.is_file() else 0
     append_detail(
@@ -448,28 +519,45 @@ def _run_provider(
         resume=resume,
     )
     pre_spawn_offset: int = 0
-    with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
-         transcript_path.open("a", encoding="utf-8") as transcript_handle, \
-         stderr_path.open("a", encoding="utf-8") as stderr_handle:
+    with (
+        prompt_path.open("r", encoding="utf-8") as prompt_handle,
+        transcript_path.open("a", encoding="utf-8") as transcript_handle,
+        stderr_path.open("a", encoding="utf-8") as stderr_handle,
+    ):
         pre_spawn_offset = transcript_handle.tell()
         lane["_attempt_transcript_start_byte"] = pre_spawn_offset
         # Linearize creation with the first run-wide sandbox-failure latch.
         # This applies to every provider and explicit permission mode.
-        with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane["lane_id"]), RecordLock(rt.parent / BLOCK):
+        with (
+            runtime_admission_lock(rt),
+            lane_operation_lock(rt, epoch_id, lane["lane_id"]),
+            RecordLock(rt.parent / BLOCK),
+        ):
             try:
                 current = read_lane(rt, epoch_id, lane["lane_id"])
                 require_same_run(current, lane)
                 from .lane_authority import read_invocation
+
                 read_invocation(current)
                 state, marker = read_runtime_state(rt), read_current_epoch(rt)
-                if (current.get("lifecycle") != "running" or current.get("launch_pending") is True
-                        or current.get("process") != lane.get("process") or not state
-                        or state.get("state") != "OPEN" or not marker or marker.get("epoch_id") != epoch_id):
-                    raise ValueError("lane/runtime owner changed before provider creation")
+                if (
+                    current.get("lifecycle") != "running"
+                    or current.get("launch_pending") is True
+                    or current.get("process") != lane.get("process")
+                    or not state
+                    or state.get("state") != "OPEN"
+                    or not marker
+                    or marker.get("epoch_id") != epoch_id
+                ):
+                    raise ValueError(
+                        "lane/runtime owner changed before provider creation"
+                    )
                 require_not_blocked(rt.parent)
                 token = reserve_invocation(rt, lane, attempt_number=attempt_number)
             except (OSError, ValueError, LaneError) as exc:
-                raise ControllerError(LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True) from exc
+                raise ControllerError(
+                    LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True
+                ) from exc
             lane["_history_token"], lane["_history_runtime"] = token, str(rt)
             try:
                 child = processes.spawn_provider(
@@ -482,8 +570,14 @@ def _run_provider(
             except Exception as exc:
                 proven_absent = getattr(exc, "no_provider_created", False) is True
                 if proven_absent:
-                    record_outcome(rt, lane, token, provider_started=False,
-                                   cleanup_proven=True, session_id=session_id)
+                    record_outcome(
+                        rt,
+                        lane,
+                        token,
+                        provider_started=False,
+                        cleanup_proven=True,
+                        session_id=session_id,
+                    )
                     lane.pop("_history_token", None)
                 raise ControllerError(
                     LAUNCH_PROVIDER_START_FAILED,
@@ -514,7 +608,9 @@ def _run_provider(
                         "cannot record provider process identity",
                     )
                 lane["_attempt_boundary_record"] = boundary.record()
-                record_started(rt, lane, token, process_boundary=lane["_attempt_boundary_record"])
+                record_started(
+                    rt, lane, token, process_boundary=lane["_attempt_boundary_record"]
+                )
                 append_detail(
                     rt,
                     "launch.worker.spawned",
@@ -591,7 +687,9 @@ def _run_provider(
         next_observation = time.monotonic()
         while child.poll() is None:
             if sandbox_health is not None:
-                failure = startup_failure(sandbox_health, stderr_path, stderr_start_byte)
+                failure = startup_failure(
+                    sandbox_health, stderr_path, stderr_start_byte
+                )
                 if failure is not None:
                     # Stop only this invocation's already-owned process boundary.
                     # Latch the run so ROOT cannot respond by spawning another lane.
@@ -625,7 +723,9 @@ def _run_provider(
                 try:
                     parsed = binding.parse_line(line.rstrip("\n"))
                 except Exception:
-                    parsed = None  # The post-exit receipt read records this malformed line.
+                    parsed = (
+                        None  # The post-exit receipt read records this malformed line.
+                    )
                 _append_provider_event(
                     rt,
                     lane,
@@ -676,7 +776,10 @@ def _run_provider(
             rt,
             epoch_id,
             lane["lane_id"],
-            lambda current, value=session: {**current, "session": {"session_id": value}},
+            lambda current, value=session: {
+                **current,
+                "session": {"session_id": value},
+            },
         )
     provider_session_id = session or session_id
     return ProviderExecution(
@@ -697,8 +800,11 @@ def run_controller(lane_id: str) -> int:
     epoch_id, lane = find_active_lane(rt, lane_id)
     try:
         from .lane_authority import read_invocation
+
         invocation = read_invocation(lane)
-        if invocation.get("lane_id") != lane_id or invocation.get("run_id") != lane.get("run_id"):
+        if invocation.get("lane_id") != lane_id or invocation.get("run_id") != lane.get(
+            "run_id"
+        ):
             raise ControllerError(
                 LAUNCH_INVOCATION_INVALID,
                 "invocation does not match the lane's current run",
@@ -712,16 +818,24 @@ def run_controller(lane_id: str) -> int:
         raise ControllerError(
             LAUNCH_CONTROLLER_START_FAILED, "cannot record controller process identity"
         )
+
     def register(current: dict[str, Any]) -> dict[str, Any]:
         require_same_run(current, lane)
         owned = {"pid": identity["pid"], "creation_time": identity["creation_time"]}
-        if current.get("lifecycle") not in ("prepared", "running") or current.get("process") not in ({}, owned):
-            raise ControllerError(LAUNCH_CONTROLLER_START_FAILED, "controller run/owner changed before registration")
+        if current.get("lifecycle") not in ("prepared", "running") or current.get(
+            "process"
+        ) not in ({}, owned):
+            raise ControllerError(
+                LAUNCH_CONTROLLER_START_FAILED,
+                "controller run/owner changed before registration",
+            )
         return {**current, "lifecycle": "running", "process": owned}
 
     with runtime_admission_lock(rt), lane_operation_lock(rt, epoch_id, lane_id):
         lane = update_lane(rt, epoch_id, lane_id, register)
-        _write_status(lane, {"controller_state": "starting", "controller_identity": identity})
+        _write_status(
+            lane, {"controller_state": "starting", "controller_identity": identity}
+        )
         _append_event(lane, "controller_started", lane_id)
     try:
         binding = _load_binding(harness_root, provider_id)
@@ -786,14 +900,29 @@ def run_controller(lane_id: str) -> int:
         prior_invocations = MAX_LANE_PROVIDER_INVOCATIONS
         _append_event(lane, "retry_history_unproven", str(exc))
     if prior_invocations >= MAX_LANE_PROVIDER_INVOCATIONS:
-        _write_status(lane, {
-            "controller_state": "exited", "provider_state": {"state": "not_started"},
-            "result_state": "invalid", "recorded_status": "provider_exited_no_result",
-            "cleanup_proven": True, "retry_limit_reached": True,
-        })
+        _write_status(
+            lane,
+            {
+                "controller_state": "exited",
+                "provider_state": {"state": "not_started"},
+                "result_state": "invalid",
+                "recorded_status": "provider_exited_no_result",
+                "cleanup_proven": True,
+                "retry_limit_reached": True,
+            },
+        )
         release_leases(rt, lane_id, lane["run_id"])
-        update_lane(rt, epoch_id, lane_id, lambda current: {**current, "lifecycle": "result_invalid"})
-        _append_event(lane, "provider_exited_no_result", "initial assignment plus one retry exhausted; use a fresh lane/session")
+        update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            lambda current: {**current, "lifecycle": "result_invalid"},
+        )
+        _append_event(
+            lane,
+            "provider_exited_no_result",
+            "initial assignment plus one retry exhausted; use a fresh lane/session",
+        )
         return 0
 
     attempt_number = 1
@@ -805,16 +934,30 @@ def run_controller(lane_id: str) -> int:
             sandbox_health = None
             try:
                 require_not_blocked(rt.parent)
-                if provider_id == "codex" and invocation["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated") != "yolo":
-                    permission_mode = invocation["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated")
+                if (
+                    provider_id == "codex"
+                    and invocation["provider"]
+                    .get("launch_config", {})
+                    .get("permission_mode", "worker-isolated")
+                    != "yolo"
+                ):
+                    permission_mode = (
+                        invocation["provider"]
+                        .get("launch_config", {})
+                        .get("permission_mode", "worker-isolated")
+                    )
                     sandbox_health = require_ready(
-                        harness_root, workspace=rt.parent, permission_mode=permission_mode,
+                        harness_root,
+                        workspace=rt.parent,
+                        permission_mode=permission_mode,
                         isolation_config_path=Path(lane["isolation_config_path"]),
                     )
             except (OSError, ValueError) as exc:
                 _record_sandbox_failure(rt, lane, None, None, str(exc))
                 raise ControllerError(
-                    LAUNCH_PROVIDER_START_FAILED, str(exc), no_provider_started=True,
+                    LAUNCH_PROVIDER_START_FAILED,
+                    str(exc),
+                    no_provider_started=True,
                 ) from exc
             execution = _run_provider(
                 rt,
@@ -824,8 +967,13 @@ def run_controller(lane_id: str) -> int:
                 binding,
                 prompt_path,
                 attempt_number=attempt_number,
-                resume=attempt_number > 1 or bool((lane.get("session") or {}).get("session_id")),
-                **({"sandbox_health": sandbox_health} if sandbox_health is not None else {}),
+                resume=attempt_number > 1
+                or bool((lane.get("session") or {}).get("session_id")),
+                **(
+                    {"sandbox_health": sandbox_health}
+                    if sandbox_health is not None
+                    else {}
+                ),
             )
         except Exception as exc:
             status_path = Path(lane["controller_status_path"])
@@ -835,7 +983,9 @@ def run_controller(lane_id: str) -> int:
                 status = {}
             boundary_record = lane.get("_attempt_boundary_record")
             if boundary_record is None and lane.get("_history_token") is None:
-                boundary_record = status.get("process_boundary") if isinstance(status, dict) else None
+                boundary_record = (
+                    status.get("process_boundary") if isinstance(status, dict) else None
+                )
             no_provider_started = bool(
                 isinstance(exc, ControllerError) and exc.no_provider_started
             )
@@ -878,7 +1028,9 @@ def run_controller(lane_id: str) -> int:
                 )
                 if cleanup_proven:
                     release_leases(rt, lane_id, lane["run_id"])
-                    _append_event(lane, "leases_released", ",".join(declared) or "(none)")
+                    _append_event(
+                        lane, "leases_released", ",".join(declared) or "(none)"
+                    )
                 update_lane(
                     rt,
                     epoch_id,
@@ -886,7 +1038,11 @@ def run_controller(lane_id: str) -> int:
                     lambda current: {**current, "lifecycle": "result_invalid"},
                 )
                 return 0
-            provider_state = dict(status.get("provider_state") or {}) if isinstance(status, dict) else {}
+            provider_state = (
+                dict(status.get("provider_state") or {})
+                if isinstance(status, dict)
+                else {}
+            )
             if no_provider_started:
                 provider_state = {"state": "not_started"}
             else:
@@ -914,8 +1070,18 @@ def run_controller(lane_id: str) -> int:
                     "cleanup_proven": cleanup_proven,
                     "recorded_status": "provider_start_failed",
                     "provider_start_error": str(exc),
-                    **({"process_boundary": None, "cleanup_error": None} if no_provider_started else {}),
-                    **({"cleanup_error": "provider/helper process boundary remains unknown or live"} if not cleanup_proven else {}),
+                    **(
+                        {"process_boundary": None, "cleanup_error": None}
+                        if no_provider_started
+                        else {}
+                    ),
+                    **(
+                        {
+                            "cleanup_error": "provider/helper process boundary remains unknown or live"
+                        }
+                        if not cleanup_proven
+                        else {}
+                    ),
                 },
             )
             _append_event(lane, "provider_start_failed", str(exc))
@@ -944,7 +1110,9 @@ def run_controller(lane_id: str) -> int:
                 "attempt": attempt_number,
             },
         )
-        _append_event(lane, "provider_exited", f"attempt={attempt_number}; exit_code={exit_code}")
+        _append_event(
+            lane, "provider_exited", f"attempt={attempt_number}; exit_code={exit_code}"
+        )
 
         cleanup_proven = execution.boundary.cleanup(force=True)
         result_state, _result = _validate_result(lane)
@@ -985,7 +1153,9 @@ def run_controller(lane_id: str) -> int:
             )
             return 5
 
-        _append_event(lane, "cleanup_proven", "provider/helper process boundary confirmed gone")
+        _append_event(
+            lane, "cleanup_proven", "provider/helper process boundary confirmed gone"
+        )
         _append_attempt(
             lane,
             attempt_number=attempt_number,
@@ -1060,10 +1230,16 @@ def run_controller(lane_id: str) -> int:
             },
         )
         release_leases(rt, lane_id, lane["run_id"])
-        _append_event(lane, "provider_exited_no_result", "one launch attempt failed; diagnose before a separate repaired launch")
+        _append_event(
+            lane,
+            "provider_exited_no_result",
+            "one launch attempt failed; diagnose before a separate repaired launch",
+        )
         _append_event(lane, "leases_released", ",".join(declared) or "(none)")
         update_lane(
-            rt, epoch_id, lane_id,
+            rt,
+            epoch_id,
+            lane_id,
             lambda current: {**current, "lifecycle": "result_invalid"},
         )
         return 0
@@ -1095,12 +1271,16 @@ def run_controller(lane_id: str) -> int:
                 )
                 return 0
             if acceptance.get("approval") == "REJECTED":
-                _write_status(lane, {"controller_state": "exited", "recorded_status": recorded})
+                _write_status(
+                    lane, {"controller_state": "exited", "recorded_status": recorded}
+                )
                 _append_event(lane, "acceptance_rejected", "REJECTED")
                 return 0
         state = read_runtime_state(rt)
         if state is not None and state.get("state") == "SHUTTING_DOWN":
-            _write_status(lane, {"controller_state": "exited", "recorded_status": recorded})
+            _write_status(
+                lane, {"controller_state": "exited", "recorded_status": recorded}
+            )
             _append_event(lane, "shutdown_stop", "runtime shutting down")
             return 0
         time.sleep(ACCEPTANCE_POLL_SECONDS)

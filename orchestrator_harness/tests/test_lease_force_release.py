@@ -36,17 +36,40 @@ class ForceReleaseLeaseTests(unittest.TestCase):
         worktree = self.runtime / "worktrees/lane-1"
         worktree.mkdir(parents=True, exist_ok=True)
         status = directory / "controller.status.json"
-        self.lane = {"lane_id": "lane-1", "run_id": "run-1", "lifecycle": "running",
-                     "process": {"pid": 41, "creation_time": "windows-filetime:134361777213898726"},
-                     "controller_status_path": str(status), "worktree_path": str(worktree),
-                     "provider": {"id": "qwen-code", "model": "fixture", "launch_config": {}}}
+        self.lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "lifecycle": "running",
+            "process": {
+                "pid": 41,
+                "creation_time": "windows-filetime:134361777213898726",
+            },
+            "controller_status_path": str(status),
+            "worktree_path": str(worktree),
+            "provider": {"id": "qwen-code", "model": "fixture", "launch_config": {}},
+        }
         retry_policy.initialize_history(self.runtime, self.lane)
-        atomic_write_json(status, {"schema": "controller-status/v1", "lane_id": "lane-1", "run_id": "run-1",
-            "controller_identity": self.lane["process"], "controller_state": "exited", "cleanup_proven": True,
-            "provider_state": {"state": "not_started"}})
-        invocation = {"schema": "controller-invocation/v1", "lane_id": "lane-1", "run_id": "run-1",
-                      "cwd": str(worktree), "provider": self.lane["provider"],
-                      "exclusive_resources": [resource_id], "paths": {"controller_status": str(status)}}
+        atomic_write_json(
+            status,
+            {
+                "schema": "controller-status/v1",
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "controller_identity": self.lane["process"],
+                "controller_state": "exited",
+                "cleanup_proven": True,
+                "provider_state": {"state": "not_started"},
+            },
+        )
+        invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "cwd": str(worktree),
+            "provider": self.lane["provider"],
+            "exclusive_resources": [resource_id],
+            "paths": {"controller_status": str(status)},
+        }
         invocation["content_hash"] = content_hash(invocation)
         atomic_write_json(directory / "invocation.json", invocation)
         return path
@@ -89,12 +112,12 @@ class ForceReleaseLeaseTests(unittest.TestCase):
         ):
             with self.assertRaises(leases.LeaseError) as raised:
                 leases.force_release_lease(self.runtime, "resource-1", lane=lane)
-        self.assertEqual(
-            leases.FORCE_RELEASE_HOLDER_UNPROVEN, raised.exception.code
-        )
+        self.assertEqual(leases.FORCE_RELEASE_HOLDER_UNPROVEN, raised.exception.code)
         self.assertTrue(path.is_file())
 
-    def test_retired_abandoned_or_superseded_run_cannot_release_unknown_holder(self) -> None:
+    def test_retired_abandoned_or_superseded_run_cannot_release_unknown_holder(
+        self,
+    ) -> None:
         lane_cases = (
             {"lane_id": "lane-1", "run_id": "run-1", "lifecycle": "retired"},
             {"lane_id": "lane-1", "run_id": "run-1", "lifecycle": "abandoned"},
@@ -109,21 +132,19 @@ class ForceReleaseLeaseTests(unittest.TestCase):
             ):
                 with self.assertRaises(leases.LeaseError) as raised:
                     leases.force_release_lease(self.runtime, resource_id, lane=lane)
-            self.assertEqual(leases.FORCE_RELEASE_HOLDER_UNPROVEN, raised.exception.code)
+            self.assertEqual(
+                leases.FORCE_RELEASE_HOLDER_UNPROVEN, raised.exception.code
+            )
             self.assertTrue(path.exists())
 
     def test_missing_and_mismatched_record_have_stable_codes(self) -> None:
         with self.assertRaises(leases.LeaseError) as missing:
             leases.force_release_lease(self.runtime, "resource-1", lane=None)
-        self.assertEqual(
-            leases.FORCE_RELEASE_LEASE_MISSING, missing.exception.code
-        )
+        self.assertEqual(leases.FORCE_RELEASE_LEASE_MISSING, missing.exception.code)
         path = self._write("resource-1", record_resource_id="other-resource")
         with self.assertRaises(leases.LeaseError) as invalid:
             leases.force_release_lease(self.runtime, "resource-1", lane=None)
-        self.assertEqual(
-            leases.FORCE_RELEASE_LEASE_INVALID, invalid.exception.code
-        )
+        self.assertEqual(leases.FORCE_RELEASE_LEASE_INVALID, invalid.exception.code)
         self.assertTrue(path.is_file())
 
     def test_lane_is_resolved_after_locked_lease_reread(self) -> None:
@@ -168,19 +189,42 @@ class ForceReleaseLeaseTests(unittest.TestCase):
     def test_superseded_owner_requires_old_provider_boundary_proof(self):
         path = self._write()
         status = Path(self.lane["controller_status_path"])
-        atomic_write_json(status, {"schema": "controller-status/v1", "lane_id": "lane-1", "run_id": "run-1",
-            "controller_identity": self.lane["process"], "controller_state": "exited", "cleanup_proven": True,
-            "provider_state": {"state": "exited"}, "process_boundary": {"fixture": "old-provider"}})
+        atomic_write_json(
+            status,
+            {
+                "schema": "controller-status/v1",
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "controller_identity": self.lane["process"],
+                "controller_state": "exited",
+                "cleanup_proven": True,
+                "provider_state": {"state": "exited"},
+                "process_boundary": {"fixture": "old-provider"},
+            },
+        )
         for gone in (False, True):
-            with self.subTest(boundary_gone=gone), mock.patch.object(leases, "identity_matches", return_value=False), \
-                 mock.patch.object(leases, "identity_exit_proven", return_value=True), \
-                 mock.patch.object(processes, "identity_exit_proven", return_value=True), \
-                 mock.patch.object(processes, "process_boundary_is_gone", return_value=gone) as proof:
+            with (
+                self.subTest(boundary_gone=gone),
+                mock.patch.object(leases, "identity_matches", return_value=False),
+                mock.patch.object(leases, "identity_exit_proven", return_value=True),
+                mock.patch.object(processes, "identity_exit_proven", return_value=True),
+                mock.patch.object(
+                    processes, "process_boundary_is_gone", return_value=gone
+                ) as proof,
+            ):
                 if gone:
-                    leases.force_release_lease(self.runtime, "resource-1", lane={"lane_id": "lane-1", "run_id": "run-2"})
+                    leases.force_release_lease(
+                        self.runtime,
+                        "resource-1",
+                        lane={"lane_id": "lane-1", "run_id": "run-2"},
+                    )
                 else:
                     with self.assertRaises(leases.LeaseError):
-                        leases.force_release_lease(self.runtime, "resource-1", lane={"lane_id": "lane-1", "run_id": "run-2"})
+                        leases.force_release_lease(
+                            self.runtime,
+                            "resource-1",
+                            lane={"lane_id": "lane-1", "run_id": "run-2"},
+                        )
                     self.assertTrue(path.exists())
                 proof.assert_called_with({"fixture": "old-provider"})
         self.assertFalse(path.exists())
@@ -188,10 +232,16 @@ class ForceReleaseLeaseTests(unittest.TestCase):
     def test_missing_retained_authority_never_uses_newer_lane_cleanup(self):
         path = self._write()
         Path(self.lane["controller_status_path"]).unlink()
-        with mock.patch.object(leases, "identity_matches", return_value=False), \
-             mock.patch.object(leases, "identity_exit_proven", return_value=True):
+        with (
+            mock.patch.object(leases, "identity_matches", return_value=False),
+            mock.patch.object(leases, "identity_exit_proven", return_value=True),
+        ):
             with self.assertRaises(leases.LeaseError) as raised:
-                leases.force_release_lease(self.runtime, "resource-1", lane={"lane_id": "lane-1", "run_id": "run-2"})
+                leases.force_release_lease(
+                    self.runtime,
+                    "resource-1",
+                    lane={"lane_id": "lane-1", "run_id": "run-2"},
+                )
         self.assertEqual(leases.FORCE_RELEASE_HOLDER_UNPROVEN, raised.exception.code)
         self.assertTrue(path.exists())
 
@@ -199,8 +249,14 @@ class ForceReleaseLeaseTests(unittest.TestCase):
         path = leases.lease_path(self.runtime, "resource-1")
         path.mkdir(parents=True)
         with self.assertRaises(leases.LeaseError):
-            leases.acquire_leases(self.runtime, ["resource-1"], lane_id="lane-1", run_id="run-1",
-                                  pid=41, creation_time="windows-filetime:134361777213898726")
+            leases.acquire_leases(
+                self.runtime,
+                ["resource-1"],
+                lane_id="lane-1",
+                run_id="run-1",
+                pid=41,
+                creation_time="windows-filetime:134361777213898726",
+            )
         self.assertTrue(path.is_dir())
 
     def test_corrupt_inventory_blocks_release_before_any_owned_deletion(self):

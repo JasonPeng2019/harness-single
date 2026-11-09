@@ -1,4 +1,4 @@
-﻿"""Exclusive-resource leases: created at launch, held only while the
+"""Exclusive-resource leases: created at launch, held only while the
 controller lives, released only after cleanup proof (or a forced path).
 """
 
@@ -13,7 +13,13 @@ from typing import Any
 
 from .core import iso_utc, read_json, require_schema
 from .processes import identity_matches, identity_exit_proven, valid_creation_identity
-from .records import RecordLock, append_jsonl, atomic_write_json, read_record, runtime_admission_lock
+from .records import (
+    RecordLock,
+    append_jsonl,
+    atomic_write_json,
+    read_record,
+    runtime_admission_lock,
+)
 from .portable_paths import component as portable_component
 
 LEASE_SCHEMA = "resource-lease/v1"
@@ -68,21 +74,32 @@ def read_lease(rt: Path, resource_id: str) -> dict[str, Any] | None:
 def _read_lease(path: Path) -> dict[str, Any]:
     try:
         metadata = path.lstat()
-        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-                or getattr(metadata, "st_file_attributes", 0) & 0x400):
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+        ):
             raise ValueError("lease is not a plain, exclusive regular file")
         record = read_record(path, LEASE_SCHEMA)
         portable_component(record.get("lane_id"))
         portable_component(record.get("run_id"))
         resource = record.get("resource_id")
-        if (not isinstance(resource, str) or not resource
-                or path.name != hashlib.sha256(resource.encode("utf-8")).hexdigest() + ".lease"
-                or type(record.get("pid")) is not int or record["pid"] <= 0
-                or not valid_creation_identity(record.get("creation_time"))):
+        if (
+            not isinstance(resource, str)
+            or not resource
+            or path.name
+            != hashlib.sha256(resource.encode("utf-8")).hexdigest() + ".lease"
+            or type(record.get("pid")) is not int
+            or record["pid"] <= 0
+            or not valid_creation_identity(record.get("creation_time"))
+        ):
             raise ValueError("lease resource or exact holder identity is invalid")
         return record
     except (OSError, ValueError, TypeError) as exc:
-        raise LeaseError(FORCE_RELEASE_LEASE_INVALID, f"lease ownership cannot be read: {path}: {exc}") from exc
+        raise LeaseError(
+            FORCE_RELEASE_LEASE_INVALID,
+            f"lease ownership cannot be read: {path}: {exc}",
+        ) from exc
 
 
 def lease_records(rt: Path) -> list[tuple[Path, dict[str, Any]]]:
@@ -92,17 +109,29 @@ def lease_records(rt: Path) -> list[tuple[Path, dict[str, Any]]]:
         metadata = directory.lstat()
     except FileNotFoundError:
         return []
-    if (not stat.S_ISDIR(metadata.st_mode) or directory.resolve() != directory.absolute()
-            or getattr(metadata, "st_file_attributes", 0) & 0x400):
-        raise LeaseError(FORCE_RELEASE_LEASE_INVALID, f"lease directory is redirected or invalid: {directory}")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or directory.resolve() != directory.absolute()
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise LeaseError(
+            FORCE_RELEASE_LEASE_INVALID,
+            f"lease directory is redirected or invalid: {directory}",
+        )
     records = []
     for path in sorted(directory.iterdir()):
         if path.name.endswith(".lease"):
             records.append((path, _read_lease(path)))
-        elif not (path.name.startswith(".") and path.name.endswith(".lock")
-                  and path.is_file() and path.resolve() == path.absolute()
-                  and path.lstat().st_nlink == 1):
-            raise LeaseError(FORCE_RELEASE_LEASE_INVALID, f"unexpected lease inventory entry: {path}")
+        elif not (
+            path.name.startswith(".")
+            and path.name.endswith(".lock")
+            and path.is_file()
+            and path.resolve() == path.absolute()
+            and path.lstat().st_nlink == 1
+        ):
+            raise LeaseError(
+                FORCE_RELEASE_LEASE_INVALID, f"unexpected lease inventory entry: {path}"
+            )
     return records
 
 
@@ -118,10 +147,17 @@ def acquire_leases(
     """Acquire every declared lease or none (fail-fast, all-or-nothing)."""
     if not resource_ids:
         return
-    if (any(not isinstance(resource, str) or not resource for resource in resource_ids)
-            or len(set(resource_ids)) != len(resource_ids)
-            or type(pid) is not int or pid <= 0 or not valid_creation_identity(creation_time)):
-        raise LeaseError(FORCE_RELEASE_LEASE_INVALID, "lease request or exact holder identity is invalid")
+    if (
+        any(not isinstance(resource, str) or not resource for resource in resource_ids)
+        or len(set(resource_ids)) != len(resource_ids)
+        or type(pid) is not int
+        or pid <= 0
+        or not valid_creation_identity(creation_time)
+    ):
+        raise LeaseError(
+            FORCE_RELEASE_LEASE_INVALID,
+            "lease request or exact holder identity is invalid",
+        )
     portable_component(lane_id)
     portable_component(run_id)
     lease_dir(rt).mkdir(parents=True, exist_ok=True)
@@ -197,7 +233,7 @@ def force_release_lease(
     superseded lane labels cannot substitute for process ownership proof.
     """
     path = lease_path(rt, resource_id)
-    with runtime_admission_lock(rt), (nullcontext() if _lock_held else _leases_lock(rt)):
+    with runtime_admission_lock(rt), nullcontext() if _lock_held else _leases_lock(rt):
         try:
             path.lstat()
         except FileNotFoundError:
@@ -247,17 +283,33 @@ def force_release_lease(
                 f"lease holder identity unproven: {resource_id}",
             )
         from .lane_cleanup import cleanup_is_proven
-        if current_lane is None or any(current_lane.get(key) != record[key] for key in ("lane_id", "run_id")):
+
+        if current_lane is None or any(
+            current_lane.get(key) != record[key] for key in ("lane_id", "run_id")
+        ):
             try:
                 from .lane_authority import retained_cleanup_owner
+
                 current_lane = retained_cleanup_owner(rt, record)
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise LeaseError(FORCE_RELEASE_HOLDER_UNPROVEN, f"retained provider cleanup authority is unproven: {resource_id}: {exc}") from exc
+                raise LeaseError(
+                    FORCE_RELEASE_HOLDER_UNPROVEN,
+                    f"retained provider cleanup authority is unproven: {resource_id}: {exc}",
+                ) from exc
         process = current_lane.get("process")
-        if not isinstance(process, dict) or (process and any(process.get(key) != record[key] for key in ("pid", "creation_time"))):
-            raise LeaseError(FORCE_RELEASE_HOLDER_UNPROVEN, f"lease holder differs from the native controller: {resource_id}")
+        if not isinstance(process, dict) or (
+            process
+            and any(process.get(key) != record[key] for key in ("pid", "creation_time"))
+        ):
+            raise LeaseError(
+                FORCE_RELEASE_HOLDER_UNPROVEN,
+                f"lease holder differs from the native controller: {resource_id}",
+            )
         if not cleanup_is_proven(current_lane):
-            raise LeaseError(FORCE_RELEASE_HOLDER_UNPROVEN, f"lane provider cleanup is unproven: {resource_id}")
+            raise LeaseError(
+                FORCE_RELEASE_HOLDER_UNPROVEN,
+                f"lane provider cleanup is unproven: {resource_id}",
+            )
         try:
             path.unlink()
         except OSError as exc:

@@ -19,11 +19,15 @@ from orchestrator_harness import operator_launch
 class BaselineProductOracleTests(unittest.TestCase):
     """Product-facing baseline-red CHECK-U1/U3/U4 contract oracles."""
 
-    def test_bound_011_exposes_only_public_orphan_lease_force_release_route(self) -> None:
+    def test_bound_011_exposes_only_public_orphan_lease_force_release_route(
+        self,
+    ) -> None:
         parser = operator_launch._build_parser()
         try:
             with redirect_stderr(StringIO()):
-                parsed = parser.parse_args(["lease", "force-release", "--resource-id", "resource-1"])
+                parsed = parser.parse_args(
+                    ["lease", "force-release", "--resource-id", "resource-1"]
+                )
         except SystemExit as exc:
             self.fail(f"BOUND-011 public route is absent (parser exited {exc.code})")
         self.assertEqual("force-release", parsed.lease_command)
@@ -33,14 +37,30 @@ class BaselineProductOracleTests(unittest.TestCase):
         parser = operator_launch._build_parser()
         for outcome in ("COMPLETE", "BLOCKED"):
             for summary in (None, "", "   "):
-                command = ["manager", "close", "--event-id", "event-1", "--outcome", outcome]
+                command = [
+                    "manager",
+                    "close",
+                    "--event-id",
+                    "event-1",
+                    "--outcome",
+                    outcome,
+                ]
                 if summary is not None:
                     command.extend(["--summary", summary])
                 with self.subTest(outcome=outcome, summary=summary):
                     with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                         parser.parse_args(command)
             accepted = parser.parse_args(
-                ["manager", "close", "--event-id", "event-1", "--outcome", outcome, "--summary", "operator decision"]
+                [
+                    "manager",
+                    "close",
+                    "--event-id",
+                    "event-1",
+                    "--outcome",
+                    outcome,
+                    "--summary",
+                    "operator decision",
+                ]
             )
             self.assertEqual("operator decision", accepted.summary)
 

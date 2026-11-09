@@ -46,7 +46,12 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
         seed_provider_history(self.runtime, self.lane)
         write_lane(self.runtime, self.epoch, "worker", self.lane)
         self.invocation = read_invocation(self.lane)
-        binding = self.root / "orchestrator_harness/provider_adapters" / self.provider["id"] / "launcher_binding.py"
+        binding = (
+            self.root
+            / "orchestrator_harness/provider_adapters"
+            / self.provider["id"]
+            / "launcher_binding.py"
+        )
         binding.parent.mkdir(parents=True)
         binding.write_text("# fixture binding\n", encoding="utf-8")
         self.terminal_status = {
@@ -84,9 +89,7 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
         return child, identity
 
     @staticmethod
-    def _stop_exact(
-        child: subprocess.Popen, identity: dict[str, object]
-    ) -> None:
+    def _stop_exact(child: subprocess.Popen, identity: dict[str, object]) -> None:
         """Terminate the exact incarnation and reap the handle on cleanup."""
         if child.poll() is None and isinstance(identity.get("pid"), int):
             processes.terminate_process(
@@ -129,7 +132,9 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
-            patch.object(launch, "read_current_epoch", return_value={"epoch_id": self.epoch}),
+            patch.object(
+                launch, "read_current_epoch", return_value={"epoch_id": self.epoch}
+            ),
             patch.object(
                 launch, "find_active_lane", return_value=(self.epoch, self.lane)
             ),
@@ -138,9 +143,7 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
                 "_validate_provider_launch_config",
                 return_value=self.invocation["provider"]["launch_config"],
             ),
-            patch.object(
-                launch.processes, "spawn_detached", return_value=child
-            ),
+            patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch, "update_lane", side_effect=update),
             patch.object(
                 launch, "_read_controller_status", return_value=self.terminal_status
@@ -180,7 +183,9 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
                 return_value=SimpleNamespace(runtime_root=self.runtime),
             ),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
-            patch.object(launch, "read_current_epoch", return_value={"epoch_id": self.epoch}),
+            patch.object(
+                launch, "read_current_epoch", return_value={"epoch_id": self.epoch}
+            ),
             patch.object(
                 launch, "find_active_lane", return_value=(self.epoch, self.lane)
             ),
@@ -189,9 +194,7 @@ class ProviderStartFailureExitRaceTests(LinkedResultFixture, unittest.TestCase):
                 "_validate_provider_launch_config",
                 return_value=self.invocation["provider"]["launch_config"],
             ),
-            patch.object(
-                launch.processes, "spawn_detached", return_value=child
-            ),
+            patch.object(launch.processes, "spawn_detached", return_value=child),
             patch.object(launch, "update_lane", side_effect=update),
             patch.object(
                 launch, "_read_controller_status", return_value=self.terminal_status

@@ -26,9 +26,7 @@ def _direct_codex_executable() -> str:
         arch = platform.machine().lower()
         suffix = "arm64" if arch in ("arm64", "aarch64") else "x64"
         triple = (
-            "aarch64-pc-windows-msvc"
-            if suffix == "arm64"
-            else "x86_64-pc-windows-msvc"
+            "aarch64-pc-windows-msvc" if suffix == "arm64" else "x86_64-pc-windows-msvc"
         )
         package = Path(shim).parent / "node_modules" / "@openai" / "codex"
         candidates = (
@@ -57,15 +55,23 @@ def _toml_inline(value: str | dict[str, Any]) -> str:
     if isinstance(value, str):
         return json.dumps(value)
     if isinstance(value, dict):
-        return "{" + ", ".join(
-            f"{json.dumps(str(key))} = {_toml_inline(child)}"
-            for key, child in value.items()
-        ) + "}"
+        return (
+            "{"
+            + ", ".join(
+                f"{json.dumps(str(key))} = {_toml_inline(child)}"
+                for key, child in value.items()
+            )
+            + "}"
+        )
     raise ValueError("unsupported Codex worker permission value")
 
 
 def _ollama_catalog_path() -> Path:
-    return Path(__file__).resolve().parents[3] / "local-config" / "ollama-model-catalog.json"
+    return (
+        Path(__file__).resolve().parents[3]
+        / "local-config"
+        / "ollama-model-catalog.json"
+    )
 
 
 def _ollama_model_catalog(model: str, reasoning_effort: str) -> Path:
@@ -75,22 +81,36 @@ def _ollama_model_catalog(model: str, reasoning_effort: str) -> Path:
         catalog = json.loads(path.read_text(encoding="utf-8"))
         entries = catalog["models"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise ValueError(f"prepare the operator-owned Ollama model catalog: {path}") from exc
+        raise ValueError(
+            f"prepare the operator-owned Ollama model catalog: {path}"
+        ) from exc
     if not isinstance(entries, list):
         raise ValueError(f"invalid Ollama model catalog: {path}")
-    matching = [item for item in entries if isinstance(item, dict) and item.get("slug") == model]
+    matching = [
+        item for item in entries if isinstance(item, dict) and item.get("slug") == model
+    ]
     if len(matching) != 1:
-        raise ValueError(f"Ollama model catalog must contain exactly one entry for {model}")
+        raise ValueError(
+            f"Ollama model catalog must contain exactly one entry for {model}"
+        )
     levels = matching[0].get("supported_reasoning_levels", [])
     if not isinstance(levels, list) or reasoning_effort not in {
         item.get("effort") for item in levels if isinstance(item, dict)
     }:
-        raise ValueError(f"Ollama model {model} does not advertise reasoning effort {reasoning_effort}")
+        raise ValueError(
+            f"Ollama model {model} does not advertise reasoning effort {reasoning_effort}"
+        )
     return path.resolve()
 
 
-def _isolation_overrides(worktree: str, permission_mode: str, isolation_config_path: str | None = None) -> list[str]:
-    config_path = Path(isolation_config_path) if isolation_config_path else Path(worktree) / ".codex" / "config.toml"
+def _isolation_overrides(
+    worktree: str, permission_mode: str, isolation_config_path: str | None = None
+) -> list[str]:
+    config_path = (
+        Path(isolation_config_path)
+        if isolation_config_path
+        else Path(worktree) / ".codex" / "config.toml"
+    )
     if not config_path.is_file():
         if Path(worktree).exists():
             raise ValueError(f"Codex worker isolation profile missing: {config_path}")
@@ -103,7 +123,10 @@ def _isolation_overrides(worktree: str, permission_mode: str, isolation_config_p
     if not isinstance(filesystem, dict) or not filesystem:
         raise ValueError(f"Codex worker filesystem profile missing: {config_path}")
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
-    if permission_mode == "worker-isolated" and filesystem.get(str(codex_home)) != "deny":
+    if (
+        permission_mode == "worker-isolated"
+        and filesystem.get(str(codex_home)) != "deny"
+    ):
         raise ValueError(f"Codex worker auth directory is not denied: {config_path}")
     return [
         f'permissions.{permission_mode}.extends=":workspace"',
@@ -111,7 +134,9 @@ def _isolation_overrides(worktree: str, permission_mode: str, isolation_config_p
     ]
 
 
-def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict[str, str]:
+def validate_launch_config(
+    *, model: str, launch_config: dict[str, Any]
+) -> dict[str, str]:
     """Validate every Codex model preference before a provider can start."""
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Codex model must be configured")
@@ -120,9 +145,13 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
     missing = sorted(_LAUNCH_CONFIG_KEYS - set(launch_config))
     if missing:
         raise ValueError(f"Codex launch_config is missing: {', '.join(missing)}")
-    unsupported = sorted(set(launch_config) - _LAUNCH_CONFIG_KEYS - _OPTIONAL_LAUNCH_CONFIG_KEYS)
+    unsupported = sorted(
+        set(launch_config) - _LAUNCH_CONFIG_KEYS - _OPTIONAL_LAUNCH_CONFIG_KEYS
+    )
     if unsupported:
-        raise ValueError(f"Codex launch_config has unsupported options: {', '.join(unsupported)}")
+        raise ValueError(
+            f"Codex launch_config has unsupported options: {', '.join(unsupported)}"
+        )
     normalized: dict[str, str] = {}
     for key in sorted(_LAUNCH_CONFIG_KEYS):
         value = launch_config[key]
@@ -134,8 +163,14 @@ def validate_launch_config(*, model: str, launch_config: dict[str, Any]) -> dict
             raise ValueError("Codex launch_config launcher must be codex or ollama")
         normalized["launcher"] = launch_config["launcher"]
     if "permission_mode" in launch_config:
-        if launch_config["permission_mode"] not in ("worker-isolated", "worker-workspace", "yolo"):
-            raise ValueError("Codex launch_config permission_mode must be worker-workspace, worker-isolated, or yolo")
+        if launch_config["permission_mode"] not in (
+            "worker-isolated",
+            "worker-workspace",
+            "yolo",
+        ):
+            raise ValueError(
+                "Codex launch_config permission_mode must be worker-workspace, worker-isolated, or yolo"
+            )
         normalized["permission_mode"] = launch_config["permission_mode"]
     return normalized
 
@@ -158,9 +193,12 @@ def build_argv(
     else:
         # Omission is the historical strict contract for saved invocations.
         permission_mode = configured.get("permission_mode", "worker-isolated")
-        isolation_overrides = _isolation_overrides(worktree, permission_mode, isolation_config_path)
+        isolation_overrides = _isolation_overrides(
+            worktree, permission_mode, isolation_config_path
+        )
         permission_args = [
-            "-c", f'default_permissions={json.dumps(permission_mode)}',
+            "-c",
+            f"default_permissions={json.dumps(permission_mode)}",
             *[part for override in isolation_overrides for part in ("-c", override)],
             *(["-c", 'windows.sandbox="elevated"'] if os.name == "nt" else []),
         ]
@@ -204,8 +242,10 @@ def build_argv(
         # before closing reasoning, corrupting the history replayed by Codex.
         # Omit that tool even when the task never intends to search the web.
         argv[-1:-1] = [
-            "-c", 'web_search="disabled"',
-            "-c", f"model_catalog_json={json.dumps(str(catalog))}",
+            "-c",
+            'web_search="disabled"',
+            "-c",
+            f"model_catalog_json={json.dumps(str(catalog))}",
         ]
     argv[0] = _direct_codex_executable()
     return argv
@@ -220,7 +260,13 @@ def parse_line(line: str) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     raw_type = value.get("type")
-    if raw_type not in {"thread.started", "item.completed", "turn.completed", "turn.failed", "turn.cancelled"}:
+    if raw_type not in {
+        "thread.started",
+        "item.completed",
+        "turn.completed",
+        "turn.failed",
+        "turn.cancelled",
+    }:
         return None
     session_id = value.get("thread_id") or value.get("threadId")
     parsed: dict[str, Any] = {}

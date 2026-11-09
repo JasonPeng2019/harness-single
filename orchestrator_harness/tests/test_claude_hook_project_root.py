@@ -29,23 +29,31 @@ class ClaudeHookProjectRootTests(unittest.TestCase):
             },
         }
         setup._validate_worker_commands("claude-code", ".claude", files)
-        settings = json.loads((payload / ".claude/settings.json").read_text(encoding="utf-8"))
+        settings = json.loads(
+            (payload / ".claude/settings.json").read_text(encoding="utf-8")
+        )
         for event, groups in settings["hooks"].items():
             command = groups[0]["hooks"][0]["command"]
             self.assertEqual(
-                f'python "${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{HOOKS[event]}"', command
+                f'python "${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{HOOKS[event]}"',
+                command,
             )
 
     def test_declared_commands_open_both_payloads_from_nested_unicode_cwd(self) -> None:
         for payload_name in ("root", "super-cache"):
-            with self.subTest(payload=payload_name), tempfile.TemporaryDirectory(
-                prefix="claude-root-", ignore_cleanup_errors=True
-            ) as raw:
+            with (
+                self.subTest(payload=payload_name),
+                tempfile.TemporaryDirectory(
+                    prefix="claude-root-", ignore_cleanup_errors=True
+                ) as raw,
+            ):
                 project = Path(raw) / "project space \u03a9"
                 nested = project / "nested path" / "deeper"
                 nested.mkdir(parents=True)
                 payload = CLAUDE / payload_name
-                settings = json.loads((payload / ".claude/settings.json").read_text(encoding="utf-8"))
+                settings = json.loads(
+                    (payload / ".claude/settings.json").read_text(encoding="utf-8")
+                )
                 for hook_name in HOOKS.values():
                     destination = project / ".claude/hooks" / hook_name
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +64,9 @@ class ClaudeHookProjectRootTests(unittest.TestCase):
                         project / ".agent-workspace",
                     )
                 else:
-                    (project / ".claude" / "orchestrator-harness-binding.json").write_text("{}", encoding="utf-8")
+                    (
+                        project / ".claude" / "orchestrator-harness-binding.json"
+                    ).write_text("{}", encoding="utf-8")
                 # The wrapper emits a JSON decision even when a deliberately minimal
                 # fixture has no live binding; stdout proves Python opened the target.
                 env = dict(os.environ, CLAUDE_PROJECT_DIR=str(project))
@@ -64,15 +74,25 @@ class ClaudeHookProjectRootTests(unittest.TestCase):
                 candidates = []
                 if git:
                     git_root = Path(git).resolve().parents[1]
-                    candidates = [git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"]
+                    candidates = [
+                        git_root / "bin" / "bash.exe",
+                        git_root / "usr" / "bin" / "bash.exe",
+                    ]
                 bash = next((path for path in candidates if path.is_file()), None)
                 if bash is None:
-                    self.skipTest("Git Bash is required to execute Claude's POSIX hook command")
+                    self.skipTest(
+                        "Git Bash is required to execute Claude's POSIX hook command"
+                    )
                 for event, groups in settings["hooks"].items():
                     command = groups[0]["hooks"][0]["command"]
                     run = subprocess.run(
-                        [str(bash), "-c", command], cwd=nested, env=env, input="{}\n",
-                        text=True, capture_output=True, timeout=15,
+                        [str(bash), "-c", command],
+                        cwd=nested,
+                        env=env,
+                        input="{}\n",
+                        text=True,
+                        capture_output=True,
+                        timeout=15,
                     )
                     self.assertEqual(0, run.returncode, run.stderr)
                     self.assertIsInstance(json.loads(run.stdout), dict)

@@ -1,4 +1,4 @@
-﻿"""Portable record storage: advisory locks, atomic replace, and JSON records.
+"""Portable record storage: advisory locks, atomic replace, and JSON records.
 
 The v2 harness relies only on portable guarantees: same-volume atomic rename
 and advisory process-scoped file locks.  Every record that can be replaced is
@@ -54,6 +54,7 @@ class RecordError(OSError):
 
 def _read_plain_json(path: Path) -> dict[str, Any]:
     from .mutation import _lexical, read_bytes
+
     target = _lexical(path)
     value = json.loads(read_bytes(target.parent, target.name).decode("utf-8"))
     if not isinstance(value, dict):
@@ -102,6 +103,7 @@ class RecordLock:
         handle = None
         try:
             from .mutation import ensure_directory_path, open_append_file
+
             if self.root is None:
                 ensure_directory_path(self.lock_path.parent)
             root = self.root if self.root is not None else self.lock_path.parent
@@ -210,6 +212,7 @@ def runtime_admission_lock(rt: Path):
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Publish complete bytes under held no-follow ancestors."""
     from .mutation import _lexical, ensure_directory_path, publish_bytes
+
     target = _lexical(path)
     ensure_directory_path(target.parent)
     publish_bytes(target.parent, target.name, data)
@@ -239,6 +242,7 @@ def write_record(path: Path, schema: str, fields: dict[str, Any]) -> dict[str, A
 def remove_record(path: Path) -> None:
     """Remove one record file under its short lock (missing is a no-op)."""
     from .mutation import _lexical, delete
+
     target = _lexical(path)
     with RecordLock(target):
         delete(target.parent, target.name)
@@ -267,13 +271,16 @@ def update_record(
     return record
 
 
-def append_jsonl(path: Path, record: dict[str, Any], *, header: dict[str, Any] | None = None) -> None:
+def append_jsonl(
+    path: Path, record: dict[str, Any], *, header: dict[str, Any] | None = None
+) -> None:
     """Append one event object to a JSONL audit log under its short lock.
 
     When ``header`` is given and the file is absent or empty, the header object
     is written as the first line first.
     """
     from .mutation import _lexical, open_append_file, MutationConflict
+
     target = _lexical(path)
     data = canonical_json(record) + b"\n"
     header_data = canonical_json(header) + b"\n" if header is not None else b""
@@ -292,8 +299,11 @@ def append_jsonl(path: Path, record: dict[str, Any], *, header: dict[str, Any] |
             os.fsync(handle.fileno())
             after = os.fstat(handle.fileno())
             named = anchored.anchor.stat(target.name)
-            if (after.st_nlink != 1 or after.st_size != before.st_size + len(payload)
-                    or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)):
+            if (
+                after.st_nlink != 1
+                or after.st_size != before.st_size + len(payload)
+                or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)
+            ):
                 raise MutationConflict("record append target changed during writing")
             anchored.anchor.assert_stable()
 
@@ -301,6 +311,7 @@ def append_jsonl(path: Path, record: dict[str, Any], *, header: dict[str, Any] |
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Read a JSONL audit log, skipping a malformed trailing line."""
     from .mutation import _lexical, read_bytes
+
     target = _lexical(path)
     try:
         raw = read_bytes(target.parent, target.name)

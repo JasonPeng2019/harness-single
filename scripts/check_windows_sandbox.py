@@ -1,4 +1,5 @@
 """Inspect sandbox readiness without running any launcher, helper, or repair."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,21 +15,37 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--harness-dir", required=True, type=Path)
     parser.add_argument("--workspace", type=Path)
-    parser.add_argument("--permission-mode", choices=("worker-isolated", "worker-workspace"),
-                        help="selected worker profile; omit for the historical ROOT health check")
-    parser.add_argument("--profile-config", type=Path,
-                        help="exact prepared worker .codex/config.toml to validate")
+    parser.add_argument(
+        "--permission-mode",
+        choices=("worker-isolated", "worker-workspace"),
+        help="selected worker profile; omit for the historical ROOT health check",
+    )
+    parser.add_argument(
+        "--profile-config",
+        type=Path,
+        help="exact prepared worker .codex/config.toml to validate",
+    )
     args = parser.parse_args()
     try:
         result = require_ready(
-            args.harness_dir.resolve(), workspace=args.workspace,
+            args.harness_dir.resolve(),
+            workspace=args.workspace,
             permission_mode=args.permission_mode,
-            isolation_config_path=args.profile_config.resolve() if args.profile_config else None,
+            isolation_config_path=args.profile_config.resolve()
+            if args.profile_config
+            else None,
         )
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    print(json.dumps({"status": "PASS" if result is not None else "NOT_APPLICABLE", "sandbox_health": result}))
+    print(
+        json.dumps(
+            {
+                "status": "PASS" if result is not None else "NOT_APPLICABLE",
+                "sandbox_health": result,
+            }
+        )
+    )
     return 0
 
 

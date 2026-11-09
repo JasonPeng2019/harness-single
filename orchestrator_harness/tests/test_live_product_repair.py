@@ -9,10 +9,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from orchestrator_harness import controller, git_source, lanes, launch, mutation, processes, records, review, setup
+from orchestrator_harness import (
+    controller,
+    git_source,
+    lanes,
+    launch,
+    mutation,
+    processes,
+    records,
+    review,
+    setup,
+)
 from orchestrator_harness.core import content_hash, iso_utc
 from orchestrator_harness.epochs import lane_record_dir
-from orchestrator_harness.tests.support import prepare_lane_fixture, seed_provider_history
+from orchestrator_harness.tests.support import (
+    prepare_lane_fixture,
+    seed_provider_history,
+)
 
 
 def _windows_error(code: int) -> OSError:
@@ -56,12 +69,16 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         self.assertEqual([], list(self.root.glob(".record.json.*.tmp")))
 
     @unittest.skipUnless(os.name == "nt", "native Windows record replacement retry")
-    def test_record_permanent_replacement_error_is_immediate_and_preserves_old(self) -> None:
+    def test_record_permanent_replacement_error_is_immediate_and_preserves_old(
+        self,
+    ) -> None:
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
         with (
             patch.object(records.os, "name", "nt"),
-            patch.object(records.os, "replace", side_effect=_windows_error(5)) as replace,
+            patch.object(
+                records.os, "replace", side_effect=_windows_error(5)
+            ) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
         ):
@@ -78,7 +95,9 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         target.write_bytes(b"old\n")
         with (
             patch.object(records.os, "name", "nt"),
-            patch.object(records.os, "replace", side_effect=_windows_error(123)) as replace,
+            patch.object(
+                records.os, "replace", side_effect=_windows_error(123)
+            ) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
         ):
@@ -104,7 +123,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 1:
-                return 0xc0000043 - 2**32
+                return 0xC0000043 - 2**32
             return real_replace(*args)
 
         with (
@@ -134,7 +153,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 2:
-                return 0xc0000022 - 2**32
+                return 0xC0000022 - 2**32
             return real_replace(*args)
 
         with (
@@ -155,7 +174,9 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         staging = self.root / ".super-cache.staging"
         staging.mkdir()
         with (
-            patch.object(mutation, "_NtSetInformationFile", return_value=0xc0000022 - 2**32) as replace,
+            patch.object(
+                mutation, "_NtSetInformationFile", return_value=0xC0000022 - 2**32
+            ) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
         ):
@@ -193,7 +214,10 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             "provider": {
                 "id": "codex",
                 "model": "configured-model",
-                "launch_config": {"reasoning_effort": "high", "service_tier": "priority"},
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
             },
         }
         binding = (
@@ -213,10 +237,13 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
 
     def _controller(self) -> subprocess.Popen[bytes]:
         """A real controller stand-in that runs until the test releases its handle."""
-        child = subprocess.Popen([sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
 
         def stop() -> None:
             # Exact cleanup through the owned handle only.
@@ -239,14 +266,18 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         self.assertIsNotNone(identity)
         self._release(child)
         child.wait(timeout=10)
-        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
+        self.assertTrue(
+            processes.identity_exit_proven(identity["pid"], identity["creation_time"])
+        )
         return identity
 
     def test_provider_start_failure_clears_exact_controller_identity_after_handle_exit(
         self,
     ) -> None:
         lane = prepare_lane_fixture(
-            self.runtime, "epoch-1", {**self.lane, "provider": self.invocation["provider"]}
+            self.runtime,
+            "epoch-1",
+            {**self.lane, "provider": self.invocation["provider"]},
         )
         seed_provider_history(self.runtime, lane)
         lane = lanes.write_lane(self.runtime, "epoch-1", "lane-1", lane)
@@ -269,20 +300,27 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
             if len(updates) == 2:
                 # Registered: the controller cannot start its provider, publishes
                 # its terminal status and event, then exits on its own.
-                controller._write_status(value, {
-                    "controller_identity": value["process"],
-                    "controller_state": "exited",
-                    "provider_state": {"state": "not_started"},
-                    "cleanup_proven": True,
-                    "recorded_status": "provider_start_failed",
-                    "provider_start_error": "provider executable is missing",
-                    "process_boundary": None,
-                    "cleanup_error": None,
-                })
+                controller._write_status(
+                    value,
+                    {
+                        "controller_identity": value["process"],
+                        "controller_state": "exited",
+                        "provider_state": {"state": "not_started"},
+                        "cleanup_proven": True,
+                        "recorded_status": "provider_start_failed",
+                        "provider_start_error": "provider executable is missing",
+                        "process_boundary": None,
+                        "cleanup_error": None,
+                    },
+                )
                 records.append_jsonl(
                     Path(value["controller_events_path"]),
-                    {"ts": iso_utc(), "run_id": value["run_id"], "event_type": "provider_start_failed",
-                     "detail": "provider executable is missing"},
+                    {
+                        "ts": iso_utc(),
+                        "run_id": value["run_id"],
+                        "event_type": "provider_start_failed",
+                        "detail": "provider executable is missing",
+                    },
                     header={"schema": controller.CONTROLLER_EVENTS_SCHEMA},
                 )
                 self._release(spawned[0])
@@ -311,51 +349,94 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(1, len(spawned))
         identity = updates[1]["process"]
         self.assertEqual(spawned[0].pid, identity["pid"])
-        self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
+        self.assertTrue(
+            processes.identity_exit_proven(identity["pid"], identity["creation_time"])
+        )
         self.assertEqual({}, updates[-1]["process"])
-        self.assertEqual({}, lanes.read_lane(self.runtime, "epoch-1", "lane-1")["process"])
+        self.assertEqual(
+            {}, lanes.read_lane(self.runtime, "epoch-1", "lane-1")["process"]
+        )
 
     def test_retire_waits_for_controller_handle_after_exited_status(self) -> None:
-        lane = prepare_lane_fixture(self.runtime, "epoch-1", {
-            **self.lane, "lifecycle": "review_pending", "provider": self.invocation["provider"],
-        })
+        lane = prepare_lane_fixture(
+            self.runtime,
+            "epoch-1",
+            {
+                **self.lane,
+                "lifecycle": "review_pending",
+                "provider": self.invocation["provider"],
+            },
+        )
         result = {
-            "schema": "result/v1", "lane_id": "lane-1", "run_id": "run-1",
-            "worker_invocation_id": "run-1", "task_card_hash": lane["task_card_hash"],
+            "schema": "result/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worker_invocation_id": "run-1",
+            "task_card_hash": lane["task_card_hash"],
             "branch": lane["git_source"]["branch_ref"].removeprefix("refs/heads/"),
-            "commit": git_source.current_tip(lane), "outcome": "PASS", "summary": "completed",
-            "checks": [{"name": "fixture", "command": ["python", "-m", "unittest"], "outcome": "PASS"}],
-            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}], "completed_at": iso_utc(),
+            "commit": git_source.current_tip(lane),
+            "outcome": "PASS",
+            "summary": "completed",
+            "checks": [
+                {
+                    "name": "fixture",
+                    "command": ["python", "-m", "unittest"],
+                    "outcome": "PASS",
+                }
+            ],
+            "evidence": [{"stdout": "native diagnostics", "exit_code": 0}],
+            "completed_at": iso_utc(),
         }
         result["content_hash"] = content_hash(result)
         records.atomic_write_json(Path(lane["result_path"]), result)
         review._write_pair(
-            self.runtime, "epoch-1", lane, review_outcome="PASS", review_summary="reviewed",
-            evidence=[], approval="ACCEPTED", force_accept_reason=None,
+            self.runtime,
+            "epoch-1",
+            lane,
+            review_outcome="PASS",
+            review_summary="reviewed",
+            evidence=[],
+            approval="ACCEPTED",
+            force_accept_reason=None,
         )
-        acceptance_path = lane_record_dir(self.runtime, "epoch-1", "lane-1") / "ORCHESTRATOR_ACCEPTANCE.json"
+        acceptance_path = (
+            lane_record_dir(self.runtime, "epoch-1", "lane-1")
+            / "ORCHESTRATOR_ACCEPTANCE.json"
+        )
         provider = self._exited_identity()
         handle = self._controller()
         identity = processes.process_identity(handle.pid)
         self.assertIsNotNone(identity)
-        lane = lanes.write_lane(self.runtime, "epoch-1", "lane-1", {
-            **lane, "lifecycle": "accepted", "process": identity,
-        })
+        lane = lanes.write_lane(
+            self.runtime,
+            "epoch-1",
+            "lane-1",
+            {
+                **lane,
+                "lifecycle": "accepted",
+                "process": identity,
+            },
+        )
         # The controller has published exited/cleanup-proven status, but its
         # process handle has not exited yet.
-        controller._write_status(lane, {
-            "controller_identity": identity,
-            "controller_state": "exited",
-            "provider_state": {"state": "exited", **provider, "exit_code": 0},
-            "process_boundary": {"root": provider, "processes": [provider]},
-            "cleanup_proven": True,
-            "recorded_status": "review_pending",
-        })
+        controller._write_status(
+            lane,
+            {
+                "controller_identity": identity,
+                "controller_state": "exited",
+                "provider_state": {"state": "exited", **provider, "exit_code": 0},
+                "process_boundary": {"root": provider, "processes": [provider]},
+                "cleanup_proven": True,
+                "recorded_status": "review_pending",
+            },
+        )
         real_wait = launch._wait_for_controller_exit
         waited: list[bool] = []
 
         def wait_for_exit(current: dict[str, object], timeout_seconds: float) -> bool:
-            self.assertTrue(processes.identity_matches(identity["pid"], identity["creation_time"]))
+            self.assertTrue(
+                processes.identity_matches(identity["pid"], identity["creation_time"])
+            )
             self._release(handle)
             handle.wait(timeout=10)
             waited.append(real_wait(current, timeout_seconds))
@@ -371,9 +452,13 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
                 ),
             ),
             patch.object(launch, "find_active_lane", return_value=("epoch-1", lane)),
-            patch.object(launch, "_wait_for_controller_exit", side_effect=wait_for_exit),
+            patch.object(
+                launch, "_wait_for_controller_exit", side_effect=wait_for_exit
+            ),
             # Provider boundary proof is covered elsewhere; the controller handle is the subject.
-            patch.object(launch.processes, "process_boundary_is_gone", return_value=True),
+            patch.object(
+                launch.processes, "process_boundary_is_gone", return_value=True
+            ),
             patch.object(launch, "release_leases"),
             patch.object(launch, "read_active_lanes", return_value=[]),
             patch.object(launch, "write_active_lanes"),
@@ -385,7 +470,10 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
         self.assertTrue(outcome["ok"], outcome)
         self.assertEqual("RETIRE_OK", outcome["code"])
         self.assertEqual([True], waited)
-        self.assertEqual("retired", lanes.read_lane(self.runtime, "epoch-1", "lane-1")["lifecycle"])
+        self.assertEqual(
+            "retired", lanes.read_lane(self.runtime, "epoch-1", "lane-1")["lifecycle"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

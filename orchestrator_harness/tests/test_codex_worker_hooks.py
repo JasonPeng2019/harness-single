@@ -169,9 +169,7 @@ class CodexWorkerHooksTestCase(unittest.TestCase):
         command = _invoked_command(run)
         self.assertIn(str(HOOK_DISPATCH_PATH), command)
         self.assertIn("--boundary", command)
-        self.assertEqual(
-            command[command.index("--boundary") + 1], STOP_BOUNDARY
-        )
+        self.assertEqual(command[command.index("--boundary") + 1], STOP_BOUNDARY)
         self.assertNotIn(POST_TOOL_USE_BOUNDARY, command)
 
 

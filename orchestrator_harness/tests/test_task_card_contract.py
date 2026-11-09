@@ -1,4 +1,5 @@
 """Contract tests for required project task-card outcome fields."""
+
 from __future__ import annotations
 
 import copy
@@ -104,7 +105,9 @@ class TaskCardContractTests(unittest.TestCase):
             managed=False,
         )
 
-        outcome_prompt, completion = path.read_text(encoding="utf-8").split("\n\n## Completion record\n")
+        outcome_prompt, completion = path.read_text(encoding="utf-8").split(
+            "\n\n## Completion record\n"
+        )
         self.assertEqual(
             """Implement the task-card contract
 
@@ -121,9 +124,19 @@ The criteria define success and the deliverables make it reviewable.
 """,
             outcome_prompt + "\n",
         )
-        for required in ("RESULT.json", "worker_invocation_id", "task_card_hash", "branch",
-                         "full current assigned branch tip", "checks", "evidence", "ISO timestamp",
-                         "Commit project changes", "content_hash", "FAIL/BLOCKED"):
+        for required in (
+            "RESULT.json",
+            "worker_invocation_id",
+            "task_card_hash",
+            "branch",
+            "full current assigned branch tip",
+            "checks",
+            "evidence",
+            "ISO timestamp",
+            "Commit project changes",
+            "content_hash",
+            "FAIL/BLOCKED",
+        ):
             self.assertIn(required, completion)
 
     def test_review_refuses_a_structurally_valid_changed_protected_card(self) -> None:

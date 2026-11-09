@@ -42,7 +42,10 @@ class AtomicAndConcurrencyOracleTests(unittest.TestCase):
                     held.append(identity)
                     events.append(identity)
 
-        workers = [threading.Thread(target=contender, args=(identity,)) for identity in ("left", "right")]
+        workers = [
+            threading.Thread(target=contender, args=(identity,))
+            for identity in ("left", "right")
+        ]
         for worker in workers:
             worker.start()
         barrier.wait()

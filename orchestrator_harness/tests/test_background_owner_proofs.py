@@ -1,4 +1,5 @@
 """Exact background ownership survives replacement and CLOSED re-observation."""
+
 from __future__ import annotations
 
 import os
@@ -9,7 +10,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from orchestrator_harness import config, epochs, lanes, monitor, processes, setup, shutdown
+from orchestrator_harness import (
+    config,
+    epochs,
+    lanes,
+    monitor,
+    processes,
+    setup,
+    shutdown,
+)
 from orchestrator_harness.records import atomic_write_json
 
 
@@ -26,29 +35,43 @@ class BackgroundOwnerProofTests(unittest.TestCase):
         setup.set_runtime_state(self.rt, "OPEN")
 
     def shutdown(self):
-        with (patch.object(shutdown, "find_harness_root", return_value=self.harness),
-              patch.object(shutdown, "load_config", return_value=self.config),
-              patch.object(shutdown, "_prune_worktrees")):
+        with (
+            patch.object(shutdown, "find_harness_root", return_value=self.harness),
+            patch.object(shutdown, "load_config", return_value=self.config),
+            patch.object(shutdown, "_prune_worktrees"),
+        ):
             return shutdown.run_shutdown()
 
     def record(self, identity=None, startup_id="3" * 32, **fields):
-        record = {"schema": setup.MONITOR_SCHEMA,
-                  **(identity or processes.process_identity(os.getpid())),
-                  "config_identity": "fixture", "startup_id": startup_id,
-                  "health": "healthy", "stop_requested": False, **fields}
+        record = {
+            "schema": setup.MONITOR_SCHEMA,
+            **(identity or processes.process_identity(os.getpid())),
+            "config_identity": "fixture",
+            "startup_id": startup_id,
+            "health": "healthy",
+            "stop_requested": False,
+            **fields,
+        }
         atomic_write_json(setup.monitor_record_path(self.rt), record)
         return record
 
     def dead_child(self):
-        child = subprocess.Popen([sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
         try:
             identity = processes.process_identity(child.pid)
             self.assertIsNotNone(identity)
             child.communicate(b"x", timeout=10)
-            self.assertTrue(processes.identity_exit_proven(identity["pid"], identity["creation_time"]))
+            self.assertTrue(
+                processes.identity_exit_proven(
+                    identity["pid"], identity["creation_time"]
+                )
+            )
             return identity
         finally:
             if child.poll() is None:
@@ -61,7 +84,9 @@ class BackgroundOwnerProofTests(unittest.TestCase):
         self.record(startup_id="4" * 32)
         path = setup.monitor_record_path(self.rt)
         original = path.read_bytes()
-        monitor._heartbeat(self.rt, "fixture", 9, [{"error": "old owner"}], monitor_owner=owner)
+        monitor._heartbeat(
+            self.rt, "fixture", 9, [{"error": "old owner"}], monitor_owner=owner
+        )
         with self.assertRaisesRegex(ValueError, "ownership changed"):
             monitor._monitor_pass(self.rt, "fixture", monitor_owner=owner)
         self.assertEqual(original, path.read_bytes())
@@ -79,13 +104,21 @@ class BackgroundOwnerProofTests(unittest.TestCase):
                 atomic_write_json(setup.monitor_record_path(rt), new)
             return original_require(rt, owner)
 
-        with (patch.object(monitor, "find_harness_root", return_value=self.harness),
-              patch.object(monitor, "load_config", return_value=self.config),
-              patch.object(monitor, "load_resource_manifest", return_value=config.ResourceManifest()),
-              patch.object(monitor, "compute_config_identity", return_value="fixture"),
-              patch.object(monitor, "_require_monitor_owner", side_effect=observe)):
+        with (
+            patch.object(monitor, "find_harness_root", return_value=self.harness),
+            patch.object(monitor, "load_config", return_value=self.config),
+            patch.object(
+                monitor,
+                "load_resource_manifest",
+                return_value=config.ResourceManifest(),
+            ),
+            patch.object(monitor, "compute_config_identity", return_value="fixture"),
+            patch.object(monitor, "_require_monitor_owner", side_effect=observe),
+        ):
             # Setup hands the reserved nonce to the exact monitor it starts.
-            with patch.dict(os.environ, {"HARNESS_MONITOR_STARTUP_ID": old["startup_id"]}):
+            with patch.dict(
+                os.environ, {"HARNESS_MONITOR_STARTUP_ID": old["startup_id"]}
+            ):
                 self.assertEqual(1, monitor.main())
             self.assertEqual(2, len(calls))
             self.assertEqual(new, setup.read_monitor_record(self.rt))
@@ -126,14 +159,27 @@ class BackgroundOwnerProofTests(unittest.TestCase):
         self.assertFalse(self.shutdown()["ok"])
 
     def test_retired_preparation_retains_run_bound_cleanup_proof(self):
-        epoch = epochs.open_epoch(self.rt, self.config, config.ResourceManifest())["epoch_id"]
+        epoch = epochs.open_epoch(self.rt, self.config, config.ResourceManifest())[
+            "epoch_id"
+        ]
         worktree = self.workspace / "worker"
         worktree.mkdir()
-        lane = lanes.write_lane(self.rt, epoch, "worker", {
-            "run_id": "initial", "provider": {"id": "qwen-code"}, "lifecycle": "prepared",
-            "worktree_path": str(worktree), "process": {},
-            "controller_status_path": str(worktree / "status.json")})
-        epochs.write_active_lanes(self.rt, epoch, [{"lane_id": "worker", "run_id": "initial"}])
+        lane = lanes.write_lane(
+            self.rt,
+            epoch,
+            "worker",
+            {
+                "run_id": "initial",
+                "provider": {"id": "qwen-code"},
+                "lifecycle": "prepared",
+                "worktree_path": str(worktree),
+                "process": {},
+                "controller_status_path": str(worktree / "status.json"),
+            },
+        )
+        epochs.write_active_lanes(
+            self.rt, epoch, [{"lane_id": "worker", "run_id": "initial"}]
+        )
         self.assertTrue(self.shutdown()["ok"])
         retired = lanes.read_lane(self.rt, epoch, "worker")
         self.assertEqual(lane["run_id"], retired["retirement_proof"]["run_id"])

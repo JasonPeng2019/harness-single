@@ -410,14 +410,25 @@ class PreparedOutputTransaction:
             raise PathSafetyError(f"output parent does not exist: {lexical.parent}")
         return lexical
 
-    def atomic_json(self, path: Path, value: Any, *, expected: TargetState | None = None) -> None:
+    def atomic_json(
+        self, path: Path, value: Any, *, expected: TargetState | None = None
+    ) -> None:
         target = self._admit_for_write(path)
         data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
         try:
             relative = target.relative_to(self.root)
-            expected = expected if expected is not None else capture_target(self.root, relative)
-            mutation_replace(self.root, relative, data, expected=expected,
-                             expected_root_identity=self.root_identity)
+            expected = (
+                expected
+                if expected is not None
+                else capture_target(self.root, relative)
+            )
+            mutation_replace(
+                self.root,
+                relative,
+                data,
+                expected=expected,
+                expected_root_identity=self.root_identity,
+            )
         except (MutationConflict, MutationUnsupported, ValueError) as exc:
             raise PathSafetyError(str(exc)) from exc
 
@@ -437,13 +448,21 @@ class PreparedOutputTransaction:
 
     def read_bytes(self, path: Path, *, max_bytes: int | None = None) -> bytes:
         target = self.revalidate(path)
-        return mutation_read(self.root, target.relative_to(self.root),
-                             max_bytes=max_bytes, expected_root_identity=self._root_identity)
+        return mutation_read(
+            self.root,
+            target.relative_to(self.root),
+            max_bytes=max_bytes,
+            expected_root_identity=self._root_identity,
+        )
 
     def publish_bytes(self, path: Path, data: bytes) -> None:
         target = self._admit_for_write(path)
-        mutation_publish(self.root, target.relative_to(self.root), data,
-                         expected_root_identity=self._root_identity)
+        mutation_publish(
+            self.root,
+            target.relative_to(self.root),
+            data,
+            expected_root_identity=self._root_identity,
+        )
 
     def publish_json(self, path: Path, value: Any) -> None:
         data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -452,19 +471,39 @@ class PreparedOutputTransaction:
     def delete(self, path: Path) -> None:
         target = self.admit(path)
         relative = target.relative_to(self.root)
-        mutation_delete(self.root, relative, expected=capture_target(self.root, relative),
-                        expected_root_identity=self.root_identity)
+        mutation_delete(
+            self.root,
+            relative,
+            expected=capture_target(self.root, relative),
+            expected_root_identity=self.root_identity,
+        )
 
-    def write_bytes(self, path: Path, data: bytes, *, expected: TargetState | None = None,
-                    expected_directories: DirectoryExpectations | None = None,
-                    metadata: FileMetadata | None = None) -> None:
+    def write_bytes(
+        self,
+        path: Path,
+        data: bytes,
+        *,
+        expected: TargetState | None = None,
+        expected_directories: DirectoryExpectations | None = None,
+        metadata: FileMetadata | None = None,
+    ) -> None:
         target = self._admit_for_write(path)
         try:
             relative = target.relative_to(self.root)
-            expected = expected if expected is not None else capture_target(self.root, relative)
-            mutation_replace(self.root, relative, data, expected=expected,
-                             expected_root_identity=self.root_identity,
-                             expected_directories=expected_directories, metadata=metadata)
+            expected = (
+                expected
+                if expected is not None
+                else capture_target(self.root, relative)
+            )
+            mutation_replace(
+                self.root,
+                relative,
+                data,
+                expected=expected,
+                expected_root_identity=self.root_identity,
+                expected_directories=expected_directories,
+                metadata=metadata,
+            )
         except (MutationConflict, MutationUnsupported, ValueError) as exc:
             raise PathSafetyError(str(exc)) from exc
 
@@ -533,17 +572,34 @@ def _signature(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)
 
 
-def _stable_observation(path: Path, *, max_bytes: int, retries: int, delay_seconds: float,
-                        sleep: Callable[[float], None], tail: bool) -> StableBytes:
-    if (type(max_bytes) is not int or max_bytes < 0 or type(retries) is not int or retries < 1
-            or not isinstance(delay_seconds, (int, float)) or not math.isfinite(delay_seconds)
-            or delay_seconds < 0):
-        raise ValueError("stable read requires a nonnegative bound/delay and positive retries")
+def _stable_observation(
+    path: Path,
+    *,
+    max_bytes: int,
+    retries: int,
+    delay_seconds: float,
+    sleep: Callable[[float], None],
+    tail: bool,
+) -> StableBytes:
+    if (
+        type(max_bytes) is not int
+        or max_bytes < 0
+        or type(retries) is not int
+        or retries < 1
+        or not isinstance(delay_seconds, (int, float))
+        or not math.isfinite(delay_seconds)
+        or delay_seconds < 0
+    ):
+        raise ValueError(
+            "stable read requires a nonnegative bound/delay and positive retries"
+        )
     target = Path(path).absolute()
     reason = "file disappeared"
     for attempt in range(retries):
         try:
-            data, info = _read_file_observation(target.parent, target.name, max_bytes=max_bytes, tail=tail)
+            data, info = _read_file_observation(
+                target.parent, target.name, max_bytes=max_bytes, tail=tail
+            )
         except FileNotFoundError:
             reason = "file disappeared"
         except MutationConflict as exc:
@@ -553,8 +609,14 @@ def _stable_observation(path: Path, *, max_bytes: int, retries: int, delay_secon
         except ValueError as exc:
             raise UnstableReadError(str(exc)) from exc
         else:
-            return StableBytes(path=path, data=data, sha256=sha256_bytes(data), size=info.st_size,
-                               mtime_ns=info.st_mtime_ns, file_id=(info.st_dev, info.st_ino))
+            return StableBytes(
+                path=path,
+                data=data,
+                sha256=sha256_bytes(data),
+                size=info.st_size,
+                mtime_ns=info.st_mtime_ns,
+                file_id=(info.st_dev, info.st_ino),
+            )
         if attempt + 1 < retries and delay_seconds:
             sleep(delay_seconds)
     raise UnstableReadError(f"unstable read for {path}: {reason}")
@@ -568,8 +630,14 @@ def read_stable(
     delay_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> StableBytes:
-    return _stable_observation(path, max_bytes=max_bytes, retries=retries,
-                               delay_seconds=delay_seconds, sleep=sleep, tail=False)
+    return _stable_observation(
+        path,
+        max_bytes=max_bytes,
+        retries=retries,
+        delay_seconds=delay_seconds,
+        sleep=sleep,
+        tail=False,
+    )
 
 
 def read_tail_stable(
@@ -580,8 +648,14 @@ def read_tail_stable(
     delay_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
 ) -> StableBytes:
-    return _stable_observation(path, max_bytes=max_bytes, retries=retries,
-                               delay_seconds=delay_seconds, sleep=sleep, tail=True)
+    return _stable_observation(
+        path,
+        max_bytes=max_bytes,
+        retries=retries,
+        delay_seconds=delay_seconds,
+        sleep=sleep,
+        tail=True,
+    )
 
 
 def _has_ads_syntax(path: Path) -> bool:

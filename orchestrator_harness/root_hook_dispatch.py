@@ -11,9 +11,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, compute_config_identity, load_config, load_resource_manifest
+from .config import (
+    ConfigError,
+    compute_config_identity,
+    load_config,
+    load_resource_manifest,
+)
 from .core import iso_utc
-from .epochs import EpochError, current_epoch_path, manager_queue_path, read_current_epoch
+from .epochs import (
+    EpochError,
+    current_epoch_path,
+    manager_queue_path,
+    read_current_epoch,
+)
 from .manager_queue import ManagerQueueError, read_manager_queue
 from .setup import read_monitor_record, read_runtime_state, require_monitor_ready
 from .records import RecordLock, runtime_admission_lock
@@ -58,7 +68,10 @@ def _notice(
             and (event.get("event_class") or event.get("type"))
         }
     )
-    if diagnostic_class and severity_order.get(highest_severity, 1) <= severity_order["error"]:
+    if (
+        diagnostic_class
+        and severity_order.get(highest_severity, 1) <= severity_order["error"]
+    ):
         highest_classes.append(diagnostic_class)
         highest_classes = sorted(set(highest_classes))
     payload: dict[str, Any] = {
@@ -106,11 +119,11 @@ def _unresolved_events(rt: Path) -> tuple[list[dict[str, Any]] | None, str | Non
     except (ManagerQueueError, OSError, ValueError) as exc:
         return None, f"manager queue is unreadable: {exc}"
     events = queue.get("events")
-    if not isinstance(events, list) or any(not isinstance(item, dict) for item in events):
+    if not isinstance(events, list) or any(
+        not isinstance(item, dict) for item in events
+    ):
         return None, "manager queue events is not a list of objects"
-    return [
-        event for event in events if event.get("state") in UNRESOLVED_STATES
-    ], None
+    return [event for event in events if event.get("state") in UNRESOLVED_STATES], None
 
 
 def unresolved_event_ids(rt: Path) -> list[str]:
@@ -134,7 +147,10 @@ def _monitor_health(rt: Path, config_identity: str) -> tuple[str | None, str | N
         # This classification supplies an action, never readiness credit.
         record = read_monitor_record(rt)
         if record and record.get("health") == "degraded":
-            return "MONITOR_DEGRADED", "monitor reports degraded health; ROOT must inspect and correct the recorded diagnostics"
+            return (
+                "MONITOR_DEGRADED",
+                "monitor reports degraded health; ROOT must inspect and correct the recorded diagnostics",
+            )
         return "MONITOR_UNHEALTHY", str(exc)
 
 
@@ -149,8 +165,10 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
         config = load_config(root)
     except (ConfigError, OSError, ValueError) as exc:
         reason = f"ROOT hook binding cannot load harness config: {exc}"
-        return _reject(reason) if boundary == "stop" else _notice(
-            provider_id, message=reason
+        return (
+            _reject(reason)
+            if boundary == "stop"
+            else _notice(provider_id, message=reason)
         )
     if config.profile != "managed":
         return {"decision": "ALLOW"}
@@ -158,19 +176,30 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
         runtime = read_runtime_state(config.runtime_root)
     except (RuntimeError, OSError, ValueError) as exc:
         reason = f"ROOT hook cannot read managed runtime state: {exc}"
-        return _reject(reason) if boundary == "stop" else _notice(provider_id, message=reason)
+        return (
+            _reject(reason)
+            if boundary == "stop"
+            else _notice(provider_id, message=reason)
+        )
     if runtime is not None and runtime.get("state") == "CLOSED":
         from .shutdown import prove_runtime_closed
+
         try:
             prove_runtime_closed(config.runtime_root, config.root_workspace, root)
         except (RuntimeError, OSError, ValueError) as exc:
             reason = f"ROOT hook cannot prove CLOSED cleanup: {exc}"
-            return _reject(reason) if boundary == "stop" else _notice(provider_id, message=reason)
+            return (
+                _reject(reason)
+                if boundary == "stop"
+                else _notice(provider_id, message=reason)
+            )
         return {"decision": "ALLOW"}
     if runtime is None or runtime.get("state") != "OPEN":
         reason = "ROOT hook cannot prove that the runtime is OPEN"
-        return _reject(reason) if boundary == "stop" else _notice(
-            provider_id, message=reason
+        return (
+            _reject(reason)
+            if boundary == "stop"
+            else _notice(provider_id, message=reason)
         )
 
     recovery_code: str | None = None
@@ -178,25 +207,35 @@ def dispatch(harness_root: Path, boundary: str, provider_id: str) -> dict[str, A
     if boundary == "post-tool-use":
         try:
             identity = compute_config_identity(config, load_resource_manifest(root))
-            recovery_code, health_message = _monitor_health(config.runtime_root, identity)
+            recovery_code, health_message = _monitor_health(
+                config.runtime_root, identity
+            )
         except (ConfigError, OSError, ValueError) as exc:
             recovery_code, health_message = "MONITOR_UNHEALTHY", str(exc)
         if recovery_code is not None:
             recovery_message = health_message
             if recovery_code != "MONITOR_DEGRADED":
-                recovery_message = f"{health_message}; ROOT must run `health monitor-recover`"
+                recovery_message = (
+                    f"{health_message}; ROOT must run `health monitor-recover`"
+                )
 
     unresolved, queue_error = _unresolved_events(config.runtime_root)
     if queue_error is not None:
-        return _reject(queue_error) if boundary == "stop" else _notice(
-            provider_id,
-            monitor_code=recovery_code,
-            message=queue_error,
+        return (
+            _reject(queue_error)
+            if boundary == "stop"
+            else _notice(
+                provider_id,
+                monitor_code=recovery_code,
+                message=queue_error,
+            )
         )
     assert unresolved is not None
     marker = read_current_epoch(config.runtime_root)
     epoch_id = str(marker.get("epoch_id")) if marker else None
-    queue_id = str(marker.get("queue_id")) if marker and marker.get("queue_id") else None
+    queue_id = (
+        str(marker.get("queue_id")) if marker and marker.get("queue_id") else None
+    )
     if boundary == "stop":
         if unresolved:
             return _reject(

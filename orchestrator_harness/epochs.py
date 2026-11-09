@@ -1,4 +1,4 @@
-﻿"""Epochs: one active epoch, launcher-owned open/reuse/close.
+"""Epochs: one active epoch, launcher-owned open/reuse/close.
 
 The public launcher owns the epoch records.  It creates a new epoch only when
 none is active and otherwise reuses the active epoch while its immutable
@@ -14,7 +14,13 @@ from typing import Any
 
 from .config import HarnessConfig, ResourceManifest, compute_config_identity
 from .core import iso_utc, new_id, read_json, require_schema, utc_now
-from .records import RecordLock, atomic_write_json, read_record, write_record, runtime_admission_lock
+from .records import (
+    RecordLock,
+    atomic_write_json,
+    read_record,
+    write_record,
+    runtime_admission_lock,
+)
 from .portable_paths import component as portable_component
 
 CURRENT_EPOCH_SCHEMA = "current-epoch/v1"
@@ -75,8 +81,15 @@ def _record_id(value: object) -> bool:
 
 
 def read_epoch_state(rt: Path, epoch_id: str) -> dict[str, Any]:
-    record = read_record(epoch_dir(rt, epoch_id) / "epoch-state.json", EPOCH_STATE_SCHEMA)
-    if record.get("epoch_id") != epoch_id or record.get("lifecycle") not in {"opening", "active", "closing", "closed"}:
+    record = read_record(
+        epoch_dir(rt, epoch_id) / "epoch-state.json", EPOCH_STATE_SCHEMA
+    )
+    if record.get("epoch_id") != epoch_id or record.get("lifecycle") not in {
+        "opening",
+        "active",
+        "closing",
+        "closed",
+    }:
         raise EpochError(f"epoch state identity or lifecycle is invalid: {epoch_id}")
     return record
 
@@ -91,7 +104,9 @@ def read_active_lanes(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
     for entry in lanes:
         if not isinstance(entry, dict) or not _record_id(entry.get("lane_id")):
             raise EpochError(f"active lane entry is invalid: {path}")
-        if "run_id" in entry and (not isinstance(entry["run_id"], str) or not entry["run_id"]):
+        if "run_id" in entry and (
+            not isinstance(entry["run_id"], str) or not entry["run_id"]
+        ):
             raise EpochError(f"active lane run identity is invalid: {path}")
         identities.append(entry["lane_id"])
     if len(set(identities)) != len(identities):
@@ -110,7 +125,9 @@ def write_active_lanes(rt: Path, epoch_id: str, lanes: list[dict[str, Any]]) -> 
         atomic_write_json(path, record)
 
 
-def _stage_manager_queue(rt: Path, epoch_id: str, *, queue_id: str | None = None) -> str:
+def _stage_manager_queue(
+    rt: Path, epoch_id: str, *, queue_id: str | None = None
+) -> str:
     """Atomically replace the fixed manager queue with a fresh queue_id."""
     queue_id = queue_id or new_id()
     path = manager_queue_path(rt)
@@ -140,7 +157,9 @@ def open_epoch(
         return _open_epoch_locked(rt, config, manifest)
 
 
-def _open_epoch_locked(rt: Path, config: HarnessConfig, manifest: ResourceManifest) -> dict[str, Any]:
+def _open_epoch_locked(
+    rt: Path, config: HarnessConfig, manifest: ResourceManifest
+) -> dict[str, Any]:
     identity = compute_config_identity(config, manifest)
     marker = read_current_epoch(rt)
     if marker is not None:
@@ -171,8 +190,14 @@ def _open_epoch_locked(rt: Path, config: HarnessConfig, manifest: ResourceManife
             elif prior["lifecycle"] != "closed":
                 pending.append(prior)
         if pending:
-            if len(pending) != 1 or pending[0]["lifecycle"] != "opening" or pending[0].get("config_identity") != identity:
-                raise EpochError("unfinished epoch ownership requires explicit reconciliation")
+            if (
+                len(pending) != 1
+                or pending[0]["lifecycle"] != "opening"
+                or pending[0].get("config_identity") != identity
+            ):
+                raise EpochError(
+                    "unfinished epoch ownership requires explicit reconciliation"
+                )
             return _finish_open_epoch(rt, pending[0])
 
     epoch_id = new_id()
@@ -218,9 +243,17 @@ def _finish_open_epoch(rt: Path, state: dict[str, Any]) -> dict[str, Any]:
         if path.exists():
             prior_queue = read_record(path, MANAGER_QUEUE_SCHEMA)
             validate_queue_record(prior_queue)
-            if any(event["state"] in {"PENDING", "ACKNOWLEDGED"} for event in prior_queue["events"]):
-                raise EpochError("cannot replace unresolved manager obligations while opening an epoch")
-            same_queue = prior_queue.get("epoch_id") == epoch_id and prior_queue.get("queue_id") == queue_id
+            if any(
+                event["state"] in {"PENDING", "ACKNOWLEDGED"}
+                for event in prior_queue["events"]
+            ):
+                raise EpochError(
+                    "cannot replace unresolved manager obligations while opening an epoch"
+                )
+            same_queue = (
+                prior_queue.get("epoch_id") == epoch_id
+                and prior_queue.get("queue_id") == queue_id
+            )
         else:
             same_queue = False
         if not same_queue:
@@ -267,9 +300,12 @@ def close_epoch(rt: Path, epoch_id: str) -> None:
                     if queue.get("queue_id") != state.get("closing_queue_id"):
                         raise EpochError("closing epoch queue identity changed")
                 if queue.get("epoch_id") != epoch_id or any(
-                    event["state"] in {"PENDING", "ACKNOWLEDGED"} for event in queue["events"]
+                    event["state"] in {"PENDING", "ACKNOWLEDGED"}
+                    for event in queue["events"]
                 ):
-                    raise EpochError("cannot close an epoch with unresolved or foreign manager obligations")
+                    raise EpochError(
+                        "cannot close an epoch with unresolved or foreign manager obligations"
+                    )
             if state["lifecycle"] != "closed":
                 state["lifecycle"] = "closing"
                 if state.get("lane_mode") == "managed":

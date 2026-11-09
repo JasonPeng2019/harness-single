@@ -280,17 +280,25 @@ class SourceIdentity:
 
 
 _COMMAND_SOURCE_FIELDS = {
-    "{source_root}": "source_root", "{branch}": "branch", "{tip}": "tip",
+    "{source_root}": "source_root",
+    "{branch}": "branch",
+    "{tip}": "tip",
 }
 
 
-def command_for_source(spec: CheckSpec, source: SourceIdentity | None) -> tuple[str, ...]:
+def command_for_source(
+    spec: CheckSpec, source: SourceIdentity | None
+) -> tuple[str, ...]:
     """Bind declared whole-argument placeholders without shell interpolation."""
     if source is None:
         return spec.command
     identity = source.to_record()
-    return tuple(identity[_COMMAND_SOURCE_FIELDS[part]] if part in _COMMAND_SOURCE_FIELDS else part
-                 for part in spec.command)
+    return tuple(
+        identity[_COMMAND_SOURCE_FIELDS[part]]
+        if part in _COMMAND_SOURCE_FIELDS
+        else part
+        for part in spec.command
+    )
 
 
 @dataclass(frozen=True)
@@ -465,21 +473,42 @@ def _scope_matches(scope: InputScope, relative: str) -> bool:
 
 # Owned outputs are not source inputs. A Git ignore rule is insufficient to
 # exclude source: unittest discovery/import can consume ignored Python files.
-_OUTPUT_ROOTS = frozenset({
-    "runtime", "local-config", ".secrets", "multi-agent-logs", "harness_watcher",
-    "test_results", ".harness-runtime", ".agent-workspace",
-})
-_OUTPUT_COMPONENTS = frozenset({
-    ".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
-    "build", "dist",
-})
+_OUTPUT_ROOTS = frozenset(
+    {
+        "runtime",
+        "local-config",
+        ".secrets",
+        "multi-agent-logs",
+        "harness_watcher",
+        "test_results",
+        ".harness-runtime",
+        ".agent-workspace",
+    }
+)
+_OUTPUT_COMPONENTS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        "build",
+        "dist",
+    }
+)
 
 
 def _source_input(relative: str) -> bool:
     parts = PurePosixPath(relative).parts
-    return bool(parts and parts[0] not in _OUTPUT_ROOTS
-                and not any(part in _OUTPUT_COMPONENTS or part.endswith(".egg-info") for part in parts)
-                and not relative.endswith((".pyc", ".pyo")))
+    return bool(
+        parts
+        and parts[0] not in _OUTPUT_ROOTS
+        and not any(
+            part in _OUTPUT_COMPONENTS or part.endswith(".egg-info") for part in parts
+        )
+        and not relative.endswith((".pyc", ".pyo"))
+    )
 
 
 def _candidate_paths(root: Path) -> tuple[str, ...]:
@@ -502,7 +531,13 @@ def _candidate_paths(root: Path) -> tuple[str, ...]:
     except UnicodeDecodeError as exc:
         raise SelectionError(f"candidate input paths are not UTF-8: {exc}") from exc
     paths = tuple(
-        sorted({_relative_path(value, "candidate_path") for value in values if value and _source_input(value)})
+        sorted(
+            {
+                _relative_path(value, "candidate_path")
+                for value in values
+                if value and _source_input(value)
+            }
+        )
     )
     return paths
 
@@ -523,12 +558,15 @@ def _validated_input_path(root: Path, relative: str, *, scope: InputScope) -> Pa
     return candidate
 
 
-def resolve_input_scope(spec: CheckSpec, root: str | Path, *,
-                        candidate_paths: tuple[str, ...] | None = None) -> tuple[str, ...]:
+def resolve_input_scope(
+    spec: CheckSpec, root: str | Path, *, candidate_paths: tuple[str, ...] | None = None
+) -> tuple[str, ...]:
     """Resolve source scopes to tracked/untracked regular files, excluding owned outputs."""
 
     root_path = Path(root).expanduser().resolve(strict=True)
-    candidates = _candidate_paths(root_path) if candidate_paths is None else candidate_paths
+    candidates = (
+        _candidate_paths(root_path) if candidate_paths is None else candidate_paths
+    )
     resolved: list[str] = []
     for scope in spec.input_scopes:
         if scope.kind == "tree":
@@ -637,21 +675,29 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.AFFECTED.INTEGRATED-CONTRACTS",
             "integrated retry, sandbox, ROOT, Git and build/test contracts",
             "affected",
-            ("python", "-B", "-m", "unittest", "-v",
-             "orchestrator_harness.tests.test_retry_policy",
-             "orchestrator_harness.tests.test_protected_retry_history",
-             "orchestrator_harness.tests.test_windows_sandbox_preflight",
-             "scripts.tests.test_probe_windows_worker_isolation",
-             "orchestrator_harness.tests.test_root_hook_dispatch",
-             "orchestrator_harness.tests.test_worker_isolation_boundaries",
-             "orchestrator_harness.tests.test_git_source",
-             "orchestrator_harness.tests.test_result_validation",
-             "orchestrator_harness.tests.test_public_checks",
-             "orchestrator_harness.tests.test_path_portability",
-             "scripts.tests.test_root_prelaunch"),
+            (
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "-v",
+                "orchestrator_harness.tests.test_retry_policy",
+                "orchestrator_harness.tests.test_protected_retry_history",
+                "orchestrator_harness.tests.test_windows_sandbox_preflight",
+                "scripts.tests.test_probe_windows_worker_isolation",
+                "orchestrator_harness.tests.test_root_hook_dispatch",
+                "orchestrator_harness.tests.test_worker_isolation_boundaries",
+                "orchestrator_harness.tests.test_git_source",
+                "orchestrator_harness.tests.test_result_validation",
+                "orchestrator_harness.tests.test_public_checks",
+                "orchestrator_harness.tests.test_path_portability",
+                "scripts.tests.test_root_prelaunch",
+            ),
             ("public-launch", "controller-lifecycle", "isolation-local", "package"),
-            PUBLIC_ROUTE_DEPENDENCIES + (
-                "harness-config.json", "AGENTS.md",
+            PUBLIC_ROUTE_DEPENDENCIES
+            + (
+                "harness-config.json",
+                "AGENTS.md",
                 "orchestrator_harness/tests/test_retry_policy.py",
                 "orchestrator_harness/tests/test_protected_retry_history.py",
                 "orchestrator_harness/tests/test_windows_sandbox_preflight.py",
@@ -704,7 +750,13 @@ def _registry() -> tuple[CheckSpec, ...]:
             "S6.AFFECTED.REAL-AGENT",
             "optional real-agent isolation journey",
             "affected",
-            ("python", "-m", "unittest", "-v", "orchestrator_harness.tests.test_real_agent_isolation"),
+            (
+                "python",
+                "-m",
+                "unittest",
+                "-v",
+                "orchestrator_harness.tests.test_real_agent_isolation",
+            ),
             ("isolation-real-agent",),
             REAL_AGENT_ROUTE_DEPENDENCIES,
             external_requirements=("WSL2", "Codex provider", "ephemeral auth"),
@@ -847,9 +899,12 @@ def _registry() -> tuple[CheckSpec, ...]:
                 "-File",
                 "tools/Invoke-CandidateSafeguard.ps1",
                 "-Run",
-                "-RepositoryRoot", "{source_root}",
-                "-ExpectedBranch", "{branch}",
-                "-ExpectedTip", "{tip}",
+                "-RepositoryRoot",
+                "{source_root}",
+                "-ExpectedBranch",
+                "{branch}",
+                "-ExpectedTip",
+                "{tip}",
             ),
             ("release-assurance", "safeguard"),
             (
@@ -882,7 +937,9 @@ def registry_record(root: str | Path | None = None) -> dict[str, Any]:
         "schema": REGISTRY_SCHEMA,
         "version": REGISTRY_VERSION,
         "registry_fingerprint": _sha256(_canonical_json(records)),
-        "checks": [spec.to_record(source) for spec in CHECK_REGISTRY] if source is not None else records,
+        "checks": [spec.to_record(source) for spec in CHECK_REGISTRY]
+        if source is not None
+        else records,
     }
 
 
@@ -975,8 +1032,9 @@ def _changed_path(root: Path, value: str) -> str:
     return _relative_path(text, "changed_path")
 
 
-def dependency_input_paths(spec: CheckSpec, root: str | Path, *,
-                           candidate_paths: tuple[str, ...] | None = None) -> tuple[str, ...]:
+def dependency_input_paths(
+    spec: CheckSpec, root: str | Path, *, candidate_paths: tuple[str, ...] | None = None
+) -> tuple[str, ...]:
     """Return the exact direct plus scoped inputs used by a check fingerprint."""
 
     root_path = Path(root).expanduser().resolve(strict=True)
@@ -997,16 +1055,26 @@ def dependency_input_paths(spec: CheckSpec, root: str | Path, *,
         direct.append(relative)
     if not spec.input_scopes:
         return tuple(direct)
-    return tuple(dict.fromkeys((*direct, *resolve_input_scope(spec, root_path, candidate_paths=candidate_paths))))
+    return tuple(
+        dict.fromkeys(
+            (
+                *direct,
+                *resolve_input_scope(spec, root_path, candidate_paths=candidate_paths),
+            )
+        )
+    )
 
 
-def dependency_fingerprint(spec: CheckSpec, root: str | Path, *,
-                           candidate_paths: tuple[str, ...] | None = None) -> str:
+def dependency_fingerprint(
+    spec: CheckSpec, root: str | Path, *, candidate_paths: tuple[str, ...] | None = None
+) -> str:
     """Hash declared direct files and every scoped candidate source input."""
 
     root_path = Path(root).expanduser().resolve(strict=True)
     inputs: list[dict[str, Any]] = []
-    for relative in dependency_input_paths(spec, root_path, candidate_paths=candidate_paths):
+    for relative in dependency_input_paths(
+        spec, root_path, candidate_paths=candidate_paths
+    ):
         path = root_path / Path(relative)
         try:
             data = anchored_read(root_path, relative)
@@ -1657,7 +1725,9 @@ def select_checks(
 
     candidate_paths = _candidate_paths(Path(source.source_root))
     fingerprints = {
-        spec.stable_id: dependency_fingerprint(spec, source.source_root, candidate_paths=candidate_paths)
+        spec.stable_id: dependency_fingerprint(
+            spec, source.source_root, candidate_paths=candidate_paths
+        )
         for spec in CHECK_REGISTRY
     }
     preserved: list[str] = []
@@ -1734,8 +1804,14 @@ def _parser() -> argparse.ArgumentParser:
         description="Portable stable release-check registry and selector"
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    registry_parser = sub.add_parser("registry", help="print the versioned check registry")
-    registry_parser.add_argument("--root", type=Path, help="bind source-dependent command arguments to this exact repository")
+    registry_parser = sub.add_parser(
+        "registry", help="print the versioned check registry"
+    )
+    registry_parser.add_argument(
+        "--root",
+        type=Path,
+        help="bind source-dependent command arguments to this exact repository",
+    )
     select = sub.add_parser("select", help="select checks for one exact source root")
     select.add_argument("--intent", choices=sorted(_INTENTS), required=True)
     select.add_argument("--root", required=True, type=Path)

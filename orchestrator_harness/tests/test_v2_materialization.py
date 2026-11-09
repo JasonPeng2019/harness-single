@@ -45,8 +45,20 @@ class GitWorktreeFailureCleanupTests(unittest.TestCase):
         commands = []
         for entry in run.call_args_list:
             argv = entry.args[0]
-            self.assertEqual(["git", "--no-replace-objects", "--no-lazy-fetch", "-C", str(root),
-                              "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false"], argv[:9])
+            self.assertEqual(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "--no-lazy-fetch",
+                    "-C",
+                    str(root),
+                    "-c",
+                    f"core.hooksPath={os.devnull}",
+                    "-c",
+                    "core.fsmonitor=false",
+                ],
+                argv[:9],
+            )
             commands.append([argv[0], *argv[3:5], *argv[9:]])
         return commands
 
@@ -90,9 +102,7 @@ class GitWorktreeFailureCleanupTests(unittest.TestCase):
             ],
             commands[1],
         )
-        self.assertIn(
-            ["git", "-C", str(root), "branch", "-D", "--", branch], commands
-        )
+        self.assertIn(["git", "-C", str(root), "branch", "-D", "--", branch], commands)
         self.assertEqual(
             ["git", "-C", str(root), "show-ref", "--verify", "--quiet", branch_ref],
             commands[-1],
@@ -109,7 +119,9 @@ class GitWorktreeFailureCleanupTests(unittest.TestCase):
             self._completed(0),
         ]
         with patch.object(bootstrap.subprocess, "run", side_effect=completed) as run:
-            with self.assertRaisesRegex(bootstrap.BootstrapError, "branch already exists"):
+            with self.assertRaisesRegex(
+                bootstrap.BootstrapError, "branch already exists"
+            ):
                 bootstrap._git_worktree_add(root, branch, target, "base")
 
         commands = self._commands(run, root)
@@ -139,7 +151,9 @@ class MaterializationFixture:
             self.harness / "resource-manifest.json",
             {"schema": "resource-manifest/v1", "resources": []},
         )
-        agent_workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
+        agent_workspace = (
+            self.harness / "super-cache" / "workspace" / ".agent-workspace"
+        )
         for name, contents in {
             "README.md": "base workspace\n",
             "hook-dispatch.py": "# hook dispatch\n",
@@ -160,13 +174,20 @@ class MaterializationFixture:
     def close(self) -> None:
         if self.bootstrap_runtime:
             from orchestrator_harness import shutdown
+
             runtime = self.root_workspace / ".harness-runtime"
             if setup.read_runtime_state(runtime) is not None:
-                with patch.object(shutdown, "find_harness_root", return_value=self.harness):
+                with patch.object(
+                    shutdown, "find_harness_root", return_value=self.harness
+                ):
                     result = shutdown.run_shutdown()
                 if not result["ok"]:
-                    raise AssertionError(f"native fixture shutdown failed; fixture preserved: {result}")
-                shutdown.prove_runtime_closed(runtime, self.root_workspace, self.harness)
+                    raise AssertionError(
+                        f"native fixture shutdown failed; fixture preserved: {result}"
+                    )
+                shutdown.prove_runtime_closed(
+                    runtime, self.root_workspace, self.harness
+                )
         self.stop_owned_monitors()
         self.temporary.cleanup()
 
@@ -175,33 +196,58 @@ class MaterializationFixture:
         for child, birth in self.monitor_children:
             if child.poll() is None:
                 rt = self.root_workspace / ".harness-runtime"
-                from orchestrator_harness.records import RecordLock, atomic_write_json, runtime_admission_lock
+                from orchestrator_harness.records import (
+                    RecordLock,
+                    atomic_write_json,
+                    runtime_admission_lock,
+                )
+
                 try:
-                    with runtime_admission_lock(rt), RecordLock(setup.monitor_record_path(rt)):
+                    with (
+                        runtime_admission_lock(rt),
+                        RecordLock(setup.monitor_record_path(rt)),
+                    ):
                         record = setup.read_monitor_record(rt)
-                        if (birth is not None and record is not None
-                                and (record.get("pid"), record.get("creation_time")) ==
-                                (birth["pid"], birth["creation_time"])):
+                        if (
+                            birth is not None
+                            and record is not None
+                            and (record.get("pid"), record.get("creation_time"))
+                            == (birth["pid"], birth["creation_time"])
+                        ):
                             record["stop_requested"] = True
                             atomic_write_json(setup.monitor_record_path(rt), record)
                     child.wait(timeout=3)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     if not setup.processes.reap_created_process(child):
-                        raise AssertionError("exact owned monitor child cleanup is unproven; fixture preserved")
+                        raise AssertionError(
+                            "exact owned monitor child cleanup is unproven; fixture preserved"
+                        )
             if child.poll() is None:
-                raise AssertionError("owned monitor child remains live; fixture preserved")
+                raise AssertionError(
+                    "owned monitor child remains live; fixture preserved"
+                )
 
     @contextmanager
     def native_setup(self):
         """Observe actual native spawns; never synthesize monitor ownership."""
         real_spawn = setup.processes.spawn_detached
+
         def spawn(*args, **kwargs):
             child = real_spawn(*args, **kwargs)
-            self.monitor_children.append((child, setup.processes.process_identity(child.pid)))
+            self.monitor_children.append(
+                (child, setup.processes.process_identity(child.pid))
+            )
             return child
-        with (patch.object(setup, "find_harness_root", return_value=self.harness),
-              patch.dict(os.environ, {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}),
-              patch.object(setup.processes, "spawn_detached", side_effect=spawn) as observed):
+
+        with (
+            patch.object(setup, "find_harness_root", return_value=self.harness),
+            patch.dict(
+                os.environ, {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+            ),
+            patch.object(
+                setup.processes, "spawn_detached", side_effect=spawn
+            ) as observed,
+        ):
             yield observed
 
     def _write_text(self, path: Path, contents: str) -> None:
@@ -262,7 +308,12 @@ class MaterializationFixture:
             },
         )
         self._write_text(
-            adapter / "super-cache" / dotdir / "skills" / "lane-assignment" / "SKILL.md",
+            adapter
+            / "super-cache"
+            / dotdir
+            / "skills"
+            / "lane-assignment"
+            / "SKILL.md",
             ".agent-workspace/lane-queue.py\n",
         )
         self._write_text(
@@ -296,14 +347,19 @@ class MaterializationFixture:
                 "runtime_root": None,
             },
         )
-        self._write_text(
-            adapter / "super-cache" / dotdir / "worker.txt", "fixture\n"
-        )
+        self._write_text(adapter / "super-cache" / dotdir / "worker.txt", "fixture\n")
         self._write_json(
             adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
-            {"schema": "harness-hook-binding/v1", "role": "worker", "provider_id": provider_id},
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "provider_id": provider_id,
+            },
         )
-        for name, helper in (("lane-assignment", "lane-queue.py"), ("manager-notify", "manager-notify.py")):
+        for name, helper in (
+            ("lane-assignment", "lane-queue.py"),
+            ("manager-notify", "manager-notify.py"),
+        ):
             self._write_text(
                 adapter / "super-cache" / dotdir / "skills" / name / "SKILL.md",
                 f".agent-workspace/{helper}\n",
@@ -333,34 +389,72 @@ class MaterializationFixture:
 
     def initialize_git(self) -> str:
         if not (self.root_workspace / ".git").exists():
-            self._write_text(self.root_workspace / ".gitignore",
-                             ".harness-runtime/\n.agent-workspace/\n.codex/\n.custom/\n.claude/\n.qwen/\nRESULT.json\n")
-            self._write_text(self.root_workspace / "application.txt", "fixture product\n")
-            self._write_text(self.root_workspace / "src" / "selected.txt", "selected product input\n")
-            self._write_text(self.root_workspace / "unrelated" / "large.log", "excluded fixture data\n")
+            self._write_text(
+                self.root_workspace / ".gitignore",
+                ".harness-runtime/\n.agent-workspace/\n.codex/\n.custom/\n.claude/\n.qwen/\nRESULT.json\n",
+            )
+            self._write_text(
+                self.root_workspace / "application.txt", "fixture product\n"
+            )
+            self._write_text(
+                self.root_workspace / "src" / "selected.txt", "selected product input\n"
+            )
+            self._write_text(
+                self.root_workspace / "unrelated" / "large.log",
+                "excluded fixture data\n",
+            )
             self.git("init", "-q")
-            self.git("add", ".gitignore", "application.txt", "src/selected.txt", "unrelated/large.log")
-            self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture base")
+            self.git(
+                "add",
+                ".gitignore",
+                "application.txt",
+                "src/selected.txt",
+                "unrelated/large.log",
+            )
+            self.git(
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@local",
+                "commit",
+                "-qm",
+                "fixture base",
+            )
         return self.git("rev-parse", "HEAD")
 
     def prepare_runtime(
-        self, *, managed: bool, manager: Path | None = None,
+        self,
+        *,
+        managed: bool,
+        manager: Path | None = None,
         checkout_paths: list[str] | None = None,
     ) -> str:
         """Actual setup/READY and Git; no epoch, ownership or source mocks."""
-        self._write_json(self.harness / "harness-config.json", {
-            "root_workspace": str(self.root_workspace),
-            "managed_coordination": "enabled" if managed else "disabled",
-            **({"manager_workspace": str(manager)} if manager is not None else {}),
-            **({"checkout_paths": checkout_paths} if checkout_paths is not None else {}),
-        })
+        self._write_json(
+            self.harness / "harness-config.json",
+            {
+                "root_workspace": str(self.root_workspace),
+                "managed_coordination": "enabled" if managed else "disabled",
+                **({"manager_workspace": str(manager)} if manager is not None else {}),
+                **(
+                    {"checkout_paths": checkout_paths}
+                    if checkout_paths is not None
+                    else {}
+                ),
+            },
+        )
         base = self.initialize_git()
         self.bootstrap_runtime = True
         with self.native_setup():
             result = setup.run_setup()
         if not result["ok"]:
             raise AssertionError(f"native fixture setup failed: {result}")
-        from orchestrator_harness.config import compute_config_identity, load_config, load_resource_manifest
+        from orchestrator_harness.config import (
+            compute_config_identity,
+            load_config,
+            load_resource_manifest,
+        )
+
         config = load_config(self.harness)
         identity = compute_config_identity(config, load_resource_manifest(self.harness))
         setup.require_monitor_ready(config.runtime_root, identity)
@@ -376,7 +470,7 @@ class MaterializationFixture:
     def add_shared_root_configs(self) -> None:
         self._write_text(
             self.harness / "adapters" / "codex" / "root" / ".codex" / "config.toml",
-            '[features]\nhooks = true\n',
+            "[features]\nhooks = true\n",
         )
         self._write_json(
             self.harness / "adapters" / "codex" / "root" / ".codex" / "hooks.json",
@@ -500,7 +594,9 @@ class V2MaterializationTests(unittest.TestCase):
             {
                 "description": "existing Codex setup",
                 "hooks": {
-                    "SessionStart": [{"hooks": [{"type": "command", "command": "session"}]}],
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "session"}]}
+                    ],
                     "Stop": [{"hooks": [{"type": "command", "command": "verify"}]}],
                 },
             },
@@ -512,7 +608,9 @@ class V2MaterializationTests(unittest.TestCase):
                 "permissions": {"defaultMode": "ask"},
                 "custom": {"keep": True},
                 "hooks": {
-                    "PreToolUse": [{"hooks": [{"type": "command", "command": "guard"}]}],
+                    "PreToolUse": [
+                        {"hooks": [{"type": "command", "command": "guard"}]}
+                    ],
                     "Stop": [{"hooks": [{"type": "command", "command": "verify"}]}],
                 },
             },
@@ -546,7 +644,9 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertEqual(2, len(claude["hooks"]["Stop"]))
         self.assertIn("PostToolUse", claude["hooks"])
 
-        first_bytes = {path: path.read_bytes() for path in (codex_hooks, claude_settings)}
+        first_bytes = {
+            path: path.read_bytes() for path in (codex_hooks, claude_settings)
+        }
         setup._preflight_root_payloads(
             plan, self.fixture.root_workspace, overwrite=False
         )
@@ -567,7 +667,7 @@ class V2MaterializationTests(unittest.TestCase):
         self.fixture.add_shared_root_configs()
         codex_config = self.fixture.root_workspace / ".codex" / "config.toml"
         self.fixture._write_text(
-            codex_config, '[features]\nhooks = false\ncustom = true\n'
+            codex_config, "[features]\nhooks = false\ncustom = true\n"
         )
         plan = setup._plan_root_payloads(self.fixture.harness)
 
@@ -580,7 +680,7 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertIn("must enable [features] hooks = true", str(raised.exception))
         self.assertFalse((self.fixture.root_workspace / ".custom").exists())
         self.assertEqual(
-            '[features]\nhooks = false\ncustom = true\n',
+            "[features]\nhooks = false\ncustom = true\n",
             codex_config.read_text(encoding="utf-8"),
         )
 
@@ -664,12 +764,7 @@ class V2MaterializationTests(unittest.TestCase):
 
     def test_overwrite_replaces_only_planned_root_payloads(self) -> None:
         planned = (
-            self.fixture.harness
-            / "adapters"
-            / "codex"
-            / "root"
-            / ".codex"
-            / "root.txt"
+            self.fixture.harness / "adapters" / "codex" / "root" / ".codex" / "root.txt"
         )
         planned_target = self.fixture.root_workspace / ".codex" / "root.txt"
         unrelated = self.fixture.root_workspace / "keep.txt"
@@ -677,7 +772,9 @@ class V2MaterializationTests(unittest.TestCase):
         planned_target.write_text("old\n", encoding="utf-8")
         unrelated.write_text("preserve\n", encoding="utf-8")
         plan = setup._plan_root_payloads(self.fixture.harness)
-        setup._preflight_root_payloads(plan, self.fixture.root_workspace, overwrite=True)
+        setup._preflight_root_payloads(
+            plan, self.fixture.root_workspace, overwrite=True
+        )
         _, overwritten, merged = setup._install_root_payloads(
             self.fixture.harness,
             self.fixture.root_workspace,
@@ -702,12 +799,12 @@ class V2MaterializationTests(unittest.TestCase):
             result = setup.run_setup()
         self.assertFalse(result["ok"])
         self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
-        self.assertFalse(
-            (self.fixture.root_workspace / ".harness-runtime").exists()
-        )
+        self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
         self.assertEqual("existing\n", collision.read_text(encoding="utf-8"))
 
-    def test_composed_worker_destination_collision_precedes_all_setup_writes(self) -> None:
+    def test_composed_worker_destination_collision_precedes_all_setup_writes(
+        self,
+    ) -> None:
         self.fixture._write_text(
             self.fixture.harness
             / "adapters"
@@ -728,7 +825,9 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertFalse((self.fixture.root_workspace / ".codex").exists())
         start_monitor.assert_not_called()
 
-    def test_unknown_or_duplicate_worker_hook_command_precedes_setup_writes(self) -> None:
+    def test_unknown_or_duplicate_worker_hook_command_precedes_setup_writes(
+        self,
+    ) -> None:
         payload = self.fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
         self.fixture._write_text(payload / "hooks" / "known.py", "# known\n")
         for commands in (
@@ -740,35 +839,66 @@ class V2MaterializationTests(unittest.TestCase):
             with self.subTest(commands=commands):
                 self.fixture._write_json(
                     payload / "hooks.json",
-                    {"hooks": {"Stop": [{"hooks": [{"command": command} for command in commands]}]}},
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {"command": command} for command in commands
+                                    ]
+                                }
+                            ]
+                        }
+                    },
                 )
                 with (
-                    patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=self.fixture.harness
+                    ),
                     patch.object(setup, "_start_monitor") as start_monitor,
                 ):
                     result = setup.run_setup()
                 self.assertFalse(result["ok"])
                 self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
-                self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
+                self.assertFalse(
+                    (self.fixture.root_workspace / ".harness-runtime").exists()
+                )
                 self.assertFalse((self.fixture.root_workspace / ".codex").exists())
                 start_monitor.assert_not_called()
 
-    def test_equivalent_worker_hook_script_spellings_are_rejected_before_setup_writes(self) -> None:
-        for variant in (r"python .codex\hooks\known.py", "python .CODEX/Hooks/KNOWN.py"):
+    def test_equivalent_worker_hook_script_spellings_are_rejected_before_setup_writes(
+        self,
+    ) -> None:
+        for variant in (
+            r"python .codex\hooks\known.py",
+            "python .CODEX/Hooks/KNOWN.py",
+        ):
             with self.subTest(variant=variant):
                 fixture = MaterializationFixture()
                 self.addCleanup(fixture.close)
-                payload = fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+                payload = (
+                    fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+                )
                 fixture._write_text(payload / "hooks" / "known.py", "# known\n")
                 fixture._write_json(
                     payload / "hooks.json",
-                    {"hooks": {"Stop": [{"hooks": [
-                        {"command": "python .codex/hooks/known.py"},
-                        {"command": variant},
-                    ]}]}},
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {"command": "python .codex/hooks/known.py"},
+                                        {"command": variant},
+                                    ]
+                                }
+                            ]
+                        }
+                    },
                 )
                 with (
-                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(
+                        setup, "find_harness_root", return_value=fixture.harness
+                    ),
                     patch.object(setup, "_start_monitor") as start_monitor,
                 ):
                     result = setup.run_setup()
@@ -784,10 +914,18 @@ class V2MaterializationTests(unittest.TestCase):
             self.fixture._write_text(payload / "hooks" / name, "# known\n")
         self.fixture._write_json(
             payload / "hooks.json",
-            {"hooks": {"Stop": [{"hooks": [
-                {"command": "python .codex/hooks/first.py"},
-                {"command": r"python .CODEX\HOOKS\second.py"},
-            ]}]}},
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {"command": "python .codex/hooks/first.py"},
+                                {"command": r"python .CODEX\HOOKS\second.py"},
+                            ]
+                        }
+                    ]
+                }
+            },
         )
         plan = setup._plan_active_cache(self.fixture.harness)
         self.assertIn(
@@ -809,18 +947,36 @@ class V2MaterializationTests(unittest.TestCase):
             / "super-cache"
             / "composed-payloads"
         )
-        for provider_id, dotdir in (("codex", ".codex"), ("disposable-custom", ".custom")):
+        for provider_id, dotdir in (
+            ("codex", ".codex"),
+            ("disposable-custom", ".custom"),
+        ):
             payload = composed / provider_id
             self.assertEqual(
-                (self.fixture.harness / "super-cache" / "workspace" / ".agent-workspace" / "lane-queue.py").read_bytes(),
+                (
+                    self.fixture.harness
+                    / "super-cache"
+                    / "workspace"
+                    / ".agent-workspace"
+                    / "lane-queue.py"
+                ).read_bytes(),
                 (payload / ".agent-workspace" / "lane-queue.py").read_bytes(),
             )
             self.assertEqual(
-                (self.fixture.harness / "adapters" / provider_id / "super-cache" / dotdir / "worker.txt").read_bytes(),
+                (
+                    self.fixture.harness
+                    / "adapters"
+                    / provider_id
+                    / "super-cache"
+                    / dotdir
+                    / "worker.txt"
+                ).read_bytes(),
                 (payload / dotdir / "worker.txt").read_bytes(),
             )
             self.assertFalse((payload / "AGENTS.md").exists())
-            self.assertTrue((payload / dotdir / "skills" / "lane-assignment" / "SKILL.md").is_file())
+            self.assertTrue(
+                (payload / dotdir / "skills" / "lane-assignment" / "SKILL.md").is_file()
+            )
 
     def test_setup_materialization_keeps_shipped_sources_immutable(self) -> None:
         before = self.fixture.source_snapshot()
@@ -828,9 +984,7 @@ class V2MaterializationTests(unittest.TestCase):
             result = setup.run_setup()
         self.assertTrue(result["ok"], result)
         self.assertEqual(before, self.fixture.source_snapshot())
-        self.assertTrue(
-            (self.fixture.root_workspace / ".codex" / "root.txt").is_file()
-        )
+        self.assertTrue((self.fixture.root_workspace / ".codex" / "root.txt").is_file())
         for provider_id, dotdir in (
             ("codex", ".codex"),
             ("disposable-custom", ".custom"),
@@ -842,7 +996,9 @@ class V2MaterializationTests(unittest.TestCase):
                     / "orchestrator-harness-binding.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(str(self.fixture.harness.resolve()), binding["harness_root"])
+            self.assertEqual(
+                str(self.fixture.harness.resolve()), binding["harness_root"]
+            )
             self.assertEqual(
                 str((self.fixture.root_workspace / ".harness-runtime").resolve()),
                 binding["runtime_root"],
@@ -858,7 +1014,6 @@ class V2MaterializationTests(unittest.TestCase):
             ).is_file()
         )
         spawn_detached.assert_called_once()
-
 
     def _snapshot(self, root: Path) -> dict[str, bytes]:
         return {
@@ -886,9 +1041,7 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertNotIn("overwritten_paths", second)
         spawn_detached.assert_called_once()
 
-        self.assertEqual(
-            root_after_first, self._snapshot(self.fixture.root_workspace)
-        )
+        self.assertEqual(root_after_first, self._snapshot(self.fixture.root_workspace))
         self.assertEqual(cache_after_first, self._snapshot(runtime / "super-cache"))
         self.assertEqual(
             manifest_after_first,
@@ -921,9 +1074,12 @@ class V2MaterializationTests(unittest.TestCase):
             lease_dir = runtime / "resources" / "leases"
             from orchestrator_harness.records import RecordLock
             from orchestrator_harness import shutdown
+
             with RecordLock(lease_dir / ".leases.lock"):
                 pass
-            with patch.object(shutdown, "find_harness_root", return_value=self.fixture.harness):
+            with patch.object(
+                shutdown, "find_harness_root", return_value=self.fixture.harness
+            ):
                 closed = shutdown.run_shutdown()
             self.assertTrue(closed["ok"], closed)
             self.fixture._write_json(
@@ -966,6 +1122,7 @@ class V2MaterializationTests(unittest.TestCase):
         self,
     ) -> None:
         from orchestrator_harness import mutation
+
         original_read = mutation._read_file_observation
         target = self.fixture.root_workspace / ".codex" / "root.txt"
 
@@ -979,9 +1136,7 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertTrue(first["ok"], first)
         before = target.read_bytes()
         with (
-            patch.object(
-                setup, "find_harness_root", return_value=self.fixture.harness
-            ),
+            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
             patch.object(mutation, "_read_file_observation", side_effect=read_guard),
         ):
             second = setup.run_setup()
@@ -996,9 +1151,7 @@ class V2MaterializationTests(unittest.TestCase):
             first = setup.run_setup()
         self.assertTrue(first["ok"], first)
         binding_path = (
-            self.fixture.root_workspace
-            / ".codex"
-            / "orchestrator-harness-binding.json"
+            self.fixture.root_workspace / ".codex" / "orchestrator-harness-binding.json"
         )
         foreign = json.loads(binding_path.read_text(encoding="utf-8"))
         foreign["harness_root"] = str(self.fixture.root / "elsewhere")
@@ -1009,9 +1162,8 @@ class V2MaterializationTests(unittest.TestCase):
             second = setup.run_setup()
         self.assertFalse(second["ok"])
         self.assertEqual(setup.SETUP_ADAPTER_COLLISION, second["code"])
-        self.assertEqual(
-            foreign, json.loads(binding_path.read_text(encoding="utf-8"))
-        )
+        self.assertEqual(foreign, json.loads(binding_path.read_text(encoding="utf-8")))
+
     def test_setup_rejects_hooked_provider_without_binding_before_writes(self) -> None:
         (
             self.fixture.harness
@@ -1021,7 +1173,9 @@ class V2MaterializationTests(unittest.TestCase):
             / ".codex"
             / "orchestrator-harness-binding.json"
         ).unlink()
-        with patch.object(setup, "find_harness_root", return_value=self.fixture.harness):
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
             result = setup.run_setup()
         self.assertFalse(result["ok"])
         self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
@@ -1041,7 +1195,9 @@ class V2MaterializationTests(unittest.TestCase):
         record = json.loads(binding_path.read_text(encoding="utf-8"))
         record["provider_id"] = "wrong-provider"
         self.fixture._write_json(binding_path, record)
-        with patch.object(setup, "find_harness_root", return_value=self.fixture.harness):
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
             result = setup.run_setup()
         self.assertFalse(result["ok"])
         self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
@@ -1067,7 +1223,11 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
         catalog_binding = (
-            harness / "adapters" / "disposable-custom" / "harness" / "launcher_binding.py"
+            harness
+            / "adapters"
+            / "disposable-custom"
+            / "harness"
+            / "launcher_binding.py"
         )
         catalog_binding.write_text(
             catalog_binding.read_text(encoding="utf-8") + "# drift\n", encoding="utf-8"
@@ -1078,7 +1238,9 @@ class V2MaterializationTests(unittest.TestCase):
 
     def test_managed_bootstrap_copies_only_selected_provider(self) -> None:
         result, worktree = self._bootstrap(
-            "managed-lane", managed=True, provider="codex",
+            "managed-lane",
+            managed=True,
+            provider="codex",
             launch_config_override={
                 "reasoning_effort": "high",
                 "service_tier": "priority",
@@ -1097,10 +1259,14 @@ class V2MaterializationTests(unittest.TestCase):
         )
         self.assertEqual(
             "# lane queue\n",
-            (worktree / ".agent-workspace" / "lane-queue.py").read_text(encoding="utf-8"),
+            (worktree / ".agent-workspace" / "lane-queue.py").read_text(
+                encoding="utf-8"
+            ),
         )
         receipt = json.loads(
-            (worktree / ".agent-workspace" / "overlay-receipt.json").read_text(encoding="utf-8")
+            (worktree / ".agent-workspace" / "overlay-receipt.json").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertEqual("composed-payloads/codex", receipt["provider_payload"])
         codex_config = tomllib.loads(
@@ -1115,7 +1281,9 @@ class V2MaterializationTests(unittest.TestCase):
             profile["filesystem"][str((Path.home() / ".codex").resolve())],
         )
 
-    def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(self) -> None:
+    def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(
+        self,
+    ) -> None:
         self.fixture.prepare_runtime(managed=True)
         for failure in ("missing", "changed"):
             with self.subTest(failure=failure):
@@ -1134,14 +1302,25 @@ class V2MaterializationTests(unittest.TestCase):
                 else:
                     installed.write_text("# tampered\n", encoding="utf-8")
                 result, worktree = self._bootstrap(
-                    f"composition-{failure}", managed=True, provider="codex", prime_cache=False
+                    f"composition-{failure}",
+                    managed=True,
+                    provider="codex",
+                    prime_cache=False,
                 )
                 self.assertFalse(result["ok"])
-                self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
+                self.assertIn(
+                    result["code"],
+                    (
+                        bootstrap.BOOTSTRAP_CACHE_MISSING,
+                        bootstrap.BOOTSTRAP_CACHE_COLLISION,
+                    ),
+                )
                 self.assertFalse(worktree.exists())
                 installed.write_bytes(original)
 
-    def test_managed_bootstrap_passes_split_manager_protection_destinations(self) -> None:
+    def test_managed_bootstrap_passes_split_manager_protection_destinations(
+        self,
+    ) -> None:
         self._assert_split_manager_protection(managed=True)
 
     def test_plain_bootstrap_passes_split_manager_protection_destinations(self) -> None:
@@ -1150,7 +1329,10 @@ class V2MaterializationTests(unittest.TestCase):
     def _assert_split_manager_protection(self, *, managed: bool) -> None:
         manager = self.fixture.root
         result, worktree = self._bootstrap(
-            "split-manager", managed=managed, provider="codex", manager=manager,
+            "split-manager",
+            managed=managed,
+            provider="codex",
+            manager=manager,
             launch_config_override={
                 "reasoning_effort": "high",
                 "service_tier": "priority",
@@ -1158,7 +1340,9 @@ class V2MaterializationTests(unittest.TestCase):
             },
         )
         self.assertTrue(result["ok"], result)
-        filesystem = tomllib.loads((worktree / ".codex/config.toml").read_text())["permissions"]["worker-isolated"]["filesystem"]
+        filesystem = tomllib.loads((worktree / ".codex/config.toml").read_text())[
+            "permissions"
+        ]["worker-isolated"]["filesystem"]
         for leaf in (".codex", ".claude", ".qwen", ".agent-workspace"):
             self.assertEqual("deny", filesystem[str(manager / leaf)])
         self.assertNotIn(str(manager), filesystem)
@@ -1180,7 +1364,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
         worktree = runtime / "worktrees" / "epoch-1" / "codex-config"
         existing_config = worktree / ".codex" / "config.toml"
-        original = b'# product-owned config\n[features]\nhooks = true\n'
+        original = b"# product-owned config\n[features]\nhooks = true\n"
         existing_config.parent.mkdir(parents=True, exist_ok=True)
         existing_config.write_bytes(original)
         payload_hooks = payload_config.with_name("hooks.json")
@@ -1283,29 +1467,52 @@ class V2MaterializationTests(unittest.TestCase):
         collision = self.fixture.root_workspace / ".agent-workspace/README.md"
         self.fixture._write_text(collision, "tracked product file\n")
         self.fixture.git("add", "-f", ".agent-workspace/README.md")
-        self.fixture.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local",
-                         "commit", "-qm", "tracked overlay collision")
+        self.fixture.git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@local",
+            "commit",
+            "-qm",
+            "tracked overlay collision",
+        )
         base = self.fixture.prepare_runtime(managed=True)
         lane_id = "overlay-failure"
         branch = f"lane/{lane_id}"
         task_card = self.fixture.root / f"{lane_id}.json"
-        self.fixture._write_json(task_card, {
-            "schema": "project-task-card/v1", "task": "prove failed materialization rollback",
-            "acceptance_criteria": ["The failed worktree is rolled back"],
-            "deliverables": ["A rollback disposition"],
-            "reason_for_acceptance_and_deliverables": "These prove rollback.",
-            "branch": branch, "base_commit": base,
-        })
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "prove failed materialization rollback",
+                "acceptance_criteria": ["The failed worktree is rolled back"],
+                "deliverables": ["A rollback disposition"],
+                "reason_for_acceptance_and_deliverables": "These prove rollback.",
+                "branch": branch,
+                "base_commit": base,
+            },
+        )
         with (
-            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
-            patch.object(bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add) as git_add,
-            patch.object(bootstrap, "_rollback_bootstrap_worktree",
-                         wraps=bootstrap._rollback_bootstrap_worktree) as rollback,
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(
+                bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add
+            ) as git_add,
+            patch.object(
+                bootstrap,
+                "_rollback_bootstrap_worktree",
+                wraps=bootstrap._rollback_bootstrap_worktree,
+            ) as rollback,
         ):
             result = bootstrap.run_bootstrap(
-                lane_id=lane_id, provider="codex", model="test-model",
+                lane_id=lane_id,
+                provider="codex",
+                model="test-model",
                 launch_config={"reasoning_effort": "high", "service_tier": "priority"},
-                exclusive_resources=[], task_card_path=str(task_card),
+                exclusive_resources=[],
+                task_card_path=str(task_card),
             )
         self.assertFalse(result["ok"], result)
         self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, result["code"], result)
@@ -1322,11 +1529,23 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertTrue(result["attempt_effects"]["rollback_proven"], result)
         self.assertFalse(worktree.exists())
         self.assertEqual(base, self.fixture.git("rev-parse", "HEAD"))
-        self.assertEqual("tracked product file\n", collision.read_text(encoding="utf-8"))
-        self.assertEqual(1, bootstrap._run_git(self.fixture.root_workspace,
-                                             "show-ref", "--verify", "--quiet", "refs/heads/" + branch).returncode)
+        self.assertEqual(
+            "tracked product file\n", collision.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            1,
+            bootstrap._run_git(
+                self.fixture.root_workspace,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/" + branch,
+            ).returncode,
+        )
 
-    def test_bootstrap_rejects_missing_provider_preferences_before_mutation(self) -> None:
+    def test_bootstrap_rejects_missing_provider_preferences_before_mutation(
+        self,
+    ) -> None:
         self.fixture._write_json(
             self.fixture.harness / "harness-config.json",
             {
@@ -1369,9 +1588,13 @@ class V2MaterializationTests(unittest.TestCase):
         open_epoch.assert_not_called()
         git_add.assert_not_called()
 
-    def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(self) -> None:
+    def test_plain_bootstrap_excludes_managed_helpers_and_provider_payload(
+        self,
+    ) -> None:
         result, worktree = self._bootstrap(
-            "plain-lane", managed=False, provider="codex",
+            "plain-lane",
+            managed=False,
+            provider="codex",
             launch_config_override={
                 "reasoning_effort": "high",
                 "service_tier": "priority",
@@ -1400,7 +1623,8 @@ class V2MaterializationTests(unittest.TestCase):
                 self.fixture = MaterializationFixture()
                 self.addCleanup(self.fixture.close)
                 result, worktree = self._bootstrap(
-                    f"windows-omitted-mode-{managed}", managed=managed,
+                    f"windows-omitted-mode-{managed}",
+                    managed=managed,
                     provider="codex",
                     launch_config_override={
                         "reasoning_effort": "high",
@@ -1449,40 +1673,96 @@ class V2MaterializationTests(unittest.TestCase):
             self.fixture._write_text(self.fixture.root_workspace / name, text)
         self.fixture.git("init", "-q")
         self.fixture.git("add", *files)
-        self.fixture.git("-c", "user.name=Fixture", "-c", "user.email=fixture@local", "commit", "-qm", "fixture base")
+        self.fixture.git(
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@local",
+            "commit",
+            "-qm",
+            "fixture base",
+        )
 
-    def test_generated_lane_material_is_ignored_without_hiding_project_source(self) -> None:
+    def test_generated_lane_material_is_ignored_without_hiding_project_source(
+        self,
+    ) -> None:
         from orchestrator_harness.records import read_record
+
         # The product ignores neither the runtime nor .codex, and ships .codex/dev source.
-        self._commit_product({".gitignore": "*.log\n", ".codex/dev/shipped.json": "{}\n"})
-        result, worktree = self._bootstrap("ignored-lane", managed=True, provider="codex")
+        self._commit_product(
+            {".gitignore": "*.log\n", ".codex/dev/shipped.json": "{}\n"}
+        )
+        result, worktree = self._bootstrap(
+            "ignored-lane", managed=True, provider="codex"
+        )
         self.assertTrue(result["ok"], result)
-        product_status = self.fixture.git("status", "--porcelain=v1", "--untracked-files=all")
+        product_status = self.fixture.git(
+            "status", "--porcelain=v1", "--untracked-files=all"
+        )
         self.assertNotIn(".harness-runtime", product_status)
         lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
+
         def status() -> set[str]:
-            return set(bootstrap._run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines())
+            return set(
+                bootstrap._run_git(
+                    worktree, "status", "--porcelain=v1", "--untracked-files=all"
+                ).stdout.splitlines()
+            )
+
         self.assertEqual(set(), status())
+
         def entries(path: Path) -> list[str]:
-            return [line for line in path.read_text(encoding="utf-8").splitlines() if not line.startswith("#")]
-        generated = {"/" + name.partition("/")[2] for name in lane["source_exclusions"] if name.startswith(".codex/")}
+            return [
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("#")
+            ]
+
+        generated = {
+            "/" + name.partition("/")[2]
+            for name in lane["source_exclusions"]
+            if name.startswith(".codex/")
+        }
         self.assertIn("/config.toml", generated)
         self.assertIn("/.gitignore", generated)
-        self.assertEqual(sorted(generated | {"/.gitignore"}), entries(worktree / ".codex/.gitignore"))
+        self.assertEqual(
+            sorted(generated | {"/.gitignore"}), entries(worktree / ".codex/.gitignore")
+        )
         self.assertEqual(["*"], entries(worktree / ".agent-workspace/.gitignore"))
         (worktree / ".codex/dev/new.json").write_text("{}\n", encoding="utf-8")
-        (worktree / ".codex/dev/shipped.json").write_text("{\"changed\": true}\n", encoding="utf-8")
-        self.assertEqual({"?? .codex/dev/new.json", " M .codex/dev/shipped.json"}, status())
+        (worktree / ".codex/dev/shipped.json").write_text(
+            '{"changed": true}\n', encoding="utf-8"
+        )
+        self.assertEqual(
+            {"?? .codex/dev/new.json", " M .codex/dev/shipped.json"}, status()
+        )
 
     def test_product_owned_generated_directory_gitignore_is_preserved(self) -> None:
-        self._commit_product({".gitignore": ".harness-runtime/\n", ".codex/.gitignore": "local/\n"})
+        self._commit_product(
+            {".gitignore": ".harness-runtime/\n", ".codex/.gitignore": "local/\n"}
+        )
         from orchestrator_harness.records import read_record
-        result, worktree = self._bootstrap("owned-ignore-lane", managed=True, provider="codex")
+
+        result, worktree = self._bootstrap(
+            "owned-ignore-lane", managed=True, provider="codex"
+        )
         self.assertTrue(result["ok"], result)
-        self.assertEqual("", bootstrap._run_git(worktree, "status", "--porcelain=v1", "--", ".codex/.gitignore").stdout)
-        self.assertEqual("local/\n", (worktree / ".codex/.gitignore").read_text(encoding="utf-8").replace("\r\n", "\n"))
+        self.assertEqual(
+            "",
+            bootstrap._run_git(
+                worktree, "status", "--porcelain=v1", "--", ".codex/.gitignore"
+            ).stdout,
+        )
+        self.assertEqual(
+            "local/\n",
+            (worktree / ".codex/.gitignore")
+            .read_text(encoding="utf-8")
+            .replace("\r\n", "\n"),
+        )
         # Generated files stay visible here; RESULT validation refuses committing them.
-        status = bootstrap._run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").stdout
+        status = bootstrap._run_git(
+            worktree, "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout
         self.assertIn("?? .codex/config.toml", status.splitlines())
         lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
         self.assertIn(".codex/config.toml", lane["source_exclusions"])
@@ -1494,39 +1774,54 @@ class V2MaterializationTests(unittest.TestCase):
     def test_plain_bootstrap_preserves_validated_task_card_copy(self) -> None:
         self._assert_bootstrap_preserves_validated_task_card_copy(managed=False)
 
-    def test_configured_checkout_scope_reaches_managed_and_plain_bootstrap(self) -> None:
+    def test_configured_checkout_scope_reaches_managed_and_plain_bootstrap(
+        self,
+    ) -> None:
         for managed in (True, False):
             with self.subTest(managed=managed):
                 self.fixture = MaterializationFixture()
                 self.addCleanup(self.fixture.close)
                 result, worktree = self._bootstrap(
-                    f"scoped-{managed}", managed=managed, provider="codex",
+                    f"scoped-{managed}",
+                    managed=managed,
+                    provider="codex",
                     checkout_paths=["src"],
                 )
                 self.assertTrue(result["ok"], result)
-                self.assertEqual("selected product input\n",
-                                 (worktree / "src/selected.txt").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "selected product input\n",
+                    (worktree / "src/selected.txt").read_text(encoding="utf-8"),
+                )
                 self.assertFalse((worktree / "unrelated").exists())
                 sparse = bootstrap._run_git(
                     worktree, "config", "--worktree", "--get", "core.sparseCheckout"
                 )
-                self.assertEqual((0, "true"), (sparse.returncode, sparse.stdout.strip()))
+                self.assertEqual(
+                    (0, "true"), (sparse.returncode, sparse.stdout.strip())
+                )
 
-    def test_sparse_scope_refuses_excluded_tracked_bootstrap_inputs_before_branch(self) -> None:
+    def test_sparse_scope_refuses_excluded_tracked_bootstrap_inputs_before_branch(
+        self,
+    ) -> None:
         for managed in (True, False):
             with self.subTest(managed=managed):
                 self.fixture = MaterializationFixture()
                 self.addCleanup(self.fixture.close)
-                self._commit_product({
-                    ".gitignore": ".harness-runtime/\n",
-                    "src/selected.txt": "selected product input\n",
-                    "unrelated/data.txt": "unrelated product input\n",
-                    ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
-                    ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
-                })
+                self._commit_product(
+                    {
+                        ".gitignore": ".harness-runtime/\n",
+                        "src/selected.txt": "selected product input\n",
+                        "unrelated/data.txt": "unrelated product input\n",
+                        ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
+                        ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
+                    }
+                )
                 result, _ = self._bootstrap(
-                    f"critical-input-refusal-{managed}", managed=managed,
-                    provider="codex", checkout_paths=["src"], allow_refusal=True,
+                    f"critical-input-refusal-{managed}",
+                    managed=managed,
+                    provider="codex",
+                    checkout_paths=["src"],
+                    allow_refusal=True,
                 )
                 self.assertFalse(result["ok"])
                 self.assertEqual(bootstrap.BOOTSTRAP_REQUEST_INVALID, result["code"])
@@ -1534,38 +1829,60 @@ class V2MaterializationTests(unittest.TestCase):
                 self.assertIn(".codex/config.toml", result["summary"])
                 self.assertIn("will not broaden", result["summary"])
                 runtime = self.fixture.root_workspace / ".harness-runtime"
-                self.assertFalse(list((runtime / "worktrees").glob(f"*/critical-input-refusal-{managed}")))
+                self.assertFalse(
+                    list(
+                        (runtime / "worktrees").glob(
+                            f"*/critical-input-refusal-{managed}"
+                        )
+                    )
+                )
                 branch = bootstrap._run_git(
-                    self.fixture.root_workspace, "show-ref", "--verify", "--quiet",
+                    self.fixture.root_workspace,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
                     f"refs/heads/lane/critical-input-refusal-{managed}",
                 )
                 self.assertEqual(1, branch.returncode)
 
-    def test_sparse_scope_including_required_inputs_preserves_them_and_excludes_unrelated_tree(self) -> None:
+    def test_sparse_scope_including_required_inputs_preserves_them_and_excludes_unrelated_tree(
+        self,
+    ) -> None:
         for managed in (True, False):
             with self.subTest(managed=managed):
                 self.fixture = MaterializationFixture()
                 self.addCleanup(self.fixture.close)
-                self._commit_product({
-                    ".gitignore": ".harness-runtime/\n",
-                    "src/selected.txt": "selected product input\n",
-                    "unrelated/data.txt": "unrelated product input\n",
-                    ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
-                    ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
-                })
+                self._commit_product(
+                    {
+                        ".gitignore": ".harness-runtime/\n",
+                        "src/selected.txt": "selected product input\n",
+                        "unrelated/data.txt": "unrelated product input\n",
+                        ".codex/config.toml": 'custom_prefix = "preserve-me"\n',
+                        ".agent-workspace/root-policy.md": "critical tracked agent policy\n",
+                    }
+                )
                 result, worktree = self._bootstrap(
-                    f"critical-input-present-{managed}", managed=managed,
-                    provider="codex", checkout_paths=["src", ".codex", ".agent-workspace"],
+                    f"critical-input-present-{managed}",
+                    managed=managed,
+                    provider="codex",
+                    checkout_paths=["src", ".codex", ".agent-workspace"],
                 )
                 self.assertTrue(result["ok"], result)
-                self.assertIn("preserve-me", (worktree / ".codex/config.toml").read_text(encoding="utf-8"))
+                self.assertIn(
+                    "preserve-me",
+                    (worktree / ".codex/config.toml").read_text(encoding="utf-8"),
+                )
                 self.assertEqual(
                     "critical tracked agent policy\n",
-                    (worktree / ".agent-workspace/root-policy.md").read_text(encoding="utf-8"),
+                    (worktree / ".agent-workspace/root-policy.md").read_text(
+                        encoding="utf-8"
+                    ),
                 )
                 self.assertFalse((worktree / "unrelated").exists())
 
-    def test_non_windows_codex_omission_keeps_saved_profile_omitted_and_generates_isolation(self) -> None:
+    def test_non_windows_codex_omission_keeps_saved_profile_omitted_and_generates_isolation(
+        self,
+    ) -> None:
         class PosixOsFacade:
             name = "posix"
 
@@ -1576,11 +1893,14 @@ class V2MaterializationTests(unittest.TestCase):
         self.addCleanup(self.fixture.close)
         with patch.object(bootstrap, "os", PosixOsFacade()):
             result, worktree = self._bootstrap(
-                "nonwindows-omitted-codex-profile", managed=False, provider="codex",
+                "nonwindows-omitted-codex-profile",
+                managed=False,
+                provider="codex",
                 launch_config_override={},
             )
         self.assertTrue(result["ok"], result)
         from orchestrator_harness.records import read_record
+
         lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
         self.assertEqual({}, lane["provider"]["launch_config"])
         config = (worktree / ".codex/config.toml").read_text(encoding="utf-8")
@@ -1591,9 +1911,7 @@ class V2MaterializationTests(unittest.TestCase):
     ) -> None:
         profile = "managed" if managed else "plain"
         lane_id = f"{profile}-task-card-lane"
-        result, worktree = self._bootstrap(
-            lane_id, managed=managed, provider="codex"
-        )
+        result, worktree = self._bootstrap(lane_id, managed=managed, provider="codex")
         self.assertTrue(result["ok"], result)
         copied_path = worktree / ".agent-workspace" / "task-card.json"
         self.assertTrue(copied_path.is_file(), copied_path)
@@ -1604,12 +1922,20 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def _bootstrap(
-        self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True,
-        manager: Path | None = None, checkout_paths: list[str] | None = None,
-        allow_refusal: bool = False, launch_config_override: dict[str, str] | None = None,
+        self,
+        lane_id: str,
+        *,
+        managed: bool,
+        provider: str,
+        prime_cache: bool = True,
+        manager: Path | None = None,
+        checkout_paths: list[str] | None = None,
+        allow_refusal: bool = False,
+        launch_config_override: dict[str, str] | None = None,
     ) -> tuple[dict[str, Any], Path]:
         from orchestrator_harness import processes
         from orchestrator_harness.records import read_record
+
         runtime = self.fixture.root_workspace / ".harness-runtime"
         if prime_cache:
             base = self.fixture.prepare_runtime(
@@ -1619,26 +1945,52 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertEqual("OPEN", setup.read_runtime_state(runtime)["state"])
             base = self.fixture.git("rev-parse", "HEAD")
         task_card = self.fixture.root / f"{lane_id}.json"
-        self.fixture._write_json(task_card, {
-            "schema": "project-task-card/v1", "task": f"materialize {lane_id}",
-            "acceptance_criteria": [f"The {lane_id} lane is materialized"],
-            "deliverables": ["A prepared worker worktree"],
-            "reason_for_acceptance_and_deliverables": "These prove materialization.",
-            "branch": f"lane/{lane_id}", "base_commit": base,
-        })
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": f"materialize {lane_id}",
+                "acceptance_criteria": [f"The {lane_id} lane is materialized"],
+                "deliverables": ["A prepared worker worktree"],
+                "reason_for_acceptance_and_deliverables": "These prove materialization.",
+                "branch": f"lane/{lane_id}",
+                "base_commit": base,
+            },
+        )
         with (
-            patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
-            patch.object(bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add) as git_add,
-            patch.object(processes, "spawn_provider", side_effect=AssertionError("bootstrap started a provider")) as provider_spawn,
-            patch.object(processes, "spawn_detached", side_effect=AssertionError("bootstrap started a detached process")) as detached,
+            patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ),
+            patch.object(
+                bootstrap, "_git_worktree_add", wraps=bootstrap._git_worktree_add
+            ) as git_add,
+            patch.object(
+                processes,
+                "spawn_provider",
+                side_effect=AssertionError("bootstrap started a provider"),
+            ) as provider_spawn,
+            patch.object(
+                processes,
+                "spawn_detached",
+                side_effect=AssertionError("bootstrap started a detached process"),
+            ) as detached,
         ):
             result = bootstrap.run_bootstrap(
-                lane_id=lane_id, provider=provider, model="test-model",
-                launch_config=(launch_config_override if launch_config_override is not None else
-                               {"reasoning_effort": "high", "service_tier": "priority"}
-                               if provider == "codex" else {"effort": "high"}
-                               if provider == "claude-code" else {}),
-                exclusive_resources=[], task_card_path=str(task_card),
+                lane_id=lane_id,
+                provider=provider,
+                model="test-model",
+                launch_config=(
+                    launch_config_override
+                    if launch_config_override is not None
+                    else {"reasoning_effort": "high", "service_tier": "priority"}
+                    if provider == "codex"
+                    else {"effort": "high"}
+                    if provider == "claude-code"
+                    else {}
+                ),
+                exclusive_resources=[],
+                task_card_path=str(task_card),
             )
         provider_spawn.assert_not_called()
         detached.assert_not_called()
@@ -1648,7 +2000,10 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertTrue((worktree / ".git").is_file())
             lane = read_record(Path(result["evidence_paths"][1]), "lane/v1")
             self.assertEqual(base, lane["git_source"]["base_commit"])
-            self.assertEqual(self.fixture.root_workspace / ".git", Path(lane["git_source"]["common_dir"]))
+            self.assertEqual(
+                self.fixture.root_workspace / ".git",
+                Path(lane["git_source"]["common_dir"]),
+            )
         else:
             if prime_cache and not allow_refusal:
                 self.fail(f"actual prepared bootstrap failed: {result}")
@@ -1659,5 +2014,7 @@ class V2MaterializationTests(unittest.TestCase):
             self.assertFalse(list((runtime / "worktrees").glob(f"*/{lane_id}")))
             worktree = runtime / "worktrees/not-admitted" / lane_id
         return result, worktree
+
+
 if __name__ == "__main__":
     unittest.main()

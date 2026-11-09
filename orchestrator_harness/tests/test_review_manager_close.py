@@ -18,7 +18,9 @@ class ReviewManagerCloseTests(unittest.TestCase):
         }
         event = {"event_id": "event-1"}
         with (
-            mock.patch.object(review, "find_harness_root", return_value=Path("harness")),
+            mock.patch.object(
+                review, "find_harness_root", return_value=Path("harness")
+            ),
             mock.patch.object(
                 review,
                 "load_config",

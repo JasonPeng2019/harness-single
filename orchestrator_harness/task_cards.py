@@ -1,4 +1,5 @@
 """Shared validation for the public project task-card contract."""
+
 from __future__ import annotations
 
 from typing import Any

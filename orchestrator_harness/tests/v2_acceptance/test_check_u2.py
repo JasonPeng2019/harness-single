@@ -8,7 +8,9 @@ from orchestrator_harness.tests.v2_acceptance.reference_runtime import Reference
 class CheckU2Tests(unittest.TestCase):
     """CHECK-U2 — REQ-002/003/008/009 profile and queue-role oracle."""
 
-    def test_managed_monitor_is_sole_event_producer_and_deduplicates_status(self) -> None:
+    def test_managed_monitor_is_sole_event_producer_and_deduplicates_status(
+        self,
+    ) -> None:
         runtime = ReferenceRuntime(mode="managed")
         runtime.bootstrap("managed-lane", "run-1")
         runtime.terminal("managed-lane", "review_pending")

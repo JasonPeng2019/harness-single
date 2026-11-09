@@ -23,7 +23,11 @@ class RecordedJobAbsenceTests(unittest.TestCase):
         native.start()
         self.addCleanup(native.stop)
         # The fake OS reports complete absence only for fixture PIDs known dead.
-        query = patch.object(p, "targeted_process_query", side_effect=lambda pid: ProcessQuery(not p.process_alive(pid), None))
+        query = patch.object(
+            p,
+            "targeted_process_query",
+            side_effect=lambda pid: ProcessQuery(not p.process_alive(pid), None),
+        )
         query.start()
         self.addCleanup(query.stop)
 

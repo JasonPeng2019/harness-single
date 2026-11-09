@@ -1,4 +1,5 @@
 """Portable source identity and output-boundary checks for the native probe."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -26,8 +27,22 @@ class ProbePortabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
-            subprocess.run(["git", "-C", str(root), "-c", "user.name=Probe", "-c",
-                            "user.email=probe@invalid", "commit", "--allow-empty", "-qm", "seed"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Probe",
+                    "-c",
+                    "user.email=probe@invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "seed",
+                ],
+                check=True,
+            )
             self.assertTrue(probe._source_head(root))
             nested = root / "nested"
             nested.mkdir()
