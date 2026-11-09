@@ -275,7 +275,9 @@ class ClaudeUsageTests(unittest.TestCase):
                 result["comparison_total_tokens"],
             ),
         )
-        self.assertEqual(25, result["model_usage"]["claude-sonnet-5-5"]["output_tokens"])
+        self.assertEqual(
+            25, result["model_usage"]["claude-sonnet-5-5"]["output_tokens"]
+        )
 
     def test_provider_aware_summarize_reports_indexed_cli_rollup(self):
         path = self.base / "claude-events.jsonl"
