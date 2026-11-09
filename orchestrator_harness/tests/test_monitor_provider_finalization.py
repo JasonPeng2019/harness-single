@@ -18,7 +18,7 @@ class ProviderFinalizationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.runtime = Path(temporary.name)
         identity = processes.process_identity(os.getpid())
-        self.assertIsNotNone(identity)
+        assert identity is not None
         self.identity = identity
         self.lane = {
             "lane_id": "finalizing",
@@ -35,9 +35,18 @@ class ProviderFinalizationTests(unittest.TestCase):
             Path(self.lane["controller_status_path"]), controller.CONTROLLER_STATUS_SCHEMA
         )
 
-    def derive(self, status: dict, **kwargs: object) -> str | None:
+    def derive(
+        self,
+        status: dict,
+        orphaned_leases: list[dict[str, object]] | None = None,
+    ) -> str | None:
         return monitor.derive_lane_status(
-            self.runtime, "epoch-1", self.lane, status, lease_records=[], **kwargs
+            self.runtime,
+            "epoch-1",
+            self.lane,
+            status,
+            lease_records=[],
+            orphaned_leases=orphaned_leases,
         )
 
     def test_provisional_provider_exit_waits_for_live_controller_decision(self) -> None:
