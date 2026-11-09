@@ -154,7 +154,7 @@ option. An unchanged effective profile keeps the saved session.
 
 For Codex workers, a fresh Windows bootstrap with no permission option records
 `permission_mode=worker-workspace`, which keeps the write sandbox and narrow Git grants without
-the broad sibling/operator read-denial list. This mode does not promise read confidentiality. Strict mode remains separately unqualified on this host.
+the broad sibling/operator read-denial list. This mode does not promise read confidentiality. Strict read isolation requires separate qualification.
 Fresh non-Windows workers keep the existing default. Select strict Windows read isolation
 explicitly with `--provider-option permission_mode=worker-isolated`; select full access explicitly
 with `--provider-option permission_mode=yolo`. Yolo passes `--yolo` without OS sandbox
@@ -177,7 +177,8 @@ installed harness. It creates a temporary two-worktree fixture, checks lane writ
 attempts writes to protected sentinels, records profile/CLI/config hashes and exact cleanup, and
 publishes a `worker-workspace`-specific health receipt only when the observations pass. It does not
 configure or repair the sandbox. A successful probe is mode-specific evidence, not proof of strict
-read isolation; absent or stale receipts do not qualify the mode.
+read isolation; absent or stale receipts do not qualify the mode. Each installation and operator
+must also qualify the intended workflow for that mode before relying on it.
 
 ```powershell
 python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
@@ -189,8 +190,9 @@ python -B scripts/check_windows_sandbox.py --harness-dir . `
 
 This writes `local-config/windows-sandbox-health-worker-workspace.json`; the legacy ROOT receipt
 `local-config/windows-sandbox-health.json` is separate. A prior worker receipt is preserved; pass
-`--replace-existing-health` only when intentionally replacing it after retaining the prior evidence. The reduced-mode probe/receipt has not
-yet received final integrated concurrent-project acceptance in this candidate.
+`--replace-existing-health` only when intentionally replacing it after retaining the prior evidence.
+The probe does not establish concurrent-project or public-check workflow qualification; validate
+those workflows for the installation and mode you intend to use.
 
 ## 4. Launch
 

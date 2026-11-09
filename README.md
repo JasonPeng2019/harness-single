@@ -235,7 +235,8 @@ and `summarize`, while existing Codex collector commands remain compatible. Clau
 the top-level terminal `modelUsage` rollup, including built-in subagents where recorded. The
 comparison metric is uncached input plus output; cache read/create fields are separate and absent
 values stay unknown. Reports preserve provider-specific totals and flag mixed metric scope. Claude
-usage is fixture-qualified; authenticated live CLI qualification is unavailable and not claimed.
+usage fixtures cover parsing and accounting; they do not qualify the actual Claude CLI, which
+requires a successful authenticated live run in the intended installation.
 
 ## Evidence and provider proof
 

@@ -56,4 +56,3 @@ The worker permission mode changes only when the replacement options explicitly 
 and incomplete required options continue to refuse. Permission-profile changes are explicit profile
 changes and do not silently alter an ordinary resume. Retained failure blocks and health-gate failures
 remain in force; changing a model or permission mode cannot bypass or clear them.
-

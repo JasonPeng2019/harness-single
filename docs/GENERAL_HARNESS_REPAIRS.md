@@ -1,8 +1,8 @@
 # General harness repairs and portable operation
 
-This guide describes the delivered R1–R7 protections and the F1–F3/R8 changes in this candidate.
-It is an operating guide, not evidence of a live provider run. Keep the prior R1–R7 completion
-report as historical evidence; its test and demo results do not qualify F1–F3 or R8.
+This guide describes the R1–R7 protections and F1–F3/R8 behavior. It is an operating guide, not
+evidence of a live provider run. Keep prior completion reports as historical evidence; tests and
+demos qualify only the source and installation they actually exercised.
 
 ## Repair summary
 
@@ -37,7 +37,8 @@ report as historical evidence; its test and demo results do not qualify F1–F3 
   uses the top-level terminal `modelUsage` rollup; comparison total is uncached input plus output,
   cache read/create values remain separate, and missing values remain unknown. Resume deltas are
   keyed by provider and native session. Reports keep per-provider totals and identify mixed metric
-  scope. Fixture behavior is documented; live Claude CLI/auth qualification is not claimed.
+  scope. Fixtures cover parsing and accounting; they do not qualify the actual Claude CLI, which
+  requires a successful authenticated live run in the intended installation.
 - **R8 — normal Windows worker mode.** A fresh Windows Codex bootstrap with omitted worker mode
   records `worker-workspace`, which keeps write restrictions and narrow Git grants without the
   broad sibling/operator read-denial list. Explicit `worker-isolated` retains strict denials;
@@ -77,9 +78,10 @@ workspace.
    python -B scripts/check_windows_sandbox.py --harness-dir . --workspace <root-workspace> --permission-mode worker-workspace
    ```
 
-   The probe is mode-specific. It does not qualify strict read isolation. Final reduced-mode
-   concurrent-project and public-check acceptance remains pending in this candidate; do not claim a
-   probe result or live acceptance from these instructions.
+   The probe is mode-specific and does not qualify strict read isolation. Each installation and
+   operator must earn a mode-specific probe receipt and qualify the intended concurrent-project and
+   public-check workflows before relying on reduced mode. These instructions are not evidence that
+   a probe or workflow has passed.
 4. Bootstrap a lane with an explicit provider, model, and complete required provider options.
    Fresh Windows Codex bootstrap omission selects and records `worker-workspace`. Select strict
    `worker-isolated` or full-access `yolo` only when the operator intends that mode. Resume omission
@@ -94,15 +96,15 @@ For provider-aware usage, use `scripts/collect_usage.py` for Claude `run`/`resum
 `snapshot`, `gate`, `finalize`, or `summarize` operations as needed. The provider identity comes
 from the ROOT launch and protected worker invocation records; collection reads native evidence and
 does not resume or modify a session. Claude collection requires the CLI/auth context configured by
-the operator. Live Claude qualification remains unavailable in this candidate.
+the operator. Fixtures do not qualify the actual Claude CLI; that requires a successful authenticated
+live run in the intended installation.
 
 ## Evidence boundary
 
 Native `watch --until-actionable` remains the manager work-discovery path. This extension does not
 claim a repair for the historical Stop-hook/compaction timeout; that cause remains unresolved.
 
-The probe script and usage collectors produce evidence only when actually run; this document does
-not claim those commands have passed. R8 still needs integrated concurrent-project acceptance in
-`worker-workspace`. Strict Windows read isolation remains separately unqualified. Historical R1–R7
-results remain valid for their recorded source revision only and are not evidence for these newer
-features.
+The probe script and usage collectors produce evidence only when actually run. Each installation
+and operator must qualify the selected Windows worker mode and intended concurrent-project/public-
+check workflow; strict read isolation requires separate qualification. Historical R1–R7 results
+remain scoped to their recorded source revision and do not qualify newer features.
