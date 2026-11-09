@@ -55,9 +55,12 @@
   loop, and a lane retired in the current epoch refuses resume with a preserved error while
   supported retained stopped lanes across closed epochs remain resumable.
 - For a fresh managed ROOT, run `scripts/prepare_root_launch.py` first; it performs the native
-  setup internally. Windows Codex requires the read-only CLI/home/cache/marker/probe gate before
-  preparation and it cannot be disabled by missing local policy; other ROOT providers are selected
-  explicitly and the Codex gate is never bypassed. Manual `harness setup` is for plain/manual
+  setup internally. Isolated Windows Codex requires the read-only CLI/home/cache/marker/probe gate
+  before preparation and missing local policy cannot disable it. Explicit Codex ROOT
+  `--sandbox danger-full-access` and worker `permission_mode=yolo` use no OS sandbox; they skip
+  readiness for that unused sandbox but retain any existing run-wide failure block. ROOT mode
+  is bound into preparation and must match launch/resume. Other ROOT providers are selected
+  explicitly. Manual `harness setup` is for plain/manual
   integration and for reopening an already prepared ROOT, where preparation revalidates the same
   run-id receipt instead of repeating setup. Never delete or fabricate runtime records or receipts.
 - Managed ROOT Stop requires runtime CLOSED, not just an empty queue. CLOSED proves cleanup,

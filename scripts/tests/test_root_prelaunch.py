@@ -256,7 +256,7 @@ class RootPrelaunchTests(unittest.TestCase):
         args.model = "deterministic-fixture"
         args.reasoning_effort = "fixture"
         args.service_tier = "fixture"
-        args.sandbox = "read-only"
+        args.sandbox = "workspace-write"
         args.interrupted_run = True
         args.inhibit_sleep = False
         return args

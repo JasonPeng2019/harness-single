@@ -37,21 +37,42 @@ Declare each exclusive resource as `{"id": "<name>", "exclusive": true}` in `res
 ## 2. Prepare before ROOT starts
 
 For a fresh managed ROOT, run pre-launch preparation FIRST: it performs the one native setup
-internally and records the run-bound receipt. On Windows Codex the read-only sandbox gate must be
-valid for the exact CLI/home/process-local LOCALAPPDATA cache before preparation. Follow
-[the integration guide](docs/INTEGRATED_RUN_FIXES.md); no PASS receipt ships with the harness.
+internally and records the run-bound receipt. The explicit working recipe below uses full-access
+Codex ROOT and, in step 3, an explicit yolo worker. This is an operating compromise for hosts where
+the broad worker-isolation profile is unusable: Codex commands have the current user's access,
+without OS sandbox enforcement. Native worktree ownership, hooks, review and cleanup still apply.
 
 ```powershell
-python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id> --sandbox danger-full-access
 ```
 
 `--workspace` must equal the configured `manager_workspace`. Select the ROOT provider explicitly:
 the default is `--provider codex`, and `--provider claude-code` or `--provider qwen-code` are
-equally valid selections; the Codex health gate applies only to Codex and is never bypassed. The
+equally valid selections (omit `--sandbox` for those providers). The
 usage collector and a fresh ROOT launch expect the matching receipt under that workspace's
 `.agent-workspace/`. An existing runtime without it is refused, and setup after ROOT starts cannot
 install hooks into that already-running session. Optional public-check policy must be installed
 before preparation so the operator-owned service is ready before any worker starts.
+
+Launch Codex ROOT with the same selected mode; for example:
+
+```powershell
+python -B scripts/collect_codex_usage.py run `
+  --run-id <id> --task <task-name> --arm harness `
+  --cwd <configured-manager-workspace> --prompt-file <root-prompt.txt> `
+  --results-dir <owned-results-directory> --harness-dir . `
+  --harness-runtime <configured-product-workspace>/.harness-runtime `
+  --model <model> --reasoning-effort <effort> --service-tier <tier> `
+  --sandbox danger-full-access --watchdog-hours <hours> --trust-project-hooks
+```
+
+For an isolated ROOT instead, use `--sandbox workspace-write` or `--sandbox read-only` in both
+preparation and launch. Omission still defaults to `workspace-write`; the harness never falls
+back to full access. On Windows these isolated modes require genuine health proof for the exact
+CLI/home/process-local LOCALAPPDATA cache. Follow [the integration guide](docs/INTEGRATED_RUN_FIXES.md);
+no PASS receipt ships with the harness. Preparation binds the selected mode, and launch/resume
+refuses a different mode. An existing run-wide sandbox-failure block also refuses full access;
+changing permissions is not recovery for an already failed run.
 
 Manual native integration remains available:
 
@@ -62,7 +83,7 @@ python -m orchestrator_harness.operator_launch harness setup
 It is for plain/manual integration and for reopening an already prepared ROOT. Reopening an
 already prepared ROOT revalidates the existing receipt instead of repeating setup. For a
 prepared CLOSED runtime, run native `harness setup` first, then pre-launch preparation with the
-SAME run ID: preparation revalidates the prior receipt/session/config/hooks and the exact stopped
+SAME run ID and ROOT sandbox mode: preparation revalidates the prior receipt/session/config/hooks and the exact stopped
 service owner, explicitly starts the enabled service with a fresh startup identity, and archives
 the old owner/config/receipt. A lane resume or launch never starts the service, and nothing
 retries automatically.
@@ -96,6 +117,7 @@ python -m orchestrator_harness.operator_launch lane bootstrap `
   --lane-id lane-01 --provider codex --model <model> `
   --provider-option reasoning_effort=<effort> `
   --provider-option service_tier=<tier> `
+  --provider-option permission_mode=yolo `
   --task-card <path-to-task-card.json>
 ```
 
@@ -109,10 +131,12 @@ Claude Code requires `effort`; Qwen Code currently requires only `--model`. Each
 repeated `--provider-option NAME=VALUE`. Bootstrap rejects missing, duplicate, or unsupported
 preferences before creating the lane, and resume reuses the recorded values unchanged.
 
-Codex also accepts `--provider-option permission_mode=yolo` for explicitly requested
+The example explicitly selects `--provider-option permission_mode=yolo` for
 approval/sandbox bypass. The adapter passes `--yolo` and omits worker-isolated and
-Windows sandbox overrides. Without this option the existing worker-isolated mode
-remains in use; `permission_mode=worker-isolated` selects it explicitly. Claude Code
+Windows sandbox overrides. To choose isolation on a qualified host, use
+`--provider-option permission_mode=worker-isolated`; omitting the option still selects that
+existing isolated default. ROOT and worker modes are independent: full-access ROOT may launch an
+isolated worker, whose Windows health gate still applies. Claude Code
 uses `--permission-mode bypassPermissions`, equivalent to its permission-bypass CLI
 flag. Permission bypass does not change the assigned repository or task ownership.
 

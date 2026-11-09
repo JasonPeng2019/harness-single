@@ -23,8 +23,12 @@ See [portable path configuration](docs/PATH_PORTABILITY.md) for tool discovery,
 unconfigured examples and the explicit WSL isolation mount inputs.
 
 See [the integrated run fixes](docs/INTEGRATED_RUN_FIXES.md) for Codex ROOT prelaunch
-preparation, the mandatory Windows sandbox health gate, the optional direct worker public
+preparation, the Windows health gate for isolated Codex execution, the optional direct worker public
 build/test service, and remaining task-completion work.
+
+See [general harness repairs](docs/GENERAL_HARNESS_REPAIRS.md) for the R1–R7 repair summary
+and a portable operational reproduction outline. The outline is guidance, not evidence that a
+live provider demo has been completed.
 
 ## Installation layout
 
@@ -101,10 +105,14 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
    `exclusive: true`; duplicate IDs and unknown fields are invalid.
 3. For a fresh managed ROOT, run pre-launch preparation FIRST; it performs the one native
    integration internally:
-   `python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>`.
-   Windows Codex needs the read-only sandbox health receipt before preparation; other ROOT
-   providers are selected explicitly (`--provider claude-code` or `--provider qwen-code`) and the
-   Codex health gate is never bypassed. Preparation validates the config and manifest, preflights
+   `python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id> --sandbox danger-full-access`.
+   This explicitly selects full-access Codex ROOT, the general operating recipe documented in
+   `QUICK_START.md`; it provides no OS sandbox enforcement. Pass the same `--sandbox` to the
+   Codex usage collector. Isolated `workspace-write` (the unchanged default) or `read-only` ROOT
+   requires the Windows read-only sandbox health receipt. Preparation binds the mode, and an
+   existing run-wide sandbox-failure block refuses every Codex mode. Other ROOT providers are
+   selected explicitly (`--provider claude-code` or `--provider qwen-code`, without `--sandbox`).
+   Preparation validates the config and manifest, preflights
    the entire catalog before writing anything, stages and byte-verifies the active super-cache,
    installs the ROOT payloads, writes the active resource manifest and lease directory, starts the
    persistent monitor, and records the run-bound receipt. It starts no lane or provider and never
@@ -114,7 +122,7 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
    for reopening an already prepared ROOT (`--overwrite` only for a separately diagnosed
    integration change). Reopening an already prepared ROOT revalidates the existing receipt
    instead of repeating setup. For a prepared CLOSED runtime, run native `harness setup` first,
-   then pre-launch preparation with the SAME run ID: preparation revalidates the prior
+   then pre-launch preparation with the SAME run ID and ROOT sandbox mode: preparation revalidates the prior
    receipt/session/config/hooks and the exact stopped service owner, explicitly starts the enabled
    service with a fresh startup identity, and archives the old owner, config and receipt. A lane
    resume or launch never starts the service, and nothing retries automatically. Never delete or

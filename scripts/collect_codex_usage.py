@@ -285,7 +285,8 @@ def run_codex(args: argparse.Namespace) -> int:
     root_prelaunch = None
     if args.arm == "harness":
         try:
-            root_prelaunch = validate_prepared_root(harness_dir, workspace, args.run_id, resuming=resuming)
+            root_prelaunch = validate_prepared_root(harness_dir, workspace, args.run_id, resuming=resuming,
+                                                    sandbox=getattr(args, "sandbox", "workspace-write"))
             native = root_prelaunch["native_session_id"]
             if resuming:
                 if native not in (None, session_id):

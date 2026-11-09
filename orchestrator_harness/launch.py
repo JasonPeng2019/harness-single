@@ -7,7 +7,9 @@ lane hard stop.  Retire is the graceful end of an accepted lane.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -77,6 +79,23 @@ class ControllerNotCreated(LaunchError):
     """The native spawn failed before returning any controller handle."""
 
 
+def _controller_spawn_options(
+    harness_root: Path, lane: Mapping[str, Any], invocation: Mapping[str, Any],
+) -> dict[str, Any]:
+    options: dict[str, Any] = {"cwd": str(harness_root)}
+    provider = invocation["provider"]
+    if (sys.platform == "win32" and provider["id"] == "codex"
+            and provider["launch_config"].get("permission_mode") != "yolo"):
+        # Windows applies sandbox ACLs through writable temporary roots. Avoid
+        # traversing the shared user TEMP and retain each invocation's artifacts.
+        temporary = Path(lane["worktree_path"]) / ".agent-workspace" / "tmp" / lane["run_id"]
+        temporary.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.update(TEMP=str(temporary), TMP=str(temporary))
+        options["env"] = environment
+    return options
+
+
 def _spawn_controller_logged(
     rt: Path,
     lane: Mapping[str, Any],
@@ -88,7 +107,7 @@ def _spawn_controller_logged(
             rt, "launch.controller.requested", component="launch",
             lane_id=lane.get("lane_id"), run_id=lane.get("run_id"),
             argv=list(argv), cwd=spawn_options.get("cwd"),
-            environment_mode="scrubbed" if "env" in spawn_options else "inherited",
+            environment_mode="explicit" if "env" in spawn_options else "inherited",
         )
         # Keep early controller/import failures, which occur before status exists.
         stderr_path = Path(lane["controller_status_path"]).with_name("controller-stderr.txt")
@@ -325,9 +344,15 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 _record_launch_failure(rt, epoch_id, lane, controller_not_created=True)
                 raise LaunchError(LAUNCH_CONTROLLER_START_FAILED, "runtime or epoch changed before spawn")
             try:
+                try:
+                    spawn_options = _controller_spawn_options(harness_root, lane, invocation)
+                except (OSError, ValueError) as exc:
+                    # Pending launch was already consumed, but no controller
+                    # exists. Retain the same native proof as a failed spawn.
+                    raise ControllerNotCreated(LAUNCH_CONTROLLER_START_FAILED, str(exc)) from exc
                 child = _spawn_controller_logged(
                     rt, lane, processes.python_argv("orchestrator_harness.controller", lane_id),
-                    {"cwd": str(harness_root)},
+                    spawn_options,
                 )
             except ControllerNotCreated:
                 _record_launch_failure(rt, epoch_id, lane, controller_not_created=True)

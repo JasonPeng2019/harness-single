@@ -10,7 +10,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/orchestrator_harness_post_tool_use.py"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_post_tool_use.py\""
           }
         ]
       }
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/orchestrator_harness_stop.py"
+          "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_stop.py\""
           }
         ]
       }

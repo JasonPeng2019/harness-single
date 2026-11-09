@@ -41,6 +41,14 @@ files are preserved.
   The gate never calls Codex, setup, elevation or fallback. A setup error or
   changed marker records a run-wide block and stops only the exact owned process
   boundary, including failures detected after fast exit.
+- Codex ROOT preparation and collector launch select the same explicit `--sandbox`:
+  `workspace-write` (unchanged default), `read-only`, or `danger-full-access`.
+  Preparation records the mode, and launch/resume refuses a mismatch. Explicit full
+  access skips readiness for an unused OS sandbox; it retains the run-wide block,
+  exact ROOT/session/configuration/service identities and cleanup guards. This is
+  an operating compromise, not sandbox isolation. Worker `permission_mode=yolo`
+  is selected independently and retains its existing behavior. Nothing falls back
+  after startup failure or changes a running/prepared run's mode.
 - Worker isolation never denies an ancestor of ROOT/the lane. Linked workers
   receive directory writes for their own private Git metadata, shared objects,
   and an exclusive branch/ref/reflog parent. The default branch is
@@ -49,6 +57,11 @@ files are preserved.
   the Git directory, pointer/backlink, branch and origin assignment before use;
   ROOT's index, config and hooks remain ungranted. Harness/operator state and
   protected sibling workspaces remain denied.
+- Windows worker-isolated Codex controllers receive a copied environment whose TEMP/TMP point
+  to `.agent-workspace/tmp/<run_id>` in the lane. Each invocation has its own directory; prior
+  artifacts and the parent's environment are preserved. Yolo, other providers and non-Windows
+  launches retain their existing environment. This mitigates shared-temp ACL traversal; it does
+  not qualify the complete broad read-denial profile or concurrent shared-principal behavior.
 - Native Windows public-check adapters and workers share the same read-denial
   policy through `orchestrator_harness.isolation_policy.shared_read_denials`.
   Public checks must not deny live source, worker worktrees or Git metadata that
@@ -77,6 +90,26 @@ files are preserved.
   handling are unchanged; built-in web search is unavailable in this launcher,
   nothing falls back to another provider automatically, and provider staffing
   fallbacks remain ROOT planning rather than harness behavior.
+- Claude hook commands in ROOT and worker payloads resolve from the quoted
+  `${CLAUDE_PROJECT_DIR}`. Setup and inherited worker bootstrap migrate only the
+  exact known legacy hook groups, deduplicate old-plus-new registrations, and
+  preserve other provider settings. Altered or missing inherited owned groups
+  refuse without changing settings. See [general harness repairs](GENERAL_HARNESS_REPAIRS.md)
+  for the R1–R7 summary and a portable reproduction outline.
+- Inherited generated Codex profiles are rebuilt from the supported workspace
+  defaults and current lane grants rather than carrying parent grants forward
+  (R3). On Windows, worker-isolated Codex gets per-invocation private TEMP/TMP
+  directories (R4); this mitigates shared-temp ACL traversal but does not qualify
+  the complete isolated profile. Explicit full-access ROOT mode remains an
+  operating compromise without OS sandbox enforcement (R7).
+- The monitor leaves provisional absent/invalid worker results to the live exact
+  controller's finalization and still surfaces explicit failures, dead or
+  mismatched controllers, lease issues, transcript contradictions and unproven
+  cleanup (R5). Usage accounting rejects duplicate `controller_started` evidence
+  within one run before pairing provider events and transcripts (R6). These
+  checks report ambiguity or failure; they do not start a retry or authorize a
+  second launch. Targeted local evidence is recorded with the repair artifacts;
+  no full live demo claim is made here.
 
 ## Operator preparation
 
@@ -84,7 +117,7 @@ Configure a fresh harness copy and ROOT workspace, and optionally a separate
 manager workspace. A wheel installation is module-only; a runnable harness root
 also needs the sibling `adapters/`, `super-cache/`, `scripts/`, `tools/`,
 `harness_watcher_implementation/`, `docs/` and `examples/` trees plus operator
-configuration. For Windows Codex, choose a process-local LOCALAPPDATA cache and
+configuration. For isolated Windows Codex, choose a process-local LOCALAPPDATA cache and
 keep it unchanged for setup, ROOT, controllers and workers. Obtain a real
 isolated-command/protected-path probe for the exact CLI/home/cache before
 issuing `local-config/windows-sandbox-health.json`.
@@ -113,13 +146,21 @@ ships no machine ACL cleanup, automatic permission reset or SDK-state edits.
 [Portable Git layout guidance](PATH_PORTABILITY.md#native-worker-git-storage)
 describes compatible storage before the first setup.
 
-Before starting Codex ROOT, the sandbox gate reads the product workspace while
+For isolated Codex ROOT, the sandbox gate reads the product workspace while
 preparation selects the configured manager workspace:
 
 ```powershell
 python -B scripts/check_windows_sandbox.py --harness-dir . --workspace <absolute-root-workspace>
-python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id>
+python -B scripts/prepare_root_launch.py --harness-dir . --workspace <configured-manager-workspace> --run-id <id> --sandbox workspace-write
 ```
+
+On hosts where that sandbox profile cannot operate, a fresh run can explicitly use
+`--sandbox danger-full-access` in preparation and in `scripts/collect_codex_usage.py run`.
+Use `--provider-option permission_mode=yolo` for each worker that should also run without
+OS sandbox enforcement. This preserves native orchestration while granting commands the
+current user's access. It is not a repair for an existing run-wide sandbox block. ROOT
+and worker modes are independent; choosing full-access ROOT does not authorize an isolated
+worker to skip its own health proof. See the complete command recipe in `QUICK_START.md`.
 
 Preparation invokes native setup once, validates hooks and writes the receipt
 under the manager workspace's `.agent-workspace/ROOT_PRELAUNCH_SETUP.json`. Before
@@ -149,7 +190,7 @@ preparation. No service, backend, sandbox or provider startup is automatically
 retried. ROOT resumes revalidate the original hooks, config, sandbox health,
 run-wide block and service. Quiescent OPEN review needs the live service;
 reopening a prepared CLOSED runtime requires the original service STOPPED with
-cleanup proved; native `harness setup` and preparation with the SAME run ID then
+cleanup proved; native `harness setup` and preparation with the SAME run ID and ROOT sandbox mode then
 revalidate the prior receipt/session/config/hooks and the exact stopped service
 owner, explicitly start the enabled service with a fresh startup identity, and
 archive the old owner, config and receipt. A lane resume or launch never starts

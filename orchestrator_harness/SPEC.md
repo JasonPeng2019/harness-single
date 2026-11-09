@@ -102,13 +102,22 @@ explicitly unproven by the current clean-source validator, never silently accept
   across run IDs. Reservations are durable before creation; uncertain, lost or
   corrupt history cannot replenish the allowance. Worker-local logs are diagnostic.
 - ROOT creation/resume requires its original matching prelaunch receipt: exact
-  workspace, native hooks/configuration, harness inputs, sandbox proof and optional
+  workspace, native hooks/configuration, harness inputs, selected ROOT sandbox mode,
+  applicable sandbox proof and optional
   service identity. OPEN quiescent review resume proves worker cleanup; CLOSED
   resume proves the original service STOPPED and does not reopen lanes.
 - Windows isolated Codex launch requires operator health proof for the selected
   binary/home/cache. The harness never performs sandbox setup. A first failure,
   including before polling or before provider creation, durably blocks the run;
   later resume, provider switching or explicit bypass cannot clear it.
+- Codex ROOT preparation accepts an explicit `--sandbox` matching its collector
+  launch: `read-only`, `workspace-write` (unchanged default), or `danger-full-access`.
+  Full access skips readiness for the unused OS sandbox but preserves the run-wide
+  failure block and all session/configuration/service/cleanup validation. The mode
+  is bound into preparation and launch evidence and cannot change on resume.
+  Older v2 receipts without a mode retain only default workspace-write semantics
+  and the original readiness requirement. Explicit worker `yolo` is an independent
+  full-access selection, not OS isolation or a sandbox-failure fallback.
 - Linked-worktree worker permissions resolve and validate Git common/per-worktree
   metadata and pointer/backlink ownership. Directory writes cover the assigned
   private Git directory, shared objects, and its exclusive branch/ref/reflog parent

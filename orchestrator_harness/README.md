@@ -114,9 +114,11 @@ and ROOT additions share the inbox lock, so an addition preserves earlier update
 
 ## Configuration and one-time integration
 
-`harness-config.json` at the harness root is the closed two-key `harness-config/v1` shape: a
-required absolute `root_workspace` and optional `managed_coordination` (`enabled` or `disabled`;
-default `enabled`). No other keys are legal. `resource-manifest.json` is the closed
+`harness-config.json` at the harness root is the closed `harness-config/v1` shape: a required
+absolute `root_workspace`, optional absolute `manager_workspace` (ROOT hooks, skills and
+`.agent-workspace`; defaults to `root_workspace`), and optional `managed_coordination`
+(`enabled` or `disabled`; default `enabled`). These are the only allowed keys.
+`resource-manifest.json` is the closed
 `resource-manifest/v1` shape: a literal `schema` field plus a `resources` list; every nonempty
 entry declares a nonempty `id` and `exclusive: true`, and duplicate IDs or unknown fields are
 invalid. ROOT never passes paths, feature flags, or a profile again on any later command; the
@@ -229,7 +231,12 @@ of the current tip; unknown, divergent, mixed, or stale credit is not green evid
 Managed ROOT Stop requires runtime CLOSED, including empty-queue/live-worker and no-epoch
 cases. CLOSED establishes cleanup, not task completion. Before a fresh Codex ROOT launch, the
 operator must prepare native hooks/monitor and a matching setup receipt with
-`scripts/prepare_root_launch.py`. Windows Codex always requires the read-only environment-bound
-sandbox gate; it never initializes or repairs the sandbox. The optional project-configured build/test service
+`scripts/prepare_root_launch.py`. Codex preparation and collector launch bind the same explicit
+`--sandbox` selection: `workspace-write` (default), `read-only`, or `danger-full-access`.
+Windows isolated modes require the read-only environment-bound sandbox gate. Full access has no
+OS sandbox and does not require proof for that unused sandbox, but an existing run-wide failure
+block still refuses it. No mode switches or fallback occur on resume. The harness never initializes
+or repairs the sandbox. See `QUICK_START.md` for the explicit full-access ROOT/yolo-worker recipe
+and the isolated alternative. The optional project-configured build/test service
 stages a lane-local client and is stopped during shutdown. See
 [the integration guide](../docs/INTEGRATED_RUN_FIXES.md) for setup, limits and remaining work.

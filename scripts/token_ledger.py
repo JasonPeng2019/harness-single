@@ -523,11 +523,19 @@ def _worker_invocations(task: dict[str, Any]) -> list[dict[str, Any]]:
                         raise LedgerError(f"invalid or duplicate attempt path: {candidate}")
                     transcript_paths[number] = candidate
                 events_path = workspace / "controller.events.jsonl"
-                starts = [
-                    row
-                    for row in read_lines(events_path, allow_partial_tail=True)
-                    if row.get("event_type") == "provider_started"
-                ]
+                event_rows = read_lines(events_path, allow_partial_tail=True)
+                controller_runs: set[str] = set()
+                for event in event_rows:
+                    if event.get("event_type") != "controller_started":
+                        continue
+                    run_id = event.get("run_id")
+                    if isinstance(run_id, str) and run_id:
+                        if run_id in controller_runs:
+                            raise LedgerError(
+                                f"duplicate controller dispatch for run {run_id!r} in {events_path}"
+                            )
+                        controller_runs.add(run_id)
+                starts = [row for row in event_rows if row.get("event_type") == "provider_started"]
                 if workspace != lane_dir / ".agent-workspace" and (
                         any(start.get("run_id") != lane_run_id for start in starts)
                         or any(row.get("run_id") != lane_run_id or row.get("lane_id") != lane_id

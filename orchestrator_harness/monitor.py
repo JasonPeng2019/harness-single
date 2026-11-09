@@ -411,9 +411,6 @@ def derive_lane_status(
         if _transcript_contradicts(lane, status):
             return "status_transcript_contradiction"
         return recorded
-    provider_state = (status or {}).get("provider_state") or {}
-    if provider_state.get("state") == "exited" and (status or {}).get("result_state") in {"absent", "invalid"}:
-        return "provider_exited_no_result"
     if _transcript_contradicts(lane, status):
         return "status_transcript_contradiction"
     return None

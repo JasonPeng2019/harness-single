@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from orchestrator_harness.windows_sandbox_preflight import require_ready
+from orchestrator_harness.windows_sandbox_preflight import require_not_blocked, require_ready
 from orchestrator_harness.config import compute_config_identity, load_config, load_resource_manifest, path_identity
 from orchestrator_harness.core import canonical_json, new_id
 from orchestrator_harness.mutation import (
@@ -29,6 +29,7 @@ LEGACY_SCHEMA = "root-prelaunch-setup/v1"
 RECEIPT = ".agent-workspace/ROOT_PRELAUNCH_SETUP.json"
 ATTEMPT = ".agent-workspace/ROOT_PRELAUNCH_ATTEMPT.json"
 PROVIDERS = {"codex": ".codex", "claude-code": ".claude", "qwen-code": ".qwen"}
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 MONITOR_FIELDS = ("startup_id", "pid", "creation_time", "config_identity", "ready_at")
 HOOK_FILES = (
     ".codex/hooks.json", ".codex/orchestrator-harness-binding.json",
@@ -72,6 +73,26 @@ def _configured(harness: Path, workspace: Path, provider_id: str):
 def _absolute(path: Path) -> Path:
     """Normalize relative spellings without following a redirected ancestor."""
     return Path(os.path.abspath(path))
+
+
+def _root_sandbox(provider_id: str, sandbox: str | None) -> str | None:
+    if provider_id != "codex":
+        if sandbox is not None:
+            raise ValueError("ROOT --sandbox applies only to Codex")
+        return None
+    selected = "workspace-write" if sandbox is None else sandbox
+    if selected not in CODEX_SANDBOXES:
+        raise ValueError("ROOT sandbox must be read-only, workspace-write, or danger-full-access")
+    return selected
+
+
+def _sandbox_health(harness: Path, config, provider_id: str, sandbox: str | None):
+    require_not_blocked(config.root_workspace)
+    if provider_id != "codex":
+        return None
+    # Explicit full access does not use the OS sandbox, but never clears a
+    # previous startup failure or changes the mode of an existing ROOT run.
+    return None if sandbox == "danger-full-access" else require_ready(harness, workspace=config.root_workspace)
 
 
 def hook_files(provider_id: str) -> tuple[str, ...]:
@@ -172,7 +193,8 @@ def check_installed(harness: Path, workspace: Path, *, allow_closed: bool = Fals
 
 def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
                        resuming: bool, provider_id: str, compare_monitor: bool = True,
-                       explicit_prepare: bool = False):
+                       explicit_prepare: bool = False, sandbox: str | None = None):
+    sandbox = _root_sandbox(provider_id, sandbox)
     config = _configured(harness, workspace, provider_id)
     receipt_path = workspace / RECEIPT
     try:
@@ -195,6 +217,10 @@ def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
                 "root_workspace": path_identity(config.root_workspace), "runtime_root": path_identity(config.runtime_root)}
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ValueError("pre-launch setup receipt belongs to a different ROOT run or configuration")
+    # Older v2 receipts never recorded an explicit permission selection. Keep
+    # their previous default and health gate; they cannot authorize full access.
+    if provider_id == "codex" and receipt.get("root_sandbox", "workspace-write") != sandbox:
+        raise ValueError("ROOT sandbox differs from the pre-launch setup receipt; preserve this run's selected mode")
     if receipt.get("status") != "PASS":
         raise ValueError("pre-launch harness setup did not pass")
     if receipt.get("workspace_identity") != workspace_identity(workspace):
@@ -205,7 +231,7 @@ def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
         raise ValueError("ROOT hook files changed after pre-launch setup")
     if receipt.get("harness_config_sha256") != digest(harness / "harness-config.json"):
         raise ValueError("harness configuration changed after pre-launch setup")
-    health = require_ready(harness, workspace=config.root_workspace) if provider_id == "codex" else None
+    health = _sandbox_health(harness, config, provider_id, sandbox)
     if receipt.get("windows_sandbox_health") != health:
         raise ValueError("Windows sandbox health changed after pre-launch setup")
     from orchestrator_harness.public_checks import home, policy, validate_service
@@ -236,27 +262,32 @@ def _validated_receipt(harness: Path, workspace: Path, run_id: str, *,
 
 
 def validate_prepared_root(harness: Path, workspace: Path, run_id: str, *,
-                           resuming: bool = False, provider_id: str = "codex") -> dict[str, Any]:
+                           resuming: bool = False, provider_id: str = "codex",
+                           sandbox: str | None = None) -> dict[str, Any]:
+    sandbox = _root_sandbox(provider_id, sandbox)
     harness, workspace = _absolute(harness), _absolute(workspace)
     config = _configured(harness, workspace, provider_id)
     with runtime_admission_lock(config.runtime_root):
         receipt, session, _owner, receipt_state = _validated_receipt(harness, workspace, run_id,
-                                                   resuming=resuming, provider_id=provider_id)
+                                                   resuming=resuming, provider_id=provider_id, sandbox=sandbox)
         receipt_path = workspace / RECEIPT
         return {"receipt_path": str(receipt_path), "receipt_sha256": receipt_state.content_sha256,
                 "prepared_at_utc": receipt["prepared_at_utc"], "provider_id": provider_id,
+                **({"root_sandbox": sandbox} if provider_id == "codex" else {}),
                 "root_session_id": session["session_id"], "native_session_id": session["native_session_id"],
                 "config_identity": session["config_identity"], "manager_workspace": str(config.manager_workspace),
                 "root_workspace": str(config.root_workspace), "runtime_root": str(config.runtime_root)}
 
 
-def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "codex") -> dict[str, Any]:
+def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "codex",
+            sandbox: str | None = None) -> dict[str, Any]:
+    sandbox = _root_sandbox(provider_id, sandbox)
     harness, workspace = _absolute(harness), _absolute(workspace)
     config = _configured(harness, workspace, provider_id)
     original_identity = compute_config_identity(config, load_resource_manifest(harness))
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("ROOT preparation requires a nonempty run ID")
-    health = require_ready(harness, workspace=config.root_workspace) if provider_id == "codex" else None
+    health = _sandbox_health(harness, config, provider_id, sandbox)
     receipt_path = workspace / RECEIPT
     prior = capture_target(workspace, RECEIPT) if receipt_path.parent.is_dir() else None
     previous = None
@@ -270,12 +301,12 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
             with runtime_admission_lock(config.runtime_root):
                 _receipt, _session, owner, _state = _validated_receipt(harness, workspace, run_id,
                                             resuming=False, provider_id=provider_id, compare_monitor=False,
-                                            explicit_prepare=True)
+                                            explicit_prepare=True, sandbox=sandbox)
             from orchestrator_harness.public_checks import home, policy
             service_ready = (policy(harness) is None or
                              read(home(config.root_workspace) / "service.json").get("status") == "READY")
             if previous.get("monitor") == owner and service_ready:
-                return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
+                return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id, sandbox=sandbox)
         elif previous.get("schema") != LEGACY_SCHEMA:
             raise ValueError("unknown pre-launch setup receipt; preserve it before preparation")
     else:
@@ -285,11 +316,13 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
             "config_identity": original_identity, "harness_config_sha256": digest(harness / "harness-config.json"),
             "workspace_identity": workspace_identity(workspace),
             "product_workspace_identity": workspace_identity(config.root_workspace)}
+        if provider_id == "codex":
+            expected_attempt["root_sandbox"] = sandbox
         if config.runtime_root.exists():
             # Only an exact pre-setup birth intent authorizes interrupted
             # preparation recovery. An unrelated manual runtime is not adopted.
             if not attempt_path.is_file() or read(attempt_path) != expected_attempt:
-                return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
+                return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id, sandbox=sandbox)
             state = read_runtime_state(config.runtime_root)
             if not state or state.get("state") not in {"OPEN", "CLOSED"}:
                 raise ValueError("interrupted preparation requires proven OPEN or CLOSED runtime; run harness shutdown")
@@ -329,7 +362,7 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
             raise ValueError("configuration changed during ROOT preparation")
         if hashes != check_installed(harness, workspace, provider_id=provider_id):
             raise ValueError("ROOT hook files changed during preparation")
-        current_health = require_ready(harness, workspace=current.root_workspace) if provider_id == "codex" else None
+        current_health = _sandbox_health(harness, current, provider_id, sandbox)
         if current_health != health:
             raise ValueError("Windows sandbox health changed during ROOT preparation")
         from orchestrator_harness.public_checks import policy, validate_service
@@ -351,6 +384,8 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
                    "manager_workspace": path_identity(current.manager_workspace),
                    "root_workspace": path_identity(current.root_workspace), "runtime_root": path_identity(current.runtime_root),
                    "config_identity": identity, "root_session_id": session["session_id"], "monitor": owner}
+        if provider_id == "codex":
+            receipt["root_sandbox"] = sandbox
         if health is not None:
             receipt["windows_sandbox_health"] = health
         if service is not None:
@@ -371,7 +406,7 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
                 receipt["prior_receipt"] = {"path": str(archive), "sha256": hashlib.sha256(prior.content).hexdigest()}
             _publish(workspace, RECEIPT, canonical_json(receipt) + b"\n", expected=expected,
                      expected_root_identity=(receipt["workspace_identity"]["device"], receipt["workspace_identity"]["inode"]))
-    return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id)
+    return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id, sandbox=sandbox)
 
 
 def main() -> int:
@@ -380,9 +415,12 @@ def main() -> int:
     parser.add_argument("--workspace", required=True, type=Path, help="configured manager ROOT workspace")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--provider", choices=tuple(PROVIDERS), default="codex")
+    parser.add_argument("--sandbox", choices=CODEX_SANDBOXES,
+                        help="explicit Codex ROOT mode; defaults to workspace-write; danger-full-access uses no OS sandbox")
     args = parser.parse_args()
     try:
-        print(json.dumps(prepare(args.harness_dir, args.workspace, args.run_id, provider_id=args.provider), indent=2))
+        print(json.dumps(prepare(args.harness_dir, args.workspace, args.run_id, provider_id=args.provider,
+                                 sandbox=args.sandbox), indent=2))
         return 0
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
         print(f"ROOT pre-launch setup failed: {exc}", file=sys.stderr)

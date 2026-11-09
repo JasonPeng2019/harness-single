@@ -667,22 +667,41 @@ def _install_managed_material(
         "claude-code": Path(".claude") / "settings.json",
         "qwen-code": Path(".qwen") / "settings.json",
     }.get(provider_id)
+    hook_migration: tuple[Path, bytes, bytes] | None = None
     if shared_hook_relative is not None:
         payload_hooks = payload / shared_hook_relative
         worktree_hooks = worktree / shared_hook_relative
         if payload_hooks.is_file() and worktree_hooks.exists():
-            from .setup import SetupError, _merge_root_hook_config
+            from .setup import (
+                SetupError,
+                _is_exact_claude_hook_migration,
+                _merge_root_hook_config,
+                _render_root_json,
+                _read_json_object,
+            )
 
             try:
                 merged = _merge_root_hook_config(payload_hooks, worktree_hooks)
-                existing = read_json(worktree_hooks)
+                existing_bytes = worktree_hooks.read_bytes()
+                existing = _read_json_object(worktree_hooks, description="existing hook configuration")
             except (OSError, ValueError, SetupError) as exc:
                 raise BootstrapError(BOOTSTRAP_CACHE_COLLISION, str(exc)) from exc
-            if merged != existing:
+            if merged != existing and not (
+                provider_id == "claude-code"
+                and _is_exact_claude_hook_migration(
+                    read_json(payload_hooks), existing, merged,
+                )
+            ):
                 raise BootstrapError(
                     BOOTSTRAP_CACHE_COLLISION,
                     f"existing worker hook configuration lacks the shipped harness hooks: "
                     f"{worktree_hooks}",
+                )
+            if merged != existing:
+                hook_migration = (
+                    worktree_hooks,
+                    existing_bytes,
+                    _render_root_json(merged),
                 )
             payload_exclusions.append(shared_hook_relative.as_posix())
     root_payload = harness_root / "adapters" / provider_id / "root"
@@ -697,6 +716,22 @@ def _install_managed_material(
         exclude=tuple(payload_exclusions),
         replace_if_matches=replace_if_matches,
     )
+    if hook_migration is not None:
+        migration_path, expected_bytes, migrated_bytes = hook_migration
+        try:
+            if migration_path.read_bytes() != expected_bytes:
+                raise BootstrapError(
+                    BOOTSTRAP_CACHE_COLLISION,
+                    f"worker hook configuration changed during migration: {migration_path}",
+                )
+            publication = _worker_output(worktree)
+            publication.revalidate(worktree)
+            publication.publish_bytes(publication.admit(migration_path), migrated_bytes)
+        except OSError as exc:
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_COLLISION,
+                f"worker hook configuration migration failed: {migration_path}: {exc}",
+            ) from exc
     inbox = {
         "schema": LANE_INBOX_SCHEMA,
         "lane_id": lane_id,
@@ -744,10 +779,44 @@ def _install_codex_worker_isolation(
         raise BootstrapError(
             BOOTSTRAP_CACHE_COLLISION, f"invalid Codex worker config: {exc}"
         ) from exc
+    marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
+    default_line = 'default_permissions = "worker-isolated"\n'
+    if existing.startswith(default_line) and existing.count(marker) == 1:
+        # A completed worker may commit this generated suffix before a child
+        # branches from it. Discard only the complete owned shape; all grants
+        # below are then derived again from the child's captured Git identity.
+        from pathlib import PurePosixPath, PureWindowsPath
+        user_config, inherited_suffix = existing[len(default_line):].split(marker, 1)
+        try:
+            inherited = tomllib.loads(inherited_suffix)
+            permissions = inherited.get("permissions", {})
+            profile = permissions.get("worker-isolated", {}) if isinstance(permissions, dict) else {}
+            filesystem = profile.get("filesystem", {}) if isinstance(profile, dict) else {}
+            if (
+                isinstance(profile, dict)
+                and inherited == {"permissions": {"worker-isolated": profile}}
+                and set(profile) == {"extends", "filesystem"}
+                and profile["extends"] == ":workspace"
+                and isinstance(filesystem, dict)
+                and filesystem.get(":workspace_roots") == {".": "write"}
+                and any(value == "deny" for value in filesystem.values())
+                and all(
+                    isinstance(value, str) and value in {"deny", "write"}
+                    and (PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute())
+                    for name, value in filesystem.items() if name != ":workspace_roots"
+                )
+            ):
+                parsed = tomllib.loads(user_config)
+                existing = user_config
+        except tomllib.TOMLDecodeError:
+            # A marker inside custom TOML does not establish generated ownership.
+            pass
+    permissions = parsed.get("permissions", {})
     if (
         "sandbox_mode" in parsed
         or "default_permissions" in parsed
-        or "worker-isolated" in parsed.get("permissions", {})
+        or not isinstance(permissions, dict)
+        or "worker-isolated" in permissions
     ):
         raise BootstrapError(
             BOOTSTRAP_CACHE_COLLISION,

@@ -318,7 +318,10 @@ def _validate_worker_commands(
                     if not isinstance(command, str):
                         raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
                     parts = command.split()
-                    relative = PurePosixPath(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
+                    if provider_id == "claude-code" and command.startswith('python "${CLAUDE_PROJECT_DIR}/') and command.endswith('"'):
+                        relative = PurePosixPath(command[len('python "${CLAUDE_PROJECT_DIR}/'):-1])
+                    else:
+                        relative = PurePosixPath(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
                     destination = relative.as_posix().casefold() if relative is not None else None
                     if (
                         relative is None
@@ -328,6 +331,7 @@ def _validate_worker_commands(
                         or relative.parts[0].casefold() != dotdir.casefold()
                         or destination not in owned
                         or destination in seen
+                        or (provider_id == "claude-code" and command != f'python "${{CLAUDE_PROJECT_DIR}}/{relative.as_posix()}"')
                     ):
                         raise SetupError(
                             SETUP_ADAPTER_COLLISION,
@@ -1361,6 +1365,28 @@ def _hook_commands(group: Any) -> set[str]:
     }
 
 
+_CLAUDE_HOOK_COMMANDS = {
+    "PostToolUse": "orchestrator_harness_post_tool_use.py",
+    "Stop": "orchestrator_harness_stop.py",
+}
+
+
+def _claude_legacy_group(group: dict[str, Any], command: str) -> dict[str, Any]:
+    """Return the one exact pre-project-root Claude registration."""
+    legacy = deepcopy(group)
+    hooks = legacy.get("hooks")
+    if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
+        return {}
+    hooks[0]["command"] = command
+    return legacy
+
+
+def _is_claude_owned_command(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return any(name in value for name in _CLAUDE_HOOK_COMMANDS.values())
+
+
 def _merge_root_hook_config(source: Path, target: Path) -> dict[str, Any]:
     """Add shipped harness hook groups to an existing provider config.
 
@@ -1392,6 +1418,30 @@ def _merge_root_hook_objects(
             f"existing hook configuration has a non-object hooks field: {target}",
         )
 
+    claude_owned: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    if source.name == "settings.json" and target.name == "settings.json":
+        for event_name, groups in shipped_hooks.items():
+            filename = _CLAUDE_HOOK_COMMANDS.get(event_name)
+            if filename and isinstance(groups, list) and len(groups) == 1:
+                canonical = groups[0]
+                command = next(iter(_hook_commands(canonical)), None)
+                if command == f'python "${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{filename}"':
+                    claude_owned[event_name] = (
+                        canonical,
+                        _claude_legacy_group(canonical, f"python .claude/hooks/{filename}"),
+                    )
+        if claude_owned:
+            for event_name, groups in existing_hooks.items():
+                if not isinstance(groups, list):
+                    continue
+                allowed = claude_owned.get(event_name, (None, None))
+                for group in groups:
+                    if any(_is_claude_owned_command(command) for command in _hook_commands(group)) and group not in allowed:
+                        raise SetupError(
+                            SETUP_ADAPTER_COLLISION,
+                            f"existing hook configuration changes a harness-owned {event_name!r} command: {target}",
+                        )
+
     merged = deepcopy(existing)
     merged_hooks = deepcopy(existing_hooks)
     merged["hooks"] = merged_hooks
@@ -1417,15 +1467,48 @@ def _merge_root_hook_objects(
                 SETUP_ADAPTER_COLLISION,
                 f"existing hook event {event_name!r} is not a list: {target}",
             )
+        legacy_groups: dict[str, dict[str, Any]] = {}
+        if event_name in claude_owned:
+            canonical, legacy = claude_owned[event_name]
+            legacy_groups = {next(iter(_hook_commands(canonical))): legacy}
         for shipped_group in shipped_groups:
             if not isinstance(shipped_group, dict) or not _hook_commands(shipped_group):
                 raise SetupError(
                     SETUP_CONFIG_INVALID,
                     f"shipped hook group is malformed in {source}",
                 )
+            shipped_commands = _hook_commands(shipped_group)
+            is_claude_hook = event_name in claude_owned
+            if is_claude_hook:
+                legacy_group = legacy_groups.get(next(iter(shipped_commands), ""))
+                matches = [group for group in existing_groups if group == shipped_group]
+                old_matches = [group for group in existing_groups if legacy_group and group == legacy_group]
+                for group in existing_groups:
+                    commands = _hook_commands(group)
+                    if any(_is_claude_owned_command(command) for command in commands) and group not in (shipped_group, legacy_group):
+                        raise SetupError(
+                            SETUP_ADAPTER_COLLISION,
+                            f"existing hook configuration changes a harness-owned {event_name!r} command: {target}",
+                        )
+                if matches:
+                    # Current registrations remain byte-idempotent; remove only exact legacy copies.
+                    if legacy_group:
+                        existing_groups[:] = [group for group in existing_groups if group != legacy_group]
+                    continue
+                if old_matches:
+                    kept = False
+                    rebuilt = []
+                    for group in existing_groups:
+                        if group == legacy_group:
+                            if not kept:
+                                rebuilt.append(deepcopy(shipped_group))
+                                kept = True
+                        else:
+                            rebuilt.append(group)
+                    existing_groups[:] = rebuilt
+                    continue
             if shipped_group in existing_groups:
                 continue
-            shipped_commands = _hook_commands(shipped_group)
             if shipped_commands.intersection(existing_commands):
                 raise SetupError(
                     SETUP_ADAPTER_COLLISION,
@@ -1434,6 +1517,52 @@ def _merge_root_hook_objects(
                 )
             existing_groups.append(deepcopy(shipped_group))
     return merged
+
+
+def _is_exact_claude_hook_migration(
+    shipped: dict[str, Any], existing: dict[str, Any], merged: dict[str, Any],
+) -> bool:
+    """Whether a worker config differs only by exact legacy registration migration."""
+    expected = shipped.get("hooks")
+    current = existing.get("hooks")
+    if not isinstance(expected, dict) or not isinstance(current, dict):
+        return False
+    normalized = deepcopy(existing)
+    normalized_hooks = normalized.get("hooks")
+    if not isinstance(normalized_hooks, dict):
+        return False
+    for event, groups in expected.items():
+        if event not in _CLAUDE_HOOK_COMMANDS or not isinstance(groups, list) or len(groups) != 1:
+            return False
+        canonical = groups[0]
+        commands = _hook_commands(canonical)
+        if len(commands) != 1:
+            return False
+        filename = _CLAUDE_HOOK_COMMANDS[event]
+        canonical_command = f'python "${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{filename}"'
+        if next(iter(commands)) != canonical_command:
+            return False
+        legacy = _claude_legacy_group(canonical, f"python .claude/hooks/{filename}")
+        found = normalized_hooks.get(event)
+        if not isinstance(found, list):
+            return False
+        owned = [group for group in found if any(_is_claude_owned_command(command) for command in _hook_commands(group))]
+        if not owned or any(group not in (canonical, legacy) for group in owned):
+            return False
+        has_canonical = any(group == canonical for group in owned)
+        rewritten = []
+        migrated_legacy = False
+        for group in found:
+            if group == legacy:
+                # Match the root merge: an existing canonical registration wins
+                # in place, while legacy-only groups collapse to one canonical.
+                if not has_canonical and not migrated_legacy:
+                    rewritten.append(deepcopy(canonical))
+                    migrated_legacy = True
+            else:
+                rewritten.append(group)
+        normalized_hooks[event] = rewritten
+    return normalized == merged
 
 
 def _validate_existing_codex_config(target: Path) -> None:

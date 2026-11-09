@@ -77,9 +77,9 @@ class ClaudeWorkerHooksTestCase(unittest.TestCase):
     def test_declaration_wires_exact_wrapper_scripts(self):
         commands = _declared_commands()
         self.assertIn(
-            "python .claude/hooks/orchestrator_harness_post_tool_use.py", commands
+            'python "${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_post_tool_use.py"', commands
         )
-        self.assertIn("python .claude/hooks/orchestrator_harness_stop.py", commands)
+        self.assertIn('python "${CLAUDE_PROJECT_DIR}/.claude/hooks/orchestrator_harness_stop.py"', commands)
 
     def test_old_hook_script_is_absent_from_declaration(self):
         for command in _declared_commands():
