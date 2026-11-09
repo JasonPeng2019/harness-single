@@ -60,7 +60,8 @@ orchestrator_harness = [
              "../scripts/probe_windows_worker_isolation.py"]
 "tools" = ["../tools/worker_public_check.py"]
 "docs" = ["../docs/BUILD_TEST_INTERFACE.md", "../docs/INTEGRATED_RUN_FIXES.md",
-          "../docs/PATH_PORTABILITY.md", "../docs/CHECKOUT_PATHS.md"]
+          "../docs/PATH_PORTABILITY.md", "../docs/CHECKOUT_PATHS.md",
+          "../docs/RESUME_PROFILES.md"]
 
 [tool.pyright]
 pythonVersion = "3.11"

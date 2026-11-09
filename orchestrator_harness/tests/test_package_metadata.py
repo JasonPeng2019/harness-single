@@ -269,6 +269,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
             "docs": "../docs/PATH_PORTABILITY.md",
         }.items():
             self.assertIn(required, data_files[destination])
+        self.assertIn("../docs/RESUME_PROFILES.md", data_files["docs"])
         self.assertNotIn("../docs/ROOT_TASK_POLICY.md", data_files["docs"])
         self.assertIn(
             "assets/release/templates/*.md",
@@ -338,7 +339,8 @@ class PackageWheelBuildTests(unittest.TestCase):
                           "scripts/claude_usage.py", "scripts/token_ledger.py",
                           "scripts/probe_windows_worker_isolation.py",
                           "tools/worker_public_check.py", "docs/BUILD_TEST_INTERFACE.md",
-                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md"):
+                          "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md",
+                          "docs/RESUME_PROFILES.md"):
                 self.assertTrue(any(name.endswith(".data/data/" + entry) for name in names), entry)
             self.assertTrue(any(name.endswith(".data/data/examples/windows-sandbox-health-worker-workspace.example.json")
                                 for name in names))
