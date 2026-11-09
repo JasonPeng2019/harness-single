@@ -101,9 +101,9 @@ class RootPrelaunchTests(unittest.TestCase):
         })
         self.cleanup_policy = (self.harness / "local-config/public-check-policy.json").read_bytes()
 
-    def prepared(self) -> None:
+    def prepared(self, provider_id: str = "codex") -> None:
         self.cleanup_config = (self.harness / "harness-config.json").read_bytes()
-        self.preparation = preparation.prepare(self.harness, self.workspace, "fixture")
+        self.preparation = preparation.prepare(self.harness, self.workspace, "fixture", provider_id=provider_id)
 
     def split_preparation(self, provider_id: str) -> None:
         product = self.workspace.parent / "product"
@@ -270,7 +270,9 @@ class RootPrelaunchTests(unittest.TestCase):
             "('HARNESS_ROOT_SESSION_ID', 'HARNESS_BINDING_ID', 'CODEX_THREAD_ID', 'CLAUDE_SESSION_ID', 'QWEN_SESSION_ID')}}), flush=True)\n"
             "print('malformed retained evidence', flush=True)\n"
             f"for native in {native_threads!r}:\n"
-            "    print(json.dumps({'type': 'thread.started', 'thread_id': native}), flush=True)\n",
+            + ("    print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': native}), flush=True)\n"
+               if getattr(args, "provider", "codex") == "claude-code" else
+               "    print(json.dumps({'type': 'thread.started', 'thread_id': native}), flush=True)\n"),
             encoding="utf-8")
         real_spawn = processes.spawn_provider
         commands = []
@@ -290,8 +292,57 @@ class RootPrelaunchTests(unittest.TestCase):
         self.assertTrue(manifest["cleanup_proven"], manifest)
         root = manifest["process_boundary"]["root"]
         self.assertTrue(processes.identity_exit_proven(root["pid"], root["creation_time"]))
-        lines = (run_dir / "codex-events.jsonl").read_text(encoding="utf-8").splitlines()
+        transcript = "claude-events.jsonl" if getattr(args, "provider", "codex") == "claude-code" else "codex-events.jsonl"
+        lines = (run_dir / transcript).read_text(encoding="utf-8").splitlines()
         return result, manifest, json.loads(lines[0])["environment"], lines
+
+    def test_claude_root_capture_uses_provider_argv_and_binds_init_session(self) -> None:
+        self.prepared(provider_id="claude-code")
+        args = self.collector_args()
+        args.provider = "claude-code"
+        args.service_tier = None
+        commands = []
+        real_spawn = processes.spawn_provider
+        entry = self.workspace / "claude-fixture.py"
+        entry.write_text("import json\nprint(json.dumps({'type':'system','subtype':'init','session_id':'claude-native'}), flush=True)\n",
+                         encoding="utf-8")
+
+        def owned_provider(argv, **kwargs):
+            commands.append(argv)
+            return real_spawn([sys.executable, "-B", str(entry)], **kwargs)
+
+        with (patch.object(collector.shutil, "which", return_value=sys.executable),
+              patch.object(processes, "spawn_provider", side_effect=owned_provider),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+            result = collector.run_codex(args)
+        self.assertEqual(0, result)
+        launch = preparation.read(Path(args.results_dir) / args.run_id / "launch.json")
+        self.assertEqual("claude-code", launch["provider_id"])
+        self.assertEqual(["--model", args.model, "--effort", args.reasoning_effort],
+                         [value for i, value in enumerate(commands[0]) if value in ("--model", "--effort")
+                          for value in commands[0][i:i + 2]])
+        self.assertEqual("claude-native", read_root_session(load_config(self.harness))["native_session_id"])
+        self.assertTrue((Path(args.results_dir) / args.run_id / "claude-events.jsonl").is_file())
+
+    def test_claude_root_resume_preserves_saved_session_in_native_argv_and_segment(self) -> None:
+        self.prepared(provider_id="claude-code")
+        bind_native_root_session(load_config(self.harness), run_id="fixture",
+            session_id=self.preparation["root_session_id"], native_session_id="claude-session")
+        args = self.collector_args()
+        args.provider = "claude-code"
+        args.service_tier = None
+        args.resume_task_file = str(self.workspace / "results/fixture/task.json")
+        Path(args.resume_task_file).parent.mkdir(parents=True)
+        Path(args.resume_task_file).write_text("{}", encoding="utf-8")
+        segment = self.workspace / "results/fixture/segments/0002"
+        with patch.object(collector, "prepare_resume", return_value=(segment, 2, "claude-session", 1.0)):
+            result, manifest, environment, _lines = self.fixture_collector(args, ["claude-session"])
+        self.assertEqual(0, result, manifest)
+        self.assertEqual("claude-code", manifest["provider_id"])
+        self.assertIn("--resume", manifest["command"])
+        self.assertIn("claude-session", manifest["command"])
+        self.assertEqual("claude-session", environment["CLAUDE_SESSION_ID"])
+        self.assertTrue((segment / "claude-events.jsonl").is_file())
 
     def test_collector_binds_observed_native_thread_once_and_passes_prepared_scope(self) -> None:
         self.prepared()

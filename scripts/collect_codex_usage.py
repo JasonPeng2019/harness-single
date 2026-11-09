@@ -1,7 +1,8 @@
-"""Capture one Codex CLI process or account for a ROOT plus native worker run.
+"""Capture one Codex/Claude CLI process or account for a ROOT plus workers.
 
-``run`` launches an initial ROOT/raw Codex process. ``resume`` continues the
-same native session in a new evidence segment after a sealed planned pause.
+``run`` launches an initial ROOT/raw process (Codex by default, or explicit
+Claude Code). ``resume`` continues that provider's same native session in a
+new evidence segment after a sealed planned pause.
 The native harness continues to own all worker launches. ``snapshot`` and
 ``gate`` only read evidence. ``finalize`` makes a write-once task archive.
 """
@@ -38,6 +39,7 @@ from token_ledger import (
     extract_usage,
     finalize,
     load_task,
+    nonempty_string,
     read_object,
     utc_now,
     valid_id,
@@ -161,13 +163,19 @@ def quiescent_open_runtime(runtime: Path) -> bool:
 
 
 def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
-    """Validate a sealed segment and return the next segment's native session."""
+    """Validate a sealed provider segment and return its native session."""
     task_path = Path(args.resume_task_file).resolve()
     task = load_task(task_path)
     if task.get("interruption_policy") != "planned_resume":
         raise LedgerError("this task was not declared as a planned interrupted run")
     run_dir = Path(task["root_run_dir"])
     original = read_object(run_dir / "launch.json")
+    provider_id = original.get("provider_id", "codex")
+    if provider_id not in ("codex", "claude-code"):
+        raise LedgerError(f"unsupported ROOT resume provider: {provider_id}")
+    requested_provider = getattr(args, "provider", None)
+    if requested_provider is not None and requested_provider != provider_id:
+        raise LedgerError("requested resume provider differs from original ROOT provider")
     if (original.get("run_id") != task["run_id"] or original.get("arm") != task["arm"]
             or original.get("task") != task["task"]
             or original.get("budget_tokens") != task["budget_tokens"]
@@ -222,20 +230,25 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
     if remaining <= 0:
         raise LedgerError("the task's active-time allowance is exhausted")
     prior = prior_dirs[-1]
-    usage = extract_usage(prior / "codex-events.jsonl")
+    transcript_name = "claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl"
+    usage = extract_usage(prior / transcript_name, provider_id=provider_id)
     if usage["status"] != "ok" or not usage.get("thread_id"):
         raise LedgerError("prior ROOT segment lacks countable usage or a native session ID")
-    for field in ("model", "reasoning_effort", "service_tier", "sandbox", "workspace"):
+    required_fields = ("model", "reasoning_effort", "workspace")
+    if provider_id == "codex":
+        required_fields += ("service_tier", "sandbox")
+    for field in required_fields:
         if not isinstance(original.get(field), str) or not original[field]:
             raise LedgerError(f"original ROOT {field} is missing")
+    args.provider = provider_id
     args.run_id = task["run_id"]
     args.task = task["task"]
     args.arm = task["arm"]
     args.cwd = original["workspace"]
     args.model = original["model"]
     args.reasoning_effort = original["reasoning_effort"]
-    args.service_tier = original["service_tier"]
-    args.sandbox = original["sandbox"]
+    args.service_tier = original.get("service_tier")
+    args.sandbox = original.get("sandbox")
     args.budget_tokens = task["budget_tokens"]
     args.harness_runtime = task.get("harness_runtime")
     args.harness_dir = original.get("harness_dir")
@@ -246,6 +259,9 @@ def prepare_resume(args: argparse.Namespace) -> tuple[Path, int, str, float]:
 
 
 def run_codex(args: argparse.Namespace) -> int:
+    provider_id = getattr(args, "provider", None) or "codex"
+    if provider_id not in ("codex", "claude-code"):
+        raise LedgerError("ROOT capture supports Codex or Claude Code")
     resuming = bool(getattr(args, "resume_task_file", None))
     if resuming:
         segment_dir, segment_number, session_id, total_limit = prepare_resume(args)
@@ -259,6 +275,11 @@ def run_codex(args: argparse.Namespace) -> int:
         raise LedgerError("task must be non-empty")
     if args.budget_tokens is not None and args.budget_tokens <= 0:
         raise LedgerError("budget-tokens must be positive")
+    if provider_id == "codex":
+        nonempty_string(args.reasoning_effort, "reasoning-effort")
+        nonempty_string(args.service_tier, "service-tier")
+    else:
+        nonempty_string(args.reasoning_effort, "effort")
     if args.watchdog_hours is None or not math.isfinite(args.watchdog_hours) or args.watchdog_hours <= 0:
         raise LedgerError("watchdog-hours must be positive")
     if args.arm == "harness" and not args.harness_runtime:
@@ -285,8 +306,11 @@ def run_codex(args: argparse.Namespace) -> int:
     root_prelaunch = None
     if args.arm == "harness":
         try:
-            root_prelaunch = validate_prepared_root(harness_dir, workspace, args.run_id, resuming=resuming,
-                                                    sandbox=getattr(args, "sandbox", "workspace-write"))
+            root_prelaunch = validate_prepared_root(
+                harness_dir, workspace, args.run_id, resuming=resuming,
+                provider_id=provider_id,
+                **({"sandbox": getattr(args, "sandbox", "workspace-write")} if provider_id == "codex" else {}),
+            )
             native = root_prelaunch["native_session_id"]
             if resuming:
                 if native not in (None, session_id):
@@ -303,8 +327,8 @@ def run_codex(args: argparse.Namespace) -> int:
     task_run_dir = Path(args.results_dir).resolve() / args.run_id
     run_dir = segment_dir if resuming else task_run_dir
     run_dir.mkdir(parents=True, exist_ok=False)
-    events_path = run_dir / "codex-events.jsonl"
-    stderr_path = run_dir / "codex-stderr.txt"
+    events_path = run_dir / ("claude-events.jsonl" if provider_id == "claude-code" else "codex-events.jsonl")
+    stderr_path = run_dir / ("claude-stderr.txt" if provider_id == "claude-code" else "codex-stderr.txt")
     last_message_path = run_dir / "last-message.txt"
     started = utc_now()
     hook_trust_args = (
@@ -317,7 +341,13 @@ def run_codex(args: argparse.Namespace) -> int:
             "-c", "features.hooks=true",
             "-c", f'projects.{json.dumps(str(workspace))}.trust_level="trusted"',
         ]
-    if resuming:
+    if provider_id == "claude-code":
+        command = ["claude", "--print", "--output-format", "stream-json", "--verbose"]
+        if resuming:
+            command.extend(["--resume", session_id])
+        command.extend(["--model", args.model, "--effort", args.reasoning_effort,
+                        "--permission-mode", "bypassPermissions"])
+    elif resuming:
         command = [
             "codex", "exec", "resume", *hook_trust_args, "--json",
             "-c", f"sandbox_mode={json.dumps(args.sandbox)}",
@@ -338,24 +368,26 @@ def run_codex(args: argparse.Namespace) -> int:
             "--output-last-message", str(last_message_path),
             "-",
         ]
-    codex_executable = shutil.which("codex.cmd" if os.name == "nt" else "codex")
-    if codex_executable is None:
-        raise OSError("Codex CLI executable not found on PATH")
+    executable_name = ("claude.cmd" if os.name == "nt" else "claude") if provider_id == "claude-code" else ("codex.cmd" if os.name == "nt" else "codex")
+    provider_executable = shutil.which(executable_name)
+    if provider_executable is None:
+        raise OSError(f"{provider_id} CLI executable not found on PATH")
     launch = {
         "schema": RUN_SCHEMA,
         "run_id": args.run_id,
         "task": args.task,
         "arm": args.arm,
         "role": "root" if args.arm == "harness" else "raw",
+        "provider_id": provider_id,
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "service_tier": args.service_tier,
-        "sandbox": args.sandbox,
+        "sandbox": getattr(args, "sandbox", None) if provider_id == "codex" else None,
         "workspace": str(workspace),
         "prompt_file": str(prompt),
         "started_at_utc": started,
         "command": command,
-        "resolved_executable": codex_executable,
+        "resolved_executable": provider_executable,
         "watchdog_hours": args.watchdog_hours,
         "budget_tokens": args.budget_tokens,
         "harness_runtime": str(Path(args.harness_runtime).resolve()) if args.harness_runtime else None,
@@ -393,7 +425,7 @@ def run_codex(args: argparse.Namespace) -> int:
         environment.pop("CLAUDE_SESSION_ID", None)
         environment.pop("QWEN_SESSION_ID", None)
         if resuming:
-            environment["CODEX_THREAD_ID"] = session_id
+            environment["CLAUDE_SESSION_ID" if provider_id == "claude-code" else "CODEX_THREAD_ID"] = session_id
     # ROOT invokes the host-side harness package outside its writable workspace.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # An uncapped run must not inherit an earlier diagnostic gate by accident.
@@ -432,7 +464,7 @@ def run_codex(args: argparse.Namespace) -> int:
                 stop_process_tree(boundary)
                 cleanup_proven = True
             except (OSError, subprocess.TimeoutExpired) as exc:
-                watchdog_errors.append(f"Codex stop: {exc}")
+                watchdog_errors.append(f"{provider_id} stop: {exc}")
         if args.arm == "harness":
             failure = shutdown_harness_runtime(Path(args.harness_runtime), harness_dir)
             if failure:
@@ -448,7 +480,7 @@ def run_codex(args: argparse.Namespace) -> int:
             with io.TextIOWrapper(os.fdopen(read_fd, "rb"), encoding="utf-8", errors="replace") as output:
                 with os.fdopen(write_fd, "wb", buffering=0) as child_output:
                     process = processes.spawn_provider(
-                        [codex_executable, *command[1:]], cwd=workspace, env=environment,
+                        [provider_executable, *command[1:]], cwd=workspace, env=environment,
                         stdin=prompt_stream, stdout=child_output, stderr=stderr_stream,
                     )
                     take_job = getattr(process, "take_job_handle", None)
@@ -487,16 +519,21 @@ def run_codex(args: argparse.Namespace) -> int:
                             event = json.loads(line)
                         except json.JSONDecodeError:
                             continue  # Raw malformed evidence remains in the archive.
-                        if isinstance(event, dict) and event.get("type") == "thread.started":
-                            native = event.get("thread_id")
+                        is_native_start = (isinstance(event, dict) and
+                            ((provider_id == "codex" and event.get("type") == "thread.started") or
+                             (provider_id == "claude-code" and event.get("type") == "system" and event.get("subtype") == "init")))
+                        if is_native_start:
+                            native = (event.get("thread_id") or event.get("threadId")) if provider_id == "codex" else event.get("session_id")
                             if not isinstance(native, str) or not native:
-                                raise LedgerError("native ROOT thread.started event has no thread identity")
+                                raise LedgerError(f"native ROOT {provider_id} start event has no session identity")
+                            if resuming and native != session_id:
+                                raise LedgerError("native ROOT resume event changed saved session identity")
                             bind_native_root_session(managed_config, run_id=args.run_id,
                                 session_id=root_prelaunch["root_session_id"], native_session_id=native)
                             native_session_seen = True
             exit_code = process.wait()
             if root_prelaunch is not None and exit_code == 0 and not native_session_seen:
-                raise LedgerError("native ROOT exited successfully without a thread.started identity")
+                raise LedgerError(f"native ROOT exited successfully without a {provider_id} session identity")
             if args.arm == "harness":
                 while not watchdog_expired.is_set() and active_harness_lanes(Path(args.harness_runtime)):
                     time.sleep(2)
@@ -579,7 +616,8 @@ def gate(args: argparse.Namespace) -> int:
         key: report[key]
         for key in (
             "run_id", "budget_tokens", "known_total_tokens", "remaining_tokens",
-            "aggregate_components", "overshoot_tokens", "in_flight_invocations",
+            "aggregate_components", "provider_metric_totals", "aggregate_metric_scope",
+            "overshoot_tokens", "in_flight_invocations",
             "unknown_usage_invocations", "token_total_is_exact",
             "errors", "gate_allows_new_work",
         )
@@ -614,16 +652,19 @@ def self_test(_: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="capture one ROOT or raw Codex process")
+    run = commands.add_parser("run", help="capture one ROOT or raw provider process")
     run.add_argument("--run-id", required=True, type=lambda value: valid_id(value, "run-id"))
     run.add_argument("--task", required=True)
     run.add_argument("--arm", required=True, choices=("harness", "raw"))
+    run.add_argument("--provider", choices=("codex", "claude-code"), default="codex",
+                     help="ROOT CLI provider; Codex remains the default")
     run.add_argument("--cwd", required=True)
     run.add_argument("--prompt-file", required=True)
     run.add_argument("--results-dir", required=True, help="explicit directory for owned ROOT usage evidence")
     run.add_argument("--model", required=True)
-    run.add_argument("--reasoning-effort", required=True)
-    run.add_argument("--service-tier", required=True)
+    run.add_argument("--reasoning-effort", "--effort", dest="reasoning_effort", required=True,
+                     help="Codex reasoning effort or Claude effort")
+    run.add_argument("--service-tier", help="Codex service tier; unused by Claude Code")
     run.add_argument("--sandbox", default="workspace-write", choices=("read-only", "workspace-write", "danger-full-access"))
     run.add_argument("--budget-tokens", type=int,
                      help="optional diagnostic launch cap; omit for uncapped reportable runs")
@@ -634,12 +675,14 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--trust-project-hooks", action="store_true",
                      help="run the prepared project hooks without an interactive trust prompt; required for harness runs")
     run.add_argument("--watchdog-hours", type=float, required=True,
-                     help="hard wall-clock limit; stops Codex and shuts down harness lanes")
+                     help="hard wall-clock limit; stops the provider and shuts down harness lanes")
     run.set_defaults(handler=run_codex, inhibit_sleep=True)
 
-    resume = commands.add_parser("resume", help="continue a sealed task run in the same Codex session")
+    resume = commands.add_parser("resume", help="continue a sealed task run in the same provider session")
     resume.add_argument("--task-file", dest="resume_task_file", required=True)
     resume.add_argument("--prompt-file", required=True)
+    resume.add_argument("--provider", choices=("codex", "claude-code"),
+                        help="optional provider assertion; defaults to the recorded ROOT provider")
     resume.add_argument("--continue-open-runtime", action="store_true",
                         help="continue a sealed ROOT turn with only cleanup-proven review-pending lanes")
     resume.set_defaults(handler=run_codex, inhibit_sleep=True)

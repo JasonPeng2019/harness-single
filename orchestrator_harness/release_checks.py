@@ -83,6 +83,8 @@ PUBLIC_ROUTE_DEPENDENCIES = (
     "orchestrator_harness/public_checks.py",
     "scripts/prepare_root_launch.py",
     "scripts/collect_codex_usage.py",
+    "scripts/collect_usage.py",
+    "scripts/claude_usage.py",
     "scripts/token_ledger.py",
     "tools/worker_public_check.py",
     "orchestrator_harness/provider_adapters/claude-code/launcher_binding.py",

@@ -40,7 +40,8 @@ HARNESS_INPUTS = (
     "harness-config.json", "resource-manifest.json",
     "orchestrator_harness/root_hook_dispatch.py", "orchestrator_harness/root_hook_wrapper.py",
     "orchestrator_harness/root_session.py", "orchestrator_harness/setup.py",
-    "scripts/collect_codex_usage.py", "scripts/prepare_root_launch.py",
+    "scripts/collect_codex_usage.py", "scripts/collect_usage.py", "scripts/claude_usage.py",
+    "scripts/token_ledger.py", "scripts/prepare_root_launch.py",
     "local-config/public-check-policy.json",
 )
 

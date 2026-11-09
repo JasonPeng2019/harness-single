@@ -133,7 +133,8 @@ class PackageMetadataStaticTests(unittest.TestCase):
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("fixture")
             scripts = ["scripts/" + name for name in (
-                "prepare_root_launch.py", "check_windows_sandbox.py", "collect_codex_usage.py", "token_ledger.py")]
+                "prepare_root_launch.py", "check_windows_sandbox.py", "collect_codex_usage.py",
+                "collect_usage.py", "claude_usage.py", "token_ledger.py")]
             for relative in scripts:
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("baseline")
@@ -332,7 +333,8 @@ class PackageWheelBuildTests(unittest.TestCase):
             for entry in required_entries:
                 self.assertIn(entry, names, entry)
             for entry in ("scripts/prepare_root_launch.py", "scripts/check_windows_sandbox.py",
-                          "scripts/collect_codex_usage.py", "scripts/token_ledger.py",
+                          "scripts/collect_codex_usage.py", "scripts/collect_usage.py",
+                          "scripts/claude_usage.py", "scripts/token_ledger.py",
                           "tools/worker_public_check.py", "docs/BUILD_TEST_INTERFACE.md",
                           "docs/INTEGRATED_RUN_FIXES.md", "docs/PATH_PORTABILITY.md"):
                 self.assertTrue(any(name.endswith(".data/data/" + entry) for name in names), entry)
