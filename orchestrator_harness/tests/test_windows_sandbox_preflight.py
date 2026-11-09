@@ -7,9 +7,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-from unittest.mock import MagicMock
 from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 from orchestrator_harness import windows_sandbox_preflight as sandbox
 
@@ -85,11 +85,20 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
             + f'[permissions.{permission_mode}.filesystem.":workspace_roots"]\n"." = "write"\n',
             encoding="utf-8",
         )
+        peer_profile = self.base / "probe-peer/.codex/config.toml"
+        peer_profile.parent.mkdir(parents=True, exist_ok=True)
+        peer_profile.write_bytes(profile.read_bytes())
+        peer_cache = self.harness / "runtime/peer-cache"
+        peer_cache.mkdir(parents=True)
         protected = {
             "root/.git/index": "1" * 64,
             "peer/.git/index": "2" * 64,
             "unrelated/sentinel": "3" * 64,
         }
+        for name in ("stdout.log", "stderr.log", "peer-stdout.log", "peer-stderr.log"):
+            (self.base / name).write_text(
+                "owned native fixture log\n", encoding="utf-8"
+            )
         self.write(
             self.evidence,
             {
@@ -101,6 +110,47 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
                 "protected_before": protected,
                 "protected_after": protected,
                 "protected_write_denials": list(protected),
+                "protected_write_targets": list(protected),
+                "codex_home": str(self.home),
+                "codex_home_read_denied": permission_mode == "worker-isolated",
+                "concurrent_overlap_proven": permission_mode == "worker-isolated",
+                "worker_helper_started": 100.0,
+                "native_logs": {
+                    name: {
+                        "path": str(self.base / name),
+                        "sha256": sandbox.digest(self.base / name),
+                    }
+                    for name in (
+                        "stdout.log",
+                        "stderr.log",
+                        "peer-stdout.log",
+                        "peer-stderr.log",
+                    )
+                },
+                "concurrent_workers": [
+                    {
+                        "profile_path": str(peer_profile),
+                        "profile_sha256": sandbox.digest(peer_profile),
+                        "local_appdata": str(peer_cache),
+                        "exit_code": 0,
+                        "cleanup_proven": True,
+                        "codex_home_read_denied": True,
+                        "worker_base_tip": "c" * 40,
+                        "worker_tip": "d" * 40,
+                        "helper_started": 100.25,
+                        "sandbox_error": None,
+                        "argv": [
+                            str(self.native),
+                            "-c",
+                            'windows.sandbox="elevated"',
+                            "--include-managed-config",
+                            "--permission-profile",
+                            permission_mode,
+                        ],
+                    }
+                ]
+                if permission_mode == "worker-isolated"
+                else [],
                 "unexpectedly_writable": [],
                 "probe_errors": [],
                 "worker_base_tip": "a" * 40,
@@ -248,13 +298,15 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
 
     def test_other_cache_cannot_reuse_proof(self):
         self.ready()
-        with patch.dict(
-            os.environ, {"LOCALAPPDATA": str(self.base / "different-cache")}
-        ):
-            with self.assertRaisesRegex(
+        with (
+            patch.dict(
+                os.environ, {"LOCALAPPDATA": str(self.base / "different-cache")}
+            ),
+            self.assertRaisesRegex(
                 sandbox.SandboxPreflightError, "this profile, cache"
-            ):
-                self.check()
+            ),
+        ):
+            self.check()
 
     def test_receipt_is_bound_to_the_selected_permission_profile(self):
         self.ready()
@@ -264,6 +316,38 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         self.write(path, value)
         with self.assertRaisesRegex(
             sandbox.SandboxPreflightError, "different worker permission mode"
+        ):
+            self.check()
+
+    def test_strict_receipt_requires_actual_home_read_and_concurrent_profile_proof(
+        self,
+    ):
+        self.ready()
+        evidence = json.loads(self.evidence.read_text())
+        evidence.pop("concurrent_workers")
+        self.write(self.evidence, evidence)
+        receipt = json.loads(
+            sandbox.health_path(self.harness, "worker-isolated").read_text()
+        )
+        receipt["probe_evidence_sha256"] = sandbox.digest(self.evidence)
+        self.write(sandbox.health_path(self.harness, "worker-isolated"), receipt)
+        with self.assertRaisesRegex(
+            sandbox.SandboxPreflightError, "read boundary, concurrent operation"
+        ):
+            self.check()
+
+    def test_strict_receipt_rejects_missing_home_read_denial(self):
+        self.ready()
+        evidence = json.loads(self.evidence.read_text())
+        evidence["codex_home_read_denied"] = False
+        self.write(self.evidence, evidence)
+        receipt = json.loads(
+            sandbox.health_path(self.harness, "worker-isolated").read_text()
+        )
+        receipt["probe_evidence_sha256"] = sandbox.digest(self.evidence)
+        self.write(sandbox.health_path(self.harness, "worker-isolated"), receipt)
+        with self.assertRaisesRegex(
+            sandbox.SandboxPreflightError, "read boundary, concurrent operation"
         ):
             self.check()
 
@@ -353,7 +437,9 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         stderr = self.base / "stderr.txt"
         stderr.write_text("", encoding="utf-8")
         self.marker.write_bytes(b"")
-        self.assertIn("marker changed", sandbox.startup_failure(health, stderr, 0))
+        self.assertIn(
+            "marker changed", sandbox.startup_failure(health, stderr, 0) or ""
+        )
 
     def test_only_current_invocation_stderr_is_examined(self):
         self.ready()
@@ -365,7 +451,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         with stderr.open("ab") as stream:
             stream.write(b"helper_sandbox_lock_failed\n")
         self.assertIn(
-            "reported sandbox", sandbox.startup_failure(health, stderr, len(old))
+            "reported sandbox", sandbox.startup_failure(health, stderr, len(old)) or ""
         )
 
     def test_setup_error_beyond_first_64k_is_not_missed(self):
@@ -413,14 +499,14 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
                 runtime,
                 lane,
                 SimpleNamespace(pid=123),
-                SimpleNamespace(root_creation_time="first-child"),
+                cast(Any, SimpleNamespace(root_creation_time="first-child")),
                 "first cause",
             )
             controller._record_sandbox_failure(
                 runtime,
                 {**lane, "run_id": "second"},
                 SimpleNamespace(pid=124),
-                SimpleNamespace(root_creation_time="second-child"),
+                cast(Any, SimpleNamespace(root_creation_time="second-child")),
                 "second cause",
             )
         block = json.loads((self.workspace / sandbox.BLOCK).read_text())
@@ -444,7 +530,7 @@ class WindowsSandboxPreflightTests(unittest.TestCase):
         agent.mkdir(parents=True)
         prompt = agent / "worker-prompt.md"
         prompt.write_text("fixture", encoding="utf-8")
-        lane = {
+        lane: dict[str, Any] = {
             "lane_id": "worker",
             "run_id": "one",
             "worktree_path": str(worktree),

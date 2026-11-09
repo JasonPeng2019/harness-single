@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import tomllib
+from pathlib import Path
 from typing import Any
 
 POLICY = "local-config/windows-sandbox-policy.json"
@@ -256,6 +256,7 @@ def require_ready(
                     "operator health receipt does not contain linked-profile probe evidence"
                 )
             probe = _object(evidence)
+            probe_profile = Path(probe.get("profile_path", "")).resolve()
             protected_before = probe.get("protected_before")
             protected_after = probe.get("protected_after")
             denied_paths = probe.get("protected_write_denials")
@@ -267,7 +268,12 @@ def require_ready(
                 or not isinstance(protected_before, dict)
                 or protected_before != protected_after
                 or not isinstance(denied_paths, list)
-                or set(denied_paths) != set(protected_before)
+                or not isinstance(
+                    probe.get("protected_write_targets", protected_before), list
+                )
+                or set(denied_paths)
+                != set(probe.get("protected_write_targets", protected_before))
+                or not set(protected_before).issubset(set(denied_paths))
                 or probe.get("unexpectedly_writable") != []
                 or probe.get("probe_errors") != []
                 or not isinstance(probe.get("worker_base_tip"), str)
@@ -277,11 +283,99 @@ def require_ready(
                 or Path(probe.get("local_appdata", "")).resolve() != local_appdata
                 or probe.get("profile_contract_sha256") != expected_contract
                 or probe.get("profile_sha256") != probe_profile_hash
+                or probe.get("codex_home") != str(codex_home)
+                or (
+                    permission_mode == "worker-isolated"
+                    and (
+                        probe.get("codex_home_read_denied") is not True
+                        or not isinstance(probe.get("concurrent_workers"), list)
+                        or len(probe["concurrent_workers"]) != 1
+                        or probe.get("concurrent_overlap_proven") is not True
+                    )
+                )
             ):
                 raise ValueError(
-                    "retained native probe does not prove this profile, cache, and exact cleanup"
+                    "retained native probe does not prove this profile, cache, read boundary, concurrent operation, and exact cleanup"
                 )
-            probe_profile = Path(probe.get("profile_path", "")).resolve()
+            if permission_mode == "worker-isolated":
+                concurrent_paths: set[str] = set()
+                helper_started = probe.get("worker_helper_started")
+                for worker_proof in probe["concurrent_workers"]:
+                    if not isinstance(worker_proof, dict):
+                        raise TypeError(
+                            "strict probe has malformed concurrent worker proof"
+                        )
+                    worker_profile = Path(
+                        worker_proof.get("profile_path", "")
+                    ).resolve()
+                    worker_hash = worker_proof.get("profile_sha256")
+                    peer_cache_path = Path(
+                        worker_proof.get("local_appdata", "")
+                    ).resolve()
+                    peer_started = worker_proof.get("helper_started")
+                    if (
+                        worker_profile == probe_profile
+                        or str(worker_profile) in concurrent_paths
+                        or not worker_profile.is_file()
+                        or not isinstance(worker_hash, str)
+                        or digest(worker_profile) != worker_hash
+                        or worker_proof.get("exit_code") != 0
+                        or worker_proof.get("cleanup_proven") is not True
+                        or worker_proof.get("codex_home_read_denied") is not True
+                        or worker_proof.get("sandbox_error") is not None
+                        or peer_cache_path == local_appdata
+                        or not peer_cache_path.is_dir()
+                        or peer_cache_path.is_symlink()
+                        or not peer_cache_path.is_relative_to(
+                            (harness / "runtime").resolve()
+                        )
+                        or not isinstance(helper_started, (int, float))
+                        or isinstance(helper_started, bool)
+                        or not isinstance(peer_started, (int, float))
+                        or isinstance(peer_started, bool)
+                        or abs(helper_started - peer_started) >= 1.0
+                        or worker_proof.get("worker_tip")
+                        == worker_proof.get("worker_base_tip")
+                        or not isinstance(worker_proof.get("argv"), list)
+                        or not worker_proof.get("argv")
+                        or Path(worker_proof["argv"][0]).resolve() != native
+                        or "--permission-profile" not in worker_proof["argv"]
+                        or worker_proof["argv"][
+                            worker_proof["argv"].index("--permission-profile") + 1
+                        ]
+                        != permission_mode
+                    ):
+                        raise ValueError(
+                            "strict probe concurrent worker evidence is incomplete or changed"
+                        )
+                    validate_worker_profile(worker_profile, permission_mode)
+                    concurrent_paths.add(str(worker_profile))
+                native_logs = probe.get("native_logs")
+                if not isinstance(native_logs, dict) or set(native_logs) != {
+                    "stdout.log",
+                    "stderr.log",
+                    "peer-stdout.log",
+                    "peer-stderr.log",
+                }:
+                    raise ValueError(
+                        "strict probe does not bind both native process logs"
+                    )
+                for log_record in native_logs.values():
+                    if not isinstance(log_record, dict):
+                        raise TypeError(
+                            "strict probe has malformed native log evidence"
+                        )
+                    log_path = Path(log_record.get("path", "")).resolve()
+                    log_hash = log_record.get("sha256")
+                    if (
+                        not log_path.is_relative_to(evidence.parent.resolve())
+                        or not log_path.is_file()
+                        or not isinstance(log_hash, str)
+                        or digest(log_path) != log_hash
+                    ):
+                        raise ValueError(
+                            "strict probe native logs are missing or changed"
+                        )
             if (
                 not probe_profile.is_file()
                 or digest(probe_profile) != probe_profile_hash

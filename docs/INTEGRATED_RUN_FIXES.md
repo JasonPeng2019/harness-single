@@ -132,8 +132,11 @@ configuration. For Windows Codex, choose a process-local LOCALAPPDATA cache and
 keep it unchanged for setup, ROOT, controllers and workers. Run the one-attempt
 linked-worker probe below; it creates an owned two-worktree fixture, tests lane
 and narrow Git writes, rejects protected writes, checks unchanged sentinels, and
-records exact cleanup. It publishes a v2 receipt only after those observed checks
-pass. The probe preserves prior evidence and never resets machine ACLs.
+records exact cleanup. It publishes a v2 receipt only after those observed checks pass. Strict mode also
+probes read denial against a non-secret sentinel inside the actual active Codex
+home and tests two distinct strict profiles running concurrently. Failed concurrent
+operations remain evidence and cannot qualify strict mode. The probe preserves prior
+evidence and never resets machine ACLs.
 The example health files are UNVERIFIED templates; a copied PASS receipt is not
 a new probe.
 
@@ -143,6 +146,7 @@ python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
   --local-appdata runtime/windows-worker-probe-cache/<run-id>
 python -B scripts/check_windows_sandbox.py --harness-dir . `
   --workspace <absolute-root-workspace> --permission-mode worker-workspace
+# Use the matching worker-isolated receipt only after a strict probe passes.
 ```
 
 The worker receipt is kept separately at

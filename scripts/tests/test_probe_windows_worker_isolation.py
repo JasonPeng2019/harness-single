@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "probe_windows_worker_isolation.py"
 spec = importlib.util.spec_from_file_location("windows_worker_probe", SCRIPT)
+if spec is None or spec.loader is None:
+    raise RuntimeError("native probe module could not be loaded")
 probe = importlib.util.module_from_spec(spec)
-assert spec and spec.loader
 spec.loader.exec_module(probe)
 
 

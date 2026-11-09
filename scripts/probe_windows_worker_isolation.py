@@ -7,9 +7,9 @@ import datetime as dt
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _sha256(path: Path) -> str:
@@ -33,6 +33,7 @@ def _git(cwd: Path, *arguments: str) -> str:
             *arguments,
         ],
         capture_output=True,
+        check=False,
         text=True,
         timeout=30,
         env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull),
@@ -49,6 +50,7 @@ def _source_head(harness: Path) -> str | None:
     completed = subprocess.run(
         ["git", "-C", str(harness), "rev-parse", "--show-toplevel"],
         capture_output=True,
+        check=False,
         text=True,
         timeout=15,
         env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull),
@@ -67,9 +69,22 @@ def _under(path: Path, parent: Path) -> bool:
 
 
 def _native_helper() -> str:
-    return r"""import hashlib, json, os, pathlib, subprocess, sys
-protected = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    return r"""import hashlib, json, os, pathlib, subprocess, sys, time, datetime
+request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+started = datetime.datetime.now(datetime.timezone.utc).timestamp()
+print(json.dumps({"native_helper_started": started, "worker_id": request["worker_id"]}), flush=True)
+time.sleep(1.0)
+protected = request["protected"]
 result = {"denied": [], "unexpectedly_writable": [], "probe_errors": []}
+if request.get("require_read_denial"):
+    try:
+        pathlib.Path(request["read_sentinel"]).read_bytes()
+    except PermissionError:
+        result["read_denied"] = True
+    except OSError as exc:
+        result["read_error"] = str(exc)
+    else:
+        result["read_sentinel_accessible"] = True
 pathlib.Path("actual-change.txt").write_text("Native worker profile write probe\\n", encoding="utf-8")
 for raw in protected:
     try:
@@ -80,8 +95,10 @@ for raw in protected:
         result["denied"].append(raw)
     except OSError as exc:
         result["probe_errors"].append({"path": raw, "error": str(exc)})
+result["worker_id"] = request["worker_id"]
+result["native_helper_started"] = started
 print(json.dumps(result), flush=True)
-if result["unexpectedly_writable"] or result["probe_errors"]:
+if result["unexpectedly_writable"] or result["probe_errors"] or (request.get("require_read_denial") and not result.get("read_denied", False)):
     raise SystemExit(3)
 git_env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
 for args in (["add", "actual-change.txt"],
@@ -113,13 +130,10 @@ def _prepare_fixture(repo: Path) -> tuple[Path, Path, list[Path]]:
     sentinel.write_bytes(b"owned protected sentinel\n")
     hook = repo / ".git" / "hooks" / "owned-sentinel"
     hook.write_bytes(b"owned protected hook\n")
-    peer_git = Path(_git(peer, "rev-parse", "--absolute-git-dir"))
     protected = [
         repo / ".git" / "config",
         repo / ".git" / "index",
         hook,
-        peer_git / "index",
-        repo / ".git" / "refs/heads/lane/probe-peer/work",
         sentinel,
     ]
     return worker, peer, protected
@@ -184,35 +198,109 @@ def _probe(args: argparse.Namespace) -> dict:
     native = Path(_direct_codex_executable()).resolve(strict=True)
     native_hash = _sha256(native)
     marker_hash = _sha256(marker)
-    contract_hash = profile_contract_digest(harness, "worker-workspace")
+    permission_mode = args.permission_mode
+    contract_hash = profile_contract_digest(harness, permission_mode)
 
     output.mkdir(parents=True, exist_ok=False)
     repo = output / "repo"
     worker, peer, protected = _prepare_fixture(repo)
     before = {str(path): _sha256(path) for path in protected}
     protected_path = output / "protected-paths.json"
+    read_sentinel = (
+        codex_home / f".harness-worker-probe-{output.name}.txt"
+        if permission_mode == "worker-isolated"
+        else None
+    )
+    if read_sentinel is not None and (
+        read_sentinel.exists() or read_sentinel.is_symlink()
+    ):
+        raise ValueError(
+            "unique read sentinel unexpectedly exists in the active Codex home"
+        )
     protected_path.write_text(
-        json.dumps([str(path) for path in protected], indent=2) + "\n", encoding="utf-8"
+        json.dumps(
+            {
+                "protected": [str(path) for path in protected],
+                "read_sentinel": str(read_sentinel) if read_sentinel else None,
+                "require_read_denial": permission_mode == "worker-isolated",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     helper = output / "native_probe.py"
     helper.write_text(_native_helper(), encoding="utf-8")
     temporary = output / "private-temp"
     temporary.mkdir()
+    peer_temporary = output / "peer-private-temp"
+    if permission_mode == "worker-isolated":
+        peer_temporary.mkdir()
+    peer_cache = (
+        cache.parent / f"{cache.name}-peer"
+        if permission_mode == "worker-isolated"
+        else None
+    )
+    if peer_cache is not None and peer_cache.exists():
+        raise ValueError("concurrent worker LOCALAPPDATA must be a fresh owned path")
+    if peer_cache is not None:
+        peer_cache.mkdir(parents=True)
     profile_path = worker / ".codex" / "config.toml"
     _install_codex_worker_isolation(
         worker,
         harness,
         repo,
-        permission_mode="worker-workspace",
+        permission_mode=permission_mode,
         manager_workspace=repo,
     )
-    profile_hash = validate_worker_profile(profile_path, "worker-workspace")
+    profile_hash = validate_worker_profile(profile_path, permission_mode)
+    peer_profile_path = peer / ".codex" / "config.toml"
+    peer_profile_hash = None
+    peer_request_path = None
+    peer_argv = None
+    if permission_mode == "worker-isolated":
+        _install_codex_worker_isolation(
+            peer, harness, repo, permission_mode=permission_mode, manager_workspace=repo
+        )
+        peer_profile_hash = validate_worker_profile(peer_profile_path, permission_mode)
+        peer_request_path = output / "peer-protected-paths.json"
+        peer_request_path.write_text(
+            json.dumps(
+                {
+                    "protected": [],
+                    "read_sentinel": str(read_sentinel),
+                    "require_read_denial": True,
+                    "worker_id": "peer",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    worker_protected = list(protected)
+    if permission_mode == "worker-isolated":
+        worker_protected.extend(
+            (
+                Path(_git(worker, "rev-parse", "--absolute-git-dir"))
+                / ".."
+                / "peer"
+                / "index",
+                repo / ".git" / "refs/heads/lane/probe-peer/work",
+            )
+        )
+    protected_request = {
+        "protected": [str(path.resolve()) for path in worker_protected],
+        "read_sentinel": str(read_sentinel) if read_sentinel else None,
+        "require_read_denial": permission_mode == "worker-isolated",
+        "worker_id": "worker",
+    }
+    protected_path.write_text(
+        json.dumps(protected_request, indent=2) + "\n", encoding="utf-8"
+    )
     profile = __import__("tomllib").loads(profile_path.read_text(encoding="utf-8"))
     external_writes = {
         name
-        for name, mode in profile["permissions"]["worker-workspace"][
-            "filesystem"
-        ].items()
+        for name, mode in profile["permissions"][permission_mode]["filesystem"].items()
         if name != ":workspace_roots" and mode == "write"
     }
     if len(external_writes) != 4:
@@ -221,14 +309,14 @@ def _probe(args: argparse.Namespace) -> dict:
         )
 
     argv = [str(native), "-c", 'windows.sandbox="elevated"']
-    for override in _isolation_overrides(str(worker), "worker-workspace"):
+    for override in _isolation_overrides(str(worker), permission_mode):
         argv.extend(("-c", override))
     argv.extend(
         (
             "sandbox",
             "--include-managed-config",
             "--permission-profile",
-            "worker-workspace",
+            permission_mode,
             "--cd",
             str(worker),
             "--",
@@ -237,17 +325,47 @@ def _probe(args: argparse.Namespace) -> dict:
             str(protected_path),
         )
     )
+    if peer_profile_hash is not None:
+        peer_argv = [str(native), "-c", 'windows.sandbox="elevated"']
+        for override in _isolation_overrides(str(peer), permission_mode):
+            peer_argv.extend(("-c", override))
+        peer_argv.extend(
+            (
+                "sandbox",
+                "--include-managed-config",
+                "--permission-profile",
+                permission_mode,
+                "--cd",
+                str(peer),
+                "--",
+                sys.executable,
+                str(helper),
+                str(peer_request_path),
+            )
+        )
     environment = os.environ.copy()
     environment.update(TEMP=str(temporary), TMP=str(temporary), LOCALAPPDATA=str(cache))
+    peer_environment = os.environ.copy()
+    if peer_cache is not None:
+        peer_environment.update(
+            TEMP=str(peer_temporary),
+            TMP=str(peer_temporary),
+            LOCALAPPDATA=str(peer_cache),
+        )
     result: dict = {
+        "protected_write_targets": json.loads(
+            protected_path.read_text(encoding="utf-8")
+        )["protected"],
         "schema": "windows-worker-profile-probe/v1",
         "source": str(harness),
         "source_head": _source_head(harness),
         "profile_contract_sha256": contract_hash,
         "argv": argv,
-        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "started_at": dt.datetime.now(dt.UTC).isoformat(),
         "local_appdata": str(cache),
-        "permission_mode": "worker-workspace",
+        "permission_mode": permission_mode,
+        "codex_home": str(codex_home),
+        "read_sentinel": str(read_sentinel) if read_sentinel else None,
         "profile_path": str(profile_path),
         "profile_sha256": profile_hash,
         "worker_base_tip": _git(repo, "rev-parse", "HEAD"),
@@ -257,12 +375,20 @@ def _probe(args: argparse.Namespace) -> dict:
         "exit_code": None,
         "cleanup_proven": False,
     }
-    child = boundary = None
+    child = boundary = peer_child = peer_boundary = None
     stdout_path, stderr_path = output / "stdout.log", output / "stderr.log"
+    peer_stdout_path, peer_stderr_path = (
+        output / "peer-stdout.log",
+        output / "peer-stderr.log",
+    )
+    if read_sentinel is not None:
+        read_sentinel.write_bytes(b"owned non-secret read-denial sentinel\n")
     try:
         with (
             stdout_path.open("wb") as stdout,
             stderr_path.open("wb") as stderr,
+            peer_stdout_path.open("wb") as peer_stdout,
+            peer_stderr_path.open("wb") as peer_stderr,
             open(os.devnull, "rb") as stdin,
         ):
             child = processes.spawn_provider(
@@ -275,18 +401,47 @@ def _probe(args: argparse.Namespace) -> dict:
             )
             take = getattr(child, "take_job_handle", None)
             boundary = processes.ProcessBoundary.for_process(
-                child.pid,
-                windows_job_handle=take() if callable(take) else None,
+                child.pid, windows_job_handle=take() if callable(take) else None
             )
             if not boundary.observe():
                 raise RuntimeError("native Codex process boundary identity is unproven")
+            if peer_argv is not None:
+                peer_child = processes.spawn_provider(
+                    peer_argv,
+                    cwd=peer,
+                    stdin=stdin,
+                    stdout=peer_stdout,
+                    stderr=peer_stderr,
+                    env=peer_environment,
+                )
+                peer_take = getattr(peer_child, "take_job_handle", None)
+                peer_boundary = processes.ProcessBoundary.for_process(
+                    peer_child.pid,
+                    windows_job_handle=peer_take() if callable(peer_take) else None,
+                )
+                if not peer_boundary.observe():
+                    raise RuntimeError(
+                        "concurrent native Codex process boundary identity is unproven"
+                    )
             resume = getattr(child, "resume", None)
             if callable(resume):
                 resume()
+            if peer_child is not None:
+                peer_resume = getattr(peer_child, "resume", None)
+                if callable(peer_resume):
+                    peer_resume()
             try:
                 result["exit_code"] = child.wait(timeout=args.timeout_seconds)
             except subprocess.TimeoutExpired:
                 result["timeout"] = True
+            if peer_child is not None:
+                try:
+                    peer_exit = peer_child.wait(timeout=args.timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    peer_exit = None
+                    result["concurrent_timeout"] = True
+            else:
+                peer_exit = None
             result["cleanup_proven"] = boundary.cleanup(
                 force=True, timeout_seconds=15.0
             )
@@ -294,23 +449,51 @@ def _probe(args: argparse.Namespace) -> dict:
                 processes.reap_created_process(child, timeout_seconds=15.0)
                 and result["cleanup_proven"]
             )
+            if peer_child is not None and peer_boundary is not None:
+                peer_cleanup = peer_boundary.cleanup(force=True, timeout_seconds=15.0)
+                peer_cleanup = (
+                    processes.reap_created_process(peer_child, timeout_seconds=15.0)
+                    and peer_cleanup
+                )
+            else:
+                peer_cleanup = None
         health_view = {"marker_path": str(marker), "marker_sha256": marker_hash}
         result["sandbox_error"] = startup_failure(health_view, stderr_path, 0)
-    except BaseException as exc:
+        if peer_child is not None:
+            result["concurrent_sandbox_error"] = startup_failure(
+                health_view, peer_stderr_path, 0
+            )
+            result["concurrent_workers"] = [
+                {
+                    "worker_id": "peer",
+                    "profile_path": str(peer_profile_path),
+                    "profile_sha256": peer_profile_hash,
+                    "argv": peer_argv,
+                    "local_appdata": str(peer_cache),
+                    "exit_code": peer_exit,
+                    "cleanup_proven": peer_cleanup,
+                    "sandbox_error": result.get("concurrent_sandbox_error"),
+                    "boundary": peer_boundary.record()
+                    if peer_boundary is not None
+                    else None,
+                }
+            ]
+    except Exception as exc:  # noqa: BLE001 - persist errors after exact owned-process cleanup
         result["error"] = f"{type(exc).__name__}: {exc}"
-        if boundary is not None:
-            result["cleanup_proven"] = boundary.cleanup(
-                force=True, timeout_seconds=15.0
-            )
-        if child is not None:
-            result["cleanup_proven"] = (
-                processes.reap_created_process(child, timeout_seconds=15.0)
-                and result["cleanup_proven"]
-            )
+        for owned_boundary in (boundary, peer_boundary):
+            if owned_boundary is not None:
+                owned_boundary.cleanup(force=True, timeout_seconds=15.0)
+        for owned_child in (child, peer_child):
+            if owned_child is not None:
+                processes.reap_created_process(owned_child, timeout_seconds=15.0)
     finally:
-        result["ended_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if read_sentinel is not None:
+            read_sentinel.unlink(missing_ok=True)
+        result["ended_at"] = dt.datetime.now(dt.UTC).isoformat()
         if boundary is not None:
             result["boundary"] = boundary.record()
+        if peer_boundary is not None and result.get("concurrent_workers"):
+            result["concurrent_workers"][0]["boundary"] = peer_boundary.record()
     after = {str(path): _sha256(path) for path in protected}
     result["protected_after"] = after
     result["protected_unchanged"] = before == after
@@ -335,33 +518,89 @@ def _probe(args: argparse.Namespace) -> dict:
         result["protected_write_denials"] = observations[0]["denied"]
         result["unexpectedly_writable"] = observations[0]["unexpectedly_writable"]
         result["probe_errors"] = observations[0]["probe_errors"]
+        result["codex_home_read_denied"] = observations[0].get("read_denied") is True
+        result["codex_home_read_error"] = observations[0].get("read_error")
+        result["worker_helper_started"] = observations[0].get("native_helper_started")
     else:
         result["observation_error"] = (
             "native helper emitted no unique write-boundary observation"
         )
+    if peer_argv is not None and result.get("concurrent_workers"):
+        peer_observations = []
+        for line in peer_stdout_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and "read_denied" in item:
+                peer_observations.append(item)
+        peer_record = result["concurrent_workers"][0]
+        peer_record["codex_home_read_denied"] = (
+            len(peer_observations) == 1
+            and peer_observations[0].get("read_denied") is True
+        )
+        peer_record["helper_started"] = (
+            peer_observations[0].get("native_helper_started")
+            if len(peer_observations) == 1
+            else None
+        )
+        peer_record["worker_base_tip"] = result["worker_base_tip"]
+        try:
+            peer_record["worker_tip"] = _git(peer, "rev-parse", "HEAD")
+        except (OSError, RuntimeError) as exc:
+            peer_record["worker_tip_error"] = str(exc)
+        helper_times = [
+            item.get("native_helper_started")
+            for item in observations[:1] + peer_observations[:1]
+        ]
+        result["concurrent_overlap_proven"] = (
+            len(helper_times) == 2
+            and all(isinstance(item, (int, float)) for item in helper_times)
+            and abs(helper_times[0] - helper_times[1]) < 1.0
+            and peer_record.get("exit_code") == 0
+            and peer_record.get("cleanup_proven") is True
+            and peer_record.get("codex_home_read_denied") is True
+            and peer_record.get("worker_tip") != peer_record.get("worker_base_tip")
+        )
+        peer_record["concurrent_overlap_proven"] = result["concurrent_overlap_proven"]
     try:
         result["worker_tip"] = _git(worker, "rev-parse", "HEAD")
     except (OSError, RuntimeError) as exc:
         result["worker_tip_error"] = str(exc)
     result["profile_contract_sha256_after"] = profile_contract_digest(
-        harness, "worker-workspace"
+        harness, permission_mode
     )
+    result["native_logs"] = {
+        str(path.name): {"path": str(path.resolve()), "sha256": _sha256(path)}
+        for path in (stdout_path, stderr_path, peer_stdout_path, peer_stderr_path)
+    }
     result_path = output / "result.json"
     passed = (
         result.get("exit_code") == 0
         and result.get("cleanup_proven") is True
         and result.get("protected_unchanged") is True
         and result.get("sandbox_error") is None
-        and set(result.get("protected_write_denials", [])) == set(before)
+        and set(result.get("protected_write_denials", []))
+        == set(json.loads(protected_path.read_text(encoding="utf-8"))["protected"])
         and not result.get("unexpectedly_writable")
         and not result.get("probe_errors")
+        and (
+            permission_mode != "worker-isolated"
+            or (
+                result.get("codex_home_read_denied") is True
+                and result.get("concurrent_overlap_proven") is True
+                and len(result.get("concurrent_workers", [])) == 1
+            )
+        )
         and result.get("worker_tip") != result.get("worker_base_tip")
         and result.get("observation_error") is None
         and result.get("profile_contract_sha256_after") == contract_hash
         and result.get("worker_tip") is not None
         and result.get("worker_tip") != _git(repo, "rev-parse", "HEAD")
     )
-    target = health_path(harness, "worker-workspace")
+    target = health_path(harness, permission_mode)
     if passed:
         if target.exists() and not args.replace_existing_health:
             result["health_receipt_written"] = False
@@ -383,7 +622,7 @@ def _probe(args: argparse.Namespace) -> dict:
             "schema": "windows-sandbox-health/v2",
             "status": "PASS",
             "probe_exit_code": 0,
-            "permission_mode": "worker-workspace",
+            "permission_mode": permission_mode,
             "profile_contract_sha256": contract_hash,
             "backend_id": "codex-windows-elevated",
             "codex_home": str(codex_home),
@@ -399,6 +638,8 @@ def _probe(args: argparse.Namespace) -> dict:
     else:
         result["health_receipt_written"] = False
         atomic_write_json(result_path, result)
+    if read_sentinel is not None:
+        read_sentinel.unlink(missing_ok=True)
     print(json.dumps(result, indent=2))
     return result
 
@@ -420,6 +661,11 @@ def main() -> int:
     )
     parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument(
+        "--permission-mode",
+        choices=("worker-workspace", "worker-isolated"),
+        default="worker-workspace",
+    )
+    parser.add_argument(
         "--replace-existing-health",
         action="store_true",
         help="back up the existing mode receipt into this new evidence directory",
@@ -429,7 +675,7 @@ def main() -> int:
         parser.error("--timeout-seconds must be 10..600")
     try:
         result = _probe(args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - provide a clear CLI failure for any validation error
         print(f"WINDOWS_WORKER_PROBE_FAILED: {exc}", file=sys.stderr)
         return 2
     return 0 if result.get("health_receipt_written") is True else 1

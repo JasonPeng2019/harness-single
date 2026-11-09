@@ -172,27 +172,38 @@ providers automatically.
 
 ### One-attempt Windows worker qualification
 
-Before claiming Windows `worker-workspace` operation, run one owned native probe against the
-installed harness. It creates a temporary two-worktree fixture, checks lane writes and commits,
-attempts writes to protected sentinels, records profile/CLI/config hashes and exact cleanup, and
-publishes a `worker-workspace`-specific health receipt only when the observations pass. It does not
-configure or repair the sandbox. A successful probe is mode-specific evidence, not proof of strict
-read isolation; absent or stale receipts do not qualify the mode. Each installation and operator
-must also qualify the intended workflow for that mode before relying on it.
+Before claiming Windows worker operation, run one owned native probe against the installed
+harness. It creates a temporary two-worktree fixture, checks lane writes and commits, attempts
+writes to protected sentinels, records profile/CLI/config hashes and exact cleanup, and publishes a
+mode-specific health receipt only when the observations pass. The strict `worker-isolated` probe
+also attempts a read of a non-secret sentinel inside the actual active CODEX_HOME and runs two
+separately generated strict profiles concurrently, each with its own cache and TEMP directory.
+Strict qualification requires both concurrent worktrees to write and commit, the home reads and
+protected writes to be denied, and exact cleanup for both native CLI process boundaries. It does not
+configure or repair the sandbox. Reduced-mode proof does not qualify strict mode; absent or stale
+receipts do not qualify a mode. Each installation and operator must qualify the intended workflow
+for that mode before relying on it.
 
 ```powershell
 python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
   --output-dir runtime/windows-worker-probe/<run-id> `
-  --local-appdata runtime/windows-worker-probe-cache/<run-id>
+  --local-appdata runtime/windows-worker-probe-cache/<run-id> `
+  --permission-mode worker-workspace
+# For strict isolation, use a fresh evidence/cache path and an explicit strict mode:
+python -B scripts/probe_windows_worker_isolation.py --harness-dir . `
+  --output-dir runtime/windows-worker-probe-strict/<run-id> `
+  --local-appdata runtime/windows-worker-probe-strict-cache/<run-id> `
+  --permission-mode worker-isolated
 python -B scripts/check_windows_sandbox.py --harness-dir . `
   --workspace <absolute-root-workspace> --permission-mode worker-workspace
 ```
 
-This writes `local-config/windows-sandbox-health-worker-workspace.json`; the legacy ROOT receipt
+This writes `local-config/windows-sandbox-health-<permission-mode>.json`; the legacy ROOT receipt
 `local-config/windows-sandbox-health.json` is separate. A prior worker receipt is preserved; pass
 `--replace-existing-health` only when intentionally replacing it after retaining the prior evidence.
-The probe does not establish concurrent-project or public-check workflow qualification; validate
-those workflows for the installation and mode you intend to use.
+A strict receipt requires actual active-home read denial and successful concurrent two-profile
+native operation. The probe does not establish public-check workflow qualification; validate that
+workflow for the installation and mode you intend to use.
 
 ## 4. Launch
 
