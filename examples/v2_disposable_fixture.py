@@ -139,7 +139,7 @@ def _launch_local_fake_child(
     environment = None
     if os.name == "nt" and sys.prefix != sys.base_prefix:
         # Match spawn_detached: the venv redirector's PID is not the Python child.
-        command[0] = sys._base_executable
+        command[0] = getattr(sys, "_base_executable", sys.executable)
         environment = {**os.environ, "__PYVENV_LAUNCHER__": sys.executable}
     started_at = _timestamp()
     process = subprocess.Popen(

@@ -13,12 +13,12 @@ import ctypes.util
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeGuard
 
 from .platform_paths import procfs_root
 
 
-def _valid_pid(pid: object) -> bool:
+def _valid_pid(pid: object) -> TypeGuard[int]:
     return (
         isinstance(pid, int)
         and not isinstance(pid, bool)
@@ -138,7 +138,8 @@ def darwin_process_info(pid: int) -> dict[str, Any] | None:
     except (OverflowError, OSError, ValueError):
         return None
     try:
-        session_id = os.getsid(pid)
+        get_session = getattr(os, "getsid", None)
+        session_id = get_session(pid) if get_session is not None else None
     except (AttributeError, OSError, PermissionError):
         session_id = None
     name = bytes(info.comm).split(b"\0", 1)[0].decode("utf-8", errors="replace")
@@ -210,7 +211,7 @@ def _linux_process_identity(pid: int) -> dict[str, Any] | None:
         return None
 
 
-def exact_process_identity(pid: int) -> dict[str, Any] | None:
+def exact_process_identity(pid: object) -> dict[str, Any] | None:
     """Return PID plus exact creation identity, or ``None`` when unprovable."""
 
     if not _valid_pid(pid):

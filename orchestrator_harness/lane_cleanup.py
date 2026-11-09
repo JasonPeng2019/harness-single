@@ -17,6 +17,17 @@ from .records import read_record
 FORCED_CLEANUP_SCHEMA = "lane-cleanup/v1"
 
 
+def _recorded_process_exited(record: object) -> bool:
+    if not isinstance(record, dict):
+        return False
+    pid, creation = record.get("pid"), record.get("creation_time")
+    return (
+        processes._valid_pid(pid)
+        and processes.valid_creation_identity(creation)
+        and processes.identity_exit_proven(pid, creation)
+    )
+
+
 def _bound_history_hash(raw: bytes, recorded: object, run_id: str) -> str:
     """Keep a receipt's history binding when only other runs appended rows.
 
@@ -83,9 +94,7 @@ def _native_cleanup_proof(lane: dict[str, Any]) -> dict[str, Any]:
     status = observation.status
     assert status is not None
     controller = lane["process"] or status.get("controller_identity")
-    if not isinstance(controller, dict) or not processes.identity_exit_proven(
-        controller.get("pid"), controller.get("creation_time")
-    ):
+    if not _recorded_process_exited(controller):
         raise ValueError("original controller exit is unproven")
     if (
         status.get("controller_identity")
@@ -305,12 +314,11 @@ def _forced_cleanup_is_proven(lane: dict[str, Any]) -> bool:
             status = observe_controller_status(lane)
             if (
                 status.kind != "valid"
+                or status.status is None
                 or status.status.get("controller_identity") != controller
             ):
                 return False
-        if not processes.identity_exit_proven(
-            controller.get("pid"), controller.get("creation_time")
-        ):
+        if not _recorded_process_exited(controller):
             return False
         boundary = record["boundary"]
         if boundary is None:
@@ -449,14 +457,7 @@ def cleanup_is_proven(lane: dict[str, Any]) -> bool:
     process = lane.get("process")
     if not isinstance(process, dict):
         return False
-    if process and (
-        type(process.get("pid")) is not int
-        or not processes.valid_creation_identity(process.get("creation_time"))
-    ):
-        return False
-    if process and not processes.identity_exit_proven(
-        process.get("pid"), process.get("creation_time")
-    ):
+    if process and not _recorded_process_exited(process):
         return False
     observation = observe_controller_status(lane)
     status = observation.status
@@ -473,12 +474,7 @@ def cleanup_is_proven(lane: dict[str, Any]) -> bool:
     if not process and not controller_identity:
         return False
     for identity in (process, controller_identity):
-        if identity and (
-            type(identity.get("pid")) is not int
-            or not processes.identity_exit_proven(
-                identity.get("pid"), identity.get("creation_time")
-            )
-        ):
+        if identity and not _recorded_process_exited(identity):
             return False
     boundary = status.get("process_boundary")
     provider_state = status.get("provider_state") or {}
@@ -496,8 +492,6 @@ def cleanup_is_proven(lane: dict[str, Any]) -> bool:
         return False
     provider_pid = provider_state.get("pid")
     provider_creation = provider_state.get("creation_time")
-    if provider_pid is not None and not processes.identity_exit_proven(
-        provider_pid, provider_creation
-    ):
+    if provider_pid is not None and not _recorded_process_exited(provider_state):
         return False
     return True

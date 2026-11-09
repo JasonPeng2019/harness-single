@@ -42,6 +42,9 @@ class LeaseError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+        self.operation_code: str | None = None
+        self.released: bool | None = None
+        self.lease_absent: bool | None = None
 
 
 def lease_dir(rt: Path) -> Path:
@@ -421,8 +424,8 @@ def force_release_lease_audited(
                     FORCE_RELEASE_AUDIT_TERMINAL_FAILED,
                     f"{operation_error}; terminal audit write also failed: {audit_exc}",
                 )
-                failed.operation_code = operation_error.code  # type: ignore[attr-defined]
-                failed.released = False  # type: ignore[attr-defined]
+                failed.operation_code = operation_error.code
+                failed.released = False
                 raise failed from audit_exc
             if operation_error is exc:
                 raise
@@ -445,8 +448,8 @@ def force_release_lease_audited(
                 "lease was released and read-back confirmed, but terminal audit "
                 f"entry could not be written: {exc}",
             )
-            failed.operation_code = FORCE_RELEASE_OK  # type: ignore[attr-defined]
-            failed.released = True  # type: ignore[attr-defined]
-            failed.lease_absent = absent  # type: ignore[attr-defined]
+            failed.operation_code = FORCE_RELEASE_OK
+            failed.released = True
+            failed.lease_absent = absent
             raise failed from exc
         return {"audit_path": str(audit_path), "lease_absent": absent}

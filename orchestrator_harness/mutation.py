@@ -24,7 +24,7 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 from .portable_paths import component as portable_component
 
@@ -123,7 +123,8 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 
 
 def same_identity(
-    actual: tuple[int, int] | list[int], expected: tuple[int, int] | list[int]
+    actual: tuple[int, int] | list[int] | None,
+    expected: tuple[int, int] | list[int],
 ) -> bool:
     """Compare a current identity with one recorded, possibly by another Python.
 
@@ -133,6 +134,8 @@ def same_identity(
     with the low half of the other; two full serials and the file ID must
     still match exactly.
     """
+    if actual is None:
+        return False
     (actual_device, actual_file), (expected_device, expected_file) = actual, expected
     if os.name == "nt" and min(actual_device, expected_device) <= 0xFFFFFFFF:
         actual_device, expected_device = (
@@ -380,7 +383,7 @@ def _windows_file_handle(
     access: int,
     share: int,
     creation: int | None = None,
-) -> tuple[object, tuple[int, int]]:
+) -> tuple[int, tuple[int, int]]:
     if os.name != "nt":
         raise MutationUnsupported("Windows file backend is unavailable")
     handle = _CreateFileW(
@@ -413,14 +416,15 @@ def _windows_file_handle(
     if info.nNumberOfLinks != 1:
         _windows_close(handle)
         raise MutationConflict(f"Windows target has multiple hard links: {path}")
+    native_handle = cast(int, handle)
     try:
-        return handle, _windows_identity(handle)
+        return native_handle, _windows_identity(native_handle)
     except BaseException:
-        _windows_close(handle)
+        _windows_close(native_handle)
         raise
 
 
-def _windows_directory_handle(path: Path, expected: TargetState) -> object:
+def _windows_directory_handle(path: Path, expected: TargetState) -> int:
     if os.name != "nt":
         raise MutationUnsupported("Windows directory backend is unavailable")
     handle = _CreateFileW(
@@ -474,10 +478,13 @@ def _windows_mark_handle_deleted(handle: object, path: Path) -> None:
 
 
 def _windows_remove_directory(path: Path, expected: TargetState) -> None:
-    _remove_anchored_tree(path.parent, Path(path.name), expected)
+    captured = capture_tree(path.parent, path.name)
+    if captured.entries and not _same_state(captured.entries[0][1], expected):
+        raise MutationConflict("captured tree root differs from the expected target")
+    _remove_anchored_tree(captured)
 
 
-def _windows_python_file(native: object, mode: str, flags: int) -> object:
+def _windows_python_file(native: int, mode: str, flags: int) -> BinaryIO:
     import msvcrt
 
     try:
@@ -486,13 +493,13 @@ def _windows_python_file(native: object, mode: str, flags: int) -> object:
         _windows_close(native)
         raise
     try:
-        return os.fdopen(descriptor, mode, closefd=True)
+        return cast(BinaryIO, os.fdopen(descriptor, mode, closefd=True))
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def _capture_open_file(handle: object) -> TargetState:
+def _capture_open_file(handle: BinaryIO) -> TargetState:
     before = os.fstat(handle.fileno())
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise MutationConflict("opened target is not one plain regular file")
@@ -514,7 +521,7 @@ def _capture_open_file(handle: object) -> TargetState:
     )
 
 
-def _windows_open_existing_for_update(path: Path, expected: TargetState) -> object:
+def _windows_open_existing_for_update(path: Path, expected: TargetState) -> BinaryIO:
     """Bind an update handle to the exact authorized regular file."""
     native, _ = _windows_file_handle(
         path, access=_GENERIC_READ | _GENERIC_WRITE, share=_FILE_SHARE_READ
@@ -550,15 +557,27 @@ def _windows_delete_existing(path: Path, expected: TargetState) -> None:
 class AnchoredAppendFile:
     """A file handle whose parent/root capability remains held until close."""
 
-    def __init__(self, handle: object, anchor: "_DirectoryAnchor") -> None:
+    def __init__(self, handle: BinaryIO, anchor: "_DirectoryAnchor") -> None:
         self.handle = handle
         self.anchor = anchor
 
     def __enter__(self) -> "AnchoredAppendFile":
         return self
 
-    def __getattr__(self, name: str) -> object:
-        return getattr(self.handle, name)
+    def fileno(self) -> int:
+        return self.handle.fileno()
+
+    def write(self, data: bytes) -> int:
+        return self.handle.write(data)
+
+    def read(self, size: int = -1) -> bytes:
+        return self.handle.read(size)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self.handle.seek(offset, whence)
+
+    def flush(self) -> None:
+        self.handle.flush()
 
     def close(self) -> None:
         try:
@@ -566,7 +585,7 @@ class AnchoredAppendFile:
         finally:
             self.anchor.close()
 
-    def __enter_file__(self) -> object:
+    def __enter_file__(self) -> BinaryIO:
         return self.handle
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -597,16 +616,16 @@ if os.name == "nt":
 
     class _ByHandleFileInformation(ctypes.Structure):
         _fields_ = [
-            ("dwFileAttributes", ctypes.wintypes.DWORD),
-            ("ftCreationTime", ctypes.wintypes.FILETIME),
-            ("ftLastAccessTime", ctypes.wintypes.FILETIME),
-            ("ftLastWriteTime", ctypes.wintypes.FILETIME),
-            ("dwVolumeSerialNumber", ctypes.wintypes.DWORD),
-            ("nFileSizeHigh", ctypes.wintypes.DWORD),
-            ("nFileSizeLow", ctypes.wintypes.DWORD),
-            ("nNumberOfLinks", ctypes.wintypes.DWORD),
-            ("nFileIndexHigh", ctypes.wintypes.DWORD),
-            ("nFileIndexLow", ctypes.wintypes.DWORD),
+            ("dwFileAttributes", _wintypes.DWORD),
+            ("ftCreationTime", _wintypes.FILETIME),
+            ("ftLastAccessTime", _wintypes.FILETIME),
+            ("ftLastWriteTime", _wintypes.FILETIME),
+            ("dwVolumeSerialNumber", _wintypes.DWORD),
+            ("nFileSizeHigh", _wintypes.DWORD),
+            ("nFileSizeLow", _wintypes.DWORD),
+            ("nNumberOfLinks", _wintypes.DWORD),
+            ("nFileIndexHigh", _wintypes.DWORD),
+            ("nFileIndexLow", _wintypes.DWORD),
         ]
 
     class _FileIdInfo(ctypes.Structure):
@@ -618,77 +637,77 @@ if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _CreateFileW = _kernel32.CreateFileW
     _CreateFileW.argtypes = [
-        ctypes.wintypes.LPCWSTR,
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.DWORD,
+        _wintypes.LPCWSTR,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
         ctypes.c_void_p,
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.HANDLE,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
+        _wintypes.HANDLE,
     ]
-    _CreateFileW.restype = ctypes.wintypes.HANDLE
+    _CreateFileW.restype = _wintypes.HANDLE
     _GetFileInformationByHandle = _kernel32.GetFileInformationByHandle
     _GetFileInformationByHandle.argtypes = [
-        ctypes.wintypes.HANDLE,
+        _wintypes.HANDLE,
         ctypes.POINTER(_ByHandleFileInformation),
     ]
-    _GetFileInformationByHandle.restype = ctypes.wintypes.BOOL
+    _GetFileInformationByHandle.restype = _wintypes.BOOL
     _GetFileInformationByHandleEx = _kernel32.GetFileInformationByHandleEx
     _GetFileInformationByHandleEx.argtypes = [
-        ctypes.wintypes.HANDLE,
+        _wintypes.HANDLE,
         ctypes.c_int,
         ctypes.c_void_p,
-        ctypes.wintypes.DWORD,
+        _wintypes.DWORD,
     ]
-    _GetFileInformationByHandleEx.restype = ctypes.wintypes.BOOL
+    _GetFileInformationByHandleEx.restype = _wintypes.BOOL
     _GetFinalPathNameByHandleW = _kernel32.GetFinalPathNameByHandleW
     _GetFinalPathNameByHandleW.argtypes = [
-        ctypes.wintypes.HANDLE,
-        ctypes.wintypes.LPWSTR,
-        ctypes.wintypes.DWORD,
-        ctypes.wintypes.DWORD,
+        _wintypes.HANDLE,
+        _wintypes.LPWSTR,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
     ]
-    _GetFinalPathNameByHandleW.restype = ctypes.wintypes.DWORD
+    _GetFinalPathNameByHandleW.restype = _wintypes.DWORD
     _QueryDosDeviceW = _kernel32.QueryDosDeviceW
     _QueryDosDeviceW.argtypes = [
-        ctypes.wintypes.LPCWSTR,
-        ctypes.wintypes.LPWSTR,
-        ctypes.wintypes.DWORD,
+        _wintypes.LPCWSTR,
+        _wintypes.LPWSTR,
+        _wintypes.DWORD,
     ]
-    _QueryDosDeviceW.restype = ctypes.wintypes.DWORD
+    _QueryDosDeviceW.restype = _wintypes.DWORD
     _DeviceIoControl = _kernel32.DeviceIoControl
     _DeviceIoControl.argtypes = [
-        ctypes.wintypes.HANDLE,
-        ctypes.wintypes.DWORD,
+        _wintypes.HANDLE,
+        _wintypes.DWORD,
         ctypes.c_void_p,
-        ctypes.wintypes.DWORD,
+        _wintypes.DWORD,
         ctypes.c_void_p,
-        ctypes.wintypes.DWORD,
-        ctypes.POINTER(ctypes.wintypes.DWORD),
+        _wintypes.DWORD,
+        ctypes.POINTER(_wintypes.DWORD),
         ctypes.c_void_p,
     ]
-    _DeviceIoControl.restype = ctypes.wintypes.BOOL
+    _DeviceIoControl.restype = _wintypes.BOOL
     _CloseHandle = _kernel32.CloseHandle
-    _CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
-    _CloseHandle.restype = ctypes.wintypes.BOOL
+    _CloseHandle.argtypes = [_wintypes.HANDLE]
+    _CloseHandle.restype = _wintypes.BOOL
     _SetFileInformationByHandle = _kernel32.SetFileInformationByHandle
     _SetFileInformationByHandle.argtypes = [
-        ctypes.wintypes.HANDLE,
-        ctypes.wintypes.DWORD,
+        _wintypes.HANDLE,
+        _wintypes.DWORD,
         ctypes.c_void_p,
-        ctypes.wintypes.DWORD,
+        _wintypes.DWORD,
     ]
-    _SetFileInformationByHandle.restype = ctypes.wintypes.BOOL
+    _SetFileInformationByHandle.restype = _wintypes.BOOL
     _MoveFileExW = _kernel32.MoveFileExW
     _MoveFileExW.argtypes = [
-        ctypes.wintypes.LPCWSTR,
-        ctypes.wintypes.LPCWSTR,
-        ctypes.wintypes.DWORD,
+        _wintypes.LPCWSTR,
+        _wintypes.LPCWSTR,
+        _wintypes.DWORD,
     ]
-    _MoveFileExW.restype = ctypes.wintypes.BOOL
+    _MoveFileExW.restype = _wintypes.BOOL
 
     class _FileDispositionInfo(ctypes.Structure):
-        _fields_ = [("DeleteFile", ctypes.wintypes.BOOL)]
+        _fields_ = [("DeleteFile", _wintypes.BOOL)]
 
     _FILE_DISPOSITION_INFO = 4
 
@@ -740,8 +759,8 @@ if os.name == "nt":
 
 
 def _windows_open_directory(
-    path: Path, *, parent: object = None, create: bool = False
-) -> tuple[object, tuple[int, int]]:
+    path: Path, *, parent: int | None = None, create: bool = False
+) -> tuple[int, tuple[int, int]]:
     """NtCreateFile refuses reparse traversal, including above an absolute root.
 
     Outside ancestors need no extra access grants or enumeration. Below the
@@ -824,7 +843,10 @@ def _windows_open_directory(
             else os.path.normcase(observed) != os.path.normcase(expected)
         ):
             raise MutationConflict(f"native directory has a path alias: {path}")
-        return handle.value, _windows_identity(handle)
+        native_handle = handle.value
+        if native_handle is None:
+            raise MutationUnsupported("native directory handle was not returned")
+        return native_handle, _windows_identity(handle)
     except BaseException:
         _windows_close(handle)
         raise
@@ -843,7 +865,7 @@ class _DirectoryAnchor:
         self.parent_fd: int | None = None
         self._fds: list[int] = []
         self._paths: list[Path] = []
-        self._handles: list[object] = []
+        self._handles: list[int] = []
         self._temporaries: dict[str, tuple[int, int]] = {}
         try:
             self.expected_root_identity = _identity(self.root.lstat())
@@ -879,7 +901,10 @@ class _DirectoryAnchor:
     def _enter_posix(self) -> None:
         _require_supported_root_boundary()
         flags = (
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
         )
         root_fd = os.open(self.root.anchor, flags)
         self._fds.append(root_fd)
@@ -918,7 +943,7 @@ class _DirectoryAnchor:
         self.parent_identity = _identity(parent_info)
 
     @staticmethod
-    def _windows_open(path: Path) -> tuple[object, tuple[int, int]]:
+    def _windows_open(path: Path) -> tuple[int, tuple[int, int]]:
         if os.name != "nt":
             raise MutationUnsupported("Windows directory backend is unavailable")
         return _windows_open_directory(path)
@@ -994,7 +1019,7 @@ class _DirectoryAnchor:
                 failed_fds.append(fd)
         self._fds = list(reversed(failed_fds))
         self._paths.clear()
-        failed_handles: list[object] = []
+        failed_handles: list[int] = []
         for handle in reversed(self._handles):
             try:
                 _windows_close(handle)
@@ -1213,25 +1238,31 @@ def durable_identity(
                 raise MutationConflict("durable identity target is absent")
         if os.name == "nt":
             close = False
+            native_handle: int | None = None
+            identity: tuple[int, int] | None = None
             if name is not None:
                 if actual.kind == "directory":
-                    handle, identity = _windows_open_directory(
-                        Path(name), parent=anchor._handles[-1]
+                    native_handle, identity = _windows_open_directory(
+                        Path(name), parent=cast(int, anchor._handles[-1])
                     )
                 else:
-                    handle, _ = _windows_file_handle(
+                    native_handle, _ = _windows_file_handle(
                         parent / name, access=_GENERIC_READ, share=_FILE_SHARE_READ
                     )
-                    identity = _windows_identity(handle)
+                    identity = _windows_identity(native_handle)
                 close = True
+            else:
+                native_handle = cast(int, anchor._handles[0])
             try:
                 if name is not None and identity != actual.identity:
                     raise MutationConflict(
                         "durable identity target changed while opening"
                     )
+                if native_handle is None:
+                    raise MutationConflict("durable identity handle is unavailable")
                 info = _FileIdInfo()
                 if not _GetFileInformationByHandleEx(
-                    handle, 18, ctypes.byref(info), ctypes.sizeof(info)
+                    native_handle, 18, ctypes.byref(info), ctypes.sizeof(info)
                 ):
                     raise MutationUnsupported(
                         "stable native FILE_ID_INFO is unavailable"
@@ -1239,7 +1270,7 @@ def durable_identity(
                 value = f"windows-file-id/v1:{int(info.VolumeSerialNumber):016x}:{bytes(info.FileId).hex()}"
             finally:
                 if close:
-                    _windows_close(handle)
+                    _windows_close(native_handle)
         else:
             if name is None:
                 info = os.fstat(handle)
@@ -1299,7 +1330,7 @@ def read_link_value(
                 if native_id != _identity(before):
                     raise MutationConflict("symbolic link changed before opening")
                 buffer = ctypes.create_string_buffer(16384)
-                received = ctypes.wintypes.DWORD()
+                received = _wintypes.DWORD()
                 if not _DeviceIoControl(
                     handle,
                     0x000900A8,
@@ -1539,9 +1570,9 @@ def _windows_rename_handle(
 
     class RenameInfo(ctypes.Structure):
         _fields_ = [
-            ("ReplaceIfExists", ctypes.wintypes.BOOL),
-            ("RootDirectory", ctypes.wintypes.HANDLE),
-            ("FileNameLength", ctypes.wintypes.DWORD),
+            ("ReplaceIfExists", _wintypes.BOOL),
+            ("RootDirectory", _wintypes.HANDLE),
+            ("FileNameLength", _wintypes.DWORD),
             ("FileName", ctypes.c_wchar * (length // 2 + 1)),
         ]
 
@@ -2215,6 +2246,8 @@ def _windows_rename_entries(
                     "rename source name was repopulated during publication"
                 )
             if retained is not None:
+                if target_file is None or target_native is None:
+                    raise MutationConflict("rename destination handle is unavailable")
                 if (
                     not _same_state(_capture_open_file(target_file), target_state)
                     or _identity(target_anchor.stat(retained.name))
@@ -2478,8 +2511,11 @@ def capture_tree(root: str | Path, relative: str | Path) -> CapturedTree:
             inventory(rel)
             if not _same_state(plan[rel], selected):
                 raise MutationConflict("tree root changed during capture")
+        root_identity = outer.root_identity
+        if root_identity is None:
+            raise MutationConflict("tree authority root identity is unavailable")
         captured = CapturedTree(
-            root_path, rel, outer.root_identity, tuple(sorted(plan.items()))
+            root_path, rel, root_identity, tuple(sorted(plan.items()))
         )
         _revalidate_tree(captured)
         outer.assert_stable()

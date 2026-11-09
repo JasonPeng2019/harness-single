@@ -341,7 +341,9 @@ def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, 
             "terminal": "COMMAND_LAUNCH_ERROR",
         }
     job_handle = (
-        process.take_job_handle() if hasattr(process, "take_job_handle") else None
+        process.take_job_handle()
+        if processes.is_windows_suspended_process(process)
+        else None
     )
     identity = processes.process_identity(process.pid)
     boundary = processes.ProcessBoundary(
@@ -352,7 +354,7 @@ def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, 
         windows_job_handle=job_handle,
     )
     try:
-        if hasattr(process, "resume"):
+        if processes.is_windows_suspended_process(process):
             process.resume()
         boundary.observe()
         terminal: str | None = None

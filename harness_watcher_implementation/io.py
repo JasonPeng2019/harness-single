@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from orchestrator_harness.stable_io import PreparedOutput, PathKeyedAppendLock
 
@@ -55,4 +55,4 @@ def lock(root: Path, path: Path) -> Iterator[None]:
 
 def append_records(root: Path, path: Path, values: list[dict[str, Any]]) -> None:
     transaction = output(root, path)
-    transaction.append_jsonl(path, values)
+    transaction.append_jsonl(path, list[Mapping[str, Any]](values))

@@ -77,6 +77,8 @@ class HarnessConfig:
 
     @property
     def runtime_root(self) -> Path:
+        if self.root_workspace is None:
+            raise ConfigError("root workspace is not configured")
         return self.root_workspace / RUNTIME_DIR_NAME
 
     @property
@@ -462,16 +464,20 @@ def compute_config_identity(config: HarnessConfig, manifest: ResourceManifest) -
     exclusive-resource set, or the record schema version) changes this digest
     and forces a new epoch.
     """
+    root_workspace = config.root_workspace
+    if root_workspace is None:
+        raise ConfigError("root workspace is not configured")
     payload = {
-        "root_workspace": str(config.root_workspace),
+        "root_workspace": str(root_workspace),
         "managed_coordination": config.managed_coordination,
         "resource_manifest": [dict(item) for item in manifest.resources],
         "runtime_record_schema_version": 1,
     }
-    if config.manager_workspace is not None and not same_path(
-        config.manager_workspace, config.root_workspace
+    manager_workspace = config.manager_workspace
+    if manager_workspace is not None and not same_path(
+        manager_workspace, root_workspace
     ):
-        payload["manager_workspace"] = path_identity(config.manager_workspace)
+        payload["manager_workspace"] = path_identity(manager_workspace)
     if config.checkout_paths is not None:
         # Preserve the historical identity for unscoped full checkouts.
         payload["checkout_paths"] = list(config.checkout_paths)

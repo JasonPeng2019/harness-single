@@ -120,6 +120,8 @@ def _wait_for_controller_exit(lane: dict[str, Any], timeout_seconds: float) -> b
         return False
     pid = process.get("pid")
     creation = process.get("creation_time")
+    if not processes._valid_pid(pid) or not processes.valid_creation_identity(creation):
+        return False
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if processes.identity_exit_proven(pid, creation):
@@ -339,12 +341,16 @@ def _service_receipt(record: dict[str, Any] | None) -> dict[str, Any] | None:
 
 def _background_cleanup_snapshot(rt: Path, root: Path, harness: Path) -> dict[str, Any]:
     monitor = read_monitor_record(rt)
-    if monitor is not None and not processes.identity_exit_proven(
-        monitor.get("pid"), monitor.get("creation_time")
-    ):
-        raise ShutdownError(
-            SHUTDOWN_MONITOR_UNPROVEN, "current monitor owner exit is unproven"
-        )
+    if monitor is not None:
+        pid, creation = monitor.get("pid"), monitor.get("creation_time")
+        if (
+            not processes._valid_pid(pid)
+            or not processes.valid_creation_identity(creation)
+            or not processes.identity_exit_proven(pid, creation)
+        ):
+            raise ShutdownError(
+                SHUTDOWN_MONITOR_UNPROVEN, "current monitor owner exit is unproven"
+            )
     from .public_checks import service_cleanup
 
     service = service_cleanup(root, harness)
@@ -433,6 +439,11 @@ def run_shutdown() -> dict[str, Any]:
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
+        root_workspace = config.root_workspace
+        if root_workspace is None:
+            raise ShutdownError(
+                SHUTDOWN_RUNTIME_AMBIGUOUS, "root workspace is not configured"
+            )
     except Exception as exc:
         return {
             "ok": False,
@@ -452,7 +463,7 @@ def run_shutdown() -> dict[str, Any]:
                     runtime_state_path(rt).exists()
                     or (rt / "epochs").exists()
                     or monitor_record_path(rt).exists()
-                    or (home(config.root_workspace) / "service.json").exists()
+                    or (home(root_workspace) / "service.json").exists()
                 ):
                     raise ShutdownError(
                         SHUTDOWN_RUNTIME_AMBIGUOUS,
@@ -468,9 +479,7 @@ def run_shutdown() -> dict[str, Any]:
             current_state = state.get("state")
             if current_state == "CLOSED":
                 _closed_inventory_clean(rt)
-                owners = _background_cleanup_snapshot(
-                    rt, config.root_workspace, harness_root
-                )
+                owners = _background_cleanup_snapshot(rt, root_workspace, harness_root)
                 expected = state.get("cleanup_owners")
                 if expected is not None and expected != owners:
                     raise ShutdownError(
@@ -552,7 +561,7 @@ def run_shutdown() -> dict[str, Any]:
 
         from .public_checks import stop_service
 
-        service_receipt = stop_service(config.root_workspace, harness_root)
+        service_receipt = stop_service(root_workspace, harness_root)
         monitor_receipt = _stop_monitor(rt)
         expected_owners = {
             "monitor": _monitor_receipt(monitor_receipt),
@@ -575,9 +584,7 @@ def run_shutdown() -> dict[str, Any]:
                     "durable active ownership remains before CLOSED",
                 )
             _closed_inventory_clean(rt)
-            owners = _background_cleanup_snapshot(
-                rt, config.root_workspace, harness_root
-            )
+            owners = _background_cleanup_snapshot(rt, root_workspace, harness_root)
             if owners != expected_owners:
                 raise ShutdownError(
                     SHUTDOWN_RUNTIME_AMBIGUOUS,
@@ -592,7 +599,7 @@ def run_shutdown() -> dict[str, Any]:
                     "updated_at": iso_utc(),
                 },
             )
-        _prune_worktrees(config.root_workspace)
+        _prune_worktrees(root_workspace)
     except ShutdownError as exc:
         return {
             "ok": False,

@@ -70,13 +70,18 @@ def _read_binding(path: Path, provider_id: str) -> dict[str, Any]:
                 f"installed {provider_id} hook has no bound {field}"
             )
     config = load_config(Path(value["harness_root"]))
+    root_workspace = config.root_workspace
+    manager_workspace = config.manager_workspace
+    if root_workspace is None or manager_workspace is None:
+        raise RootHookBindingError("ROOT_BINDING_STALE: workspace is not configured")
+    runtime_root = config.runtime_root
     expected_identity = compute_config_identity(
         config, load_resource_manifest(config.harness_root)
     )
     expected_paths = {
-        "runtime_root": config.runtime_root,
-        "manager_workspace": config.manager_workspace,
-        "root_workspace": config.root_workspace,
+        "runtime_root": runtime_root,
+        "manager_workspace": manager_workspace,
+        "root_workspace": root_workspace,
     }
     if (
         value.get("config_identity") != expected_identity
@@ -85,7 +90,7 @@ def _read_binding(path: Path, provider_id: str) -> dict[str, Any]:
             for field, wanted in expected_paths.items()
         )
         or path_identity(path.absolute().parent.parent)
-        != path_identity(config.manager_workspace)
+        != path_identity(manager_workspace)
     ):
         raise RootHookBindingError(
             "ROOT_BINDING_STALE: explicitly prepare hooks for the current manager/product configuration"

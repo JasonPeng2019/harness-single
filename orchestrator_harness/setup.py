@@ -18,8 +18,10 @@ from __future__ import annotations
 # Setuptools executes this filename as a build script. Native harness setup
 # imports it as a package module; keep those two entry points explicit.
 if __name__ == "__main__" and not __package__:
-    from setuptools import setup as build_package
+    from importlib import import_module
+    from typing import Any, Callable, cast
 
+    build_package = cast(Callable[..., Any], import_module("setuptools").setup)
     build_package()
     raise SystemExit(0)
 
@@ -338,7 +340,24 @@ def _catalog_bytes(path: Path, catalog: _CacheCatalog | None) -> bytes:
     )
     if source is None:
         raise SetupError(SETUP_CACHE_INVALID, f"uncaptured cache source: {path}")
-    return source.state.content
+    content = source.state.content
+    if content is None:
+        raise SetupError(
+            SETUP_CACHE_INVALID, f"captured cache source has no bytes: {path}"
+        )
+    return content
+
+
+def _required_identity(state: TargetState, description: str) -> tuple[int, int]:
+    if state.identity is None:
+        raise MutationConflict(f"{description} has no captured filesystem identity")
+    return state.identity
+
+
+def _required_content(state: TargetState, description: str) -> bytes:
+    if state.content is None:
+        raise MutationConflict(f"{description} has no captured file contents")
+    return state.content
 
 
 def _validate_worker_commands(
@@ -880,6 +899,8 @@ def _capture_cache_boundary(rt: Path) -> _CacheBoundary:
             authority = authority.parent
         with _DirectoryAnchor(authority, authority) as anchor:
             identity = anchor.root_identity
+            if identity is None:
+                raise MutationConflict("cache authority identity is unavailable")
             directories = {
                 Path("."): TargetState(True, "directory", identity, None, None)
             }
@@ -987,7 +1008,7 @@ def _prepare_cache_runtime(boundary: _CacheBoundary) -> _CacheBoundary:
             CapturedTree(
                 boundary.runtime,
                 Path(name),
-                runtime_state.identity,
+                _required_identity(runtime_state, "cache runtime"),
                 ((Path(name), TargetState.absent()),),
             ),
         )
@@ -1212,7 +1233,9 @@ def _read_cache_transaction(
             SETUP_CACHE_INVALID, "cache journal capture belongs to another runtime"
         )
     return (
-        _decode_cache_transaction(boundary.journal.content, rt)
+        _decode_cache_transaction(
+            _required_content(boundary.journal, "cache journal"), rt
+        )
         if boundary.journal.present
         else None
     )
@@ -1257,7 +1280,7 @@ def _match_cache_objects(
         )
     objects = {value["entries"]["."]["identity"]: value for value in record["objects"]}
     for name, tree in boundary.trees:
-        if _tree_manifest(tree) is None:
+        if tree is None or _tree_manifest(tree) is None:
             continue
         proof = _cache_tree_proof(tree, "target")
         original = objects.get(proof["entries"]["."]["identity"])
@@ -1669,13 +1692,16 @@ def _recover_cache_transaction(
     elif backup:
         remove_tree(backup[0].root, backup[0].relative, captured=backup[0])
     # Revalidate all remaining original files and the original journal at last use.
-    expected_live = (
-        live[0]
-        if valid_target or valid_previous
-        else _rebase_cache_tree(backup[0], "super-cache")
-        if backup
-        else None
-    )
+    if valid_target or valid_previous:
+        if live is None:
+            raise SetupError(
+                SETUP_CACHE_INVALID, "validated live cache disappeared during recovery"
+            )
+        expected_live = live[0]
+    elif backup:
+        expected_live = _rebase_cache_tree(backup[0], "super-cache")
+    else:
+        expected_live = None
     if expected_live is not None:
         _revalidate_tree(expected_live)
     elif transaction["previous"] is not None:
@@ -1856,7 +1882,7 @@ def _install_active_cache(
             "previous": previous,
             "target": target,
             "objects": [_cache_tree_proof(prior, "previous")]
-            if previous is not None
+            if prior is not None and previous is not None
             else [],
             "state": "building",
             "error": None,
@@ -1927,7 +1953,7 @@ def _install_active_cache(
                 receipt = replace(
                     rt,
                     selected,
-                    source.state.content,
+                    _required_content(source.state, f"cache source {source.path}"),
                     expected=TargetState.absent(),
                     expected_root_identity=root_state.identity,
                     expected_directories=_root_directory_chain(
@@ -1951,7 +1977,7 @@ def _install_active_cache(
             stage = CapturedTree(
                 rt,
                 Path(stage_name),
-                root_state.identity,
+                _required_identity(root_state, "cache runtime"),
                 tuple(sorted(stage_entries.items())),
             )
             _revalidate_tree(stage)
@@ -1989,7 +2015,7 @@ def _install_active_cache(
                     original_stage = CapturedTree(
                         rt,
                         Path(stage_name),
-                        root_state.identity,
+                        _required_identity(root_state, "cache runtime"),
                         tuple(sorted(stage_entries.items())),
                     )
                     remove_tree(rt, stage_name, captured=original_stage)
@@ -2054,6 +2080,14 @@ def _materialized_binding(
     bound["harness_root"] = str(harness_root.resolve())
     bound["runtime_root"] = str(runtime_root.resolve())
     config = load_config(harness_root)
+    if (
+        config.runtime_root is None
+        or config.manager_workspace is None
+        or config.root_workspace is None
+    ):
+        raise SetupError(
+            SETUP_CONFIG_INVALID, "configured runtime/workspace path is missing"
+        )
     if path_identity(config.runtime_root) != path_identity(runtime_root):
         raise SetupError(
             SETUP_CONFIG_INVALID,
@@ -2428,7 +2462,10 @@ def _capture_root_source(source: Path) -> _RootPayloadSource:
             stat.S_IMODE(info.st_mode), info.st_atime_ns, info.st_mtime_ns
         )
         _require_anchored_expected(anchor, source.name, state)
-        return _RootPayloadSource(source, anchor.root_identity, state, metadata)
+        identity = anchor.root_identity
+        if identity is None:
+            raise MutationConflict("ROOT payload source authority is unavailable")
+        return _RootPayloadSource(source, identity, state, metadata)
 
 
 def _revalidate_root_source(source: _RootPayloadSource) -> None:
@@ -2525,6 +2562,8 @@ def _capture_root_payloads(
             authority = authority.parent
         with _DirectoryAnchor(authority, authority) as anchor:
             identity = anchor.root_identity
+            if identity is None:
+                raise MutationConflict("ROOT payload authority identity is unavailable")
             directories = {
                 Path("."): TargetState(True, "directory", identity, None, None)
             }
@@ -2646,19 +2685,23 @@ def _preflight_root_payloads(
         sources = {file.source.path for file in snapshot.files}
         for file in snapshot.files:
             target = snapshot.workspace / file.relative
-            data = file.source.state.content
+            data = _required_content(
+                file.source.state, f"ROOT payload source {file.source.path}"
+            )
             metadata = file.source.metadata
             merged = False
             if file.target.present:
                 if file.relative == CODEX_ROOT_CONFIG:
-                    _validate_captured_codex_config(target, file.target.content)
+                    _validate_captured_codex_config(
+                        target, _required_content(file.target, f"ROOT target {target}")
+                    )
                     data = None
                 elif file.relative in SHARED_ROOT_HOOK_CONFIGS:
                     shipped = _captured_json_object(
                         data, file.source.path, description="shipped hook configuration"
                     )
                     current = _captured_json_object(
-                        file.target.content,
+                        _required_content(file.target, f"ROOT target {target}"),
                         target,
                         description="existing hook configuration",
                     )
@@ -2669,7 +2712,10 @@ def _preflight_root_payloads(
                     data = _render_root_json(combined) if merged else None
                     metadata = None
                 elif not overwrite:
-                    valid = file.target.content == data
+                    target_content = _required_content(
+                        file.target, f"ROOT target {target}"
+                    )
+                    valid = target_content == data
                     template = (binding_templates or {}).get(
                         root_workspace / file.relative
                     )
@@ -2681,7 +2727,7 @@ def _preflight_root_payloads(
                     ):
                         try:
                             valid = json.loads(
-                                file.target.content.decode("utf-8")
+                                target_content.decode("utf-8")
                             ) == _materialized_binding(
                                 template, harness_root, runtime_root
                             )
@@ -2843,7 +2889,11 @@ def _materialize_root_hook_bindings(
                     f"installed {provider_id} binding is missing from the publication"
                 )
             try:
-                copied = json.loads(state.content.decode("utf-8"))
+                copied = json.loads(
+                    _required_content(state, f"installed {provider_id} hook").decode(
+                        "utf-8"
+                    )
+                )
             except (UnicodeDecodeError, ValueError) as exc:
                 raise SetupError(
                     SETUP_CONFIG_INVALID,
@@ -3142,7 +3192,7 @@ def _start_monitor_locked(
     harness_root: Path,
     rt: Path,
     config_identity: str,
-) -> dict[str, Any]:
+) -> _MonitorStartup:
     """Reserve STARTING before spawn; caller holds admission and record locks."""
     record = {
         "schema": MONITOR_SCHEMA,
@@ -3225,7 +3275,7 @@ def _start_monitor(
     rt: Path,
     config: HarnessConfig,
     config_identity: str,
-) -> dict[str, Any]:
+) -> _MonitorStartup:
     """Start the one persistent monitor under the monitor-record lock."""
     record_path = monitor_record_path(rt)
     with runtime_admission_lock(rt), RecordLock(record_path):
@@ -3236,7 +3286,11 @@ def _start_monitor(
         if existing is not None:
             pid = existing.get("pid")
             creation = existing.get("creation_time")
-            if processes.identity_matches(pid, creation):
+            if (
+                processes._valid_pid(pid)
+                and processes.valid_creation_identity(creation)
+                and processes.identity_matches(pid, creation)
+            ):
                 if (
                     existing.get("stop_requested")
                     or existing.get("health") == "STOPPED"
@@ -3248,7 +3302,11 @@ def _start_monitor(
                     raise ConfigError("live monitor configuration identity differs")
                 _validate_monitor_ready(rt, config_identity, existing)
                 raise ConfigError(SETUP_MONITOR_ALREADY_RUNNING)
-            if not processes.identity_exit_proven(pid, creation):
+            if (
+                not processes._valid_pid(pid)
+                or not processes.valid_creation_identity(creation)
+                or not processes.identity_exit_proven(pid, creation)
+            ):
                 raise ConfigError(
                     "monitor owner exit is unproven; preserve its ownership record"
                 )
@@ -3270,10 +3328,11 @@ def _heartbeat_is_fresh(record: dict[str, Any]) -> bool:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return False
-    if parsed.tzinfo is None:
+    offset = parsed.utcoffset()
+    if offset is None:
         return False
     return (
-        parsed.utcoffset().total_seconds() == 0
+        offset.total_seconds() == 0
         and 0
         <= (datetime.now(timezone.utc) - parsed).total_seconds()
         <= HEARTBEAT_STALENESS_SECONDS
@@ -3309,15 +3368,21 @@ def _validate_monitor_ready(
     # ready_at is a birth fact and may be older than the current heartbeat.
     try:
         ready = datetime.fromisoformat(record["ready_at"].replace("Z", "+00:00"))
+        offset = ready.utcoffset()
         if (
-            ready.tzinfo is None
-            or ready.utcoffset().total_seconds() != 0
+            offset is None
+            or offset.total_seconds() != 0
             or ready > datetime.now(timezone.utc)
         ):
             raise ValueError("invalid readiness timestamp")
     except (KeyError, AttributeError, TypeError, ValueError) as exc:
         raise ConfigError("monitor has no valid child-published ready_at") from exc
-    if not processes.identity_matches(record.get("pid"), record.get("creation_time")):
+    pid, creation = record.get("pid"), record.get("creation_time")
+    if (
+        not processes._valid_pid(pid)
+        or not processes.valid_creation_identity(creation)
+        or not processes.identity_matches(pid, creation)
+    ):
         raise ConfigError(
             "initialized monitor incarnation is not live; explicitly run health monitor-recover"
         )
@@ -3588,7 +3653,9 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             harness_root,
             root_plan,
             captured_sources={
-                file.source.path: file.source.state.content
+                file.source.path: _required_content(
+                    file.source.state, f"ROOT payload source {file.source.path}"
+                )
                 for file in root_capture.files
             },
         )
@@ -3794,6 +3861,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
 
             config_identity = compute_config_identity(config, manifest)
             monitor_already_running = False
+            monitor: _MonitorStartup | None = None
             try:
                 monitor = _start_monitor(harness_root, rt, config, config_identity)
             except ConfigError as exc:
@@ -3811,6 +3879,8 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
                 "next_action": "proceed; the runtime is monitored",
             }
         else:
+            if monitor is None:
+                raise ConfigError("monitor startup returned no child handle")
             _wait_monitor_ready(rt, config_identity, monitor)
     except SetupError as exc:
         return _failure(

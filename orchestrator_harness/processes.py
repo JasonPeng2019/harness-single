@@ -19,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Protocol, Sequence, TypeGuard, cast
 
 from harness_common.process_identity import (
     darwin_process_ids,
@@ -46,7 +46,7 @@ WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 BOUNDARY_WAIT_SECONDS = 5.0
 
 
-def _valid_pid(pid: object) -> bool:
+def _valid_pid(pid: object) -> TypeGuard[int]:
     return (
         isinstance(pid, int)
         and not isinstance(pid, bool)
@@ -184,7 +184,7 @@ def identity_matches(pid: int, creation_time: str | None) -> bool:
     return current is not None and current["creation_time"] == creation_time
 
 
-def valid_creation_identity(value: object) -> bool:
+def valid_creation_identity(value: object) -> TypeGuard[str]:
     """Recognize native start identities and the supported legacy UTC form."""
     if not isinstance(value, str) or not value:
         return False
@@ -272,7 +272,7 @@ def _linux_identity_exit_proven(pid: int, creation_time: str) -> bool | None:
     return None
 
 
-def identity_exit_proven(pid: int, creation_time: str) -> bool:
+def identity_exit_proven(pid: object, creation_time: object) -> bool:
     """Prove this incarnation exited; an unreadable PID is not absence."""
     if not _valid_pid(pid) or not valid_creation_identity(creation_time):
         return False
@@ -340,7 +340,9 @@ def terminate_process(
     supplied the same exact identity.
     """
 
-    if identity_exit_proven(pid, creation_time):
+    if valid_creation_identity(creation_time) and identity_exit_proven(
+        pid, creation_time
+    ):
         return True
     if (
         not _valid_pid(pid)
@@ -490,7 +492,7 @@ def spawn_detached(
         # The Windows venv redirector starts another process, so its Popen PID
         # cannot attest the Python child. Launch the base executable directly
         # while asking Python to retain the venv's interpreter identity.
-        child_argv[0] = sys._base_executable
+        child_argv[0] = getattr(sys, "_base_executable", sys.executable)
         child_env = dict(os.environ if env is None else env)
         child_env["__PYVENV_LAUNCHER__"] = sys.executable
     return subprocess.Popen(
@@ -591,6 +593,20 @@ def _create_kill_on_close_job() -> int:
         raise
 
 
+class WindowsSuspendedProvider(Protocol):
+    """Windows provider handle suspended until its process boundary is ready."""
+
+    pid: int
+
+    def take_job_handle(self) -> int | None: ...
+
+    def resume(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def close(self) -> None: ...
+
+
 class _WindowsSuspendedProcess:
     """Small ``Popen``-shaped handle for a natively suspended process."""
 
@@ -638,6 +654,8 @@ class _WindowsSuspendedProcess:
     def poll(self) -> int | None:
         if self.returncode is not None:
             return self.returncode
+        if self._handle is None:
+            raise OSError("process handle is closed before its exit was observed")
         import _winapi
 
         code = _winapi.GetExitCodeProcess(self._handle)
@@ -650,12 +668,17 @@ class _WindowsSuspendedProcess:
         import _winapi
 
         if self.poll() is None:
+            handle = self._handle
+            if handle is None:
+                raise OSError("process handle closed before wait")
             milliseconds = (
                 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
             )
-            result = _winapi.WaitForSingleObject(self._handle, milliseconds)
+            result = _winapi.WaitForSingleObject(handle, milliseconds)
             if result == 0x102:  # WAIT_TIMEOUT
-                raise subprocess.TimeoutExpired(self.args, timeout)
+                raise subprocess.TimeoutExpired(
+                    self.args, timeout if timeout is not None else 0.0
+                )
             if result == 0xFFFFFFFF:  # WAIT_FAILED
                 raise OSError("WaitForSingleObject failed")
         result = self.poll()
@@ -667,7 +690,10 @@ class _WindowsSuspendedProcess:
         import _winapi
 
         if self.poll() is None:
-            _winapi.TerminateProcess(self._handle, 1)
+            handle = self._handle
+            if handle is None:
+                raise OSError("process handle closed before termination")
+            _winapi.TerminateProcess(handle, 1)
 
     kill = terminate
 
@@ -689,6 +715,11 @@ class _WindowsSuspendedProcess:
             self.close()
         except (AttributeError, OSError):
             pass
+
+
+def is_windows_suspended_process(value: object) -> TypeGuard[WindowsSuspendedProvider]:
+    """Narrow a provider child only after confirming its Windows handle type."""
+    return isinstance(value, _WindowsSuspendedProcess)
 
 
 def _spawn_windows_suspended(
@@ -749,6 +780,8 @@ def _spawn_windows_suspended(
     thread_handle: int | None = None
     attribute_buffer: Any = None
     attribute_initialized = False
+    kernel32: Any = None
+    attribute_list: Any = None
     native_error: BaseException | None = None
     result: _WindowsSuspendedProcess | None = None
     try:
@@ -891,7 +924,7 @@ def _spawn_windows_suspended(
         )
     except BaseException as exc:
         native_error = exc
-    if attribute_initialized:
+    if attribute_initialized and kernel32 is not None and attribute_list is not None:
         try:
             kernel32.DeleteProcThreadAttributeList(attribute_list)
         except BaseException as exc:
@@ -1196,8 +1229,8 @@ def _linux_process_query(
         ticks = ticks or _linux_clock_ticks()
     except Exception as exc:
         return ProcessQuery(False, None, (f"process filesystem setup failed: {exc}",))
+    entry = root / str(pid)
     try:
-        entry = root / str(pid)
         stat_text = (entry / "stat").read_text(encoding="ascii")
         close = stat_text.rfind(")")
         fields = stat_text[close + 2 :].split()
@@ -1508,9 +1541,13 @@ class ProcessBoundary:
         *,
         snapshot_provider: Callable[[], ProcessSnapshot] | None = None,
     ) -> "ProcessBoundary":
-        root = record.get("root") if isinstance(record.get("root"), dict) else {}
+        root_value = record.get("root")
+        root = root_value if isinstance(root_value, dict) else {}
+        root_pid = root.get("pid")
+        if not isinstance(root_pid, int) or isinstance(root_pid, bool):
+            root_pid = 0
         boundary = cls(
-            root.get("pid"),
+            root_pid,
             root.get("creation_time"),
             process_group_id=record.get("process_group_id"),
             session_id=record.get("session_id"),

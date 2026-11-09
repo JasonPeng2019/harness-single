@@ -16,13 +16,23 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Protocol, cast
 import base64
 
 SCHEMA = "manager-attention-timeline/v1"
 REPORT_SCHEMA = "manager-attention-report/v1"
 SOURCE_ROLES = frozenset({"orchestrator", "subagent", "harness", "supervisor"})
 PRODUCER_ROLES = frozenset({"orchestrator", "subagent"})
+
+
+class _PosixFcntl(Protocol):
+    LOCK_EX: int
+    LOCK_NB: int
+    LOCK_UN: int
+
+    def flock(self, fd: int, operation: int) -> None: ...
+
+
 KINDS = frozenset(
     {
         "AGENT_SIGNAL_CREATED",
@@ -2120,7 +2130,8 @@ def _advisory_lock(path: Path, timeout: float):
                 else:
                     import fcntl
 
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    posix_fcntl = cast(_PosixFcntl, fcntl)
+                    posix_fcntl.flock(fd, posix_fcntl.LOCK_EX | posix_fcntl.LOCK_NB)
                 acquired = True
                 break
             except OSError:
@@ -2138,7 +2149,8 @@ def _advisory_lock(path: Path, timeout: float):
             elif acquired:
                 import fcntl
 
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                posix_fcntl = cast(_PosixFcntl, fcntl)
+                posix_fcntl.flock(fd, posix_fcntl.LOCK_UN)
         finally:
             anchored.close()
 

@@ -44,6 +44,16 @@ def root_session_path(config: HarnessConfig) -> Path:
     return config.manager_workspace / ".agent-workspace" / "ROOT_SESSION.json"
 
 
+def _configured_paths(config: HarnessConfig) -> tuple[Path, Path, Path]:
+    manager = config.manager_workspace
+    root = config.root_workspace
+    if manager is None or root is None:
+        raise ConfigError(
+            "ROOT_SESSION_REQUIRED: configure and explicitly prepare ROOT"
+        )
+    return manager, root, config.runtime_root
+
+
 def read_root_session(config: HarnessConfig) -> dict[str, Any]:
     """Read a current prepared binding; missing/unknown records require preparation."""
     path = root_session_path(config)
@@ -79,9 +89,10 @@ def read_root_session(config: HarnessConfig) -> dict[str, Any]:
         )
     try:
         prepared = datetime.fromisoformat(record["prepared_at"].replace("Z", "+00:00"))
+        offset = prepared.utcoffset()
         if (
-            prepared.tzinfo is None
-            or prepared.utcoffset().total_seconds() != 0
+            offset is None
+            or offset.total_seconds() != 0
             or prepared > datetime.now(timezone.utc)
         ):
             raise ValueError("invalid preparation timestamp")
@@ -93,13 +104,14 @@ def read_root_session(config: HarnessConfig) -> dict[str, Any]:
                 raise ValueError(f"invalid {key}")
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"ROOT_SESSION_INVALID: {exc}") from exc
+    manager_workspace, root_workspace, runtime_root = _configured_paths(config)
     identity = compute_config_identity(
         config, load_resource_manifest(config.harness_root)
     )
     expected = {
-        "manager_workspace": path_identity(config.manager_workspace),
-        "root_workspace": path_identity(config.root_workspace),
-        "runtime_root": path_identity(config.runtime_root),
+        "manager_workspace": path_identity(manager_workspace),
+        "root_workspace": path_identity(root_workspace),
+        "runtime_root": path_identity(runtime_root),
         "config_identity": identity,
     }
     if any(record.get(key) != value for key, value in expected.items()):
@@ -131,7 +143,8 @@ def publish_root_session(
             "ROOT_SESSION_INVALID: preparation requires a run and registered provider"
         )
     path = root_session_path(config)
-    with runtime_admission_lock(config.runtime_root):
+    _, _, runtime_root = _configured_paths(config)
+    with runtime_admission_lock(runtime_root):
         from .setup import require_monitor_ready
 
         identity = compute_config_identity(
@@ -139,7 +152,7 @@ def publish_root_session(
         )
         # Admission excludes lifecycle changes. Release the monitor record lock
         # before acquiring the session record lock, including on reuse.
-        require_monitor_ready(config.runtime_root, identity)
+        require_monitor_ready(runtime_root, identity)
         return _publish_ready_session(
             config, path, run_id, provider_id, native_session_id, identity
         )
@@ -153,6 +166,7 @@ def _publish_ready_session(
     native_session_id: str | None,
     identity: str,
 ) -> dict[str, Any]:
+    manager_workspace, root_workspace, runtime_root = _configured_paths(config)
     with RecordLock(path):
         try:
             path.lstat()
@@ -179,9 +193,9 @@ def _publish_ready_session(
             "provider_id": provider_id,
             "native_session_id": native_session_id,
             "config_identity": identity,
-            "manager_workspace": path_identity(config.manager_workspace),
-            "root_workspace": path_identity(config.root_workspace),
-            "runtime_root": path_identity(config.runtime_root),
+            "manager_workspace": path_identity(manager_workspace),
+            "root_workspace": path_identity(root_workspace),
+            "runtime_root": path_identity(runtime_root),
             "prepared_at": iso_utc(),
         }
         record["content_hash"] = content_hash(record)

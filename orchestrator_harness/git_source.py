@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import Any
+from typing import Any, TypeGuard
 
 from .core import content_hash
 from .mutation import read_bytes as anchored_read, same_identity
@@ -255,7 +255,7 @@ def capture(root: Path, worktree: Path, *, branch: str | None = None) -> dict[st
     return source
 
 
-def validate(source: dict[str, Any]) -> None:
+def validate(source: object) -> TypeGuard[dict[str, Any]]:
     if (
         not isinstance(source, dict)
         or source.get("schema") != SCHEMA
@@ -299,6 +299,7 @@ def validate(source: dict[str, Any]) -> None:
         raise ValueError("ROOT Git configuration changed after preparation")
     if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", source["base_commit"]):
         raise ValueError("protected Git origin is not an exact full commit")
+    return True
 
 
 def _run(
@@ -403,7 +404,7 @@ def verify_objects(source: dict[str, Any], kind: str, oids: list[str]) -> None:
             )
         size = int(fields[2])
         start = end + 1
-        value = memoryview(output)[start : start + size]
+        value = output[start : start + size]
         if (
             size < 0
             or len(value) != size
@@ -459,7 +460,8 @@ def tree_entries(source: dict[str, Any], tip: str) -> dict[str, tuple[str, str]]
 
 def current_tip(lane: dict[str, Any]) -> str:
     source = lane.get("git_source")
-    validate(source)
+    if not validate(source):
+        raise ValueError("protected Git assignment is missing or corrupt")
     if Path(lane["worktree_path"]).absolute() != Path(source["worktree"]):
         raise ValueError("protected Git assignment differs from the lane worktree")
     if lane.get("git_write_namespace") is not None:

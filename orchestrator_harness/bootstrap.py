@@ -411,6 +411,8 @@ def _overlay_source_directories(source: CapturedTree) -> dict[Path, TargetState]
 
 def _overlay_source_file(plan: _OverlayPlan, item: _OverlayFile) -> None:
     source = plan.source
+    if source is None:
+        raise MutationConflict("overlay plan has no captured source tree")
     relative = source.relative / item.relative
     directories = _overlay_source_directories(source)
     actual = _overlay_metadata(
@@ -435,7 +437,10 @@ def _overlay_predecessor(item: _OverlayFile) -> None:
 def _overlay_check_destinations(
     plan: _OverlayPlan, directories: dict[Path, TargetState], *, files: bool
 ) -> None:
-    with _DirectoryAnchor(plan.authority, plan.authority) as anchor:
+    authority = plan.authority
+    if authority is None or plan.authority_identity is None:
+        raise MutationConflict("overlay plan has no captured destination authority")
+    with _DirectoryAnchor(authority, authority) as anchor:
         if anchor.root_identity != plan.authority_identity:
             raise MutationConflict("overlay destination authority changed")
         for relative in sorted(
@@ -446,7 +451,7 @@ def _overlay_check_destinations(
                 continue
             parent = directories[relative.parent]
             if parent.present:
-                actual = capture_target(plan.authority, relative)
+                actual = capture_target(authority, relative)
                 if not _same_state(actual, state):
                     raise MutationConflict("overlay directory changed after planning")
             elif state.present:
@@ -454,10 +459,10 @@ def _overlay_check_destinations(
         if files:
             for item in plan.files:
                 target = plan.destination / item.relative
-                relative = target.relative_to(plan.authority)
+                relative = target.relative_to(authority)
                 if directories[relative.parent].present:
                     if not _same_state(
-                        capture_target(plan.authority, relative), item.target
+                        capture_target(authority, relative), item.target
                     ):
                         raise MutationConflict(
                             "overlay destination file changed after planning"
@@ -496,6 +501,8 @@ def _overlay_plan(
             authority = authority.parent
         with _DirectoryAnchor(authority, authority) as anchor:
             identity = anchor.root_identity
+            if identity is None:
+                raise MutationConflict("overlay destination identity is unavailable")
             directories = {
                 Path("."): TargetState(True, "directory", identity, None, None, None)
             }
@@ -557,11 +564,12 @@ def _overlay_plan(
                                 raise MutationConflict(
                                     f"overlay predecessor differs at {target}"
                                 )
-                            predecessor = (
-                                expected_path,
-                                reference_anchor.root_identity,
-                                expected,
-                            )
+                            reference_identity = reference_anchor.root_identity
+                            if reference_identity is None:
+                                raise MutationConflict(
+                                    "overlay predecessor identity is unavailable"
+                                )
+                            predecessor = (expected_path, reference_identity, expected)
                 planned.append(
                     _OverlayFile(
                         relative, state, metadata, target_state, write, predecessor
@@ -602,6 +610,8 @@ def _copy_overlay(
     )
     if not plan.files:
         return
+    if plan.source is None or plan.authority is None or plan.authority_identity is None:
+        raise MutationConflict("overlay plan lacks its captured source or destination")
     try:
         _revalidate_tree(plan.source)
         directories = dict(plan.directories)
@@ -632,10 +642,15 @@ def _copy_overlay(
             relative = target.relative_to(plan.authority)
             chain = _overlay_chain(relative.parent, directories)
             if item.write:
+                content = item.source.content
+                if content is None:
+                    raise MutationConflict(
+                        "captured overlay source has no file contents"
+                    )
                 output.admit(target)
                 output.write_bytes(
                     target,
-                    item.source.content,
+                    content,
                     expected=item.target,
                     expected_directories=chain,
                     metadata=item.metadata,
@@ -1369,6 +1384,12 @@ def run_bootstrap(
 
         harness_root = find_harness_root()
         config = load_config(harness_root)
+        if (
+            config.runtime_root is None
+            or config.root_workspace is None
+            or config.manager_workspace is None
+        ):
+            raise ValueError("runtime and workspace paths must be configured")
         manifest = load_resource_manifest(harness_root)
     except Exception as exc:
         return {
@@ -1503,10 +1524,15 @@ def run_bootstrap(
                 f"{summary}; rollback incomplete: attempt identity is unavailable",
                 effects,
             )
-        try:
-            notes = _rollback_bootstrap_worktree(
-                config.root_workspace, branch, worktree_path
+        root_workspace = config.root_workspace
+        if root_workspace is None:
+            effects["rollback_proven"] = False
+            return (
+                f"{summary}; rollback incomplete: configured workspace is unavailable",
+                effects,
             )
+        try:
+            notes = _rollback_bootstrap_worktree(root_workspace, branch, worktree_path)
         except Exception as rollback_exc:
             effects["rollback_proven"] = False
             effects["rollback_notes"] = [str(rollback_exc)]
@@ -1532,21 +1558,28 @@ def run_bootstrap(
             if allowance_expired():
                 raise refuse_expired_allowance("epoch was opened")
             state = open_epoch(rt, config, manifest)
-            epoch_id = state["epoch_id"]
-            for entry in read_active_lanes(rt, epoch_id):
+            active_epoch_id = state.get("epoch_id")
+            if not isinstance(active_epoch_id, str) or not active_epoch_id:
+                raise BootstrapError(
+                    BOOTSTRAP_REQUEST_INVALID, "opened epoch has no valid identity"
+                )
+            epoch_id = active_epoch_id
+            for entry in read_active_lanes(rt, active_epoch_id):
                 if entry.get("lane_id") == lane_id:
                     raise BootstrapError(
                         BOOTSTRAP_LANE_ID_IN_USE,
                         f"lane id already used this epoch: {lane_id}",
                     )
-            if (lane_record_dir(rt, epoch_id, lane_id) / "lane.json").exists():
+            if (lane_record_dir(rt, active_epoch_id, lane_id) / "lane.json").exists():
                 raise BootstrapError(
                     BOOTSTRAP_LANE_ID_IN_USE,
                     f"durable lane id already used this epoch: {lane_id}",
                 )
             run_id = new_id()
-            worktree_path = rt / "worktrees" / epoch_id / lane_id
-            branch = str(task_card.get("branch") or f"lane/{epoch_id}/{lane_id}/work")
+            worktree_path = rt / "worktrees" / active_epoch_id / lane_id
+            branch = str(
+                task_card.get("branch") or f"lane/{active_epoch_id}/{lane_id}/work"
+            )
             base_commit = str(task_card.get("base_commit") or "HEAD")
             git_write_namespace = None
             if (
@@ -1655,19 +1688,19 @@ def run_bootstrap(
                         BOOTSTRAP_RUNTIME_NOT_OPEN,
                         "runtime changed before lane publication",
                     )
-                write_lane(rt, epoch_id, lane_id, lane)
+                write_lane(rt, active_epoch_id, lane_id, lane)
                 lane_record_written = True
-                entries = read_active_lanes(rt, epoch_id)
+                entries = read_active_lanes(rt, active_epoch_id)
                 entries.append(
                     {
                         "lane_id": lane_id,
                         "lane_record_path": str(
-                            lane_record_dir(rt, epoch_id, lane_id) / "lane.json"
+                            lane_record_dir(rt, active_epoch_id, lane_id) / "lane.json"
                         ),
                         "run_id": run_id,
                     }
                 )
-                write_active_lanes(rt, epoch_id, entries)
+                write_active_lanes(rt, active_epoch_id, entries)
 
             def base_lane_record() -> dict[str, Any]:
                 """Build the lane record shared by prepared and pending-plan lanes."""
@@ -1735,7 +1768,7 @@ def run_bootstrap(
             lane = base_lane_record()
             from .lane_authority import stage_authority
 
-            lane = stage_authority(rt, epoch_id, lane, task_card)
+            lane = stage_authority(rt, active_epoch_id, lane, task_card)
             from .retry_policy import initialize_history
 
             initialize_history(rt, lane)

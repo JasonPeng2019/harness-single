@@ -17,7 +17,7 @@ from typing import Any, Mapping
 from . import processes
 from .activity_log import append_detail
 from .bootstrap import BootstrapError, _validate_provider_launch_config
-from .config import find_harness_root, load_config
+from .config import HarnessConfig, find_harness_root, load_config
 from .core import read_json, require_schema
 from .epochs import (
     lane_record_dir,
@@ -195,14 +195,25 @@ def _wait_for_controller_exit(lane: dict[str, Any], timeout_seconds: float) -> b
     )
 
 
-def _wait_for_pid_exit(pid: int, creation: str | None, timeout_seconds: float) -> bool:
+def _wait_for_pid_exit(pid: object, creation: object, timeout_seconds: float) -> bool:
     """Wait for proven exit of the exact PID-plus-creation incarnation."""
+    if not processes._valid_pid(pid) or not processes.valid_creation_identity(creation):
+        return False
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if processes.identity_exit_proven(pid, creation):
             return True
         time.sleep(RETIRE_CONTROLLER_EXIT_POLL_SECONDS)
     return processes.identity_exit_proven(pid, creation)
+
+
+def _configured_root_workspace(config: HarnessConfig) -> Path:
+    root = config.root_workspace
+    if root is None:
+        raise LaunchError(
+            LAUNCH_INVOCATION_INVALID, "configured root workspace is unavailable"
+        )
+    return root
 
 
 def _reap_controller_and_prove_exit(
@@ -221,7 +232,7 @@ def _reap_controller_and_prove_exit(
     """
     pid = identity.get("pid")
     creation = identity.get("creation_time")
-    if not isinstance(pid, int):
+    if not processes._valid_pid(pid) or not processes.valid_creation_identity(creation):
         return False
     if processes.identity_matches(pid, creation):
         if not _wait_for_pid_exit(pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS):
@@ -553,7 +564,7 @@ def run_launch(lane_id: str) -> dict[str, Any]:
             )
             if running or terminal:
                 lane = read_lane(rt, epoch_id, lane_id)
-                state = status.get("recorded_status") if terminal else "running"
+                state = (status or {}).get("recorded_status") if terminal else "running"
                 return {
                     "ok": True,
                     "code": "LAUNCH_OK",
@@ -761,6 +772,8 @@ def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
     if (
         ok
         and boundary_ok
+        and processes._valid_pid(controller_pid)
+        and processes.valid_creation_identity(controller_creation)
         and processes.identity_exit_proven(controller_pid, controller_creation)
     ):
         return True, "", ""
@@ -773,7 +786,10 @@ def _cleanup_lane_processes(lane: dict[str, Any]) -> tuple[bool, str, str]:
         for member in [boundary.get("root"), *boundary.get("processes", [])]:
             if isinstance(member, dict):
                 identities.append((member.get("pid"), member.get("creation_time")))
-    if any(processes.identity_matches(pid, creation) for pid, creation in identities):
+    if any(
+        processes._valid_pid(pid) and processes.identity_matches(pid, creation)
+        for pid, creation in identities
+    ):
         return (
             False,
             FORCE_STOP_PROCESS_SURVIVED,
@@ -927,7 +943,7 @@ def run_force_stop(
                 if e.get("lane_id") != lane_id
             ]
             write_active_lanes(rt, epoch_id, entries)
-            _prune_worktrees(config.root_workspace)
+            _prune_worktrees(_configured_root_workspace(config))
     except (LaunchError, LaneError) as exc:
         return {
             "ok": False,
@@ -1048,10 +1064,26 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         process = lane.get("process") or (status or {}).get("controller_identity") or {}
         pid = process.get("pid")
         creation = process.get("creation_time")
-        controller_gone = processes.identity_exit_proven(pid, creation)
+        if not processes._valid_pid(pid) or not processes.valid_creation_identity(
+            creation
+        ):
+            return {
+                "ok": False,
+                "code": RETIRE_CLEANUP_UNPROVEN,
+                "summary": "controller process identity is unavailable",
+                "evidence_paths": [],
+                "next_action": "preserve the exact controller ownership evidence",
+            }
+        controller_gone = (
+            processes._valid_pid(pid)
+            and processes.valid_creation_identity(creation)
+            and processes.identity_exit_proven(pid, creation)
+        )
         deadline = time.monotonic() + RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
         while (
             not controller_gone
+            and processes._valid_pid(pid)
+            and processes.valid_creation_identity(creation)
             and processes.identity_matches(pid, creation)
             and (status or {}).get("controller_state") != "exited"
             and time.monotonic() < deadline
@@ -1060,9 +1092,15 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
             status = _read_controller_status(lane)
             if status is None:
                 break
-            controller_gone = processes.identity_exit_proven(pid, creation)
+            controller_gone = (
+                processes._valid_pid(pid)
+                and processes.valid_creation_identity(creation)
+                and processes.identity_exit_proven(pid, creation)
+            )
         if (
             not controller_gone
+            and processes._valid_pid(pid)
+            and processes.valid_creation_identity(creation)
             and processes.identity_matches(pid, creation)
             and (status or {}).get("controller_state") == "exited"
             and (status or {}).get("cleanup_proven") is True
@@ -1113,7 +1151,7 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
                 if e.get("lane_id") != lane_id
             ]
             write_active_lanes(rt, epoch_id, entries)
-            _prune_worktrees(config.root_workspace)
+            _prune_worktrees(_configured_root_workspace(config))
             if not entries:
                 _maybe_close_epoch(rt, epoch_id)
     except LaunchError as exc:

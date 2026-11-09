@@ -291,6 +291,7 @@ def close_epoch(rt: Path, epoch_id: str) -> None:
                 raise EpochError("active epoch marker is missing; closure is ambiguous")
             if reconcile_active_lanes(rt, epoch_id):
                 raise EpochError("cannot close an epoch with durable active lanes")
+            queue: dict[str, Any] | None = None
             if state.get("lane_mode") == "managed":
                 if marker is not None:
                     queue = read_manager_queue(rt)
@@ -309,6 +310,8 @@ def close_epoch(rt: Path, epoch_id: str) -> None:
             if state["lifecycle"] != "closed":
                 state["lifecycle"] = "closing"
                 if state.get("lane_mode") == "managed":
+                    if queue is None:
+                        raise EpochError("managed closing epoch has no queue identity")
                     state["closing_queue_id"] = queue["queue_id"]
                 atomic_write_json(state_path, state)
             with RecordLock(marker_path):
