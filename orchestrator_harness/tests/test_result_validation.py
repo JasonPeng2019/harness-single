@@ -127,6 +127,34 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         self.git(self.worker, "update-index", "--skip-worktree", "scope_excluded/hidden file.py")
         root_accepts(True)
 
+        # Skip-worktree is not an authorization to ignore a file that exists.
+        # Identical materialization remains clean; changed bytes and a linked
+        # substitution are rejected even while the omission bit remains set.
+        excluded_file.parent.mkdir(parents=True)
+        excluded_file.write_bytes(b"must remain omitted\n")
+        root_accepts(True)
+        excluded_file.write_bytes(b"changed behind skip-worktree\n")
+        root_accepts(False)
+        excluded_file.write_bytes(b"must remain omitted\n")
+        root_accepts(True)
+        excluded_file.unlink()
+        os.link(selected_file, excluded_file)
+        root_accepts(False)
+        excluded_file.unlink()
+        excluded_file.write_bytes(b"must remain omitted\n")
+        root_accepts(True)
+
+        hidden_oid = self.git(self.worker, "rev-parse", "HEAD:scope_excluded/hidden file.py")
+        hidden_object = Path(self.lane["git_source"]["common_dir"]) / "objects" / hidden_oid[:2] / hidden_oid[2:]
+        original_object, object_mode = hidden_object.read_bytes(), hidden_object.stat().st_mode
+        try:
+            hidden_object.chmod(object_mode | 0o200)
+            hidden_object.write_bytes(zlib.compress(b"blob 19\ncorrupt hidden bytes\n"))
+            root_accepts(False)
+        finally:
+            hidden_object.write_bytes(original_object)
+            hidden_object.chmod(object_mode)
+
         self.git(self.worker, "update-index", "--skip-worktree", "src café/chosen file.py")
         root_accepts(False)
         self.git(self.worker, "update-index", "--no-skip-worktree", "src café/chosen file.py")

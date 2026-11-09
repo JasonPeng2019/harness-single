@@ -15,7 +15,7 @@ from typing import Any
 
 from .core import content_hash
 from . import git_source
-from .mutation import read_bytes as anchored_read
+from .mutation import capture_target, read_bytes as anchored_read
 from .portable_paths import repository_parts
 
 RESULT_SCHEMA = "result/v1"
@@ -112,6 +112,23 @@ def _index_tags(source: dict[str, Any], option: str) -> dict[str, str]:
     return result
 
 
+def _optional_working_bytes(worktree: Path, path: str) -> bytes | None:
+    """Read a tracked path if present, proving each component without following links."""
+    parts = path.split("/")
+    for index in range(1, len(parts)):
+        parent = capture_target(worktree, "/".join(parts[:index]))
+        if not parent.present:
+            return None
+        if parent.kind != "directory":
+            raise ValueError(f"working source parent is not a directory: {'/'.join(parts[:index])}")
+    state = capture_target(worktree, path)
+    if not state.present:
+        return None
+    if state.kind != "file" or state.content is None:
+        raise ValueError(f"working source is not a regular file: {path}")
+    return state.content
+
+
 def require_clean(lane: dict[str, Any], tip: str) -> None:
     source, worktree = lane["git_source"], Path(lane["worktree_path"])
     tree = git_source.tree_entries(source, tip)
@@ -158,16 +175,21 @@ def require_clean(lane: dict[str, Any], tip: str) -> None:
     expected_omitted = set(expected_index) - expected_materialized
     if skipped != expected_omitted or assumed:
         raise ValueError("assigned index sparse or assume-unchanged flags differ from protected checkout scope")
-    git_source.verify_objects(source, "blob", [oid for name, (mode, oid) in expected_index.items()
-                                                if name in expected_materialized and mode != "160000"])
+    # Sparse checkout controls filesystem presence, not access to the shared
+    # object store. Keep verifying every committed blob in the assigned index.
+    git_source.verify_objects(source, "blob", [oid for mode, oid in expected_index.values() if mode != "160000"])
     for name, (mode, oid) in expected_index.items():
-        if name not in expected_materialized:
-            continue
         if mode == "160000":
             raise ValueError("source cleanliness for a Git submodule requires explicit validation; it is not proven by the parent index")
-        # Read actual bytes regardless of assume-unchanged/skip-worktree flags.
-        # Real links remain unproven; never follow one outside the assignment.
-        value = anchored_read(worktree, name, expected_root_identity=tuple(lane["worktree_identity"]))
+        if name in expected_materialized:
+            # Read actual bytes regardless of assume-unchanged/skip-worktree flags.
+            value = anchored_read(worktree, name, expected_root_identity=tuple(lane["worktree_identity"]))
+        else:
+            # A protected sparse omission permits genuine absence only. Git's
+            # skip-worktree bit can hide a materialized tracked file from status.
+            value = _optional_working_bytes(worktree, name)
+            if value is None:
+                continue
         digest = git_source.object_digest("blob", value, len(oid))
         if digest != oid and mode in {"100644", "100755"}:
             digest = _canonical_working_digest(source, tip, name, value)

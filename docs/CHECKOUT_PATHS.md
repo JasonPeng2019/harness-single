@@ -39,3 +39,11 @@ setting for a full checkout; bootstrap does not widen the requested scope.
 The installed Git must support linked-worktree-specific configuration and
 `git sparse-checkout set --cone --no-sparse-index`. Bootstrap checks the actual
 Git commands and reports their failure; no full-checkout fallback is attempted.
+
+The requested scope is recorded in protected invocation authority and carried
+through resume; the worker assignment mirror is diagnostic only. PASS validation
+requires the index omission flags to match that recorded scope. An excluded
+tracked path may be absent, but if it is present its bytes and filesystem entry
+must validate just like an included path. Skip-worktree and assume-unchanged
+flags describe Git index behavior; they do not authorize dirty files or make
+sparse checkout an access-control boundary.
