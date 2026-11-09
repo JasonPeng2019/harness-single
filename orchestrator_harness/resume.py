@@ -15,6 +15,7 @@ from typing import Any
 from . import processes
 from .setup import COMPOSED_PAYLOADS
 from .bootstrap import (
+    _validate_provider_launch_config,
     _worker_output,
     _write_invocation,
     _write_result_template,
@@ -46,6 +47,7 @@ RESUME_WORKTREE_MISSING = "RESUME_WORKTREE_MISSING"
 NO_SAVED_SESSION_ID = "NO_SAVED_SESSION_ID"
 INVALID_RESUME_TASK_CARD = "INVALID_RESUME_TASK_CARD"
 RESUME_LANE_WRITE_FAILED = "RESUME_LANE_WRITE_FAILED"
+PROFILE_CHANGE_INVALID = "PROFILE_CHANGE_INVALID"
 
 _RESUMABLE_LIFECYCLES = frozenset(
     {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
@@ -116,6 +118,30 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     return record
 
 
+def _effective_profile(provider: dict[str, Any]) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    """Compare provider behavior while preserving historical omitted-mode meaning."""
+    provider_id = provider.get("id")
+    launch_config = dict(provider.get("launch_config") or {})
+    if provider_id == "codex":
+        launcher = launch_config.get("launcher", "codex")
+        permission_mode = launch_config.get("permission_mode", "worker-isolated")
+        launch_config["launcher"] = launcher
+        launch_config["permission_mode"] = permission_mode
+    return (
+        str(provider_id), str(provider.get("model") or ""),
+        tuple(sorted((str(key), str(value)) for key, value in launch_config.items())),
+    )
+
+
+def _effective_provider_record(provider: dict[str, Any]) -> dict[str, Any]:
+    effective = {**provider, "launch_config": dict(provider.get("launch_config") or {})}
+    if effective.get("id") == "codex":
+        effective["launch_config"].setdefault("launcher", "codex")
+        # An omitted persisted Codex mode remains its historical strict profile.
+        effective["launch_config"].setdefault("permission_mode", "worker-isolated")
+    return effective
+
+
 def _has_valid_acceptance_chain(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
@@ -180,6 +206,86 @@ def _clear_prior_run(rt: Path, epoch_id: str, lane: dict[str, Any], *, output=No
     remove_record(folder / "COMPLETION_REVIEW.json")
     remove_record(folder / "ORCHESTRATOR_ACCEPTANCE.json")
     output.delete(worktree / ".agent-workspace" / "controller.status.json")
+
+
+PROFILE_HISTORY_SCHEMA = "provider-profile-transition/v1"
+
+
+def _profile_history_folder(rt: Path, epoch_id: str, lane: dict[str, Any]) -> Path:
+    source_epoch = (
+        lane.get("resume_from_epoch_id")
+        if lane.get("lifecycle") == "resuming" and isinstance(lane.get("resume_from_epoch_id"), str)
+        else epoch_id
+    )
+    return lane_record_dir(rt, source_epoch, lane["lane_id"]) / "resume-history" / str(lane["run_id"])
+
+
+def _archive_profile_transition(
+    rt: Path,
+    epoch_id: str,
+    lane: dict[str, Any],
+    *,
+    new_run_id: str,
+    new_provider: dict[str, Any],
+    rationale: str,
+    output,
+) -> Path:
+    """Archive exact prior native bindings and establish a protected transition plan."""
+    history = _profile_history_folder(rt, epoch_id, lane)
+    folder = history.parent.parent
+    history.mkdir(parents=True, exist_ok=True)
+    record_path = history / "transition.json"
+    transition = {
+        "schema": PROFILE_HISTORY_SCHEMA,
+        "lane_id": lane["lane_id"],
+        "from_epoch_id": folder.parent.parent.name,
+        "from_run_id": lane["run_id"],
+        "to_run_id": new_run_id,
+        "worktree_path": lane["worktree_path"],
+        "provider_id": lane["provider"]["id"],
+        "old_provider": lane["provider"],
+        "new_provider": new_provider,
+        "effective_new_provider": _effective_provider_record(new_provider),
+        "previous_session_id": (lane.get("session") or {}).get("session_id"),
+        "rationale": rationale.strip(),
+        "recorded_at": iso_utc(),
+    }
+    if record_path.exists():
+        existing = read_json(record_path)
+        for key in ("lane_id", "from_epoch_id", "from_run_id", "worktree_path", "provider_id",
+                    "old_provider", "new_provider", "previous_session_id", "rationale"):
+            if existing.get(key) != transition[key]:
+                raise ValueError("an interrupted profile transition has different protected inputs")
+        return history
+
+    worktree = Path(lane["worktree_path"])
+    sources = {
+        "lane.json": folder / "lane.json",
+        "invocation.json": Path(lane["invocation_path"]),
+        "worker-invocation.json": worktree / ".agent-workspace" / "invocation.json",
+        "controller.status.json": worktree / ".agent-workspace" / "controller.status.json",
+        "task-card.json": worktree / ".agent-workspace" / "task-card.json",
+        "controller.attempts.jsonl": worktree / ".agent-workspace" / "controller.attempts.jsonl",
+        "provider-transcript.jsonl": worktree / ".agent-workspace" / "provider-transcript.jsonl",
+        "provider-stderr.txt": worktree / ".agent-workspace" / "provider-stderr.txt",
+        "last-message.txt": worktree / ".agent-workspace" / "last-message.txt",
+        "RESULT.json": worktree / "RESULT.json",
+        "COMPLETION_REVIEW.json": folder / "COMPLETION_REVIEW.json",
+        "ORCHESTRATOR_ACCEPTANCE.json": folder / "ORCHESTRATOR_ACCEPTANCE.json",
+    }
+    for name, source in sources.items():
+        try:
+            data = output.read_bytes(source) if source == worktree or worktree in source.parents else source.read_bytes()
+        except FileNotFoundError:
+            continue
+        target = history / name
+        if target.exists():
+            if target.read_bytes() != data:
+                raise ValueError(f"prior profile evidence changed after archival: {target}")
+        else:
+            atomic_write_bytes(target, data)
+    atomic_write_json(record_path, transition)
+    return history
 
 
 def _reset_worker_inbox(worktree: Path, lane_id: str, run_id: str, *, output=None) -> None:
@@ -262,6 +368,8 @@ def run_resume(
     lane_id: str,
     resume_task_card: str,
     rationale: str | None = None,
+    model: str | None = None,
+    launch_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute ``resume-lane`` and return the structured result."""
     try:
@@ -277,7 +385,10 @@ def run_resume(
         }
     try:
         with runtime_admission_lock(config.runtime_root):
-            return _run_resume(config, harness_root, lane_id, resume_task_card, rationale)
+            return _run_resume(
+                config, harness_root, lane_id, resume_task_card, rationale,
+                model=model, launch_config=launch_config,
+            )
     except Exception as exc:
         return {
             "ok": False, "code": RESUME_LANE_WRITE_FAILED, "summary": str(exc),
@@ -287,7 +398,8 @@ def run_resume(
 
 
 def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
-                rationale: str | None) -> dict[str, Any]:
+                rationale: str | None, *, model: str | None = None,
+                launch_config: dict[str, Any] | None = None) -> dict[str, Any]:
     rt = config.runtime_root
     retained = False
     try:
@@ -304,6 +416,44 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             "summary": f"lane not found: {lane_id}",
             "evidence_paths": [],
             "next_action": "check the lane id or bootstrap a fresh lane",
+        }
+
+    profile_requested = model is not None or launch_config is not None
+    if profile_requested and (model is None or launch_config is None):
+        return {
+            "ok": False, "code": PROFILE_CHANGE_INVALID,
+            "summary": "explicit profile change requires --model and the complete set of --provider-option values",
+            "evidence_paths": [],
+            "next_action": "pass --model and every provider-required --provider-option, or omit both to keep the saved profile",
+        }
+    replacement_provider = lane.get("provider")
+    if profile_requested:
+        try:
+            configured = _validate_provider_launch_config(
+                harness_root, provider_id=lane["provider"]["id"],
+                model=model, launch_config=launch_config,
+            )
+        except Exception as exc:
+            return {
+                "ok": False, "code": PROFILE_CHANGE_INVALID,
+                "summary": f"replacement profile is invalid: {exc}",
+                "evidence_paths": [],
+                "next_action": "provide a supported model and complete provider options for the lane's existing adapter",
+            }
+        replacement_provider = {
+            **lane["provider"], "model": model.strip(), "launch_config": configured,
+        }
+    profile_changed = profile_requested and (
+        _effective_profile(replacement_provider) != _effective_profile(lane.get("provider"))
+    )
+    if profile_requested and not profile_changed:
+        replacement_provider = lane["provider"]
+    if profile_changed and (not isinstance(rationale, str) or not rationale.strip()):
+        return {
+            "ok": False, "code": PROFILE_CHANGE_INVALID,
+            "summary": "an explicit profile change requires a nonblank --rationale",
+            "evidence_paths": [],
+            "next_action": "explain why the lane is moving to this complete replacement profile",
         }
 
     try:
@@ -377,7 +527,7 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             }
         session = lane.get("session") or {}
         session_id = session.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
+        if not profile_changed and (not isinstance(session_id, str) or not session_id):
             return {
                 "ok": False,
                 "code": NO_SAVED_SESSION_ID,
@@ -430,21 +580,54 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
             require_same_run(read_lane(rt, epoch_id, lane_id), lane)
             if _has_valid_acceptance_chain(rt, epoch_id, lane):
                 raise ValueError("ROOT accepted this run before resume; retire it instead")
-            prior_invocation = read_invocation(lane)
             output = _worker_output(worktree)
             if output.root_identity != tuple(lane["worktree_identity"]):
                 raise ValueError("assigned worktree changed before resume mutation")
             output.revalidate(worktree / ".agent-workspace")
+            history = None
+            if profile_changed and lane.get("lifecycle") == "resuming":
+                candidate_history = _profile_history_folder(rt, epoch_id, lane)
+                if (candidate_history / "transition.json").is_file():
+                    history = candidate_history
+                    prior_invocation = read_json(history / "invocation.json")
+                else:
+                    prior_invocation = read_invocation(lane)
+            else:
+                prior_invocation = read_invocation(lane)
             if managed:
                 from .public_checks import home, policy, validate_service
                 if (policy(harness_root) is not None
                         or (home(config.root_workspace) / "config.json").exists()
                         or (home(config.root_workspace) / "service.json").exists()):
                     validate_service(config.root_workspace, harness_root)
+            if profile_changed:
+                history = history or _archive_profile_transition(
+                    rt, epoch_id, lane, new_run_id=run_id,
+                    new_provider=replacement_provider,
+                    rationale=rationale or "explicit operator profile change",
+                    output=output,
+                )
+                transition = read_json(history / "transition.json")
+                run_id = transition["to_run_id"]
+                from .retry_policy import record_profile_transition
+                record_profile_transition(
+                    rt, lane, new_run_id=run_id, new_provider=replacement_provider,
+                    rationale=transition["rationale"],
+                )
             update_lane(rt, epoch_id, lane_id, mark_resuming)
             current = read_lane(rt, epoch_id, lane_id)
             if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
                 raise ValueError("lane run or status changed before prior run cleanup")
+            if profile_changed and lane["provider"]["id"] == "codex":
+                old_mode = lane["provider"].get("launch_config", {}).get("permission_mode", "worker-isolated")
+                new_mode = replacement_provider["launch_config"].get("permission_mode", "worker-isolated")
+                if old_mode != new_mode and new_mode != "yolo":
+                    from .bootstrap import regenerate_codex_worker_profile
+                    regenerate_codex_worker_profile(
+                        worktree, harness_root, config.root_workspace,
+                        permission_mode=new_mode,
+                        manager_workspace=config.manager_workspace,
+                    )
             _clear_prior_run(rt, epoch_id, lane, output=output)
             if managed:
                 _reset_worker_inbox(worktree, lane_id, run_id, output=output)
@@ -454,14 +637,17 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 worktree, task_card, managed=managed, rationale=rationale, output=output
             )
             _write_result_template(worktree, lane_id, run_id, output=output)
+            if profile_changed:
+                prior_invocation_path = history / "invocation.json"
+                prior_invocation = read_json(prior_invocation_path)
             exclusive_resources = list(prior_invocation["exclusive_resources"])
             invocation = _write_invocation(
                 worktree,
                 lane_id=lane_id,
                 run_id=run_id,
                 provider_id=lane["provider"]["id"],
-                model=lane["provider"]["model"],
-                launch_config=lane["provider"]["launch_config"],
+                model=replacement_provider["model"],
+                launch_config=replacement_provider["launch_config"],
                 exclusive_resources=exclusive_resources,
                 output=output,
             )
@@ -481,7 +667,9 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 _write_worker_binding(worktree, rt, lane_id, run_id, output=output)
             # The resume task card is a per-lane input; keep the current copy.
             output.publish_json(output.admit(worktree / ".agent-workspace" / "task-card.json"), task_card)
-            replacement = stage_authority(rt, epoch_id, {**lane, "run_id": run_id}, task_card)
+            replacement = stage_authority(
+                rt, epoch_id, {**lane, "run_id": run_id, "provider": replacement_provider}, task_card
+            )
 
             def replace_run(current: dict[str, Any]) -> dict[str, Any]:
                 if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path", "provider")) or current.get("lifecycle") != "resuming":
@@ -506,6 +694,8 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                     "acceptance_advancement": None,
                     "last_reported_actionable_status": None,
                     "resume_from_run_id": prior_run_id,
+                    "provider": replacement_provider,
+                    "session": {} if profile_changed else current.get("session", {}),
                 }
 
             update_lane(rt, epoch_id, lane_id, replace_run)
