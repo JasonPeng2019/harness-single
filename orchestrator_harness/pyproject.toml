@@ -36,6 +36,7 @@ orchestrator_harness = [
     "assets/release/templates/*.md",
     "config.example.json",
     "install_wsl_codex.ps1",
+    "SPEC.md",
     "provider_adapters/*/launcher_binding.py",
 ]
 
