@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import json
 import os
 from pathlib import Path
 from unittest import TestCase
@@ -43,6 +44,73 @@ class RootSandboxModeTests(_RootModeCase):
             fixtures.subprocess.CompletedProcess([], 0, '{"ok":true}', '')))
         from orchestrator_harness import public_checks
         stack.enter_context(patch.object(public_checks, "start_service", return_value=None))
+
+    def legacy_attempt(self) -> tuple[Path, bytes]:
+        """Create the exact pre-sandbox attempt shape from an owned fixture."""
+        f = self.fixture
+        config = preparation._configured(f.harness, f.workspace, "codex")
+        old_attempt = {
+            "schema": "root-prelaunch-attempt/v1",
+            "run_id": "fixture",
+            "harness_dir": str(f.harness),
+            "workspace": str(f.workspace),
+            "provider_id": "codex",
+            "config_identity": preparation.compute_config_identity(
+                config, preparation.load_resource_manifest(f.harness)),
+            "harness_config_sha256": preparation.digest(f.harness / "harness-config.json"),
+            "workspace_identity": preparation.workspace_identity(f.workspace),
+            "product_workspace_identity": preparation.workspace_identity(config.root_workspace),
+        }
+        path = f.workspace / preparation.ATTEMPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Noncanonical whitespace verifies recovery leaves the durable evidence untouched.
+        raw = (json.dumps(old_attempt, indent=2) + "\n").encode("utf-8")
+        path.write_bytes(raw)
+        return path, raw
+
+    def test_legacy_attempt_recovers_default_mode_without_runtime_before_receipt(self):
+        f = self.fixture
+        path, original = self.legacy_attempt()
+        self.assertFalse((f.workspace / ".harness-runtime").exists())
+        with patch.object(preparation.subprocess, "run", wraps=preparation.subprocess.run) as setup:
+            # The class fixture replaces run with a deterministic successful setup.
+            prepared = preparation.prepare(f.harness, f.workspace, "fixture")
+        setup.assert_called_once()
+        self.assertEqual("workspace-write", prepared["root_sandbox"])
+        self.assertTrue((f.workspace / preparation.RECEIPT).is_file())
+        self.assertEqual(original, path.read_bytes())
+
+    def test_legacy_attempt_recovers_default_mode_with_open_runtime_before_receipt(self):
+        f = self.fixture
+        path, original = self.legacy_attempt()
+        runtime = f.workspace / ".harness-runtime"
+        runtime.mkdir()
+        with patch.object(preparation, "read_runtime_state", return_value={"state": "OPEN"}), \
+             patch.object(preparation.subprocess, "run") as setup:
+            prepared = preparation.prepare(f.harness, f.workspace, "fixture")
+        setup.assert_not_called()
+        self.assertEqual("workspace-write", prepared["root_sandbox"])
+        self.assertEqual("PREPARATION_REVALIDATED", preparation.read(
+            f.workspace / preparation.RECEIPT)["setup_result"]["code"])
+        self.assertEqual(original, path.read_bytes())
+
+    def test_legacy_attempt_refuses_other_modes_and_changed_identity(self):
+        f = self.fixture
+        path, original = self.legacy_attempt()
+        for mode in ("danger-full-access", "read-only"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "different ROOT run"):
+                preparation.prepare(f.harness, f.workspace, "fixture", sandbox=mode)
+            self.assertEqual(original, path.read_bytes())
+        self.assertFalse((f.workspace / preparation.RECEIPT).exists())
+
+        changed = json.loads(original)
+        changed["config_identity"] = "changed-identity"
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        altered = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "different ROOT run"):
+            preparation.prepare(f.harness, f.workspace, "fixture")
+        self.assertEqual(altered, path.read_bytes())
+        self.assertFalse((f.workspace / preparation.RECEIPT).exists())
 
     def test_explicit_full_access_prepares_and_revalidates_without_sandbox_health(self):
         f = self.fixture

@@ -318,10 +318,23 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
             "product_workspace_identity": workspace_identity(config.root_workspace)}
         if provider_id == "codex":
             expected_attempt["root_sandbox"] = sandbox
+
+        def matches_attempt(record: dict[str, Any]) -> bool:
+            if record == expected_attempt:
+                return True
+            if provider_id == "codex" and sandbox == "workspace-write":
+                # Before ROOT mode binding, v1 attempts meant Codex's default
+                # workspace-write mode. Accept only that exact old identity;
+                # retain its original bytes as recovery evidence.
+                legacy_attempt = dict(expected_attempt)
+                legacy_attempt.pop("root_sandbox")
+                return record == legacy_attempt
+            return False
+
         if config.runtime_root.exists():
             # Only an exact pre-setup birth intent authorizes interrupted
             # preparation recovery. An unrelated manual runtime is not adopted.
-            if not attempt_path.is_file() or read(attempt_path) != expected_attempt:
+            if not attempt_path.is_file() or not matches_attempt(read(attempt_path)):
                 return validate_prepared_root(harness, workspace, run_id, provider_id=provider_id, sandbox=sandbox)
             state = read_runtime_state(config.runtime_root)
             if not state or state.get("state") not in {"OPEN", "CLOSED"}:
@@ -334,7 +347,7 @@ def prepare(harness: Path, workspace: Path, run_id: str, *, provider_id: str = "
             with RecordLock(attempt_path):
                 captured = capture_target(workspace, ATTEMPT)
                 if captured.present:
-                    if read(attempt_path) != expected_attempt:
+                    if not matches_attempt(read(attempt_path)):
                         raise ValueError("pre-launch attempt belongs to a different ROOT run")
                 else:
                     _publish(workspace, ATTEMPT, canonical_json(expected_attempt) + b"\n", expected=captured,
