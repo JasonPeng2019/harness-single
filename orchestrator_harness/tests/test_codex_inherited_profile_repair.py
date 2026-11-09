@@ -80,7 +80,7 @@ class CodexInheritedProfileRepairTests(unittest.TestCase):
             self.assertNotIn(str(stale), filesystem)
         self.assertNotIn(str(common), filesystem)
         self.assertNotIn(str(common / "refs/heads"), filesystem)
-        marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
+        marker = "# Harness-owned worker isolation; regenerated for every lane.\n"
         self.assertEqual(inherited.split(marker)[0], rendered.split(marker)[0])
         self.assertIn(self.user_prefix, rendered)
         with patch.object(Path, "home", return_value=self.home), patch.dict(
@@ -109,7 +109,7 @@ class CodexInheritedProfileRepairTests(unittest.TestCase):
         self.install(self.parent)
         config = self.parent / ".codex/config.toml"
         generated = config.read_text(encoding="utf-8")
-        marker = "# Harness-owned worker read isolation; regenerated for every lane.\n"
+        marker = "# Harness-owned worker isolation; regenerated for every lane.\n"
         variants = [
             generated + "[user_settings]\nkeep = true\n",
             generated + "[permissions.worker-isolated.network]\nenabled = true\n",

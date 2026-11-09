@@ -1,4 +1,4 @@
-"""Shared native read denials for coding workers and public checks.
+"""Native read-denial policy for explicitly strict workers and public checks.
 
 Windows materializes these restrictions on a persistent sandbox group. Profiles
 in one workspace therefore use the same deny set; a check must not deny source,
@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 
-def shared_read_denials(
+def strict_read_denials(
     harness_root: Path,
     root_workspace: Path,
     manager_workspace: Path,
@@ -46,6 +46,10 @@ def shared_read_denials(
     # sibling restrictions remain, but no profile can deny a product ancestor.
     return {path for path in denied
             if path != root_workspace and path not in root_workspace.parents}
+
+
+# Kept as a source-compatible name for existing strict public-check adapters.
+shared_read_denials = strict_read_denials
 
 
 def require_git_read_access(denied: set[Path], common_dir: Path, private_dir: Path) -> None:
