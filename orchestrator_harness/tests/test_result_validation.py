@@ -530,10 +530,28 @@ class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
         self.commit(root, "sha256 base")
         self.git(root, "worktree", "add", "-qb", "lane/hash/work", str(worker))
         source = git_source.capture(root, worker, branch="lane/hash/work")
-        lane = {**self.lane, "worktree_path": str(worker), "git_source": source,
-                "worktree_identity": [worker.stat().st_dev, worker.stat().st_ino]}
-        result = self.record(branch="lane/hash/work", commit=source["base_commit"])
+        run_id = "sha256-format-run"
+        # Stage a real protected assignment for this SHA256 worktree so clean
+        # RESULT validation exercises source validation instead of stale fixture authority.
+        bootstrap._write_worker_prompt(worker, self.task, managed=False)
+        bootstrap._write_invocation(
+            worker, lane_id="worker", run_id=run_id,
+            provider_id=self.provider["id"], model=self.provider["model"],
+            launch_config=self.provider["launch_config"], exclusive_resources=[],
+        )
+        bootstrap._write_worker_binding(worker, self.rt, "worker", run_id)
+        lane = stage_authority(
+            self.rt, self.epoch,
+            {**self.lane, "run_id": run_id, "worktree_path": str(worker),
+             "result_path": str(worker / "RESULT.json"), "branch": "lane/hash/work",
+             "git_source": source,
+             "worktree_identity": [worker.stat().st_dev, worker.stat().st_ino]},
+            self.task,
+        )
+        result = self.record(branch="lane/hash/work", commit=source["base_commit"],
+                             run_id=run_id, worker_invocation_id=run_id)
         self.assertEqual(64, len(result["commit"]))
+        self.assertEqual(source["content_hash"], read_invocation(lane)["git_source_hash"])
         validate_record(result, lane)
 
 
