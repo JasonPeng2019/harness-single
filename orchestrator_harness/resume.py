@@ -683,6 +683,7 @@ def _run_resume(config, harness_root: Path, lane_id: str, resume_task_card: str,
                 model=replacement_provider["model"],
                 launch_config=replacement_provider["launch_config"],
                 exclusive_resources=exclusive_resources,
+                checkout_paths=lane.get("checkout_paths"),
                 output=output,
             )
             invocation_path = worktree / ".agent-workspace" / "invocation.json"

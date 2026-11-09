@@ -675,6 +675,7 @@ def _write_invocation(
     model: str,
     launch_config: dict[str, str],
     exclusive_resources: list[str],
+    checkout_paths: list[str] | tuple[str, ...] | None = None,
     output: PreparedOutputTransaction | None = None,
 ) -> dict[str, Any]:
     agent_workspace = worktree / ".agent-workspace"
@@ -707,6 +708,8 @@ def _write_invocation(
         },
         "created_at": iso_utc(),
     }
+    if checkout_paths is not None:
+        invocation["checkout_paths"] = list(checkout_paths)
     invocation["content_hash"] = content_hash(invocation)
     output = _worker_output(worktree, output)
     output.ensure_parent(agent_workspace / "invocation.json")
@@ -1454,6 +1457,8 @@ def run_bootstrap(
                     "acceptance_advancement": None,
                     "last_reported_actionable_status": None,
                 }
+                if config.checkout_paths is not None:
+                    record["checkout_paths"] = list(config.checkout_paths)
                 if managed:
                     record["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
                     record["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
@@ -1472,6 +1477,7 @@ def run_bootstrap(
                 model=model,
                 launch_config=configured_launch,
                 exclusive_resources=list(exclusive_resources),
+                checkout_paths=config.checkout_paths,
             )
 
             lane = base_lane_record()

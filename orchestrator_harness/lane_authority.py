@@ -41,7 +41,8 @@ def stage_authority(rt: Path, epoch_id: str, lane: dict[str, Any], task_card: di
     if (invocation.get("content_hash") != content_hash(invocation)
             or invocation.get("lane_id") != lane["lane_id"] or invocation.get("run_id") != lane["run_id"]
             or invocation.get("provider") != lane["provider"]
-            or invocation.get("exclusive_resources") != lane["exclusive_resources"]):
+            or invocation.get("exclusive_resources") != lane["exclusive_resources"]
+            or invocation.get("checkout_paths") != lane.get("checkout_paths")):
         raise ValueError("generated invocation differs from the operator-owned assignment")
     directory = lane_record_dir(rt, epoch_id, lane["lane_id"]) / "runs" / lane["run_id"]
     if directory.exists():
@@ -96,6 +97,7 @@ def read_invocation(lane: dict[str, Any]) -> dict[str, Any]:
             or invocation.get("exclusive_resources") != lane["exclusive_resources"]
             or invocation.get("content_hash") != lane["invocation_hash"]
             or invocation.get("content_hash") != content_hash(invocation)
+            or invocation.get("checkout_paths") != lane.get("checkout_paths")
             or invocation.get("git_source_hash") != lane["git_source"]["content_hash"]
             or invocation.get("result_assignment_hash") != lane["result_assignment_hash"]
             or assignment(lane)["content_hash"] != lane["result_assignment_hash"]

@@ -29,6 +29,10 @@ def assignment(lane: dict[str, Any]) -> dict[str, Any]:
     fields = ("lane_id", "run_id", "worktree_path", "worktree_identity", "git_source",
               "git_write_namespace", "task_card_hash", "source_exclusions")
     record = {key: lane[key] for key in fields if key in lane}
+    # Keep historical full-checkout assignment identities unchanged. A sparse
+    # scope is included only when the operator explicitly configured one.
+    if lane.get("checkout_paths") is not None:
+        record["checkout_paths"] = list(lane["checkout_paths"])
     record["schema"] = ASSIGNMENT_SCHEMA
     record["content_hash"] = content_hash(record)
     return record
@@ -82,6 +86,32 @@ def _canonical_working_digest(source: dict[str, Any], tip: str, path: str, value
     return digest
 
 
+def _materialized_by_cone(path: str, checkout_paths: list[str] | tuple[str, ...]) -> bool:
+    parts = path.split("/")
+    if len(parts) == 1:  # cone mode always includes files at the repository root
+        return True
+    parent = "/".join(parts[:-1])
+    for selected in checkout_paths:
+        if path == selected or path.startswith(selected + "/"):
+            return True
+        # Cone mode includes immediate files in each ancestor directory needed
+        # to reach a selected directory, but not deeper sibling subtrees.
+        if selected == parent or selected.startswith(parent + "/"):
+            return True
+    return False
+
+
+def _index_tags(source: dict[str, Any], option: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for entry in git_source.git(source, "ls-files", option, "-z").split(b"\0"):
+        if entry:
+            tag, raw_path = entry.split(b" ", 1)
+            path = raw_path.decode("utf-8")
+            repository_parts(path)
+            result[path] = tag.decode("ascii")
+    return result
+
+
 def require_clean(lane: dict[str, Any], tip: str) -> None:
     source, worktree = lane["git_source"], Path(lane["worktree_path"])
     tree = git_source.tree_entries(source, tip)
@@ -98,13 +128,41 @@ def require_clean(lane: dict[str, Any], tip: str) -> None:
         raise ValueError(f"reported branch commits generated lane files ({', '.join(changed) or 'in its history'}); "
                          f"rebuild it with 'git reset --soft {base_commit}', {restore}then commit again "
                          "(working files stay)")
+    # ROOT reads the scope from the protected invocation, never the worker's
+    # mutable assignment mirror. The staged Stop check has only the mirror and
+    # remains a diagnostic; ROOT repeats this validation against its authority.
+    if "invocation_path" in lane:
+        from .lane_authority import read_invocation
+        invocation = read_invocation(lane)
+        checkout_paths = invocation.get("checkout_paths")
+    else:
+        # The worker Stop mirror can only provide a diagnostic. It is bound to
+        # its mirror hash, and ROOT rechecks from protected invocation authority.
+        checkout_paths = lane.get("checkout_paths")
+    if checkout_paths is not None and (not isinstance(checkout_paths, list)
+            or not checkout_paths or any(not isinstance(path, str) for path in checkout_paths)):
+        raise ValueError("protected sparse checkout scope is invalid")
     index = _index_entries(source)
-    expected = {name: entry for name, entry in tree.items() if not _excluded(name, lane)}
-    actual = {name: entry for name, entry in index.items() if not _excluded(name, lane)}
-    if actual != expected:
+    expected_index = {name: entry for name, entry in tree.items() if not _excluded(name, lane)}
+    actual_index = {name: entry for name, entry in index.items() if not _excluded(name, lane)}
+    if actual_index != expected_index:
         raise ValueError("assigned worktree index differs from the reported commit")
-    git_source.verify_objects(source, "blob", [oid for mode, oid in expected.values() if mode != "160000"])
-    for name, (mode, oid) in expected.items():
+    if checkout_paths is None:
+        expected_materialized = set(expected_index)
+    else:
+        expected_materialized = {name for name in expected_index if _materialized_by_cone(name, checkout_paths)}
+    skip_tags = _index_tags(source, "-t")
+    assume_tags = _index_tags(source, "-v")
+    skipped = {name for name, tag in skip_tags.items() if tag == "S" and not _excluded(name, lane)}
+    assumed = {name for name, tag in assume_tags.items() if tag.islower() and not _excluded(name, lane)}
+    expected_omitted = set(expected_index) - expected_materialized
+    if skipped != expected_omitted or assumed:
+        raise ValueError("assigned index sparse or assume-unchanged flags differ from protected checkout scope")
+    git_source.verify_objects(source, "blob", [oid for name, (mode, oid) in expected_index.items()
+                                                if name in expected_materialized and mode != "160000"])
+    for name, (mode, oid) in expected_index.items():
+        if name not in expected_materialized:
+            continue
         if mode == "160000":
             raise ValueError("source cleanliness for a Git submodule requires explicit validation; it is not proven by the parent index")
         # Read actual bytes regardless of assume-unchanged/skip-worktree flags.

@@ -12,16 +12,131 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from orchestrator_harness import controller, git_source, launch, monitor, resume, review
+from orchestrator_harness import bootstrap, controller, git_source, launch, monitor, resume, review, retry_policy, setup
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import lane_record_dir
-from orchestrator_harness.lane_authority import read_invocation
+from orchestrator_harness.lane_authority import read_invocation, stage_authority
+from orchestrator_harness.lanes import read_lane, write_lane
 from orchestrator_harness.records import atomic_write_json
 from orchestrator_harness.result_validation import read_result, validate_record
 from orchestrator_harness.tests.result_fixture import LinkedResultFixture
 
 
 class ResultValidationTests(LinkedResultFixture, unittest.TestCase):
+    def test_sparse_pass_uses_protected_scope_and_rejects_tampered_materialization(self):
+        selected = "src café"
+        selected_file = self.worker / selected / "chosen file.py"
+        excluded_file = self.worker / "scope_excluded" / "hidden file.py"
+        selected_file.parent.mkdir(parents=True)
+        excluded_file.parent.mkdir(parents=True)
+        selected_file.write_bytes("print('selected ✓')\n".encode("utf-8"))
+        excluded_file.write_bytes(b"must remain omitted\n")
+        self.git(self.worker, "add", "src café", "scope_excluded")
+        self.commit(self.worker, "add sparse fixture sources")
+        initial_base = self.lane["git_source"]["base_commit"]
+
+        self.git(self.worker, "sparse-checkout", "init", "--cone", "--no-sparse-index")
+        self.git(self.worker, "sparse-checkout", "set", selected)
+        self.assertTrue(selected_file.is_file())
+        self.assertFalse(excluded_file.exists())
+
+        source = git_source.capture(self.root, self.worker, branch="lane/worker/work")
+        source["base_commit"] = initial_base
+        source["content_hash"] = content_hash(source)
+        scope = [selected]
+        run_id = "sparse-pass"
+        bootstrap._write_invocation(
+            self.worker, lane_id="worker", run_id=run_id,
+            provider_id=self.provider["id"], model=self.provider["model"],
+            launch_config=self.provider["launch_config"], exclusive_resources=[],
+            checkout_paths=scope,
+        )
+        record = {**self.lane, "run_id": run_id, "git_source": source, "checkout_paths": scope}
+        self.lane = write_lane(self.rt, self.epoch, "worker",
+                               stage_authority(self.rt, self.epoch, record, self.task))
+        bootstrap._write_worker_binding(self.worker, self.rt, "worker", run_id)
+
+        # Ordinary retry and an explicit model transition both carry the same
+        # protected sparse scope into their new invocation and assignment.
+        retry_policy.initialize_history(self.rt, self.lane)
+        reservation = retry_policy.reserve_invocation(self.rt, self.lane)
+        retry_policy.record_started(self.rt, self.lane, reservation)
+        retry_policy.record_outcome(
+            self.rt, self.lane, reservation, provider_started=True,
+            cleanup_proven=True, session_id="fixture-saved-session",
+        )
+        setup.set_runtime_state(self.rt, "OPEN")
+        self.lane["session"] = {"session_id": "fixture-saved-session"}
+        write_lane(self.rt, self.epoch, "worker", self.lane)
+        with patch.object(resume, "find_harness_root", return_value=self.base), \
+             patch.object(resume, "load_config", return_value=self.config), \
+             patch.object(resume, "find_active_lane", return_value=(self.epoch, self.lane)), \
+             patch.object(resume, "_live_controller", return_value=False):
+            resumed = resume.run_resume(
+                lane_id="worker", resume_task_card=str(self.lane["task_card_path"])
+            )
+        self.assertTrue(resumed["ok"], resumed)
+        self.lane = read_lane(self.rt, self.epoch, "worker")
+        bootstrap._write_worker_binding(self.worker, self.rt, "worker", self.lane["run_id"])
+        self.assertEqual(scope, self.lane["checkout_paths"])
+        self.assertEqual(scope, read_invocation(self.lane)["checkout_paths"])
+
+        with patch.object(resume, "find_harness_root", return_value=self.base), \
+             patch.object(resume, "load_config", return_value=self.config), \
+             patch.object(resume, "find_active_lane", return_value=(self.epoch, self.lane)), \
+             patch.object(resume, "_live_controller", return_value=False), \
+             patch.object(resume, "_validate_provider_launch_config", side_effect=lambda *args, **kwargs: kwargs["launch_config"]):
+            changed = resume.run_resume(
+                lane_id="worker", resume_task_card=str(self.lane["task_card_path"]),
+                model="fixture-next", launch_config={"effort": "high"},
+                rationale="verify sparse scope survives explicit model change",
+            )
+        self.assertTrue(changed["ok"], changed)
+        self.lane = read_lane(self.rt, self.epoch, "worker")
+        bootstrap._write_worker_binding(self.worker, self.rt, "worker", self.lane["run_id"])
+        self.assertEqual(scope, self.lane["checkout_paths"])
+        self.assertEqual(scope, read_invocation(self.lane)["checkout_paths"])
+        self.assertEqual(scope, json.loads((self.worker / ".agent-workspace/result-assignment.json").read_text())["checkout_paths"])
+
+        self.publish()
+        stop_report = self.worker_check()
+        self.assertTrue(stop_report["valid"], stop_report)
+        status, result = controller._validate_result(self.lane)
+        self.assertEqual("valid", status)
+        self.assertIsNotNone(result)
+        self.assertEqual(scope, read_invocation(self.lane)["checkout_paths"])
+        acceptance_pair = self.pair()
+        self.assertTrue(monitor._review_pair_is_valid(self.rt, self.epoch, self.lane))
+        launch._validate_current_acceptance(self.rt, self.epoch, self.lane, acceptance_pair[1])
+        self.assertTrue(resume._has_valid_acceptance_chain(self.rt, self.epoch, self.lane))
+
+        def root_accepts(expected):
+            status, result = controller._validate_result(self.lane)
+            self.assertEqual("valid" if expected else "invalid", status)
+            self.assertEqual(expected, result is not None)
+
+        self.lane["checkout_paths"] = ["scope_excluded"]
+        root_accepts(False)
+        self.lane["checkout_paths"] = scope
+        root_accepts(True)
+
+        # Clearing the protected omission bit cannot make a missing excluded
+        # file part of the accepted materialization.
+        self.git(self.worker, "update-index", "--no-skip-worktree", "scope_excluded/hidden file.py")
+        root_accepts(False)
+        self.git(self.worker, "update-index", "--skip-worktree", "scope_excluded/hidden file.py")
+        root_accepts(True)
+
+        self.git(self.worker, "update-index", "--skip-worktree", "src café/chosen file.py")
+        root_accepts(False)
+        self.git(self.worker, "update-index", "--no-skip-worktree", "src café/chosen file.py")
+        selected_file.unlink()
+        root_accepts(False)
+        with self.assertRaises(launch.LaunchError):
+            launch._validate_current_acceptance(self.rt, self.epoch, self.lane, acceptance_pair[1])
+        with self.assertRaisesRegex(ValueError, "accepted source is no longer valid"):
+            resume._has_valid_acceptance_chain(self.rt, self.epoch, self.lane)
+
     def test_valid_result_is_accepted_by_root_monitor_and_fresh_staged_worker(self):
         self.assert_consumers(True)
         self.assertEqual(self.lane["result_assignment_hash"], read_invocation(self.lane)["result_assignment_hash"])
